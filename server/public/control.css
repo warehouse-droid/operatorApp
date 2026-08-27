@@ -15,6 +15,11 @@ body {
   margin: 0;
 }
 
+html.sales-order-reload-open,
+body.sales-order-reload-open {
+  overflow: hidden;
+}
+
 button,
 input,
 select,
@@ -1364,7 +1369,7 @@ pre {
 
 .photo-lightbox-panel {
   position: relative;
-  max-width: min(96vw, 1500px);
+  max-width: min(100%, 1500px);
   max-height: 92vh;
   display: grid;
   place-items: center;
@@ -1380,9 +1385,10 @@ pre {
 }
 
 .sales-order-reload-panel {
-  width: min(92vw, 620px);
+  width: min(100%, 620px);
   max-height: 92vh;
-  overflow: auto;
+  overflow-x: hidden;
+  overflow-y: auto;
   padding: 28px;
   border-radius: 12px;
   background: white;
@@ -1392,9 +1398,33 @@ pre {
   gap: 14px;
 }
 
+.sales-order-reload-modal {
+  display: flex;
+  align-items: flex-start;
+  justify-content: center;
+  overflow-x: hidden;
+  overflow-y: auto;
+}
+
+.sales-order-reload-modal > .sales-order-reload-panel {
+  flex: 0 0 auto;
+  max-height: none;
+  margin-block: auto;
+  overflow: visible;
+}
+
 .sales-order-reload-panel h2,
 .sales-order-reload-panel p {
   margin: 0;
+}
+
+.sales-order-reload-panel > .photo-lightbox-close {
+  top: 10px;
+  right: 10px;
+}
+
+.sales-order-reload-panel > h2 {
+  padding-right: 48px;
 }
 
 .sales-order-reload-panel label {
@@ -1409,7 +1439,7 @@ pre {
 }
 
 .sales-order-reload-panel:has(.sales-order-reattempt-lines) {
-  width: min(96vw, 980px);
+  width: min(100%, 980px);
 }
 
 .sales-order-reattempt-summary,
@@ -1441,6 +1471,20 @@ pre {
   background: #f8fafb;
 }
 
+.sales-order-reattempt-line > input[type="radio"],
+.sales-order-physical-confirmation > input[type="checkbox"] {
+  width: 24px;
+  height: 24px;
+  min-height: 24px;
+  margin: 0;
+  padding: 0;
+}
+
+.sales-order-physical-confirmation {
+  grid-template-columns: 28px minmax(0, 1fr);
+  align-items: start;
+}
+
 .sales-order-reattempt-identities {
   grid-template-columns: repeat(2, minmax(0, 1fr));
 }
@@ -1469,6 +1513,23 @@ pre {
 }
 
 @media (max-width: 720px) {
+  .photo-lightbox {
+    padding: 12px;
+  }
+
+  .sales-order-reload-panel {
+    padding: 18px;
+  }
+
+  .loaded-layout {
+    grid-template-columns: minmax(0, 1fr);
+  }
+
+  .loaded-order-list,
+  .loaded-detail-panel {
+    max-height: none;
+  }
+
   .sales-order-reattempt-summary,
   .sales-order-reattempt-identities,
   .sales-order-reattempt-quantities {

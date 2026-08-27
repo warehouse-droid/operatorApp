@@ -36,7 +36,9 @@ assert(
 );
 assert(
   /stopLineRowIds\.length \? stopLineRowIds : dropoffLineRowIds/.test(dispatchSource)
-    && /if \(!lineRowIds\.size\) return \(order\?\.dropoffs \|\| \[\]\)\.length > 1 \? \[\] : order\?\.items \|\| \[\];/.test(dispatchSource),
+    && /const dropoffs = routeDropoffsForOrder\(order\);/.test(dispatchSource)
+    && /const items = routeItemsForOrder\(order\);/.test(dispatchSource)
+    && /if \(!lineRowIds\.size\) return dropoffs\.length > 1 \? \[\] : items;/.test(dispatchSource),
   "Drop item selection must fall back to dropoff IDs without leaking every line from an unresolved multi-drop PO."
 );
 assert(

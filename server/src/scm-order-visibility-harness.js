@@ -260,6 +260,11 @@ assert.match(purchaseOrderResponse, /scheduleId:\s*order\.scm\?\.scheduleId/,
   "PO split reconciliation must receive the persisted schedule ID.");
 assert.match(purchaseOrderResponse, /updatedAt:\s*order\.scm\?\.updatedAt/,
   "PO split reconciliation must receive the persisted schedule update time.");
+assert.match(
+  purchaseOrderResponse,
+  /dispatchCompletionEvidenceType:\s*order\.dispatchCompletionEvidenceType/,
+  "PO split reconciliation must preserve exact Driver completion precedence."
+);
 
 const salesScheduleResponse = sourceSection(
   serverSource,

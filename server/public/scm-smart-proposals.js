@@ -698,6 +698,20 @@ function smartUrgencyLegend() {
   </div>`;
 }
 
+function smartPlanningPhasePanel(plan) {
+  if (!plan || plan.planningPhase === "integrated") return "";
+  if (plan.planningPhase === "po_pending_approval") {
+    return `<div class="smart-notice warn smart-planning-phase" data-smart-planning-phase="po_pending_approval">
+      <div><strong>Phase 1 · Purchase orders ready for review</strong><br><span>Approve only after the intended POs or active local split references exist. Draft proposal statuses do not count as inbound. Approval freezes that evidence, then builds Phase 2 transfers.</span></div>
+      ${smartCanWrite() ? `<button class="smart-button primary" data-smart-action="approve-po-phase" type="button">Approve PO phase &amp; build transfers</button>` : ""}
+    </div>`;
+  }
+  if (plan.planningPhase === "transfer_ready") {
+    return `<div class="smart-notice success smart-planning-phase" data-smart-planning-phase="transfer_ready"><strong>Phase 2/3 · Transfers and consolidation built</strong><span> The PO evidence used for this run is frozen. Later PO changes will be included in the next planning cycle.</span></div>`;
+  }
+  return `<div class="smart-notice smart-planning-phase"><strong>Planning phase:</strong> ${smartEscape(plan.planningPhase)}</div>`;
+}
+
 smartPlans = function smartPlansV2() {
   const plan = smartState.plan;
   const runs = smartState.data.planningRuns || [];
@@ -729,6 +743,7 @@ smartPlans = function smartPlansV2() {
       <select id="smartPlanSort"><option value="destination" ${smartState.planSort === "destination" ? "selected" : ""}>Tie-break: destination route</option><option value="source" ${smartState.planSort === "source" ? "selected" : ""}>Tie-break: source yard / vendor</option></select>
       <button class="smart-button" data-smart-action="filter-plan" type="button">Apply</button><span class="smart-help">${proposals.length} proposal(s)</span>
     </div>
+    ${smartPlanningPhasePanel(plan)}
     ${smartUrgencyLegend()}
     </div>
     ${exclusionPanel}
@@ -889,9 +904,19 @@ smartScmApp.addEventListener("click", async (event) => {
     await smartSearchManualLoadItems();
     return;
   }
-  if (!["group-proposals", "recalculate-po", "save-proposal-line", "save-pallet-line", "reset-pallet-line", "remove-proposal-line", "add-proposal-line", "split-proposal-line", "create-manual-load"].includes(action)) return;
+  if (!["approve-po-phase", "group-proposals", "recalculate-po", "save-proposal-line", "save-pallet-line", "reset-pallet-line", "remove-proposal-line", "add-proposal-line", "split-proposal-line", "create-manual-load"].includes(action)) return;
   try {
-    if (action === "group-proposals") {
+    if (action === "approve-po-phase") {
+      if (!smartState.plan?.id) throw new Error("Select the PO-phase planning run first.");
+      if (!confirm("Approve the PO phase now? Only real active NetSuite POs and active local split references will count as expected inbound. This run's Phase 2 basis will then be frozen.")) return;
+      smartState.plan = await smartWork(
+        "Building transfer phase",
+        () => smartApi(`/api/scm/smart/planning-runs/${smartState.plan.id}/approve-po-phase`, { method: "POST", body: {} }),
+        "PO phase approved and transfer phase built"
+      );
+      await smartLoadBootstrap({ quiet: true });
+      smartRender();
+    } else if (action === "group-proposals") {
       const proposalIds = [...smartState.selectedProposalIds];
       if (proposalIds.length < 2) throw new Error("Select at least two compatible loads.");
       if (!confirm(`Group ${proposalIds.length} selected loads into one truck? Quantities above capacity will be reduced proportionally to whole pallets and shown as deferred.`)) return;

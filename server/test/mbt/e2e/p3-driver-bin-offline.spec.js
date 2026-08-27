@@ -2,7 +2,18 @@ import AxeBuilder from "@axe-core/playwright";
 import { expect, test } from "./mbt-e2e-test.js";
 
 const TOKEN = "p3-driver-bin-browser-token";
-const PLAN_DATE = "2039-08-03";
+const PLAN_DATE = (() => {
+  const parts = new Intl.DateTimeFormat("en-CA", {
+    timeZone: "America/Toronto",
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit"
+  }).formatToParts(new Date());
+  const byType = Object.fromEntries(parts.map((part) => [part.type, part.value]));
+  return `${byType.year}-${byType.month}-${byType.day}`;
+})();
+const MANIFEST_GENERATED_AT = new Date(Date.now() - 60_000).toISOString();
+const MANIFEST_EXPIRES_AT = new Date(Date.now() + (24 * 60 * 60 * 1000)).toISOString();
 const MANIFEST_ID = "00000000-0000-4000-8000-000000000911";
 const ASSET_ID = "00000000-0000-4000-8000-000000000912";
 const JOB_ID = "BIN-P3-PWA-JOB-1";
@@ -81,8 +92,8 @@ function bootstrap() {
     planId: "900911",
     planDate: PLAN_DATE,
     planRevision: 1,
-    generatedAt: "2039-08-03T10:00:00.000Z",
-    expiresAt: "2039-08-04T16:00:00.000Z",
+    generatedAt: MANIFEST_GENERATED_AT,
+    expiresAt: MANIFEST_EXPIRES_AT,
     offlineSyncGrant: "p3-browser-grant",
     currentJobFingerprint: FINGERPRINT,
     predecessorFingerprint: PREDECESSOR,
@@ -171,7 +182,7 @@ async function mockDriver(page, context, {
     if (url.pathname.startsWith("/api/driver/test-photo-upload/")) {
       const photoId = url.pathname.split("/").pop();
       return json({
-        key: `driver/driver-stop-photo/2039/08/03/${photoId}/evidence.jpg`,
+        key: `driver/driver-stop-photo/${PLAN_DATE.replaceAll("-", "/")}/${photoId}/evidence.jpg`,
         byteSize: Number(headers["content-length"] || byteSize || 0)
       });
     }
@@ -374,6 +385,9 @@ test("Driver online-only mode uploads and completes BIN evidence without creatin
   await page.locator('[data-bin-note="condition_note"]').fill("Sent directly online");
   await attachLocalGalleryPhoto(page, galleryJpeg);
   await expect(page.locator('[data-bin-photo-slot="placement_photo"] img')).toBeVisible();
+  await page.locator('[data-action="recheck-location"]').click();
+  await expect(page.locator(".location-check.ok")).toContainText("Location verified");
+  await expect(page.locator('[data-action="complete-job"]')).toBeEnabled();
 
   await page.locator('[data-action="complete-job"]').click();
   await expect.poll(() => observed.onlineBinBodies.some(({ type }) => type === "job_completed")).toBe(true);
@@ -436,6 +450,8 @@ test("P3-F19/P3-F20/P3-F22: airplane draft survives reload and reconnects with o
   await expect(page.locator('[data-bin-scan="outgoing_bin_scan"]')).toHaveValue("QR-BIN-PWA-14-001");
   await expect(page.locator('[data-bin-note="condition_note"]')).toHaveValue("Saved in airplane mode");
   await expect(page.locator('[data-bin-photo-slot="placement_photo"] img')).toBeVisible();
+  await expect(page.locator(".location-check.not_checked_offline")).toContainText("Location not checked offline");
+  await expect(page.locator('[data-action="complete-job"]')).toBeEnabled();
 
   await page.locator('[data-action="complete-job"]').click();
   await expect(page.locator(".no-job, [data-driver-no-job]")).toBeVisible();

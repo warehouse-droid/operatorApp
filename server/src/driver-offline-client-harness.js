@@ -1306,8 +1306,8 @@ for (const asset of [
   assert.ok(driverHtml.includes(`/${asset}?v=20260819-driver-route-readiness-v1`));
   assert.ok(driverWorker.includes(`/${asset}?v=20260819-driver-route-readiness-v1`));
 }
-assert.match(driverWorker, /DRIVER_CACHE_NAME = `\$\{DRIVER_CACHE_PREFIX\}v37`/);
-assert.match(driverWorker, /DRIVER_REFRESH_CACHE_NAME = `\$\{DRIVER_CACHE_PREFIX\}refresh-v37`/);
+assert.match(driverWorker, /DRIVER_CACHE_NAME = `\$\{DRIVER_CACHE_PREFIX\}v38`/);
+assert.match(driverWorker, /DRIVER_REFRESH_CACHE_NAME = `\$\{DRIVER_CACHE_PREFIX\}refresh-v38`/);
 assert.match(
   driverSource,
   /serviceWorker\.register\("\/driver-service-worker\.js\?v=20260819-driver-route-readiness-v1"/

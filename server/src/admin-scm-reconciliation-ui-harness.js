@@ -484,15 +484,15 @@ assert.ok(
   "Admin reconciliation CSS cache bust is missing."
 );
 assert.ok(
-  adminHtml.includes("/control.js?v=20260805-so-type-filter-v2"),
+  adminHtml.includes("/control.js?v=20260825-so-reattempt-current-item-v1"),
   "Admin reconciliation client cache bust is missing."
 );
 assert.ok(
-  controlHtml.includes("/control.css?v=20260730-reconciliation-multi-ref-v1"),
+  controlHtml.includes("/control.css?v=20260825-so-reattempt-current-item-v1"),
   "Control reconciliation CSS cache bust is missing."
 );
 assert.ok(
-  controlHtml.includes("/control.js?v=20260805-so-type-filter-v2"),
+  controlHtml.includes("/control.js?v=20260825-so-reattempt-current-item-v1"),
   "Control reconciliation client cache bust is missing."
 );
 includesAll(sidebar, [

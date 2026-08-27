@@ -3095,7 +3095,7 @@ function kilometres(metres) {
 }
 
 /**
- * Schema-v2 PO and reverse-VRMA pricing. Exact vendor-pair money is independent
+ * Schema-v2/v3 PO and reverse-VRMA pricing. Exact vendor-pair money is independent
  * of the routing provider; distance is mandatory only for a fallback or a
  * staff-selected endpoint-override comparison.
  *

@@ -601,11 +601,16 @@ test("P4 browser: dump sites and item-owned pricing use only the charging fields
   ]));
   expect(creates[0].body.graph.distanceBands).toHaveLength(3);
   expect(creates[0].body.graph.mbbsChargingPolicy).toEqual(expect.objectContaining({
-    schemaVersion: 2,
+    schemaVersion: 3,
+    currency: "CAD",
     directPickupUnitAmountMinor: 12345,
     poVrmaAdditionalStopUnitAmountMinor: 4567,
     soChargeBasis: "per_order_group_as_one",
     toDirectPickupChargeBasis: "fixed_unit_once",
+    toReplenishmentChargeBasis: "full_route_once",
+    toReplenishmentMultiDropBasis: "longest_origin_drop_plus_each_distinct_drop_after_first",
+    toReplenishmentAdditionalDropUnitAmountMinor: 10000,
+    poChargeBasis: "shared_leg_equal_split",
     poVrmaBaseChargeBasis: "vendor_yard_pair_then_distance_band",
     vrmaDirectionBasis: "same_pair_reverse",
     poVrmaAdditionalStopBasis: "each_distinct_stop_after_base_pair",

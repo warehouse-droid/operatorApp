@@ -79,7 +79,29 @@ async function findSnapshotTarget(targetRef, planDate = "") {
     dateClause = "AND p.plan_date = $2::date";
   }
   const result = await query(
-    `SELECT p.id, p.plan_date::text AS plan_date, snapshot.orders
+    `SELECT p.id, p.plan_date::text AS plan_date, snapshot.orders,
+            EXISTS (
+              SELECT 1
+                FROM jsonb_array_elements(COALESCE(snapshot.trucks, '[]'::jsonb)) truck(value)
+                CROSS JOIN LATERAL jsonb_array_elements(COALESCE(truck.value -> 'loads', '[]'::jsonb)) load(value)
+                CROSS JOIN LATERAL jsonb_array_elements(COALESCE(load.value -> 'stops', '[]'::jsonb)) stop(value)
+               WHERE lower(btrim(COALESCE(
+                 stop.value ->> 'orderId',
+                 stop.value ->> 'order_id',
+                 stop.value ->> 'orderRef',
+                 stop.value ->> 'tranid',
+                 stop.value ->> 'orderNumber',
+                 ''
+               ))) = lower(btrim($1))
+                  OR EXISTS (
+                    SELECT 1
+                      FROM jsonb_array_elements_text(
+                        CASE WHEN jsonb_typeof(stop.value -> 'orderRefs') = 'array'
+                          THEN stop.value -> 'orderRefs' ELSE '[]'::jsonb END
+                      ) ref(value)
+                     WHERE lower(btrim(ref.value)) = lower(btrim($1))
+                  )
+            ) AS planned
        FROM dispatch_plans p
        JOIN dispatch_plan_snapshots snapshot ON snapshot.plan_id = p.id
       WHERE p.status <> 'cancelled'
@@ -97,7 +119,8 @@ async function findSnapshotTarget(targetRef, planDate = "") {
   return order ? {
     order,
     planId: result.rows[0].id,
-    planDate: dateOnly(result.rows[0].plan_date)
+    planDate: dateOnly(result.rows[0].plan_date),
+    planned: result.rows[0].planned === true
   } : null;
 }
 
@@ -306,7 +329,7 @@ export async function resolveDispatchSalesTarget({ dispatchTargetRef = "", planD
     target: {
       ref,
       kind,
-      planId: snapshot?.planId || null,
+      planId: snapshot?.planned ? snapshot.planId : null,
       planDate: snapshot?.planDate || dateOnly(planDate),
       memberRefs,
       customer: exactCanonical?.customer || order.customer || "",

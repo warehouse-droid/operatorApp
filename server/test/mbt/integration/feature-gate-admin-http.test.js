@@ -25,6 +25,22 @@ const EXPECTED_FLAGS = Object.freeze([
   "operator_customer_pickup_photo_required",
   "sales_stock_request_over_availability",
   "special_stock_request_workflow",
+  "operator_netsuite_customer_pickup_if_3445",
+  "operator_netsuite_receiving_ir_3445",
+  "operator_netsuite_delivery_prep_if_3445",
+  "operator_netsuite_customer_pickup_if_2967",
+  "operator_netsuite_receiving_ir_2967",
+  "operator_netsuite_delivery_prep_if_2967",
+  "operator_netsuite_customer_pickup_if_12441",
+  "operator_netsuite_receiving_ir_12441",
+  "operator_netsuite_delivery_prep_if_12441",
+  "operator_netsuite_customer_pickup_if_150",
+  "operator_netsuite_receiving_ir_150",
+  "operator_netsuite_delivery_prep_if_150",
+  "dispatch_netsuite_sales_order_if_3445",
+  "dispatch_netsuite_sales_order_if_2967",
+  "dispatch_netsuite_sales_order_if_12441",
+  "dispatch_netsuite_sales_order_if_150",
   "mbt_enabled",
   "mbt_master_data",
   "mbt_asset_management",
@@ -117,6 +133,17 @@ test("P3-F29 Admin gate inventory is private, complete, and keeps live integrati
   assert.equal(gate(allowed.payload, "driver_offline_mode").environmentAllowed, true);
   assert.equal(gate(allowed.payload, "operator_customer_pickup_photo_required").environmentAllowed, true);
   assert.equal(gate(allowed.payload, "special_stock_request_workflow").environmentAllowed, true);
+  assert.equal(gate(allowed.payload, "operator_netsuite_delivery_prep_if_12441").configured, false);
+  assert.equal(gate(allowed.payload, "operator_netsuite_delivery_prep_if_12441").environmentAllowed, false);
+  assert.equal(gate(allowed.payload, "operator_netsuite_delivery_prep_if_12441").effective, false);
+  assert.equal(gate(allowed.payload, "operator_netsuite_delivery_prep_if_12441").locationId, 15);
+  assert.equal(gate(allowed.payload, "operator_netsuite_delivery_prep_if_12441").yardCode, "12441");
+  assert.equal(gate(allowed.payload, "operator_netsuite_delivery_prep_if_12441").operatorFunction, "delivery_prep");
+  assert.equal(gate(allowed.payload, "operator_netsuite_delivery_prep_if_12441").transactionType, "IF");
+  assert.equal(gate(allowed.payload, "dispatch_netsuite_sales_order_if_12441").configured, false);
+  assert.equal(gate(allowed.payload, "dispatch_netsuite_sales_order_if_12441").environmentAllowed, false);
+  assert.equal(gate(allowed.payload, "dispatch_netsuite_sales_order_if_12441").gateGroup, "dispatch_sales_order_fulfillment");
+  assert.equal(gate(allowed.payload, "dispatch_netsuite_sales_order_if_12441").transactionType, "IF");
   assert.equal(gate(allowed.payload, "mbt_enabled").environmentAllowed, true);
   assert.equal(gate(allowed.payload, "mbt_master_data").environmentAllowed, false);
   assert.equal(gate(allowed.payload, "mbt_customer_sync").locked, true);

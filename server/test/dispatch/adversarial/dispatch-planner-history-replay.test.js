@@ -129,6 +129,24 @@ test("DPO-14 causal replay compares after every cross-system event and keeps evi
   assert.equal(first.causalDigest, second.causalDigest, "Identical evidence must produce an identical replay digest.");
 });
 
+test("DPO-14 replay derives truthful Toronto-local labels for a custom exclusive window", () => {
+  const report = buildDispatchHistoricalReplayReport({
+    window: {
+      from: "2026-08-11T04:00:00.000Z",
+      to: "2026-08-25T04:00:00.000Z",
+      timezone: "America/Toronto",
+      localDates: ["2026-08-05", "2026-08-18"]
+    }
+  });
+
+  assert.deepEqual(report.window, {
+    from: "2026-08-11T04:00:00.000Z",
+    to: "2026-08-25T04:00:00.000Z",
+    timezone: "America/Toronto",
+    localDates: ["2026-08-11", "2026-08-24"]
+  });
+});
+
 test("DPO-14 sparse historical shapes remain private, deterministic, and visibly incomplete", () => {
   const sanitized = sanitizeDispatchReplayPlan({
     planId: "SPARSE-PLAN",

@@ -13,9 +13,40 @@ const FRONTEND_TESTS = Object.freeze([
 ]);
 const DATABASE_TESTS = Object.freeze([
   "test/mbt/integration/scm-schedule-status-concurrency.test.js",
-  "test/mbt/integration/scm-schedule-status-http.test.js"
+  "test/mbt/integration/scm-schedule-status-http.test.js",
+  "test/dispatch/integration/scm-po-split-editing.test.js"
 ]);
 const MUTANTS = Object.freeze([
+  {
+    name: "PO Schedule ignores canonical Driver completion",
+    target: "src/dispatch-repository.js",
+    from: "     AND dispatch_completion.dispatch_completion_status = 'completed'",
+    to: "     AND dispatch_completion.dispatch_completion_status = 'disabled-by-mutant'"
+  },
+  {
+    name: "PO Schedule completion contaminates sibling split references",
+    target: "src/dispatch-repository.js",
+    from: "     AND lower(btrim(dispatch_completion.order_ref)) = lower(btrim(b.order_ref))",
+    to: "     AND true"
+  },
+  {
+    name: "PO Schedule drops non-Driver completion projection",
+    target: "src/dispatch-repository.js",
+    from: "        WHEN dispatch_completion.completion_event_id IS NOT NULL\n          THEN 'Completed'",
+    to: "        WHEN false\n          THEN 'Completed'"
+  },
+  {
+    name: "PO Schedule lets a reconciliation review override Driver completion",
+    target: "src/dispatch-repository.js",
+    from: "        WHEN dispatch_completion.completion_evidence_type = 'driver_job'\n          THEN 'Completed'",
+    to: "        WHEN false\n          THEN 'Completed'"
+  },
+  {
+    name: "reconciliation enrichment lets review override Driver completion",
+    target: "src/scm-reconciliation-repository.js",
+    from: "    const driverCompleted = text(row.dispatchCompletionEvidenceType).toLowerCase() === \"driver_job\";",
+    to: "    const driverCompleted = false;"
+  },
   {
     name: "active split ref no longer fills a blank packing slip",
     target: "src/dispatch-repository.js",
@@ -31,8 +62,8 @@ const MUTANTS = Object.freeze([
   {
     name: "successful saves keep the old revision token",
     target: "src/dispatch-repository.js",
-    from: "       updated_at = GREATEST(clock_timestamp(), scm_transport_schedule.updated_at + interval '1 microsecond')",
-    to: "       updated_at = scm_transport_schedule.updated_at"
+    from: "       notes = EXCLUDED.notes,\n       updated_by = EXCLUDED.updated_by,\n       updated_at = GREATEST(clock_timestamp(), scm_transport_schedule.updated_at + interval '1 microsecond')",
+    to: "       notes = EXCLUDED.notes,\n       updated_by = EXCLUDED.updated_by,\n       updated_at = scm_transport_schedule.updated_at"
   },
   {
     name: "split identity overrides a genuinely entered packing slip",
@@ -43,7 +74,7 @@ const MUTANTS = Object.freeze([
   {
     name: "HTTP mutations stop requiring a loaded schedule revision",
     target: "src/server.js",
-    occurrences: 2,
+    occurrences: 3,
     from: "expectedUpdatedAt: requiredScmScheduleRevision(req.body || {})",
     to: "expectedUpdatedAt: undefined"
   },

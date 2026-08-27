@@ -45,6 +45,37 @@ function stableJson(value) {
   return JSON.stringify(stableValue(value));
 }
 
+function replayLocalDate(value, timeZone) {
+  const parts = new Intl.DateTimeFormat("en-CA", {
+    timeZone,
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit"
+  }).formatToParts(value);
+  const values = Object.fromEntries(parts.map((part) => [part.type, part.value]));
+  return `${values.year}-${values.month}-${values.day}`;
+}
+
+function normalizeReplayWindow(window = {}) {
+  if (!window || typeof window !== "object") {return {};}
+  const fromTime = Date.parse(window.from);
+  const toTime = Date.parse(window.to);
+  if (!Number.isFinite(fromTime) || !Number.isFinite(toTime) || toTime <= fromTime) {return window;}
+  const timezone = text(window.timezone) || "America/Toronto";
+  try {
+    return {
+      ...window,
+      timezone,
+      localDates: [
+        replayLocalDate(new Date(fromTime), timezone),
+        replayLocalDate(new Date(toTime - 1), timezone)
+      ]
+    };
+  } catch {
+    return window;
+  }
+}
+
 function sanitizeOrder(order = {}, salt) {
   const ref = identity(order);
   const childDetails = (Array.isArray(order.childOrderDetails) ? order.childOrderDetails : [])
@@ -361,7 +392,7 @@ export function buildDispatchHistoricalReplayReport({ events = [], window = {}, 
   return {
     schemaVersion: 1,
     generatedAt: new Date().toISOString(),
-    window,
+    window: normalizeReplayWindow(window),
     privacy: {
       identifiers: "sha256-pseudonymized",
       names: "excluded",

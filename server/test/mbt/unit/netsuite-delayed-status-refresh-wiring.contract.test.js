@@ -9,6 +9,7 @@ test("DSR-W1: webhook uses durable enqueue and no in-memory delayed status map",
   assert.doesNotMatch(serverSource, /function scheduleTransactionStatusRefresh/);
   assert.match(serverSource, /await enqueueDelayedStatusRefresh\(\{[\s\S]*?orderType: "sales_order"/);
   assert.match(serverSource, /await enqueueDelayedStatusRefresh\(\{[\s\S]*?orderType: "purchase_order"/);
+  assert.match(serverSource, /await enqueueDelayedStatusRefresh\(\{[\s\S]*?orderType: "transfer_order"/);
 });
 
 test("DSR-W2: server starts the durable worker without global pending-order polling", () => {

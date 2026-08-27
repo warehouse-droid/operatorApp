@@ -139,6 +139,22 @@ async function installPickupApi(page, policySequence) {
       state.configRequests += 1;
       return fulfillJson(route, policySequence[index]);
     }
+    if (pathname === "/api/operator/netsuite-posting-policy") {
+      return fulfillJson(route, {
+        schemaVersion: "operator-netsuite-posting-policy-v1",
+        supported: true,
+        gateKey: "operator_netsuite_customer_pickup_if_3445",
+        functionKey: "customer_pickup",
+        transactionType: "IF",
+        locationId: 1,
+        yardCode: "3445",
+        present: true,
+        configured: false,
+        environmentAllowed: false,
+        effective: false,
+        revision: 1
+      });
+    }
     if (pathname === "/api/operator/photo-upload-token") {
       state.uploadTokenRequests += 1;
       return fulfillJson(route, { error: "Zero-photo flow must not request an upload token." }, 500);

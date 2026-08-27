@@ -192,9 +192,13 @@ export function isNetSuiteOrderClosed(order = {}) {
   if (text(order.status ?? order.statusCode).toUpperCase() === "H") return true;
   return [
     "CLOSED",
+    "REJECTED",
     "SALES ORDER:CLOSED",
+    "SALES ORDER:REJECTED",
     "PURCHASE ORDER:CLOSED",
-    "TRANSFER ORDER:CLOSED"
+    "PURCHASE ORDER:REJECTED",
+    "TRANSFER ORDER:CLOSED",
+    "TRANSFER ORDER:REJECTED"
   ].includes(normalizedStatusLabel(
     order.statusText
       ?? order.status_text
@@ -213,9 +217,13 @@ export function exactNetSuiteClosedSql(alias) {
          '\\s+', ' ', 'g'
        )) IN (
          'CLOSED',
+         'REJECTED',
          'SALES ORDER:CLOSED',
+         'SALES ORDER:REJECTED',
          'PURCHASE ORDER:CLOSED',
-         'TRANSFER ORDER:CLOSED'
+         'PURCHASE ORDER:REJECTED',
+         'TRANSFER ORDER:CLOSED',
+         'TRANSFER ORDER:REJECTED'
        )
   )`;
 }

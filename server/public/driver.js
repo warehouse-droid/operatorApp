@@ -2042,6 +2042,14 @@ function locationCheckApproved() {
     || locationOverrideApproval.isAccepted(currentJob);
 }
 
+function offlineLocationCheckResult() {
+  return {
+    status: "not_checked_offline",
+    locationStatus: "not_checked_offline",
+    message: t("driver.locationOfflineMessage", "Location was not checked while offline.")
+  };
+}
+
 function locationCheckBlocksConfirmation() {
   return !locationCheckApproved();
 }
@@ -2159,11 +2167,7 @@ async function checkCurrentJobLocation({ render = true } = {}) {
   // location verification are separate concerns, and a temporarily unavailable
   // ledger is not permission to leak an online-only request.
   if (!navigator.onLine || browserOfflineObserved || usingSavedOfflineBinRoute) {
-    locationCheck = {
-      status: "not_checked_offline",
-      locationStatus: "not_checked_offline",
-      message: t("driver.locationOfflineMessage", "Location was not checked while offline.")
-    };
+    locationCheck = offlineLocationCheckResult();
     if (render) renderJob();
     return locationCheck;
   }
@@ -2285,17 +2289,17 @@ function driverRoutePresenceSnapshot() {
 }
 
 function driverRouteChangeLocalReadiness(routeRequest = {}) {
-  if (!navigator.onLine) return { ready: false, message: "Reconnect before confirming route readiness." };
-  if (document.visibilityState !== "visible") return { ready: false, message: "Keep this Driver screen open and visible." };
+  if (!navigator.onLine) return { ready: false, message: t("driver.routeReadinessReconnect", "Reconnect before confirming route readiness.") };
+  if (document.visibilityState !== "visible") return { ready: false, message: t("driver.routeReadinessKeepVisible", "Keep this Driver screen open and visible.") };
   const snapshot = driverRoutePresenceSnapshot();
   if (!offlineManifest?.manifestId || routeRequest.manifestId !== offlineManifest.manifestId) {
-    return { ready: false, message: "Download the current saved route before confirming." };
+    return { ready: false, message: t("driver.routeReadinessDownload", "Download the current saved route before confirming.") };
   }
   if (snapshot.syncState !== "clean" || snapshot.pendingEventCount || snapshot.pendingPhotoCount) {
-    return { ready: false, message: "Finish synchronizing all events and photos first." };
+    return { ready: false, message: t("driver.routeReadinessSyncFirst", "Finish synchronizing all events and photos first.") };
   }
-  if (snapshot.activeJobId) return { ready: false, message: "Finish the active stop, rest, or photo action first." };
-  return { ready: true, message: "This device is synchronized and idle." };
+  if (snapshot.activeJobId) return { ready: false, message: t("driver.routeReadinessFinishAction", "Finish the active stop, rest, or photo action first.") };
+  return { ready: true, message: t("driver.routeReadinessReady", "This device is synchronized and idle.") };
 }
 
 function driverRoutePushCanBeEnabled() {
@@ -2322,10 +2326,10 @@ function renderDriverRouteChangeStatus() {
       && readyUntil > Date.now();
     return `
       <section class="driver-route-change-request">
-        <p><strong>${escapeHtml(planDateText(routeRequest.planDate))}</strong> · Route update pending</p>
-        <p>No route has changed yet. SCM must re-preview and explicitly apply it after every affected Driver device is ready.</p>
+        <p><strong>${escapeHtml(planDateText(routeRequest.planDate))}</strong> · ${t("driver.routeUpdatePending", "Route update pending")}</p>
+        <p>${t("driver.routeUpdatePendingHelp", "No route has changed yet. SCM must re-preview and explicitly apply it after every affected Driver device is ready.")}</p>
         <p class="driver-route-change-reason">${escapeHtml(alreadyReady
-          ? `Readiness recorded until ${dateTimeText(routeRequest.readyExpiresAt)}. Keep this screen visible while SCM applies.`
+          ? tf("driver.routeReadinessRecordedUntil", "Readiness recorded until {time}. Keep this screen visible while SCM applies.", { time: dateTimeText(routeRequest.readyExpiresAt) })
           : readiness.message)}</p>
         <div class="driver-route-change-actions">
           <button
@@ -2334,18 +2338,18 @@ function renderDriverRouteChangeStatus() {
             data-route-request-id="${escapeHtml(routeRequest.requestId)}"
             ${alreadyReady || !readiness.ready ? "disabled" : ""}
             type="button"
-          >${alreadyReady ? "Ready recorded" : "I am ready for route update"}</button>
-          <button data-action="refresh-driver-route-change" type="button">Refresh status</button>
+          >${alreadyReady ? t("driver.routeReadyRecorded", "Ready recorded") : t("driver.routeReadyAction", "I am ready for route update")}</button>
+          <button data-action="refresh-driver-route-change" type="button">${t("driver.refreshStatus", "Refresh status")}</button>
         </div>
       </section>
     `;
   }).join("");
   routeChangeStatus.innerHTML = `
-    <h2>Route update needs attention</h2>
-    <p>Do not close this Driver screen until SCM confirms the update is applied.</p>
+    <h2>${t("driver.routeUpdateNeedsAttention", "Route update needs attention")}</h2>
+    <p>${t("driver.routeUpdateKeepOpen", "Do not close this Driver screen until SCM confirms the update is applied.")}</p>
     ${requestCards}
     ${driverRoutePushCanBeEnabled() ? `
-      <button data-action="enable-driver-route-alerts" type="button">Enable route alerts</button>
+      <button data-action="enable-driver-route-alerts" type="button">${t("driver.enableRouteAlerts", "Enable route alerts")}</button>
     ` : ""}
   `;
   routeChangeStatus.hidden = false;
@@ -2409,15 +2413,15 @@ async function enableDriverRouteAlerts(button) {
   if (!("serviceWorker" in navigator) || !("PushManager" in window) || typeof Notification === "undefined") {
     driverRoutePushAvailable = false;
     renderDriverRouteChangeStatus();
-    return showToast("Route alerts are not supported on this device.");
+    return showToast(t("driver.routeAlertsUnsupported", "Route alerts are not supported on this device."));
   }
   button.disabled = true;
   try {
     const settings = await request("/api/driver/route-push/public-key");
     driverRoutePushAvailable = settings.enabled === true;
-    if (!settings.enabled || !settings.publicKey) throw new Error("Route alerts are not configured on the server.");
+    if (!settings.enabled || !settings.publicKey) throw new Error(t("driver.routeAlertsNotConfigured", "Route alerts are not configured on the server."));
     const permission = await Notification.requestPermission();
-    if (permission !== "granted") throw new Error("Route alert permission was not granted.");
+    if (permission !== "granted") throw new Error(t("driver.routeAlertPermissionDenied", "Route alert permission was not granted."));
     const registration = driverServiceWorkerRegistration || await navigator.serviceWorker.ready;
     const subscription = await registration.pushManager.getSubscription()
       || await registration.pushManager.subscribe({
@@ -2428,7 +2432,7 @@ async function enableDriverRouteAlerts(button) {
       method: "POST",
       body: JSON.stringify({ subscription: subscription.toJSON() })
     });
-    showToast("Route alerts enabled.");
+    showToast(t("driver.routeAlertsEnabled", "Route alerts enabled."));
   } catch (error) {
     showToast(error.message);
   } finally {
@@ -2441,18 +2445,18 @@ async function acknowledgeDriverRouteChangeRequest(requestId, button) {
   const readiness = driverRouteChangeLocalReadiness(routeRequest || {});
   if (!routeRequest || !readiness.ready) {
     renderDriverRouteChangeStatus();
-    return showToast(readiness.message || "This route request is no longer available.");
+    return showToast(readiness.message || t("driver.routeRequestUnavailable", "This route request is no longer available."));
   }
   button.disabled = true;
   try {
     if (!(await sendDriverRoutePresence({ visible: true }))) {
-      throw new Error("The server could not verify this visible Driver screen.");
+      throw new Error(t("driver.routeVisibleScreenUnverified", "The server could not verify this visible Driver screen."));
     }
     const result = await request(
       `/api/driver/route-change-requests/${encodeURIComponent(requestId)}/ready`,
       { method: "POST", body: "{}" }
     );
-    showToast(result.message || "Readiness recorded. SCM must re-preview and apply the change.");
+    showToast(localizeMessage(result.message || t("driver.routeReadinessRecorded", "Readiness recorded. SCM must re-preview and apply the change.")));
     await loadDriverRouteChangeRequests();
   } catch (error) {
     showToast(error.message);
@@ -3865,6 +3869,16 @@ async function renderOfflineProjection(manifest = offlineManifest) {
   photoPromptOpen = false;
   locationCheck = null;
   locationOverrideApproval.reconcile(currentJob);
+
+  // A refreshed offline route cannot perform a live GPS check. Restore the
+  // explicit offline approval state so an in-progress stop does not become
+  // permanently disabled merely because the document was reloaded.
+  if (
+    currentJob?.status === "in_progress"
+    && (offlineCachedView || !navigator.onLine || browserOfflineObserved)
+  ) {
+    locationCheck = offlineLocationCheckResult();
+  }
 
   const preStatus = String(dayState?.preDvirStatus || "").toLowerCase();
   const samsaraPending = !dayState?.samsaraOnDutyConfirmed || !dayState?.samsaraPreDvirConfirmed;
@@ -6597,6 +6611,10 @@ window.addEventListener("online", () => {
 window.addEventListener("offline", () => {
   markDriverBrowserOffline();
   stopOnlineRouteRevalidation();
+  if (currentJob?.status === "in_progress" && !photoInteractionActive()) {
+    locationCheck = offlineLocationCheckResult();
+    renderJob();
+  }
   renderOfflineStatus();
   applyDriverActionProtectionGate();
   void refreshOfflineHealth();

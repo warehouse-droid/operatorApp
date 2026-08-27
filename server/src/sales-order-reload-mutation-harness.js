@@ -223,16 +223,16 @@ const mutations = [
     }
   },
   {
-    name: "replace historical freight identity with current NetSuite SKU",
-    from: "sku: line.historicalSku,",
-    to: "sku: line.currentSku,",
+    name: "replace current re-attempt identity with historical freight SKU",
+    from: "sku: line.currentSku,",
+    to: "sku: line.historicalSku,",
     async killed(candidate) {
       const preview = reattemptPreview(candidate);
       const [target] = candidate.buildSalesOrderReattemptTargets({
         preview,
         selections: [{ lineKey: preview.lines[0].lineKey, pieceQty: 1, reason: "Retry" }]
       });
-      assert.equal(target.sku, "HISTORICAL-SKU");
+      assert.equal(target.sku, "CURRENT-SKU");
     }
   },
   {

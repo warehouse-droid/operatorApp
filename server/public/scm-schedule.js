@@ -41,6 +41,7 @@ const SCM_SCHEDULE_COLUMNS = [
   { key: "dropoff", label: "Drop off Point", width: 150, minWidth: 110 },
   { key: "brand", label: "Brand", width: 145, minWidth: 100 },
   { key: "content", label: "Content", width: 520, minWidth: 220 },
+  { key: "remark", label: "Remark", width: 260, minWidth: 180 },
   { key: "order", label: "Order Number", width: 170, minWidth: 130 },
   { key: "weight", label: "Weight LBs", width: 104, minWidth: 90 },
   { key: "packing", label: "Packing Slip Number", width: 168, minWidth: 130 },
@@ -773,6 +774,19 @@ function selectHtml({ rowId, field, value, options, disabled = false }) {
   `;
 }
 
+function poDestinationOverrideSelectHtml({ rowId, row, options, disabled = false }) {
+  const savedOverride = String(row.scheduleDropoffPoint || "").trim();
+  const effectiveDestination = String(row.dropoffPoint || "").trim() || "--";
+  return `<div class="scm-po-destination-override">
+    <select data-row="${scmScheduleEscape(rowId)}" data-field="dropoffPoint" ${disabled ? "disabled" : ""}>
+      <option value="" ${savedOverride ? "" : "selected"}>Use NetSuite lines (${scmScheduleEscape(effectiveDestination)})</option>
+      ${savedOverride && !options.includes(savedOverride) ? `<option value="${scmScheduleEscape(savedOverride)}" selected>${scmScheduleEscape(savedOverride)}</option>` : ""}
+      ${options.map((option) => `<option value="${scmScheduleEscape(option)}" ${savedOverride === option ? "selected" : ""}>${scmScheduleEscape(option)}</option>`).join("")}
+    </select>
+    <small>${savedOverride ? "Overrides all PO lines" : "NetSuite line routing"}</small>
+  </div>`;
+}
+
 function inputHtml({ rowId, field, value, type = "text", placeholder = "", readonly = false }) {
   return `<input data-row="${scmScheduleEscape(rowId)}" data-field="${scmScheduleEscape(field)}" type="${type}" value="${scmScheduleEscape(value || "")}" placeholder="${scmScheduleEscape(placeholder)}" autocomplete="off" ${readonly ? "readonly" : ""} />`;
 }
@@ -937,6 +951,8 @@ function scmScheduleRowMatchesCurrentFilters(row = {}) {
       row.dropoffPoint,
       row.brand,
       row.content,
+      row.remark,
+      row.netSuiteMemo,
       row.packingSlipRef,
       row.groupRef
     ].join(" ").toLowerCase();
@@ -1024,6 +1040,19 @@ function scmScheduleReconciliationLines(row = {}) {
   return Array.isArray(lines) ? lines : [];
 }
 
+function scmScheduleIsSyntheticPoGroup(row = {}) {
+  if (String(row.orderKind || "").trim().toUpperCase() !== "PO") return false;
+  const reconciliation = scmScheduleReconciliation(row);
+  if (reconciliation.groupedRollup === true) return true;
+  return String(row.orderRef || "").trim().toUpperCase().startsWith("PGOB-");
+}
+
+function scmScheduleReconciliationGroupMembers(row = {}) {
+  const reconciliation = scmScheduleReconciliation(row);
+  const members = reconciliation.groupMembers ?? reconciliation.group_members;
+  return Array.isArray(members) ? members : [];
+}
+
 function scmScheduleAllocationTargets(row = {}) {
   const reconciliation = scmScheduleReconciliation(row);
   const explicit = reconciliation.allocationTargets
@@ -1043,6 +1072,7 @@ function scmScheduleAllocationTargets(row = {}) {
 }
 
 function scmSchedulePoSplitAdjustmentOrderRef(row = {}) {
+  if (scmScheduleIsSyntheticPoGroup(row)) return "";
   return String(row.sourceRef || row.sourceOrderRef || row.orderRef || "").trim();
 }
 
@@ -1097,6 +1127,7 @@ function scmSchedulePoSplitCandidatePreviewHtml(candidate = null) {
 
 function scmSchedulePoSplitLineAdjustmentHtml(row = {}) {
   const rowId = scheduleRowId(row);
+  if (scmScheduleIsSyntheticPoGroup(row)) return "";
   if (!scmScheduleCanResolveReconciliation()
     || String(row.orderKind || "").toUpperCase() !== "PO") return "";
   const loading = scmSchedulePoSplitLineOptionsLoading.has(rowId);
@@ -1196,6 +1227,7 @@ function scmSchedulePoSplitLineAdjustmentHtml(row = {}) {
 }
 
 async function loadScmSchedulePoSplitLineOptions(rowId, row = {}, { force = false } = {}) {
+  if (scmScheduleIsSyntheticPoGroup(row)) return;
   if (!scmScheduleCanResolveReconciliation()
     || String(row.orderKind || "").toUpperCase() !== "PO"
     || scmSchedulePoSplitLineOptionsLoading.has(rowId)
@@ -1331,6 +1363,35 @@ function scmScheduleReconciliationLinesHtml(row = {}) {
   </div>`;
 }
 
+function scmScheduleReconciliationGroupMembersHtml(row = {}) {
+  const members = scmScheduleReconciliationGroupMembers(row);
+  if (!members.length) {
+    return `<div class="scm-reconcile-group-notice">
+      This is a synthetic Purchase Order group. Review and resolve its member rows individually.
+    </div>`;
+  }
+  return `<div class="scm-reconcile-group-notice">
+      Group totals are calculated from the member orders below. Receipt lines, allocations, and admin resolutions remain on each real member order.
+    </div>
+    <div class="scm-reconcile-lines scm-reconcile-group-members" role="table" aria-label="Purchase Order group members">
+      <div class="scm-reconcile-line header" role="row">
+        <span>Member</span><span>Source PO</span><span>Ordered</span><span>Received</span><span>Remaining</span><span>Status</span>
+      </div>
+      ${members.map((member) => {
+        const status = member.applicationStatus || "Queued";
+        const review = String(member.reconciliationStatus || "").toLowerCase() === "review";
+        return `<div class="scm-reconcile-line" role="row">
+          <span><strong>${scmScheduleEscape(member.orderRef || "--")}</strong></span>
+          <span>${scmScheduleEscape(member.sourceOrderRef || "--")}</span>
+          <span>${scmScheduleEscape(formatScheduleNumber(member.ordered || 0))}</span>
+          <span>${scmScheduleEscape(formatScheduleNumber(member.received || 0))}</span>
+          <span>${scmScheduleEscape(formatScheduleNumber(member.remaining || 0))}</span>
+          <span class="${review ? "inferred" : ""}">${scmScheduleEscape(review ? "Reconcile Review" : status)}</span>
+        </div>`;
+      }).join("")}
+    </div>`;
+}
+
 function scmScheduleAllocationEditorHtml(row = {}) {
   const targets = scmScheduleAllocationTargets(row);
   if (!targets.length || !scmScheduleCanResolveReconciliation()) return "";
@@ -1362,6 +1423,7 @@ function scmScheduleAllocationEditorHtml(row = {}) {
 }
 
 function scmScheduleReconciliationActionsHtml(row = {}) {
+  if (scmScheduleIsSyntheticPoGroup(row)) return "";
   const rowId = scheduleRowId(row);
   const status = scmScheduleReconciliationStatus(row);
   const busy = scmScheduleReconciliationBusyRef === rowId;
@@ -1405,6 +1467,13 @@ function scmScheduleReconciliationDetailHtml(row = {}) {
     || !scmScheduleExpandedReconciliationRows.has(rowId)
     || !["PO", "TO"].includes(String(row.orderKind || "").toUpperCase())) return "";
   const reason = scmScheduleReconciliationReason(row);
+  const groupedRollup = scmScheduleIsSyntheticPoGroup(row);
+  const detailBody = groupedRollup
+    ? scmScheduleReconciliationGroupMembersHtml(row)
+    : `${scmScheduleReconciliationLinesHtml(row)}
+      ${scmScheduleAllocationEditorHtml(row)}
+      ${scmSchedulePoSplitLineAdjustmentHtml(row)}
+      ${scmScheduleReconciliationActionsHtml(row)}`;
   return `<section class="scm-reconciliation-detail ${scmScheduleNeedsReconciliationReview(row) ? "review" : ""}" data-reconciliation-detail="${scmScheduleEscape(rowId)}">
     <div class="scm-reconcile-detail-head">
       <div><strong>${scmScheduleEscape(row.displayRef || row.orderRef || rowId)} reconciliation</strong>
@@ -1413,10 +1482,7 @@ function scmScheduleReconciliationDetailHtml(row = {}) {
       <button data-action="toggle-reconciliation-row" data-row="${scmScheduleEscape(rowId)}" type="button">Close</button>
     </div>
     ${scmScheduleReconciliationSummaryHtml(row)}
-    ${scmScheduleReconciliationLinesHtml(row)}
-    ${scmScheduleAllocationEditorHtml(row)}
-    ${scmSchedulePoSplitLineAdjustmentHtml(row)}
-    ${scmScheduleReconciliationActionsHtml(row)}
+    ${detailBody}
   </section>`;
 }
 
@@ -1428,6 +1494,27 @@ function contentCell(row = {}) {
       ${totalPalletQty > 0 ? `<strong class="scm-content-total">Total ${scmScheduleEscape(formatScheduleNumber(totalPalletQty))} PLT</strong>` : ""}
     </div>
   `;
+}
+
+function remarkCell(row = {}, { rowId = "", editable = false } = {}) {
+  const local = String(row.remarkOverride || "");
+  const netSuiteMemo = String(row.netSuiteMemo || "");
+  if (!editable) {
+    return `<div class="scm-remark-layout">
+      ${readOnlyCell(row.remark)}
+      ${row.remarkSource === "netsuite" ? `<small>NetSuite Memo</small>` : row.remarkSource === "local" ? `<small>Local override</small>` : ""}
+    </div>`;
+  }
+  const placeholder = row.orderKind === "TO" && netSuiteMemo
+    ? netSuiteMemo
+    : "Add remark";
+  return `<div class="scm-remark-layout">
+    <textarea data-row="${scmScheduleEscape(rowId)}" data-field="remarkOverride" rows="2" maxlength="2000"
+      placeholder="${scmScheduleEscape(placeholder)}">${scmScheduleEscape(local)}</textarea>
+    ${row.orderKind === "TO" && netSuiteMemo
+      ? `<small title="${scmScheduleEscape(netSuiteMemo)}">${local ? "Local override · clear to use NetSuite Memo" : "NetSuite Memo"}</small>`
+      : `<small>${local ? "Local remark" : "Blank"}</small>`}
+  </div>`;
 }
 
 function orderNumberCell(row = {}) {
@@ -1466,7 +1553,9 @@ function scmScheduleTableRowHtml(row, { pickupOptions = [], dropoffOptions = OWN
     const scmWorkingView = editable;
     const reconciliationReview = scmScheduleNeedsReconciliationReview(row);
     const displayStatus = scmScheduleEffectiveStatus(row);
-    const rowEditable = editable && !reconciliationReview;
+    const splitOperationalLock = row.isScmSplit === true && row.scmSplitLocked === true;
+    const rowEditable = editable && !reconciliationReview && !splitOperationalLock;
+    const remarkEditable = editable && !reconciliationReview;
     const statusEditable = rowEditable && !SCM_SYSTEM_STATUSES.has(displayStatus);
     const selectable = rowEditable && row.orderKind === "PO" && !row.groupRef && !String(row.orderRef || "").toUpperCase().startsWith("PGOB-");
     const displayType = scmScheduleDisplayType(row, { scmWorkingView });
@@ -1488,8 +1577,10 @@ function scmScheduleTableRowHtml(row, { pickupOptions = [], dropoffOptions = OWN
     const typeFormatting = scmScheduleCellFormatting("type", row.isSpecialOrder ? "Sp.O" : row.orderKind);
     const dropoffFormatting = scmScheduleCellFormatting("dropoffPoint", row.dropoffPoint);
     const statusFormatting = scmScheduleCellFormatting("status", displayStatus);
+    const rowPickupOptions = Array.isArray(row.pickupOptions) ? row.pickupOptions : pickupOptions;
+    const rowDropoffOptions = Array.isArray(row.dropoffOptions) ? row.dropoffOptions : dropoffOptions;
     return `
-      <div class="scm-sheet-row status-${scmScheduleEscape(displayStatus.toLowerCase().replaceAll(" ", "-"))} ${isGroupOrder ? "group-order" : ""} ${reconciliationReview ? "reconcile-review" : ""}${rowFormatting.className}" data-schedule-row="${scmScheduleEscape(rowId)}" data-row-ref="${scmScheduleEscape(row.orderRef)}"${rowFormatting.style}>
+      <div class="scm-sheet-row status-${scmScheduleEscape(displayStatus.toLowerCase().replaceAll(" ", "-"))} ${isGroupOrder ? "group-order" : ""} ${reconciliationReview ? "reconcile-review" : ""} ${splitOperationalLock ? "split-operational-lock" : ""}${rowFormatting.className}" data-schedule-row="${scmScheduleEscape(rowId)}" data-row-ref="${scmScheduleEscape(row.orderRef)}"${rowFormatting.style}>
         ${editable ? `<div class="scm-sheet-cell scm-select-cell">${selectable ? `<input data-action="select-row" data-row="${scmScheduleEscape(rowId)}" type="checkbox" ${scmScheduleSelectedRows.has(rowId) ? "checked" : ""} aria-label="Select ${scmScheduleEscape(row.orderRef)}" />` : ""}</div>` : ""}
         <div class="scm-sheet-cell readonly">${readOnlyCell(scheduleDateText(row))}</div>
         <div class="scm-sheet-cell readonly scm-type-cell${typeFormatting.className}"${typeFormatting.style}>
@@ -1502,10 +1593,15 @@ function scmScheduleTableRowHtml(row, { pickupOptions = [], dropoffOptions = OWN
           </label>` : ""}
         </div>
         <div class="scm-sheet-cell">${rowEditable ? selectHtml({ rowId, field: "method", value: row.method, options: SCM_METHODS }) : readOnlyCell(row.method)}</div>
-        <div class="scm-sheet-cell">${rowEditable ? selectHtml({ rowId, field: "pickupPoint", value: row.pickupPoint, options: pickupOptions }) : readOnlyCell(row.pickupPoint)}</div>
-        <div class="scm-sheet-cell scm-dropoff-cell${dropoffFormatting.className}"${dropoffFormatting.style}>${rowEditable ? selectHtml({ rowId, field: "dropoffPoint", value: row.dropoffPoint, options: dropoffOptions }) : readOnlyCell(row.dropoffPoint)}</div>
+        <div class="scm-sheet-cell">${rowEditable ? selectHtml({ rowId, field: "pickupPoint", value: row.pickupPoint, options: rowPickupOptions }) : readOnlyCell(row.pickupPoint)}</div>
+        <div class="scm-sheet-cell scm-dropoff-cell${dropoffFormatting.className}"${dropoffFormatting.style}>${rowEditable
+          ? row.orderKind === "PO"
+            ? poDestinationOverrideSelectHtml({ rowId, row, options: rowDropoffOptions })
+            : selectHtml({ rowId, field: "dropoffPoint", value: row.dropoffPoint, options: rowDropoffOptions })
+          : readOnlyCell(row.dropoffPoint)}</div>
         <div class="scm-sheet-cell readonly">${readOnlyCell(row.orderKind === "TO" ? "Transfer Order" : row.brand || row.party)}</div>
         <div class="scm-sheet-cell readonly content-cell">${contentCell(row)}</div>
+        <div class="scm-sheet-cell ${remarkEditable ? "" : "readonly"} remark-cell">${remarkCell(row, { rowId, editable: remarkEditable })}</div>
         <div class="scm-sheet-cell readonly">
           ${orderNumberCell(row)}
         </div>
@@ -1524,7 +1620,10 @@ function scmScheduleTableRowHtml(row, { pickupOptions = [], dropoffOptions = OWN
           ${editable
             ? reconciliationReview
               ? `<span class="scm-review-blocked" title="Resolve reconciliation review before editing this order.">Review blocked</span>`
-              : `<button data-action="save-row" data-row="${scmScheduleEscape(rowId)}" data-ref="${scmScheduleEscape(row.orderRef)}" data-kind="${scmScheduleEscape(row.orderKind)}" type="button" ${scmScheduleSavingRef === rowId ? "disabled" : ""}>${scmScheduleSavingRef === rowId ? "Saving" : "Save"}</button>`
+              : splitOperationalLock
+                ? `<span class="scm-review-blocked" title="Unplan or unlink this split PO before changing operational fields.">Unplan first</span>
+                  <button data-action="save-remark-row" data-row="${scmScheduleEscape(rowId)}" data-ref="${scmScheduleEscape(row.orderRef)}" type="button" ${scmScheduleSavingRef === rowId ? "disabled" : ""}>${scmScheduleSavingRef === rowId ? "Saving" : "Save remark"}</button>`
+                : `<button data-action="save-row" data-row="${scmScheduleEscape(rowId)}" data-ref="${scmScheduleEscape(row.orderRef)}" data-kind="${scmScheduleEscape(row.orderKind)}" type="button" ${scmScheduleSavingRef === rowId ? "disabled" : ""}>${scmScheduleSavingRef === rowId ? "Saving" : "Save"}</button>`
             : `<span class="view-only-chip">View</span>`}
           ${canCompleteVrma
             ? `<button class="primary scm-complete-vrma" data-action="complete-vrma"
@@ -1676,10 +1775,7 @@ function replaceScmScheduleRow(oldRowId, refreshedRow) {
   migrateScmScheduleRowState(oldRowId, newRowId);
   oldElement.insertAdjacentHTML(
     "beforebegin",
-    scmScheduleTableRowHtml(refreshedRow, {
-      pickupOptions: scheduleOptionList("pickupPoint"),
-      dropoffOptions: scheduleOptionList("dropoffPoint")
-    })
+    scmScheduleTableRowHtml(refreshedRow)
   );
   oldDetail?.remove();
   oldElement.remove();
@@ -1709,7 +1805,8 @@ function collectRowPatch(rowId) {
   const row = scmScheduleRows.find((item) => scheduleRowId(item) === rowId);
   const patch = {
     orderKind: row?.orderKind || "PO",
-    expectedUpdatedAt: row?.updatedAt || null
+    expectedUpdatedAt: row?.updatedAt || null,
+    expectedSplitRevision: row?.isScmSplit ? row?.scmSplitRevision : undefined
   };
   scmScheduleApp.querySelectorAll(`[data-row="${CSS.escape(rowId)}"][data-field]`).forEach((field) => {
     patch[field.dataset.field] = field.type === "checkbox" ? field.checked : field.value;
@@ -1717,9 +1814,21 @@ function collectRowPatch(rowId) {
   return patch;
 }
 
+function collectRowRemarkPatch(rowId) {
+  const row = scmScheduleRows.find((item) => scheduleRowId(item) === rowId);
+  const field = scmScheduleApp.querySelector(
+    `[data-row="${CSS.escape(rowId)}"][data-field="remarkOverride"]`
+  );
+  return {
+    orderKind: row?.orderKind || "PO",
+    expectedUpdatedAt: row?.updatedAt || null,
+    remarkOverride: field?.value || ""
+  };
+}
+
 function setScmScheduleRowControlsDisabled(rowId, disabled) {
   scmScheduleApp.querySelectorAll(
-    `[data-row="${CSS.escape(rowId)}"][data-field], button[data-action="save-row"][data-row="${CSS.escape(rowId)}"]`
+    `[data-row="${CSS.escape(rowId)}"][data-field], button[data-action="save-row"][data-row="${CSS.escape(rowId)}"], button[data-action="save-remark-row"][data-row="${CSS.escape(rowId)}"]`
   ).forEach((field) => { field.disabled = disabled; });
 }
 
@@ -2253,6 +2362,38 @@ scmScheduleApp.addEventListener("click", async (event) => {
       return;
     }
     window.open(`/scm/POsplit?order=${encodeURIComponent(orderRef)}`, "_blank", "noopener");
+  }
+
+  if (action === "save-remark-row") {
+    const rowId = target.dataset.row || "";
+    const orderRef = target.dataset.ref || "";
+    if (!orderRef || scmScheduleSavingRef) return;
+    const patch = collectRowRemarkPatch(rowId);
+    scmScheduleSavingRef = rowId;
+    updateScmScheduleNotice("");
+    setScmScheduleRowControlsDisabled(rowId, true);
+    target.textContent = "Saving";
+    try {
+      const payload = await scmScheduleApi(`/api/scm/schedule/${encodeURIComponent(orderRef)}/remark`, {
+        method: "PUT",
+        body: JSON.stringify({ ...patch, audit: { sessionId: sessionStorage.getItem("mbbs.dispatch.sessionId") || "" } })
+      });
+      scmScheduleSavingRef = "";
+      const replacement = replaceScmScheduleRow(rowId, payload?.row);
+      if (!replacement.replaced) {
+        updateScmScheduleNotice(`Saved remark for ${orderRef}; refreshing the schedule.`);
+        await loadScmSchedule();
+      } else {
+        updateScmScheduleNotice(`Saved remark for ${payload.row?.orderRef || orderRef}.`);
+      }
+    } catch (error) {
+      updateScmScheduleNotice(`Remark save failed: ${error.message}`);
+    } finally {
+      scmScheduleSavingRef = "";
+      setScmScheduleRowControlsDisabled(rowId, false);
+      if (target.isConnected) target.textContent = "Save remark";
+    }
+    return;
   }
 
   if (action === "save-row") {

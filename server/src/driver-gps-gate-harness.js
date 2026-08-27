@@ -9,7 +9,7 @@ const offlineServiceSource = fs.readFileSync(
 );
 
 assert(
-  /function locationCheckApproved\(\)[\s\S]{0,220}locationCheck\?\.status === "ok"[\s\S]{0,120}locationCheck\?\.status === "not_checked_offline"[\s\S]{0,120}locationOverrideAccepted/.test(driverSource),
+  /function locationCheckApproved\(\)[\s\S]{0,220}locationCheck\?\.status === "ok"[\s\S]{0,120}locationCheck\?\.status === "not_checked_offline"[\s\S]{0,120}locationOverrideApproval\.isAccepted\(currentJob\)/.test(driverSource),
   "GPS approval must require an OK result, a genuine offline marker, or an explicit override."
 );
 assert(
@@ -35,13 +35,13 @@ const overrideHandler = driverSource.slice(overrideHandlerStart, overrideHandler
 assert(overrideHandlerStart >= 0 && overrideHandlerEnd > overrideHandlerStart, "Location override handler must exist.");
 assert(
   overrideHandler.indexOf("ensureAuthoritativeJobBeforeAction(overrideJob)")
-    < overrideHandler.indexOf("locationOverrideAccepted = true"),
+    < overrideHandler.indexOf("locationOverrideApproval.accept(currentJob)"),
   "Location override must revalidate the live job before accepting the explicit bypass."
 );
 assert(
-  overrideHandler.indexOf("locationOverrideAccepted = true")
-    < overrideHandler.indexOf('photoPromptOpen = true'),
-  "The explicit location override must be accepted before the photo screen opens."
+  overrideHandler.indexOf("locationOverrideApproval.accept(currentJob)")
+    < overrideHandler.lastIndexOf("return renderJob()"),
+  "The stop-bound location override must be accepted before the confirmation UI is rerendered."
 );
 assert(
   driverSource.includes('data-action="override-location"')

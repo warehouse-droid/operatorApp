@@ -243,10 +243,15 @@ export function createDelayedStatusRefreshWorker(dependencies = {}) {
   }
 
   async function fetchRemoteState(job) {
+    const netSuiteTypes = {
+      sales_order: "SalesOrd",
+      purchase_order: "PurchOrd",
+      transfer_order: "TrnfrOrd"
+    };
     const remoteStatus = await fetchTransactionStatus({
       orderType: job.orderType,
       netsuiteOrderId: job.netsuiteOrderId,
-      netsuiteType: job.orderType === "sales_order" ? "SalesOrd" : "PurchOrd"
+      netsuiteType: netSuiteTypes[job.orderType]
     });
     let lines = [];
     let allocationRefresh = null;
@@ -269,6 +274,7 @@ export function createDelayedStatusRefreshWorker(dependencies = {}) {
     const updated = await applyStatus({
       orderType: job.orderType,
       netsuiteOrderId: job.netsuiteOrderId,
+      tranid: String(remoteStatus.tranid || job.tranid || ""),
       status: statusCode(remoteStatus),
       statusText: statusText(remoteStatus)
     });

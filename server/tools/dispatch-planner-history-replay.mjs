@@ -268,7 +268,7 @@ try {
 
   report = buildDispatchHistoricalReplayReport({
     events,
-    window: { from, to, timezone: "America/Toronto", localDates: ["2026-08-05", "2026-08-18"] },
+    window: { from, to, timezone: "America/Toronto" },
     sourceCounts
   });
   report.historicalActionCounts = {

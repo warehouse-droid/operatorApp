@@ -15,10 +15,13 @@ import {
   getScmVrmaOptions,
   listDispatchOrders,
   listScmSchedule,
+  removeScmVrmaOrder,
   searchScmVrmaItems,
   syncScmScheduleFromDispatchPlan,
-  updateScmScheduleEntry
+  updateScmScheduleEntry,
+  upsertLocalCoOrder
 } from "./dispatch-repository.js";
+import { receiveLocalCoOrder } from "./receiving-repository.js";
 
 const suffix = String(Date.now());
 const ref = `VRMA-HARNESS-${suffix}`;
@@ -29,6 +32,7 @@ const convertedItemId = Number(`98${suffix.slice(-11)}`);
 const genericItemId = convertedItemId + 1;
 const convertedSku = `VRMA-CONV-${suffix}`;
 const genericSku = `VRMA-GENERIC-${suffix}`;
+const harnessOperatorId = `vrma-harness-operator-${suffix}`;
 
 function assert(condition, message, details = {}) {
   if (condition) return;
@@ -73,9 +77,119 @@ function payload(overrides = {}) {
   };
 }
 
+async function verifyVrmaTransitCo() {
+  const transitRef = `${ref}-CO`;
+  await createScmVrmaOrder(payload({
+    vrmaRef: transitRef,
+    notes: "VRMA CO end-to-end rollback fixture"
+  }));
+  const sourceOrder = (await listDispatchOrders({ search: transitRef }))
+    .find((order) => order.id === transitRef);
+  assert(sourceOrder?.sourceTable === "scm_vrma_orders",
+    "The VRMA CO fixture must be available in Dispatch Planning.",
+    { sourceOrder });
+
+  const coRef = `CO-${transitRef}`;
+  const createdCo = await upsertLocalCoOrder({
+    sourceOrderRef: transitRef,
+    fromYard: "3445",
+    toYard: "12441",
+    order: {
+      ...sourceOrder,
+      sourceOrderType: "VRMA",
+      transitCo: { id: coRef, fromYard: "3445", toYard: "12441", sourceOrderId: transitRef }
+    },
+    requestedBy: "scm-vrma-co-harness"
+  });
+  const projected = (await listDispatchOrders({ search: transitRef }))
+    .find((order) => order.id === transitRef);
+  assert(projected?.transitCo?.id === coRef
+      && projected?.transitCo?.fromYard === "3445"
+      && projected?.transitCo?.toYard === "12441"
+      && projected?.pickupLocations?.[0] === "12441",
+    "The VRMA Dispatch feed must retain the active CO and use its transit depot pickup.",
+    { projected });
+
+  await assertRejects(
+    () => createScmVrmaOrder(payload({
+      vrmaRef: transitRef,
+      notes: "This stale edit must not replace the CO source snapshot."
+    })),
+    new RegExp(`Cancel ${coRef}`, "i"),
+    "A VRMA with an active CO must stay immutable until the CO is cancelled."
+  );
+  const vrmaBeforeReceipt = await getScmVrmaOrder(transitRef);
+  await assertRejects(
+    () => removeScmVrmaOrder({
+      vrmaRef: transitRef,
+      note: "Attempt to orphan active CO",
+      actor: "scm-vrma-co-harness",
+      expectedUpdatedAt: vrmaBeforeReceipt.concurrencyUpdatedAt,
+      confirm: true
+    }),
+    new RegExp(`Cancel ${coRef}`, "i"),
+    "Removing a VRMA must not orphan its active CO."
+  );
+
+  const sourceBeforeReceipt = await listVrmaDeliveryPrepOrders({ locationId: 1, status: "active" });
+  assert(!sourceBeforeReceipt.some((order) => order.tranid === transitRef),
+    "VRMA delivery prep must stay hidden at the source yard until its CO is received.");
+
+  await query("UPDATE local_co_orders SET status = 'planned' WHERE co_ref = $1", [coRef]);
+  await query(
+    `UPDATE local_co_order_lines
+        SET received_pallet_qty = pallet_qty,
+            received_layer_qty = layer_qty,
+            received_section_qty = section_qty,
+            received_piece_qty = piece_qty,
+            received_sales_qty = quantity,
+            confirmed_at = now(),
+            confirmed_by = $2
+      WHERE co_id = $1`,
+    [createdCo.id, harnessOperatorId]
+  );
+  const receipt = await receiveLocalCoOrder(coRef, harnessOperatorId, {
+    photoDataUrls: [
+      "data:image/jpeg;base64,AA==",
+      "data:image/jpeg;base64,AQ=="
+    ]
+  });
+  const receivedHeader = await getScmVrmaOrder(transitRef);
+  const packedAtDepot = await listVrmaDeliveryPrepOrders({ locationId: 15, status: "packed" });
+  const packedLines = await query(
+    `SELECT packed_pallet_qty, packed_layer_qty, packed_section_qty, packed_piece_qty,
+            packed_sales_qty, confirmed
+       FROM scm_vrma_order_lines
+      WHERE vrma_order_id = $1
+      ORDER BY id`,
+    [receivedHeader.id]
+  );
+  const syntheticTransfer = await query(
+    `SELECT COUNT(*)::int AS count
+       FROM transfer_orders
+      WHERE netsuite_id = $1
+         OR tranid = $2`,
+    [Number(createdCo.delivery_order_id), coRef]
+  );
+  assert(receipt.receiptStatus === "local_co_received"
+      && receivedHeader.pickupLocation === "12441"
+      && receivedHeader.operatorStatus === "packed"
+      && packedAtDepot.some((order) => order.tranid === transitRef)
+      && packedLines.rows.length === 2
+      && packedLines.rows.every((line) => line.confirmed === true)
+      && Number(syntheticTransfer.rows[0]?.count) === 0,
+    "Receiving a VRMA CO must make the original VRMA packed at the depot without creating a synthetic TO.",
+    { receipt, receivedHeader, packedAtDepot, packedLines: packedLines.rows, syntheticTransfer: syntheticTransfer.rows[0] });
+}
+
 const rollback = await beginRollbackContext();
 try {
   await rollback.run(async () => {
+    await query(
+      `INSERT INTO operators (id, username, display_name, password_hash, password_salt, role, active)
+       VALUES ($1, $2, 'VRMA Harness Operator', 'test-only-hash', 'test-only-salt', 'operator', true)`,
+      [harnessOperatorId, harnessOperatorId]
+    );
     await query(
       `INSERT INTO dispatch_local_vendors (name, active, updated_by)
        VALUES ($1, true, 'scm-vrma-harness')`,
@@ -136,6 +250,8 @@ try {
       /Use Delete VRMA/i,
       "VRMA cancellation must use the guarded, audited removal workflow."
     );
+
+    await verifyVrmaTransitCo();
 
     const created = await createScmVrmaOrder(payload());
     assert(created.vrma.pickup_location === "3445"

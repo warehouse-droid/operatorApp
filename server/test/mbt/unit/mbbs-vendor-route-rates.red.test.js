@@ -12,6 +12,7 @@ import {
 } from "../../../src/mbt/mbbs-vendor-route-rates.js";
 import {
   DEFAULT_MBBS_RATE_CARD_POLICY,
+  DEFAULT_MBBS_RATE_CARD_POLICY_V3,
   normalizeMbbsRateCardPolicy
 } from "../../../src/mbt/mbbs-rate-card-policy.js";
 
@@ -243,6 +244,43 @@ test("M3-M4 flat or distance base is charged once, extra stops are versioned, an
     }),
     (error) => error?.code === "MBT_BILLING_AMOUNT_INVALID"
   );
+});
+
+test("v4 schema-v3 prices BWS Uxbridge to 12441 at exactly CAD 200 and retains fail-closed policy validation", () => {
+  assert.deepEqual(calculateMbbsPurchaseRouteAmount({
+    pricingMethod: "vendor_yard_flat",
+    vendorRouteAmountMinor: 20_000,
+    distanceBandAmountMinor: 0,
+    routeStopCount: 2,
+    mbbsChargingPolicy: DEFAULT_MBBS_RATE_CARD_POLICY_V3
+  }), {
+    pricingMethod: "vendor_yard_flat",
+    pricingSource: "vendor_yard_flat",
+    baseAmountMinor: 20_000,
+    distanceBandAmountMinor: 0,
+    vendorRouteAmountMinor: 20_000,
+    additionalStopCount: 0,
+    additionalStopUnitAmountMinor: 10_000,
+    additionalStopFeeMinor: 0,
+    calculatedAmountMinor: 20_000
+  });
+
+  for (const mbbsChargingPolicy of [
+    { ...DEFAULT_MBBS_RATE_CARD_POLICY_V3, schemaVersion: 1 },
+    { ...DEFAULT_MBBS_RATE_CARD_POLICY_V3, schemaVersion: 4 },
+    { ...DEFAULT_MBBS_RATE_CARD_POLICY_V3, currency: "USD" }
+  ]) {
+    assert.throws(
+      () => calculateMbbsPurchaseRouteAmount({
+        pricingMethod: "vendor_yard_flat",
+        vendorRouteAmountMinor: 20_000,
+        distanceBandAmountMinor: 0,
+        routeStopCount: 2,
+        mbbsChargingPolicy
+      }),
+      (error) => error?.code === "MBT_RATE_CARD_POLICY_INVALID"
+    );
+  }
 });
 
 test("M7-M9 latest supplied table resolves 54 exact rows with canonical 150 labels and 17 distance fallbacks", () => {

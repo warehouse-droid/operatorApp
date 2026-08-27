@@ -7,6 +7,8 @@ const seed = Number(String(Date.now()).slice(-7));
 const parentId = 9970000000 + seed;
 const parentRef = `HARNESS-SO-${seed}`;
 const splitRef = `${parentRef}-S1`;
+const purchaseOrderId = parentId + 1;
+const purchaseOrderRef = `HARNESS-PO-${seed}`;
 const lineId = 880000 + (seed % 100000);
 const planDate = "2098-12-29";
 
@@ -89,6 +91,73 @@ try {
     );
     assert.equal(created.rowCount, 1, "first materialization should create one synthetic line");
     const syntheticLineId = created.rows[0].id;
+
+    await query(
+      `INSERT INTO purchase_orders (
+         netsuite_id, tranid, trandate, vendor, status, status_text,
+         netsuite_active, synced_at
+       ) VALUES (
+         $1, $2, current_date, 'Split Harness Vendor', 'pendingReceipt',
+         'Purchase Order : Pending Receipt', true, now()
+       )`,
+      [purchaseOrderId, purchaseOrderRef]
+    );
+    const purchaseLine = await query(
+      `INSERT INTO purchase_order_lines (
+         purchase_order_id, line_id, item_id, item_name, sku,
+         item_type, item_type_text, quantity, unit, piece_qty, to_pcs,
+         netsuite_active, synced_at
+       ) VALUES (
+         $1, $2, 990001, 'Split Harness Item', $3,
+         'InvtPart', 'Inventory Item', 100, 'PC', 100, 1,
+         true, now()
+       )
+       RETURNING id`,
+      [purchaseOrderId, lineId, `HARNESS-SKU-${seed}`]
+    );
+    const allocation = await query(
+      `INSERT INTO dispatch_so_po_allocations (
+         sales_order_id, sales_order_ref, sales_line_id,
+         po_order_id, po_order_ref, po_line_id,
+         item_id, item_name, sku, allocated_piece_qty, allocated_sales_qty,
+         created_by, dispatch_target_ref, dispatch_target_kind,
+         dispatch_target_line_key
+       ) VALUES (
+         (SELECT netsuite_id FROM sales_orders WHERE tranid = $1), $1, $2,
+         $3, $4, $5,
+         990001, 'Split Harness Item', $6, 10, 10,
+         'split-materialization-harness', $1, 'split', $7
+       )
+       RETURNING id`,
+      [
+        splitRef,
+        syntheticLineId,
+        purchaseOrderId,
+        purchaseOrderRef,
+        purchaseLine.rows[0].id,
+        `HARNESS-SKU-${seed}`,
+        `${splitRef}::${splitRef}::${lineId}`
+      ]
+    );
+
+    await applyConfirmedDispatchPlanToDelivery(splitPlan({
+      lineRowId: Number(parentLine.rows[0].id) + 99999,
+      pieces: 12
+    }));
+
+    const preservedAllocation = await query(
+      `SELECT allocation.id, allocation.sales_line_id, line.piece_qty
+         FROM dispatch_so_po_allocations allocation
+         JOIN sales_order_lines line ON line.id = allocation.sales_line_id
+        WHERE allocation.id = $1`,
+      [allocation.rows[0].id]
+    );
+    assert.equal(preservedAllocation.rowCount, 1,
+      "repeat split materialization must not cascade-delete an active PO allocation");
+    assert.equal(preservedAllocation.rows[0].sales_line_id, syntheticLineId,
+      "the selected split line identity must remain stable while preserving its PO allocation");
+    assert.equal(Number(preservedAllocation.rows[0].piece_qty), 12,
+      "the preserved split line must still receive its refreshed planned quantity");
 
     await query(
       `UPDATE sales_order_lines

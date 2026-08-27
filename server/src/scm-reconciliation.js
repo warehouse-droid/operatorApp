@@ -1,5 +1,7 @@
 const EPSILON = 0.000001;
 
+export { applySplitTargetEvidencePrecedence } from "./scm-split-status-evidence-precedence.js";
+
 export function reconciliationQuantity(value) {
   if (value === null || value === undefined || value === "") return 0;
   const parsed = Number(String(value).replaceAll(",", ""));
@@ -23,10 +25,13 @@ export function classifyNetSuiteLifecycle(statusText = "", statusCode = "") {
   const partiallyReceived = /\bpartially received\b/.test(text);
   const partiallyFulfilled = /\bpartially fulfilled\b/.test(text);
   const exactLeaf = (pattern) => new RegExp(`(?:^|:\\s*)${pattern}$`).test(text);
+  const rejected = exactLeaf("rejected");
   return {
     text,
     cancelled: /\b(cancelled|canceled|voided|void)\b/.test(text),
-    closed: String(statusCode || "").trim().toUpperCase() === "H"
+    rejected,
+    closed: rejected
+      || String(statusCode || "").trim().toUpperCase() === "H"
       || exactLeaf("closed")
       || exactLeaf("fully billed"),
     partiallyReceived,

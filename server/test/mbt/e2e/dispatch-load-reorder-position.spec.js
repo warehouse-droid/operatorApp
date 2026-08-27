@@ -279,7 +279,12 @@ test("DLR-05 browser: Load 1/2/3 arbitrary drag persists positional start contex
   await page.goto("/dispatch/planning");
   const enterEditMode = page.getByRole("button", { name: "Enter Edit Mode" });
   await expect(enterEditMode).toBeEnabled();
-  await enterEditMode.click();
+  // The planning canvas intentionally retains its desktop working width on
+  // narrow viewports, so the route notice can overlap this toolbar control.
+  // Exercise the button's accessible activation path instead of bypassing
+  // actionability with a forced pointer click.
+  await enterEditMode.focus();
+  await page.keyboard.press("Enter");
   await expect(page.getByRole("button", { name: "Exit Edit" })).toBeVisible();
   await expectPositionMetadata(page, ["load-a", "load-b", "load-c"]);
 

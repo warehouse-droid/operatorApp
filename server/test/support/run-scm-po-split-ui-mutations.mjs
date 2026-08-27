@@ -13,8 +13,8 @@ const MUTANTS = Object.freeze([
   {
     name: "split Update action returns",
     target: CLIENT,
-    from: '${isSplit ? `<button class="danger-button" data-action="unsplit-order" type="button">${t("dispatch.unsplit", "Unsplit")}</button>` : ""}',
-    to: '${isSplit ? `<button data-action="update-split" type="button">Update</button><button class="danger-button" data-action="unsplit-order" type="button">${t("dispatch.unsplit", "Unsplit")}</button>` : ""}'
+    from: '${isSplit ? `<button class="danger-button" data-action="unsplit-order" type="button" ${splitLocked ? "disabled" : ""}>${t("dispatch.unsplit", "Unsplit")}</button>` : ""}',
+    to: '${isSplit ? `<button data-action="update-split" type="button">Update</button><button class="danger-button" data-action="unsplit-order" type="button" ${splitLocked ? "disabled" : ""}>${t("dispatch.unsplit", "Unsplit")}</button>` : ""}'
   },
   {
     name: "live destination selection is ignored",
@@ -37,9 +37,21 @@ const MUTANTS = Object.freeze([
     to: "scmDestinationLocationId = selected || fallback;"
   },
   {
+    name: "selected initial status is discarded",
+    target: CLIENT,
+    from: "const status = scmLiveSplitInitialStatus();",
+    to: 'const status = "Queued";'
+  },
+  {
+    name: "entered split remark is discarded",
+    target: CLIENT,
+    from: "const remarkOverride = scmLiveSplitRemark();",
+    to: 'const remarkOverride = "";'
+  },
+  {
     name: "the fixed client cache key is removed",
     target: PAGE,
-    from: "dispatch-scm.js?v=20260813-po-split-status-v3",
+    from: "dispatch-scm.js?v=20260827-split-create-metadata-v1",
     to: "dispatch-scm.js?v=stale-po-split-client"
   }
 ]);

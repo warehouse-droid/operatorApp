@@ -1169,6 +1169,27 @@ export async function updatePurchaseOrderNetSuiteStatus(orderId, patch = {}) {
   return updated;
 }
 
+export async function updateTransferOrderNetSuiteStatus(orderId, patch = {}) {
+  const result = await query(
+    `UPDATE transfer_orders
+        SET status = COALESCE($2, status),
+            status_text = COALESCE($3, status_text),
+            status_updated_at = CASE
+              WHEN status IS DISTINCT FROM COALESCE($2, status)
+                OR status_text IS DISTINCT FROM COALESCE($3, status_text)
+              THEN now()
+              ELSE status_updated_at
+            END,
+            synced_at = now()
+      WHERE netsuite_id = $1
+      RETURNING netsuite_id, tranid, status, status_text`,
+    [orderId, patch.status || null, patch.statusText || patch.status_text || null]
+  );
+  const updated = result.rows[0] || null;
+  if (updated) await enqueueNetSuiteMirrorOrderEvent("transfer_order", orderId, { changeType: "status" });
+  return updated;
+}
+
 export async function upsertPurchaseOrders(orders = []) {
   for (const order of orders || []) {
     const dispatch = await enrichPurchaseOrderDispatch(order);

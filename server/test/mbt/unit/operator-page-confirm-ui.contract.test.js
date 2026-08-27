@@ -58,11 +58,11 @@ test("page confirmation has a duplicate-click guard and ships in a fresh Operato
   assert.match(operator, /pageConfirming = true;/u);
   assert.match(operator, /pageConfirming = false;/u);
   assert.match(css, /@media \(max-width: 700px\)[\s\S]*?\.receiving-grid\s*\{[\s\S]*?grid-template-columns:\s*minmax\(0, 1fr\)/u);
-  assert.match(html, /operator\.css\?v=20260815-page-confirm-v1/u);
-  assert.match(html, /operator\.js\?v=20260815-operator-page-confirm-v1/u);
-  assert.match(serviceWorker, /mbbs-yard-operator-v141-page-confirm-v1/u);
-  assert.match(serviceWorker, /operator\.css\?v=20260815-page-confirm-v1/u);
-  assert.match(serviceWorker, /operator\.js\?v=20260815-operator-page-confirm-v1/u);
+  assert.match(html, /operator\.css\?v=20260825-fulfillment-layout-v1/u);
+  assert.match(html, /operator\.js\?v=20260825-fulfillment-layout-v1/u);
+  assert.match(serviceWorker, /mbbs-yard-operator-v142-fulfillment-layout-v1/u);
+  assert.match(serviceWorker, /operator\.css\?v=20260825-fulfillment-layout-v1/u);
+  assert.match(serviceWorker, /operator\.js\?v=20260825-fulfillment-layout-v1/u);
 });
 
 test("server exposes separate Customer Pickup and PO-only batch endpoints", async () => {

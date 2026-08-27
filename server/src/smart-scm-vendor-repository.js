@@ -1132,6 +1132,26 @@ async function smartScmAlternativeEvidence(rows = [], destinationLocationId) {
                  )
             ), 0) AS blanket_excluded,
             COALESCE((
+              SELECT SUM(GREATEST(
+                       COALESCE(child_line.quantity, 0)
+                       - COALESCE(child_line.netsuite_received_baseline_qty, child_line.netsuite_received_qty, 0),
+                       0
+                     ))
+                FROM dispatch_scm_po_split_lines ledger
+                JOIN dispatch_scm_po_splits split ON split.id = ledger.split_id
+                JOIN purchase_order_lines child_line ON child_line.id = ledger.split_line_id
+                JOIN purchase_orders child_po ON child_po.netsuite_id = split.split_po_id
+                JOIN purchase_orders source_po ON source_po.netsuite_id = split.source_po_id
+               WHERE ledger.item_id = requested.item_id
+                 AND COALESCE(child_line.location_id, child_po.destination_location_id) = $2
+                 AND split.status = 'active'
+                 AND source_po.is_blanket_po = true
+                 AND child_po.netsuite_active = true
+                 AND child_line.netsuite_active = true
+                 AND NOT COALESCE(child_line.netsuite_closed, false)
+                 AND lower(COALESCE(child_po.status_text, '')) !~ '(closed|cancelled|fully received)'
+            ), 0) AS released_split_inbound,
+            COALESCE((
               SELECT SUM(CASE
                 WHEN allocation.status = 'reserved' THEN allocation.reserved_sales_qty
                 WHEN allocation.status = 'held' THEN allocation.held_sales_qty
@@ -1169,6 +1189,7 @@ async function smartScmAlternativeEvidence(rows = [], destinationLocationId) {
       quantityAvailableSales: quantityAvailable,
       authoritativeOnOrderSales: row.quantity_on_order,
       blanketExcludedSales: adjustment.blanket_excluded,
+      releasedSplitInboundSales: adjustment.released_split_inbound,
       reservedBlanketSales: adjustment.blanket_reserved,
       pendingTransferReservationSales: reservation.inbound_quantity,
       quantityBackorderedSales: row.quantity_backordered,
@@ -1200,6 +1221,7 @@ async function smartScmAlternativeEvidence(rows = [], destinationLocationId) {
       quantityOnOrder,
       quantityOnOrderAuthoritative: position.authoritativeOnOrderSales,
       quantityBlanketExcluded: position.blanketExcludedSales,
+      quantityReleasedSplitInbound: position.releasedSplitInboundSales,
       quantityBlanketReservedInbound: position.reservedBlanketSales,
       quantityPendingTransferReservation: position.pendingTransferReservationSales,
       quantityBackordered,

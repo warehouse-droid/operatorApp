@@ -517,9 +517,10 @@ export function normalizeLocalRateCardGraph(value, { sourceKind } = {}) {
   if (isMbbsCrossChargeGraph(graph)) {
     normalized.mbbsChargingPolicy = normalizeMbbsRateCardPolicy(graph.mbbsChargingPolicy);
     normalized.mbbsVendorRouteRates = normalizeMbbsVendorRouteRates(vendorRouteRates);
-    if (normalized.mbbsVendorRouteRates.length > 0
-        && normalized.mbbsChargingPolicy.schemaVersion !== 2) {
-      return invalidInput("MBBS vendor-route rates require charging policy schema version 2.");
+    const supportedVendorRoutePolicy = normalized.mbbsChargingPolicy.schemaVersion === 2
+      || normalized.mbbsChargingPolicy.schemaVersion === 3;
+    if (normalized.mbbsVendorRouteRates.length > 0 && !supportedVendorRoutePolicy) {
+      return invalidInput("MBBS vendor-route rates require charging policy schema version 2 or 3.");
     }
   } else if (graph.mbbsChargingPolicy !== null && graph.mbbsChargingPolicy !== undefined) {
     return invalidInput("An MBBS charging policy requires DELIVERY_CHARGE_MBBS cross-charge bands.");

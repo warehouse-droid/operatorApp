@@ -18,9 +18,13 @@ test("DSR-P1: identity validation accepts only supported order families and posi
     }),
     { orderType: "purchase_order", netsuiteOrderId: 959552, tranid: "POB03745" }
   );
-  assert.throws(
-    () => normalizeDelayedStatusRefreshIdentity({ orderType: "transfer_order", netsuiteOrderId: 1 }),
-    /order type/i
+  assert.deepEqual(
+    normalizeDelayedStatusRefreshIdentity({
+      orderType: " transfer_order ",
+      netsuiteOrderId: "1",
+      tranid: " TOB00960 "
+    }),
+    { orderType: "transfer_order", netsuiteOrderId: 1, tranid: "TOB00960" }
   );
   assert.throws(
     () => normalizeDelayedStatusRefreshIdentity({ orderType: "purchase_order", netsuiteOrderId: 0 }),

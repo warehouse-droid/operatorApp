@@ -205,7 +205,7 @@ async function insertPoSplitSearchWindowFixtures() {
      SELECT
        $1::bigint - fixture_number,
        CASE
-         WHEN fixture_number = 0 THEN $2
+         WHEN fixture_number = $7::int THEN $2
          ELSE 'ZZZ-' || $3 || '-' || lpad(fixture_number::text, 4, '0')
        END,
        DATE '2026-07-30', $4, $5, 'pendingReceipt', 'Purchase Order : Pending Receipt',

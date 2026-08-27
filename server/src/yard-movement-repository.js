@@ -1,6 +1,10 @@
 import { hasActiveTransaction, query } from "./db.js";
 import { salesStoreLocationIdSql } from "./sales-store.js";
-import { getActiveReloadCycleForOrder, listSalesOrderLoadAttempts } from "./sales-order-reload-repository.js";
+import {
+  getActiveReloadCycleForOrder,
+  getLatestSalesOrderReattemptForOrder,
+  listSalesOrderLoadAttempts
+} from "./sales-order-reload-repository.js";
 
 const VALID_DIRECTIONS = new Set(["inbound", "outbound"]);
 const VALID_ORDER_TYPES = new Set(["sales_order", "transfer_order", "purchase_order", "co_order", "vrma_order", "custom_order"]);
@@ -862,13 +866,22 @@ export async function getYardMovementDetail({
   const isSalesOrderLoad = normalizedDirection === "outbound"
     && normalizedType === "sales_order"
     && /^\d+$/.test(String(orderId || ""));
-  const [lineResult, photoResult, driverResult, driverPhotoResult, allLoadAttempts, activeReloadCycle] = await runIndependentReads([
+  const [
+    lineResult,
+    photoResult,
+    driverResult,
+    driverPhotoResult,
+    allLoadAttempts,
+    activeReloadCycle,
+    latestReattemptCycle
+  ] = await runIndependentReads([
     readLines,
     readPhotos,
     readDriverRecords,
     readDriverPhotos,
     () => (isSalesOrderLoad ? listSalesOrderLoadAttempts(Number(orderId)) : Promise.resolve([])),
-    () => (isSalesOrderLoad ? getActiveReloadCycleForOrder(Number(orderId)) : Promise.resolve(null))
+    () => (isSalesOrderLoad ? getActiveReloadCycleForOrder(Number(orderId)) : Promise.resolve(null)),
+    () => (isSalesOrderLoad ? getLatestSalesOrderReattemptForOrder(Number(orderId)) : Promise.resolve(null))
   ]);
   const loadAttempts = attemptsWithinDates(allLoadAttempts, fromDate, toDate);
   return {
@@ -879,7 +892,8 @@ export async function getYardMovementDetail({
     driverEvents: driverResult.rows,
     driverPhotos: driverPhotoResult.rows,
     loadAttempts,
-    activeReloadCycle
+    activeReloadCycle,
+    latestReattemptCycle
   };
 }
 

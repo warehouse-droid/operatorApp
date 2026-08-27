@@ -211,6 +211,20 @@ function poLineById(id) {
   return (dependencyState.poOptions?.poLines || []).find((line) => String(line.id) === String(id));
 }
 
+function dependencyPoEntryRefs(entry) {
+  return [...new Set([
+    entry?.poRef,
+    entry?.originalPoRef,
+    ...(Array.isArray(entry?.poAliases) ? entry.poAliases : [])
+  ].map((value) => String(value || "").trim()).filter(Boolean))];
+}
+
+function dependencyPoRefMatches(entry, poRef) {
+  const normalizedRef = String(poRef || "").trim().toLowerCase();
+  return Boolean(normalizedRef)
+    && dependencyPoEntryRefs(entry).some((ref) => ref.toLowerCase() === normalizedRef);
+}
+
 function renderPoLinkLines() {
   const options = dependencyState.poOptions;
   const salesLines = options?.salesLines || [];
@@ -224,7 +238,8 @@ function renderPoLinkLines() {
         <tbody>${salesLines.map((line) => {
           const candidates = (line.poCandidates || [])
             .map((candidate) => ({ ...candidate, line: poLineById(candidate.poLineId) }))
-            .filter((candidate) => String(candidate.line?.poRef || "").trim().toLowerCase() === poRef);
+            .filter((candidate) => dependencyPoRefMatches(candidate.line, poRef)
+              || dependencyPoRefMatches(candidate, poRef));
           if (!dependencyState.poSelections[line.targetLineKey] && candidates.length === 1) {
             dependencyState.poSelections[line.targetLineKey] = String(candidates[0].poLineId);
           }

@@ -18,6 +18,11 @@ import {
 } from "./transfer-dependency-reservation.js";
 import { transferDependencySourceBackorderDecision } from "./transfer-dependency-source-backorder.js";
 import {
+  ensureTransferDependencyPendingFulfillment,
+  transferDependencyApprovalStatusAfterPrintBlock,
+  transferDependencyCreationOutcome
+} from "./auto-transfer-approval-policy.js";
+import {
   dependencyBlocksDispatchStructureChange,
   dispatchDependencyOrderRefs as dispatchOrderRefs,
   everySalesAssignmentFollowsTransfer
@@ -34,6 +39,11 @@ const YARD_BY_ID = new Map(DEPENDENCY_YARDS.map((yard) => [String(yard.locationI
 const EPSILON = 0.000001;
 
 export { transferDependencySourceBackorderDecision };
+export {
+  ensureTransferDependencyPendingFulfillment,
+  transferDependencyApprovalStatusAfterPrintBlock,
+  transferDependencyCreationOutcome
+};
 
 function number(value) {
   const parsed = Number(String(value ?? 0).replaceAll(",", ""));
@@ -3787,6 +3797,7 @@ export async function confirmTransferDependencyBatch(batchId, {
   operatorId = null,
   proposalId = null,
   createTransferOrder,
+  approveTransferOrder = null,
   hydrateTransferOrder,
   findTransferOrder = null
 } = {}) {
@@ -3817,7 +3828,10 @@ export async function confirmTransferDependencyBatch(batchId, {
   if (proposalId !== null && proposalId !== undefined && !requestedProposal) {
     throw new Error("Transfer proposal not found in this dependency batch.");
   }
-  if (requestedProposal && ["created", "attention"].includes(requestedProposal.creationStatus) && requestedProposal.transferOrderId) {
+  if (requestedProposal
+      && ["created", "attention"].includes(requestedProposal.creationStatus)
+      && requestedProposal.transferOrderId
+      && requestedProposal.approvalStatus === "approved") {
     return {
       batch,
       results: [{ proposalId: requestedProposal.id, status: requestedProposal.creationStatus,
@@ -3827,6 +3841,17 @@ export async function confirmTransferDependencyBatch(batchId, {
   const validation = await validateTransferDependencyBatchForCreation(batch, {
     proposalIds: requestedProposal ? [requestedProposal.id] : null
   });
+  const recoverableProposals = (batch.proposals || []).filter((proposal) => (
+    ["created", "attention"].includes(proposal.creationStatus)
+    && proposal.transferOrderId
+    && proposal.approvalStatus !== "approved"
+    && (!requestedProposal || String(proposal.id) === String(requestedProposal.id))
+  ));
+  validation.pendingProposals = [
+    ...recoverableProposals,
+    ...validation.pendingProposals.filter((proposal) =>
+      !recoverableProposals.some((candidate) => String(candidate.id) === String(proposal.id)))
+  ];
   if (!requestedProposal && validation.uncovered > EPSILON && !batch.allowIncompleteCoverage) {
     throw new Error("The shortage is not fully covered. Enable incomplete coverage before creating Transfer Orders.");
   }
@@ -3838,9 +3863,13 @@ export async function confirmTransferDependencyBatch(batchId, {
   }
   const results = [];
   for (const proposal of validation.pendingProposals) {
-    let createdTransferOrderId = null;
+    let createdTransferOrderId = Number(proposal.transferOrderId) || null;
+    let createdTransferOrderRef = proposal.transferOrderRef || null;
+    let approvalConfirmed = proposal.approvalStatus === "approved";
     try {
-      let created = null;
+      let created = createdTransferOrderId
+        ? { id: createdTransferOrderId, recovered: true }
+        : null;
       if (["creating", "failed"].includes(proposal.creationStatus) && typeof findTransferOrder === "function") {
         created = await findTransferOrder({ proposal, batch });
       }
@@ -3875,43 +3904,86 @@ export async function confirmTransferDependencyBatch(batchId, {
       const transferOrderId = Number(created?.id);
       if (!Number.isInteger(transferOrderId) || transferOrderId <= 0) throw new Error("NetSuite did not return the created Transfer Order ID.");
       createdTransferOrderId = transferOrderId;
-      const transferOrder = await hydrateTransferOrder(transferOrderId, proposal);
-      if (!transferOrder?.id || !transferOrder?.tranid) throw new Error("The created Transfer Order could not be synchronized.");
-      const pendingFulfillment = transferOrder.pendingFulfillment === true;
-      const creationStatus = pendingFulfillment ? "created" : "attention";
-      const statusMessage = pendingFulfillment
-        ? null
-        : `${transferOrder.tranid} was created, but NetSuite status is ${transferOrder.statusText || transferOrder.status || "unknown"} instead of Pending Fulfillment.`;
+      const transferOrder = await ensureTransferDependencyPendingFulfillment({
+        created,
+        proposal,
+        batch,
+        hydrateTransferOrder,
+        approveTransferOrder,
+        rememberTransferOrder: async (identified) => {
+          createdTransferOrderRef = identified.tranid;
+          await query(
+            `UPDATE scm_transfer_dependency_proposals
+                SET creation_status = 'creating', creation_error = NULL,
+                    netsuite_transfer_order_id = $2,
+                    netsuite_transfer_order_ref = $3,
+                    approval_status = 'approving', approval_error = NULL,
+                    updated_at = now()
+              WHERE id = $1`,
+            [proposal.id, identified.id, identified.tranid]
+          );
+        }
+      });
+      const outcome = transferDependencyCreationOutcome(transferOrder);
+      approvalConfirmed = outcome.pendingFulfillment;
       await query(
         `UPDATE scm_transfer_dependency_proposals
             SET creation_status = $4, netsuite_transfer_order_id = $2,
-                netsuite_transfer_order_ref = $3, creation_error = $5, updated_at = now()
+                netsuite_transfer_order_ref = $3, creation_error = $5,
+                approval_status = $6,
+                approval_error = $5,
+                approved_at = CASE WHEN $6 = 'approved' THEN COALESCE(approved_at, now()) ELSE NULL END,
+                approved_by = CASE WHEN $6 = 'approved' THEN COALESCE(approved_by, $7) ELSE NULL END,
+                quantity_verification_status = 'pending',
+                quantity_verification_error = NULL,
+                quantity_verified_at = NULL, quantity_verified_by = NULL,
+                print_job_id = NULL, print_request_status = 'idle',
+                print_request_id = NULL, print_request_started_at = NULL,
+                print_request_error = NULL,
+                updated_at = now()
           WHERE id = $1`,
-        [proposal.id, transferOrder.id, transferOrder.tranid, creationStatus, statusMessage]
+        [proposal.id, transferOrder.id, transferOrder.tranid, outcome.creationStatus,
+          outcome.statusMessage, outcome.approvalStatus, operatorId]
       );
       const dependencyId = await createDependencyFromProposal(proposal, batch, transferOrder, operatorId);
-      if (!pendingFulfillment) {
+      if (!outcome.pendingFulfillment) {
         await query(
           `UPDATE order_dependencies
               SET status = 'attention', attention_reason = $2, updated_by = $3, updated_at = now()
             WHERE id = $1`,
-          [dependencyId, statusMessage, operatorId]
+          [dependencyId, outcome.statusMessage, operatorId]
         );
       }
-      results.push({ proposalId: proposal.id, status: creationStatus, transferOrderId: transferOrder.id,
+      results.push({ proposalId: proposal.id, status: outcome.creationStatus, transferOrderId: transferOrder.id,
         transferOrderRef: transferOrder.tranid, netsuiteStatus: transferOrder.statusText || transferOrder.status,
-        recovered: created?.recovered === true, error: statusMessage });
+        approvalStatus: outcome.approvalStatus, printStatus: outcome.printStatus,
+        recovered: created?.recovered === true, error: outcome.statusMessage });
     } catch (error) {
       if (error.status === 409) throw error;
       await query(
         `UPDATE scm_transfer_dependency_proposals
             SET creation_status = $3, creation_error = $2,
-                netsuite_transfer_order_id = COALESCE(netsuite_transfer_order_id, $4), updated_at = now()
+                netsuite_transfer_order_id = COALESCE(netsuite_transfer_order_id, $4),
+                netsuite_transfer_order_ref = COALESCE(netsuite_transfer_order_ref, $5),
+                approval_status = CASE
+                  WHEN $6::boolean THEN 'approved'
+                  WHEN $4::bigint IS NOT NULL THEN 'failed'
+                  ELSE approval_status
+                END,
+                approval_error = CASE
+                  WHEN $6::boolean THEN NULL
+                  WHEN $4::bigint IS NOT NULL THEN $2
+                  ELSE approval_error
+                END,
+                updated_at = now()
           WHERE id = $1`,
-        [proposal.id, error.message, createdTransferOrderId ? "attention" : "failed", createdTransferOrderId]
+        [proposal.id, error.message, createdTransferOrderId ? "attention" : "failed",
+          createdTransferOrderId, createdTransferOrderRef, approvalConfirmed]
       );
       results.push({ proposalId: proposal.id, status: createdTransferOrderId ? "attention" : "failed",
-        transferOrderId: createdTransferOrderId, error: error.message });
+        transferOrderId: createdTransferOrderId, transferOrderRef: createdTransferOrderRef,
+        approvalStatus: approvalConfirmed ? "approved" : createdTransferOrderId ? "failed" : "pending",
+        error: error.message });
     }
   }
   const failed = results.filter((result) => result.status === "failed").length;

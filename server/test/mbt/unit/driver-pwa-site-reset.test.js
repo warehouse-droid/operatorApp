@@ -78,7 +78,7 @@ test("the standalone WebKit fallback clears every origin storage layer but accur
 test("the reset ships as a new atomic shell generation without forcing a protocol-version cutover", () => {
   assert.match(DRIVER_HTML, /driver\.js\?v=20260819-driver-route-readiness-v1/u);
   assert.match(DRIVER_SOURCE, /driver-service-worker\.js\?v=20260819-driver-route-readiness-v1/u);
-  assert.match(WORKER_SOURCE, /DRIVER_CACHE_NAME = `\$\{DRIVER_CACHE_PREFIX\}v37`/u);
+  assert.match(WORKER_SOURCE, /DRIVER_CACHE_NAME = `\$\{DRIVER_CACHE_PREFIX\}v38`/u);
   assert.match(WORKER_SOURCE, /driver\.js\?v=20260819-driver-route-readiness-v1/u);
   assert.match(DRIVER_SOURCE, /DRIVER_PWA_CLIENT_VERSION = "2026\.08\.12\.3"/u);
   assert.match(WORKER_SOURCE, /DRIVER_PWA_CLIENT_VERSION = "2026\.08\.12\.3"/u);

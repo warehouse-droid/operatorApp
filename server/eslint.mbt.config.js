@@ -26,10 +26,17 @@ export default [
     files: [
       "src/mbt/**/*.js",
       "src/operator-customer-pickup-photo-policy.js",
+      "src/operator-netsuite-posting-*.js",
+      "src/operator-linked-quantity-domain.js",
+      "src/sales-order-auto-fulfillment-*.js",
       "src/driver-historical-assist-*.js",
       "src/netsuite-m2m-*.js",
       "src/netsuite-delayed-status-refresh-*.js",
       "src/pending-approval-reconciliation*.js",
+      "src/scm-po-split-adjustment.js",
+      "src/scm-schedule-route-options.js",
+      "src/smart-scm-phased-planning.js",
+      "src/smart-scm-skip-12441.js",
       "test/mbt/**/*.{js,mjs}",
       "test/support/**/*.mjs",
       "tools/**/*.mjs"
@@ -69,6 +76,7 @@ export default [
       "src/dispatch-actual-arrival-*.js",
       "src/scm-dependency-*.js",
       "src/driver-route-*.js",
+      "src/sales-order-reattempt-*.js",
       "test/dispatch/**/*.js"
     ],
     languageOptions: {

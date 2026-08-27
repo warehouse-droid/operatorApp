@@ -344,12 +344,17 @@ assert(visiblePhysicalPallets.every((line) => line.officialLineItem && line.subm
               delivery_safety_factor = 1.645,
               execution_mode = 'mock',
               pickup_safety_factor = 1.3,
+              truck_capacity_lbs = 78000,
+              full_load_ratio = 0.95,
+              hold_load_ratio = 0.50,
               zero_demand_coverage_enabled = true,
               zero_demand_pickup_order_count = 5,
               zero_demand_delivery_order_count = 1,
               coverage_order_percentile = 0.50,
               coverage_history_weeks = 104,
-              coverage_prior_strength_orders = 8`
+              coverage_prior_strength_orders = 8,
+              skip_12441_enabled = false,
+              inventory_planning_mode = 'integrated'`
     );
     const forecastRun = await runSmartScmForecast({ triggerSource: "harness", operatorId: null });
     assert.equal(forecastRun.status, "completed");
@@ -460,7 +465,10 @@ assert(visiblePhysicalPallets.every((line) => line.officialLineItem && line.subm
       proposedPallets: 1
     }, null);
     const manualProposal = manualRun.proposals.find((proposal) => !beforeManualIds.has(proposal.id));
-    assert(manualProposal, "Adding a manual load must create a new proposal in the current planning run.");
+    assert(
+      manualProposal,
+      `Adding a manual load must create a new proposal in the current planning run; before=${beforeManualIds.size}, after=${manualRun.proposals.length}, revision=${JSON.stringify(manualRun.revisions[0]?.diff || {})}.`
+    );
     assert.equal(manualProposal.status, "held", "A manual PO load must start on Hold.");
     assert.equal(manualProposal.lines.length, 1);
     assert.equal(manualProposal.lines[0].proposedPallets, 1);

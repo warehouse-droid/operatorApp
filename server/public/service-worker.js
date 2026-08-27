@@ -1,13 +1,13 @@
-const CACHE_NAME = "mbbs-yard-operator-v141-page-confirm-v1";
+const CACHE_NAME = "mbbs-yard-operator-v142-fulfillment-layout-v1";
 const OPERATOR_CACHE_PREFIX = "mbbs-yard-operator-";
 const APP_SHELL = [
   "/operator",
   "/operator.html",
-  "/operator.css?v=20260815-page-confirm-v1",
+  "/operator.css?v=20260825-fulfillment-layout-v1",
   "/i18n.css?v=20260701-i18n-v2",
   "/vendor/quagga2/quagga.min.js?v=1.12.1",
-  "/i18n.js?v=20260815-customer-pickup-photo-gate-v1",
-  "/operator.js?v=20260815-operator-page-confirm-v1",
+  "/i18n.js?v=20260825-local-status-plan-date-v1",
+  "/operator.js?v=20260825-fulfillment-layout-v1",
   "/manifest.webmanifest",
   "/icons/mbbs-yard-192.png",
   "/icons/mbbs-yard-512.png",

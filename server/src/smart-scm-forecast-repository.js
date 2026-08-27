@@ -1,6 +1,7 @@
 import { query } from "./db.js";
 import { writeAudit } from "./auth-repository.js";
 import { calculateSmartScmPolicyLevels } from "./smart-scm-policy-calculation.js";
+import { smartScmApplySkip12441Policy, smartScmBuild12441DemandProjection } from "./smart-scm-skip-12441.js";
 
 const EPSILON = 0.000001;
 const BUSINESS_SEASONAL_PRIOR = Object.freeze([
@@ -676,7 +677,12 @@ async function insertForecastRows(rows = []) {
 }
 
 function publicForecast(row, settings = {}) {
-  const levels = calculateSmartScmPolicyLevels(row, row, settings);
+  const skip12441Effective = Boolean(settings.skip_12441_enabled)
+    && (Number(row.location_id) === 15 || String(row.yard_code) === "12441");
+  const levels = smartScmApplySkip12441Policy({
+    ...calculateSmartScmPolicyLevels(row, row, settings),
+    policy: row
+  }, { enabled: skip12441Effective });
   return {
     id: Number(row.id),
     runId: Number(row.run_id),
@@ -704,11 +710,11 @@ function publicForecast(row, settings = {}) {
     demandDataCutoff: row.demand_data_cutoff || null,
     representativeOrderPallets: number(row.representative_order_pallets),
     coverageOrderCount: Number(row.coverage_order_count || 0),
-    coverageFloorPallets: number(row.coverage_floor_pallets),
+    coverageFloorPallets: skip12441Effective ? 0 : number(row.coverage_floor_pallets),
     coverageSource: row.coverage_source || "none",
     coverageLocalSamples: Number(row.coverage_local_samples || 0),
     coverageDonorSamples: Number(row.coverage_donor_samples || 0),
-    zeroDemandCoverageApplied: Boolean(row.zero_demand_coverage_applied),
+    zeroDemandCoverageApplied: skip12441Effective ? false : Boolean(row.zero_demand_coverage_applied),
     coverageCapacityShortfall: Boolean(row.coverage_capacity_shortfall),
     baselineWeekly: number(row.baseline_weekly),
     p50Weekly: number(row.p50_weekly),
@@ -737,6 +743,7 @@ function publicForecast(row, settings = {}) {
     preferredPallets: round(levels.preferredPallets),
     capacityPallets: round(levels.capacityPallets),
     stockPolicyModel: levels.forecastModel,
+    skip12441Effective,
     wape: row.wape === null ? null : number(row.wape),
     bias: row.bias === null ? null : number(row.bias),
     eligibleForPromotion: Boolean(row.eligible_for_promotion),
@@ -754,7 +761,16 @@ export async function runSmartScmForecast({ triggerSource = "manual", operatorId
   const run = created.rows[0];
   try {
     const [settings, policies] = await Promise.all([smartScmSettings(), forecastPolicies()]);
-    const facts = await salesFactsForPolicies(policies);
+    const sourceFacts = await salesFactsForPolicies(policies);
+    const demandProjection = smartScmBuild12441DemandProjection({
+      enabled: Boolean(settings.skip_12441_enabled),
+      facts: sourceFacts
+    });
+    const facts = demandProjection.facts;
+    const projectionByItem = new Map(demandProjection.allocations.map((allocation) => [
+      String(allocation.itemId),
+      allocation
+    ]));
     const policyByKey = new Map(policies.map((policy) => [`${policy.item_id}:${policy.location_id}`, policy]));
     const factsByKey = new Map();
     let dataCutoff = null;
@@ -906,6 +922,10 @@ export async function runSmartScmForecast({ triggerSource = "manual", operatorId
         coverage_capacity_shortfall: coverage.coverageCapacityShortfall,
         eligible_for_promotion: eligible,
         drivers: [
+          ...(projectionByItem.has(String(policy.item_id)) ? [{
+            label: "12441 demand redistribution",
+            value: `${projectionByItem.get(String(policy.item_id)).sobQuantity} to 3445 / ${projectionByItem.get(String(policy.item_id)).soaQuantity} to 2967 (${projectionByItem.get(String(policy.item_id)).ratioSource})`
+          }] : []),
           { label: formulaEvidence.stockout ? `Stockout eligible-week average (up to ${formulaEvidence.windowWeeks} weeks)` : `Recent average (${formulaEvidence.windowWeeks} completed weeks)`, value: round(formulaEvidence.demand) },
           { label: "Formula weekly standard deviation", value: round(formulaEvidence.standardDeviation) },
           { label: "Current available pallets", value: round(formulaEvidence.availablePallets) },
@@ -963,6 +983,9 @@ export async function runSmartScmForecast({ triggerSource = "manual", operatorId
       coverageOrderPercentile: number(settings.coverage_order_percentile, 0.5),
       coverageHistoryWeeks: boundedInteger(settings.coverage_history_weeks, 104, 26, 260),
       coveragePriorStrengthOrders: boundedInteger(settings.coverage_prior_strength_orders, 8, 1, 100),
+      skip12441Enabled: Boolean(settings.skip_12441_enabled),
+      skip12441RedistributedItems: demandProjection.allocations.length,
+      skip12441RedistributedQuantity: round(demandProjection.allocations.reduce((sum, row) => sum + number(row.originalQuantity), 0)),
       averageSelectedWape: scored ? round(selectedWapeSum / scored) : null
     };
     const completed = await query(

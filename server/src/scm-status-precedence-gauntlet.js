@@ -8,13 +8,15 @@ import { fileURLToPath } from "node:url";
 const serverRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const sourceFiles = [
   "package.json",
+  "src/dispatch-repository.js",
   "src/scm-reconciliation-repository.js",
   "src/server.js",
   "src/scm-reconciliation-repository-harness.js",
   "src/scm-order-visibility-harness.js",
   "src/scm-order-visibility-integration-harness.js",
   "src/scm-status-precedence-mutation-harness.js",
-  "src/scm-status-precedence-gauntlet.js"
+  "src/scm-status-precedence-gauntlet.js",
+  "test/dispatch/integration/scm-po-split-editing.test.js"
 ];
 
 async function focusedSourceHash() {

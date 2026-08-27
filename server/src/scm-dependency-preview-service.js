@@ -1,12 +1,8 @@
 import { query } from "./db.js";
 import { getDispatchPlan } from "./dispatch-plan-repository.js";
 import { resolveDispatchSalesTarget } from "./dispatch-order-target-repository.js";
+import { listClosedNetSuiteOrders } from "./netsuite-closed-order-repository.js";
 import {
-  getScmDependencyChangeRequest,
-  listRouteBearingDevicePresence
-} from "./scm-dependency-management-repository.js";
-import {
-  driverRouteReadiness,
   evaluateDependencyMutationBlockers,
   normalizeDependencyMutationAction
 } from "./scm-dependency-management-policy.js";
@@ -62,24 +58,10 @@ async function relationshipContext(command = {}) {
 
 async function closedOrderRefs(refs = []) {
   if (!refs.length) {return [];}
-  const result = await query(
-    `SELECT ref
-       FROM (
-         SELECT tranid AS ref, status, status_text, netsuite_active FROM sales_orders
-          WHERE tranid = ANY($1::text[])
-         UNION ALL
-         SELECT tranid AS ref, status, status_text, netsuite_active FROM transfer_orders
-          WHERE tranid = ANY($1::text[])
-         UNION ALL
-         SELECT tranid AS ref, status, status_text, netsuite_active FROM purchase_orders
-          WHERE tranid = ANY($1::text[])
-       ) orders
-      WHERE COALESCE(netsuite_active, true) = false
-         OR upper(COALESCE(status, '')) IN ('C', 'H')
-         OR COALESCE(status_text, '') ~* '(closed|cancel)'`,
-    [refs]
-  );
-  return [...new Set(result.rows.map((row) => text(row.ref)).filter(Boolean))];
+  const conflicts = await listClosedNetSuiteOrders(refs);
+  return [...new Set(conflicts
+    .map((conflict) => text(conflict.requestedRef || conflict.canonicalRef))
+    .filter(Boolean))];
 }
 
 async function operatorActivityRefs({ salesRefs = [], transferRefs = [] } = {}) {
@@ -211,15 +193,19 @@ async function dependencyExecutionIds({ dependencyIds = [], transferRefs = [] } 
   return result.rows.map((row) => Number(row.id));
 }
 
-async function driverActivity({ planId = null, refs = [] } = {}) {
-  if (!planId && !refs.length) {return [];}
+async function driverActivity({ refs = [] } = {}) {
+  if (!refs.length) {return [];}
   const result = await query(
     `SELECT id, job_id
        FROM driver_job_records
-      WHERE ($1::bigint IS NOT NULL AND plan_id = $1)
-         OR (cardinality($2::text[]) > 0 AND order_refs ?| $2::text[])
+      WHERE order_refs ?| $1::text[]
+        AND (
+          started_at IS NOT NULL
+          OR completed_at IS NOT NULL
+          OR lower(COALESCE(status, '')) IN ('in_progress', 'in-progress', 'started', 'complete', 'completed')
+        )
       ORDER BY id`,
-    [planId || null, refs]
+    [refs]
   );
   return result.rows.map((row) => row.job_id || String(row.id));
 }
@@ -259,19 +245,6 @@ async function activeForeignLease(planDate, actor = {}) {
     sessionId: row.session_id,
     expiresAt: row.expires_at
   } : null;
-}
-
-function mergeReadyDevices(devices = [], pendingRequest = null) {
-  const readyByIdentity = new Map((pendingRequest?.devices || []).map((device) => [
-    `${text(device.driverLogin).toLowerCase()}|${text(device.deviceId)}|${text(device.manifestId)}`,
-    device
-  ]));
-  return devices.map((device) => {
-    const ready = readyByIdentity.get(
-      `${text(device.driverLogin).toLowerCase()}|${text(device.deviceId)}|${text(device.manifestId)}`
-    );
-    return ready ? { ...device, readyAt: ready.readyAt, readyExpiresAt: ready.readyExpiresAt } : device;
-  });
 }
 
 export async function previewScmDependencyMutation(command = {}, actor = {}, { lock = false } = {}) {
@@ -347,7 +320,11 @@ export async function previewScmDependencyMutation(command = {}, actor = {}, { l
     };
   }
 
-  const planId = Number(command.planId || resolved.target.planId || relation.dependency?.planned_plan_id) || null;
+  // Dispatch sends the open board's plan id with every dependency command, even
+  // when the target is only in that board's unassigned order pool. A relationship
+  // changes a Driver route only when the resolved target is actually assigned to
+  // that route (or an existing relationship retains a historical planned plan).
+  const planId = Number(resolved.target.planId || relation.dependency?.planned_plan_id) || null;
   if (lock && planId) {await query("SELECT id FROM dispatch_plans WHERE id = $1 FOR UPDATE", [planId]);}
   const plan = planId ? await getDispatchPlan(planId) : null;
   const memberRefs = [...new Set([
@@ -366,7 +343,7 @@ export async function previewScmDependencyMutation(command = {}, actor = {}, { l
   const operatorRefs = await operatorActivityRefs({ salesRefs: memberRefs, transferRefs });
   const receivingRefs = await receivingActivityRefs({ purchaseRefs, transferRefs });
   const executionIds = await dependencyExecutionIds({ dependencyIds, transferRefs });
-  const jobIds = await driverActivity({ planId, refs: affectedRefs });
+  const jobIds = await driverActivity({ refs: affectedRefs });
   const evidenceIds = await offlineEvidence({ planId });
   const lease = await activeForeignLease(
     plan?.planDate || command.planDate || resolved.target.planDate,
@@ -395,16 +372,13 @@ export async function previewScmDependencyMutation(command = {}, actor = {}, { l
     planTerminal: ["completed", "cancelled"].includes(text(plan?.status).toLowerCase()) ? plan.status : ""
   });
 
-  let devices = [];
-  let readiness = { required: false, ready: true, blockers: [] };
-  if (plan?.status === "confirmed") {
-    const pending = command.requestId ? await getScmDependencyChangeRequest(command.requestId) : null;
-    devices = mergeReadyDevices(await listRouteBearingDevicePresence({
-      planId: plan.id,
-      planDate: plan.planDate
-    }), pending);
-    readiness = driverRouteReadiness({ planStatus: plan.status, devices });
-  }
+  // Dependency changes that do not touch an actually started Driver job must
+  // not wait for a PWA screen/heartbeat. A started affected job is already a
+  // hard blocker above. On an allowed confirmed-plan commit, the command
+  // transaction still supersedes every old manifest and grant, so a stale
+  // offline event is retained for review and cannot mutate the revised route.
+  const devices = [];
+  const readiness = { required: false, ready: true, blockers: [] };
   const blockers = [
     ...(relationshipBlocker ? [relationshipBlocker] : []),
     ...baseBlockers,

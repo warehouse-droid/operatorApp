@@ -19,6 +19,8 @@ import {
 } from "./yard-movement-repository.js";
 import { getNextDispatchSplitSuffix } from "./delivery-repository.js";
 import { dispatchPlannedOrderConflictRefs } from "./dispatch-plan-repository.js";
+import { upsertLocalCoOrder } from "./dispatch-repository.js";
+import { receiveLocalCoOrder } from "./receiving-repository.js";
 
 const [
   migrationSource,
@@ -82,8 +84,13 @@ function assertStaticIntegration() {
   );
   assert.match(
     driverRepositorySource,
-    /typeHint\s*\|\|\s*""\)\.trim\(\)\.toUpperCase\(\)\s*===\s*"CUSTOM"\)[\s\S]{0,180}orderDetailsFromPlan/,
+    /typeHint\s*\|\|\s*""\)\.trim\(\)\.toUpperCase\(\)\s*===\s*"CUSTOM"\)[\s\S]{0,120}return\s+detailsFromCustomOrder/,
     "Driver order details for Custom Orders must come directly from the saved dispatch plan."
+  );
+  assert.match(
+    driverRepositorySource,
+    /async function detailsFromCustomOrder[\s\S]{0,900}driverOrderDetailsFromPlan\(/,
+    "The Custom Order detail resolver must preserve the Dispatch-plan item representation."
   );
   assert.match(
     serverSource,
@@ -844,6 +851,104 @@ async function verifyBackendCanonicalization(runId) {
   );
 }
 
+async function verifyTransitCoCanonicalization(runId) {
+  const refNumber = `CUSTOM-CO-${runId}`;
+  const stored = await createDispatchCustomOrder(validInput(refNumber, {
+    pickupLocation: "3445",
+    dropoffLocation: "Custom CO destination, 88 Transit Test Road, Toronto ON",
+    orderDetails: "One Custom Order load routed through the transit depot.",
+    weightLbs: 1800
+  }), "custom-order-co-harness");
+  const sourceOrder = dispatchOrderFromCustomOrder(stored);
+  const coRef = `CO-${refNumber}`;
+  await upsertLocalCoOrder({
+    sourceOrderRef: refNumber,
+    fromYard: "3445",
+    toYard: "12441",
+    order: {
+      ...sourceOrder,
+      sourceOrderType: "CUSTOM",
+      transitCo: { id: coRef, fromYard: "3445", toYard: "12441", sourceOrderId: refNumber }
+    },
+    requestedBy: "custom-order-co-harness"
+  });
+
+  const [withTransit] = await listDispatchCustomOrders({
+    includeCancelled: false,
+    includeCompleted: false,
+    search: refNumber
+  });
+  assert.equal(withTransit?.transitCo?.id, coRef, "The Custom feed must rehydrate its active local CO.");
+  assert.equal(withTransit?.transitCo?.fromYard, "3445");
+  assert.equal(withTransit?.transitCo?.toYard, "12441");
+
+  await assert.rejects(
+    updateDispatchCustomOrder(stored.id, validInput(refNumber, {
+      orderDetails: "This stale edit must not replace the CO source snapshot."
+    }), "custom-order-co-harness"),
+    (error) => error?.status === 409
+      && error?.code === "DISPATCH_CUSTOM_ORDER_ACTIVE_CO"
+      && String(error?.message || "").includes(coRef),
+    "A Custom Order with an active CO must stay immutable until the CO is cancelled."
+  );
+  await assert.rejects(
+    cancelDispatchCustomOrder(stored.id, "custom-order-co-harness"),
+    (error) => error?.status === 409
+      && error?.code === "DISPATCH_CUSTOM_ORDER_ACTIVE_CO"
+      && String(error?.message || "").includes(coRef),
+    "Cancelling a Custom Order must not orphan its active CO."
+  );
+
+  const mapped = dispatchOrderFromCustomOrder(withTransit);
+  assert.equal(mapped.sourceYard, "12441", "The CO destination must become the Custom Order pickup.");
+  assert.deepEqual(mapped.pickupLocations, ["12441"]);
+  assert.deepEqual(mapped.transitOriginalPickupLocations, ["3445"]);
+  assert.equal(mapped.transitCo?.sourceOrderId, refNumber);
+
+  const submitted = submittedCustomPlan(withTransit, { includePickup: false });
+  const canonical = await canonicalizeDispatchCustomOrdersInPlan(submitted);
+  assert.equal(canonical.orders[0]?.transitCo?.id, coRef, "Server canonicalization must retain the CO relationship.");
+  assert.deepEqual(canonical.orders[0]?.pickupLocations, ["12441"]);
+  const pickup = customStops(canonical, refNumber).find((stop) => stop.type === "pick");
+  assert.equal(pickup?.location, "12441", "The server-authoritative Custom pickup stop must use the transit depot.");
+
+  const persisted = await query(
+    `SELECT co.details, line.item_name, line.quantity
+       FROM local_co_orders co
+       LEFT JOIN local_co_order_lines line ON line.co_id = co.id
+      WHERE co.co_ref = $1`,
+    [coRef]
+  );
+  assert.equal(persisted.rows[0]?.details?.sourceOrderType, "CUSTOM");
+  assert.equal(persisted.rows[0]?.item_name, "Custom order");
+  assert.equal(Number(persisted.rows[0]?.quantity), 1);
+
+  await query("UPDATE local_co_orders SET status = 'planned' WHERE co_ref = $1", [coRef]);
+  await query(
+    `UPDATE local_co_order_lines
+        SET received_sales_qty = quantity,
+            confirmed_at = now(),
+            confirmed_by = null
+      WHERE co_id = (SELECT id FROM local_co_orders WHERE co_ref = $1)`,
+    [coRef]
+  );
+  const receipt = await receiveLocalCoOrder(coRef, null, {
+    photoDataUrls: ["data:image/jpeg;base64,AA==", "data:image/jpeg;base64,AQ=="]
+  });
+  const syntheticTransfer = await query(
+    `SELECT COUNT(*)::int AS count
+       FROM transfer_orders
+      WHERE tranid = $1
+         OR netsuite_id = (SELECT delivery_order_id FROM local_co_orders WHERE co_ref = $1)`,
+    [coRef]
+  );
+  const customAfterReceipt = await getDispatchCustomOrder(stored.id);
+  assert.equal(receipt.receiptStatus, "local_co_received");
+  assert.equal(Number(syntheticTransfer.rows[0]?.count), 0,
+    "Receiving a Custom Order CO must not create a synthetic Transfer Order.");
+  assert.equal(customAfterReceipt?.status, "open", "CO receiving must preserve the original Custom Order identity and state.");
+}
+
 async function verifyDriverOnlyRecord(runId) {
   const refNumber = `CUSTOM-DRIVER-${runId}`;
   const fixtureDate = "2098-08-17";
@@ -1032,6 +1137,7 @@ try {
     await verifyRepositoryCrud(runId);
     await verifyStatusFiltering(runId);
     await verifyBackendCanonicalization(runId);
+    await verifyTransitCoCanonicalization(runId);
     await verifyDriverOnlyRecord(runId);
     await verifyExactSalesStoreYardScope(runId);
 
@@ -1043,6 +1149,7 @@ try {
       customDestinationStopTime: true,
       legacyStopTimeFallback: true,
       backendCanonicalization: true,
+      customTransitCoCanonicalization: true,
       immutableReferenceGuard: true,
       crossDateAssignmentExclusivity: true,
       customSplitSuffixIdentity: true,

@@ -371,7 +371,9 @@ const historicalRestore = Function(
   let lastSavedAt = "";
   let lastServerSavedAt = "";
   let lastSavedPlanHash = "";
+  let lastAcknowledgedPlanState = null;
   let appliedPlanStructure = { planId: "", planDate: "", orderIds: new Set() };
+  function dispatchPlanWireState(plan = {}) { return plan; }
   function rememberAssignedOrderEvidence() {}
   function clearActiveRouteEstimates() {}
   function activePhysicalOrderEvidence() { return { all: new Set(), pickups: new Set(), drops: new Set() }; }
@@ -516,6 +518,7 @@ const makeBlockedSaveQueueFixture = Function(
   let lastSavedAt = "";
   let isApplyingRemotePlan = false;
   let routeNotice = "";
+  const dispatchConfig = { plannerCommandMode: "off" };
   let firstSaveStartedResolve;
   let firstSaveResponseResolve;
   const firstSaveStarted = new Promise((resolve) => { firstSaveStartedResolve = resolve; });
@@ -640,10 +643,12 @@ const unlinkActionSource = sourceSlice(
   'if (action === "undo-plan")',
   "dependency unlink action"
 );
-assert.match(unlinkActionSource, /removeLocalOrderDependency\(dependencyId\)/,
-  "A successful unlink must remove the stale dependency from local grouped-order copies immediately.");
-assert.doesNotMatch(unlinkActionSource, /loadOrderDependencyOptions/,
-  "A successful unlink must not resurrect a stale grouped dependency through an immediate failing refresh.");
+assert.match(unlinkActionSource, /runAtomicDispatchDependencyMutation\(/,
+  "A successful unlink must consume the server's atomic plan and dependency result.");
+assert.match(unlinkActionSource, /if \(!applied\) return;/,
+  "The unlink UI must not refresh from a dependency command that was not atomically applied.");
+assert.doesNotMatch(unlinkActionSource, /removeLocalOrderDependency\(dependencyId\)/,
+  "The unlink UI must not independently mutate stale grouped-order copies after applying the server snapshot.");
 const groupOrderSource = sourceSlice("function groupOrder", "function groupedDispatchOrderId", "group plan ownership");
 assert.match(groupOrderSource, /groupPlanId:\s*currentPlan\?\.id/,
   "A local group must retain the plan that owns its dependency structure.");

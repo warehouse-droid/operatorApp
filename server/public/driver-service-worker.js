@@ -7,8 +7,8 @@ importScripts("/driver-offline-sync.js?v=20260819-driver-route-readiness-v1");
 
 const DRIVER_PWA_CLIENT_VERSION = "2026.08.12.3";
 const DRIVER_CACHE_PREFIX = "mbbs-driver-shell-";
-const DRIVER_CACHE_NAME = `${DRIVER_CACHE_PREFIX}v37`;
-const DRIVER_REFRESH_CACHE_NAME = `${DRIVER_CACHE_PREFIX}refresh-v37`;
+const DRIVER_CACHE_NAME = `${DRIVER_CACHE_PREFIX}v38`;
+const DRIVER_REFRESH_CACHE_NAME = `${DRIVER_CACHE_PREFIX}refresh-v38`;
 const DRIVER_OFFLINE_MODE_REQUEST = "/__mbbs_driver_offline_mode__";
 const DRIVER_SHELL = [
   "/driver",

@@ -756,6 +756,7 @@ assert.equal(
 );
 
 const loadEditFunctions = [
+  sourceRange(plannerUi, "function poRouteProjectionForOrder", "function orderWeightLbs"),
   sourceRange(plannerUi, "function loadDriverKey", "function loadDriver"),
   sourceRange(plannerUi, "function loadHasAssignedDriver", "function truckHasPlanningContent"),
   sourceRange(plannerUi, "function driverLockNotice", "function ownYardFixedMinutesFor"),
@@ -1055,7 +1056,7 @@ assert.equal((initDispatchSource.match(/loadDriverJobStatuses\(/g) || []).length
 assert(repository.includes("displayOrder: numberValue(row.display_order, 0)"), "Setup API does not expose persisted display order.");
 assert(repository.includes("cleanDriver(driver, index)"), "Driver request order is not explicitly persisted as display_order.");
 assert(setupHtml.includes("20260818-actual-stop-arrival-v1"), "Dispatch Setup browser asset version was not bumped.");
-assert(plannerHtml.includes('/dispatch.js?v=20260822-load-reorder-v1'), "Dispatch planner browser asset version was not bumped.");
+assert(plannerHtml.includes('/dispatch.js?v=20260826-co-vrma-custom-v1'), "Dispatch planner browser asset version was not bumped.");
 
 const activityPositionSource = sourceRange(
   plannerUi,

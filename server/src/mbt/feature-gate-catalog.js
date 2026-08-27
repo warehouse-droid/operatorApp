@@ -1,5 +1,10 @@
 // @ts-check
 
+import {
+  OPERATOR_NETSUITE_GATE_DEFINITIONS,
+  OPERATOR_NETSUITE_YARDS
+} from "../operator-netsuite-posting-policy.js";
+
 /**
  * The Admin page owns local operational gates. Live customer synchronization
  * and NetSuite posting remain deployment-owned boundaries.
@@ -50,6 +55,26 @@ export const MBT_ADMIN_GATE_DEFINITIONS = Object.freeze([
     locked: false,
     lockReason: null
   }),
+  ...OPERATOR_NETSUITE_GATE_DEFINITIONS.map((definition) => Object.freeze({
+    ...definition,
+    environmentProperty: "netSuiteDirectAccessEnabled",
+    gateGroup: "operator_netsuite_posting"
+  })),
+  ...OPERATOR_NETSUITE_YARDS.map((yard) => Object.freeze({
+    flagKey: `dispatch_netsuite_sales_order_if_${yard.yardCode}`,
+    label: `${yard.yardCode} completed Delivery SO → IF`,
+    description: `After an accepted Driver customer drop or audited manual Dispatch completion from yard ${yard.yardCode}, create one verified Sales Order Item Fulfillment for the conserved Operator residual plus completed direct PO/TO supply.`,
+    transactionType: "IF",
+    locationId: yard.locationId,
+    yardCode: yard.yardCode,
+    configuredDefault: false,
+    requiresNetSuiteDirectAccess: true,
+    independent: true,
+    locked: false,
+    lockReason: null,
+    environmentProperty: "netSuiteDirectAccessEnabled",
+    gateGroup: "dispatch_sales_order_fulfillment"
+  })),
   Object.freeze({
     flagKey: "mbt_enabled",
     label: "MBT local modules",
@@ -136,6 +161,9 @@ export const MBT_ADMIN_WRITABLE_GATE_KEYS = Object.freeze(
 
 /** @param {Record<string, unknown>} definition @param {Record<string, unknown>} environment */
 function environmentAllows(definition, environment) {
+  if (definition.requiresNetSuiteDirectAccess === true) {
+    return environment.netSuiteDirectAccessEnabled === true;
+  }
   if (definition.independent === true) {
     return true;
   }
@@ -168,6 +196,18 @@ function optionalUpdatedBy(flag) {
   return String(flag.updatedBy);
 }
 
+/** @param {Record<string, unknown>} definition */
+function gateMetadata(definition) {
+  return {
+    gateGroup: definition.gateGroup || "general",
+    operatorFunction: definition.operatorFunction || null,
+    transactionType: definition.transactionType || null,
+    locationId: definition.locationId || null,
+    yardCode: definition.yardCode || null,
+    requiresNetSuiteDirectAccess: definition.requiresNetSuiteDirectAccess === true
+  };
+}
+
 /** @param {Record<string, unknown>} definition @param {Record<string, unknown> | undefined} flag @param {Record<string, unknown>} environment @param {boolean} databaseRootConfigured */
 function materializedGate(definition, flag, environment, databaseRootConfigured) {
   const present = Boolean(flag);
@@ -178,6 +218,7 @@ function materializedGate(definition, flag, environment, databaseRootConfigured)
     label: definition.label,
     description: definition.description,
     independent: definition.independent === true,
+    ...gateMetadata(definition),
     present,
     configured,
     environmentAllowed,

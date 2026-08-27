@@ -73,6 +73,23 @@ test("DSR-R1: enqueue commits atomically, coalesces an active duplicate, and rol
   }
 });
 
+test("DSR-R15: the durable outbox accepts a Transfer Order identity", async () => {
+  const orderId = identity(15);
+  try {
+    const enqueued = await enqueueDelayedStatusRefresh({
+      orderType: "transfer_order",
+      netsuiteOrderId: orderId,
+      tranid: "TOB00960",
+      availableAt: new Date("2026-08-27T12:00:10.000Z")
+    });
+    assert.equal(enqueued.orderType, "transfer_order");
+    assert.equal(enqueued.netsuiteOrderId, orderId);
+    assert.equal(enqueued.created, true);
+  } finally {
+    await cleanup([orderId]);
+  }
+});
+
 test("DSR-R2: concurrent SKIP LOCKED claimers receive a due job exactly once", async () => {
   const orderId = identity(10);
   try {

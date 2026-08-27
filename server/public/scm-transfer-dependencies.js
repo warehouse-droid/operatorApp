@@ -461,7 +461,7 @@ function renderDependencyCandidates() {
       : dependencyState.reviewStatus === "completed"
       ? "No completed Auto Transfer reviews."
       : dependencyState.reviewStatus === "created"
-        ? "No created Transfer Orders waiting for approval or printing."
+        ? "No created Transfer Orders pending user print or attention."
         : "No open Sales Order shortages.";
     return `<div class="empty-state">${emptyText}</div>`;
   }
@@ -470,7 +470,7 @@ function renderDependencyCandidates() {
       data-action="select-order" data-order-id="${order.salesOrderId}" type="button">
       <span><strong class="scm-dependency-order-ref">${depEscape(order.salesOrderRef)}${order.testFixture ? `<b class="scm-dependency-test-badge">TEST</b>` : ""}</strong><small>${depEscape(order.customer || "")}</small></span>
       <span class="scm-dependency-order-side">${dependencyState.search ? `<em class="dependency-status status-${depEscape(order.workflowStage || "open")}">${depEscape(order.workflowStage || "open")}</em>` : ""}<b>${depQty(order.uncoveredQuantity)}</b><small>uncovered</small></span>
-      <small>${depEscape(order.outboundLocation || "--")} | ${depEscape(depDate(order.expectedDeliveryDate))}${order.completionType === "reviewed_no_transfer" ? " | Reviewed - No Transfer" : order.completionType === "transfer_manually_reviewed" ? " | Created TO reviewed" : order.workflowStage === "created" ? " | Waiting approval / print" : order.completionType === "transfer_approved_printed" ? " | Approved & printed" : ""}</small>
+      <small>${depEscape(order.outboundLocation || "--")} | ${depEscape(depDate(order.expectedDeliveryDate))}${order.completionType === "reviewed_no_transfer" ? " | Reviewed - No Transfer" : order.completionType === "transfer_manually_reviewed" ? " | Created TO reviewed" : order.workflowStage === "created" ? " | Pending user print / attention" : order.completionType === "transfer_approved_printed" ? " | Approved & printed" : ""}</small>
     </button>
   `).join("");
 }
@@ -535,7 +535,7 @@ function renderInventoryMatrix() {
     </div>` : ""}
     <div class="scm-dependency-review-action">
       <span>${order.workflowStage === "created"
-        ? "Transfer Orders were created and are waiting for quantity verification, approval, and source-yard printing. If no further action is required, mark this order reviewed manually."
+        ? "Created Transfer Orders wait here for source-yard printing; any automatic-approval exception is shown on its proposal. If no further action is required, mark this order reviewed manually."
         : order.completionType === "transfer_manually_reviewed"
           ? `Created Transfer Orders were manually reviewed${order.completedAt ? ` on ${depEscape(depDate(order.completedAt))}` : ""}.`
         : order.completionType === "transfer_approved_printed"
@@ -685,7 +685,8 @@ function renderProposal(proposal) {
   const revisionPending = ["updating", "attention"].includes(proposal.revisionStatus);
   const createdQuantityEditable = created && !proposal.revisionBlockedReason && !revisionPending;
   const quantityEditable = (draftEditable || createdQuantityEditable) && !controlsBusy;
-  const printStatus = proposal.printJob?.status || "not queued";
+  const printStatus = proposal.printJob?.status
+    || (proposal.approvalStatus === "approved" ? "Pending user print" : "not queued");
   const printInProgress = ["queued", "leased", "printing"].includes(printStatus);
   const printed = printStatus === "printed";
   const approvalInProgress = proposal.approvalStatus === "approving";
@@ -694,7 +695,7 @@ function renderProposal(proposal) {
     : ["failed", "uncertain"].includes(printStatus)
     ? "Retry Source-yard Print"
     : proposal.approvalStatus === "approved"
-      ? "Get Ticket & Print"
+      ? "Print Source-yard Ticket"
       : "Verify, Approve & Print";
   return `
     <article class="scm-dependency-proposal ${mergeSelected ? "merge-selected" : ""}" data-proposal-id="${proposal.id}" data-creation-status="${depEscape(proposal.creationStatus)}" data-pallet-overridden="${proposal.palletQuantityOverridden === true}">
@@ -1416,6 +1417,7 @@ scmDependencyApp.addEventListener("click", async (event) => {
     const proposal = dependencyState.batch.proposals.find((row) => Number(row.id) === proposalId);
     if (!proposal) return;
     const reprint = proposal.printJob?.status === "printed";
+    const alreadyApproved = proposal.approvalStatus === "approved";
     const printRequestId = dependencyPrintRequestIds.get(String(proposalId))
       || dependencyRequestId(`transfer-dependency-print:${proposalId}`);
     dependencyPrintRequestIds.set(String(proposalId), printRequestId);
@@ -1423,9 +1425,13 @@ scmDependencyApp.addEventListener("click", async (event) => {
       ? `Requeue ${proposal.transferOrderRef} picking ticket to the ${proposal.fromLocation} printer?`
       : reprint
         ? `Verify current quantities and print a new ${proposal.transferOrderRef} picking ticket at ${proposal.fromLocation}? The earlier print remains in history.`
-      : `Verify ${proposal.transferOrderRef} against the saved quantities, approve it in NetSuite, and print its picking ticket at ${proposal.fromLocation}?`;
+      : alreadyApproved
+        ? `Verify ${proposal.transferOrderRef} against the saved quantities and print its picking ticket at ${proposal.fromLocation}?`
+        : `Verify ${proposal.transferOrderRef} against the saved quantities, approve it in NetSuite, and print its picking ticket at ${proposal.fromLocation}?`;
     if (!window.confirm(prompt)) return;
-    await runDependencyAction("Verifying, approving, and preparing source-yard print...", async () => {
+    await runDependencyAction(alreadyApproved
+      ? "Verifying and preparing source-yard print..."
+      : "Verifying, approving, and preparing source-yard print...", async () => {
       const result = await depApi(`/api/scm/transfer-dependencies/batches/${batchId}/proposals/${proposalId}/approve-print`, {
         method: "POST",
         body: JSON.stringify({
@@ -1436,8 +1442,8 @@ scmDependencyApp.addEventListener("click", async (event) => {
       dependencyPrintRequestIds.delete(String(proposalId));
       if (dependencyBatchViewIsCurrent(batchId, salesOrderId)) dependencyState.batch = result.batch;
       dependencyState.notice = result.printJob?.status === "printed"
-        ? `${proposal.transferOrderRef} was ${reprint ? "reprinted" : "approved and printed"}.`
-        : `${proposal.transferOrderRef} was approved; its picking ticket is ${result.printJob?.status || "queued"} at ${proposal.fromLocation}.`;
+        ? `${proposal.transferOrderRef} was ${reprint ? "reprinted" : "printed"}.`
+        : `${proposal.transferOrderRef} picking ticket is ${result.printJob?.status || "queued"} at ${proposal.fromLocation}.`;
       await loadDependencyCandidates({ preserveSelection: true, refreshInventory: false });
     }, { scope: `proposal:${proposalId}` });
     return;
@@ -1450,11 +1456,11 @@ scmDependencyApp.addEventListener("click", async (event) => {
     const payload = recovering ? null : collectDependencyBatchPayload([card]);
     const confirmation = recovering
       ? "Recover the Transfer Order already created by the interrupted request? This will not create a duplicate if the existing order is found."
-      : "Create this Transfer Order in NetSuite? A successful order cannot be rolled back from this screen.";
+      : "Create and automatically approve this Transfer Order in NetSuite? Printing remains pending until you choose Print.";
     if (!window.confirm(confirmation)) return;
     const batchId = Number(dependencyState.batch.id);
     const salesOrderId = dependencyState.selectedSalesOrderId;
-    await runDependencyAction(recovering ? "Recovering NetSuite Transfer Order..." : "Creating NetSuite Transfer Order...", async () => {
+    await runDependencyAction(recovering ? "Recovering NetSuite Transfer Order..." : "Creating and approving NetSuite Transfer Order...", async () => {
       if (payload) {
         const savedBatch = await depApi(`/api/scm/transfer-dependencies/batches/${batchId}`, {
           method: "PUT",
@@ -1471,7 +1477,7 @@ scmDependencyApp.addEventListener("click", async (event) => {
       dependencyState.notice = recoveredCount
         ? "Existing Transfer Order recovered and linked without creating a duplicate."
         : createdCount
-        ? "Transfer Order created in NetSuite."
+        ? "Transfer Order created and approved in NetSuite. Pending user print."
         : attentionCount
           ? "Transfer Order was created but needs attention; review its NetSuite status below."
           : failedCount

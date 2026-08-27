@@ -1649,7 +1649,7 @@ function sameVendorRouteRate(actual, retained) {
 }
 
 /**
- * Independently recompute a schema-v2 PO/VRMA amount from the active graph.
+ * Independently recompute a schema-v2/v3 PO/VRMA amount from the active graph.
  * Browser-supplied money and the earlier preview are evidence only.
  *
  * @param {Record<string, any>} entry

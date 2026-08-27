@@ -16,7 +16,8 @@ const environmentOpen = Object.freeze({
   driverExecutionEnabled: true,
   billingOperationsEnabled: true,
   customerSyncEnabled: true,
-  netSuiteWritesEnabled: true
+  netSuiteWritesEnabled: true,
+  netSuiteDirectAccessEnabled: true
 });
 
 function flags(enabled = []) {
@@ -36,13 +37,29 @@ function gate(gates, flagKey) {
   return selected;
 }
 
-test("P3-F29 Admin catalog exposes five independent operational controls, seven writable MBT gates, and two locked integration gates", () => {
+test("Admin catalog exposes four default-off completion-owned SO IF gates", () => {
   assert.deepEqual(MBT_ADMIN_GATE_KEYS, [
     "driver_offline_mode",
     "driver_yard_dependency_soft_mode",
     "operator_customer_pickup_photo_required",
     "sales_stock_request_over_availability",
     "special_stock_request_workflow",
+    "operator_netsuite_customer_pickup_if_3445",
+    "operator_netsuite_receiving_ir_3445",
+    "operator_netsuite_delivery_prep_if_3445",
+    "operator_netsuite_customer_pickup_if_2967",
+    "operator_netsuite_receiving_ir_2967",
+    "operator_netsuite_delivery_prep_if_2967",
+    "operator_netsuite_customer_pickup_if_12441",
+    "operator_netsuite_receiving_ir_12441",
+    "operator_netsuite_delivery_prep_if_12441",
+    "operator_netsuite_customer_pickup_if_150",
+    "operator_netsuite_receiving_ir_150",
+    "operator_netsuite_delivery_prep_if_150",
+    "dispatch_netsuite_sales_order_if_3445",
+    "dispatch_netsuite_sales_order_if_2967",
+    "dispatch_netsuite_sales_order_if_12441",
+    "dispatch_netsuite_sales_order_if_150",
     "mbt_enabled",
     "mbt_master_data",
     "mbt_asset_management",
@@ -53,7 +70,14 @@ test("P3-F29 Admin catalog exposes five independent operational controls, seven 
     "mbt_customer_sync",
     "mbt_netsuite_writes"
   ]);
-  assert.deepEqual(MBT_ADMIN_WRITABLE_GATE_KEYS, MBT_ADMIN_GATE_KEYS.slice(0, 12));
+  assert.deepEqual(MBT_ADMIN_WRITABLE_GATE_KEYS, MBT_ADMIN_GATE_KEYS.slice(0, 28));
+  for (const flagKey of MBT_ADMIN_GATE_KEYS.filter((key) => key.startsWith("dispatch_netsuite_sales_order_if_"))) {
+    const selected = gate(materializeMbtAdminGates({ flags: flags([]), environment: environmentOpen }), flagKey);
+    assert.equal(selected.gateGroup, "dispatch_sales_order_fulfillment");
+    assert.equal(selected.transactionType, "IF");
+    assert.equal(selected.configured, false);
+    assert.equal(selected.effective, false);
+  }
 });
 
 test("P3-F29 effective state requires both deployment and database root/specific gates", () => {
@@ -100,6 +124,18 @@ test("P3-F29 effective state requires both deployment and database root/specific
   });
   assert.equal(gate(capabilityClosed, "mbt_enabled").effective, true);
   assert.equal(gate(capabilityClosed, "mbt_master_data").effective, false);
+
+  const directAccessClosed = materializeMbtAdminGates({
+    flags: allEnabled,
+    environment: { ...environmentOpen, netSuiteDirectAccessEnabled: false }
+  });
+  assert.equal(gate(directAccessClosed, "operator_netsuite_delivery_prep_if_12441").configured, true);
+  assert.equal(gate(directAccessClosed, "operator_netsuite_delivery_prep_if_12441").environmentAllowed, false);
+  assert.equal(gate(directAccessClosed, "operator_netsuite_delivery_prep_if_12441").effective, false);
+  assert.equal(gate(directAccessClosed, "dispatch_netsuite_sales_order_if_12441").configured, true);
+  assert.equal(gate(directAccessClosed, "dispatch_netsuite_sales_order_if_12441").environmentAllowed, false);
+  assert.equal(gate(directAccessClosed, "dispatch_netsuite_sales_order_if_12441").effective, false);
+  assert.equal(gate(directAccessClosed, "driver_offline_mode").effective, true);
 });
 
 test("P3-F29 a missing database row remains visible, inactive, locked, and revisionless", () => {

@@ -1781,12 +1781,34 @@ function moveTruckInPlan(truckId, delta) {
   return true;
 }
 
+function poRouteProjectionForOrder(order = {}) {
+  const projection = order?.poRouteProjection;
+  return String(order?.type || "").toUpperCase() === "PO"
+    && projection
+    && Number(projection.version || 0) >= 1
+    ? projection
+    : null;
+}
+
+function routeItemsForOrder(order = {}) {
+  const projection = poRouteProjectionForOrder(order);
+  return Array.isArray(projection?.items) ? projection.items : (order?.items || []);
+}
+
+function routeDropoffsForOrder(order = {}) {
+  const projection = poRouteProjectionForOrder(order);
+  return Array.isArray(projection?.dropoffs) ? projection.dropoffs : (order?.dropoffs || []);
+}
+
 function orderWeightLbs(order) {
-  return Math.round(Number(order?.weight || 0));
+  const projectedWeight = poRouteProjectionForOrder(order)?.weight;
+  return Math.round(Number(projectedWeight ?? order?.weight ?? 0));
 }
 
 function dropoffForStop(order = {}, stop = {}) {
-  const dropoffs = Array.isArray(order?.dropoffs) ? order.dropoffs : [];
+  const dropoffs = typeof routeDropoffsForOrder === "function"
+    ? routeDropoffsForOrder(order)
+    : (order?.dropoffs || []);
   const key = String(stop?.dropoffKey || "");
   if (key) {
     const exact = dropoffs.find((dropoff) => String(dropoff.key || "") === key);
@@ -1801,47 +1823,89 @@ function dropoffForStop(order = {}, stop = {}) {
 }
 
 function dropItemsForStop(order = {}, stop = {}) {
+  const dropoffs = routeDropoffsForOrder(order);
+  const items = routeItemsForOrder(order);
   const stopLineRowIds = Array.isArray(stop?.lineRowIds) ? stop.lineRowIds.filter((value) => value !== null && value !== undefined && String(value) !== "") : [];
   const dropoffLineRowIds = dropoffForStop(order, stop)?.lineRowIds || [];
   const lineRowIds = new Set((stopLineRowIds.length ? stopLineRowIds : dropoffLineRowIds).map(String));
-  if (!lineRowIds.size) return (order?.dropoffs || []).length > 1 ? [] : order?.items || [];
-  return (order?.items || []).filter((item) => lineRowIds.has(String(item.lineRowId)));
+  if (!lineRowIds.size) return dropoffs.length > 1 ? [] : items;
+  return items.filter((item) => lineRowIds.has(String(item.lineRowId)));
 }
 
 function dropWeightLbs(order = {}, stop = {}) {
-  const explicit = stop?.dropWeight ?? dropoffForStop(order, stop)?.weight;
-  if (explicit !== undefined && explicit !== null && Number.isFinite(Number(explicit))) return Math.max(0, Math.round(Number(explicit)));
+  const projection = poRouteProjectionForOrder(order);
+  const dropoff = dropoffForStop(order, stop);
+  if (projection) {
+    const projected = dropoff?.weight;
+    if (projected !== undefined && projected !== null && Number.isFinite(Number(projected))) {
+      return Math.max(0, Math.round(Number(projected)));
+    }
+    const projectedItemWeight = dropItemsForStop(order, stop).reduce((sum, item) => {
+      const lineWeight = Number(item.lineWeight || 0);
+      return sum + (lineWeight || (Number(item.quantity || item.salesQty || 0) * Number(item.itemWeight || 0)));
+    }, 0);
+    if (projectedItemWeight > 0) return Math.round(projectedItemWeight);
+    return routeDropoffsForOrder(order).length > 1 ? 0 : Math.max(0, Math.round(Number(projection.weight || 0)));
+  }
+  const explicit = stop?.dropWeight ?? dropoff?.weight;
+  if (explicit !== undefined && explicit !== null && Number.isFinite(Number(explicit))) {
+    return Math.max(0, Math.round(Number(explicit)));
+  }
   const itemWeight = dropItemsForStop(order, stop).reduce((sum, item) => {
     const lineWeight = Number(item.lineWeight || 0);
     return sum + (lineWeight || (Number(item.quantity || item.salesQty || 0) * Number(item.itemWeight || 0)));
   }, 0);
   if (itemWeight > 0) return Math.round(itemWeight);
-  return (order?.dropoffs || []).length > 1 ? 0 : orderWeightLbs(order);
+  return routeDropoffsForOrder(order).length > 1 ? 0 : orderWeightLbs(order);
+}
+
+function routeDropQuantity(order = {}, stop = {}, field = "pallets") {
+  const projection = poRouteProjectionForOrder(order);
+  const dropoff = dropoffForStop(order, stop);
+  const names = {
+    pallets: ["dropPallets", "pallets"],
+    layers: ["dropLayers", "layers"],
+    sections: ["dropSections", "sections"],
+    pieces: ["dropPieces", "pieces"]
+  }[field] || [];
+  const [stopField, itemField] = names;
+  if (projection) {
+    const projected = dropoff?.[itemField];
+    if (projected !== undefined && projected !== null && Number.isFinite(Number(projected))) {
+      return Math.max(0, Number(projected));
+    }
+    const projectedItemQuantity = dropItemsForStop(order, stop)
+      .reduce((sum, item) => sum + Number(item?.[itemField] || 0), 0);
+    if (projectedItemQuantity > 0) return projectedItemQuantity;
+    return routeDropoffsForOrder(order).length > 1
+      ? 0
+      : Math.max(0, Number(projection[field] || 0));
+  }
+  const explicit = stop?.[stopField] ?? dropoff?.[itemField];
+  if (explicit !== undefined && explicit !== null && Number.isFinite(Number(explicit))) {
+    return Math.max(0, Number(explicit));
+  }
+  const itemQuantity = dropItemsForStop(order, stop)
+    .reduce((sum, item) => sum + Number(item?.[itemField] || 0), 0);
+  if (itemQuantity > 0) return itemQuantity;
+  return routeDropoffsForOrder(order).length > 1
+    ? 0
+    : Number(order?.[field] || 0);
 }
 
 function dropPallets(order = {}, stop = {}) {
-  const explicit = stop?.dropPallets ?? dropoffForStop(order, stop)?.pallets;
-  if (explicit !== undefined && explicit !== null && Number.isFinite(Number(explicit))) return Math.max(0, Number(explicit));
-  const itemPallets = dropItemsForStop(order, stop).reduce((sum, item) => sum + Number(item.pallets || 0), 0);
-  if (itemPallets > 0) return itemPallets;
-  return (order?.dropoffs || []).length > 1 ? 0 : Number(order?.pallets || 0);
+  return routeDropQuantity(order, stop, "pallets");
 }
 
 function dropUnitText(order = {}, stop = {}) {
-  const dropoff = dropoffForStop(order, stop) || {};
-  const items = dropItemsForStop(order, stop);
-  const layers = Number(stop.dropLayers ?? dropoff.layers ?? items.reduce((sum, item) => sum + Number(item.layers || 0), 0));
+  const layers = routeDropQuantity(order, stop, "layers");
   return `${qtyText(dropPallets(order, stop))} PLT${layers ? ` ${qtyText(layers)} LYR` : ""}`;
 }
 
 function dropFootprintPallets(order = {}, stop = {}) {
-  const dropoff = dropoffForStop(order, stop) || {};
-  const items = dropItemsForStop(order, stop);
   const pallets = dropPallets(order, stop);
-  const hasLoose = Number(stop.dropLayers ?? dropoff.layers ?? 0) > 0
-    || Number(stop.dropSections ?? dropoff.sections ?? 0) > 0
-    || Number(stop.dropPieces ?? dropoff.pieces ?? 0) > 0
-    || items.some((item) => Number(item.layers || 0) > 0 || Number(item.sections || 0) > 0 || Number(item.pieces || 0) > 0);
+  const hasLoose = ["layers", "sections", "pieces"]
+    .some((field) => routeDropQuantity(order, stop, field) > 0);
   return pallets + (hasLoose ? 1 : 0);
 }
 
@@ -2167,7 +2231,7 @@ function itemHasQuantity(item = {}) {
 function tooltipItemsForOrder(order, { pickupLocation = "", stop = null } = {}) {
   if (stop?.type === "drop") return dropItemsForStop(order, stop).filter(isOperationalDispatchItem).filter(itemHasQuantity);
   if (pickupLocation && order?.type === "PO") {
-    return (order.items || []).filter(isOperationalDispatchItem).filter(itemHasQuantity);
+    return routeItemsForOrder(order).filter(isOperationalDispatchItem).filter(itemHasQuantity);
   }
   const directItems = pickupLocation ? directPickupItemsForLocation(order, pickupLocation) : [];
   if (directItems.length && !sameDispatchLocation(order.sourceYard || order.outboundLocation, pickupLocation)) {
@@ -2306,19 +2370,25 @@ function linkLineItemsMatch(salesLine = {}, sourceLine = {}) {
   return Boolean(salesName && sourceName && salesName === sourceName);
 }
 
-function poLinkLinesForRef(poRef) {
+function poLinkEntryRefs(entry = {}) {
+  return [...new Set([
+    entry.poRef,
+    entry.originalPoRef,
+    ...(Array.isArray(entry.poAliases) ? entry.poAliases : [])
+  ].map((value) => String(value || "").trim().toLowerCase()).filter(Boolean))];
+}
+
+function poLinkRefMatches(entry = {}, poRef = "") {
   const normalizedRef = String(poRef || "").trim().toLowerCase();
-  if (!normalizedRef) return [];
-  return (poAllocationOptions?.poLines || []).filter(
-    (line) => String(line.poRef || "").trim().toLowerCase() === normalizedRef
-  );
+  return Boolean(normalizedRef && poLinkEntryRefs(entry).includes(normalizedRef));
+}
+
+function poLinkLinesForRef(poRef) {
+  return (poAllocationOptions?.poLines || []).filter((line) => poLinkRefMatches(line, poRef));
 }
 
 function poLinkCandidateMetaForLine(line = {}, poRef) {
-  const normalizedRef = String(poRef || "").trim().toLowerCase();
-  return (line.poCandidates || []).filter(
-    (candidate) => String(candidate.poRef || "").trim().toLowerCase() === normalizedRef
-  );
+  return (line.poCandidates || []).filter((candidate) => poLinkRefMatches(candidate, poRef));
 }
 
 function poLinkCandidateLinesForSalesLine(line = {}, poRef) {
@@ -2474,19 +2544,19 @@ function applyPoLinkDefaultsForRef(orderRef, poRef) {
   const options = poAllocationOptions || {};
   const draft = getLinkModalDraft("po", orderRef);
   const normalizedRef = String(poRef || "").trim().toLowerCase();
-  const selectedPoLines = (options.poLines || []).filter((line) => String(line.poRef || "").trim().toLowerCase() === normalizedRef);
+  const selectedPoLines = (options.poLines || []).filter((line) => poLinkRefMatches(line, normalizedRef));
   if (!normalizedRef || !selectedPoLines.length) return false;
   draft.quantities = {};
   draft.poLineIds = {};
   draft.pendingSoLineKey = "";
   for (const line of options.salesLines || []) {
     const units = availableUnitsForLine(line);
-    const candidateMeta = (line.poCandidates || []).filter((candidate) => String(candidate.poRef || "").trim().toLowerCase() === normalizedRef);
+    const candidateMeta = (line.poCandidates || []).filter((candidate) => poLinkRefMatches(candidate, normalizedRef));
     const candidateIds = new Set(candidateMeta.map((candidate) => String(candidate.poLineId)));
     const candidates = selectedPoLines.filter((poLine) => candidateIds.has(String(poLine.id)));
     const exactIds = new Set(candidateMeta.filter((candidate) => candidate.exactMatch).map((candidate) => String(candidate.poLineId)));
     const exactCandidates = candidates.filter((poLine) => exactIds.has(String(poLine.id)));
-    const selected = exactCandidates.length === 1 ? exactCandidates[0] : (!line.isSpecial && candidates.length === 1 ? candidates[0] : null);
+    const selected = exactCandidates.length === 1 ? exactCandidates[0] : (candidates.length === 1 ? candidates[0] : null);
     const matched = Boolean(selected);
     draft.poLineIds[line.targetLineKey] = selected ? String(selected.id) : "";
     const quantities = {};
@@ -2506,7 +2576,7 @@ function applyPoLinkDefaultsForRef(orderRef, poRef) {
 
 function movementText(order) {
   if (order.type === "PO") {
-    const destinations = [...new Set((order.dropoffs || []).map((dropoff) => dropoff.destinationYard).filter(Boolean))];
+    const destinations = [...new Set(routeDropoffsForOrder(order).map((dropoff) => dropoff.destinationYard).filter(Boolean))];
     const destinationText = destinations.length
       ? destinations.join(" + ")
       : order.destinationYard || order.pickupLocations?.[0] || "our yard";
@@ -3026,6 +3096,31 @@ function splitParentOrderId(order = {}) {
   return /-S\d+$/i.test(orderId) ? orderId.replace(/-S\d+$/i, "") : "";
 }
 
+function specialOrderPalletItemQuantity(items = []) {
+  const lines = Array.isArray(items) ? items.filter(Boolean) : [];
+  const itemLabel = (item) => String(item.sku || item.itemName || item.item_name || "").trim().toUpperCase();
+  const isSpecial = (item) => Number(item.itemId ?? item.item_id) === 2055
+    || /^MBBS[-\s]*SPECIAL(?:\s+ORDER)?$/u.test(itemLabel(item));
+  const isPallet = (item) => Number(item.itemId ?? item.item_id) === 1784 || itemLabel(item) === "PALLET";
+  if (!lines.some(isSpecial)) return null;
+  const palletLines = lines.filter(isPallet);
+  if (!palletLines.length) return null;
+  return Number(palletLines.reduce((sum, item) => {
+    const quantity = Number(item.quantity ?? item.salesQty ?? 0);
+    return sum + (Number.isFinite(quantity) ? Math.max(quantity, 0) : 0);
+  }, 0).toFixed(6));
+}
+
+function effectiveOrderPalletQuantity(order = {}, items = [], childOrderDetails = []) {
+  if (Array.isArray(childOrderDetails) && childOrderDetails.length) {
+    return Number(childOrderDetails.reduce((sum, child) => {
+      const specialPallets = specialOrderPalletItemQuantity(child.items || []);
+      return sum + (specialPallets ?? Number(child.pallets || 0));
+    }, 0).toFixed(6));
+  }
+  return specialOrderPalletItemQuantity(items) ?? Number(order.pallets || 0);
+}
+
 function deliveryInstructionOrderTargets(order = {}) {
   const members = Array.isArray(order.childOrders) && order.childOrders.length
     ? flattenDispatchGroupMembers(order).childOrderDetails
@@ -3124,6 +3219,24 @@ function normalizeOrder(order) {
     order.transitCo?.toYard ? [order.transitCo.toYard] : basePickupLocations
   );
   const dropoffs = normalizePoDropoffs(order, type, items);
+  const rawPoRouteProjection = type === "PO" && order.poRouteProjection?.version
+    ? order.poRouteProjection
+    : null;
+  const poRouteProjection = rawPoRouteProjection ? {
+    ...rawPoRouteProjection,
+    items: Array.isArray(rawPoRouteProjection.items) ? rawPoRouteProjection.items : [],
+    dropoffs: normalizePoDropoffs(
+      { ...order, dropoffs: rawPoRouteProjection.dropoffs || [] },
+      type,
+      rawPoRouteProjection.items || []
+    ),
+    pallets: Number(rawPoRouteProjection.pallets || 0),
+    layers: Number(rawPoRouteProjection.layers || 0),
+    sections: Number(rawPoRouteProjection.sections || 0),
+    pieces: Number(rawPoRouteProjection.pieces || 0),
+    salesQty: Number(rawPoRouteProjection.salesQty || 0),
+    weight: Number(rawPoRouteProjection.weight || 0)
+  } : null;
   return {
     ...order,
     type,
@@ -3138,12 +3251,13 @@ function normalizeOrder(order) {
     windowStart: order.windowStart || "",
     windowEnd: order.windowEnd || "",
     items,
-    pallets: Number(order.pallets || 0),
+    pallets: effectiveOrderPalletQuantity(order, items, groupMembers.childOrderDetails),
     layers: Number(order.layers || 0),
     salesQty: Number(order.salesQty || 0),
     weight: Number(order.weight || 0),
     pickupLocations,
     dropoffs,
+    ...(poRouteProjection ? { poRouteProjection } : {}),
     childOrders: groupMembers.childOrders,
     childOrderDetails: groupMembers.childOrderDetails,
     groupAliases: groupMembers.groupAliases,
@@ -5470,14 +5584,17 @@ function isNetSuiteDispatchOrder(order) {
 
 function supportsTransitCoForOrder(order) {
   if (!order) return false;
-  if (["SO", "TO"].includes(order.type)) return true;
-  return (order.childOrderDetails || []).some((child) => ["SO", "TO"].includes(canonicalDispatchOrderType(child?.type, child?.id)));
+  if (transitSourceOrderType(order)) return true;
+  return (order.childOrderDetails || []).some((child) => Boolean(transitSourceOrderType(child)));
 }
 
 function transitSourceOrderType(order) {
-  if (["SO", "TO"].includes(order?.type)) return order.type;
-  const child = (order?.childOrderDetails || []).find((item) => ["SO", "TO"].includes(canonicalDispatchOrderType(item?.type, item?.id)));
-  return child ? canonicalDispatchOrderType(child.type, child.id) : "";
+  if (!order || isSalesOrderReattempt(order)) return "";
+  if (String(order.sourceTable || order.source_table || "").trim().toLowerCase() === "scm_vrma_orders") return "VRMA";
+  const type = canonicalDispatchOrderType(order.type, order.id);
+  if (["SO", "TO", "CUSTOM"].includes(type)) return type;
+  const child = (order.childOrderDetails || []).find((item) => Boolean(transitSourceOrderType(item)));
+  return child ? transitSourceOrderType(child) : "";
 }
 
 function transitCoSourceRef(coOrder) {
@@ -7293,6 +7410,15 @@ function directPickupWeight(order = {}, entries = order.directPickupManifest || 
 }
 
 function pickupWeightForOrderLocation(order, location) {
+  const scopedItems = tooltipItemsForOrder(order, { pickupLocation: location });
+  const scopedWeight = scopedItems.reduce((sum, item) => {
+    const itemWeight = Number(item.itemWeight || item.item_weight || 0);
+    const quantity = Number(item.quantity || item.salesQty || item.sales_qty || 0);
+    return sum + (itemWeight && quantity
+      ? itemWeight * quantity
+      : Number(item.lineWeight || item.line_weight || 0));
+  }, 0);
+  if (scopedWeight > 0) return Math.round(scopedWeight);
   const direct = directPickupEntriesForLocation(order, location);
   const source = String(order.sourceYard || order.outboundLocation || "");
   if (direct.length && !sameDispatchLocation(source, location)) return directPickupWeight(order, direct);
@@ -10426,6 +10552,7 @@ function renderSelectedOrderActions() {
   const reconciliationBlocked = selected.some((item) => isScmReconciliationBlocked(item));
   const blockedUngroup = groupedCount && groupedOrderTransitCoId(order);
   const dispatchCompleted = order.dispatchCompletionStatus === "completed";
+  const transitCoSupported = selected.length === 1 && supportsTransitCoForOrder(order);
   return `
     <div class="selected-order-actions">
       <span>${escapeHtml(label)}</span>
@@ -10435,6 +10562,7 @@ function renderSelectedOrderActions() {
       ${reconciliationBlocked ? "" : groupedCount ? `<button data-action="ungroup-order" data-order-ref="${escapeHtml(order.id)}" ${blockedUngroup ? `disabled title="Cancel ${escapeHtml(blockedUngroup)} before ungrouping"` : ""} type="button">Ungroup</button>` : selected.length > 1 && !includesCustomOrder ? `<button data-action="open-group-modal" data-order-ref="${escapeHtml(order.id)}" type="button">Group</button>` : ""}
       ${blockedUngroup ? `<span>Cancel ${escapeHtml(blockedUngroup)} before ungrouping</span>` : ""}
       ${isSalesOrderReattempt(order) ? `<span class="chip">System-managed Sales Order re-attempt for ${escapeHtml(order.parentOrderRef || "linked parent")}</span>` : order.type === "CUSTOM" ? `<button data-action="edit-custom-order" data-custom-order-id="${escapeHtml(order.customOrderId || "")}" type="button">Open Custom Order</button>` : ""}
+      ${!reviewOnly && !reconciliationBlocked && !dispatchCompleted && transitCoSupported ? `<button data-action="open-transit-co" data-order-ref="${escapeHtml(order.id)}" type="button">${order.transitCo ? "Manage CO" : "Add CO"}</button>` : ""}
       ${!reviewOnly && !reconciliationBlocked && order.type === "PO" && order.sourceTable !== "scm_vrma_orders" ? `<button data-action="open-po-yard-modal" data-order-ref="${escapeHtml(order.id)}" type="button">Set Yard</button>` : ""}
       ${!reviewOnly && order.type === "SO" ? `<button data-action="open-po-link-modal" data-order-ref="${escapeHtml(order.id)}" type="button">Link PO</button>` : ""}
       ${!reviewOnly && order.type === "SO" ? `<button data-action="open-to-link-modal" data-order-ref="${escapeHtml(order.id)}" type="button">Link TO</button>` : ""}
@@ -11701,10 +11829,13 @@ function renderMap() {
   `;
 }
 
-function renderTransitCoEditor(order) {
+function renderTransitCoEditor(order, { creationChecked = false } = {}) {
   const originalPickup = order.transitOriginalPickupLocations?.[0] || order.transitCo?.fromYard || order.pickupLocations?.[0] || "3445";
   const toYard = order.transitCo?.toYard || "12441";
-  const sourceTypeLabel = order.childOrders?.length ? "grouped order" : order.type === "TO" ? "TO" : "SO";
+  const sourceType = transitSourceOrderType(order);
+  const sourceTypeLabel = order.childOrders?.length
+    ? "grouped order"
+    : ({ SO: "SO", TO: "TO", VRMA: "VRMA", CUSTOM: "Custom Order" })[sourceType] || "order";
   return `
     <section class="transit-co-editor">
       ${order.transitCo ? `
@@ -11714,7 +11845,7 @@ function renderTransitCoEditor(order) {
         </label>
       ` : `
         <label class="transit-check">
-          <input name="createTransitCo" type="checkbox" />
+          <input name="createTransitCo" type="checkbox" ${creationChecked ? "checked" : ""} />
           <span>Initiate CO transit depot order</span>
         </label>
       `}
@@ -11873,9 +12004,7 @@ function renderToLinkModal(order) {
 
 function renderPoLinkMatchBoard(order, salesLines, poLines, draft) {
   const normalizedRef = String(draft.ref || "").trim().toLowerCase();
-  const selectedPoLines = poLines.filter(
-    (line) => String(line.poRef || "").trim().toLowerCase() === normalizedRef
-  );
+  const selectedPoLines = poLines.filter((line) => poLinkRefMatches(line, normalizedRef));
   if (!normalizedRef) {
     return `<div class="po-match-empty">Choose a purchase order to start matching its lines.</div>`;
   }
@@ -12427,6 +12556,31 @@ function renderModal() {
   }
   const order = orderById(modalOrderId) || selectedOrder();
   if (!order) return "";
+  if (modalType === "transit-co") {
+    const sourceType = transitSourceOrderType(order);
+    const sourceLabel = ({ SO: "Sales Order", TO: "Transfer Order", VRMA: "VRMA", CUSTOM: "Custom Order" })[sourceType] || "order";
+    return `
+      <div class="modal-backdrop show">
+        <section class="dispatch-modal">
+          <div class="modal-header">
+            <div>
+              <h2>${order.transitCo ? "Manage" : "Add"} CO Transit</h2>
+              <p>${escapeHtml(order.id)} | ${escapeHtml(sourceLabel)}</p>
+            </div>
+            <button data-action="close-modal" type="button">Close</button>
+          </div>
+          <form class="modal-body" data-form="transit-co">
+            ${renderTransitCoEditor(order, { creationChecked: true })}
+            <div class="modal-status" data-edit-status></div>
+            <div class="modal-footer">
+              <button data-action="close-modal" type="button">Close</button>
+              ${order.transitCo ? "" : `<button class="primary" type="submit">Create CO</button>`}
+            </div>
+          </form>
+        </section>
+      </div>
+    `;
+  }
   if (modalType === "edit-order") {
     const isPurchaseOrderDeliveryOverride = order.type === "PO" && order.sourceTable === "purchase_orders";
     const deliveryAddressValue = isPurchaseOrderDeliveryOverride
@@ -12820,7 +12974,7 @@ function poDropStopDetails(dropoff = {}) {
 
 function addPoDropoffsToLoad(order, loadId, insertIndex = null) {
   const { load } = findLoad(loadId);
-  const dropoffs = Array.isArray(order?.dropoffs) ? order.dropoffs : [];
+  const dropoffs = routeDropoffsForOrder(order);
   if (!load || !dropoffs.length) return false;
   const beforeStops = (load.stops || []).map((stop) => ({ ...stop }));
   const beforeNotice = routeNotice;
@@ -12876,7 +13030,7 @@ function addOrderToLoad(orderId, loadId, type = "drop", location = "", insertInd
   if (type === "drop" && isScmGroupedPoOrder(order)) {
     return addScmGroupedPoToLoad(order, loadId, insertIndex);
   }
-  if (type === "drop" && order.type === "PO" && !stopDetails.dropoffKey && order.dropoffs?.length) {
+  if (type === "drop" && order.type === "PO" && !stopDetails.dropoffKey && routeDropoffsForOrder(order).length) {
     return addPoDropoffsToLoad(order, loadId, insertIndex);
   }
   const transferNormalizedInsertIndex = type === "drop"
@@ -12979,7 +13133,7 @@ function pullExistingStop(orderId, type, location, stopDetails = {}) {
         if (stop.dropLocation && String(stop.dropLocation) === String(stopDetails.dropLocation || "")) return true;
         if (!stop.dropoffKey && !stop.dropLocation) {
           const order = orderById(orderId);
-          const dropoffs = Array.isArray(order?.dropoffs) ? order.dropoffs : [];
+          const dropoffs = routeDropoffsForOrder(order);
           return dropoffs.length <= 1 || String(dropoffs[0]?.key || "") === String(stopDetails.dropoffKey);
         }
         return false;
@@ -13128,7 +13282,11 @@ function splitTotalsForPart(order, partIndex) {
       return next;
     })
     .filter(Boolean);
-  const pallets = items.reduce((sum, item) => sum + Number(item.pallets || 0) + (Number(item.layers || 0) > 0 ? 1 : 0), 0);
+  const specialPallets = specialOrderPalletItemQuantity(items);
+  const pallets = specialPallets ?? items.reduce(
+    (sum, item) => sum + Number(item.pallets || 0) + (Number(item.layers || 0) > 0 ? 1 : 0),
+    0
+  );
   const salesQty = items.reduce((sum, item) => sum + Number(item.quantity || 0), 0);
   const weight = items.reduce((sum, item) => {
     const itemWeight = Number(item.itemWeight || item.item_weight || 0);
@@ -13633,7 +13791,8 @@ function upsertTransitCoForOrder(orderId, fromYard, toYard) {
     sourceOrderId: order.id,
     relatedSoId: order.type === "SO" ? order.id : "",
     relatedToId: order.type === "TO" ? order.id : "",
-    sourceOrderType: order.type,
+    relatedVrmaId: sourceOrderType === "VRMA" ? order.id : "",
+    relatedCustomOrderId: sourceOrderType === "CUSTOM" ? order.id : "",
     transitOrder: true,
     groupKey: `${fromYard} to ${toYard}`,
     childOrders: order.childOrders || [],
@@ -14470,6 +14629,17 @@ app.addEventListener("click", async (event) => {
       : "/dispatch/custom-orders";
     return;
   }
+  if (action === "open-transit-co") {
+    const order = orderById(button.dataset.orderRef || selectedOrderId);
+    if (!order || !supportsTransitCoForOrder(order)) return;
+    if (!ensureDispatchPlanEditor()) return;
+    selectedOrderId = order.id;
+    selectedOrderIds = new Set([order.id]);
+    modalType = "transit-co";
+    modalOrderId = order.id;
+    renderDispatchModalInPlace();
+    return;
+  }
   if (action === "manual-complete-order") {
     const order = orderById(button.dataset.orderRef || selectedOrderId);
     manuallyCompleteSelectedOrder(order, button).catch((error) => {
@@ -14716,7 +14886,14 @@ app.addEventListener("click", async (event) => {
     poAllocationError = "";
     getLinkModalDraft("po", modalOrderId);
     render({ save: false });
-    loadPoAllocationOptions(actionOrderId).catch(() => null);
+    try {
+      if (localPlanDirty || saveQueued || saveInFlight) await saveCurrentPlanNow();
+      await loadPoAllocationOptions(actionOrderId);
+    } catch (error) {
+      poAllocationLoading = false;
+      poAllocationError = `Save the split before linking its PO: ${error.message}`;
+      renderActiveLinkModalInPlace();
+    }
     return;
   }
   if (action === "open-to-link-modal") {
@@ -15929,12 +16106,12 @@ function hideDispatchTooltip(event) {
 
 app.addEventListener("pointerout", hideDispatchTooltip);
 
-app.addEventListener("submit", (event) => {
+app.addEventListener("submit", async (event) => {
   const form = event.target.closest("form");
   if (!form) return;
   if (form.dataset.form === "dispatch-login") return;
   event.preventDefault();
-  if (["po-link", "to-link", "edit-order-details"].includes(form.dataset.form) && !ensureDispatchPlanEditor()) return;
+  if (["po-link", "to-link", "transit-co", "edit-order-details"].includes(form.dataset.form) && !ensureDispatchPlanEditor()) return;
   const data = Object.fromEntries(new FormData(form).entries());
   if (form.dataset.form === "to-link") {
     const order = orderById(modalOrderId);
@@ -16075,6 +16252,51 @@ app.addEventListener("submit", (event) => {
     });
     return;
   }
+  if (form.dataset.form === "transit-co") {
+    const order = orderById(modalOrderId);
+    if (!order || order.transitCo || !supportsTransitCoForOrder(order)) return;
+    const transitFromYard = String(data.transitFromYard || order.pickupLocations?.[0] || "3445").trim();
+    const transitToYard = String(data.transitToYard || "12441").trim();
+    if (data.createTransitCo !== "on") {
+      setEditFormStatus(form, "Confirm that this order should use a CO transit move.", "error");
+      return;
+    }
+    if (!transitFromYard || !transitToYard || sameDispatchLocation(transitFromYard, transitToYard)) {
+      setEditFormStatus(form, "CO pick-from yard and transit depot must be different.", "error");
+      return;
+    }
+    const submitButton = form.querySelector("button[type='submit']");
+    const beforeOrders = structuredClone(orders);
+    const beforeOrderCatalog = structuredClone(orderCatalog);
+    const beforeAssignedEvidence = structuredClone(assignedOrderEvidenceById);
+    if (submitButton) {
+      submitButton.disabled = true;
+      submitButton.textContent = "Creating...";
+    }
+    setEditFormStatus(form, "Creating the local CO...", "info");
+    try {
+      const coOrder = upsertTransitCoForOrder(order.id, transitFromYard, transitToYard);
+      if (!coOrder) throw new Error("The selected CO route is invalid.");
+      await saveTransitCoToServer(orderById(order.id) || order, coOrder);
+      activeOrderType = "CO";
+      requestTargetedOrderPoolRefresh([order.id, coOrder.id]);
+      modalType = "";
+      modalOrderId = "";
+      routeNotice = `${coOrder.id} created. Plan this CO before ${order.id}.`;
+      clearActiveRouteEstimates();
+      commitPlanMutation("co_created");
+    } catch (error) {
+      orders = beforeOrders;
+      orderCatalog = beforeOrderCatalog;
+      assignedOrderEvidenceById = beforeAssignedEvidence;
+      if (submitButton) {
+        submitButton.disabled = false;
+        submitButton.textContent = "Create CO";
+      }
+      setEditFormStatus(form, `CO creation failed: ${error.message}`, "error");
+    }
+    return;
+  }
   if (form.dataset.form === "edit-order-details") {
     const order = orderById(modalOrderId);
     if (!order) return;
@@ -16100,6 +16322,36 @@ app.addEventListener("submit", (event) => {
       submitButton.textContent = "Saving...";
     }
     setEditFormStatus(form, "Saving dispatch info...", "info");
+    const localCoOnlySource = ["VRMA", "CUSTOM"].includes(transitSourceOrderType(order));
+    if (wantsTransitCo && localCoOnlySource) {
+      const beforeOrders = structuredClone(orders);
+      const beforeOrderCatalog = structuredClone(orderCatalog);
+      const beforeAssignedEvidence = structuredClone(assignedOrderEvidenceById);
+      if (submitButton) submitButton.textContent = "Creating...";
+      setEditFormStatus(form, "Creating the local CO...", "info");
+      try {
+        const coOrder = upsertTransitCoForOrder(order.id, transitFromYard, transitToYard);
+        if (!coOrder) throw new Error("The selected CO route is invalid.");
+        await saveTransitCoToServer(orderById(order.id) || order, coOrder);
+        activeOrderType = "CO";
+        requestTargetedOrderPoolRefresh([order.id, coOrder.id]);
+        modalType = "";
+        modalOrderId = "";
+        routeNotice = `${coOrder.id} created. Plan this CO before ${order.id}.`;
+        clearActiveRouteEstimates();
+        commitPlanMutation("co_created");
+      } catch (error) {
+        orders = beforeOrders;
+        orderCatalog = beforeOrderCatalog;
+        assignedOrderEvidenceById = beforeAssignedEvidence;
+        if (submitButton) {
+          submitButton.disabled = false;
+          submitButton.textContent = "Save Dispatch Info";
+        }
+        setEditFormStatus(form, `CO creation failed: ${error.message}`, "error");
+      }
+      return;
+    }
     const detailsEndpoint = isPurchaseOrderDeliveryOverride
       ? `/api/dispatch/orders/${encodeURIComponent(order.id)}/details?response=targeted`
       : `/api/dispatch/orders/${encodeURIComponent(order.id)}/details?response=ack`;

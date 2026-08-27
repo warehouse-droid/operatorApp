@@ -234,9 +234,9 @@ for (const version of [
   "scm-smart-blanket.css?v=20260807-blanket-editor-v1",
   "scm-smart-exclusions.css?v=20260801-planning-pauses-v3",
   "app-sidebar.js?v=20260819-scm-custom-orders-v1",
-  "scm-smart.js?v=20260812-vendor-po-price-sync-v1",
+  "scm-smart.js?v=20260826-phased-planning-v1",
   "scm-smart-blanket.js?v=20260812-blanket-source-items-v1",
-  "scm-smart-proposals.js?v=20260810-manual-priority-v1",
+  "scm-smart-proposals.js?v=20260826-phased-planning-v1",
   "scm-smart-exclusions.js?v=20260801-po-only-pauses-v1",
   "scm-smart-vendor.js?v=20260812-vendor-po-price-sync-v1"
 ]) assert.equal(html.includes(version), true, `Smart SCM must load cache-busted asset ${version}.`);

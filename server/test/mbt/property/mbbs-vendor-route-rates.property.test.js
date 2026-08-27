@@ -9,10 +9,10 @@ import {
   selectMbbsVendorRouteRate
 } from "../../../src/mbt/mbbs-vendor-route-rates.js";
 
-/** @param {number} additionalStopUnitAmountMinor */
-function policy(additionalStopUnitAmountMinor) {
+/** @param {number} additionalStopUnitAmountMinor @param {2 | 3} schemaVersion */
+function policy(additionalStopUnitAmountMinor, schemaVersion) {
   return {
-    schemaVersion: 2,
+    schemaVersion,
     currency: "CAD",
     poVrmaAdditionalStopUnitAmountMinor: additionalStopUnitAmountMinor
   };
@@ -33,29 +33,31 @@ function rate({ localVendorId, baseAmountMinor, vendorYardName = "Generated vend
   };
 }
 
-test("M3-M4 property: 1,000 generated PO/VRMA routes conserve exact cents for either base method", () => {
-  fc.assert(fc.property(
-    fc.constantFrom("vendor_yard_flat", "distance_band"),
-    fc.integer({ min: 0, max: 10_000_000 }),
-    fc.integer({ min: 0, max: 1_000_000 }),
-    fc.integer({ min: 2, max: 100 }),
-    (pricingMethod, baseAmountMinor, additionalStopUnitAmountMinor, routeStopCount) => {
-      const result = calculateMbbsPurchaseRouteAmount({
-        pricingMethod,
-        vendorRouteAmountMinor: pricingMethod === "vendor_yard_flat" ? baseAmountMinor : 0,
-        distanceBandAmountMinor: pricingMethod === "distance_band" ? baseAmountMinor : 0,
-        routeStopCount,
-        mbbsChargingPolicy: policy(additionalStopUnitAmountMinor)
-      });
-      const expectedAdditionalStopCount = routeStopCount - 2;
-      const expectedAdditionalStopFeeMinor = expectedAdditionalStopCount * additionalStopUnitAmountMinor;
-      assert.equal(result.baseAmountMinor, baseAmountMinor);
-      assert.equal(result.additionalStopCount, expectedAdditionalStopCount);
-      assert.equal(result.additionalStopFeeMinor, expectedAdditionalStopFeeMinor);
-      assert.equal(result.calculatedAmountMinor, baseAmountMinor + expectedAdditionalStopFeeMinor);
-      assert.ok(Number.isSafeInteger(result.calculatedAmountMinor));
-    }
-  ), { numRuns: 1_000 });
+test("M3-M4 property: schemas 2 and 3 each conserve exact cents across 1,000 generated PO/VRMA routes", () => {
+  for (const schemaVersion of /** @type {const} */ ([2, 3])) {
+    fc.assert(fc.property(
+      fc.constantFrom("vendor_yard_flat", "distance_band"),
+      fc.integer({ min: 0, max: 10_000_000 }),
+      fc.integer({ min: 0, max: 1_000_000 }),
+      fc.integer({ min: 2, max: 100 }),
+      (pricingMethod, baseAmountMinor, additionalStopUnitAmountMinor, routeStopCount) => {
+        const result = calculateMbbsPurchaseRouteAmount({
+          pricingMethod,
+          vendorRouteAmountMinor: pricingMethod === "vendor_yard_flat" ? baseAmountMinor : 0,
+          distanceBandAmountMinor: pricingMethod === "distance_band" ? baseAmountMinor : 0,
+          routeStopCount,
+          mbbsChargingPolicy: policy(additionalStopUnitAmountMinor, schemaVersion)
+        });
+        const expectedAdditionalStopCount = routeStopCount - 2;
+        const expectedAdditionalStopFeeMinor = expectedAdditionalStopCount * additionalStopUnitAmountMinor;
+        assert.equal(result.baseAmountMinor, baseAmountMinor);
+        assert.equal(result.additionalStopCount, expectedAdditionalStopCount);
+        assert.equal(result.additionalStopFeeMinor, expectedAdditionalStopFeeMinor);
+        assert.equal(result.calculatedAmountMinor, baseAmountMinor + expectedAdditionalStopFeeMinor);
+        assert.ok(Number.isSafeInteger(result.calculatedAmountMinor));
+      }
+    ), { numRuns: 1_000 });
+  }
 });
 
 test("M2-M3 property: 1,000 generated exact pairs are direction-symmetric and partial yard names never match", () => {

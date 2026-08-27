@@ -626,12 +626,14 @@ export function createMbtRouter(dependencies = {}) {
       schemaVersion: "mbt-admin-gates-v1",
       safetyProfile: "local_non_posting",
       environmentRootAllowed: config.mbt.enabled === true,
+      netSuiteDirectAccessAllowed: config.netsuite.directAccessEnabled === true,
       gates: materializeMbtAdminGates({
         flags: await listMbtAdminFeatureFlags(),
         environment: {
           enabled: config.mbt.enabled,
           ...config.mbtPhase3,
-          netSuiteWritesEnabled: config.mbt.netSuiteWritesEnabled
+          netSuiteWritesEnabled: config.mbt.netSuiteWritesEnabled,
+          netSuiteDirectAccessEnabled: config.netsuite.directAccessEnabled
         }
       })
     };

@@ -26,7 +26,7 @@ async function rollbackTest(operation) {
   }
 }
 
-async function installV2Graph({ localVendorId, vendorYardName, vendorYardAddress, destinationYardCode, flatMinor }) {
+async function installV4Graph({ localVendorId, vendorYardName, vendorYardAddress, destinationYardCode, flatMinor }) {
   const suffix = crypto.randomUUID().replaceAll("-", "");
   const cardId = crypto.randomUUID();
   const versionId = crypto.randomUUID();
@@ -59,7 +59,7 @@ async function installV2Graph({ localVendorId, vendorYardName, vendorYardAddress
     `INSERT INTO mbt_rate_card_versions (
        rate_card_version_id, rate_card_id, version_number, status,
        effective_from, validation_snapshot, created_by, updated_by
-     ) VALUES ($1, $2, 3, 'draft', now(), '{}'::jsonb, $3, $3)`,
+     ) VALUES ($1, $2, 4, 'draft', now(), '{}'::jsonb, $3, $3)`,
     [versionId, cardId, ACTOR.operatorId]
   );
   await query(
@@ -76,13 +76,16 @@ async function installV2Graph({ localVendorId, vendorYardName, vendorYardAddress
   );
   await query(
     `UPDATE mbt_mbbs_rate_card_policies
-        SET schema_version = 2,
+        SET schema_version = 3,
             direct_pickup_unit_amount_minor = 10000,
             po_vrma_additional_stop_unit_amount_minor = 10000,
             po_vrma_base_charge_basis = 'vendor_yard_pair_then_distance_band',
             vrma_direction_basis = 'same_pair_reverse',
             po_vrma_additional_stop_basis = 'each_distinct_stop_after_base_pair',
             endpoint_override_basis = 'flat_default_user_may_choose_distance',
+            to_replenishment_additional_drop_unit_amount_minor = 10000,
+            to_replenishment_multi_drop_basis =
+              'longest_origin_drop_plus_each_distinct_drop_after_first',
             updated_by = $2, updated_at = now(), revision = revision + 1
       WHERE rate_card_version_id = $1`,
     [versionId, ACTOR.operatorId]
@@ -151,7 +154,7 @@ async function driverRoute({ reference, sourceType, pickup, drops, suffix }) {
   return loadId;
 }
 
-test("M2-M6 exact PO/VRMA flat rates survive route failure; override choice and distance fallback remain server-owned", async () => {
+test("M2-M6 schema-v3 exact PO/VRMA flat rates survive route failure; override choice and distance fallback remain server-owned", async () => {
   await rollbackTest(async () => {
     const suffix = crypto.randomUUID().replaceAll("-", "").toUpperCase();
     const localVendorName = `Vendor Rate ${suffix}`;
@@ -175,7 +178,7 @@ test("M2-M6 exact PO/VRMA flat rates survive route failure; override choice and 
     );
     assert.equal(mbbsYard.rowCount, 1);
     const destinationAddress = String(mbbsYard.rows[0].address);
-    const versionId = await installV2Graph({
+    const versionId = await installV4Graph({
       localVendorId,
       vendorYardName,
       vendorYardAddress: vendorAddress,

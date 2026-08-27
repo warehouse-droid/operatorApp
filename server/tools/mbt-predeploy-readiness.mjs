@@ -121,7 +121,10 @@ export const REQUIRED_MBT_P3_MIGRATIONS = Object.freeze([
   "174_driver_pwa_historical_assist.sql",
   "175_mbt_mbbs_cross_charge_route_pricing_v4.sql",
   "176_special_stock_request_workflow.sql",
-  "177_special_stock_request_two_stage_handoff.sql"
+  "177_special_stock_request_two_stage_handoff.sql",
+  "178_operator_netsuite_posting_gates.sql",
+  "179_sales_order_reattempt_current_item_corrections.sql",
+  "180_sales_order_completion_fulfillment.sql"
 ]);
 
 export const REQUIRED_MBT_P3_FLAGS = Object.freeze([

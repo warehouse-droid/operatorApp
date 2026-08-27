@@ -1,4 +1,8 @@
 import { query } from "./db.js";
+import {
+  listLatestSalesOrderReattemptItemCorrections,
+  projectSalesOrderReattemptLineSnapshot
+} from "./sales-order-reattempt-correction-repository.js";
 
 const MAX_REF_LENGTH = 100;
 const MAX_LOCATION_LENGTH = 500;
@@ -15,6 +19,24 @@ function inputError(message, code = "DISPATCH_CUSTOM_ORDER_INVALID") {
 
 function conflictError(message, code = "DISPATCH_CUSTOM_ORDER_CONFLICT") {
   return Object.assign(new Error(message), { status: 409, code });
+}
+
+async function assertNoActiveTransitCo(refNumber) {
+  const result = await query(
+    `SELECT co_ref, status
+       FROM local_co_orders
+      WHERE lower(btrim(source_order_ref)) = lower(btrim($1))
+        AND status <> 'cancelled'
+      ORDER BY updated_at DESC, id DESC
+      LIMIT 1`,
+    [String(refNumber || "").trim()]
+  );
+  const activeCo = result.rows[0];
+  if (!activeCo) return;
+  throw conflictError(
+    `Cancel ${activeCo.co_ref} before editing or cancelling this Custom Order.`,
+    "DISPATCH_CUSTOM_ORDER_ACTIVE_CO"
+  );
 }
 
 function requiredText(value, label, maxLength) {
@@ -76,7 +98,18 @@ function customOrderInput(input = {}) {
   };
 }
 
-function rowToCustomOrder(row = {}) {
+function rowToCustomOrder(row = {}, corrections = []) {
+  const rawLineSnapshot = Array.isArray(row.line_snapshot) ? row.line_snapshot : [];
+  const lineSnapshot = row.order_kind === "sales_order_reattempt"
+    ? projectSalesOrderReattemptLineSnapshot(rawLineSnapshot, corrections)
+    : rawLineSnapshot;
+  const transitCo = row.transit_co_ref ? {
+    id: row.transit_co_ref,
+    fromYard: row.transit_co_from_yard || row.pickup_location || "",
+    toYard: row.transit_co_to_yard || "",
+    sourceOrderId: row.ref_number || "",
+    source: "local-db"
+  } : null;
   return {
     id: String(row.id || ""),
     refNumber: row.ref_number || "",
@@ -104,16 +137,31 @@ function rowToCustomOrder(row = {}) {
     reloadCycleId: row.reload_cycle_id === null || row.reload_cycle_id === undefined
       ? null
       : Number(row.reload_cycle_id),
-    lineSnapshot: Array.isArray(row.line_snapshot) ? row.line_snapshot : [],
+    lineSnapshot,
+    identityCorrections: corrections,
     palletQty: Number(row.pallet_qty || 0),
     layerQty: Number(row.layer_qty || 0),
     sectionQty: Number(row.section_qty || 0),
     pieceQty: Number(row.piece_qty || 0),
     salesQty: Number(row.sales_qty || 0),
+    transitCo,
     billingDisposition: row.order_kind === "sales_order_reattempt"
       ? SALES_ORDER_REATTEMPT_BILLING_DISPOSITION
       : row.billing_disposition || "standard"
   };
+}
+
+async function mapCustomOrderRows(rows = []) {
+  const corrections = await listLatestSalesOrderReattemptItemCorrections(
+    rows.filter((row) => row.order_kind === "sales_order_reattempt").map((row) => row.id)
+  );
+  const byOrder = new Map();
+  for (const correction of corrections) {
+    const existing = byOrder.get(correction.childOrderId) || [];
+    existing.push(correction);
+    byOrder.set(correction.childOrderId, existing);
+  }
+  return rows.map((row) => rowToCustomOrder(row, byOrder.get(Number(row.id)) || []));
 }
 
 async function assertReferenceAvailable(refNumber, { excludeCustomOrderId = null } = {}) {
@@ -175,23 +223,34 @@ export async function listDispatchCustomOrders({
   const term = String(search || "").trim().slice(0, 120);
   const cleanLimit = Math.min(Math.max(Number(limit) || 500, 1), 2000);
   const result = await query(
-    `SELECT *
-      FROM dispatch_custom_orders
-      WHERE ($1::boolean OR status <> 'cancelled')
-        AND ($4::boolean OR status <> 'completed')
+    `SELECT custom_order.*,
+            active_co.co_ref AS transit_co_ref,
+            active_co.from_location AS transit_co_from_yard,
+            active_co.to_location AS transit_co_to_yard
+       FROM dispatch_custom_orders custom_order
+       LEFT JOIN LATERAL (
+         SELECT co.co_ref, co.from_location, co.to_location
+           FROM local_co_orders co
+          WHERE co.source_order_ref = custom_order.ref_number
+            AND co.status <> 'cancelled'
+          ORDER BY co.updated_at DESC, co.id DESC
+          LIMIT 1
+       ) active_co ON true
+      WHERE ($1::boolean OR custom_order.status <> 'cancelled')
+        AND ($4::boolean OR custom_order.status <> 'completed')
         AND (
           $2::text = ''
-          OR ref_number ILIKE '%' || $2 || '%'
-          OR pickup_location ILIKE '%' || $2 || '%'
-          OR dropoff_location ILIKE '%' || $2 || '%'
-          OR order_details ILIKE '%' || $2 || '%'
-          OR created_by ILIKE '%' || $2 || '%'
+          OR custom_order.ref_number ILIKE '%' || $2 || '%'
+          OR custom_order.pickup_location ILIKE '%' || $2 || '%'
+          OR custom_order.dropoff_location ILIKE '%' || $2 || '%'
+          OR custom_order.order_details ILIKE '%' || $2 || '%'
+          OR custom_order.created_by ILIKE '%' || $2 || '%'
         )
-      ORDER BY created_at DESC, id DESC
+      ORDER BY custom_order.created_at DESC, custom_order.id DESC
       LIMIT $3`,
     [Boolean(includeCancelled), term, cleanLimit, Boolean(includeCompleted)]
   );
-  return result.rows.map(rowToCustomOrder);
+  return mapCustomOrderRows(result.rows);
 }
 
 export async function getDispatchCustomOrder(id) {
@@ -201,7 +260,7 @@ export async function getDispatchCustomOrder(id) {
       WHERE id = $1`,
     [id]
   );
-  return result.rowCount ? rowToCustomOrder(result.rows[0]) : null;
+  return result.rowCount ? (await mapCustomOrderRows(result.rows))[0] : null;
 }
 
 export async function getDispatchCustomOrderForUpdate(id) {
@@ -212,7 +271,7 @@ export async function getDispatchCustomOrderForUpdate(id) {
       FOR UPDATE`,
     [id]
   );
-  return result.rowCount ? rowToCustomOrder(result.rows[0]) : null;
+  return result.rowCount ? (await mapCustomOrderRows(result.rows))[0] : null;
 }
 
 export async function createDispatchCustomOrder(input = {}, actor = "") {
@@ -253,6 +312,7 @@ export async function updateDispatchCustomOrder(id, input = {}, actor = "") {
   if (current.status !== "open") {
     throw conflictError("Only open Custom Orders can be edited.", "DISPATCH_CUSTOM_ORDER_NOT_EDITABLE");
   }
+  await assertNoActiveTransitCo(current.refNumber);
   const normalized = customOrderInput({
     refNumber: current.refNumber,
     pickupLocation: input.pickupLocation ?? input.pickup_location ?? current.pickupLocation,
@@ -306,6 +366,7 @@ export async function cancelDispatchCustomOrder(id, actor = "") {
     );
   }
   if (current.status === "cancelled") return current;
+  await assertNoActiveTransitCo(current.refNumber);
   const result = await query(
     `UPDATE dispatch_custom_orders
         SET status = 'cancelled',
@@ -342,7 +403,14 @@ export async function completeDispatchCustomOrders(refNumbers = [], actor = "") 
 
 export function dispatchOrderFromCustomOrder(customOrder = {}) {
   const pickupLocation = String(customOrder.pickupLocation || "").trim();
-  const ownYardPickup = ["3445", "2967", "12441", "150"].includes(pickupLocation);
+  const transitCo = customOrder.transitCo?.id && customOrder.transitCo?.toYard
+    ? {
+        ...customOrder.transitCo,
+        sourceOrderId: customOrder.refNumber
+      }
+    : null;
+  const effectivePickupLocation = String(transitCo?.toYard || pickupLocation).trim();
+  const ownYardPickup = ["3445", "2967", "12441", "150"].includes(effectivePickupLocation);
   const salesOrderReattempt = customOrder.orderKind === "sales_order_reattempt";
   const genericItem = {
     lineRowId: `custom:${customOrder.id}`,
@@ -380,7 +448,17 @@ export function dispatchOrderFromCustomOrder(customOrder = {}) {
         lineWeight: Number(line.lineWeight || 0),
         reason: line.reason || "",
         historicalSku: line.historicalSku || line.sku || "",
+        historicalItemId: line.historicalItemId ?? line.itemId ?? null,
+        historicalItemName: line.historicalItemName || line.historicalSku || line.sku || "",
+        historicalDescription: line.historicalDescription || "",
         currentSku: line.currentSku || "",
+        currentItemId: line.currentItemId ?? null,
+        currentItemName: line.currentItemName || line.currentSku || "",
+        effectiveSku: line.effectiveSku || line.sku || "",
+        effectiveItemId: line.effectiveItemId ?? line.itemId ?? null,
+        identityCorrected: Boolean(line.identityCorrected),
+        identityCorrectionReason: line.identityCorrectionReason || "",
+        identityCorrectedAt: line.identityCorrectedAt || null,
         skuMismatch: Boolean(line.skuMismatch),
         itemMismatch: Boolean(line.itemMismatch)
       }))
@@ -409,10 +487,10 @@ export function dispatchOrderFromCustomOrder(customOrder = {}) {
       ? `Sales Order re-attempt · ${customOrder.parentOrderRef || "linked parent"}`
       : "Custom Order",
     address: customOrder.dropoffLocation,
-    sourceYard: pickupLocation,
-    sourceAddress: pickupLocation,
+    sourceYard: effectivePickupLocation,
+    sourceAddress: effectivePickupLocation,
     defaultSourceAddress: pickupLocation,
-    pickupAddressOverride: ownYardPickup ? "" : pickupLocation,
+    pickupAddressOverride: ownYardPickup ? "" : effectivePickupLocation,
     destinationAddress: customOrder.dropoffLocation,
     destinationYard: customOrder.dropoffLocation,
     expectedDeliveryDate: "",
@@ -423,7 +501,10 @@ export function dispatchOrderFromCustomOrder(customOrder = {}) {
     stopMinutes: customOrder.stopMinutes === null || customOrder.stopMinutes === undefined
       ? null
       : Number(customOrder.stopMinutes),
-    pickupLocations: [pickupLocation],
+    pickupLocations: [effectivePickupLocation],
+    transitOriginalPickupLocations: transitCo ? [pickupLocation] : [],
+    transitOriginalSourceYard: transitCo ? pickupLocation : undefined,
+    transitCo,
     dropoffs: [],
     pallets: salesOrderReattempt ? Number(customOrder.palletQty || 0) : 0,
     layers: salesOrderReattempt ? Number(customOrder.layerQty || 0) : 0,
@@ -579,6 +660,10 @@ function canonicalCustomOrderSnapshot(customOrder, clientOrder = {}, assigned = 
   return snapshot;
 }
 
+function customOrderDispatchPickupLocation(customOrder = {}) {
+  return String(customOrder.transitCo?.toYard || customOrder.pickupLocation || "").trim();
+}
+
 function customStopError(customOrder, message, code = "DISPATCH_CUSTOM_ORDER_STRUCTURE_INVALID") {
   return new DispatchCustomOrderPlanError(message, code, {
     customOrderId: String(customOrder?.id || ""),
@@ -611,7 +696,7 @@ function canonicalizeCustomStops(plan = {}, customMappings = []) {
             ...stop,
             loadId: load.id || "",
             orderId: customOrder.refNumber,
-            location: customOrder.pickupLocation
+            location: customOrderDispatchPickupLocation(customOrder)
           };
           delete next.dropLocation;
           delete next.drop_location;
@@ -665,6 +750,7 @@ function canonicalizeCustomStops(plan = {}, customMappings = []) {
       for (const { mapping } of mappingsInDropOrder) {
         const { customOrder } = mapping;
         const customRef = normalizedRef(customOrder.refNumber);
+        const pickupLocation = customOrderDispatchPickupLocation(customOrder);
         const drop = stops.find((stop) =>
           stop?.type === "drop" && normalizedRef(stop.orderId) === customRef
         );
@@ -672,7 +758,7 @@ function canonicalizeCustomStops(plan = {}, customMappings = []) {
         const sharedPickupIndex = stops.findIndex((stop, index) =>
           index < dropIndex
           && stop?.type === "pick"
-          && normalizedRef(stop.location) === normalizedRef(customOrder.pickupLocation)
+          && normalizedRef(stop.location) === normalizedRef(pickupLocation)
         );
         const ownedPickupIndex = stops.findIndex((stop) =>
           stop?.type === "pick" && normalizedRef(stop.orderId) === customRef
@@ -701,7 +787,7 @@ function canonicalizeCustomStops(plan = {}, customMappings = []) {
           loadId: load.id || "",
           orderId: customOrder.refNumber,
           type: "pick",
-          location: customOrder.pickupLocation
+          location: pickupLocation
         });
       }
       return { ...load, stops };
@@ -744,14 +830,25 @@ export async function canonicalizeDispatchCustomOrdersInPlan(plan = {}, {
   }
 
   const result = await query(
-    `SELECT *
-       FROM dispatch_custom_orders
-      WHERE id::text = ANY($1::text[])
-         OR lower(btrim(ref_number)) = ANY($2::text[])
-      ${lockRows ? "FOR UPDATE" : ""}`,
+    `SELECT custom_order.*,
+            active_co.co_ref AS transit_co_ref,
+            active_co.from_location AS transit_co_from_yard,
+            active_co.to_location AS transit_co_to_yard
+       FROM dispatch_custom_orders custom_order
+       LEFT JOIN LATERAL (
+         SELECT co.co_ref, co.from_location, co.to_location
+           FROM local_co_orders co
+          WHERE co.source_order_ref = custom_order.ref_number
+            AND co.status <> 'cancelled'
+          ORDER BY co.updated_at DESC, co.id DESC
+          LIMIT 1
+       ) active_co ON true
+      WHERE custom_order.id::text = ANY($1::text[])
+         OR lower(btrim(custom_order.ref_number)) = ANY($2::text[])
+      ${lockRows ? "FOR UPDATE OF custom_order" : ""}`,
     [candidateIds, candidateRefs]
   );
-  const customOrders = result.rows.map(rowToCustomOrder);
+  const customOrders = await mapCustomOrderRows(result.rows);
   const byId = new Map(customOrders.map((order) => [String(order.id), order]));
   const byRef = new Map(customOrders.map((order) => [normalizedRef(order.refNumber), order]));
   const previousById = new Map(

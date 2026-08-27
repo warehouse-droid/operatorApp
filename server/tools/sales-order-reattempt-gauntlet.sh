@@ -22,7 +22,7 @@ mkdir -p "$reattempt_artifact_dir"
 : >"$reattempt_report"
 
 reattempt_cleanup() {
-  "${reattempt_compose[@]}" --profile tools down --volumes --remove-orphans >/dev/null 2>&1 || true
+  "${reattempt_compose[@]}" --profile tools --profile runtime --profile e2e down --volumes --remove-orphans >/dev/null 2>&1 || true
 }
 
 reattempt_finish() {
@@ -67,21 +67,35 @@ reattempt_source_state="$({
   sha256sum \
     migrations/139_sales_order_reload_cycles.sql \
     migrations/164_sales_order_partial_reattempt.sql \
+    migrations/179_sales_order_reattempt_current_item_corrections.sql \
     src/sales-order-reload.js \
     src/sales-order-reload-repository.js \
+    src/sales-order-reattempt-correction.js \
+    src/sales-order-reattempt-correction-repository.js \
+    src/sales-order-reattempt-correction-mutation-harness.js \
+    src/sales-order-reattempt-mutation-harness.js \
     src/delivery-repository.js \
     src/dispatch-custom-order-repository.js \
     src/dispatch-planner-v2-repository.js \
     src/mbt/mbbs-billing-candidate-service.js \
     src/server.js \
     public/control.js \
+    public/control.html \
     public/control.css \
     public/dispatch.js \
     test/mbt/unit/sales-order-reattempt-policy.red.test.js \
+    test/mbt/unit/sales-order-reattempt-correction.red.test.js \
     test/mbt/property/sales-order-reattempt-quantity.property.test.js \
+    test/mbt/property/sales-order-reattempt-correction.property.test.js \
+    test/mbt/adversarial/sales-order-reattempt-correction-adversarial.test.js \
     test/mbt/integration/sales-order-reattempt.red.test.js \
+    test/mbt/integration/sales-order-reattempt-correction-http.test.js \
+    test/mbt/concurrency/sales-order-reattempt-correction-concurrency.test.js \
+    test/mbt/e2e/sales-order-reattempt-correction.spec.js \
+    test/support/sales-order-reattempt-correction-fixture.mjs \
     test/dispatch/frontend/sales-order-reattempt-ui.contract.test.js \
     test/sales-order-reattempt-spec.md \
+    test/sales-order-reattempt-current-item-correction-spec.md \
     tools/sales-order-reattempt-gauntlet.sh \
     package.json
 } | sha256sum | awk '{print $1}')"
@@ -94,7 +108,7 @@ reattempt_source_state="$({
 } | tee -a "$reattempt_report"
 
 reattempt_cleanup
-"${reattempt_compose[@]}" build test 2>&1 | tee -a "$reattempt_report"
+"${reattempt_compose[@]}" --profile tools --profile runtime --profile e2e build test app e2e 2>&1 | tee -a "$reattempt_report"
 "${reattempt_compose[@]}" up -d --wait db 2>&1 | tee -a "$reattempt_report"
 "${reattempt_compose[@]}" --profile tools run --rm migrate 2>&1 | tee -a "$reattempt_report"
 
@@ -108,11 +122,22 @@ reattempt_run test:sales-order-reload-photo-entry
 reattempt_run test:sales-order-reload-idempotency
 reattempt_run mutate:sales-order-reattempt
 reattempt_run coverage:sales-order-reattempt
+reattempt_run lint:sales-order-reattempt
+reattempt_run secrets:sales-order-reattempt
+reattempt_run typecheck:mbt
 reattempt_run syntax:legacy
 reattempt_run_command "server syntax" node --check src/server.js
 reattempt_run_command "re-attempt repository syntax" node --check src/sales-order-reload-repository.js
+reattempt_run_command "re-attempt correction syntax" node --check src/sales-order-reattempt-correction.js
+reattempt_run_command "re-attempt correction repository syntax" node --check src/sales-order-reattempt-correction-repository.js
 reattempt_run_command "delivery repository syntax" node --check src/delivery-repository.js
 reattempt_run_command "custom-order repository syntax" node --check src/dispatch-custom-order-repository.js
 reattempt_run_command "billing candidate syntax" node --check src/mbt/mbbs-billing-candidate-service.js
+
+reattempt_failed_suite="test:sales-order-reattempt:e2e"
+"${reattempt_compose[@]}" --profile runtime up -d --wait app 2>&1 | tee -a "$reattempt_report"
+"${reattempt_compose[@]}" --profile runtime --profile e2e run --rm e2e \
+  npm run test:sales-order-reattempt:e2e 2>&1 | tee -a "$reattempt_report"
+reattempt_failed_suite=""
 
 echo "Sales Order partial re-attempt gauntlet passed." | tee -a "$reattempt_report"

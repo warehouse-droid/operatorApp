@@ -6,9 +6,11 @@ import { fileURLToPath } from "node:url";
 
 const serverRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const repositoryPath = path.join(serverRoot, "src/scm-reconciliation-repository.js");
+const dispatchRepositoryPath = path.join(serverRoot, "src/dispatch-repository.js");
 const serverPath = path.join(serverRoot, "src/server.js");
 const originals = new Map([
   [repositoryPath, await readFile(repositoryPath, "utf8")],
+  [dispatchRepositoryPath, await readFile(dispatchRepositoryPath, "utf8")],
   [serverPath, await readFile(serverPath, "utf8")]
 ]);
 
@@ -72,17 +74,19 @@ const mutations = [
     }
   },
   {
-    name: "discard the calculated terminal status in the PO Split response",
-    file: serverPath,
-    test: "src/scm-order-visibility-integration-harness.js",
-    expectedFailure: /Completed reconciliation must remain terminal despite a newer manual Queued status/i,
+    name: "discard exact Driver completion from the PO Split response",
+    file: dispatchRepositoryPath,
+    args: [
+      "--test",
+      "--test-concurrency=1",
+      "test/dispatch/integration/scm-po-split-editing.test.js"
+    ],
+    expectedFailure: /PO Split derives Completed from exact canonical Driver completion without contaminating a sibling/i,
     mutate(source) {
-      return replaceOccurrence(
+      return replaceExact(
         source,
-        'status: row.calculatedStatus || row.reconciliationApplicationStatus || row.status || order.scm?.status || "",',
-        'status: row.status || order.scm?.status || "",',
-        1,
-        2
+        "  const completion = ownRef ? completionByRef.get(ownRef) : null;",
+        "  const completion = null;"
       );
     }
   }
@@ -93,7 +97,7 @@ try {
   for (const mutation of mutations) {
     const original = originals.get(mutation.file);
     await writeFile(mutation.file, mutation.mutate(original));
-    const result = spawnSync(process.execPath, [mutation.test], {
+    const result = spawnSync(process.execPath, mutation.args || [mutation.test], {
       cwd: serverRoot,
       encoding: "utf8",
       env: process.env,

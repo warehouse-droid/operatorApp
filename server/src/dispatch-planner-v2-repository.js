@@ -135,7 +135,7 @@ function slimAssignedOrder(order = {}) {
     "originalOrderId", "sourceOrderId", "relatedSoId", "originalPoRef", "sourcePoRef",
     "sourcePoRefs", "correspondingPoRefs", "childOrders",
     "childOrderDetails", "groupAliases", "transitCo", "transitOriginalPickupLocations",
-    "transitOriginalSourceYard", "poPickupManifest", "orderDependencies", "dependencyLabels",
+    "transitOriginalSourceYard", "poPickupManifest", "poRouteProjection", "orderDependencies", "dependencyLabels",
     "dependencyDirectPickup", "dependencyWaitingForTransfer", "dependencyAttention",
     "dependencyUncovered", "dependencyUncoveredQuantity", "planOwned", "isSplit", "isGrouped",
     "groupPlanId", "groupPlanDate",

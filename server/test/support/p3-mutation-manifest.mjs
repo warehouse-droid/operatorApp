@@ -7,6 +7,17 @@
  */
 export const P3_DEDICATED_MUTATION_RUNNERS = Object.freeze([
   Object.freeze({
+    runner: "run-auto-transfer-auto-approval-mutations.mjs",
+    adminUrlEnvironment: null,
+    sourcePaths: Object.freeze([
+      "public/scm-transfer-dependencies.js",
+      "src/auto-transfer-approval-policy.js",
+      "src/order-dependency-repository.js",
+      "src/server.js",
+      "src/transfer-dependency-netsuite.js"
+    ])
+  }),
+  Object.freeze({
     runner: "run-customer-charge-mutations.mjs",
     adminUrlEnvironment: null,
     sourcePaths: Object.freeze([
@@ -76,6 +87,16 @@ export const P3_DEDICATED_MUTATION_RUNNERS = Object.freeze([
     sourcePaths: Object.freeze([
       "src/dispatch-planner-optimization.js",
       "src/dispatch-planner-replay.js"
+    ])
+  }),
+  Object.freeze({
+    runner: "run-dispatch-po-route-residual-mutations.mjs",
+    adminUrlEnvironment: null,
+    sourcePaths: Object.freeze([
+      "src/dispatch-load-assignment.js",
+      "src/dispatch-po-route-projection.js",
+      "src/driver-repository.js",
+      "src/scm-dependency-plan-reconciler.js"
     ])
   }),
   Object.freeze({
@@ -188,6 +209,38 @@ export const P3_DEDICATED_MUTATION_RUNNERS = Object.freeze([
       "public/operator.js",
       "src/delivery-repository.js",
       "src/operator-customer-pickup-photo-policy.js",
+      "src/server.js"
+    ])
+  }),
+  Object.freeze({
+    runner: "run-operator-linked-fulfillment-mutations.mjs",
+    adminUrlEnvironment: null,
+    sourcePaths: Object.freeze([
+      "migrations/180_sales_order_completion_fulfillment.sql",
+      "src/delivery-repository.js",
+      "src/operator-linked-quantity-domain.js",
+      "src/operator-netsuite-posting-admission.js",
+      "src/operator-netsuite-posting-targets.js",
+      "src/sales-order-auto-fulfillment-domain.js",
+      "src/sales-order-auto-fulfillment-netsuite-adapter.js",
+      "src/sales-order-auto-fulfillment-repository.js",
+      "src/sales-order-auto-fulfillment-service.js"
+    ])
+  }),
+  Object.freeze({
+    runner: "run-operator-netsuite-posting-mutations.mjs",
+    adminUrlEnvironment: null,
+    sourcePaths: Object.freeze([
+      "migrations/178_operator_netsuite_posting_gates.sql",
+      "src/operator-netsuite-posting-adapter.js",
+      "src/operator-netsuite-posting-admission.js",
+      "src/operator-netsuite-posting-domain.js",
+      "src/operator-netsuite-posting-finalizer.js",
+      "src/operator-netsuite-posting-policy.js",
+      "src/operator-netsuite-posting-repository.js",
+      "src/operator-netsuite-posting-runtime.js",
+      "src/operator-netsuite-posting-service.js",
+      "src/operator-netsuite-posting-targets.js",
       "src/server.js"
     ])
   }),

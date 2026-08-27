@@ -24,6 +24,15 @@ import { getDeliveryInstructionsForDriverOrderIds } from "./delivery-instruction
 import { assertNoClosedNetSuiteOrders, listClosedNetSuiteOrders } from "./netsuite-closed-order-repository.js";
 import { operationalPlanOrderRefs, scrubOrderRefsFromOperationalPlan } from "./netsuite-closed-order-policy.js";
 import { assertDriverPlanExecutionDate } from "./driver-plan-date-policy.js";
+import {
+  dispatchOrderFromCustomOrder,
+  listDispatchCustomOrders
+} from "./dispatch-custom-order-repository.js";
+import { getSalesOrderReattemptDriverReadiness } from "./sales-order-reattempt-correction-repository.js";
+import {
+  purchaseOrderRouteItems,
+  purchaseOrderRouteProjection
+} from "./dispatch-po-route-projection.js";
 
 const YARD_ADDRESSES = {
   "3445": "3445 Kennedy Road, Toronto, ON",
@@ -62,6 +71,22 @@ function isPhotoReference(value) {
 
 function driverKey(value) {
   return String(value || "").trim().toLowerCase();
+}
+
+export function canonicalDriverPlanOrderType(planOrder = null, fallback = "") {
+  const sourceTable = String(
+    planOrder?.sourceTable
+    || planOrder?.source_table
+    || ""
+  ).trim().toLowerCase();
+  if (sourceTable === "scm_vrma_orders") return "VRMA";
+  return String(
+    planOrder?.type
+    || planOrder?.orderType
+    || planOrder?.order_type
+    || fallback
+    || ""
+  ).trim().toUpperCase();
 }
 
 function normalizeSamsaraAccounts(accounts = {}) {
@@ -189,10 +214,23 @@ async function overlayLiveVrmaRouteDetails(plans = []) {
   if (!liveByRef.size) return plans;
 
   for (const plan of plans) {
+    const effectivePickupByRef = new Map();
     for (const order of plan.orders || []) {
-      const pickup = liveByRef.get(String(order?.id || "").trim().toLowerCase());
-      if (!pickup) continue;
+      const refKey = String(order?.id || "").trim().toLowerCase();
+      const livePickup = liveByRef.get(refKey);
+      if (!livePickup) continue;
+      const pickup = String(order?.transitCo?.toYard || livePickup).trim();
+      effectivePickupByRef.set(refKey, pickup);
       const address = yardAddress(pickup);
+      if (order?.transitCo?.toYard) {
+        order.transitOriginalPickupLocations = Array.isArray(order.transitOriginalPickupLocations)
+          && order.transitOriginalPickupLocations.length
+          ? order.transitOriginalPickupLocations
+          : [String(order.transitCo.fromYard || livePickup).trim()].filter(Boolean);
+        order.transitOriginalSourceYard = order.transitOriginalSourceYard
+          || order.transitCo.fromYard
+          || livePickup;
+      }
       order.sourceYard = pickup;
       order.pickupLocations = [pickup];
       order.sourceAddress = address;
@@ -207,7 +245,7 @@ async function overlayLiveVrmaRouteDetails(plans = []) {
       for (const load of truck.loads || []) {
         for (const stop of load.stops || []) {
           if (stop?.type !== "pick") continue;
-          const pickup = liveByRef.get(String(stop.orderId || "").trim().toLowerCase());
+          const pickup = effectivePickupByRef.get(String(stop.orderId || "").trim().toLowerCase());
           if (pickup) stop.location = pickup;
         }
       }
@@ -896,7 +934,9 @@ function buildJob(plan, truck, load, stop, truckIndex, loadIndex, stopIndex, phy
     physicalVisitJobIds,
     physicalVisitStopIds,
     consolidatedPhysicalVisit: physicalVisitJobIds.length > 1,
-    orderTypes: [...new Set(orderRefs.map((ref) => directTransferRefs.includes(ref) ? "TO" : orderByRef(plan, ref)?.type).filter(Boolean))],
+    orderTypes: [...new Set(orderRefs.map((ref) => directTransferRefs.includes(ref)
+      ? "TO"
+      : canonicalDriverPlanOrderType(orderByRef(plan, ref))).filter(Boolean))],
     dependencyPickupManifests,
     requiredPhotos: 2,
     sequence: { truckIndex, loadIndex, stopIndex }
@@ -2053,17 +2093,23 @@ function isMaterialLine(line) {
   return ["InvtPart", "NonInvtPart"].includes(itemType);
 }
 
-function orderDetailsFromPlan(orderRef, planOrder = null, context = {}) {
+export function driverOrderDetailsFromPlan(orderRef, planOrder = null, context = {}) {
   const requestedLineRowIds = new Set((context.lineRowIds || []).map(String));
+  const projection = purchaseOrderRouteProjection(planOrder || {});
+  const routeItems = projection && context.stopType === "pickup"
+    ? (planOrder?.items || [])
+    : purchaseOrderRouteItems(planOrder);
   const sourceItems = context.stopType === "dropoff" && requestedLineRowIds.size
-    ? (planOrder?.items || []).filter((item) => requestedLineRowIds.has(String(item.lineRowId)))
-    : (planOrder?.items || []);
+    ? routeItems.filter((item) => requestedLineRowIds.has(String(item.lineRowId)))
+    : routeItems;
   const items = sourceItems
-    .map((item) => planItemForPickup(item, { ...context, orderType: planOrder?.type || context.orderType }))
+    .map((item) => projection
+      ? item
+      : planItemForPickup(item, { ...context, orderType: planOrder?.type || context.orderType }))
     .filter(planItemHasQuantity);
   return {
     orderId: Number(planOrder?.netsuiteId || planOrder?.netsuite_id || 0) || null,
-    orderType: String(planOrder?.type || context.orderType || "").trim().toUpperCase(),
+    orderType: canonicalDriverPlanOrderType(planOrder, context.orderType),
     orderRef,
     party: planOrder?.customer || planOrder?.vendor || planOrder?.party || "",
     source: "dispatch_plan",
@@ -2076,9 +2122,30 @@ function orderDetailsFromPlan(orderRef, planOrder = null, context = {}) {
   };
 }
 
+async function detailsFromCustomOrder(orderRef, planOrder = null, context = {}) {
+  const candidates = await listDispatchCustomOrders({
+    includeCancelled: true,
+    includeCompleted: true,
+    search: orderRef,
+    limit: 20
+  });
+  const customOrder = candidates.find((candidate) =>
+    String(candidate.refNumber || "").trim().toLowerCase() === String(orderRef || "").trim().toLowerCase()
+  );
+  if (!customOrder) return driverOrderDetailsFromPlan(orderRef, planOrder, { ...context, orderType: "CUSTOM" });
+  return driverOrderDetailsFromPlan(
+    orderRef,
+    dispatchOrderFromCustomOrder(customOrder),
+    { ...context, orderType: "CUSTOM" }
+  );
+}
+
 async function orderDetails(orderRef, typeHint = "", planOrder = null, context = {}) {
   if (String(typeHint || "").trim().toUpperCase() === "CUSTOM") {
-    return orderDetailsFromPlan(orderRef, planOrder, { ...context, orderType: "CUSTOM" });
+    return detailsFromCustomOrder(orderRef, planOrder, context);
+  }
+  if (purchaseOrderRouteProjection(planOrder || {})) {
+    return driverOrderDetailsFromPlan(orderRef, planOrder, { ...context, orderType: "PO" });
   }
   const detail = typeHint === "PO"
     ? await detailsFromReceiving(orderRef, "PO", context)
@@ -2087,14 +2154,14 @@ async function orderDetails(orderRef, typeHint = "", planOrder = null, context =
       : typeHint === "TO"
         ? await detailsFromDelivery(orderRef, "TO", context) || await detailsFromReceiving(orderRef, "TO")
         : await detailsFromDelivery(orderRef, "SO", context) || await detailsFromReceiving(orderRef) || await detailsFromLocalCo(orderRef);
-  if (!detail) return orderDetailsFromPlan(orderRef, planOrder, context);
+  if (!detail) return driverOrderDetailsFromPlan(orderRef, planOrder, context);
   const items = (detail.lines || []).filter(isMaterialLine).map((line) => ({
     itemName: line.item_name || line.sku || "",
     sku: line.sku || line.item_name || "",
     description: line.item_description || "",
     units: visibleUnits(line)
   }));
-  if (!items.length && planOrder?.items?.length) return orderDetailsFromPlan(orderRef, planOrder, context);
+  if (!items.length && planOrder?.items?.length) return driverOrderDetailsFromPlan(orderRef, planOrder, context);
   return {
     orderId: Number(detail.netsuite_id || detail.id || 0) || null,
     orderType: String(detail.order_type || typeHint || "").trim().toUpperCase(),
@@ -2224,6 +2291,30 @@ async function materializeDriverJob(plan, job, status = null, { deferDeliveryIns
   return materialized;
 }
 
+async function decorateReattemptReadiness(jobs = []) {
+  const readiness = await getSalesOrderReattemptDriverReadiness(
+    jobs.flatMap((job) => job.orderRefs || [])
+  );
+  const byRef = new Map(readiness.map((entry) => [String(entry.orderRef || "").trim().toLowerCase(), entry]));
+  return jobs.map((job) => {
+    const states = (job.orderRefs || [])
+      .map((orderRef) => byRef.get(String(orderRef || "").trim().toLowerCase()))
+      .filter(Boolean);
+    const blocked = states.find((entry) => entry.allowed !== true) || null;
+    return {
+      ...job,
+      reattemptReadiness: states,
+      executionBlocked: Boolean(blocked),
+      executionBlock: blocked
+        ? {
+            code: blocked.code,
+            message: `${blocked.orderRef} is waiting for its matching Operator re-load to be completed.`
+          }
+        : null
+    };
+  });
+}
+
 async function enrichMbtDriverJob(job, {
   allowBin = false,
   clientVersion = DRIVER_PWA_CURRENT_VERSION,
@@ -2258,12 +2349,12 @@ export async function getDriverDayJobs(driverLogin, {
   }
   const jobs = planJobsForDriver(plan, login, { allowBin });
   const statuses = await jobStatusMap(jobs.map((job) => job.jobId));
-  const materializedJobs = await Promise.all(jobs.map(async (job) => materializeDriverJob(
+  const materializedJobs = await decorateReattemptReadiness(await Promise.all(jobs.map(async (job) => materializeDriverJob(
     plan,
     await enrichMbtDriverJob(job, { allowBin, clientVersion, minimumClientVersion }),
     statuses.get(job.jobId),
     { deferDeliveryInstructions: true }
-  )));
+  ))));
   const instructionByOrderId = await getDeliveryInstructionsForDriverOrderIds(
     materializedJobs
       .flatMap(materializedDriverSalesOrders)
@@ -2311,7 +2402,7 @@ export async function getDriverNextJobContext(driverLogin, {
     // enriches only the one actionable BIN stop.
     jobs: baseJobs,
     job: next
-      ? await materializeDriverJob(
+      ? (await decorateReattemptReadiness([await materializeDriverJob(
           assignment.plan,
           await enrichMbtDriverJob(next, {
             allowBin,
@@ -2319,7 +2410,7 @@ export async function getDriverNextJobContext(driverLogin, {
             minimumClientVersion
           }),
           statuses.get(next.jobId)
-        )
+        )]))[0]
       : null
   };
 }

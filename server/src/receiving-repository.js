@@ -31,6 +31,34 @@ function roundQuantity(value) {
   return Math.round((Number(value) || 0) * 1000000) / 1000000;
 }
 
+function supportedReceivingDestinationLocationId(value) {
+  const text = String(value || "").trim();
+  if (text === "3445" || text === "1") return 1;
+  if (text === "12441" || text === "15") return 15;
+  if (text === "2967" || text === "28" || text === "13") return 28;
+  if (text === "150" || text === "26") return 26;
+  return null;
+}
+
+function supportedReceivingDestinationLocation(value) {
+  const id = supportedReceivingDestinationLocationId(value);
+  if (id === 1) return "3445";
+  if (id === 15) return "12441";
+  if (id === 28) return "2967";
+  if (id === 26) return "150";
+  return "";
+}
+
+function scheduleDestinationLocationIdSql(field) {
+  return `CASE BTRIM(COALESCE(${field}, ''))
+    WHEN '3445' THEN 1
+    WHEN '12441' THEN 15
+    WHEN '2967' THEN 28
+    WHEN '150' THEN 26
+    ELSE NULL
+  END`;
+}
+
 function hasConversion(line) {
   return positiveQuantity(line.to_plt) > 0
     || positiveQuantity(line.to_lyr) > 0
@@ -245,13 +273,19 @@ export async function listReceivingVendors({ destinationLocationId = null } = {}
   let destinationClause = "";
   if (destinationLocationId) {
     params.push(destinationLocationId);
-    destinationClause = `AND destination_location_id = $${params.length}`;
+    destinationClause = `AND COALESCE(
+      ${scheduleDestinationLocationIdSql("schedule.dropoff_point")},
+      po.destination_location_id
+    ) = $${params.length}`;
   }
   const result = await query(
     `SELECT vendor_id, vendor, COUNT(*)::int AS order_count
-	     FROM purchase_orders
-	     WHERE netsuite_active = true
-	       AND NOT ${netSuiteClosedOrderFamilySql("purchase_orders", "PO")}
+	     FROM purchase_orders po
+       LEFT JOIN scm_transport_schedule schedule
+         ON schedule.order_kind = 'PO'
+        AND lower(schedule.order_ref) = lower(COALESCE(NULLIF(po.dispatch_ref, ''), po.tranid))
+	     WHERE po.netsuite_active = true
+	       AND NOT ${netSuiteClosedOrderFamilySql("po", "PO")}
        AND (status_text ILIKE '%Pending Receipt%' OR status_text ILIKE '%Partially Received%')
        ${destinationClause}
      GROUP BY vendor_id, vendor
@@ -327,18 +361,24 @@ export async function listReceivingOrders({ orderType, vendor = null, sourceLoca
   }
   const result = await query(
     `WITH receiving_order_source AS (
-       SELECT netsuite_id, 'purchase_order'::text AS order_type,
-              COALESCE(NULLIF(dispatch_ref, ''), tranid) AS tranid,
-              tranid AS original_tranid,
-              dispatch_ref,
-              trandate,
-              vendor_id, vendor, status, status_text, foreign_total,
-              source_location_id, source_location, destination_location_id, destination_location,
-              netsuite_active, synced_at, receipt_status, memo, expected_delivery_date,
-              dispatch_vendor_yard, dispatch_address, dispatch_window_start,
-              dispatch_window_end, dispatch_instructions
-	       FROM purchase_orders
-	       WHERE NOT ${netSuiteClosedOrderFamilySql("purchase_orders", "PO")}
+       SELECT po.netsuite_id, 'purchase_order'::text AS order_type,
+              COALESCE(NULLIF(po.dispatch_ref, ''), po.tranid) AS tranid,
+              po.tranid AS original_tranid,
+              po.dispatch_ref,
+              po.trandate,
+              po.vendor_id, po.vendor, po.status, po.status_text, po.foreign_total,
+              po.source_location_id, po.source_location,
+              COALESCE(${scheduleDestinationLocationIdSql("schedule.dropoff_point")}, po.destination_location_id) AS destination_location_id,
+              COALESCE(NULLIF(BTRIM(schedule.dropoff_point), ''), po.destination_location) AS destination_location,
+              NULLIF(BTRIM(schedule.dropoff_point), '') AS destination_override,
+              po.netsuite_active, po.synced_at, po.receipt_status, po.memo, po.expected_delivery_date,
+              po.dispatch_vendor_yard, po.dispatch_address, po.dispatch_window_start,
+              po.dispatch_window_end, po.dispatch_instructions
+	       FROM purchase_orders po
+         LEFT JOIN scm_transport_schedule schedule
+           ON schedule.order_kind = 'PO'
+          AND lower(schedule.order_ref) = lower(COALESCE(NULLIF(po.dispatch_ref, ''), po.tranid))
+	       WHERE NOT ${netSuiteClosedOrderFamilySql("po", "PO")}
 	       UNION ALL
        SELECT netsuite_id, 'transfer_order'::text AS order_type,
               tranid,
@@ -348,6 +388,7 @@ export async function listReceivingOrders({ orderType, vendor = null, sourceLoca
               NULL::bigint AS vendor_id, NULL::text AS vendor, status, status_text, NULL::numeric AS foreign_total,
               from_location_id AS source_location_id, from_location AS source_location,
               to_location_id AS destination_location_id, to_location AS destination_location,
+              NULL::text AS destination_override,
               netsuite_active, synced_at, receiving_status AS receipt_status, memo, expected_delivery_date,
               NULL::text AS dispatch_vendor_yard, dispatch_address, dispatch_window_start,
               dispatch_window_end, dispatch_instructions
@@ -383,18 +424,24 @@ export async function listReceivingOrders({ orderType, vendor = null, sourceLoca
 export async function getReceivingOrder(orderId) {
   const order = await query(
     `WITH receiving_order_source AS (
-       SELECT netsuite_id, 'purchase_order'::text AS order_type,
-              COALESCE(NULLIF(dispatch_ref, ''), tranid) AS tranid,
-              tranid AS original_tranid,
-              dispatch_ref,
-              trandate,
-              vendor_id, vendor, status, status_text, foreign_total,
-              source_location_id, source_location, destination_location_id, destination_location,
-              netsuite_active, synced_at, receipt_status, memo, expected_delivery_date,
-              dispatch_vendor_yard, dispatch_address, dispatch_window_start,
-              dispatch_window_end, dispatch_instructions
-	       FROM purchase_orders
-	       WHERE NOT ${netSuiteClosedOrderFamilySql("purchase_orders", "PO")}
+       SELECT po.netsuite_id, 'purchase_order'::text AS order_type,
+              COALESCE(NULLIF(po.dispatch_ref, ''), po.tranid) AS tranid,
+              po.tranid AS original_tranid,
+              po.dispatch_ref,
+              po.trandate,
+              po.vendor_id, po.vendor, po.status, po.status_text, po.foreign_total,
+              po.source_location_id, po.source_location,
+              COALESCE(${scheduleDestinationLocationIdSql("schedule.dropoff_point")}, po.destination_location_id) AS destination_location_id,
+              COALESCE(NULLIF(BTRIM(schedule.dropoff_point), ''), po.destination_location) AS destination_location,
+              NULLIF(BTRIM(schedule.dropoff_point), '') AS destination_override,
+              po.netsuite_active, po.synced_at, po.receipt_status, po.memo, po.expected_delivery_date,
+              po.dispatch_vendor_yard, po.dispatch_address, po.dispatch_window_start,
+              po.dispatch_window_end, po.dispatch_instructions
+	       FROM purchase_orders po
+         LEFT JOIN scm_transport_schedule schedule
+           ON schedule.order_kind = 'PO'
+          AND lower(schedule.order_ref) = lower(COALESCE(NULLIF(po.dispatch_ref, ''), po.tranid))
+	       WHERE NOT ${netSuiteClosedOrderFamilySql("po", "PO")}
 	       UNION ALL
        SELECT netsuite_id, 'transfer_order'::text AS order_type,
               tranid,
@@ -404,6 +451,7 @@ export async function getReceivingOrder(orderId) {
               NULL::bigint AS vendor_id, NULL::text AS vendor, status, status_text, NULL::numeric AS foreign_total,
               from_location_id AS source_location_id, from_location AS source_location,
               to_location_id AS destination_location_id, to_location AS destination_location,
+              NULL::text AS destination_override,
               netsuite_active, synced_at, receiving_status AS receipt_status, memo, expected_delivery_date,
               NULL::text AS dispatch_vendor_yard, dispatch_address, dispatch_window_start,
               dispatch_window_end, dispatch_instructions
@@ -467,7 +515,24 @@ export async function getReceivingOrder(orderId) {
      ORDER BY line_id NULLS LAST, id`,
     [orderId]
   );
-  return { ...order.rows[0], lines: lines.rows.map(applyPoAllocationFields).filter(hasReceivingDisplayQuantity) };
+  const receivingOrder = order.rows[0];
+  const overrideLocationId = receivingOrder.order_type === "purchase_order"
+    ? supportedReceivingDestinationLocationId(receivingOrder.destination_override)
+    : null;
+  const overrideLocation = supportedReceivingDestinationLocation(overrideLocationId);
+  const projectedLines = lines.rows.map((line) => overrideLocationId
+    ? {
+        ...line,
+        netsuite_location_id: line.location_id,
+        netsuite_location: line.location,
+        location_id: overrideLocationId,
+        location: overrideLocation
+      }
+    : line);
+  return {
+    ...receivingOrder,
+    lines: projectedLines.map(applyPoAllocationFields).filter(hasReceivingDisplayQuantity)
+  };
 }
 
 export async function confirmReceivingLine(orderId, lineRowId, values, operatorId) {
@@ -787,6 +852,18 @@ function openLocalCoSourceSql(coAlias = "co") {
         FROM transfer_orders closed_source_to
        WHERE upper(BTRIM(closed_source_to.tranid)) = upper(BTRIM(${coAlias}.source_order_ref))
          AND ${netSuiteClosedOrderFamilySql("closed_source_to", "TO")}
+    )
+    AND NOT EXISTS (
+      SELECT 1
+        FROM scm_vrma_orders cancelled_source_vrma
+       WHERE upper(BTRIM(cancelled_source_vrma.vrma_ref)) = upper(BTRIM(${coAlias}.source_order_ref))
+         AND lower(BTRIM(COALESCE(cancelled_source_vrma.status, ''))) IN ('cancelled', 'canceled')
+    )
+    AND NOT EXISTS (
+      SELECT 1
+        FROM dispatch_custom_orders cancelled_source_custom
+       WHERE upper(BTRIM(cancelled_source_custom.ref_number)) = upper(BTRIM(${coAlias}.source_order_ref))
+         AND lower(BTRIM(COALESCE(cancelled_source_custom.status, ''))) IN ('cancelled', 'canceled')
     )`;
 }
 
@@ -924,7 +1001,8 @@ export async function getLocalCoReceivingOrder(coRefOrId) {
             'Local CO - Pending Receive' AS status_text,
             co.details
        FROM co_orders co
-      WHERE co.co_ref = $1 OR co.delivery_order_id::text = $1 OR co.id::text = $1`,
+      WHERE (co.co_ref = $1 OR co.delivery_order_id::text = $1 OR co.id::text = $1)
+        AND ${openLocalCoSourceSql("co")}`,
     [String(coRefOrId)]
   );
   if (!order.rowCount) return null;
@@ -1058,17 +1136,38 @@ export async function receiveLocalCoOrder(coRefOrId, operatorId, { photoDataUrls
       LIMIT 1`,
     [co.source_order_ref]
   );
+  const sourceVrma = await query(
+    `SELECT *
+       FROM scm_vrma_orders
+      WHERE vrma_ref = $1
+      LIMIT 1`,
+    [co.source_order_ref]
+  );
+  const sourceCustom = await query(
+    `SELECT *
+       FROM dispatch_custom_orders
+      WHERE ref_number = $1
+      LIMIT 1`,
+    [co.source_order_ref]
+  );
   const sourceOrder = sourceDelivery.rows[0] || null;
   const sourceTransferOrder = sourceTransfer.rows[0] || null;
+  const sourceVrmaOrder = sourceVrma.rows[0] || null;
+  const sourceCustomOrder = sourceCustom.rows[0] || null;
   const receiveAsSourceSo = Boolean(sourceOrder);
   const receiveAsSourceTransfer = !receiveAsSourceSo && Boolean(sourceTransferOrder);
+  const receiveAsSourceVrma = !receiveAsSourceSo && !receiveAsSourceTransfer && Boolean(sourceVrmaOrder);
+  const receiveAsSourceCustom = !receiveAsSourceSo
+    && !receiveAsSourceTransfer
+    && !receiveAsSourceVrma
+    && Boolean(sourceCustomOrder);
   const deliveryOrderId = receiveAsSourceSo
     ? Number(sourceOrder.netsuite_id)
     : receiveAsSourceTransfer
       ? Number(sourceTransferOrder.netsuite_id)
       : Number(co.netsuite_id);
   const coRemark = `${co.tranid}: received transit stock from ${co.source_location} for ${co.source_order_ref}.`;
-  const sourceForMemo = sourceOrder || sourceTransferOrder || {};
+  const sourceForMemo = sourceOrder || sourceTransferOrder || sourceVrmaOrder || sourceCustomOrder || {};
   const receiveAsSourceOrder = receiveAsSourceSo || receiveAsSourceTransfer;
   const existingMemo = receiveAsSourceOrder ? String(sourceForMemo.memo || "").trim() : "";
   const existingInstructions = receiveAsSourceOrder ? String(sourceForMemo.dispatch_instructions || "").trim() : "";
@@ -1143,7 +1242,23 @@ export async function receiveLocalCoOrder(coRefOrId, operatorId, { photoDataUrls
         co.dispatch_parking_spot || ""
       ]
     );
-  } else {
+  } else if (receiveAsSourceVrma) {
+    await query(
+      `UPDATE scm_vrma_orders
+          SET pickup_location = $2,
+              operator_status = 'packed',
+              local_yard_order_status = 'Open',
+              preparing_operator_id = null,
+              preparing_started_at = null,
+              status_updated_at = now(),
+              updated_by = 'co-receiving',
+              updated_at = now()
+        WHERE id = $1`,
+      [sourceVrmaOrder.id, co.destination_location]
+    );
+  } else if (!receiveAsSourceCustom) {
+    // Unknown legacy sources retain the synthetic Transfer Order fallback.
+    // A known Custom Order stays driver-only and uses its durable CO pickup.
     await query(
       `INSERT INTO transfer_orders (
          netsuite_id, tranid, trandate, status, status_text,
@@ -1201,7 +1316,7 @@ export async function receiveLocalCoOrder(coRefOrId, operatorId, { photoDataUrls
 
   if (receiveAsSourceSo) {
     await query("DELETE FROM sales_order_lines WHERE sales_order_id = $1", [deliveryOrderId]);
-  } else {
+  } else if (receiveAsSourceTransfer || (!receiveAsSourceVrma && !receiveAsSourceCustom)) {
     await query("DELETE FROM transfer_order_lines WHERE transfer_order_id = $1 AND line_stage = 'outbound'", [deliveryOrderId]);
   }
   for (const line of confirmedLines) {
@@ -1249,7 +1364,29 @@ export async function receiveLocalCoOrder(coRefOrId, operatorId, { photoDataUrls
         )`,
         values
       );
-    } else {
+    } else if (receiveAsSourceVrma) {
+      await query(
+        `UPDATE scm_vrma_order_lines
+            SET packed_pallet_qty = $3,
+                packed_layer_qty = $4,
+                packed_piece_qty = $5,
+                packed_section_qty = $6,
+                packed_sales_qty = $7,
+                confirmed = true,
+                confirmed_at = COALESCE(confirmed_at, now())
+          WHERE vrma_order_id = $1
+            AND id = $2`,
+        [
+          sourceVrmaOrder.id,
+          line.line_id,
+          line.received_pallet_qty,
+          line.received_layer_qty,
+          line.received_piece_qty,
+          line.received_section_qty,
+          line.received_sales_qty
+        ]
+      );
+    } else if (!receiveAsSourceCustom) {
       await query(
         `INSERT INTO transfer_order_lines (
           line_stage, transfer_order_id, line_id, item_id, item_name, item_type, item_type_text,
@@ -1303,6 +1440,8 @@ export async function receiveLocalCoOrder(coRefOrId, operatorId, { photoDataUrls
       deliveryOrderId,
       revivedSourceSalesOrder: receiveAsSourceSo,
       revivedSourceTransferOrder: receiveAsSourceTransfer,
+      revivedSourceVrma: receiveAsSourceVrma,
+      retainedSourceCustomOrder: receiveAsSourceCustom,
       lines: confirmedLines.length
     }
   });
@@ -1469,11 +1608,15 @@ export async function searchReceivingItems({ orderType, vendor = null, sourceLoc
   }
   const result = await query(
     `WITH receiving_order_source AS (
-       SELECT netsuite_id, 'purchase_order'::text AS order_type, vendor,
-              NULL::bigint AS source_location_id, destination_location_id,
-              status_text, netsuite_active
-	       FROM purchase_orders
-	       WHERE NOT ${netSuiteClosedOrderFamilySql("purchase_orders", "PO")}
+       SELECT po.netsuite_id, 'purchase_order'::text AS order_type, po.vendor,
+              NULL::bigint AS source_location_id,
+              COALESCE(${scheduleDestinationLocationIdSql("schedule.dropoff_point")}, po.destination_location_id) AS destination_location_id,
+              po.status_text, po.netsuite_active
+	       FROM purchase_orders po
+         LEFT JOIN scm_transport_schedule schedule
+           ON schedule.order_kind = 'PO'
+          AND lower(schedule.order_ref) = lower(COALESCE(NULLIF(po.dispatch_ref, ''), po.tranid))
+	       WHERE NOT ${netSuiteClosedOrderFamilySql("po", "PO")}
 	       UNION ALL
        SELECT netsuite_id, 'transfer_order'::text AS order_type, NULL::text AS vendor,
               from_location_id AS source_location_id, to_location_id AS destination_location_id,

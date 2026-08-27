@@ -578,8 +578,134 @@ function closePhotoLightbox() {
   modal.remove();
 }
 
+let salesOrderReloadPagePosition = null;
+
+function lockSalesOrderReloadPage() {
+  if (salesOrderReloadPagePosition) return;
+  salesOrderReloadPagePosition = { x: window.scrollX, y: window.scrollY };
+  document.documentElement.classList.add("sales-order-reload-open");
+  document.body.classList.add("sales-order-reload-open");
+  window.scrollTo(0, 0);
+}
+
+function unlockSalesOrderReloadPage() {
+  if (!salesOrderReloadPagePosition) return;
+  const position = salesOrderReloadPagePosition;
+  salesOrderReloadPagePosition = null;
+  document.documentElement.classList.remove("sales-order-reload-open");
+  document.body.classList.remove("sales-order-reload-open");
+  window.scrollTo(position.x, position.y);
+}
+
 function closeSalesOrderReloadDialog() {
   document.querySelector(".sales-order-reload-modal")?.remove();
+  unlockSalesOrderReloadPage();
+}
+
+function operatorIsAdmin() {
+  return String(operator?.role || "").toLowerCase() === "admin"
+    || (operator?.roles || []).some((role) => String(role || "").toLowerCase() === "admin");
+}
+
+async function openReattemptCurrentItemCorrectionDialog(cycle) {
+  const orderRef = String(cycle?.reattemptOrderRef || "").trim();
+  if (!orderRef) return;
+  closeSalesOrderReloadDialog();
+  let preview;
+  try {
+    const response = await request(
+      `/api/control/sales-order-reattempts/${encodeURIComponent(orderRef)}/current-item-correction-preview`
+    );
+    preview = response.preview;
+  } catch (error) {
+    alert(error.message);
+    return;
+  }
+  const correctableLines = (preview.lines || []).filter((line) => (
+    line.requiresCorrection && line.currentQuantitySupportsTarget
+  ));
+  const modal = document.createElement("div");
+  modal.className = "photo-lightbox sales-order-reload-modal";
+  modal.innerHTML = `
+    <form class="photo-lightbox-panel sales-order-reload-panel" role="dialog" aria-modal="true" aria-label="Correct re-attempt current item">
+      <button class="photo-lightbox-close" data-action="close-sales-order-reload" type="button">×</button>
+      <h2>Correct re-attempt current item</h2>
+      <p><strong>${escapeHtml(preview.orderRef)}</strong> · linked to ${escapeHtml(preview.parentOrderRef)}</p>
+      <div class="notice warning">
+        <strong>Immutable evidence remains unchanged</strong>
+        <span>This changes the current operational projection only. Original load evidence, Driver photos, timestamps, completion events, and saved historical plans are retained.</span>
+      </div>
+      ${preview.warning ? `<div class="notice warning"><strong>Operator load evidence is absent</strong><span>${escapeHtml(preview.warning)}</span></div>` : ""}
+      <div class="sales-order-reattempt-lines">
+        ${(preview.lines || []).map((line) => `
+          <label class="sales-order-reattempt-line">
+            <input type="radio" name="netsuiteLineId" value="${escapeHtml(line.netsuiteLineId)}" ${line.requiresCorrection && line.currentQuantitySupportsTarget ? "required" : "disabled"} />
+            <div class="sales-order-reattempt-identities">
+              <div><small>Effective/current item</small><strong>${escapeHtml(line.afterSku || "No unique current match")}</strong><span>${movementQuantity(line.targetSalesQty)} ${escapeHtml(line.afterSalesUom || "")}</span></div>
+              <div><small>Historical first-attempt item</small><strong>${escapeHtml(line.historicalSku || "Unknown")}</strong><span>${movementQuantity(line.targetPalletQty)} PLT</span></div>
+            </div>
+            <small>${line.requiresCorrection && !line.currentQuantitySupportsTarget
+              ? "Current NetSuite quantity is below the authorized re-attempt quantity; correction is blocked."
+              : line.requiresCorrection
+                ? `Currently projected as ${escapeHtml(line.beforeSku || "Unknown")}`
+                : "Already uses the current item"}</small>
+          </label>
+        `).join("")}
+      </div>
+      ${correctableLines.length ? `
+        <label>
+          <span>Mandatory correction reason</span>
+          <textarea name="reason" maxlength="500" rows="3" required placeholder="Record how the physically delivered item was verified"></textarea>
+        </label>
+        <label class="notice sales-order-physical-confirmation">
+          <input type="checkbox" name="physicalConfirmation" required />
+          <span>I confirm the physical second attempt delivered the Effective/current item shown above.</span>
+        </label>
+      ` : `<div class="notice"><strong>No correction is required.</strong><span>Every selected re-attempt line already uses the current item.</span></div>`}
+      <div class="loaded-filter-actions">
+        <button data-action="close-sales-order-reload" type="button">${t("common.cancel", "Cancel")}</button>
+        ${correctableLines.length ? `<button class="primary" type="submit">Apply append-only correction</button>` : ""}
+      </div>
+    </form>
+  `;
+  modal.addEventListener("click", (event) => {
+    if (event.target === modal || event.target.closest("[data-action='close-sales-order-reload']")) {
+      closeSalesOrderReloadDialog();
+    }
+  });
+  modal.querySelector("form")?.addEventListener("submit", async (event) => {
+    event.preventDefault();
+    const form = event.currentTarget;
+    const data = new FormData(form);
+    const netsuiteLineId = Number(data.get("netsuiteLineId"));
+    const line = correctableLines.find((candidate) => Number(candidate.netsuiteLineId) === netsuiteLineId);
+    if (!line) return;
+    const submit = form.querySelector("button[type='submit']");
+    if (submit) submit.disabled = true;
+    try {
+      await request(
+        `/api/control/sales-order-reattempts/${encodeURIComponent(orderRef)}/current-item-corrections`,
+        {
+          method: "POST",
+          body: JSON.stringify({
+            idempotencyKey: crypto.randomUUID(),
+            netsuiteLineId,
+            expectedStateFingerprint: line.expectedStateFingerprint,
+            reason: String(data.get("reason") || "").trim(),
+            physicallyDeliveredCurrentItem: data.get("physicalConfirmation") === "on"
+          })
+        }
+      );
+      closeSalesOrderReloadDialog();
+      await loadLoadedOrderDetailForSelection();
+      refreshLoadedPanels();
+    } catch (error) {
+      if (submit) submit.disabled = false;
+      alert(error.message);
+    }
+  });
+  document.body.appendChild(modal);
+  lockSalesOrderReloadPage();
 }
 
 function reattemptQuantityFields(line = {}) {
@@ -605,7 +731,7 @@ function renderSalesOrderReattemptLine(line = {}) {
         <div><small>Current Sales Order SKU</small><strong>${escapeHtml(line.currentSku || "No current match")}</strong><span>${movementQuantity(line.currentSalesQty || 0)} ${escapeHtml(line.currentSalesUom || "")}</span></div>
       </div>
       ${line.skuMismatch || line.itemMismatch
-        ? `<div class="notice warning"><strong>Historical/current item mismatch</strong><span>${escapeHtml(line.mismatchWarning || "The loaded item differs from the current Sales Order line. The re-attempt keeps the historical freight identity.")}</span></div>`
+          ? `<div class="notice warning"><strong>Historical/current item mismatch</strong><span>${escapeHtml(line.mismatchWarning || "The loaded item differs from the current Sales Order line. The re-attempt uses the current item operationally and retains the historical identity as evidence.")}</span></div>`
         : ""}
       ${!line.selectable ? `<div class="notice warning"><strong>Selection unavailable</strong><span>This historical line has no authoritative current Sales Order mapping.</span></div>` : ""}
       <div class="sales-order-reattempt-quantities">
@@ -751,6 +877,7 @@ async function openSalesOrderReloadDialog(order, { cancel = false, cycle = null 
     }
   });
   document.body.appendChild(modal);
+  lockSalesOrderReloadPage();
   modal.querySelector("input:not([disabled]), textarea:not([disabled])")?.focus();
 }
 
@@ -2698,7 +2825,14 @@ function renderLoadedOrderDetail() {
   if (!loadedOrderDetail) {
     return `<div class="empty-detail"><strong>${t("common.selectOrder", "Select an order")}</strong><span>${t("yard.selectMovementHelp", "Yard processing, driver delivery details, timestamps, and photo proof will show here.")}</span></div>`;
   }
-  const { order, lines = [], photos = [], loadAttempts = [], activeReloadCycle = null } = loadedOrderDetail;
+  const {
+    order,
+    lines = [],
+    photos = [],
+    loadAttempts = [],
+    activeReloadCycle = null,
+    latestReattemptCycle = null
+  } = loadedOrderDetail;
   const driverRecords = loadedOrderDetail.driverRecords || loadedOrderDetail.driverEvents || [];
   const driverPhotos = loadedOrderDetail.driverPhotos || [];
   const route = [order.source_location, order.destination_location].filter(Boolean).join(" → ");
@@ -2717,7 +2851,13 @@ function renderLoadedOrderDetail() {
         <strong>${lines.length} ${t("control.lines", "line(s)")} · ${t("yard.yardActivities", "Yard")} ${order.yard_activity_count || order.process_count || 0} · ${t("yard.driverActivities", "Driver")} ${order.driver_activity_count || driverRecords.length}</strong>
         ${salesOrderReloadEligible && !activeReloadCycle ? `<button class="primary" data-action="authorize-sales-order-reload" type="button">Authorize Re-load</button>` : ""}
         ${reloadCanCancel ? `<button data-action="cancel-sales-order-reload" data-cycle-id="${escapeHtml(activeReloadCycle.id)}" type="button">Cancel Re-load</button>` : ""}
+        ${operatorIsAdmin() && latestReattemptCycle?.reattemptOrderRef && latestReattemptCycle?.lines?.some((line) => (
+          (line.skuMismatch || line.itemMismatch) && !line.identityCorrected
+        ))
+          ? `<button data-action="correct-sales-order-reattempt-item" type="button">Correct re-attempt item</button>`
+          : ""}
         ${activeReloadCycle ? `<small><strong>Re-load #${escapeHtml(activeReloadCycle.cycleNumber)}</strong> · ${escapeHtml(activeReloadCycle.status)} · ${escapeHtml(activeReloadCycle.reason)}</small>` : ""}
+        ${latestReattemptCycle?.operatorLoadEvidenceMissing ? `<small class="notice warning"><strong>Operator load evidence is absent</strong> · completion source: ${escapeHtml(latestReattemptCycle.completionSource || "unknown")}</small>` : ""}
       </div>
     </div>
     <div class="loaded-lines">
@@ -5004,6 +5144,11 @@ app.addEventListener("click", async (event) => {
         cancel: true,
         cycle: loadedOrderDetail.activeReloadCycle
       });
+      return;
+    }
+    if (button.dataset.action === "correct-sales-order-reattempt-item") {
+      if (!loadedOrderDetail?.latestReattemptCycle) return;
+      await openReattemptCurrentItemCorrectionDialog(loadedOrderDetail.latestReattemptCycle);
       return;
     }
     if (button.dataset.action === "export-loaded-csv") {

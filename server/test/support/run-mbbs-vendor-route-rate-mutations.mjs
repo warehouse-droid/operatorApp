@@ -15,12 +15,35 @@ const TESTS = Object.freeze([
   "test/mbt/integration/mbbs-vendor-route-candidates.red.test.js"
 ]);
 
+const SCHEMA_PROPERTIES = Object.freeze([
+  "test/mbt/property/mbbs-vendor-route-rates.property.test.js"
+]);
+
 const MUTANTS = Object.freeze([
   Object.freeze({
     name: "negative vendor-route money is accepted",
     target: "src/mbt/mbbs-vendor-route-rates.js",
     from: "  if (typeof value !== \"number\" || !Number.isSafeInteger(value) || value < 0) {",
     to: "  if (typeof value !== \"number\" || !Number.isSafeInteger(value)) {"
+  }),
+  Object.freeze({
+    name: "schema-v3 vendor-route calculation regresses to schema v2 only",
+    target: "src/mbt/mbbs-vendor-route-rates.js",
+    from: "  const supportedSchema = policy.schemaVersion === 2 || policy.schemaVersion === 3;",
+    to: "  const supportedSchema = policy.schemaVersion === 2;",
+    tests: SCHEMA_PROPERTIES
+  }),
+  Object.freeze({
+    name: "unsupported vendor-route policy schemas are accepted",
+    target: "src/mbt/mbbs-vendor-route-rates.js",
+    from: "  if (!supportedSchema || policy.currency !== \"CAD\") {",
+    to: "  if (policy.currency !== \"CAD\") {"
+  }),
+  Object.freeze({
+    name: "schema-v3 rate-card graphs regress to schema v2 only",
+    target: "src/mbt/rate-card-configuration-service.js",
+    from: "    const supportedVendorRoutePolicy = normalized.mbbsChargingPolicy.schemaVersion === 2\n      || normalized.mbbsChargingPolicy.schemaVersion === 3;",
+    to: "    const supportedVendorRoutePolicy = normalized.mbbsChargingPolicy.schemaVersion === 2;"
   }),
   Object.freeze({
     name: "reverse VRMA loses PO pair-price parity",
@@ -106,13 +129,13 @@ function occurrenceCount(source, needle) {
   return source.split(needle).length - 1;
 }
 
-/** @param {string} label */
-function runTests(label) {
+/** @param {string} label @param {readonly string[]} [tests] */
+function runTests(label, tests = TESTS) {
   process.stdout.write(`\n[mutation] ${label}\n`);
   const result = spawnSync(process.execPath, [
     "--test",
     "--test-concurrency=1",
-    ...TESTS
+    ...tests
   ], {
     cwd: process.cwd(),
     env: process.env,
@@ -148,7 +171,8 @@ try {
       throw new Error(`${mutant.name}: expected exactly one mutation target occurrence.`);
     }
     await writeFile(path.resolve(mutant.target), original.replace(mutant.from, mutant.to), "utf8");
-    if (runTests(mutant.name) === 0) {
+    const tests = "tests" in mutant ? mutant.tests : TESTS;
+    if (runTests(mutant.name, tests) === 0) {
       throw new Error(`${mutant.name}: survived the focused regression suite.`);
     }
     killed += 1;

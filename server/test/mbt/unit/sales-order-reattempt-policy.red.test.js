@@ -129,7 +129,11 @@ test("Selected 16-pallet line conserves selected and already-delivered quantitie
 
   assert.equal(targets.length, 2, "Unselected evidence must be retained for the delivered remainder.");
   assert.equal(targets[0].selectedForReattempt, true);
-  assert.equal(targets[0].sku, "UNI-WIN70T-RDM-CG", "The child must retain the historical freight identity.");
+  assert.equal(targets[0].sku, "UNI-WIN70T-RDM-GN", "The child must use the authoritative current operational item.");
+  assert.equal(targets[0].itemId, 3632);
+  assert.equal(targets[0].historicalSku, "UNI-WIN70T-RDM-CG");
+  assert.equal(targets[0].historicalItemId, 3631);
+  assert.equal(targets[0].currentSku, "UNI-WIN70T-RDM-GN");
   assert.equal(targets[0].targetPalletQty, 16);
   assert.equal(targets[0].targetSalesQty, 1470.08);
   assert.equal(targets[0].alreadyDeliveredPalletQty, 0);

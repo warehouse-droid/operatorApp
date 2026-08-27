@@ -160,8 +160,8 @@ assert.match(driverSource, /navigator\.serviceWorker\.addEventListener\("control
 assert.match(driverSource, /updateViaCache: "none"/);
 assert.match(driverSource, /String\(savedJob\.fingerprint\) !== currentFingerprint/);
 assert.match(offlineSyncSource, /\[DRIVER_PWA_VERSION_HEADER\]: DRIVER_PWA_CLIENT_VERSION/);
-assert.match(workerSource, /DRIVER_CACHE_NAME = `\$\{DRIVER_CACHE_PREFIX\}v37`/);
-assert.match(workerSource, /DRIVER_REFRESH_CACHE_NAME = `\$\{DRIVER_CACHE_PREFIX\}refresh-v37`/);
+assert.match(workerSource, /DRIVER_CACHE_NAME = `\$\{DRIVER_CACHE_PREFIX\}v38`/);
+assert.match(workerSource, /DRIVER_REFRESH_CACHE_NAME = `\$\{DRIVER_CACHE_PREFIX\}refresh-v38`/);
 assert.match(workerSource, /DRIVER_VERSION_REQUEST/);
 assert.match(workerSource, /type: "DRIVER_VERSION", version: DRIVER_PWA_CLIENT_VERSION/);
 for (const asset of [

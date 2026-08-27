@@ -13,7 +13,7 @@ export const DELAYED_STATUS_REFRESH_POLL_INTERVAL_MS = 5_000;
 export const DELAYED_STATUS_REFRESH_LEASE_MS = 120_000;
 export const DELAYED_STATUS_REFRESH_BATCH_SIZE = 10;
 
-const SUPPORTED_ORDER_TYPES = new Set(["sales_order", "purchase_order"]);
+const SUPPORTED_ORDER_TYPES = new Set(["sales_order", "purchase_order", "transfer_order"]);
 
 function normalizedStatusCode(row = {}) {
   return String(row.status ?? "").trim().toUpperCase();
@@ -21,7 +21,7 @@ function normalizedStatusCode(row = {}) {
 
 function normalizedStatusText(row = {}) {
   return String(row.statusText ?? row.status_text ?? "")
-    .replace(/^(?:sales|purchase)\s+order\s*:\s*/i, "")
+    .replace(/^(?:sales|purchase|transfer)\s+order\s*:\s*/i, "")
     .replace(/\s+/g, " ")
     .trim();
 }

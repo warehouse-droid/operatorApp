@@ -20,6 +20,10 @@
   "include": [
     "src/mbt/**/*.js",
     "src/operator-customer-pickup-photo-policy.js",
+    "src/operator-netsuite-posting-*.js",
+    "src/operator-linked-quantity-domain.js",
+    "src/sales-order-auto-fulfillment-*.js",
+    "src/sales-order-reattempt-*.js",
     "src/driver-historical-assist-*.js",
     "src/netsuite-delayed-status-refresh-*.js",
     "test/support/**/*.mjs",

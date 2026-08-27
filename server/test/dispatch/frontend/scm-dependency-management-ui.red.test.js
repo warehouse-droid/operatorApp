@@ -30,6 +30,10 @@ test("the manager uses indexed paging and loads current group/split line identit
   assert.match(source, /memberRefs/u);
   assert.match(source, /\/to-options/u);
   assert.match(source, /\/po-options/u);
+  assert.match(source, /dependencyPoEntryRefs/u);
+  assert.match(source, /originalPoRef/u);
+  assert.match(source, /poAliases/u);
+  assert.match(html, /scm-dependency-management\.js\?v=20260824-po-ref-link-search-v1/u);
 });
 
 test("TO, PO, mode, and unlink changes are always previewed before an explicit apply", () => {

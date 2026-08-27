@@ -248,7 +248,7 @@ try {
     const materialPayloadLine = restPayload.item.items.find((line) => line.item.id === "1234");
     const palletPayloadLine = restPayload.item.items.find((line) => line.item.id === "9999");
     check(!Object.hasOwn(restPayload, "orderStatus"),
-      "Auto Transfer creation must let NetSuite choose the initial order status.");
+      "Auto Transfer creation must omit the status NetSuite rejects during POST.", { restPayload });
     check(restPayload.employee?.id === config.transferDependency.employeeId,
       "Auto Transfer must write the configured current-login employee.", { restPayload });
     check(restPayload.custbody3?.id === config.transferDependency.deliveryMethodId,
@@ -967,10 +967,20 @@ try {
       createTransferOrder: async () => ({ id: createdTransferIds[0] }),
       hydrateTransferOrder: fakeHydrateTransferOrder
     });
+    const autoApprovedProposal = singleProposalResult.batch.proposals
+      .find((proposal) => proposal.creationStatus === "created");
     check(singleProposalResult.results.filter((entry) => entry.status === "created").length === 1
       && singleProposalResult.batch.status === "partially_created"
       && singleProposalResult.batch.proposals.some((proposal) => proposal.creationStatus === "draft"),
     "Creating one proposed TO must leave sibling proposals editable for separate creation.", { singleProposalResult });
+    check(autoApprovedProposal?.approvalStatus === "approved"
+      && Boolean(autoApprovedProposal.approvedAt)
+      && autoApprovedProposal.approvedBy === "dependency-harness"
+      && autoApprovedProposal.printJob === null
+      && autoApprovedProposal.printRequestStatus === "idle",
+    "A created Pending Fulfillment TO must persist approved while remaining pending user print.", {
+      autoApprovedProposal
+    });
     const createdProposalBeforeRevision = singleProposalResult.batch.proposals
       .find((proposal) => proposal.creationStatus === "created");
     const historicalPrint = await query(

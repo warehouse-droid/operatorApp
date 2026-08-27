@@ -19,7 +19,13 @@ let scmLoading = false;
 let scmSummaryOpen = false;
 let scmDestinationLocationId = "";
 let scmPickupPoint = "";
+let scmSplitInitialStatus = "Queued";
+let scmSplitRemark = "";
 let scmGroupSelection = new Set();
+let scmSplitEditor = null;
+let scmSplitLineInputs = {};
+let scmSplitSourceSearch = "";
+let scmSplitEditorRequest = 0;
 const scmInitialOrderRef = new URLSearchParams(window.location.search).get("order") || "";
 let scmInitialOrderApplied = false;
 
@@ -28,6 +34,15 @@ const SCM_DESTINATION_YARDS = [
   { id: "15", text: "12441" },
   { id: "28", text: "2967" },
   { id: "26", text: "150" }
+];
+const SCM_MANUAL_STATUSES = [
+  "Queued",
+  "Urgent",
+  "Cancelled",
+  "Hold",
+  "Priority",
+  "Surplus Only",
+  "Book Appt"
 ];
 
 function escapeHtml(value) {
@@ -225,7 +240,22 @@ function scmLiveSplitPickupPoint(order = scmSelectedOrder()) {
   return scmPickupPoint;
 }
 
-function renderScmPickupYardControl(order = {}, { action = "existing-pickup-yard", field = true } = {}) {
+function scmLiveSplitInitialStatus() {
+  const selected = String(
+    scmApp.querySelector('[data-action="split-initial-status"]')?.value || ""
+  ).trim();
+  if (SCM_MANUAL_STATUSES.includes(selected)) scmSplitInitialStatus = selected;
+  if (!SCM_MANUAL_STATUSES.includes(scmSplitInitialStatus)) scmSplitInitialStatus = "Queued";
+  return scmSplitInitialStatus;
+}
+
+function scmLiveSplitRemark() {
+  const control = scmApp.querySelector('[data-action="split-remark"]');
+  if (control) scmSplitRemark = String(control.value || "");
+  return scmSplitRemark;
+}
+
+function renderScmPickupYardControl(order = {}, { action = "existing-pickup-yard", field = true, disabled = false } = {}) {
   const options = scmVendorYardOptions(order);
   const selected = ensureScmPickupPoint(order);
   const fieldAttr = field ? ` data-scm-field="pickupPoint"` : "";
@@ -234,7 +264,7 @@ function renderScmPickupYardControl(order = {}, { action = "existing-pickup-yard
   }
   const hasSelected = options.some((option) => String(option.yard || "").toLowerCase() === String(selected || "").toLowerCase());
   const effectiveSelected = hasSelected ? selected : options[0]?.yard || selected;
-  return `<label class="scm-pickup-yard-field"><span>${t("dispatch.pickupYard", "Pickup Yard")}</span><select${fieldAttr} data-action="${action}">
+  return `<label class="scm-pickup-yard-field"><span>${t("dispatch.pickupYard", "Pickup Yard")}</span><select${fieldAttr} data-action="${action}" ${disabled ? "disabled" : ""}>
     ${hasSelected ? "" : `<option value="${escapeHtml(selected)}">${escapeHtml(selected || t("dispatch.selectPickupYard", "Select pickup yard"))}</option>`}
     ${options.map((option) => `<option value="${escapeHtml(option.yard)}" ${String(option.yard || "").toLowerCase() === String(effectiveSelected || "").toLowerCase() ? "selected" : ""}>${escapeHtml(option.yard)}</option>`).join("")}
   </select></label>`;
@@ -242,6 +272,68 @@ function renderScmPickupYardControl(order = {}, { action = "existing-pickup-yard
 
 function scmOrderIsSplit(order = {}) {
   return order.isScmSplit === true || order.parseSource === "scm-split";
+}
+
+function scmSplitEditorUnits(line = {}) {
+  const conversions = [
+    { key: "pallets", label: "PLT", conversion: scmNumber(line.toPlt) },
+    { key: "layers", label: "LYR", conversion: scmNumber(line.toLyr) },
+    { key: "sections", label: "SEC", conversion: scmNumber(line.toSec) },
+    { key: "pieces", label: "PCS", conversion: scmNumber(line.toPcs) }
+  ];
+  if (conversions.some((unit) => unit.conversion > 0)) {
+    return conversions.filter((unit) => unit.conversion > 0
+      && (scmNumber(line.maximum?.[unit.key]) > 0 || scmNumber(line.current?.[unit.key]) > 0));
+  }
+  return [{ key: "salesQty", label: line.unit || "Sales Qty", conversion: 1 }];
+}
+
+function scmSplitInputForLine(line = {}) {
+  const key = String(line.sourceLineId || "");
+  if (!scmSplitLineInputs[key]) {
+    const converted = [line.toPlt, line.toLyr, line.toSec, line.toPcs]
+      .some((value) => scmNumber(value) > 0);
+    scmSplitLineInputs[key] = {
+      pallets: scmNumber(line.current?.pallets),
+      layers: scmNumber(line.current?.layers),
+      sections: scmNumber(line.current?.sections),
+      pieces: scmNumber(line.current?.pieces),
+      // Converted lines are edited through their visible unit controls. Keeping
+      // the derived sales quantity here would make a fully cleared line remain
+      // non-zero and therefore impossible to remove.
+      salesQty: converted ? 0 : scmNumber(line.current?.salesQty)
+    };
+  }
+  return scmSplitLineInputs[key];
+}
+
+function scmSplitInputHasQuantity(input = {}) {
+  return ["pallets", "layers", "sections", "pieces", "salesQty"]
+    .some((key) => scmNumber(input[key]) > 0);
+}
+
+async function loadScmSplitEditor(order = scmSelectedOrder(), { render = true } = {}) {
+  const request = ++scmSplitEditorRequest;
+  if (!order || !scmOrderIsSplit(order)) {
+    scmSplitEditor = null;
+    scmSplitLineInputs = {};
+    scmSplitSourceSearch = "";
+    if (render) renderScm();
+    return;
+  }
+  scmSplitEditor = null;
+  scmSplitLineInputs = {};
+  if (render) renderScm();
+  try {
+    const payload = await scmApi(`/api/dispatch/scm/purchase-order-splits/${encodeURIComponent(order.id)}/source-lines`);
+    if (request !== scmSplitEditorRequest || String(scmSelectedOrder()?.id || "") !== String(order.id || "")) return;
+    scmSplitEditor = payload;
+    for (const line of payload.lines || []) scmSplitInputForLine(line);
+  } catch (error) {
+    if (request !== scmSplitEditorRequest) return;
+    scmNotice = `Split items failed to load: ${error.message}`;
+  }
+  if (render) renderScm();
 }
 
 function scmOrderCanGroup(order = {}) {
@@ -394,6 +486,8 @@ async function loadScmOrders() {
       const selected = scmOrders.find((order) => String(order.id) === String(selectedScmOrderId));
       scmRenameRef = scmOrderIsSplit(selected) ? selected?.id || "" : selected?.dispatchRef || "";
     }
+    const selected = scmOrders.find((order) => String(order.id) === String(selectedScmOrderId));
+    await loadScmSplitEditor(selected, { render: false });
   } catch (error) {
     scmNotice = `SCM PO list failed: ${error.message}`;
   } finally {
@@ -440,6 +534,8 @@ function renderOrderList() {
     const groupSelected = scmGroupSelection.has(String(order.id));
     const quantityLabel = scmOrderQuantityLabel(order);
     const plannedLabel = scmPlannedLabel(order);
+    const completed = String(order.scm?.status || "").trim().toLowerCase() === "completed"
+      || order.dispatchCompleted === true;
     const pickupPoint = scmDefaultPickupPoint(order) || "";
     const destinationYards = [...new Set([
       order.destinationYard,
@@ -447,7 +543,7 @@ function renderOrderList() {
     ].map((yard) => String(yard || "").trim()).filter(Boolean))];
     const destinationText = destinationYards.join(", ");
     return `
-      <button class="order-card scm-po-card ${plannedLabel ? "has-plan" : ""} ${isSplit ? "scm-split-card" : ""} ${alreadyGrouped ? "scm-grouped-card" : ""} ${groupSelected ? "multi-selected" : ""} ${String(order.id) === String(selectedScmOrderId) ? "selected" : ""}" data-action="select-order" data-id="${escapeHtml(order.id)}" type="button">
+      <button class="order-card scm-po-card ${plannedLabel || completed ? "has-plan" : ""} ${isSplit ? "scm-split-card" : ""} ${alreadyGrouped ? "scm-grouped-card" : ""} ${groupSelected ? "multi-selected" : ""} ${String(order.id) === String(selectedScmOrderId) ? "selected" : ""}" data-action="select-order" data-id="${escapeHtml(order.id)}" type="button">
         <div class="scm-card-main">
           <strong>${escapeHtml(order.id)}</strong>
           <span class="scm-card-party">${isSplit ? t("dispatch.scmSplitOrder", "SCM Split Order") : escapeHtml(order.customer || order.vendorYard || order.sourceYard || "Purchase Order")}</span>
@@ -457,13 +553,60 @@ function renderOrderList() {
           <span class="scm-card-qty">${escapeHtml(quantityLabel || "-")}</span>
           <span class="scm-card-weight">${t("dispatch.orderWeight", "Order weight")}: ${escapeHtml(scmWeightLabel(order.weight))}</span>
         </div>
-        ${plannedLabel ? `<div class="scm-card-plan-side">
-          <span class="scm-planned-badge">Planned</span>
-          <span class="scm-card-plan">${escapeHtml(plannedLabel)}</span>
+        ${plannedLabel || completed ? `<div class="scm-card-plan-side">
+          <span class="scm-planned-badge${completed ? " scm-completed-badge" : ""}">${completed ? "Completed" : "Planned"}</span>
+          ${plannedLabel ? `<span class="scm-card-plan">${escapeHtml(plannedLabel)}</span>` : ""}
         </div>` : ""}
       </button>
     `;
   }).join("");
+}
+
+function scmSplitEditorSalesQuantity(line = {}, input = {}) {
+  const converted = (scmNumber(input.pallets) * scmNumber(line.toPlt))
+    + (scmNumber(input.layers) * scmNumber(line.toLyr))
+    + (scmNumber(input.sections) * scmNumber(line.toSec))
+    + (scmNumber(input.pieces) * scmNumber(line.toPcs));
+  return converted > 0 ? converted : scmNumber(input.salesQty);
+}
+
+function renderScmSplitLineEditor(order = {}) {
+  if (!scmSplitEditor || String(scmSplitEditor.split?.splitPoRef || "") !== String(order.id || "")) {
+    return `<div class="empty-state">${t("common.loading", "Loading...")}</div>`;
+  }
+  const locked = scmSplitEditor.split?.locked === true || order.scmSplitLocked === true;
+  const needle = scmLineSearch.trim().toLowerCase();
+  const activeLines = (scmSplitEditor.lines || []).filter((line) => {
+    const input = scmSplitInputForLine(line);
+    if (!line.inSplit && !scmSplitInputHasQuantity(input)) return false;
+    return !needle || [line.sku, line.itemName, line.description, line.unit].join(" ").toLowerCase().includes(needle);
+  });
+  const sourceNeedle = scmSplitSourceSearch.trim().toLowerCase();
+  const addCandidates = (scmSplitEditor.lines || []).filter((line) => {
+    const input = scmSplitInputForLine(line);
+    if (!line.canAdd || line.inSplit || scmSplitInputHasQuantity(input)) return false;
+    return !sourceNeedle || [line.sku, line.itemName, line.description, line.unit].join(" ").toLowerCase().includes(sourceNeedle);
+  }).slice(0, 12);
+  const lineCards = activeLines.map((line) => {
+    const input = scmSplitInputForLine(line);
+    const units = scmSplitEditorUnits(line);
+    const weight = scmSplitEditorSalesQuantity(line, input) * scmNumber(line.itemWeight);
+    return `<article class="scm-line-card scm-split-edit-line" data-split-source-line="${escapeHtml(line.sourceLineId)}">
+      <div class="scm-line-main"><div><strong>${escapeHtml(line.sku || line.itemName || "Item")}</strong><span>${escapeHtml(line.description || "")}</span></div>
+        <div class="scm-line-totals"><span>Maximum on this split: ${escapeHtml(units.map((unit) => `${scmNumber(line.maximum?.[unit.key]).toLocaleString()} ${unit.label}`).join(" / "))}</span><span>${escapeHtml(scmWeightLabel(weight))}</span></div></div>
+      <div class="scm-line-inputs">
+        ${units.map((unit) => `<label><span>${escapeHtml(unit.label)}</span><input data-action="split-line-qty" data-source-line="${escapeHtml(line.sourceLineId)}" data-field="${escapeHtml(unit.key)}" type="number" min="0" max="${escapeHtml(scmNumber(line.maximum?.[unit.key]))}" step="1" value="${escapeHtml(scmNumber(input[unit.key]))}" ${locked ? "disabled" : ""} /></label>`).join("")}
+        <button class="danger-button" data-action="remove-split-line" data-source-line="${escapeHtml(line.sourceLineId)}" type="button" ${locked ? "disabled" : ""}>Remove</button>
+      </div>
+    </article>`;
+  }).join("");
+  return `${locked ? `<div class="route-notice">This split is planned, linked, grouped, received, or already used by Driver. Unplan/unlink it before changing any split detail.</div>` : ""}
+    <section class="scm-split-source-picker">
+      <label><span>Add item from ${escapeHtml(scmSplitEditor.split?.sourcePoRef || "source PO")}</span><input data-action="split-source-search" type="search" value="${escapeHtml(scmSplitSourceSearch)}" placeholder="SKU, item name, or description" autocomplete="off" ${locked ? "disabled" : ""} /></label>
+      ${sourceNeedle ? `<div class="scm-split-source-results">${addCandidates.map((line) => `<button data-action="add-split-source-line" data-source-line="${escapeHtml(line.sourceLineId)}" type="button" ${locked ? "disabled" : ""}><strong>${escapeHtml(line.sku || line.itemName)}</strong><span>${escapeHtml(scmSplitEditorUnits(line).map((unit) => `${scmNumber(line.maximum?.[unit.key]).toLocaleString()} ${unit.label} available`).join(" / "))}</span></button>`).join("") || `<span>No remaining source item matches.</span>`}</div>` : ""}
+    </section>
+    ${lineCards || `<div class="empty-state">No split item matches this search.</div>`}
+    <div class="scm-submit-row"><button class="primary-action" data-action="save-split-lines" type="button" ${locked || scmLoading ? "disabled" : ""}>${scmLoading ? "Saving..." : "Save split quantities"}</button></div>`;
 }
 
 function renderSelectedOrder() {
@@ -478,7 +621,7 @@ function renderSelectedOrder() {
   }
   const isSplit = scmOrderIsSplit(order);
   const visibleItems = scmFilteredItems(order);
-  const lineRows = visibleItems.map((item) => {
+  const lineRows = isSplit ? renderScmSplitLineEditor(order) : visibleItems.map((item) => {
     const input = scmInputForLine(item.lineRowId);
     const units = scmAvailableUnits(item);
     const displayedQuantities = isSplit
@@ -544,32 +687,40 @@ function renderSelectedOrder() {
 function renderScmScheduleMiniPanel(order = {}) {
   const scm = order.scm || {};
   const isSplit = scmOrderIsSplit(order);
+  const splitLocked = isSplit && (order.scmSplitLocked === true || scmSplitEditor?.split?.locked === true);
   const currentMethod = scm.method || "MBT";
   const currentStatus = scm.status || "Queued";
   const currentGroup = scm.groupRef || "";
   const orderKind = order.type === "TO" ? "TO" : "PO";
-  const manualStatuses = ["Queued", "Urgent", "Cancelled", "Hold", "Priority", "Surplus Only", "Book Appt"];
-  const statusIsManual = manualStatuses.includes(currentStatus);
-  const selectedDestination = scmDestinationLocationId || scmDefaultDestinationLocationId(order);
+  const statusIsManual = SCM_MANUAL_STATUSES.includes(currentStatus);
+  const remarkOverride = String(scm.remarkOverride || "");
+  const savedDestinationOverride = String(scm.dropoffPoint || "").trim();
+  const effectiveDestination = order.destinationYard
+    || SCM_DESTINATION_YARDS.find((yard) => yard.id === scmDefaultDestinationLocationId(order))?.text
+    || "NetSuite line destinations";
+  const destinationOverrideControl = `<label class="scm-po-destination-override"><span>${t("dispatch.destinationOverride", "Destination Override")}</span><select data-scm-field="dropoffPoint" ${splitLocked ? "disabled" : ""}>
+    <option value="" ${savedDestinationOverride ? "" : "selected"}>${t("dispatch.useNetsuiteLineDestinations", "Use NetSuite line destinations")} (${escapeHtml(effectiveDestination)})</option>
+    ${SCM_DESTINATION_YARDS.map((yard) => `<option value="${yard.text}" ${yard.text === savedDestinationOverride ? "selected" : ""}>${yard.text}</option>`).join("")}
+  </select><small>${t("dispatch.overrideAllPoLines", "Override all PO lines when a yard is selected.")}</small></label>`;
   return `
     <section class="scm-mini-panel">
       <div class="scm-mini-grid">
-        <label><span>Method</span><select data-scm-field="method">
+        <label><span>Method</span><select data-scm-field="method" ${splitLocked ? "disabled" : ""}>
           ${["MBT", "Vendor", "Customer Pickup"].map((value) => `<option value="${value}" ${currentMethod === value ? "selected" : ""}>${value}</option>`).join("")}
         </select></label>
         <label><span>Status</span>${statusIsManual
-          ? `<select data-scm-field="status">${manualStatuses.map((value) => `<option value="${value}" ${currentStatus === value ? "selected" : ""}>${value}</option>`).join("")}</select>`
+          ? `<select data-scm-field="status" ${splitLocked ? "disabled" : ""}>${SCM_MANUAL_STATUSES.map((value) => `<option value="${value}" ${currentStatus === value ? "selected" : ""}>${value}</option>`).join("")}</select>`
           : `<input value="${escapeHtml(currentStatus)}" readonly />`}</label>
-        ${renderScmPickupYardControl(order, { action: isSplit ? "existing-split-pickup-yard" : "existing-pickup-yard", field: !isSplit })}
-        <label class="checkbox-line"><input data-scm-field="isSpecialOrder" type="checkbox" ${scm.isSpecialOrder ? "checked" : ""} /> <span>Sp.O</span></label>
+        ${renderScmPickupYardControl(order, { action: isSplit ? "existing-split-pickup-yard" : "existing-pickup-yard", field: !isSplit, disabled: splitLocked })}
+        <label class="checkbox-line"><input data-scm-field="isSpecialOrder" type="checkbox" ${scm.isSpecialOrder ? "checked" : ""} ${splitLocked ? "disabled" : ""} /> <span>Sp.O</span></label>
         ${isSplit
-          ? `<label><span>${t("dispatch.changeRef", "Change Ref")}</span><input data-action="rename-ref" value="${escapeHtml(scmRenameRef || order.id || "")}" autocomplete="off" /></label>
-             <label><span>${t("dispatch.destinationYard", "Destination Yard")}</span><select data-action="existing-split-destination-yard">
-               ${SCM_DESTINATION_YARDS.map((yard) => `<option value="${yard.id}" ${yard.id === selectedDestination ? "selected" : ""}>${yard.text}</option>`).join("")}
-             </select></label>`
+          ? `<label><span>${t("dispatch.changeRef", "Change Ref")}</span><input data-action="rename-ref" value="${escapeHtml(scmRenameRef || order.id || "")}" autocomplete="off" ${splitLocked ? "disabled" : ""} /></label>`
           : `<label><span>Packing Slip / Ref</span><input data-scm-field="packingSlipRef" value="${escapeHtml(scm.packingSlipRef || order.dispatchRef || "")}" /></label>`}
-        <button data-action="save-scm-schedule" data-kind="${escapeHtml(orderKind)}" type="button" ${scmLoading ? "disabled" : ""}>${scmLoading ? "Saving..." : "Save Schedule"}</button>
-        ${isSplit ? `<button class="danger-button" data-action="unsplit-order" type="button">${t("dispatch.unsplit", "Unsplit")}</button>` : ""}
+        ${destinationOverrideControl}
+        <label class="scm-remark-field"><span>Remark</span><textarea data-scm-field="remarkOverride" rows="2" maxlength="2000" placeholder="Add remark">${escapeHtml(remarkOverride)}</textarea><small>${remarkOverride ? "Local remark" : "Shared with PO / TO Schedule"}</small></label>
+        <button data-action="save-scm-schedule" data-kind="${escapeHtml(orderKind)}" type="button" ${scmLoading || splitLocked ? "disabled" : ""}>${scmLoading ? "Saving..." : "Save Schedule"}</button>
+        ${splitLocked ? `<button data-action="save-scm-remark" data-kind="${escapeHtml(orderKind)}" type="button" ${scmLoading ? "disabled" : ""}>${scmLoading ? "Saving..." : "Save Remark"}</button>` : ""}
+        ${isSplit ? `<button class="danger-button" data-action="unsplit-order" type="button" ${splitLocked ? "disabled" : ""}>${t("dispatch.unsplit", "Unsplit")}</button>` : ""}
       </div>
       ${currentGroup ? `<div class="scm-group-tools compact"><strong>${escapeHtml(currentGroup)}</strong><button class="danger-button" data-action="cancel-scm-group" data-group="${escapeHtml(currentGroup)}" type="button">Ungroup</button></div>` : ""}
     </section>
@@ -607,6 +758,16 @@ function renderScmSplitModal() {
           <div class="scm-ref-input">
             ${renderScmPickupYardControl(order, { action: "split-pickup-yard", field: false })}
           </div>
+          <label class="scm-ref-input">
+            <span>Status</span>
+            <select data-action="split-initial-status">
+              ${SCM_MANUAL_STATUSES.map((status) => `<option value="${status}" ${status === scmSplitInitialStatus ? "selected" : ""}>${status}</option>`).join("")}
+            </select>
+          </label>
+          <label class="scm-ref-input scm-remark-field">
+            <span>Remark</span>
+            <textarea data-action="split-remark" rows="3" maxlength="2000" placeholder="Add remark">${escapeHtml(scmSplitRemark)}</textarea>
+          </label>
           <div class="scm-summary-lines">
             ${rows.map(({ item, quantities }) => `
               <article>
@@ -678,6 +839,8 @@ async function createScmSplit() {
   }));
   const destinationLocationId = scmLiveSplitDestinationLocationId(order);
   const pickupPoint = scmVendorYardOptions(order).length ? scmLiveSplitPickupPoint(order) : "";
+  const status = scmLiveSplitInitialStatus();
+  const remarkOverride = scmLiveSplitRemark();
   if (!scmRef.trim()) {
     scmNotice = "New PO ref number is required.";
     renderScm();
@@ -704,6 +867,8 @@ async function createScmSplit() {
         newPoRef: scmRef.trim(),
         pickupPoint,
         destinationLocationId,
+        status,
+        remarkOverride,
         lines,
         audit: { sessionId: sessionStorage.getItem("mbbs.dispatch.sessionId") || "" }
       })
@@ -713,6 +878,8 @@ async function createScmSplit() {
     scmRef = "";
     scmDestinationLocationId = "";
     scmPickupPoint = "";
+    scmSplitInitialStatus = "Queued";
+    scmSplitRemark = "";
     scmSummaryOpen = false;
     scmLineInputs = {};
     await loadScmOrders();
@@ -770,6 +937,7 @@ async function updateScmSplitRef() {
       method: "PUT",
       body: JSON.stringify({
         newPoRef: newRef,
+        expectedRevision: scmSplitEditor?.split?.revision ?? order.scmSplitRevision,
         audit: { sessionId: sessionStorage.getItem("mbbs.dispatch.sessionId") || "" }
       })
     });
@@ -817,6 +985,8 @@ async function updateScmSplit() {
   renderScm();
   try {
     let currentRef = order.id;
+    let currentRevision = Number(scmSplitEditor?.split?.revision ?? order.scmSplitRevision ?? 1);
+    let scheduleUpdatedAt = order.scm?.updatedAt || null;
     let updatedRef = null;
     let updatedDestination = null;
     let updatedPickup = null;
@@ -824,23 +994,33 @@ async function updateScmSplit() {
     if (refChanged) {
       const refPayload = await scmApi(`/api/dispatch/scm/purchase-order-splits/${encodeURIComponent(currentRef)}`, {
         method: "PUT",
-        body: JSON.stringify({ newPoRef: newRef, audit })
+        body: JSON.stringify({ newPoRef: newRef, expectedRevision: currentRevision, audit })
       });
       currentRef = refPayload.updated?.newPoRef || newRef;
+      currentRevision = Number(refPayload.updated?.revision || currentRevision + 1);
+      scheduleUpdatedAt = refPayload.updated?.scheduleUpdatedAt || scheduleUpdatedAt;
       updatedRef = currentRef;
     }
     if (destinationChanged) {
       const destinationPayload = await scmApi(`/api/dispatch/scm/purchase-order-splits/${encodeURIComponent(currentRef)}/destination`, {
         method: "PUT",
-        body: JSON.stringify({ destinationLocationId: nextDestinationId, audit })
+        body: JSON.stringify({
+          destinationLocationId: nextDestinationId,
+          expectedUpdatedAt: scheduleUpdatedAt,
+          expectedRevision: currentRevision,
+          audit
+        })
       });
+      currentRevision = Number(destinationPayload.updated?.revision || currentRevision + 1);
+      scheduleUpdatedAt = destinationPayload.updated?.scheduleUpdatedAt || scheduleUpdatedAt;
       updatedDestination = destinationPayload.updated?.destinationLocation || SCM_DESTINATION_YARDS.find((yard) => yard.id === nextDestinationId)?.text || "";
     }
     if (pickupChanged) {
       const pickupPayload = await scmApi(`/api/dispatch/scm/purchase-order-splits/${encodeURIComponent(currentRef)}/pickup`, {
         method: "PUT",
-        body: JSON.stringify({ pickupPoint: nextPickupPoint, audit })
+        body: JSON.stringify({ pickupPoint: nextPickupPoint, expectedRevision: currentRevision, audit })
       });
+      currentRevision = Number(pickupPayload.updated?.revision || currentRevision + 1);
       updatedPickup = pickupPayload.updated?.pickupPoint || nextPickupPoint;
     }
     selectedScmOrderId = updatedRef || currentRef;
@@ -862,6 +1042,42 @@ async function updateScmSplit() {
   }
 }
 
+async function saveScmSplitLines() {
+  const order = scmSelectedOrder();
+  if (!order || !scmOrderIsSplit(order) || !scmSplitEditor || scmSplitEditor.split?.locked) return;
+  const lines = (scmSplitEditor.lines || [])
+    .map((line) => ({ sourceLineId: line.sourceLineId, ...scmSplitInputForLine(line) }))
+    .filter((line) => {
+      const source = scmSplitEditor.lines.find((candidate) => String(candidate.sourceLineId) === String(line.sourceLineId));
+      return source?.inSplit || scmSplitInputHasQuantity(line);
+    });
+  if (!lines.some(scmSplitInputHasQuantity)) {
+    scmNotice = "Keep at least one item in this split, or use Unsplit.";
+    renderScm();
+    return;
+  }
+  scmLoading = true;
+  scmNotice = "Saving split quantities...";
+  renderScm();
+  try {
+    const payload = await scmApi(`/api/dispatch/scm/purchase-order-splits/${encodeURIComponent(order.id)}/lines`, {
+      method: "PUT",
+      body: JSON.stringify({
+        expectedRevision: scmSplitEditor.split.revision,
+        lines,
+        audit: { sessionId: sessionStorage.getItem("mbbs.dispatch.sessionId") || "" }
+      })
+    });
+    scmNotice = `Updated ${payload.updated?.changes?.length || 0} split item line(s).`;
+    await loadScmOrders();
+  } catch (error) {
+    scmNotice = `Split quantity update failed: ${error.message}`;
+  } finally {
+    scmLoading = false;
+    renderScm();
+  }
+}
+
 async function unsplitScmOrder() {
   const order = scmSelectedOrder();
   if (!order || !scmOrderIsSplit(order)) return;
@@ -870,7 +1086,11 @@ async function unsplitScmOrder() {
   scmNotice = "Unsplitting order...";
   renderScm();
   try {
-    await scmApi(`/api/dispatch/scm/purchase-order-splits/${encodeURIComponent(order.id)}?sessionId=${encodeURIComponent(sessionStorage.getItem("mbbs.dispatch.sessionId") || "")}`, {
+    const params = new URLSearchParams({
+      sessionId: sessionStorage.getItem("mbbs.dispatch.sessionId") || "",
+      expectedRevision: String(scmSplitEditor?.split?.revision ?? order.scmSplitRevision ?? 1)
+    });
+    await scmApi(`/api/dispatch/scm/purchase-order-splits/${encodeURIComponent(order.id)}?${params}`, {
       method: "DELETE"
     });
     scmNotice = `${order.id} was unsplit. Quantity returned to ${order.sourcePoRef || "source PO"}.`;
@@ -890,7 +1110,10 @@ async function unsplitScmOrder() {
 function collectScmSchedulePatch(order = scmSelectedOrder()) {
   const patch = {
     orderKind: order?.type === "TO" ? "TO" : "PO",
-    expectedUpdatedAt: order?.scm?.updatedAt || null
+    expectedUpdatedAt: order?.scm?.updatedAt || null,
+    expectedSplitRevision: scmOrderIsSplit(order)
+      ? scmSplitEditor?.split?.revision ?? order?.scmSplitRevision
+      : undefined
   };
   scmApp.querySelectorAll("[data-scm-field]").forEach((field) => {
     patch[field.dataset.scmField] = field.type === "checkbox" ? field.checked : field.value;
@@ -901,6 +1124,7 @@ function collectScmSchedulePatch(order = scmSelectedOrder()) {
 async function saveScmScheduleForSelected() {
   const order = scmSelectedOrder();
   if (!order || scmLoading) return;
+  const previousDestinationOverride = String(order.scm?.dropoffPoint || "").trim();
   const patch = collectScmSchedulePatch(order);
   order.scm ||= {};
   for (const [key, value] of Object.entries(patch)) {
@@ -910,7 +1134,27 @@ async function saveScmScheduleForSelected() {
   scmNotice = "Saving SCM schedule...";
   renderScm();
   scmApp.querySelectorAll("[data-scm-field]").forEach((field) => { field.disabled = true; });
+  let splitDestinationUpdated = false;
   try {
+    const requestedDestination = String(patch.dropoffPoint || "").trim();
+    if (scmOrderIsSplit(order)
+      && requestedDestination
+      && requestedDestination.toLowerCase() !== previousDestinationOverride.toLowerCase()) {
+      const destination = SCM_DESTINATION_YARDS.find((yard) => yard.text === requestedDestination);
+      if (!destination) throw new Error("Select a supported MBBS destination yard.");
+      const destinationPayload = await scmApi(`/api/dispatch/scm/purchase-order-splits/${encodeURIComponent(order.id)}/destination`, {
+        method: "PUT",
+        body: JSON.stringify({
+          destinationLocationId: destination.id,
+          expectedUpdatedAt: patch.expectedUpdatedAt,
+          expectedRevision: patch.expectedSplitRevision,
+          audit: { sessionId: sessionStorage.getItem("mbbs.dispatch.sessionId") || "" }
+        })
+      });
+      splitDestinationUpdated = true;
+      patch.expectedUpdatedAt = destinationPayload.updated?.scheduleUpdatedAt || patch.expectedUpdatedAt;
+      patch.expectedSplitRevision = destinationPayload.updated?.revision || patch.expectedSplitRevision;
+    }
     await scmApi(`/api/scm/schedule/${encodeURIComponent(order.id)}`, {
       method: "PUT",
       body: JSON.stringify({
@@ -921,7 +1165,37 @@ async function saveScmScheduleForSelected() {
     scmNotice = `Saved SCM schedule for ${order.id}.`;
     await loadScmOrders();
   } catch (error) {
-    scmNotice = `Save schedule failed: ${error.message}`;
+    scmNotice = splitDestinationUpdated
+      ? `Destination updated, but the remaining schedule save failed: ${error.message}`
+      : `Save schedule failed: ${error.message}`;
+  } finally {
+    scmLoading = false;
+    renderScm();
+  }
+}
+
+async function saveScmRemarkForSelected() {
+  const order = scmSelectedOrder();
+  if (!order || scmLoading) return;
+  const remarkField = scmApp.querySelector('[data-scm-field="remarkOverride"]');
+  const remarkOverride = String(remarkField?.value || "");
+  scmLoading = true;
+  scmNotice = "Saving remark...";
+  renderScm();
+  try {
+    const payload = await scmApi(`/api/scm/schedule/${encodeURIComponent(order.id)}/remark`, {
+      method: "PUT",
+      body: JSON.stringify({
+        orderKind: order.type === "TO" ? "TO" : "PO",
+        expectedUpdatedAt: order.scm?.updatedAt || null,
+        remarkOverride,
+        audit: { sessionId: sessionStorage.getItem("mbbs.dispatch.sessionId") || "" }
+      })
+    });
+    scmNotice = `Saved remark for ${payload.row?.orderRef || order.id}.`;
+    await loadScmOrders();
+  } catch (error) {
+    scmNotice = `Remark save failed: ${error.message}`;
   } finally {
     scmLoading = false;
     renderScm();
@@ -1011,6 +1285,7 @@ scmApp.addEventListener("click", async (event) => {
     scmNotice = "";
     scmSummaryOpen = false;
     renderScm();
+    await loadScmSplitEditor(selected);
   }
   if (action === "refresh") {
     await loadScmOrders();
@@ -1037,6 +1312,8 @@ scmApp.addEventListener("click", async (event) => {
     scmSummaryOpen = true;
     scmDestinationLocationId = scmDefaultDestinationLocationId(scmSelectedOrder());
     scmPickupPoint = scmDefaultPickupPoint(scmSelectedOrder());
+    scmSplitInitialStatus = "Queued";
+    scmSplitRemark = "";
     scmNotice = "";
     renderScm();
   }
@@ -1044,6 +1321,8 @@ scmApp.addEventListener("click", async (event) => {
     scmSummaryOpen = false;
     scmDestinationLocationId = "";
     scmPickupPoint = "";
+    scmSplitInitialStatus = "Queued";
+    scmSplitRemark = "";
     renderScm();
   }
   if (action === "confirm-create-split") {
@@ -1062,11 +1341,32 @@ scmApp.addEventListener("click", async (event) => {
   if (action === "update-split-ref") {
     await updateScmSplitRef();
   }
+  if (action === "add-split-source-line") {
+    const line = scmSplitEditor?.lines?.find((candidate) => String(candidate.sourceLineId) === String(target.dataset.sourceLine));
+    if (!line || scmSplitEditor?.split?.locked) return;
+    const input = scmSplitInputForLine(line);
+    const first = scmSplitEditorUnits(line).find((unit) => scmNumber(line.maximum?.[unit.key]) > 0);
+    if (first) input[first.key] = Math.min(1, scmNumber(line.maximum?.[first.key]));
+    scmSplitSourceSearch = "";
+    renderScm();
+  }
+  if (action === "remove-split-line") {
+    const line = scmSplitEditor?.lines?.find((candidate) => String(candidate.sourceLineId) === String(target.dataset.sourceLine));
+    if (!line || scmSplitEditor?.split?.locked) return;
+    scmSplitLineInputs[String(line.sourceLineId)] = { pallets: 0, layers: 0, sections: 0, pieces: 0, salesQty: 0 };
+    renderScm();
+  }
+  if (action === "save-split-lines") {
+    await saveScmSplitLines();
+  }
   if (action === "unsplit-order") {
     await unsplitScmOrder();
   }
   if (action === "save-scm-schedule") {
     await saveScmScheduleForSelected();
+  }
+  if (action === "save-scm-remark") {
+    await saveScmRemarkForSelected();
   }
   if (action === "create-scm-group") {
     await createScmGroupForSelected();
@@ -1088,8 +1388,27 @@ scmApp.addEventListener("input", (event) => {
     scmRef = target.value;
     return;
   }
+  if (target.dataset.action === "split-remark") {
+    scmSplitRemark = target.value;
+    return;
+  }
   if (target.dataset.action === "rename-ref") {
     scmRenameRef = target.value;
+    return;
+  }
+  if (target.dataset.action === "split-source-search") {
+    scmSplitSourceSearch = target.value;
+    renderScm();
+    return;
+  }
+  if (target.dataset.action === "split-line-qty") {
+    const line = scmSplitEditor?.lines?.find((candidate) => String(candidate.sourceLineId) === String(target.dataset.sourceLine));
+    if (!line || scmSplitEditor?.split?.locked) return;
+    const input = scmSplitInputForLine(line);
+    input[target.dataset.field] = Math.min(
+      scmNumber(target.value),
+      scmNumber(line.maximum?.[target.dataset.field])
+    );
     return;
   }
   if (target.dataset.action === "line-search") {
@@ -1113,6 +1432,9 @@ scmApp.addEventListener("change", (event) => {
   }
   if (target.dataset.action === "split-pickup-yard" || target.dataset.action === "existing-split-pickup-yard" || target.dataset.action === "existing-pickup-yard") {
     scmPickupPoint = target.value;
+  }
+  if (target.dataset.action === "split-initial-status") {
+    scmSplitInitialStatus = SCM_MANUAL_STATUSES.includes(target.value) ? target.value : "Queued";
   }
   if (target.dataset.action === "filter-dropoff") {
     scmDropoffFilter = target.value;

@@ -12,6 +12,7 @@ const repoRoot = path.resolve(process.env.MBBS_REPO_ROOT || path.resolve(serverR
 const CHECKOUT_SHA = "11d5960a326750d5838078e36cf38b85af677262";
 const UPLOAD_ARTIFACT_SHA = "043fb46d1a93c77aae656e7c1c64a875d1fc6a0a";
 const P3_DEDICATED_MUTATION_RUNNERS = Object.freeze([
+  "run-auto-transfer-auto-approval-mutations.mjs",
   "run-customer-charge-mutations.mjs",
   "run-delivery-instruction-mutations.mjs",
   "run-dispatch-active-load-mutations.mjs",
@@ -21,6 +22,7 @@ const P3_DEDICATED_MUTATION_RUNNERS = Object.freeze([
   "run-dispatch-order-completion-mutations.mjs",
   "run-dispatch-performance-mutations.mjs",
   "run-dispatch-planner-optimization-mutations.mjs",
+  "run-dispatch-po-route-residual-mutations.mjs",
   "run-dispatch-runtime-resilience-mutations.mjs",
   "run-dispatch-save-recovery-mutations.mjs",
   "run-dispatch-v2-summary-marker-mutations.mjs",
@@ -34,6 +36,8 @@ const P3_DEDICATED_MUTATION_RUNNERS = Object.freeze([
   "run-netsuite-delayed-status-refresh-mutations.mjs",
   "run-netsuite-m2m-mutations.mjs",
   "run-operator-customer-pickup-photo-gate-mutations.mjs",
+  "run-operator-linked-fulfillment-mutations.mjs",
+  "run-operator-netsuite-posting-mutations.mjs",
   "run-p310-adversarial-mutations.mjs",
   "run-p310-reconciliation-mutations.mjs",
   "run-p311-mutations.mjs",
@@ -110,7 +114,9 @@ const P3_ADVERSARIAL_TESTS = Object.freeze([
   "dispatch-completion-repository-adversarial.test.js",
   "driver-plan-date-execution-adversarial.test.js",
   "driver-pwa-historical-assist-adversarial.test.js",
+  "operator-netsuite-posting-adversarial.test.js",
   "p311-completed-load-snapshot-integrity.test.js",
+  "sales-order-reattempt-correction-adversarial.test.js",
   "shadow-billing-adversarial.test.js",
   "shadow-billing-snapshot-boundary-adversarial.test.js",
   "stock-request-adversarial.test.js",

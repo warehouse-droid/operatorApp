@@ -27,7 +27,7 @@ test("DSR-PR1: every pre-terminal attempt has one positive delay and terminal at
 
 test("DSR-PR2: normalized identities preserve every valid positive integer without coercing fractions", () => {
   fc.assert(fc.property(
-    fc.constantFrom("sales_order", "purchase_order"),
+    fc.constantFrom("sales_order", "purchase_order", "transfer_order"),
     fc.integer({ min: 1, max: Number.MAX_SAFE_INTEGER }),
     fc.string(),
     (orderType, netsuiteOrderId, tranid) => {

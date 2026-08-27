@@ -265,8 +265,8 @@ async function captureLegacyState(client, ids) {
   );
   const schedule = await captureExactRow(
     client,
-    `SELECT to_jsonb(selected) - ARRAY['dispatch_plan_id', 'dispatch_previous_state']::text[] AS snapshot,
-            md5((to_jsonb(selected) - ARRAY['dispatch_plan_id', 'dispatch_previous_state']::text[])::text) AS checksum
+    `SELECT to_jsonb(selected) - ARRAY['dispatch_plan_id', 'dispatch_previous_state', 'remark_override']::text[] AS snapshot,
+            md5((to_jsonb(selected) - ARRAY['dispatch_plan_id', 'dispatch_previous_state', 'remark_override']::text[])::text) AS checksum
        FROM (
          SELECT *
            FROM scm_transport_schedule
@@ -363,9 +363,25 @@ test("F06/F16: schema-101 upgrade preserves representative legacy records and is
     assert.match(firstRunner.stdout, /Applied 171_netsuite_delayed_status_refresh_outbox\.sql/);
     assert.match(firstRunner.stdout, /Applied 176_special_stock_request_workflow\.sql/);
     assert.match(firstRunner.stdout, /Applied 177_special_stock_request_two_stage_handoff\.sql/);
+    assert.match(firstRunner.stdout, /Applied 178_operator_netsuite_posting_gates\.sql/);
+    assert.match(firstRunner.stdout, /Applied 179_sales_order_reattempt_current_item_corrections\.sql/);
+    assert.match(firstRunner.stdout, /Applied 180_sales_order_completion_fulfillment\.sql/);
+    assert.match(firstRunner.stdout, /Applied 181_smart_scm_phased_planning_po_split_editing\.sql/);
+    assert.match(firstRunner.stdout, /Applied 182_dispatch_direct_po_link_execution\.sql/);
+    assert.match(firstRunner.stdout, /Applied 183_scm_authoritative_schedule_status\.sql/);
+    assert.match(firstRunner.stdout, /Applied 184_scm_schedule_remarks\.sql/);
 
     const after = await captureLegacyState(client, ids);
-    assert.deepEqual(after, before, "Migrations 102-177 must not rewrite representative schema-101 field values.");
+    assert.deepEqual(after, before, "Migrations 102-184 must not rewrite representative schema-101 field values.");
+
+    const scheduleRemark = await client.query(
+      `SELECT remark_override
+         FROM scm_transport_schedule
+        WHERE id = $1`,
+      [ids.scheduleId]
+    );
+    assert.deepEqual(scheduleRemark.rows, [{ remark_override: null }],
+      "The new local remark must be additive and must not reinterpret legacy planning notes.");
 
     const truckCapability = await client.query(
       `SELECT bin_service_enabled, bin_slot_capacity
@@ -558,10 +574,52 @@ test("F06/F16: schema-101 upgrade preserves representative legacy records and is
       "sales_special_stock_order_lines"
     ]);
 
-    assert.equal(receiptsBeforeNoOp.rowCount, 177);
+    const phasedPlanningColumns = await client.query(
+      `SELECT table_name, column_name
+         FROM information_schema.columns
+        WHERE table_schema = 'public'
+          AND (table_name, column_name) IN (
+            ('scm_smart_settings', 'skip_12441_enabled'),
+            ('scm_smart_settings', 'inventory_planning_mode'),
+            ('scm_smart_planning_runs', 'planning_phase'),
+            ('scm_smart_planning_runs', 'phase_one_approved_at'),
+            ('scm_smart_planning_runs', 'phase_one_approved_by'),
+            ('scm_smart_planning_runs', 'phase_two_basis'),
+            ('scm_smart_planning_runs', 'phase_two_created_at'),
+            ('dispatch_scm_po_splits', 'revision'),
+            ('dispatch_scm_po_splits', 'updated_at')
+          )
+        ORDER BY table_name, column_name`
+    );
+    assert.deepEqual(phasedPlanningColumns.rows, [
+      { table_name: "dispatch_scm_po_splits", column_name: "revision" },
+      { table_name: "dispatch_scm_po_splits", column_name: "updated_at" },
+      { table_name: "scm_smart_planning_runs", column_name: "phase_one_approved_at" },
+      { table_name: "scm_smart_planning_runs", column_name: "phase_one_approved_by" },
+      { table_name: "scm_smart_planning_runs", column_name: "phase_two_basis" },
+      { table_name: "scm_smart_planning_runs", column_name: "phase_two_created_at" },
+      { table_name: "scm_smart_planning_runs", column_name: "planning_phase" },
+      { table_name: "scm_smart_settings", column_name: "inventory_planning_mode" },
+      { table_name: "scm_smart_settings", column_name: "skip_12441_enabled" }
+    ]);
+    const splitChangeEventTable = await client.query(
+      `SELECT to_regclass('public.dispatch_scm_po_split_change_events')::text AS table_name,
+              EXISTS (
+                SELECT 1 FROM pg_trigger
+                 WHERE tgrelid = 'dispatch_scm_po_split_change_events'::regclass
+                   AND tgname = 'trg_dispatch_scm_po_split_change_events_immutable'
+                   AND NOT tgisinternal
+              ) AS immutable_trigger`
+    );
+    assert.deepEqual(splitChangeEventTable.rows, [{
+      table_name: "dispatch_scm_po_split_change_events",
+      immutable_trigger: true
+    }]);
+
+    assert.equal(receiptsBeforeNoOp.rowCount, 184);
     assert.equal(
       receiptsBeforeNoOp.rows.at(-1)?.filename,
-      "177_special_stock_request_two_stage_handoff.sql"
+      "184_scm_schedule_remarks.sql"
     );
     assert.deepEqual(
       receiptsBeforeNoOp.rows

@@ -14,8 +14,8 @@ Tier: 3 — relationship quantities, Dispatch snapshots, Operator materializatio
 | The relationship commits but the plan/snapshot update fails | Injected-failure transaction test proving rollback |
 | A stale group/split or plan revision receives a relationship | Signature/revision concurrency tests |
 | PO unlink bypasses Operator, receiving, or Driver progress | Shared-blocker integration tests |
-| An online/offline race lets a Driver use a superseded route | Driver readiness, manifest fencing, and concurrency tests |
-| A screen-off PWA silently receives a route replacement | Pending-request E2E: no mutation before visible authenticated readiness |
+| An online/offline race lets a Driver use a superseded route | Started-job blocking, manifest fencing, and concurrency tests |
+| A screen-off PWA retains an unstarted stale route | Atomic manifest/grant supersession and rejected-event review evidence |
 | Route pickup reconciliation deletes a stop another order needs | Shared-pickup property and historical replay tests |
 | The new search scans every saved snapshot or loses global targets | Query-count/performance and normal/group/split search tests |
 | Existing failed-save recovery or snapshot restore changes behavior | Dispatch recovery/restore regression tests |
@@ -34,10 +34,10 @@ Tier: 3 — relationship quantities, Dispatch snapshots, Operator materializatio
 10. **Pickup conservation.** Added relationships create required pickups before the drop; removed relationships remove only orphaned derived pickups and preserve manual/shared stops and unrelated sequence.
 11. **Global latest search.** Server-paged search returns current normal targets, active groups, active split children, and valid remaining source quantities across plan dates without starting NetSuite whole-order sync.
 12. **Dispatch parity.** Existing Dispatch link endpoints use the same command and blocker; pending planner edits flush first and no second autosave performs the relationship write.
-13. **Visible Driver readiness.** A confirmed route with an issued manifest changes only after every route-bearing device is visible, online, synchronized, idle, and has a current short-lived readiness token.
-14. **Screen off waits.** A suspended/offline device creates a pending request only. A visible notification may prompt the driver, but notification delivery never authorizes the change.
-15. **Fresh human retry.** When the Driver becomes ready, SCM must re-preview and click Apply; pending requests never auto-apply.
-16. **Manifest fence.** Successful commit supersedes old manifests/grants. An unexpected old event is retained for offline review and is never applied to the revised route.
+13. **Unstarted route changes.** A dependency change may update a confirmed route without a Driver PWA readiness handshake when none of the affected order references has actually started Driver work.
+14. **Started work is immutable.** Any started or completed Driver job for an affected order is a hard blocker; a readiness acknowledgement can never override it. Planned job rows with no start/completion evidence do not block.
+15. **Unrelated activity isolation.** Driver activity for another order or route does not block the selected dependency change.
+16. **Manifest fence.** Every successful confirmed-route commit supersedes old manifests/grants atomically. An unexpected old event is retained for offline review and is never applied to the revised route.
 17. **Snapshot compatibility.** Old snapshots remain readable; restore uses current relationship ledgers and retains the existing recovery snapshot on validation failure.
 18. **No deployment.** Implementation and verification use disposable isolated containers only; production containers, data, and schema are not mutated.
 

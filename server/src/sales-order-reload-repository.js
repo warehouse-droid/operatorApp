@@ -6,6 +6,12 @@ import {
   normalizeReloadRequestId,
   reloadPackedQuantities
 } from "./sales-order-reload.js";
+import { applyEffectiveReattemptIdentity } from "./sales-order-reattempt-correction.js";
+import {
+  listLatestSalesOrderReattemptCycleCorrections,
+  listLatestSalesOrderReattemptItemCorrections,
+  projectSalesOrderReattemptLineSnapshot
+} from "./sales-order-reattempt-correction-repository.js";
 
 export const ACTIVE_RELOAD_STATUSES = Object.freeze(["authorized", "preparing", "packed", "in_progress"]);
 const QUANTITY_TOLERANCE = 0.000001;
@@ -129,7 +135,7 @@ function mapReloadLine(row) {
   return mapped;
 }
 
-function mapReattemptOrder(row) {
+function mapReattemptOrder(row, corrections = []) {
   if (!row) return null;
   return {
     id: Number(row.id),
@@ -139,7 +145,10 @@ function mapReattemptOrder(row) {
     parentSalesOrderId: row.parent_sales_order_id === null ? null : Number(row.parent_sales_order_id),
     parentOrderRef: row.parent_order_ref || "",
     reloadCycleId: row.reload_cycle_id === null ? null : Number(row.reload_cycle_id),
-    lineSnapshot: Array.isArray(row.line_snapshot) ? row.line_snapshot : [],
+    lineSnapshot: projectSalesOrderReattemptLineSnapshot(
+      Array.isArray(row.line_snapshot) ? row.line_snapshot : [],
+      corrections
+    ),
     palletQty: quantity(row.pallet_qty),
     layerQty: quantity(row.layer_qty),
     sectionQty: quantity(row.section_qty),
@@ -172,6 +181,11 @@ function mapReloadCycle(row, lines = [], reattemptOrder = null, assignment = nul
     preparingOperatorId: row.preparing_operator_id || null,
     preparingStartedAt: row.preparing_started_at || null,
     completedAt: row.completed_at || null,
+    completionSource: row.completion_source || "",
+    operatorLoadEvidenceMissing: Boolean(row.operator_load_evidence_missing),
+    completionReconciledAt: row.completion_reconciled_at || null,
+    completionReconciledBy: row.completion_reconciled_by || null,
+    completionReconciliationNote: row.completion_reconciliation_note || "",
     cancelledBy: row.cancelled_by || null,
     cancelledAt: row.cancelled_at || null,
     cancelReason: row.cancel_reason || "",
@@ -204,7 +218,9 @@ async function reattemptOrderForCycle(cycleId) {
       LIMIT 1`,
     [cycleId]
   );
-  return result.rowCount ? mapReattemptOrder(result.rows[0]) : null;
+  if (!result.rowCount) return null;
+  const corrections = await listLatestSalesOrderReattemptItemCorrections([result.rows[0].id]);
+  return mapReattemptOrder(result.rows[0], corrections);
 }
 
 async function reattemptAssignment(orderRef) {
@@ -252,7 +268,13 @@ async function loadCycleLines(cycleId, { forUpdate = false } = {}) {
       ${forUpdate ? "FOR UPDATE" : ""}`,
     [cycleId]
   );
-  return result.rows.map(mapReloadLine);
+  const lines = result.rows.map(mapReloadLine);
+  const corrections = await listLatestSalesOrderReattemptCycleCorrections([cycleId]);
+  const byLine = new Map(corrections.map((correction) => [String(correction.netsuiteLineId), correction]));
+  return lines.map((line) => applyEffectiveReattemptIdentity(
+    line,
+    byLine.get(String(line.currentLineId ?? line.netsuiteLineId ?? "")) || null
+  ));
 }
 
 async function cycleRowById(cycleId, { forUpdate = false } = {}) {
@@ -518,22 +540,32 @@ function reattemptLineSnapshot(target, cycleId) {
     lineRowId: `reattempt:${cycleId}:${target.historicalLineIndex}`,
     lineId: target.historicalLineId ?? target.netsuiteLineId ?? target.historicalLineIndex + 1,
     salesOrderLineId: target.currentSalesOrderLineId,
-    itemId: target.historicalItemId,
-    sku: target.historicalSku,
-    itemName: target.historicalItemName || target.historicalSku,
-    description: target.historicalDescription,
+    itemId: target.itemId,
+    sku: target.sku,
+    itemName: target.itemName || target.sku,
+    description: target.itemDescription,
     pallets: quantity(target.targetPalletQty),
     layers: quantity(target.targetLayerQty),
     sections: quantity(target.targetSectionQty),
     pieces: quantity(target.targetPieceQty),
     quantity: quantity(target.targetSalesQty),
     salesQty: quantity(target.targetSalesQty),
-    unit: target.historicalSalesUom,
+    unit: target.salesUom,
     itemWeight: quantity(target.itemWeight),
     lineWeight,
     reason: target.selectionReason,
+    historicalItemId: target.historicalItemId,
     historicalSku: target.historicalSku,
+    historicalItemName: target.historicalItemName,
+    historicalDescription: target.historicalDescription,
+    historicalSalesUom: target.historicalSalesUom,
+    currentItemId: target.currentItemId,
     currentSku: target.currentSku,
+    currentItemName: target.currentItemName,
+    currentDescription: target.currentDescription,
+    currentSalesUom: target.currentSalesUom,
+    effectiveItemId: target.itemId,
+    effectiveSku: target.sku,
     skuMismatch: Boolean(target.skuMismatch),
     itemMismatch: Boolean(target.itemMismatch)
   };
@@ -752,6 +784,20 @@ export async function getActiveReloadCycleForOrder(orderId, { forUpdate = false 
   const child = await reattemptOrderForCycle(row.id);
   const assignment = child ? await reattemptAssignment(child.refNumber) : null;
   return mapReloadCycle(row, await loadCycleLines(row.id, { forUpdate }), child, assignment);
+}
+
+export async function getLatestSalesOrderReattemptForOrder(orderId) {
+  const id = positiveId(orderId, "Sales Order");
+  const result = await query(
+    `SELECT id
+       FROM operator_reload_cycles
+      WHERE sales_order_id = $1
+        AND workflow_kind = 'sales_order_reattempt'
+      ORDER BY cycle_number DESC, id DESC
+      LIMIT 1`,
+    [id]
+  );
+  return result.rowCount ? getReloadCycle(result.rows[0].id) : null;
 }
 
 export async function lockReloadCycle(cycleId) {
@@ -1196,6 +1242,8 @@ export async function recordReloadLoadAttempt(orderId, operatorId, { photoDataUr
       `UPDATE operator_reload_cycles
           SET status = $2,
               completed_at = CASE WHEN $2 = 'completed' THEN now() ELSE null END,
+              completion_source = CASE WHEN $2 = 'completed' THEN 'operator_load' ELSE completion_source END,
+              operator_load_evidence_missing = false,
               preparing_operator_id = null,
               preparing_started_at = null,
               updated_at = now()
@@ -1277,11 +1325,22 @@ export async function listSalesOrderLoadAttempts(orderId) {
       ORDER BY record.created_at DESC, record.id DESC`,
     [salesOrderId]
   );
+  const correctionRows = await listLatestSalesOrderReattemptCycleCorrections(
+    result.rows.map((row) => row.reload_cycle_id).filter(Boolean)
+  );
+  const correctionByCycleLine = new Map(correctionRows.map((correction) => [
+    `${correction.cycleId}:${correction.netsuiteLineId}`,
+    correction
+  ]));
   return result.rows.map((row) => {
     const exact = Array.isArray(row.attempt_line_snapshot) && row.attempt_line_snapshot.length > 0;
-    const attemptLines = exact
+    const rawAttemptLines = exact
       ? row.attempt_line_snapshot
       : (Array.isArray(row.line_snapshot) ? row.line_snapshot : []);
+    const attemptLines = rawAttemptLines.map((line) => applyEffectiveReattemptIdentity(
+      line,
+      correctionByCycleLine.get(`${Number(row.reload_cycle_id || 0)}:${String(line.lineId ?? line.netsuiteLineId ?? "")}`) || null
+    ));
     const photos = photoReferences(
       Array.isArray(row.photo_data_urls) && row.photo_data_urls.length
         ? row.photo_data_urls

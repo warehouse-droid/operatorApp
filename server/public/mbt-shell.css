@@ -752,6 +752,203 @@ body[data-mbt-surface="gates"] .mbt-shell {
   gap: 12px;
 }
 
+.mbt-operator-posting-controls,
+.mbt-operator-posting-attention {
+  margin: 24px 0;
+  padding: 18px;
+  border: 1px solid #c8d8ce;
+  border-radius: 14px;
+  background: #f8fbf9;
+}
+
+.mbt-general-gates-title {
+  margin: 28px 0 14px;
+}
+
+.mbt-operator-gate-matrix {
+  overflow-x: auto;
+}
+
+.mbt-gate-ceiling {
+  margin-bottom: 12px;
+  padding: 10px 12px;
+  border-radius: 9px;
+  background: #dff2e5;
+  color: #185b35;
+  font-size: 0.84rem;
+  font-weight: 750;
+}
+
+.mbt-gate-ceiling[data-state="closed"] {
+  background: #fff0d5;
+  color: #6d4c12;
+}
+
+.mbt-operator-gate-table {
+  width: 100%;
+  min-width: 790px;
+  border-collapse: separate;
+  border-spacing: 8px;
+}
+
+.mbt-operator-gate-table th {
+  padding: 8px;
+  color: #33483d;
+  font-size: 0.82rem;
+  text-align: left;
+}
+
+.mbt-operator-gate-table tbody > tr > th {
+  font-size: 1rem;
+}
+
+.mbt-operator-gate-cell {
+  min-width: 180px;
+  padding: 12px;
+  border: 1px solid #d3dfd7;
+  border-radius: 10px;
+  background: #fff;
+  vertical-align: top;
+}
+
+.mbt-operator-gate-cell[data-state="effective"] {
+  border-color: #76ad88;
+  background: #eef9f1;
+}
+
+.mbt-operator-gate-cell strong,
+.mbt-operator-gate-cell span,
+.mbt-operator-gate-cell small {
+  display: block;
+}
+
+.mbt-operator-gate-cell span,
+.mbt-operator-gate-cell small {
+  margin-top: 5px;
+  color: #607168;
+  font-size: 0.72rem;
+}
+
+.mbt-operator-gate-toggle {
+  width: 100%;
+  margin-top: 10px;
+}
+
+.mbt-attention-list {
+  display: grid;
+  gap: 10px;
+}
+
+.mbt-attention-empty {
+  margin: 0;
+  padding: 12px;
+  border-radius: 9px;
+  background: #e8eeea;
+}
+
+.mbt-attention-empty.danger {
+  background: #ffe9e3;
+  color: #812a18;
+}
+
+.mbt-attention-card {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  gap: 16px;
+  align-items: center;
+  padding: 14px;
+  border: 1px solid #e5bba9;
+  border-radius: 10px;
+  background: #fff6f2;
+}
+
+.mbt-attention-card h3,
+.mbt-attention-card p {
+  margin: 0 0 5px;
+}
+
+.mbt-attention-card code {
+  overflow-wrap: anywhere;
+}
+
+.mbt-fulfillment-gate-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 10px;
+}
+
+.mbt-fulfillment-gate-grid .mbt-gate-card {
+  grid-template-columns: minmax(0, 1fr) auto;
+}
+
+.mbt-fulfillment-gate-grid .mbt-gate-states {
+  grid-column: 1 / -1;
+}
+
+.mbt-fulfillment-candidate {
+  align-items: start;
+}
+
+.mbt-fulfillment-lines {
+  display: grid;
+  gap: 7px;
+  margin-top: 10px;
+}
+
+.mbt-fulfillment-lines label {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) 110px;
+  gap: 10px;
+  align-items: center;
+  padding: 8px;
+  border-radius: 8px;
+  background: rgba(255, 255, 255, 0.78);
+}
+
+.mbt-fulfillment-lines input,
+.mbt-fulfillment-action select,
+.mbt-historical-search input {
+  width: 100%;
+  min-height: 38px;
+  padding: 7px 9px;
+  border: 1px solid #91aa9a;
+  border-radius: 8px;
+  background: #fff;
+}
+
+.mbt-fulfillment-card-actions,
+.mbt-fulfillment-action {
+  display: grid;
+  gap: 7px;
+}
+
+.mbt-fulfillment-card-actions {
+  min-width: 220px;
+}
+
+.mbt-historical-search {
+  display: grid;
+  gap: 7px;
+  margin-bottom: 14px;
+}
+
+.mbt-historical-search > div {
+  display: grid;
+  grid-template-columns: minmax(220px, 1fr) auto auto;
+  gap: 8px;
+}
+
+.mbt-historical-event {
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr);
+  gap: 10px;
+  align-items: start;
+  padding: 12px;
+  border: 1px solid #d3dfd7;
+  border-radius: 9px;
+  background: #fff;
+}
+
 .mbt-gate-card {
   display: grid;
   grid-template-columns: minmax(260px, 1.5fr) minmax(260px, 1fr) minmax(150px, 0.55fr);
@@ -851,7 +1048,8 @@ body[data-mbt-surface="gates"] .mbt-shell {
 
 @media (max-width: 620px) {
   .mbt-gate-controls-heading,
-  .mbt-gate-card {
+  .mbt-gate-card,
+  .mbt-attention-card {
     display: grid;
     grid-template-columns: minmax(0, 1fr);
   }
@@ -866,6 +1064,16 @@ body[data-mbt-surface="gates"] .mbt-shell {
     grid-column: 1;
     grid-row: auto;
     text-align: left;
+  }
+
+  .mbt-fulfillment-gate-grid,
+  .mbt-fulfillment-lines label,
+  .mbt-historical-search > div {
+    grid-template-columns: minmax(0, 1fr);
+  }
+
+  .mbt-fulfillment-card-actions {
+    min-width: 0;
   }
 }
 

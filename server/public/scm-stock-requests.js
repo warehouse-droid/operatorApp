@@ -14,6 +14,7 @@ const scmStockState = {
   selectedTransferId: null,
   detail: null,
   selectedLineIds: new Set(),
+  pendingDecision: null,
   loading: true,
   busy: false,
   error: "",
@@ -193,6 +194,23 @@ function scmStockRequestLine(line) {
   </article>`;
 }
 
+function scmStockDecisionEditor() {
+  const pending = scmStockState.pendingDecision;
+  if (!pending) return "";
+  const isReject = pending.decision === "reject";
+  const label = isReject ? "Reject" : "Request Changes";
+  const title = isReject ? "Reject stock-request lines" : "Request changes for stock-request lines";
+  return `<section class="stock-request-section stock-request-form stock-request-decision-editor" role="dialog" aria-labelledby="scmStockDecisionTitle">
+    <h3 id="scmStockDecisionTitle">${title}</h3>
+    <p>${pending.lineIds.length} line(s) will be updated. Enter the required reason before confirming.</p>
+    <label><span>${label} reason</span><textarea data-scm-stock-decision-reason maxlength="1000" rows="3" required>${scmStockEscape(pending.reason || "")}</textarea></label>
+    <div class="stock-request-actions">
+      <button data-scm-stock-action="cancel-decision" type="button">Cancel</button>
+      <button class="${isReject ? "danger" : "primary"}" data-scm-stock-action="confirm-decision" type="button">Confirm ${label}</button>
+    </div>
+  </section>`;
+}
+
 function scmStockRequestDetail() {
   const request = scmStockState.detail;
   if (!request) return `<div class="stock-request-empty"><strong>Select a request</strong><span>All-yard availability and line decisions will appear here.</span></div>`;
@@ -215,8 +233,9 @@ function scmStockRequestDetail() {
       <button data-scm-stock-action="select-all" type="button" ${selectable.length ? "" : "disabled"}>Select actionable lines</button>
       <button class="primary" data-scm-stock-action="convert" type="button" ${scmStockState.selectedLineIds.size ? "" : "disabled"}>Convert to TO</button>
       <button data-scm-stock-action="request-changes" type="button" ${canRequestChanges ? "" : "disabled"}>Request Changes</button>
-      <button class="danger" data-scm-stock-action="reject" type="button" ${scmStockState.selectedLineIds.size ? "" : "disabled"}>Reject</button>
+      <button class="danger" data-scm-stock-action="reject" type="button" ${selectable.length ? "" : "disabled"}>${selected.length ? "Reject selected" : "Reject all actionable"}</button>
     </div>
+    ${scmStockDecisionEditor()}
     <section class="stock-request-section"><h3>Request lines and all-yard availability</h3><div class="stock-request-lines">${request.lines.map(scmStockRequestLine).join("")}</div></section>`;
 }
 
@@ -441,21 +460,40 @@ async function scmStockSaveLine(button) {
   renderScmStockRequests();
 }
 
-async function scmStockDecision(decision) {
+function scmStockOpenDecision(decision) {
+  const allowedStatuses = decision === "reject"
+    ? new Set(["submitted", "changes_requested"])
+    : new Set(["submitted"]);
+  const eligible = (scmStockState.detail?.lines || []).filter((line) => allowedStatuses.has(line.status));
+  const selected = eligible.filter((line) => scmStockState.selectedLineIds.has(line.id));
+  const targets = selected.length ? selected : eligible;
+  if (!targets.length) throw new Error("No actionable stock-request lines are available.");
+  scmStockState.pendingDecision = {
+    decision,
+    lineIds: targets.map((line) => line.id),
+    reason: ""
+  };
+  scmStockState.error = "";
+  renderScmStockRequests();
+  scmStockRequestApp.querySelector("[data-scm-stock-decision-reason]")?.focus();
+}
+
+async function scmStockDecision(decision, { lineIds, reason } = {}) {
   const label = decision === "reject" ? "Reject" : "Request Changes";
-  const reason = prompt(`${label} reason (required):`, "");
-  if (reason === null) return;
-  if (!reason.trim()) throw new Error(`${label} requires a reason.`);
-  const selectedLineIds = [...scmStockState.selectedLineIds];
+  const normalizedReason = String(reason || "").trim();
+  if (!normalizedReason) throw new Error(`${label} requires a reason.`);
+  const selectedLineIds = [...new Set((lineIds || []).map(Number))];
+  if (!selectedLineIds.length) throw new Error("Select at least one stock-request line.");
   scmStockState.detail = await scmStockApi(`/api/scm/stock-requests/${scmStockState.detail.id}/line-decisions`, {
     method: "POST",
     body: JSON.stringify({
       expectedRevision: scmStockState.detail.revision,
       lineIds: selectedLineIds,
       decision,
-      reason
+      reason: normalizedReason
     })
   });
+  scmStockState.pendingDecision = null;
   scmStockState.error = "";
   scmStockState.notice = decision === "reject"
     ? "Selected request line(s) were rejected."
@@ -519,6 +557,7 @@ scmStockRequestApp.addEventListener("click", async (event) => {
   try {
     if (action === "special") return window.MBBSSCMSpecialStock?.open({ operator: scmStockState.operator });
     if (action === "queue") {
+      scmStockState.pendingDecision = null;
       scmStockState.queue = button.dataset.queue;
       localStorage.setItem("mbbs.scm.stockRequests.queue", scmStockState.queue);
       scmStockState.selectedLineIds.clear();
@@ -534,6 +573,7 @@ scmStockRequestApp.addEventListener("click", async (event) => {
       return scmStockLoad({ preserveSelection: false });
     }
     if (action === "select") {
+      scmStockState.pendingDecision = null;
       scmStockState.selectedId = Number(button.dataset.id);
       localStorage.setItem("mbbs.scm.stockRequests.selected", String(scmStockState.selectedId));
       scmStockState.selectedLineIds.clear();
@@ -549,8 +589,20 @@ scmStockRequestApp.addEventListener("click", async (event) => {
       return renderScmStockRequests();
     }
     if (action === "save-line") return scmStockSaveLine(button);
-    if (action === "request-changes") return scmStockDecision("request_changes");
-    if (action === "reject") return scmStockDecision("reject");
+    if (action === "request-changes") return scmStockOpenDecision("request_changes");
+    if (action === "reject") return scmStockOpenDecision("reject");
+    if (action === "cancel-decision") {
+      scmStockState.pendingDecision = null;
+      return renderScmStockRequests();
+    }
+    if (action === "confirm-decision") {
+      const pending = scmStockState.pendingDecision;
+      if (!pending) throw new Error("The SCM decision is no longer available. Open it again.");
+      pending.reason = scmStockRequestApp.querySelector("[data-scm-stock-decision-reason]")?.value || "";
+      scmStockState.busy = true;
+      await scmStockDecision(pending.decision, pending);
+      return;
+    }
     if (action === "convert") {
       scmStockState.busy = true;
       renderScmStockRequests();

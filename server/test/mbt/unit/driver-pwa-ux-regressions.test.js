@@ -159,7 +159,7 @@ test("the updated override policy is atomically included in the Driver PWA shell
   const assetVersion = "20260819-driver-route-readiness-v1";
   assert.ok(driverHtml.includes(`/driver-location-override.js?v=${assetVersion}`));
   assert.ok(workerSource.includes(`/driver-location-override.js?v=${assetVersion}`));
-  assert.match(workerSource, /DRIVER_CACHE_NAME = `\$\{DRIVER_CACHE_PREFIX\}v37`/u);
+  assert.match(workerSource, /DRIVER_CACHE_NAME = `\$\{DRIVER_CACHE_PREFIX\}v38`/u);
   assert.match(driverSource, /driver-service-worker\.js\?v=20260819-driver-route-readiness-v1/u);
 });
 

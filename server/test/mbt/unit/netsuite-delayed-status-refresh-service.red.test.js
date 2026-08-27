@@ -272,6 +272,35 @@ test("DSR-S11: heartbeat overlap, fencing, and renewal errors are contained", as
   assert.equal(logs.some((entry) => /renewal failed.*unavailable/i.test(entry)), true);
 });
 
+test("DSR-S15: Transfer Orders refresh through NetSuite TrnfrOrd without Sales Order line work", async () => {
+  const statusRequests = [];
+  let salesLineFetches = 0;
+  const { worker, calls } = harness({
+    fetchTransactionStatus: async (input) => {
+      statusRequests.push(input);
+      return {
+        tranid: "TOB00960",
+        status: "F",
+        status_text: "Transfer Order : Pending Receipt"
+      };
+    },
+    fetchSalesOrderLines: async () => {
+      salesLineFetches += 1;
+      return [];
+    }
+  });
+
+  const result = await worker.processJob(job({
+    orderType: "transfer_order",
+    tranid: "TOB00960"
+  }));
+
+  assert.equal(result.outcome, "succeeded");
+  assert.equal(statusRequests[0].netsuiteType, "TrnfrOrd");
+  assert.equal(salesLineFetches, 0);
+  assert.equal(calls.applied[0].orderType, "transfer_order");
+});
+
 test("DSR-S12: finalization and event failures cannot create an unowned status result", async () => {
   const finalization = harness({ finishAttempt: async () => false });
   assert.deepEqual(await finalization.worker.processJob(job()), {

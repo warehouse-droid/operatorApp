@@ -900,6 +900,26 @@ async function inventorySnapshot(itemId, locationId, toPlt, { excludeTransferOrd
                  )
             ), 0) AS blanket_excluded,
             COALESCE((
+              SELECT SUM(GREATEST(
+                       COALESCE(child_line.quantity, 0)
+                       - COALESCE(child_line.netsuite_received_baseline_qty, child_line.netsuite_received_qty, 0),
+                       0
+                     ))
+                FROM dispatch_scm_po_split_lines ledger
+                JOIN dispatch_scm_po_splits split ON split.id = ledger.split_id
+                JOIN purchase_order_lines child_line ON child_line.id = ledger.split_line_id
+                JOIN purchase_orders child_po ON child_po.netsuite_id = split.split_po_id
+                JOIN purchase_orders source_po ON source_po.netsuite_id = split.source_po_id
+               WHERE ledger.item_id = $1
+                 AND COALESCE(child_line.location_id, child_po.destination_location_id) = $2
+                 AND split.status = 'active'
+                 AND source_po.is_blanket_po = true
+                 AND child_po.netsuite_active = true
+                 AND child_line.netsuite_active = true
+                 AND NOT COALESCE(child_line.netsuite_closed, false)
+                 AND lower(COALESCE(child_po.status_text, '')) !~ '(closed|cancelled|fully received)'
+            ), 0) AS released_split_inbound,
+            COALESCE((
               SELECT SUM(GREATEST(COALESCE(line.quantity, 0) - COALESCE(line.netsuite_received_qty, 0), 0))
                 FROM transfer_order_lines line JOIN transfer_orders transfer ON transfer.netsuite_id = line.transfer_order_id
                WHERE line.item_id = $1 AND transfer.to_location_id = $2 AND line.line_stage = 'receiving'
@@ -937,6 +957,7 @@ async function inventorySnapshot(itemId, locationId, toPlt, { excludeTransferOrd
     authoritativeOnOrderSales: row.authoritative_on_order,
     blanketExcludedSales: row.blanket_excluded,
     excludedTransferOrderSales: row.transfer_excluded,
+    releasedSplitInboundSales: row.released_split_inbound,
     reservedBlanketSales: row.blanket_reserved,
     pendingTransferReservationSales: row.pending_transfer_reservation,
     quantityBackorderedSales: row.backordered,
@@ -948,6 +969,7 @@ async function inventorySnapshot(itemId, locationId, toPlt, { excludeTransferOrd
     quantityOnOrderAuthoritative: position.authoritativeOnOrderSales,
     quantityBlanketExcluded: position.blanketExcludedSales,
     quantityTransferOrderExcluded: position.excludedTransferOrderSales,
+    quantityReleasedSplitInbound: position.releasedSplitInboundSales,
     quantityBlanketReservedInbound: position.reservedBlanketSales,
     quantityPendingTransferReservation: position.pendingTransferReservationSales,
     quantityBackordered: position.quantityBackorderedSales,

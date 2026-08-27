@@ -228,7 +228,7 @@ function dispatchStopPhysicalAddressKey(plan = {}, stop = {}, order = {}) {
 }
 
 function dispatchDropoffForStop(order = {}, stop = {}) {
-  const dropoffs = Array.isArray(order.dropoffs) ? order.dropoffs : [];
+  const dropoffs = dispatchRouteDropoffs(order);
   const dropoffKey = text(stop.dropoffKey ?? stop.dropoff_key);
   if (dropoffKey) {
     const exact = dropoffs.find((dropoff) => text(dropoff?.key) === dropoffKey);
@@ -254,43 +254,80 @@ function dispatchDropItemsForStop(order = {}, stop = {}) {
     ?? dispatchDropoffForStop(order, stop)?.line_row_ids
     ?? [];
   const selectedIds = new Set((stopLineRowIds.length ? stopLineRowIds : dropoffLineRowIds).map(text).filter(Boolean));
-  if (!selectedIds.size) return (order.dropoffs || []).length > 1 ? [] : order.items || [];
-  return (order.items || []).filter((item) => selectedIds.has(dispatchLineRowId(item)));
+  const dropoffs = dispatchRouteDropoffs(order);
+  const items = dispatchRouteItems(order);
+  if (!selectedIds.size) return dropoffs.length > 1 ? [] : items;
+  return items.filter((item) => selectedIds.has(dispatchLineRowId(item)));
+}
+
+function dispatchRouteProjection(order = {}) {
+  const projection = order.poRouteProjection ?? order.po_route_projection;
+  return text(order.type || order.orderType || order.order_type).toUpperCase() === "PO"
+    && projection
+    && Number(projection.version || 0) >= 1
+    ? projection
+    : null;
+}
+
+function dispatchRouteItems(order = {}) {
+  const projection = dispatchRouteProjection(order);
+  return Array.isArray(projection?.items) ? projection.items : (order.items || []);
+}
+
+function dispatchRouteDropoffs(order = {}) {
+  const projection = dispatchRouteProjection(order);
+  return Array.isArray(projection?.dropoffs) ? projection.dropoffs : (order.dropoffs || []);
 }
 
 function dispatchNumber(value) {
   return finiteNumber(value) ?? 0;
 }
 
-function dispatchDropPallets(order = {}, stop = {}) {
+function dispatchDropQuantity(order = {}, stop = {}, field = "pallets") {
+  const projection = dispatchRouteProjection(order);
   const dropoff = dispatchDropoffForStop(order, stop) || {};
-  const explicit = stop.dropPallets
-    ?? stop.drop_pallets
-    ?? dropoff.pallets
-    ?? dropoff.pallet_qty;
+  const names = {
+    pallets: ["dropPallets", "drop_pallets", "pallets", "pallet_qty"],
+    layers: ["dropLayers", "drop_layers", "layers", "layer_qty"],
+    sections: ["dropSections", "drop_sections", "sections", "section_qty"],
+    pieces: ["dropPieces", "drop_pieces", "pieces", "piece_qty"]
+  }[field] || [];
+  const [stopCamel, stopSnake, itemCamel, itemSnake] = names;
+  if (projection) {
+    const projected = dropoff[itemCamel] ?? dropoff[itemSnake];
+    if (projected !== undefined && projected !== null && finiteNumber(projected) !== null) {
+      return Math.max(0, Number(projected));
+    }
+    const itemQuantity = dispatchDropItemsForStop(order, stop)
+      .reduce((sum, item) => sum + dispatchNumber(item?.[itemCamel] ?? item?.[itemSnake]), 0);
+    if (itemQuantity > 0) return itemQuantity;
+    return dispatchRouteDropoffs(order).length > 1
+      ? 0
+      : dispatchNumber(projection[field] ?? projection[itemSnake]);
+  }
+  const explicit = stop[stopCamel]
+    ?? stop[stopSnake]
+    ?? dropoff[itemCamel]
+    ?? dropoff[itemSnake];
   if (explicit !== undefined && explicit !== null && finiteNumber(explicit) !== null) {
     return Math.max(0, Number(explicit));
   }
-  const itemPallets = dispatchDropItemsForStop(order, stop)
-    .reduce((sum, item) => sum + dispatchNumber(item?.pallets ?? item?.pallet_qty), 0);
-  if (itemPallets > 0) return itemPallets;
-  return (order.dropoffs || []).length > 1
+  const itemQuantity = dispatchDropItemsForStop(order, stop)
+    .reduce((sum, item) => sum + dispatchNumber(item?.[itemCamel] ?? item?.[itemSnake]), 0);
+  if (itemQuantity > 0) return itemQuantity;
+  return dispatchRouteDropoffs(order).length > 1
     ? 0
-    : dispatchNumber(order.pallets ?? order.pallet_qty);
+    : dispatchNumber(order[itemCamel] ?? order[itemSnake]);
+}
+
+function dispatchDropPallets(order = {}, stop = {}) {
+  return dispatchDropQuantity(order, stop, "pallets");
 }
 
 function dispatchDropFootprintPallets(order = {}, stop = {}) {
-  const dropoff = dispatchDropoffForStop(order, stop) || {};
-  const items = dispatchDropItemsForStop(order, stop);
   const pallets = dispatchDropPallets(order, stop);
-  const hasLoose = dispatchNumber(stop.dropLayers ?? stop.drop_layers ?? dropoff.layers ?? dropoff.layer_qty) > 0
-    || dispatchNumber(stop.dropSections ?? stop.drop_sections ?? dropoff.sections ?? dropoff.section_qty) > 0
-    || dispatchNumber(stop.dropPieces ?? stop.drop_pieces ?? dropoff.pieces ?? dropoff.piece_qty) > 0
-    || items.some((item) =>
-      dispatchNumber(item?.layers ?? item?.layer_qty) > 0
-      || dispatchNumber(item?.sections ?? item?.section_qty) > 0
-      || dispatchNumber(item?.pieces ?? item?.piece_qty) > 0
-    );
+  const hasLoose = ["layers", "sections", "pieces"]
+    .some((field) => dispatchDropQuantity(order, stop, field) > 0);
   return pallets + (hasLoose ? 1 : 0);
 }
 
@@ -408,7 +445,7 @@ function dispatchItemHasQuantity(item = {}) {
 }
 
 function dispatchPickupItemsForLocation(plan = {}, order = {}, location = "") {
-  if (text(order.type).toUpperCase() === "PO") return (order.items || []).filter(dispatchItemHasQuantity);
+  if (text(order.type).toUpperCase() === "PO") return dispatchRouteItems(order).filter(dispatchItemHasQuantity);
   const directItems = dispatchDirectPickupItemsForLocation(order, location);
   if (directItems.length && !dispatchLocationsShareYard(order.sourceYard || order.outboundLocation, location)) {
     return directItems.filter(dispatchItemHasQuantity);

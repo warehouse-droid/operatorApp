@@ -153,7 +153,10 @@ test("P3.12: deployment readiness requires every Phase 3 migration and exactly n
     "174_driver_pwa_historical_assist.sql",
     "175_mbt_mbbs_cross_charge_route_pricing_v4.sql",
     "176_special_stock_request_workflow.sql",
-    "177_special_stock_request_two_stage_handoff.sql"
+    "177_special_stock_request_two_stage_handoff.sql",
+    "178_operator_netsuite_posting_gates.sql",
+    "179_sales_order_reattempt_current_item_corrections.sql",
+    "180_sales_order_completion_fulfillment.sql"
   ]);
   assert.deepEqual(REQUIRED_MBT_P3_FLAGS, EXPECTED_FLAGS);
   const rows = EXPECTED_FLAGS.map((flag_key) => ({ flag_key, enabled: false }));

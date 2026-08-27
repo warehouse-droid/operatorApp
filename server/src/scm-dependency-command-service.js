@@ -2,6 +2,35 @@ function commandError(status, code, message, details = {}) {
   return Object.assign(new Error(message), { status, code, details });
 }
 
+function purchaseOrderSnapshotRefs(order = {}) {
+  return [...new Set([
+    order.id,
+    order.originalPoRef,
+    order.dispatchRef,
+    order.sourcePoRef
+  ].map((value) => String(value || "").trim().toLowerCase()).filter(Boolean))];
+}
+
+export function mergeDependencyPurchaseOrderSnapshots(currentOrders = [], refreshedOrders = [], purchaseRefs = []) {
+  const wanted = new Set((Array.isArray(purchaseRefs) ? purchaseRefs : [])
+    .map((value) => String(value || "").trim().toLowerCase())
+    .filter(Boolean));
+  if (!wanted.size) {return currentOrders;}
+  const next = [...(currentOrders || [])];
+  for (const fresh of refreshedOrders || []) {
+    const freshRefs = purchaseOrderSnapshotRefs(fresh);
+    if (String(fresh?.type || "").toUpperCase() !== "PO"
+      || !freshRefs.some((ref) => wanted.has(ref))) {continue;}
+    const existingIndex = next.findIndex((order) =>
+      String(order?.type || "").toUpperCase() === "PO"
+      && purchaseOrderSnapshotRefs(order).some((ref) => freshRefs.includes(ref))
+    );
+    if (existingIndex >= 0) {next[existingIndex] = fresh;}
+    else {next.push(fresh);}
+  }
+  return next;
+}
+
 function assertCommand(command = {}) {
   if (!command.requestId) {throw commandError(400, "DEPENDENCY_REQUEST_ID_REQUIRED", "A dependency request ID is required.");}
   if (!/^[0-9a-f]{64}$/u.test(String(command.payloadHash || ""))) {
@@ -161,12 +190,39 @@ async function mutateRelationship(command, actor, preview) {
 
 async function refreshAffectedPlan(command, actor, preview, relationship) {
   const currentPlan = preview.affectedPlan;
-  let orders = await enrichDispatchOrdersWithDependencies(currentPlan.orders || []);
-  orders = await enrichDispatchOrdersWithPoTargetAllocations(orders);
+  const purchaseRefs = [...new Set([
+    ...(relationship.allocations || []).map((allocation) => allocation.poOrderRef),
+    relationship.cancelled?.poOrderRef,
+    relationship.poOrderRef
+  ].map((value) => String(value || "").trim()).filter(Boolean))];
+  const refreshedPurchaseOrders = [];
+  for (const purchaseRef of purchaseRefs) {
+    const candidates = await listDispatchOrders({
+      type: "PO",
+      search: purchaseRef,
+      includeScmLinkedSearchRefs: true
+    });
+    const wanted = purchaseRef.toLowerCase();
+    const exact = candidates.find((order) => purchaseOrderSnapshotRefs(order).includes(wanted));
+    if (exact) {refreshedPurchaseOrders.push(exact);}
+  }
+  let orders = mergeDependencyPurchaseOrderSnapshots(
+    currentPlan.orders || [],
+    refreshedPurchaseOrders,
+    purchaseRefs
+  );
+  orders = await enrichDispatchOrdersWithDependencies(orders);
+  orders = await enrichDispatchOrdersWithPoTargetAllocations(orders, {
+    projectUnallocatedPoRefs: relationship.relatedOrderRefs || [],
+    releasedTargetRefs: [relationship.targetRef || command.targetRef].filter(Boolean)
+  });
   const reconciled = reconcileDependencyManagedPickups({
     plan: { ...currentPlan, orders },
     enrichedOrders: orders,
-    affectedTargetRefs: [relationship.targetRef || command.targetRef]
+    affectedTargetRefs: [...new Set([
+      relationship.targetRef || command.targetRef,
+      ...(relationship.relatedOrderRefs || [])
+    ].filter(Boolean))]
   });
   const saved = await saveDispatchPlanSnapshot(currentPlan.id, {
     orders: reconciled.orders,
@@ -288,6 +344,19 @@ export async function executeScmDependencyCommand(command = {}, actor = {}, port
         }]);
       }
       if (plan.status === "confirmed") {
+        // Manifest supersession is linked by foreign key to the durable change
+        // request. Offline flows already have that row from Driver readiness;
+        // immediate online-only flows must create the same audit envelope before
+        // fencing any previously issued route artifacts.
+        await requiredPort(ports, "createPendingRequest")({
+          ...command,
+          targetRef: command.targetRef || preview?.target?.ref || "",
+          targetSignature: command.targetSignature || preview?.targetSignature || "",
+          planId: plan.id,
+          planDate: plan.planDate || command.planDate || "",
+          actor,
+          devices: preview.affectedDriverDevices || []
+        });
         await requiredPort(ports, "materializeOperator")(plan, command, relationship);
         await requiredPort(ports, "supersedeDriverArtifacts")({
           planId: plan.id,
@@ -319,6 +388,7 @@ import {
   createSalesOrderPoAllocations,
   cancelSalesOrderPoAllocation,
   enrichDispatchOrdersWithPoTargetAllocations,
+  listDispatchOrders,
   syncScmScheduleFromDispatchPlan
 } from "./dispatch-repository.js";
 import { saveDispatchPlanSnapshot } from "./dispatch-plan-repository.js";

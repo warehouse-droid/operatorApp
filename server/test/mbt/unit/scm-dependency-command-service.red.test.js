@@ -2,7 +2,10 @@ import assert from "node:assert/strict";
 import crypto from "node:crypto";
 import test from "node:test";
 
-import { executeScmDependencyCommand } from "../../../src/scm-dependency-command-service.js";
+import {
+  executeScmDependencyCommand,
+  mergeDependencyPurchaseOrderSnapshots
+} from "../../../src/scm-dependency-command-service.js";
 
 function command() {
   return {
@@ -25,6 +28,7 @@ function transactionalPorts({ failPlanSave = false, existingReceipt = null, rout
     operatorMaterializations: 0,
     supersededManifests: 0,
     pendingRequests: 0,
+    appliedRequests: 0,
     receipt: existingReceipt,
     calls: []
   };
@@ -58,7 +62,7 @@ function transactionalPorts({ failPlanSave = false, existingReceipt = null, rout
     createPendingRequest: async () => {
       state.calls.push("pending.create");
       state.pendingRequests += 1;
-      return { status: "waiting_driver" };
+      return { status: routeReady ? "driver_ready" : "waiting_driver" };
     },
     reserveReceipt: async () => {
       state.calls.push("receipt.reserve");
@@ -94,6 +98,11 @@ function transactionalPorts({ failPlanSave = false, existingReceipt = null, rout
       state.calls.push("receipt.complete");
       state.receipt = { status: "succeeded", result };
       return state.receipt;
+    },
+    markPendingApplied: async () => {
+      state.calls.push("pending.applied");
+      state.appliedRequests += 1;
+      return { status: "applied" };
     }
   };
   return { state, ports };
@@ -107,6 +116,8 @@ test("relationship, refreshed snapshot, Operator materialization, and manifest f
   assert.equal(state.planRevision, 9);
   assert.equal(state.operatorMaterializations, 1);
   assert.equal(state.supersededManifests, 1);
+  assert.equal(state.pendingRequests, 1);
+  assert.equal(state.appliedRequests, 1);
   assert.deepEqual(state.calls, [
     "transaction.begin",
     "preview.locked",
@@ -114,9 +125,11 @@ test("relationship, refreshed snapshot, Operator materialization, and manifest f
     "relationship.mutate",
     "plan.save",
     "plan.validate",
+    "pending.create",
     "operator.materialize",
     "driver.supersede",
     "receipt.complete",
+    "pending.applied",
     "transaction.commit"
   ]);
 });
@@ -154,4 +167,30 @@ test("a committed request retry returns its original result without another muta
   assert.deepEqual(result, { ...previousResult, idempotent: true });
   assert.equal(state.relationships, 0);
   assert.deepEqual(state.calls, []);
+});
+
+test("a linked PO absent from a compact plan is added from the current global order catalog", () => {
+  const target = { id: "GOB-118278-118279", type: "SO", marker: "preserve-target" };
+  const unrelated = { id: "PO-OTHER", type: "PO", marker: "preserve-unrelated" };
+  const fresh = {
+    id: "SN1398699",
+    originalPoRef: "POB03699",
+    type: "PO",
+    pallets: 51,
+    marker: "fresh"
+  };
+
+  assert.deepEqual(
+    mergeDependencyPurchaseOrderSnapshots([target, unrelated], [fresh], ["SN1398699"]),
+    [target, unrelated, fresh]
+  );
+  assert.deepEqual(
+    mergeDependencyPurchaseOrderSnapshots(
+      [target, { ...fresh, pallets: 13, marker: "stale" }, unrelated],
+      [fresh],
+      ["POB03699"]
+    ),
+    [target, fresh, unrelated],
+    "an original NetSuite PO alias must replace the stale visible-ref snapshot in place"
+  );
 });

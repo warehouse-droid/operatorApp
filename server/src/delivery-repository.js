@@ -9,6 +9,7 @@ import { isNetSuiteSalesOrderBilled } from "./sales-order-reconciliation.js";
 import { netSuiteClosedOrderFamilySql, operationalPlanOrderRefs } from "./netsuite-closed-order-policy.js";
 import { assertNoClosedNetSuiteOrders, listClosedNetSuiteOrders } from "./netsuite-closed-order-repository.js";
 import { getOperatorCustomerPickupPhotoRequirement } from "./operator-customer-pickup-photo-policy.js";
+import { applyOperatorLinkedQuantityProjection } from "./operator-linked-quantity-domain.js";
 import {
   ACTIVE_RELOAD_STATUSES,
   getActiveReloadCycleForOrder,
@@ -116,7 +117,12 @@ function decorateSalesOrderReload(order, cycle) {
       reload_target_sales_qty: reloadLine.targetSalesQty,
       reload_remaining_sales_qty: reloadLine.remainingSalesQty,
       historical_sku: reloadLine.historicalSku || reloadLine.sku,
+      historicalSku: reloadLine.historicalSku || reloadLine.sku,
+      historicalItemId: reloadLine.historicalItemId ?? reloadLine.itemId ?? null,
       current_sku: reloadLine.currentSku || canonical.sku || "",
+      currentSku: reloadLine.currentSku || canonical.sku || "",
+      effectiveSku: reloadLine.effectiveSku || reloadLine.sku || "",
+      identityCorrected: Boolean(reloadLine.identityCorrected),
       sku_mismatch: Boolean(reloadLine.skuMismatch),
       item_mismatch: Boolean(reloadLine.itemMismatch),
       already_delivered_sales_qty: reloadLine.alreadyDeliveredSalesQty,
@@ -530,29 +536,22 @@ const packedQtySql = `
 `;
 
 function applyDeliveryAllocationFields(line) {
-  const allocatedPallets = positiveQuantity(line.po_allocated_pallet_qty);
-  const allocatedLayers = positiveQuantity(line.po_allocated_layer_qty);
-  const allocatedSections = positiveQuantity(line.po_allocated_section_qty);
-  const allocatedPieces = positiveQuantity(line.po_allocated_piece_qty);
-  const allocatedSalesQty = positiveQuantity(line.po_allocated_sales_qty);
-  return {
-    ...line,
-    original_pallet_qty: line.pallet_qty,
-    original_layer_qty: line.layer_qty,
-    original_section_qty: line.section_qty,
-    original_piece_qty: line.piece_qty,
-    original_quantity: line.quantity,
-    po_allocated_pallet_qty: allocatedPallets,
-    po_allocated_layer_qty: allocatedLayers,
-    po_allocated_section_qty: allocatedSections,
-    po_allocated_piece_qty: allocatedPieces,
-    po_allocated_sales_qty: allocatedSalesQty,
-    pallet_qty: Math.max(positiveQuantity(line.pallet_qty) - allocatedPallets, 0),
-    layer_qty: Math.max(positiveQuantity(line.layer_qty) - allocatedLayers, 0),
-    section_qty: Math.max(positiveQuantity(line.section_qty) - allocatedSections, 0),
-    piece_qty: Math.max(positiveQuantity(line.piece_qty) - allocatedPieces, 0),
-    quantity: Math.max(positiveQuantity(line.quantity) - allocatedSalesQty, 0)
-  };
+  return applyOperatorLinkedQuantityProjection(line, {
+    linkedPo: {
+      pallets: line.linked_po_pallet_qty,
+      layers: line.linked_po_layer_qty,
+      sections: line.linked_po_section_qty,
+      pieces: line.linked_po_piece_qty,
+      sales: line.linked_po_sales_qty
+    },
+    linkedDirectTo: {
+      pallets: line.linked_direct_to_pallet_qty,
+      layers: line.linked_direct_to_layer_qty,
+      sections: line.linked_direct_to_section_qty,
+      pieces: line.linked_direct_to_piece_qty,
+      sales: line.linked_direct_to_sales_qty
+    }
+  });
 }
 
 function isExcludedDeliveryServiceLine(line = {}) {
@@ -584,6 +583,8 @@ function hasDeliveryDisplayQuantity(line) {
     || positiveQuantity(line.packed_section_qty) > 0
     || positiveQuantity(line.packed_piece_qty) > 0
     || positiveQuantity(line.packed_sales_qty) > 0
+    || Boolean(line.no_yard_load_required)
+    || Boolean(line.linked_quantity_blocked)
     || Boolean(line.sync_exception);
 }
 
@@ -623,6 +624,19 @@ function formatLoadUnits(units, field) {
 function buildDeliveryLoadValidation(order) {
   const issues = [];
   for (const line of order.lines || []) {
+    if (line.linked_quantity_blocked) {
+      const itemLabel = line.sku || line.item_name || `Line ${line.line_id}`;
+      issues.push({
+        lineId: line.id,
+        netsuiteLineId: line.line_id,
+        itemName: itemLabel,
+        itemDescription: line.item_description || "",
+        code: "linked_quantity_exceeds_target",
+        message: `${itemLabel} has linked PO/TO quantity above its Dispatch target. Correct the links before loading.`,
+        linkedQuantityErrors: line.linked_quantity_errors || []
+      });
+      continue;
+    }
     const lineDeleted = !line.netsuite_active || line.sync_exception === "line_deleted";
     const units = loadLineUnits(line).map((unit) => lineDeleted ? { ...unit, required: 0 } : unit);
     const packedSalesQty = linePackedSalesQuantity(line);
@@ -668,6 +682,23 @@ function buildDeliveryLoadValidation(order) {
   };
 }
 
+function assertOperatorLinkedLineLoadable(line) {
+  const itemLabel = line?.sku || line?.item_name || `Line ${line?.line_id || ""}`.trim();
+  if (line?.linked_quantity_blocked) {
+    const error = new Error(`${itemLabel} has linked PO/TO quantity above its Dispatch target. Correct the links before packing.`);
+    error.status = 409;
+    error.code = "DELIVERY_LINKED_QUANTITY_BLOCKED";
+    error.linkedQuantityErrors = line.linked_quantity_errors || [];
+    throw error;
+  }
+  if (line?.no_yard_load_required) {
+    const error = new Error(`${itemLabel} requires no Operator yard load because its full quantity is direct supplied.`);
+    error.status = 409;
+    error.code = "DELIVERY_NO_YARD_LOAD_REQUIRED";
+    throw error;
+  }
+}
+
 export const CUSTOMER_PICKUP_DELIVERY_METHOD = "Pick-Up";
 
 export function isPickupDeliveryMethod(value) {
@@ -690,7 +721,7 @@ function deliveryMethodClause(alias = "delivery_order_source") {
   )`;
 }
 
-function activePoAllocationSql(unit, lineAlias = "delivery_line_source") {
+function linkedAllocationColumns(unit) {
   const column = unit === "pallet" ? "allocated_pallet_qty"
     : unit === "layer" ? "allocated_layer_qty"
       : unit === "section" ? "allocated_section_qty"
@@ -701,18 +732,58 @@ function activePoAllocationSql(unit, lineAlias = "delivery_line_source") {
       : unit === "section" ? "section_qty"
         : unit === "piece" ? "piece_qty"
           : "allocated_quantity";
-  return `(
-    COALESCE((SELECT SUM(${column}) FROM dispatch_so_po_allocations a WHERE a.status = 'active' AND a.sales_line_id = ${lineAlias}.id), 0)
-    + COALESCE((
-      SELECT SUM(dl.${dependencyColumn})
-        FROM order_dependency_lines dl
-        JOIN order_dependencies d ON d.id = dl.dependency_id
-       WHERE dl.sales_line_id = ${lineAlias}.id
-         AND d.dependency_mode = 'direct_to_customer'
-         AND d.status <> 'cancelled'
-    ), 0)
-  )`;
+  return { column, dependencyColumn };
 }
+
+function activePoAllocationSql(unit, lineAlias = "delivery_line_source") {
+  const { column } = linkedAllocationColumns(unit);
+  return `COALESCE((
+    SELECT SUM(a.${column})
+      FROM dispatch_so_po_allocations a
+     WHERE a.status = 'active'
+       AND a.sales_line_id = ${lineAlias}.id
+  ), 0)`;
+}
+
+function activeDirectToAllocationSql(unit, lineAlias = "delivery_line_source") {
+  const { dependencyColumn } = linkedAllocationColumns(unit);
+  return `COALESCE((
+    SELECT SUM(dl.${dependencyColumn})
+      FROM order_dependency_lines dl
+      JOIN order_dependencies d ON d.id = dl.dependency_id
+     WHERE dl.sales_line_id = ${lineAlias}.id
+       AND d.dependency_mode = 'direct_to_customer'
+       AND d.status <> 'cancelled'
+  ), 0)`;
+}
+
+function activeLinkedAllocationSelectSql(lineAlias) {
+  return `
+    ${activePoAllocationSql("pallet", lineAlias)} AS linked_po_pallet_qty,
+    ${activePoAllocationSql("layer", lineAlias)} AS linked_po_layer_qty,
+    ${activePoAllocationSql("section", lineAlias)} AS linked_po_section_qty,
+    ${activePoAllocationSql("piece", lineAlias)} AS linked_po_piece_qty,
+    ${activePoAllocationSql("sales", lineAlias)} AS linked_po_sales_qty,
+    ${activeDirectToAllocationSql("pallet", lineAlias)} AS linked_direct_to_pallet_qty,
+    ${activeDirectToAllocationSql("layer", lineAlias)} AS linked_direct_to_layer_qty,
+    ${activeDirectToAllocationSql("section", lineAlias)} AS linked_direct_to_section_qty,
+    ${activeDirectToAllocationSql("piece", lineAlias)} AS linked_direct_to_piece_qty,
+    ${activeDirectToAllocationSql("sales", lineAlias)} AS linked_direct_to_sales_qty
+  `;
+}
+
+const zeroLinkedAllocationSelectSql = `
+  0::numeric AS linked_po_pallet_qty,
+  0::numeric AS linked_po_layer_qty,
+  0::numeric AS linked_po_section_qty,
+  0::numeric AS linked_po_piece_qty,
+  0::numeric AS linked_po_sales_qty,
+  0::numeric AS linked_direct_to_pallet_qty,
+  0::numeric AS linked_direct_to_layer_qty,
+  0::numeric AS linked_direct_to_section_qty,
+  0::numeric AS linked_direct_to_piece_qty,
+  0::numeric AS linked_direct_to_sales_qty
+`;
 
 function isTransferDeliveryOrder(order) {
   return order?.order_type === "transfer_order";
@@ -728,10 +799,6 @@ function canonicalLineTarget(order) {
   return isTransferDeliveryOrder(order)
     ? { table: "transfer_order_lines", orderColumn: "transfer_order_id", extraWhere: "AND line_stage = 'outbound'", allocationAlias: null }
     : { table: "sales_order_lines", orderColumn: "sales_order_id", extraWhere: "", allocationAlias: "sales_order_lines" };
-}
-
-function activeDeliveryAllocationSql(order, unit, lineAlias) {
-  return isTransferDeliveryOrder(order) ? "0" : activePoAllocationSql(unit, lineAlias);
 }
 
 function lineRequiredSalesSql(alias) {
@@ -846,6 +913,13 @@ function addNumericFields(target, source, fields) {
 }
 
 function aggregateGroupLines(groupId, childOrders = []) {
+  const linkedAuditFields = [
+    "original_pallet_qty", "original_layer_qty", "original_section_qty", "original_piece_qty", "original_quantity",
+    "linked_po_pallet_qty", "linked_po_layer_qty", "linked_po_section_qty", "linked_po_piece_qty", "linked_po_sales_qty",
+    "linked_direct_to_pallet_qty", "linked_direct_to_layer_qty", "linked_direct_to_section_qty", "linked_direct_to_piece_qty", "linked_direct_to_sales_qty",
+    "linked_allocated_pallet_qty", "linked_allocated_layer_qty", "linked_allocated_section_qty", "linked_allocated_piece_qty", "linked_allocated_sales_qty",
+    "operator_required_pallet_qty", "operator_required_layer_qty", "operator_required_section_qty", "operator_required_piece_qty", "operator_required_sales_qty"
+  ];
   const linesByKey = new Map();
   for (const order of childOrders) {
     for (const line of order.lines || []) {
@@ -870,7 +944,14 @@ function aggregateGroupLines(groupId, childOrders = []) {
           packed_section_qty: positiveQuantity(line.packed_section_qty),
           packed_piece_qty: positiveQuantity(line.packed_piece_qty),
           packed_sales_qty: positiveQuantity(line.packed_sales_qty),
-          loaded_qty: positiveQuantity(line.loaded_qty)
+          loaded_qty: positiveQuantity(line.loaded_qty),
+          ...Object.fromEntries(linkedAuditFields.map((field) => [field, positiveQuantity(line[field])])),
+          linked_quantity_blocked: Boolean(line.linked_quantity_blocked),
+          linked_quantity_errors: (line.linked_quantity_errors || []).map((error) => ({
+            ...error,
+            sourceOrderRef: order.tranid,
+            sourceLineId: line.id
+          }))
         });
         continue;
       }
@@ -885,17 +966,32 @@ function aggregateGroupLines(groupId, childOrders = []) {
         "packed_section_qty",
         "packed_piece_qty",
         "packed_sales_qty",
-        "loaded_qty"
+        "loaded_qty",
+        ...linkedAuditFields
       ]);
       existing.source_lines.push(groupLineSource(line, order));
       if (!existing.source_order_refs.includes(order.tranid)) existing.source_order_refs.push(order.tranid);
       existing.reload_line = Boolean(existing.reload_line || line.reload_line);
       existing.confirmed = Boolean(existing.confirmed || line.confirmed);
+      existing.linked_quantity_blocked = Boolean(existing.linked_quantity_blocked || line.linked_quantity_blocked);
+      existing.linked_quantity_errors.push(...(line.linked_quantity_errors || []).map((error) => ({
+        ...error,
+        sourceOrderRef: order.tranid,
+        sourceLineId: line.id
+      })));
       if (line.sync_exception && !existing.sync_exception) existing.sync_exception = line.sync_exception;
       if (line.sync_exception_at && !existing.sync_exception_at) existing.sync_exception_at = line.sync_exception_at;
     }
   }
-  return [...linesByKey.values()].sort((a, b) => String(a.sku || a.item_name || "").localeCompare(String(b.sku || b.item_name || "")));
+  return [...linesByKey.values()].map((line) => {
+    const hasOriginal = ["original_pallet_qty", "original_layer_qty", "original_section_qty", "original_piece_qty", "original_quantity"]
+      .some((field) => positiveQuantity(line[field]) > 0.000001);
+    line.no_yard_load_required = hasOriginal
+      && ["pallet_qty", "layer_qty", "section_qty", "piece_qty", "quantity"]
+        .every((field) => positiveQuantity(line[field]) <= 0.000001);
+    line.linked_supply_label = line.no_yard_load_required ? "No yard load required—direct supply" : "";
+    return line;
+  }).sort((a, b) => String(a.sku || a.item_name || "").localeCompare(String(b.sku || b.item_name || "")));
 }
 
 async function loadDispatchGroupChildOrders(groups = []) {
@@ -944,36 +1040,16 @@ async function loadDispatchGroupChildOrders(groups = []) {
   const lineResult = await query(
     isTransfer
       ? `SELECT l.*,
-                0::numeric AS po_allocated_pallet_qty,
-                0::numeric AS po_allocated_layer_qty,
-                0::numeric AS po_allocated_section_qty,
-                0::numeric AS po_allocated_piece_qty,
-                0::numeric AS po_allocated_sales_qty
+                ${zeroLinkedAllocationSelectSql}
            FROM transfer_order_lines l
           WHERE l.transfer_order_id = ANY($1::bigint[])
             AND l.line_stage = 'outbound'
             AND (l.netsuite_active = true OR l.sync_exception IS NOT NULL OR (${packedQtySql}) > 0)
           ORDER BY l.transfer_order_id, l.line_id NULLS LAST, l.id`
-      : `WITH alloc AS (
-           SELECT sales_line_id,
-                  SUM(allocated_pallet_qty) AS po_allocated_pallet_qty,
-                  SUM(allocated_layer_qty) AS po_allocated_layer_qty,
-                  SUM(allocated_section_qty) AS po_allocated_section_qty,
-                  SUM(allocated_piece_qty) AS po_allocated_piece_qty,
-                  SUM(allocated_sales_qty) AS po_allocated_sales_qty
-             FROM dispatch_so_po_allocations
-            WHERE status = 'active'
-            GROUP BY sales_line_id
-         )
-         SELECT l.*,
-                COALESCE(alloc.po_allocated_pallet_qty, 0) + ${activePoAllocationSql("pallet", "l")} - COALESCE(alloc.po_allocated_pallet_qty, 0) AS po_allocated_pallet_qty,
-                COALESCE(alloc.po_allocated_layer_qty, 0) + ${activePoAllocationSql("layer", "l")} - COALESCE(alloc.po_allocated_layer_qty, 0) AS po_allocated_layer_qty,
-                COALESCE(alloc.po_allocated_section_qty, 0) + ${activePoAllocationSql("section", "l")} - COALESCE(alloc.po_allocated_section_qty, 0) AS po_allocated_section_qty,
-                COALESCE(alloc.po_allocated_piece_qty, 0) + ${activePoAllocationSql("piece", "l")} - COALESCE(alloc.po_allocated_piece_qty, 0) AS po_allocated_piece_qty,
-                COALESCE(alloc.po_allocated_sales_qty, 0) + ${activePoAllocationSql("sales", "l")} - COALESCE(alloc.po_allocated_sales_qty, 0) AS po_allocated_sales_qty
+      : `SELECT l.*,
+                ${activeLinkedAllocationSelectSql("l")}
            FROM sales_order_lines l
            JOIN sales_orders o ON o.netsuite_id = l.sales_order_id
-           LEFT JOIN alloc ON alloc.sales_line_id = l.id
           WHERE l.sales_order_id = ANY($1::bigint[])
             AND (l.netsuite_active = true
               OR (${sandboxSql} AND COALESCE(o.is_test_fixture, false))
@@ -1148,27 +1224,11 @@ export async function getDeliveryOrdersBatch(ids = []) {
         [regularIds]
       );
     const lineResult = await query(
-        `WITH alloc AS (
-           SELECT sales_line_id,
-                  SUM(allocated_pallet_qty) AS po_allocated_pallet_qty,
-                  SUM(allocated_layer_qty) AS po_allocated_layer_qty,
-                  SUM(allocated_section_qty) AS po_allocated_section_qty,
-                  SUM(allocated_piece_qty) AS po_allocated_piece_qty,
-                  SUM(allocated_sales_qty) AS po_allocated_sales_qty
-             FROM dispatch_so_po_allocations
-            WHERE status = 'active'
-            GROUP BY sales_line_id
-         )
-          SELECT l.*,
+        `SELECT l.*,
                  CASE WHEN ${sandboxSql} AND COALESCE(o.is_test_fixture, false) THEN true ELSE l.netsuite_active END AS netsuite_active,
-                COALESCE(alloc.po_allocated_pallet_qty, 0) + ${activePoAllocationSql("pallet", "l")} - COALESCE(alloc.po_allocated_pallet_qty, 0) AS po_allocated_pallet_qty,
-                COALESCE(alloc.po_allocated_layer_qty, 0) + ${activePoAllocationSql("layer", "l")} - COALESCE(alloc.po_allocated_layer_qty, 0) AS po_allocated_layer_qty,
-                COALESCE(alloc.po_allocated_section_qty, 0) + ${activePoAllocationSql("section", "l")} - COALESCE(alloc.po_allocated_section_qty, 0) AS po_allocated_section_qty,
-                COALESCE(alloc.po_allocated_piece_qty, 0) + ${activePoAllocationSql("piece", "l")} - COALESCE(alloc.po_allocated_piece_qty, 0) AS po_allocated_piece_qty,
-                COALESCE(alloc.po_allocated_sales_qty, 0) + ${activePoAllocationSql("sales", "l")} - COALESCE(alloc.po_allocated_sales_qty, 0) AS po_allocated_sales_qty
+                 ${activeLinkedAllocationSelectSql("l")}
             FROM sales_order_lines l
             JOIN sales_orders o ON o.netsuite_id = l.sales_order_id
-           LEFT JOIN alloc ON alloc.sales_line_id = l.id
           WHERE l.sales_order_id = ANY($1::bigint[])
              AND (l.netsuite_active = true
                OR (${sandboxSql} AND COALESCE(o.is_test_fixture, false))
@@ -1537,7 +1597,8 @@ function mapVrmaLineForDelivery(line = {}, order = {}) {
 
 function mapVrmaOrderForDelivery(row = {}, lines = []) {
   const planned = Boolean(row.plan_id);
-  const locationId = vrmaOperatorLocationId(row.pickup_location);
+  const pickupLocation = String(row.effective_pickup_location || row.pickup_location || "").trim();
+  const locationId = vrmaOperatorLocationId(pickupLocation);
   const order = {
     vrma_order_id: row.id,
     netsuite_id: `VRMA:${row.vrma_ref}`,
@@ -1549,9 +1610,9 @@ function mapVrmaOrderForDelivery(row = {}, lines = []) {
     status_text: `Local VRMA - ${row.operator_status || (planned ? "Planned" : "Open")}`,
     foreign_total: null,
     order_location_id: locationId,
-    order_location: row.pickup_location,
+    order_location: pickupLocation,
     outbound_location_id: locationId,
-    outbound_location: row.pickup_location,
+    outbound_location: pickupLocation,
     delivery_method_id: null,
     delivery_method: "Local VRMA",
     operator_status: row.operator_status || "open",
@@ -1576,7 +1637,7 @@ function mapVrmaOrderForDelivery(row = {}, lines = []) {
     memo: row.notes || "",
     order_type: "vrma_order",
     source_location_id: locationId,
-    source_location: row.pickup_location,
+    source_location: pickupLocation,
     destination_location_id: null,
     destination_location: row.dropoff_location,
     warning_count: 0,
@@ -1606,7 +1667,7 @@ export async function listVrmaDeliveryPrepOrders({ locationId = null, ref = "", 
     const yard = VRMA_OPERATOR_YARD_BY_LOCATION.get(String(locationId));
     if (!yard) return [];
     params.push(yard);
-    clauses.push(`v.pickup_location = $${params.length}`);
+    clauses.push(`COALESCE(active_co.to_location, v.pickup_location) = $${params.length}`);
   }
   if (ref) {
     params.push(normalizeVrmaDeliveryRef(ref));
@@ -1614,6 +1675,7 @@ export async function listVrmaDeliveryPrepOrders({ locationId = null, ref = "", 
   }
   const result = await query(
     `SELECT v.*,
+            COALESCE(active_co.to_location, v.pickup_location) AS effective_pickup_location,
             vendor_yard.address AS vendor_address,
             vendor_yard.window_start,
             vendor_yard.window_end,
@@ -1626,6 +1688,14 @@ export async function listVrmaDeliveryPrepOrders({ locationId = null, ref = "", 
             planned.parking_spot,
             (SELECT COUNT(*)::int FROM scm_vrma_order_lines line WHERE line.vrma_order_id = v.id) AS line_count
        FROM scm_vrma_orders v
+       LEFT JOIN LATERAL (
+         SELECT co.co_ref, co.status, co.to_location
+           FROM local_co_orders co
+          WHERE co.source_order_ref = v.vrma_ref
+            AND co.status <> 'cancelled'
+          ORDER BY co.updated_at DESC, co.id DESC
+          LIMIT 1
+       ) active_co ON true
        JOIN LATERAL (
          SELECT y.address, y.window_start, y.window_end, y.instructions
            FROM dispatch_local_vendors local_vendor
@@ -1651,6 +1721,10 @@ export async function listVrmaDeliveryPrepOrders({ locationId = null, ref = "", 
           LIMIT 1
        ) planned ON true
       WHERE ${clauses.join(" AND ")}
+        AND NOT (
+          active_co.co_ref IS NOT NULL
+          AND active_co.status IN ('pending_load', 'preparing', 'packed', 'loaded', 'planned')
+        )
       ORDER BY planned.plan_id NULLS FIRST, v.updated_at DESC, v.vrma_ref`,
     params
   );
@@ -2390,18 +2464,7 @@ export async function getDeliveryOrder(id) {
   if (!order.rowCount) return Number(id) < 0 ? getLocalCoDeliveryOrder(id) : null;
 
   const lines = await query(
-    `WITH alloc AS (
-       SELECT sales_line_id,
-              SUM(allocated_pallet_qty) AS po_allocated_pallet_qty,
-              SUM(allocated_layer_qty) AS po_allocated_layer_qty,
-              SUM(allocated_section_qty) AS po_allocated_section_qty,
-              SUM(allocated_piece_qty) AS po_allocated_piece_qty,
-              SUM(allocated_sales_qty) AS po_allocated_sales_qty
-         FROM dispatch_so_po_allocations
-        WHERE status = 'active'
-        GROUP BY sales_line_id
-     ),
-     delivery_line_source AS (
+    `WITH delivery_line_source AS (
        SELECT sales_order_id AS order_id, id, line_id, item_id, item_name, sku,
               item_description, item_type, item_type_text, quantity, unit,
               item_weight, location_id, location, pallet_qty, layer_qty, section_qty, piece_qty,
@@ -2424,13 +2487,8 @@ export async function getDeliveryOrder(id) {
        WHERE line_stage = 'outbound'
      )
      SELECT delivery_line_source.*,
-            ${activePoAllocationSql("pallet", "delivery_line_source")} AS po_allocated_pallet_qty,
-            ${activePoAllocationSql("layer", "delivery_line_source")} AS po_allocated_layer_qty,
-            ${activePoAllocationSql("section", "delivery_line_source")} AS po_allocated_section_qty,
-            ${activePoAllocationSql("piece", "delivery_line_source")} AS po_allocated_piece_qty,
-            ${activePoAllocationSql("sales", "delivery_line_source")} AS po_allocated_sales_qty
+            ${activeLinkedAllocationSelectSql("delivery_line_source")}
      FROM delivery_line_source
-     LEFT JOIN alloc ON alloc.sales_line_id = delivery_line_source.id
      WHERE order_id = $1
        AND (
          netsuite_active = true
@@ -2557,7 +2615,7 @@ async function materializeSalesSplitOrder(order, parent) {
     ]
   );
   if (!splitItems.length) return splitId;
-  await query("DELETE FROM sales_order_lines WHERE sales_order_id = $1 AND COALESCE(loaded_qty, 0) = 0 AND COALESCE(packed_pallet_qty, 0) = 0 AND COALESCE(packed_layer_qty, 0) = 0 AND COALESCE(packed_section_qty, 0) = 0 AND COALESCE(packed_piece_qty, 0) = 0", [splitId]);
+  const selectedSplitLineIds = [];
   for (const item of splitItems) {
     const rawLineId = item.lineId ?? item.line_id;
     const lineId = rawLineId == null || String(rawLineId).trim() === "" ? null : rawLineId;
@@ -2565,7 +2623,7 @@ async function materializeSalesSplitOrder(order, parent) {
       .find((value) => value != null && String(value).trim() !== "");
     const lineIdentity = lineId ?? fallbackIdentity ?? "line";
     const conflictTarget = lineId == null ? "(id)" : "(sales_order_id, line_id)";
-    await query(
+    const upserted = await query(
       `INSERT INTO sales_order_lines (
          sales_order_id, id, line_id, item_id, item_name, sku, item_description,
          item_type, item_type_text, quantity, unit, pallet_qty, layer_qty,
@@ -2601,7 +2659,8 @@ async function materializeSalesSplitOrder(order, parent) {
              section_qty = EXCLUDED.section_qty,
              piece_qty = EXCLUDED.piece_qty,
              netsuite_active = true,
-             synced_at = now()`,
+             synced_at = now()
+       RETURNING id`,
       [
         splitId,
         syntheticOrderId(`sales-line:${order.id}:${lineIdentity}`),
@@ -2618,7 +2677,19 @@ async function materializeSalesSplitOrder(order, parent) {
         lineId
       ]
     );
+    if (upserted.rows[0]?.id != null) selectedSplitLineIds.push(upserted.rows[0].id);
   }
+  await query(
+    `DELETE FROM sales_order_lines
+      WHERE sales_order_id = $1
+        AND NOT (id = ANY($2::bigint[]))
+        AND COALESCE(loaded_qty, 0) = 0
+        AND COALESCE(packed_pallet_qty, 0) = 0
+        AND COALESCE(packed_layer_qty, 0) = 0
+        AND COALESCE(packed_section_qty, 0) = 0
+        AND COALESCE(packed_piece_qty, 0) = 0`,
+    [splitId, selectedSplitLineIds]
+  );
   await remapDispatchLinksToMaterializedSplit(order, splitId);
   return splitId;
 }
@@ -5006,9 +5077,10 @@ async function updateSourceLinePackedQuantities(sources = []) {
 }
 
 async function applyGroupedLinePackedQuantityToOrder(groupOrder, lineId, values, operatorId, { absolute = false, claim = true, audit = true } = {}) {
-  if (claim) await claimPreparingGroupOrder(groupOrder, operatorId);
   const { lines } = await resolveGroupSourceLines(groupOrder, lineId);
   if (!lines.length) throw new Error("Grouped delivery line not found.");
+  for (const { line } of lines) assertOperatorLinkedLineLoadable(line);
+  if (claim) await claimPreparingGroupOrder(groupOrder, operatorId);
   const requested = {
     pallets: normalizeQuantity(values?.pallets) || 0,
     layers: normalizeQuantity(values?.layers) || 0,
@@ -5505,9 +5577,12 @@ export async function confirmDeliveryLine(orderId, lineId, values, operatorId) {
     await confirmLocalCoDeliveryLine(orderId, lineId, values, operatorId);
     return;
   }
+  const currentLine = (current?.lines || []).find((item) => String(item.id) === String(lineId));
+  if (currentLine) assertOperatorLinkedLineLoadable(currentLine);
   const order = await claimPreparingOrder(orderId, operatorId);
   const line = (order.lines || []).find((item) => String(item.id) === String(lineId));
   if (!line || line.sync_exception) throw new Error("Delivery line not found.");
+  assertOperatorLinkedLineLoadable(line);
 
   const pallets = normalizeQuantity(values?.pallets) || 0;
   const layers = normalizeQuantity(values?.layers) || 0;
@@ -5765,6 +5840,7 @@ export async function setDeliveryLinePackedQuantity(orderId, lineId, values, ope
   const lineTarget = canonicalLineTarget(order);
   const line = (order.lines || []).find((item) => String(item.id) === String(lineId));
   if (!line || line.sync_exception) throw new Error("Delivery line not found.");
+  assertOperatorLinkedLineLoadable(line);
   const salesOnly = isSalesQuantityOnlyLine(line);
   const available = remainingPackAvailability(line);
   const next = salesOnly

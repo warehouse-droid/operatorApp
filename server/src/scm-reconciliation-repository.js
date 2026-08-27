@@ -2,6 +2,7 @@ import crypto from "node:crypto";
 import { query, withTransaction } from "./db.js";
 import {
   allocateReconciliationProgress,
+  applySplitTargetEvidencePrecedence,
   classifyNetSuiteLifecycle,
   derivePoToReconciliationState,
   netSuiteHeaderCompletesReceipt,
@@ -9,6 +10,8 @@ import {
   rollupReconciliationGroup,
   roundReconciliationQuantity
 } from "./scm-reconciliation.js";
+import { allocateSplitReceiptsByDestination } from "./scm-split-receipt-allocation.js";
+import { deriveScmGroupSchedulePersistence } from "./scm-reconciliation-group-schedule.js";
 import {
   filterDbBackedSalesOrderReconciliationCandidates,
   normalizeSalesOrderReconciliationType
@@ -90,6 +93,9 @@ export function scmScheduleEffectiveReconciliationStatus({
   const currentScheduleStatus = text(scheduleStatus) || "Queued";
   const currentReconciliationStatus = text(reconciliationStatus).toLowerCase();
   const currentReconciliationApplicationStatus = text(reconciliationApplicationStatus);
+  if (["complete", "completed"].includes(currentScheduleStatus.toLowerCase())) {
+    return "Completed";
+  }
   if (blockingReview || currentReconciliationStatus === "review") return "Reconcile Review";
   if (["complete", "completed"].includes(currentReconciliationApplicationStatus.toLowerCase())) {
     return "Completed";
@@ -2194,6 +2200,8 @@ async function loadSplitLineTargets(order, sourceLine) {
               child_line.received_section_qty,
               child_line.received_piece_qty,
               child_line.to_plt, child_line.to_lyr, child_line.to_sec, child_line.to_pcs,
+              COALESCE(child_line.location_id, child.destination_location_id) AS target_destination_location_id,
+              COALESCE(NULLIF(child_line.location, ''), child.destination_location) AS target_destination_location,
               schedule.eta_date,
               schedule.status AS schedule_status,
               schedule.updated_at AS schedule_updated_at
@@ -2226,6 +2234,8 @@ async function loadSplitLineTargets(order, sourceLine) {
         salesQuantityFromPack(row, "received_")
       ),
       exactFulfilledQty: 0,
+      destinationLocationId: positiveId(row.target_destination_location_id),
+      destinationLocation: row.target_destination_location || "",
       actualDispatchAt: ["Planned", "Partially Done", "In Transit", "Completed"].includes(row.schedule_status)
         ? row.schedule_updated_at
         : null,
@@ -2893,6 +2903,8 @@ function addTargetProgress(targets, allocation, progressKind, lineIdentity = "")
       ordered: 0,
       fulfilled: 0,
       received: 0,
+      evidencedFulfilled: 0,
+      evidencedReceived: 0,
       exactAllocation: true,
       hidden: false,
       hasActivePlan: Boolean(allocation.actualDispatchAt || allocation.plannedEta),
@@ -2910,6 +2922,22 @@ function addTargetProgress(targets, allocation, progressKind, lineIdentity = "")
   }
   target[progressKind] = roundReconciliationQuantity(
     target[progressKind] + reconciliationQuantity(allocation.allocatedQty)
+  );
+  const exactField = progressKind === "fulfilled"
+    ? "exactFulfilledQty"
+    : "exactReceivedQty";
+  const evidenceField = progressKind === "fulfilled"
+    ? "evidencedFulfilled"
+    : "evidencedReceived";
+  const allocated = reconciliationQuantity(allocation.allocatedQty);
+  const explicitQuantity = reconciliationQuantity(allocation[exactField]);
+  const evidenced = explicitQuantity > EPSILON
+    ? Math.min(explicitQuantity, allocated)
+    : ["exact", "pinned"].includes(allocation.allocationMethod)
+      ? allocated
+      : 0;
+  target[evidenceField] = roundReconciliationQuantity(
+    target[evidenceField] + evidenced
   );
   if (allocation.allocationMethod) target.allocationMethods.add(allocation.allocationMethod);
   if (allocation.allocationMethod === "inferred") target.exactAllocation = false;
@@ -3013,7 +3041,103 @@ function groupedReconciliationApplicationStatus(rollup = {}, currentStatus = "")
   return current;
 }
 
-async function applyAffectedScheduleGroupRollups(orderKind, memberRefs = []) {
+async function applyScheduleGroupRollup(group, { updatedBy = "reconciliation" } = {}) {
+  const parentResult = await query(
+    `SELECT id, status, reconciliation_blocked, last_reconciled_at,
+            updated_by, updated_at
+       FROM scm_transport_schedule
+      WHERE order_kind = 'PO'
+        AND lower(order_ref) = lower($1)
+      FOR UPDATE`,
+    [group.group_ref]
+  );
+  const parent = parentResult.rows[0];
+  if (!parent) return null;
+  const members = await query(
+    `SELECT member.order_ref,
+            COALESCE(schedule.status, 'Queued') AS status,
+            COALESCE(schedule.reconciliation_blocked, false) AS reconciliation_blocked,
+            COALESCE(state.reconciliation_status, 'pending') AS reconciliation_status
+       FROM scm_schedule_group_members member
+       LEFT JOIN scm_transport_schedule schedule
+         ON schedule.order_kind = member.order_kind
+        AND lower(schedule.order_ref) = lower(member.order_ref)
+       LEFT JOIN scm_reconciliation_order_state state
+         ON state.id = schedule.reconciliation_order_state_id
+      WHERE member.group_id = $1
+        AND member.order_kind = 'PO'
+      ORDER BY member.id`,
+    [group.id]
+  );
+  const rollup = rollupReconciliationGroup(members.rows.map((member) => ({
+    status: member.status || "Queued",
+    reconciliationStatus: member.reconciliation_blocked === true
+      || ["review", "missing", "error"].includes(text(member.reconciliation_status).toLowerCase())
+      ? "review"
+      : "ok"
+  })));
+  const applicationStatus = groupedReconciliationApplicationStatus(
+    rollup,
+    parent.status
+  );
+  const persistence = deriveScmGroupSchedulePersistence({
+    currentStatus: parent.status,
+    applicationStatus,
+    reconciliationStatus: rollup.reconciliationStatus
+  });
+  const updated = await query(
+    `UPDATE scm_transport_schedule
+        SET status = $2,
+            reconciliation_blocked = $3,
+            last_reconciled_at = now(),
+            updated_by = $4,
+            updated_at = now()
+      WHERE id = $1
+        AND (
+          status IS DISTINCT FROM $2
+          OR reconciliation_blocked IS DISTINCT FROM $3
+        )
+      RETURNING status, reconciliation_blocked, last_reconciled_at,
+                updated_by, updated_at`,
+    [
+      Number(parent.id),
+      persistence.persistedStatus,
+      persistence.reconciliationBlocked,
+      text(updatedBy) || "reconciliation"
+    ]
+  );
+  const after = updated.rows[0] || parent;
+  return {
+    groupRef: group.group_ref,
+    applicationStatus: persistence.applicationStatus,
+    reconciliationStatus: persistence.reconciliationStatus,
+    changed: Boolean(updated.rows[0]),
+    before: {
+      status: parent.status,
+      reconciliationBlocked: parent.reconciliation_blocked === true,
+      lastReconciledAt: parent.last_reconciled_at || null,
+      updatedBy: parent.updated_by || "",
+      updatedAt: parent.updated_at || null
+    },
+    after: {
+      status: after.status,
+      reconciliationBlocked: after.reconciliation_blocked === true,
+      lastReconciledAt: after.last_reconciled_at || null,
+      updatedBy: after.updated_by || "",
+      updatedAt: after.updated_at || null
+    },
+    members: members.rows.map((member) => ({
+      orderRef: member.order_ref,
+      status: member.status,
+      reconciliationBlocked: member.reconciliation_blocked === true,
+      reconciliationStatus: member.reconciliation_status
+    }))
+  };
+}
+
+async function applyAffectedScheduleGroupRollups(orderKind, memberRefs = [], {
+  updatedBy = "reconciliation"
+} = {}) {
   if (text(orderKind).toUpperCase() !== "PO") return [];
   const normalizedRefs = [...new Set(memberRefs.map((ref) => text(ref).toLowerCase()).filter(Boolean))];
   if (!normalizedRefs.length) return [];
@@ -3033,59 +3157,99 @@ async function applyAffectedScheduleGroupRollups(orderKind, memberRefs = []) {
   );
   const results = [];
   for (const group of groups.rows) {
-    const parent = await query(
-      `SELECT status
-         FROM scm_transport_schedule
-        WHERE order_kind = 'PO'
-          AND lower(order_ref) = lower($1)
-        FOR UPDATE`,
-      [group.group_ref]
-    );
-    if (!parent.rows.length) continue;
-    const members = await query(
-      `SELECT member.order_ref,
-              COALESCE(schedule.status, 'Queued') AS status,
-              COALESCE(schedule.reconciliation_blocked, false) AS reconciliation_blocked,
-              COALESCE(state.reconciliation_status, 'pending') AS reconciliation_status
-         FROM scm_schedule_group_members member
-         LEFT JOIN scm_transport_schedule schedule
-           ON schedule.order_kind = member.order_kind
-          AND lower(schedule.order_ref) = lower(member.order_ref)
-         LEFT JOIN scm_reconciliation_order_state state
-           ON state.id = schedule.reconciliation_order_state_id
-        WHERE member.group_id = $1
-          AND member.order_kind = 'PO'
-        ORDER BY member.id`,
-      [group.id]
-    );
-    const rollup = rollupReconciliationGroup(members.rows.map((member) => ({
-      status: member.status || "Queued",
-      reconciliationStatus: member.reconciliation_blocked === true
-        || ["review", "missing", "error"].includes(text(member.reconciliation_status).toLowerCase())
-        ? "review"
-        : "ok"
-    })));
-    const reconciliationBlocked = rollup.reconciliationStatus === "review";
-    const applicationStatus = groupedReconciliationApplicationStatus(
-      rollup,
-      parent.rows[0].status
-    );
-    await query(
-      `UPDATE scm_transport_schedule
-          SET reconciliation_blocked = $2,
-              last_reconciled_at = now()
-        WHERE order_kind = 'PO'
-          AND lower(order_ref) = lower($1)
-          AND reconciliation_blocked IS DISTINCT FROM $2`,
-      [group.group_ref, reconciliationBlocked]
-    );
-    results.push({
-      groupRef: group.group_ref,
-      applicationStatus,
-      reconciliationStatus: rollup.reconciliationStatus
-    });
+    const result = await applyScheduleGroupRollup(group, { updatedBy });
+    if (result) results.push(result);
   }
   return results;
+}
+
+export async function repairScmPoScheduleGroupRollup({
+  groupRef = "",
+  expectedMemberRefs = [],
+  actor = "system",
+  dryRun = false
+} = {}) {
+  const ref = text(groupRef);
+  const cleanActor = text(actor) || "system";
+  if (!ref || !ref.toUpperCase().startsWith("PGOB-")) {
+    throw Object.assign(new Error("A valid PGOB Purchase Order group reference is required."), {
+      status: 400
+    });
+  }
+  return withTransaction(async () => {
+    const groupResult = await query(
+      `SELECT id, group_ref
+         FROM scm_schedule_groups
+        WHERE status = 'active'
+          AND lower(group_ref) = lower($1)
+        FOR UPDATE`,
+      [ref]
+    );
+    const group = groupResult.rows[0];
+    if (!group) {
+      throw Object.assign(new Error("The active Purchase Order group was not found."), {
+        status: 404
+      });
+    }
+    const memberResult = await query(
+      `SELECT order_ref
+         FROM scm_schedule_group_members
+        WHERE group_id = $1
+          AND order_kind = 'PO'
+        ORDER BY order_ref`,
+      [Number(group.id)]
+    );
+    const actualMembers = memberResult.rows.map((row) => text(row.order_ref)).filter(Boolean);
+    const expectedMembers = [...new Set((Array.isArray(expectedMemberRefs) ? expectedMemberRefs : [])
+      .map(text)
+      .filter(Boolean))];
+    if (expectedMembers.length) {
+      const actualKeys = actualMembers.map((value) => value.toLowerCase()).sort();
+      const expectedKeys = expectedMembers.map((value) => value.toLowerCase()).sort();
+      if (
+        actualKeys.length !== expectedKeys.length
+        || actualKeys.some((value, index) => value !== expectedKeys[index])
+      ) {
+        throw Object.assign(
+          new Error(
+            `The PO group member set changed; expected ${expectedMembers.join(", ")}`
+            + ` but found ${actualMembers.join(", ") || "none"}.`
+          ),
+          { status: 409, code: "SCM_PO_GROUP_MEMBER_SET_CHANGED" }
+        );
+      }
+    }
+    const result = await applyScheduleGroupRollup(group, { updatedBy: cleanActor });
+    if (!result) {
+      throw Object.assign(new Error("The Purchase Order group schedule was not found."), {
+        status: 404
+      });
+    }
+    let auditEventId = null;
+    if (result.changed && !dryRun) {
+      const audit = await insertReconciliationAuditEvent({
+        eventKey: `manual:po-group-rollup-repair:${Number(group.id)}:${crypto.randomUUID()}`,
+        source: "manual",
+        eventType: "schedule_group.rollup_repaired",
+        recordType: "SYSTEM",
+        action: "repair_group_rollup",
+        parentOrderRef: group.group_ref,
+        payload: {
+          before: result.before,
+          after: result.after,
+          members: result.members,
+          expectedMemberRefs: expectedMembers
+        },
+        actor: cleanActor
+      });
+      auditEventId = Number(audit.event?.id) || null;
+    }
+    return {
+      ...result,
+      dryRun: dryRun === true,
+      auditEventId
+    };
+  }, { rollback: dryRun === true });
 }
 
 async function applyTargetScheduleStates(order, orderStateId, targetStates, blocked) {
@@ -3345,6 +3509,7 @@ export async function reconcileScmOrderFamily({
   const targets = new Map();
   const linePlans = [];
   const reasons = [text(explicitReviewReason)].filter(Boolean);
+  const unexplainedReceiptLocations = [];
   let exactAllocation = true;
   let anyPlannedTarget = order.dispatchPlanned === true;
 
@@ -3441,15 +3606,6 @@ export async function reconcileScmOrderFamily({
       : [])
   ];
   let exactIdentityRequired = !sourceLines.length && identityDiagnostics.length > 0;
-  const incorrectReceiptLocations = current.rows.filter((row) =>
-    row.transaction_type === "IR"
-    && positiveId(row.line_actual_location_id || row.actual_location_id)
-    && positiveId(order.destinationLocationId)
-    && positiveId(row.line_actual_location_id || row.actual_location_id) !== positiveId(order.destinationLocationId)
-  );
-  if (incorrectReceiptLocations.length) {
-    reasons.push("One or more Item Receipts use a location different from the order's current destination.");
-  }
   if (
     previous
     && positiveId(previous.destination_location_id)
@@ -3660,6 +3816,8 @@ export async function reconcileScmOrderFamily({
         currentQty: parentResidual,
         exactFulfilledQty: 0,
         exactReceivedQty: 0,
+        destinationLocationId: positiveId(line.locationId || order.destinationLocationId),
+        destinationLocation: line.location || order.destinationLocation || "",
         isParent: true,
         createdAt: "9999-12-31T23:59:59.999Z"
       }
@@ -3683,10 +3841,40 @@ export async function reconcileScmOrderFamily({
         pinned: target.pinnedFulfilled
       })), { exactField: "exactFulfilledQty", parentRef: order.scheduleRef })
       : { allocations: allocationTargets.map((target) => ({ ...target, allocatedQty: 0, allocationMethod: "" })), conflict: false, overflowQty: 0 };
-    const receivedAllocation = allocateReconciliationProgress(received, allocationTargets.map((target) => ({
+    const receivedTargets = allocationTargets.map((target) => ({
       ...target,
       pinned: target.pinnedReceived
-    })), { exactField: "exactReceivedQty", parentRef: order.scheduleRef });
+    }));
+    const receiptRowsForLine = order.kind === "PO"
+      ? matched.matchedRows.filter((row) =>
+        row.transaction_type === "IR"
+        && row.matchedLine === line
+      )
+      : [];
+    const receivedAllocation = order.kind === "PO"
+      ? allocateSplitReceiptsByDestination({
+        totalReceivedQty: received,
+        targets: receivedTargets,
+        receiptRows: receiptRowsForLine,
+        exactField: "exactReceivedQty",
+        parentRef: order.scheduleRef
+      })
+      : allocateReconciliationProgress(received, receivedTargets, {
+        exactField: "exactReceivedQty",
+        parentRef: order.scheduleRef
+      });
+    for (const unexplained of receivedAllocation.unexplainedLocations || []) {
+      unexplainedReceiptLocations.push({
+        sourceLineKey: line.sourceLineKey,
+        itemName: line.itemName || line.sku || "",
+        actualLocationId: unexplained.locationId,
+        quantity: unexplained.quantity
+      });
+      reasons.push(
+        `Received quantity ${unexplained.quantity} at location ${unexplained.locationId}`
+        + ` cannot be allocated to an active split PO destination for ${line.sku || line.itemName || line.sourceLineKey}.`
+      );
+    }
     if (
       fulfilledAllocation.conflict
       || receivedAllocation.conflict
@@ -3778,6 +3966,8 @@ export async function reconcileScmOrderFamily({
         ordered: 0,
         fulfilled: 0,
         received: 0,
+        evidencedFulfilled: 0,
+        evidencedReceived: 0,
         exactAllocation: false,
         hidden: false,
         hasActivePlan: split.hasActivePlan,
@@ -3825,15 +4015,20 @@ export async function reconcileScmOrderFamily({
     const sourceInitialStatus = isSourceTarget
       ? order.localStatus || (order.kind === "PO" ? "Hold" : "Queued")
       : "";
-    const targetPreviousStatus = targetScheduleIsNewer
-      ? previousSchedule.status
-      : previousTarget.applicationStatus
-        || previousSchedule.status
-        || sourceInitialStatus
-        || "Queued";
+    const previousScheduleCompleted = ["complete", "completed"].includes(
+      text(previousSchedule.status).toLowerCase()
+    );
+    const targetPreviousStatus = previousScheduleCompleted
+      ? "Completed"
+      : targetScheduleIsNewer
+        ? previousSchedule.status
+        : previousTarget.applicationStatus
+          || previousSchedule.status
+          || sourceInitialStatus
+          || "Queued";
     const inheritedFamilyCompletion = target.inheritedFamilyCompletion === true;
     const hidden = target.forceVisible === true ? false : target.ordered <= EPSILON;
-    const derived = derivePoToReconciliationState({
+    const calculated = derivePoToReconciliationState({
       kind: order.kind,
       statusText: order.statusText,
       statusCode: order.status,
@@ -3845,13 +4040,26 @@ export async function reconcileScmOrderFamily({
       hasActivePlan: target.hasActivePlan,
       hasOperationalActivity: target.fulfilled > EPSILON || target.received > EPSILON
     });
+    const derived = applySplitTargetEvidencePrecedence({
+      targetKind: target.targetKind,
+      previousStatus: targetPreviousStatus,
+      hasActivePlan: target.hasActivePlan,
+      evidencedFulfilledQty: target.evidencedFulfilled,
+      evidencedReceivedQty: target.evidencedReceived,
+      derivedState: calculated
+    });
+    const preserveLocalCompletion = previousScheduleCompleted
+      && derived.lifecycle?.closed !== true
+      && derived.lifecycle?.cancelled !== true;
     const applicationStatus = inheritedFamilyCompletion
       ? "Completed"
-      : reconciliationReason && !hidden
-        ? "Reconcile Review"
-        : hidden
-          ? "Cancelled"
-          : derived.applicationStatus;
+      : preserveLocalCompletion
+        ? "Completed"
+        : reconciliationReason && !hidden
+          ? "Reconcile Review"
+          : hidden
+            ? "Cancelled"
+            : derived.applicationStatus;
     targetStates[target.orderRef] = {
       ...plainTargetState(target),
       hidden,
@@ -3968,11 +4176,7 @@ export async function reconcileScmOrderFamily({
           itemId: row.item_id,
           quantity: row.quantity
         })),
-        incorrectReceiptLocations: incorrectReceiptLocations.map((row) => ({
-          transactionId: row.netsuite_transaction_id,
-          transactionRef: row.transaction_ref,
-          actualLocationId: row.line_actual_location_id || row.actual_location_id
-        }))
+        unexplainedReceiptLocations
       },
       runId,
       eventId: lastEventId
@@ -5804,13 +6008,15 @@ export async function enrichScmScheduleWithReconciliation(rows = [], {
     : { rows: [] };
   const groupMatches = new Map();
   for (const member of groupMembersResult.rows) {
-    const match = byTarget.get(`PO:${text(member.order_ref).toLowerCase()}`) || {
+    const matchedMember = byTarget.get(`PO:${text(member.order_ref).toLowerCase()}`) || {
       state: null,
-      target: null,
-      orderRef: member.order_ref
+      target: null
     };
     if (!groupMatches.has(member.group_ref)) groupMatches.set(member.group_ref, []);
-    groupMatches.get(member.group_ref).push(match);
+    groupMatches.get(member.group_ref).push({
+      ...matchedMember,
+      orderRef: member.order_ref
+    });
   }
   const stateIds = [...new Set(states.map((state) => Number(state.id)))];
   const [linesResult, allocationResult] = includeDetails && stateIds.length
@@ -5986,8 +6192,30 @@ export async function enrichScmScheduleWithReconciliation(rows = [], {
           memberTargets.reduce((sum, target, index) =>
             sum + reconciliationQuantity(target[field] ?? memberStates[index][fallbackField]), 0)
         );
+        const groupMembers = members.map((member, index) => {
+          const memberState = memberStates[index] || {};
+          const memberTarget = memberTargets[index] || {};
+          const memberCases = Array.isArray(memberState.review_cases)
+            ? memberState.review_cases
+            : [];
+          const memberReview = memberState.reconciliation_status === "review"
+            || memberState.reconciliation_status === "missing"
+            || memberCases.some((item) => item.severity === "blocking");
+          return {
+            orderRef: member.orderRef,
+            sourceOrderRef: memberState.source_order_ref || "",
+            applicationStatus: memberTarget.applicationStatus
+              || memberState.application_status
+              || "Queued",
+            reconciliationStatus: memberReview ? "review" : "ok",
+            ordered: numericJson(memberTarget.ordered ?? memberState.ordered_qty),
+            received: numericJson(memberTarget.received ?? memberState.received_qty),
+            remaining: numericJson(memberTarget.remaining ?? memberState.remaining_qty)
+          };
+        });
         match = {
           groupedRollup: true,
+          groupMembers,
           state: {
             ...memberStates[0],
             application_status: groupApplicationStatus,
@@ -6014,14 +6242,15 @@ export async function enrichScmScheduleWithReconciliation(rows = [], {
         };
       }
     }
+    const scheduleReviewBlocked = row.reconciliationBlocked === true;
     const state = match?.state;
     if (!state) {
       const next = {
         ...row,
-        reconciliationStatus: "unreconciled",
-        reconciliationReason: ""
+        reconciliationStatus: scheduleReviewBlocked ? "review" : "unreconciled",
+        reconciliationReason: scheduleReviewBlocked ? text(row.reconciliationReason) : ""
       };
-      if (!reviewOnly) enriched.push(next);
+      if (!reviewOnly || scheduleReviewBlocked) enriched.push(next);
       continue;
     }
     const target = match.target
@@ -6030,7 +6259,9 @@ export async function enrichScmScheduleWithReconciliation(rows = [], {
       || {};
     if (target.hidden === true && !completedView) continue;
     const cases = Array.isArray(state.review_cases) ? state.review_cases : [];
-    const isReview = state.reconciliation_status === "review" || cases.some((item) => item.severity === "blocking");
+    const isReview = scheduleReviewBlocked
+      || state.reconciliation_status === "review"
+      || cases.some((item) => item.severity === "blocking");
     const isPending = state.reconciliation_status === "pending";
     if (reviewOnly && !isReview) continue;
     const quantities = {
@@ -6044,10 +6275,13 @@ export async function enrichScmScheduleWithReconciliation(rows = [], {
     const currentTargetStatus = target.applicationStatus === "Reconcile Review"
       ? state.application_status
       : target.applicationStatus;
-    const effectiveStatus = match.groupedRollup
-      ? currentTargetStatus || state.application_status
-      : scmScheduleEffectiveReconciliationStatus({
-          scheduleStatus: row.status,
+    const locallyCompleted = Boolean(text(row.dispatchCompletionEvidenceType));
+    let effectiveStatus = "Completed";
+    if (!locallyCompleted) {
+      effectiveStatus = match.groupedRollup
+        ? currentTargetStatus || state.application_status
+        : scmScheduleEffectiveReconciliationStatus({
+          scheduleStatus: row.calculatedStatus || row.status,
           scheduleId: row.scheduleId,
           scheduleUpdatedAt: row.updatedAt,
           reconciliationStatus: state.reconciliation_status,
@@ -6055,6 +6289,7 @@ export async function enrichScmScheduleWithReconciliation(rows = [], {
           reconciliationApplicationStatus: currentTargetStatus || state.application_status,
           blockingReview: isReview
         });
+    }
     const displayedReason = isReview
       ? state.reconciliation_reason || target.reason || ""
       : "";
@@ -6075,8 +6310,12 @@ export async function enrichScmScheduleWithReconciliation(rows = [], {
         recovered: state.is_recovered === true,
         exactAllocation: target.exactAllocation ?? state.exact_allocation,
         quantities,
-        lines: linesByState.get(Number(state.id)) || [],
-        allocationTargets: allocationsByState.get(Number(state.id)) || [],
+        groupedRollup: match.groupedRollup === true,
+        groupMembers: match.groupedRollup ? match.groupMembers || [] : [],
+        lines: match.groupedRollup ? [] : linesByState.get(Number(state.id)) || [],
+        allocationTargets: match.groupedRollup
+          ? []
+          : allocationsByState.get(Number(state.id)) || [],
         reviewCases: cases,
         dismissible: cases.length > 0 && cases.every((item) => item.dismissible === true)
       } : undefined
@@ -7092,6 +7331,12 @@ export async function resolveScmReconciliationReview({
           WHERE reconciliation_order_state_id = $1`,
         [state.id, state.application_status, cleanActor]
       );
+      await applyAffectedScheduleGroupRollups(source.kind, [
+        source.tranid,
+        ...Object.entries(acceptedTargets).map(([targetRef, target]) =>
+          target?.orderRef || targetRef
+        )
+      ], { updatedBy: cleanActor });
     }
     return {
       ok: true,

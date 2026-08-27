@@ -1,9 +1,20 @@
-import { query, withTransaction } from "./db.js";
+import { hasActiveTransaction, query, withTransaction } from "./db.js";
 import { writeAudit } from "./auth-repository.js";
 import { latestSmartScmForecastRunId, smartScmForecastMap } from "./smart-scm-forecast-repository.js";
 import { calculateSmartScmOrderRequirement, calculateSmartScmPolicyLevels } from "./smart-scm-policy-calculation.js";
 import { smartScmBuiltInRouteRule, smartScmIsGormleySource, smartScmRouteRuleKey, smartScmRouteRuleMap } from "./smart-scm-route-repository.js";
 import { listSmartScmActivePlanningExclusionItemIds } from "./smart-scm-planning-exclusion-repository.js";
+import {
+  smartScmApplyInboundOverlay,
+  smartScmExpectedPoLineEligible,
+  smartScmPlanningPhaseOneDrafts,
+  smartScmSplitInboundOverlay
+} from "./smart-scm-phased-planning.js";
+import {
+  smartScmApplySkip12441Policy,
+  smartScmAutomaticDestinationAllowed,
+  smartScmBuild12441DemandProjection
+} from "./smart-scm-skip-12441.js";
 
 const EPSILON = 0.000001;
 export const SMART_SCM_MAX_PALLET_OVERRIDE_QUANTITY = 1_000_000;
@@ -42,22 +53,26 @@ export function smartScmEffectiveInboundSales({
   authoritativeOnOrderSales = 0,
   blanketExcludedSales = 0,
   excludedTransferOrderSales = 0,
+  releasedSplitInboundSales = 0,
   reservedBlanketSales = 0,
   pendingTransferReservationSales = 0
 } = {}) {
   const authoritative = positive(authoritativeOnOrderSales);
   const blanketExcluded = positive(blanketExcludedSales);
   const transferExcluded = positive(excludedTransferOrderSales);
+  const releasedSplitInbound = positive(releasedSplitInboundSales);
   const blanketReserved = positive(reservedBlanketSales);
   const transferReserved = positive(pendingTransferReservationSales);
   return {
     authoritativeOnOrderSales: authoritative,
     blanketExcludedSales: blanketExcluded,
     excludedTransferOrderSales: transferExcluded,
+    releasedSplitInboundSales: releasedSplitInbound,
     reservedBlanketSales: blanketReserved,
     pendingTransferReservationSales: transferReserved,
     effectiveOnOrderSales: round(
       Math.max(0, authoritative - blanketExcluded - transferExcluded)
+        + releasedSplitInbound
         + blanketReserved
         + transferReserved
     )
@@ -484,7 +499,7 @@ export async function loadSmartScmPlanningPolicies({ includeTemporarilyExcluded 
   });
 }
 
-async function inventoryState({ excludeTransferOrderIds = [] } = {}) {
+async function inventoryState({ excludeTransferOrderIds = [], applySplitOverlay = false } = {}) {
   const excludedTransferOrderIds = [...new Set((excludeTransferOrderIds || [])
     .map(Number)
     .filter((id) => Number.isInteger(id) && id > 0))];
@@ -493,6 +508,48 @@ async function inventoryState({ excludeTransferOrderIds = [] } = {}) {
             quantity_on_order, quantity_backordered, synced_at
        FROM inventory_balances`
   );
+  let balanceRows = balances.rows;
+  let splitInboundEvidence = [];
+  const releasedSplitInboundMap = new Map();
+  if (applySplitOverlay) {
+    const splitLines = await query(
+      `SELECT split.split_po_ref,
+              ledger.item_id,
+              COALESCE(source_line.location_id, source_po.destination_location_id) AS source_location_id,
+              COALESCE(child_line.location_id, child_po.destination_location_id) AS destination_location_id,
+              child_line.quantity,
+              COALESCE(child_line.netsuite_received_baseline_qty, child_line.netsuite_received_qty, 0) AS received_quantity,
+              split.status = 'active' AND child_po.netsuite_active = true AND child_line.netsuite_active = true AS active,
+              COALESCE(child_line.netsuite_closed, false) AS closed,
+              child_po.status_text AS order_status,
+              COALESCE(source_po.is_blanket_po, false) AS source_already_excluded
+         FROM dispatch_scm_po_split_lines ledger
+         JOIN dispatch_scm_po_splits split ON split.id = ledger.split_id
+         JOIN purchase_order_lines child_line ON child_line.id = ledger.split_line_id
+         JOIN purchase_orders child_po ON child_po.netsuite_id = split.split_po_id
+         JOIN purchase_order_lines source_line ON source_line.id = ledger.source_line_id
+         JOIN purchase_orders source_po ON source_po.netsuite_id = split.source_po_id
+        WHERE split.status = 'active'`
+    );
+    const eligibleLines = splitLines.rows.filter((row) => smartScmExpectedPoLineEligible({
+      ...row,
+      orderRef: row.split_po_ref,
+      orderActive: row.active,
+      lineActive: row.active
+    }));
+    const overlay = smartScmSplitInboundOverlay({ lines: eligibleLines });
+    balanceRows = smartScmApplyInboundOverlay({
+      balances: balanceRows,
+      deltas: overlay.authoritativeDeltas
+    });
+    for (const row of overlay.releasedSplitInboundDeltas) {
+      releasedSplitInboundMap.set(
+        `${row.itemId}:${row.locationId}`,
+        positive(row.quantity)
+      );
+    }
+    splitInboundEvidence = overlay.evidence;
+  }
   const adjustments = await query(
     `WITH blanket_po AS (
        SELECT line.item_id,
@@ -562,7 +619,7 @@ async function inventoryState({ excludeTransferOrderIds = [] } = {}) {
       WHERE status = 'active'
       GROUP BY item_id, source_location_id, destination_location_id`
   );
-  const balanceMap = new Map(balances.rows.map((row) => [`${row.item_id}:${row.location_id}`, row]));
+  const balanceMap = new Map(balanceRows.map((row) => [`${row.item_id ?? row.itemId}:${row.location_id ?? row.locationId}`, row]));
   const blanketExcludedMap = new Map(adjustments.rows.map((row) => [
     `${row.item_id}:${row.location_id}`,
     positive(row.blanket_quantity)
@@ -589,7 +646,9 @@ async function inventoryState({ excludeTransferOrderIds = [] } = {}) {
     excludedTransferOrderMap,
     reservedBlanketMap,
     outboundReservationMap,
-    inboundReservationMap
+    inboundReservationMap,
+    releasedSplitInboundMap,
+    splitInboundEvidence
   };
 }
 
@@ -602,7 +661,7 @@ async function latestVendorSupplyMap() {
   return new Map(result.rows.map((row) => [String(row.item_id), row]));
 }
 
-export async function smartScmMinimumOrderMap(policies = []) {
+export async function smartScmMinimumOrderMap(policies = [], settings = {}) {
   const toPltByItem = new Map(policies.map((policy) => [String(policy.item_id), positive(policy.to_plt)]));
   const itemIds = [...toPltByItem.keys()].map(Number).filter(Number.isInteger);
   if (!itemIds.length) return new Map();
@@ -625,8 +684,12 @@ export async function smartScmMinimumOrderMap(policies = []) {
       GROUP BY sf.item_id, sf.location_id, sf.delivery_method, sf.document_ref`,
     [itemIds]
   );
+  const projected = smartScmBuild12441DemandProjection({
+    enabled: Boolean(settings.skip_12441_enabled),
+    facts: result.rows
+  });
   const values = new Map();
-  for (const row of result.rows) {
+  for (const row of projected.facts) {
     const toPlt = toPltByItem.get(String(row.item_id));
     if (!toPlt) continue;
     const expectedMethod = String(YARD_BY_ID.get(String(row.location_id))?.code) === "12441" ? "delivery" : "pickup";
@@ -651,6 +714,7 @@ export function calculatePolicyState(policy, forecast, inventory, minimumOrder, 
     authoritativeOnOrderSales: balance.quantity_on_order,
     blanketExcludedSales: inventory.blanketExcludedMap.get(key),
     excludedTransferOrderSales: inventory.excludedTransferOrderMap.get(key),
+    releasedSplitInboundSales: inventory.releasedSplitInboundMap.get(key),
     reservedBlanketSales: inventory.reservedBlanketMap.get(key),
     pendingTransferReservationSales: inventory.inboundReservationMap.get(key),
     quantityBackorderedSales: balance.quantity_backordered,
@@ -710,6 +774,7 @@ export function calculatePolicyState(policy, forecast, inventory, minimumOrder, 
     authoritativeOnOrderSales: position.authoritativeOnOrderSales,
     blanketExcludedSales: position.blanketExcludedSales,
     excludedTransferOrderSales: position.excludedTransferOrderSales,
+    releasedSplitInboundSales: position.releasedSplitInboundSales,
     reservedBlanketSales: position.reservedBlanketSales,
     pendingTransferReservationSales: position.pendingTransferReservationSales,
     onOrderSales,
@@ -793,6 +858,7 @@ export function smartScmProposalLineForState(state, pallets, extraReason = {}) {
       quantityOnOrderAuthoritative: state.authoritativeOnOrderSales,
       quantityBlanketExcluded: state.blanketExcludedSales,
       quantityTransferOrderExcluded: state.excludedTransferOrderSales,
+      quantityReleasedSplitInbound: state.releasedSplitInboundSales,
       quantityBlanketReservedInbound: state.reservedBlanketSales,
       quantityPendingTransferReservation: state.pendingTransferReservationSales,
       quantityBackordered: state.backorderedSales,
@@ -1563,7 +1629,10 @@ export function smartScmBuildPlanningDrafts({ states, supplyMap, settings }) {
       const hub = YARDS.find((yard) => yard.code === "12441");
       if (internal.remaining > EPSILON
         && !purchasePlanningExcluded
-        && Number(state.policy.location_id) !== hub.locationId) {
+        && Number(state.policy.location_id) !== hub.locationId
+        && smartScmAutomaticDestinationAllowed(hub.locationId, {
+          skip12441Enabled: Boolean(settings.skip_12441_enabled)
+        })) {
         const vendorHubLine = smartScmProposalLineForState(state, internal.remaining, {
           vendorSupplyStatus: supplyStatus,
           residualAfterInternalTransferPallets: internal.remaining,
@@ -1659,6 +1728,135 @@ async function insertDrafts(runId, drafts = []) {
       );
     }
   }
+}
+
+function smartScmBuildTransferPhaseDrafts({ states = [], settings = {} } = {}) {
+  const drafts = [];
+  const exceptions = [];
+  const stateByKey = new Map(states.map((state) => [state.key, state]));
+  for (const state of states.filter((entry) => positive(entry.requiredPallets) > EPSILON)) {
+    if (!smartScmAutomaticDestinationAllowed(state.policy.location_id, {
+      skip12441Enabled: Boolean(settings.skip_12441_enabled)
+    })) continue;
+    const internal = internalTransferDrafts({
+      state,
+      requestedPallets: state.requiredPallets,
+      stateByKey,
+      settings,
+      provisional: false,
+      keyPrefix: "phased"
+    });
+    drafts.push(...internal.drafts);
+    const hub = YARDS.find((yard) => yard.code === "12441");
+    if (internal.remaining > EPSILON
+      && Number(state.policy.location_id) !== hub.locationId
+      && smartScmAutomaticDestinationAllowed(hub.locationId, {
+        skip12441Enabled: Boolean(settings.skip_12441_enabled)
+      })) {
+      const line = smartScmProposalLineForState(state, internal.remaining, {
+        residualAfterInternalTransferPallets: internal.remaining,
+        consolidationRequired: true,
+        actualDestinationYard: state.policy.yard_code,
+        phasedPlanning: true
+      });
+      line.destinationLocationId = hub.locationId;
+      line.destinationName = hub.code;
+      splitLineByTruck(line, positive(settings.truck_capacity_lbs, 78000)).forEach((part, index) => drafts.push(createDraft({
+        type: "PO",
+        phase: "vendor_hub",
+        sourceKind: "vendor",
+        sourceVendorYardId: state.policy.vendor_yard_id,
+        sourceName: state.policy.plant || state.policy.vendor || "Vendor",
+        destinationLocationId: hub.locationId,
+        destinationName: hub.code,
+        vendor: state.policy.vendor,
+        plant: state.policy.plant,
+        urgent: state.urgent,
+        line: part,
+        status: "held",
+        keySuffix: `phased-${state.policy.yard_code}-${index + 1}`
+      }, settings)));
+    } else if (internal.remaining > EPSILON) {
+      exceptions.push({
+        itemId: Number(state.policy.item_id),
+        yard: state.policy.yard_code,
+        reason: Boolean(settings.skip_12441_enabled)
+          ? "Transfer supply is insufficient and automatic 12441 consolidation is disabled"
+          : "Transfer supply is insufficient",
+        remainingPallets: round(internal.remaining)
+      });
+    }
+  }
+  return { drafts, exceptions };
+}
+
+async function smartScmExpectedPoEvidence() {
+  const result = await query(
+    `WITH active_split_remaining AS (
+       SELECT ledger.source_line_id,
+              SUM(GREATEST(
+                COALESCE(child_line.quantity, 0)
+                  - COALESCE(child_line.netsuite_received_baseline_qty, child_line.netsuite_received_qty, 0),
+                0
+              )) AS relocated_remaining
+         FROM dispatch_scm_po_split_lines ledger
+         JOIN dispatch_scm_po_splits split
+           ON split.id = ledger.split_id
+          AND split.status = 'active'
+         JOIN purchase_orders child_po
+           ON child_po.netsuite_id = split.split_po_id
+          AND child_po.netsuite_active = true
+         JOIN purchase_order_lines child_line
+           ON child_line.id = ledger.split_line_id
+          AND child_line.netsuite_active = true
+        GROUP BY ledger.source_line_id
+     )
+     SELECT po.netsuite_id AS order_id,
+            COALESCE(NULLIF(po.dispatch_ref, ''), po.tranid) AS order_ref,
+            po.status_text AS order_status,
+            po.netsuite_active AS order_active,
+            line.id AS line_id,
+            line.item_id,
+            COALESCE(line.location_id, po.destination_location_id) AS location_id,
+            GREATEST(
+              COALESCE(line.quantity, 0)
+                - COALESCE(line.netsuite_received_baseline_qty, line.netsuite_received_qty, 0)
+                - CASE WHEN split.id IS NULL THEN COALESCE(relocated.relocated_remaining, 0) ELSE 0 END,
+              0
+            ) AS remaining_quantity,
+            line.netsuite_active AS line_active,
+            COALESCE(line.netsuite_closed, false) AS closed,
+            split.id AS split_id,
+            split.source_po_id,
+            split.split_po_ref,
+            COALESCE(source_po.is_blanket_po, false) AS blanket_split
+       FROM purchase_orders po
+       JOIN purchase_order_lines line ON line.purchase_order_id = po.netsuite_id
+       LEFT JOIN dispatch_scm_po_splits split
+         ON split.split_po_id = po.netsuite_id
+        AND split.status = 'active'
+       LEFT JOIN purchase_orders source_po ON source_po.netsuite_id = split.source_po_id
+       LEFT JOIN active_split_remaining relocated ON relocated.source_line_id = line.id
+      WHERE po.netsuite_active = true
+        AND line.netsuite_active = true
+        AND COALESCE(po.is_blanket_po, false) = false
+        AND (po.status_text ILIKE '%Pending Receipt%' OR po.status_text ILIKE '%Partially Received%')
+      ORDER BY po.netsuite_id, line.id`
+  );
+  return result.rows
+    .filter(smartScmExpectedPoLineEligible)
+    .map((row) => ({
+      orderId: Number(row.order_id),
+      orderRef: row.order_ref,
+      lineId: Number(row.line_id),
+      itemId: Number(row.item_id),
+      locationId: Number(row.location_id),
+      remainingQuantity: round(positive(row.remaining_quantity)),
+      source: row.split_id ? "local_split" : "netsuite_po",
+      splitId: row.split_id === null ? null : Number(row.split_id),
+      sourcePoId: row.source_po_id === null ? null : Number(row.source_po_id),
+      blanketSplit: row.blanket_split === true
+    }));
 }
 
 function publicProposalLine(row) {
@@ -1959,22 +2157,29 @@ async function proposalRows({ proposalId = null, runId = null, status = "", stat
 export async function loadSmartScmPlanningDemandStates({
   forecastRunId = null,
   includeTemporarilyExcluded = true,
-  excludeTransferOrderIds = []
+  excludeTransferOrderIds = [],
+  settingsOverride = null
 } = {}) {
   const selectedForecastRunId = forecastRunId || await latestSmartScmForecastRunId();
-  const settings = await settingsRow();
+  const settings = settingsOverride || await settingsRow();
   const policies = await loadSmartScmPlanningPolicies({ includeTemporarilyExcluded });
-  const inventory = await inventoryState({ excludeTransferOrderIds });
+  const inventory = await inventoryState({
+    excludeTransferOrderIds,
+    applySplitOverlay: settings.inventory_planning_mode === "po_then_transfer"
+  });
   const supplyMap = await latestVendorSupplyMap();
   const forecasts = await smartScmForecastMap(selectedForecastRunId);
   const routeRules = await smartScmRouteRuleMap();
-  const minimumOrders = await smartScmMinimumOrderMap(policies);
-  const states = classifySmartScmUrgency(policies.map((policy) => calculatePolicyState(
-    policy,
-    forecasts.get(`${policy.item_id}:${policy.location_id}`),
-    inventory,
-    minimumOrders.get(`${policy.item_id}:${policy.location_id}`),
-    settings
+  const minimumOrders = await smartScmMinimumOrderMap(policies, settings);
+  const states = classifySmartScmUrgency(policies.map((policy) => smartScmApplySkip12441Policy(
+    calculatePolicyState(
+      policy,
+      forecasts.get(`${policy.item_id}:${policy.location_id}`),
+      inventory,
+      minimumOrders.get(`${policy.item_id}:${policy.location_id}`),
+      settings
+    ),
+    { enabled: Boolean(settings.skip_12441_enabled) }
   )));
   return {
     forecastRunId: selectedForecastRunId,
@@ -1984,7 +2189,8 @@ export async function loadSmartScmPlanningDemandStates({
     supplyMap,
     forecasts,
     routeRules,
-    minimumOrders
+    minimumOrders,
+    splitInboundEvidence: inventory.splitInboundEvidence || []
   };
 }
 
@@ -1996,16 +2202,21 @@ export async function runSmartScmPlan({ triggerSource = "manual", operatorId = n
   const selectedForecastRunId = planning.forecastRunId;
   const { settings, states, supplyMap, routeRules } = planning;
   const temporarilyExcludedItemIds = await listSmartScmActivePlanningExclusionItemIds();
+  const planningMode = settings.inventory_planning_mode || "integrated";
+  const planningPhase = planningMode === "po_then_transfer" ? "po_pending_approval" : "integrated";
   const created = await query(
-    `INSERT INTO scm_smart_planning_runs (trigger_source, forecast_run_id, settings_snapshot, created_by, plan_kind)
-     VALUES ($1, $2, $3::jsonb, $4, 'inventory')
+    `INSERT INTO scm_smart_planning_runs (
+       trigger_source, forecast_run_id, settings_snapshot, created_by, plan_kind, planning_phase
+     )
+     VALUES ($1, $2, $3::jsonb, $4, 'inventory', $5)
      RETURNING *`,
-    [triggerSource, selectedForecastRunId, JSON.stringify(settings), operatorId]
+    [triggerSource, selectedForecastRunId, JSON.stringify(settings), operatorId, planningPhase]
   );
   const run = created.rows[0];
   try {
     const calculated = smartScmBuildPlanningDrafts({ states, supplyMap, settings });
-    const drafts = consolidateCompatibleDrafts(calculated.drafts, settings, "initial", routeRules);
+    const phaseOneDrafts = smartScmPlanningPhaseOneDrafts(calculated.drafts, { mode: planningMode });
+    const drafts = consolidateCompatibleDrafts(phaseOneDrafts, settings, "initial", routeRules);
     const { exceptions } = calculated;
     await withTransaction(async () => {
       await insertDrafts(run.id, drafts);
@@ -2020,7 +2231,9 @@ export async function runSmartScmPlan({ triggerSource = "manual", operatorId = n
         held: drafts.filter((draft) => draft.status === "held").length,
         temporarilyExcludedItems: temporarilyExcludedItemIds.length,
         temporarilyExcludedItemIds,
-        exceptions
+        exceptions,
+        planningMode,
+        planningPhase
       };
       await query(
         `UPDATE scm_smart_planning_runs
@@ -2058,6 +2271,126 @@ export async function runSmartScmPlan({ triggerSource = "manual", operatorId = n
   }
 }
 
+export async function approveSmartScmPoPhase(runId, operatorId = null) {
+  const id = Number(runId);
+  if (!Number.isSafeInteger(id) || id <= 0) {
+    throw Object.assign(new Error("Select a valid Smart SCM planning run."), { status: 400 });
+  }
+  const nestedTransaction = hasActiveTransaction();
+  let outcome;
+  for (let attempt = 0; attempt < 3; attempt += 1) {
+    try {
+      outcome = await withTransaction(async () => {
+        // A phase approval must use one immutable database view. Otherwise a PO
+        // sync between the state query and the evidence query could produce a
+        // transfer plan whose recorded basis describes different inventory.
+        if (!nestedTransaction) await query("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ");
+        const locked = await query(
+          `SELECT * FROM scm_smart_planning_runs WHERE id = $1 FOR UPDATE`,
+          [id]
+        );
+        const run = locked.rows[0];
+        if (!run || run.plan_kind !== "inventory") {
+          throw Object.assign(new Error("Smart SCM inventory planning run was not found."), { status: 404 });
+        }
+        if (run.planning_phase === "transfer_ready") return { reused: true };
+        if (run.status !== "ready" || run.planning_phase !== "po_pending_approval"
+          || run.settings_snapshot?.inventory_planning_mode !== "po_then_transfer") {
+          throw Object.assign(new Error("This run is not waiting for PO-phase approval."), { status: 409 });
+        }
+        const planning = await loadSmartScmPlanningDemandStates({
+          forecastRunId: run.forecast_run_id,
+          includeTemporarilyExcluded: true,
+          settingsOverride: run.settings_snapshot
+        });
+        const evidence = await smartScmExpectedPoEvidence();
+        const calculated = smartScmBuildTransferPhaseDrafts({
+          states: planning.states,
+          settings: run.settings_snapshot
+        });
+        const drafts = consolidateCompatibleDrafts(
+          calculated.drafts,
+          run.settings_snapshot,
+          "phased-transfer",
+          planning.routeRules
+        );
+        await insertDrafts(id, drafts);
+        const counts = await query(
+          `SELECT COUNT(*)::int AS proposals,
+                  COUNT(*) FILTER (WHERE proposal_type = 'PO')::int AS po_proposals,
+                  COUNT(*) FILTER (WHERE proposal_type = 'TO')::int AS to_proposals,
+                  COUNT(*) FILTER (WHERE urgent = true)::int AS urgent,
+                  COUNT(*) FILTER (WHERE status = 'held')::int AS held
+             FROM scm_smart_proposals
+            WHERE run_id = $1`,
+          [id]
+        );
+        const basis = {
+          approvedAt: new Date().toISOString(),
+          approvedBy: operatorId || null,
+          expectedPurchaseOrderLines: evidence,
+          splitInboundEvidence: planning.splitInboundEvidence,
+          demandStates: planning.states.map((state) => ({
+            itemId: Number(state.policy.item_id),
+            locationId: Number(state.policy.location_id),
+            yardCode: state.policy.yard_code,
+            availablePallets: round(state.availablePallets),
+            effectiveOnOrderSales: round(state.onOrderSales),
+            backorderedSales: round(state.backorderedSales),
+            inventoryPositionPallets: round(state.positionPallets),
+            safetyStockPallets: round(state.safety),
+            reorderPointPallets: round(state.rop),
+            preferredStockPallets: round(state.preferred),
+            requiredPallets: round(state.requiredPallets)
+          })),
+          exceptions: calculated.exceptions,
+          frozen: true
+        };
+        await query(
+          `UPDATE scm_smart_planning_runs
+              SET planning_phase = 'transfer_ready',
+                  phase_one_approved_at = now(),
+                  phase_one_approved_by = $2,
+                  phase_two_basis = $3::jsonb,
+                  phase_two_created_at = now(),
+                  totals = totals || $4::jsonb,
+                  completed_at = now()
+            WHERE id = $1`,
+          [
+            id,
+            operatorId,
+            JSON.stringify(basis),
+            JSON.stringify({
+              proposals: Number(counts.rows[0]?.proposals || 0),
+              poProposals: Number(counts.rows[0]?.po_proposals || 0),
+              toProposals: Number(counts.rows[0]?.to_proposals || 0),
+              urgent: Number(counts.rows[0]?.urgent || 0),
+              held: Number(counts.rows[0]?.held || 0),
+              phaseTwoProposals: drafts.length,
+              phaseTwoExceptions: calculated.exceptions
+            })
+          ]
+        );
+        await writeAudit({
+          actorType: operatorId ? "operator" : "system",
+          actorOperatorId: operatorId,
+          source: "smart_scm",
+          action: "smart_scm.plan.po_phase_approved",
+          details: { runId: id, phaseTwoProposalCount: drafts.length, basis }
+        });
+        return { reused: false };
+      });
+      break;
+    } catch (error) {
+      // Under REPEATABLE READ, two simultaneous approvals can make the loser
+      // observe a serialization conflict after waiting for the run lock. Retry
+      // with a new snapshot so it returns the durable idempotent result.
+      if (nestedTransaction || error?.code !== "40001" || attempt === 2) throw error;
+    }
+  }
+  return { ...(await getSmartScmPlanningRun(id)), phaseApprovalReused: outcome.reused };
+}
+
 export async function listSmartScmPlanningRuns({ limit = 30, planKind = "inventory" } = {}) {
   const kind = String(planKind || "inventory").trim().toLowerCase();
   const result = await query(
@@ -2075,6 +2408,10 @@ export async function listSmartScmPlanningRuns({ limit = 30, planKind = "invento
     planKind: row.plan_kind || "inventory",
     forecastRunId: row.forecast_run_id === null ? null : Number(row.forecast_run_id),
     revision: Number(row.revision || 1),
+    planningPhase: row.planning_phase || "integrated",
+    phaseOneApprovedAt: row.phase_one_approved_at || null,
+    phaseOneApprovedBy: row.phase_one_approved_by || null,
+    phaseTwoCreatedAt: row.phase_two_created_at || null,
     totals: row.totals || {},
     error: row.error,
     createdBy: row.created_by,
@@ -2096,6 +2433,11 @@ export async function getSmartScmPlanningRun(id) {
     planKind: row.plan_kind || "inventory",
     forecastRunId: row.forecast_run_id === null ? null : Number(row.forecast_run_id),
     revision: Number(row.revision || 1),
+    planningPhase: row.planning_phase || "integrated",
+    phaseOneApprovedAt: row.phase_one_approved_at || null,
+    phaseOneApprovedBy: row.phase_one_approved_by || null,
+    phaseTwoBasis: row.phase_two_basis || {},
+    phaseTwoCreatedAt: row.phase_two_created_at || null,
     settingsSnapshot: row.settings_snapshot || {},
     totals: row.totals || {},
     error: row.error,

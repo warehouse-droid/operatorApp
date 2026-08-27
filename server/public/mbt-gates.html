@@ -47,9 +47,71 @@
           ></textarea>
         </label>
         <p class="mbt-gate-help">
-          Turning Driver offline mode off requires a live connection for new Driver actions. The Sales over-availability gate affects Sales submission; SCM can intentionally convert full requested demand and the shortage remains visible as a Transfer Order backorder. Live customer synchronization and NetSuite posting remain locked.
+          Turning Driver offline mode off requires a live connection for new Driver actions. The Sales over-availability gate affects Sales submission; SCM can intentionally convert full requested demand and the shortage remains visible as a Transfer Order backorder. Operator IF/IR posting is controlled below per yard; unrelated MBT NetSuite posting remains locked.
         </p>
 
+        <section class="mbt-operator-posting-controls" aria-labelledby="operatorPostingTitle">
+          <div class="mbt-gate-controls-heading">
+            <div>
+              <h2 id="operatorPostingTitle">Operator NetSuite posting by yard</h2>
+              <p>Each cell independently controls one Operator function at one yard. All cells default off and remain capped by the server NetSuite direct-access setting.</p>
+            </div>
+          </div>
+          <div id="operatorNetSuiteGateMatrix" class="mbt-operator-gate-matrix" aria-live="polite"></div>
+        </section>
+
+        <section class="mbt-operator-posting-attention" aria-labelledby="operatorPostingAttentionTitle">
+          <div class="mbt-gate-controls-heading">
+            <div>
+              <h2 id="operatorPostingAttentionTitle">NetSuite verification attention</h2>
+              <p>Orders shown here are frozen. Resume performs external-ID recovery and verification before any local completion.</p>
+            </div>
+          </div>
+          <div id="operatorNetSuiteAttention" class="mbt-attention-list" aria-live="polite"></div>
+        </section>
+
+        <section class="mbt-operator-posting-controls" aria-labelledby="salesOrderFulfillmentTitle">
+          <div class="mbt-gate-controls-heading">
+            <div>
+              <h2 id="salesOrderFulfillmentTitle">Completed Delivery SO fulfillment by yard</h2>
+              <p>Each yard defaults off. When enabled, only a Driver customer drop or audited manual Dispatch completion may create the SO Item Fulfillment.</p>
+            </div>
+          </div>
+          <p class="mbt-gate-help">
+            Quantity rule: Operator-loaded residual + completed Link PO + completed direct Link TO = exact Dispatch target. Operator Delivery Prep never creates this SO IF, and this worker never creates a PO receipt or Transfer Order transaction. Enabling a yard records a watermark; older completions remain stopped until an Admin selects them below.
+          </p>
+          <div id="salesOrderFulfillmentGateMatrix" class="mbt-operator-gate-matrix" aria-live="polite"></div>
+        </section>
+
+        <section class="mbt-operator-posting-attention" aria-labelledby="salesOrderFulfillmentAttentionTitle">
+          <div class="mbt-gate-controls-heading">
+            <div>
+              <h2 id="salesOrderFulfillmentAttentionTitle">Delivery SO fulfillment queue</h2>
+              <p>Frozen evidence, live NetSuite drift, exact line quantities, and external-ID recovery are visible here. Every Admin decision requires the audit reason above.</p>
+            </div>
+          </div>
+          <div id="salesOrderFulfillmentAttention" class="mbt-attention-list" aria-live="polite"></div>
+        </section>
+
+        <section class="mbt-operator-posting-attention" aria-labelledby="salesOrderFulfillmentHistoricalTitle">
+          <div class="mbt-gate-controls-heading">
+            <div>
+              <h2 id="salesOrderFulfillmentHistoricalTitle">Selected historical SO completions</h2>
+              <p>Search first, review the completion timestamp and source parent, then explicitly select only the old completions that should enter the guarded queue.</p>
+            </div>
+          </div>
+          <form id="salesOrderFulfillmentHistoricalForm" class="mbt-historical-search">
+            <label for="salesOrderFulfillmentHistoricalSearch">Sales Order reference</label>
+            <div>
+              <input id="salesOrderFulfillmentHistoricalSearch" name="search" minlength="2" maxlength="160" autocomplete="off" placeholder="Example: SOB118279" />
+              <button type="submit">Preview</button>
+              <button id="queueSalesOrderFulfillmentHistorical" type="button">Queue selected</button>
+            </div>
+          </form>
+          <div id="salesOrderFulfillmentHistoricalResults" class="mbt-attention-list" aria-live="polite"></div>
+        </section>
+
+        <h2 class="mbt-general-gates-title">Other operational controls</h2>
         <div id="gateList" class="mbt-gate-list" aria-live="polite"></div>
       </section>
     </main>

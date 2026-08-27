@@ -41,8 +41,17 @@ import {
   renewDelayedStatusRefreshLease
 } from "./netsuite-delayed-status-refresh-repository.js";
 import { createDelayedStatusRefreshWorker } from "./netsuite-delayed-status-refresh-service.js";
+import {
+  SCM_SCHEDULE_STATUS_REFRESH_INTERVAL_MS,
+  createScmScheduleStatusRefresh
+} from "./scm-schedule-status-refresh.js";
+import {
+  hasActiveScmReconciliationRun,
+  listStaleScmScheduleStatusCandidates
+} from "./scm-schedule-status-refresh-repository.js";
 import { buildAuthorizationUrl, exchangeCodeForToken, fetchDeliveryOrdersFromNetSuite, fetchDeliveryOrderFromNetSuite, fetchCustomerPickupOrderFromNetSuite, fetchDeliveryOrderDetailsFromNetSuite, fetchDeliveryOrderDetailsBatchFromNetSuite, fetchTransferDeliveryOrdersFromNetSuite, fetchTransferDeliveryOrderFromNetSuite, fetchTransferOrderDetailsFromNetSuite, fetchTransferOrderVerificationLinesFromNetSuite, fetchTransferOrderByIdFromNetSuite, findTransferOrdersByDependencyMarkerFromNetSuite, findTransferOrdersBySmartScmMarkerFromNetSuite, fetchPurchaseOrdersFromNetSuite, fetchPurchaseOrderFromNetSuite, fetchPurchaseOrderReferenceFromNetSuite, fetchPurchaseOrderDetailsFromNetSuite, fetchTransferReceivingOrdersFromNetSuite, fetchTransferReceivingOrderFromNetSuite, fetchInventoryBalanceForItemFromNetSuite, fetchInventoryBalancesFromNetSuite, fetchInventoryBalancesForItemsFromNetSuite, fetchItemFulfillmentFromNetSuite, fetchItemReceiptFromNetSuite, fetchTransactionProgressFromNetSuite, fetchTransactionStatusFromNetSuite, createPurchaseOrderInNetSuite, createTransferOrderInNetSuite, updateTransferOrderInNetSuite, updateTransferOrderStatusInNetSuite, fetchPickingTicketFromNetSuite, resolveNetSuiteTransferLocations, resolveNetSuiteYardLocations, resolvePalletItemFromNetSuite, transformSalesOrderToItemFulfillment, transformTransferOrderToItemFulfillment, transformPurchaseOrderToItemReceipt, transformTransferOrderToItemReceipt } from "./netsuite.js";
 import { buildTransferDependencyRestPayload, selectSmartScmMarkerTransferOrder, smartScmTransferOrderMemoMarker, transferDependencyMemoMarker, transferDependencyPickingTicketJobKey, transferOrderQuantityRevisionStatusBlock } from "./transfer-dependency-netsuite.js";
+import { transferDependencyApprovalStatusAfterPrintBlock } from "./auto-transfer-approval-policy.js";
 import {
   assertScmReconciliationOrderEditable,
   cancelScmReconciliationRun,
@@ -101,19 +110,45 @@ import {
   lockReloadAuthorizationSnapshot,
   lockReloadCycle
 } from "./sales-order-reload-repository.js";
+import {
+  applySalesOrderReattemptCurrentItemCorrection,
+  assertSalesOrderReattemptDriverReady,
+  getSalesOrderReattemptCurrentItemCorrectionPreview
+} from "./sales-order-reattempt-correction-repository.js";
 import { listDeliveryOrders, listVrmaDeliveryPrepOrders, getDeliveryOrder, getFulfillableDeliveryOrder, buildItemFulfillmentPayload, markDeliveryPrepared, updateDeliveryStatus, confirmDeliveryLine, confirmDeliveryLines, setDeliveryLinePackedQuantity, unpackDeliveryLine, unpackDeliveryOrder, recordDeliveryFulfillment, recordDeliveryFulfillmentFailure, recordDeliveryLoad, listDeliveryFulfillments, getDeliveryBootstrap, getDeliveryPrepNotifications, resetDeliveryFulfillmentState, applyConfirmedDispatchPlanToDelivery, deactivateUnplannedDispatchSplitOrders, getNextDispatchSplitSuffix, getCurrentOperatorDeliveryDraft, releaseCurrentDeliveryDraft, listSavedDeliveryOrdersForOperator, listSavedDeliveryOrderKeysForOperator, saveDeliveryOrderForOperator, removeSavedDeliveryOrderForOperator, listDeliveryLoadTrucks, listDeliveryLoadOrders } from "./delivery-repository.js";
 import { getYardMovementDetail, listYardMovementCsvRows, listYardMovements } from "./yard-movement-repository.js";
 import { yardMixedUnits } from "./yard-quantity.js";
 import { clearCustomerPickupDraft, confirmCustomerPickupLine, confirmCustomerPickupLines, findCustomerPickupOrder, isPendingApprovalStatus, isPickupDeliveryMethod, recordCustomerPickupLoad } from "./customer-pickup-repository.js";
 import { getOperatorCustomerPickupPhotoRequirement } from "./operator-customer-pickup-photo-policy.js";
+import { getOperatorNetSuitePostingPolicy } from "./operator-netsuite-posting-policy-repository.js";
+import {
+  assertOperatorNetSuitePostingOrderMutable,
+  getPublicOperatorNetSuitePostingCommand,
+  listPublicOperatorNetSuitePostingAttentionCommands,
+  publicOperatorNetSuitePostingCommand,
+  resumePublicOperatorNetSuitePostingCommand,
+  submitOperatorNetSuitePostingAction
+} from "./operator-netsuite-posting-controller.js";
+import { startOperatorNetSuitePostingRuntime } from "./operator-netsuite-posting-runtime.js";
+import {
+  enqueueSalesOrderAutoFulfillmentCandidate,
+  startSalesOrderAutoFulfillmentRuntime
+} from "./sales-order-auto-fulfillment-runtime.js";
+import {
+  listSalesOrderAutoFulfillmentCandidates,
+  previewHistoricalSalesOrderAutoFulfillmentEvents,
+  queueHistoricalSalesOrderAutoFulfillmentCandidates,
+  resolveSalesOrderAutoFulfillmentCandidate
+} from "./sales-order-auto-fulfillment-repository.js";
+import { configureOperatorNetSuitePostingCompletionEvents } from "./operator-netsuite-posting-finalizer.js";
 import { createOperator, getOperatorByToken, hasOperators, listAudit, listAuditOptions, listOperators, loginOperator, logoutToken, operatorHomeRoute, setOperatorActive, updateOperatorPassword, updateOperatorRoles, writeAudit } from "./auth-repository.js";
 import { applyInventoryClassificationRules, confirmCycleCountLine, getCycleCountDraft, listCycleCountRecords, listInventoryClassifications, listInventoryFacets, listInventoryItems, submitCycleCount, updateInventoryClassification, upsertInventoryBalances } from "./inventory-repository.js";
 import { listReceivingVendors, listReceivingSources, listReceivingOrders, getReceivingOrder, searchReceivingItems, confirmReceivingLine, confirmPurchaseOrderReceivingLines, unconfirmReceivingLine, getReceivableReceivingOrder, buildItemReceiptPayload, recordReceivingReceipt, recordReceivingReceiptFailure, listReceivingReceipts, listLocalCoSources, listLocalCoReceivingOrders, searchLocalCoItems, getLocalCoReceivingOrder, confirmLocalCoReceivingLine, unconfirmLocalCoReceivingLine, receiveLocalCoOrder } from "./receiving-repository.js";
-import { listExistingInboundOrderIds, listExistingOutboundOrderIds, markMissingInboundOrderLines, markMissingInboundOrders, markMissingOutboundOrderLines, markOutboundOrderMissing, updatePurchaseOrderNetSuiteStatus, updateSalesOrderNetSuiteStatus, upsertInboundTransferOrderLines, upsertInboundTransferOrders, upsertOutboundTransferOrderLines, upsertOutboundTransferOrders, upsertPurchaseOrderLines, upsertPurchaseOrders, upsertSalesOrderLines, upsertSalesOrders } from "./order-sync-repository.js";
+import { listExistingInboundOrderIds, listExistingOutboundOrderIds, markMissingInboundOrderLines, markMissingInboundOrders, markMissingOutboundOrderLines, markOutboundOrderMissing, updatePurchaseOrderNetSuiteStatus, updateSalesOrderNetSuiteStatus, updateTransferOrderNetSuiteStatus, upsertInboundTransferOrderLines, upsertInboundTransferOrders, upsertOutboundTransferOrderLines, upsertOutboundTransferOrders, upsertPurchaseOrderLines, upsertPurchaseOrders, upsertSalesOrderLines, upsertSalesOrders } from "./order-sync-repository.js";
 import { acceptNetSuiteMirrorEvents, enqueueNetSuiteMirrorOrderEvent, getNetSuiteMirrorStatus, isNetSuiteMirrorConsumer, isNetSuiteMirrorSource, listNetSuiteMirrorManifest, retryNetSuiteMirrorFailures } from "./netsuite-mirror-repository.js";
 import { kickNetSuiteMirrorConsumer, localNetSuiteMirrorEventPage, localNetSuiteMirrorInventorySnapshot, localNetSuiteMirrorOrderSnapshot, relayPendingNetSuiteMirrorEvents, requireNetSuiteMirrorSignature, runNetSuiteMirrorConsumerTick, runNetSuiteMirrorReconciliation, startNetSuiteMirrorWorkers } from "./netsuite-mirror-service.js";
 import { listOperatorHistory, listRecordWarnings, reportOperatorRecordError, resolveRecordWarning } from "./history-repository.js";
-import { listDispatchOrders, enrichDispatchOrdersWithPoTargetAllocations, listScmPurchaseOrders, listScmSchedule, updateScmScheduleEntry, createScmScheduleGroup, cancelScmScheduleGroup, listScmViewPresets, upsertScmViewPreset, completeScmVrmaOrderOverride, createScmVrmaOrder, getScmVrmaOrder, getScmVrmaOptions, removeScmVrmaOrder, searchScmVrmaItems, syncScmScheduleFromDispatchPlan, createScmPurchaseOrderSplit, updateScmPurchaseOrderSplitRef, updateScmPurchaseOrderSplitDestination, updateScmPurchaseOrderSplitPickupYard, updatePurchaseOrderDispatchRef, cancelScmPurchaseOrderSplit, refreshDispatchEnrichment, reparseMissingSalesOrderDispatch, searchSalesOrderMethodOverrides, setPurchaseOrderVendorYard, updateDispatchOrderDetails, updateSalesOrderLocalMethod, getSalesOrderPoAllocationOptions, createSalesOrderPoAllocation, createSalesOrderPoAllocations, cancelSalesOrderPoAllocation, createDispatchOperatorRequest, upsertLocalCoOrder, cancelLocalCoOrder, listDispatchOperatorRequests, resolveDispatchOperatorRequestsForOrder } from "./dispatch-repository.js";
+import { listDispatchOrders, enrichDispatchOrdersWithPoTargetAllocations, listScmPurchaseOrders, listScmSchedule, updateScmScheduleEntry, createScmScheduleGroup, cancelScmScheduleGroup, listScmViewPresets, upsertScmViewPreset, completeScmVrmaOrderOverride, createScmVrmaOrder, getScmVrmaOrder, getScmVrmaOptions, removeScmVrmaOrder, searchScmVrmaItems, syncScmScheduleFromDispatchPlan, createScmPurchaseOrderSplit, getScmPurchaseOrderSplitSourceLines, updateScmPurchaseOrderSplitLines, updateScmPurchaseOrderSplitRef, updateScmPurchaseOrderSplitDestination, updateScmPurchaseOrderSplitPickupYard, updatePurchaseOrderDispatchRef, cancelScmPurchaseOrderSplit, refreshDispatchEnrichment, reparseMissingSalesOrderDispatch, searchSalesOrderMethodOverrides, setPurchaseOrderVendorYard, updateDispatchOrderDetails, updateSalesOrderLocalMethod, getSalesOrderPoAllocationOptions, createSalesOrderPoAllocation, createSalesOrderPoAllocations, cancelSalesOrderPoAllocation, createDispatchOperatorRequest, upsertLocalCoOrder, cancelLocalCoOrder, listDispatchOperatorRequests, resolveDispatchOperatorRequestsForOrder } from "./dispatch-repository.js";
 import { setPurchaseOrderBlanketFlag } from "./dispatch-repository.js";
 import { cancelDispatchCustomOrder, canonicalizeDispatchCustomOrdersInPlan, completeDispatchCustomOrders, createDispatchCustomOrder, dispatchOrderFromCustomOrder, getDispatchCustomOrderForUpdate, listDispatchCustomOrders, updateDispatchCustomOrder } from "./dispatch-custom-order-repository.js";
 import {
@@ -301,7 +336,7 @@ import { authenticateDispatchDriver, ensureDispatchFleetSetup, getDispatchDriver
 import { assertNoActiveConsolidationClaimsByRefs, confirmConsolidationItem, getActiveConsolidationBatch, getSavedConsolidationQueue, packConsolidationOrder, releaseConsolidationBatch, startSavedConsolidationBatch, updateConsolidationLine } from "./delivery-consolidation-repository.js";
 import { DEPENDENCY_YARDS, assertNoActiveOrderDependenciesByRefs, cancelOrderDependency, completeDirectDependenciesForSalesOrderDrop, completeYardDependenciesForTransferDrop, confirmTransferDependencyBatch, createOrderDependency, enrichDispatchOrdersWithDependencies, generateTransferDependencySuggestion, getDependencyInventoryMatrix, getDirectPickupDependencyExecutionBlock, getOrderDependencyOptions, getSalesOrderDependencyExecutionBlock, getTransferDependencyBatch, listOrderDependencies, listTransferDependencyCandidates, markDirectDependencyPickupCompleted, mergeTransferDependencyProposals, normalDispatchGroupTargets, prepareTransferDependencyPalletItem, reconcileCompletedYardTransfersForSalesOrderStart, reconcileOrderDependency, removeTransferDependencyProposalLine, reopenTransferDependencyCandidate, retryTransferDependencyBatch, reviewTransferDependencyCandidate, reviseTransferDependencyProposal, syncDirectDependencyOperatorProgress, syncOrderDependenciesForTransferOrder, syncOrderDependenciesFromDispatchPlan, updateOrderDependencyMode, updateTransferDependencyBatch, validateDispatchPlanDependencies } from "./order-dependency-repository.js";
 import { activateSmartScmInputFile, importSmartScmSalesCsv, listSmartScmInputFiles, parseSmartScmVendorResponseFile, smartScmInputDownload, storeSmartScmInputFile } from "./smart-scm-import-repository.js";
-import { getSmartScmBootstrap, getSmartScmSettings, getSmartScmPlanningRun, listSmartScmForecasts, listSmartScmForecastRuns, listSmartScmPlanningPauses, listSmartScmPlanningRuns, listSmartScmProposals, promoteSmartScmForecastSegment, runSmartScmForecast, runSmartScmPlan, smartScmAutoTick, updateSmartScmSettings } from "./smart-scm-repository.js";
+import { approveSmartScmPoPhase, getSmartScmBootstrap, getSmartScmSettings, getSmartScmPlanningRun, listSmartScmForecasts, listSmartScmForecastRuns, listSmartScmPlanningPauses, listSmartScmPlanningRuns, listSmartScmProposals, promoteSmartScmForecastSegment, runSmartScmForecast, runSmartScmPlan, smartScmAutoTick, updateSmartScmSettings } from "./smart-scm-repository.js";
 import { buildSmartScmItemMasterCsvTemplate, getSmartScmSyncStatus, importSmartScmItemMasterCsv, listSmartScmItems, updateSmartScmItem } from "./smart-scm-item-repository.js";
 import { refreshSmartScmLiveData } from "./smart-scm-sync-service.js";
 import { addSmartScmPlanningExclusion, deactivateSmartScmPlanningExclusion } from "./smart-scm-planning-exclusion-repository.js";
@@ -1212,7 +1247,12 @@ async function dispatchCustomOrdersForManagement({ includeCancelled = true, sear
     const activity = activityByRef.get(String(order.refNumber || "").trim().toLowerCase()) || null;
     const completed = order.status === "completed" || Boolean(activity?.completed_dropoff);
     const planned = Boolean(assignment);
-    const locked = order.systemManaged || order.status !== "open" || planned || Boolean(activity?.has_activity);
+    const activeTransitCo = String(order.transitCo?.id || "").trim();
+    const locked = order.systemManaged
+      || order.status !== "open"
+      || planned
+      || Boolean(activity?.has_activity)
+      || Boolean(activeTransitCo);
     const status = order.status === "cancelled"
       ? "cancelled"
       : completed
@@ -1223,14 +1263,16 @@ async function dispatchCustomOrdersForManagement({ includeCancelled = true, sear
     const lockedReason = order.systemManaged
       ? "Sales Order re-attempt children are system-managed through Control and cannot be edited as Custom Orders."
       : order.status === "cancelled"
-      ? "Cancelled Custom Orders are read-only."
-      : completed
-        ? "This Custom Order has been delivered and is read-only."
-        : activity?.has_activity
-          ? "Driver activity has started. This Custom Order can no longer be changed."
-          : planned
-            ? `Remove this Custom Order from ${assignment.dispatchPlanDate || "its dispatch plan"} before editing or cancelling it.`
-            : "";
+        ? "Cancelled Custom Orders are read-only."
+        : completed
+          ? "This Custom Order has been delivered and is read-only."
+          : activity?.has_activity
+            ? "Driver activity has started. This Custom Order can no longer be changed."
+            : activeTransitCo
+              ? `Cancel ${activeTransitCo} in Dispatch Planning before editing or cancelling this Custom Order.`
+              : planned
+                ? `Remove this Custom Order from ${assignment.dispatchPlanDate || "its dispatch plan"} before editing or cancelling it.`
+                : "";
     return {
       ...order,
       status,
@@ -1843,7 +1885,8 @@ async function listScmPurchaseOrdersForResponse(filters = {}, operator = null) {
       sourceId: order.netsuiteId || order.sourceId || order.raw?.netsuite_id || null,
       status: order.scm?.status || "Hold",
       scheduleId: order.scm?.scheduleId || null,
-      updatedAt: order.scm?.updatedAt || null
+      updatedAt: order.scm?.updatedAt || null,
+      dispatchCompletionEvidenceType: order.dispatchCompletionEvidenceType || ""
     })),
     { includeDetails: false, view: "dispatch" }
   );
@@ -2349,12 +2392,18 @@ async function approveAndPrintTransferDependencyProposal(batchId, proposalId, op
   }
   if (mismatches.length) {
     const message = `TO verification failed: ${mismatches.slice(0, 8).join("; ")}`;
+    const approvalStatus = transferDependencyApprovalStatusAfterPrintBlock(
+      proposal.approvalStatus,
+      "failed"
+    );
     await query(
       `UPDATE scm_transfer_dependency_proposals
           SET quantity_verification_status = 'failed', quantity_verification_error = $2,
-              approval_status = 'failed', approval_error = $2, updated_at = now()
+              approval_status = $3,
+              approval_error = CASE WHEN $3 = 'approved' THEN NULL ELSE $2 END,
+              updated_at = now()
         WHERE id = $1`,
-      [Number(proposal.id), message]
+      [Number(proposal.id), message, approvalStatus]
     );
     await writeDispatchAudit({
       action: "scm.transfer_dependency.verification_failed",
@@ -2377,23 +2426,35 @@ async function approveAndPrintTransferDependencyProposal(batchId, proposalId, op
 
   const restletUrl = String(config.smartScm?.pickingTicketRestletUrl || "").trim();
   if (!restletUrl) {
-    const message = "Quantity verified. SMART_SCM_PICKING_TICKET_RESTLET_URL is not configured, so the TO remains Pending Approval in Created.";
+    const approvalStatus = transferDependencyApprovalStatusAfterPrintBlock(
+      proposal.approvalStatus,
+      "pending"
+    );
+    const message = approvalStatus === "approved"
+      ? "Quantity verified. The TO remains approved, but source-yard printing is pending because SMART_SCM_PICKING_TICKET_RESTLET_URL is not configured."
+      : "Quantity verified. SMART_SCM_PICKING_TICKET_RESTLET_URL is not configured, so the TO remains Pending Approval in Created.";
     await query(
       `UPDATE scm_transfer_dependency_proposals
-          SET approval_status = 'pending', approval_error = $2, updated_at = now()
+          SET approval_status = $3, approval_error = $2, updated_at = now()
         WHERE id = $1`,
-      [Number(proposal.id), message]
+      [Number(proposal.id), message, approvalStatus]
     );
     throw Object.assign(new Error(message), { status: 409 });
   }
   const printer = (await listYardPrinters()).find((row) => Number(row.locationId) === Number(proposal.fromLocationId));
   if (!printer?.transferOrderReady) {
-    const message = `Quantity verified. ${proposal.fromLocation} requires two different TO printers, an enabled yard queue, and an agent token before approval.`;
+    const approvalStatus = transferDependencyApprovalStatusAfterPrintBlock(
+      proposal.approvalStatus,
+      "pending"
+    );
+    const message = approvalStatus === "approved"
+      ? `Quantity verified. The TO remains approved, but source-yard printing is pending because ${proposal.fromLocation} requires two different TO printers, an enabled yard queue, and an agent token.`
+      : `Quantity verified. ${proposal.fromLocation} requires two different TO printers, an enabled yard queue, and an agent token before approval.`;
     await query(
       `UPDATE scm_transfer_dependency_proposals
-          SET approval_status = 'pending', approval_error = $2, updated_at = now()
+          SET approval_status = $3, approval_error = $2, updated_at = now()
         WHERE id = $1`,
-      [Number(proposal.id), message]
+      [Number(proposal.id), message, approvalStatus]
     );
     throw Object.assign(new Error(message), { status: 409 });
   }
@@ -3978,6 +4039,9 @@ async function startDriverPhysicalVisitJobs(driverLogin, job, routeJobs = [], {
   occurredAt = null,
   offlineTrace = null
 } = {}) {
+  await assertSalesOrderReattemptDriverReady(
+    driverPhysicalVisitOrderRefs(job, routeJobs)
+  );
   await assertNoClosedNetSuiteOrders(
     driverPhysicalVisitOrderRefs(job, routeJobs),
     "start Driver work"
@@ -4139,6 +4203,9 @@ async function completeDriverJobOperationalEffects({
   strictPlanCleanup = false
 } = {}) {
   if (!job?.jobId) throw new Error("Driver job is no longer available.");
+  await assertSalesOrderReattemptDriverReady(
+    driverPhysicalVisitOrderRefs(job, routeJobs)
+  );
   await assertNoClosedNetSuiteOrders(
     driverPhysicalVisitOrderRefs(job, routeJobs),
     "be completed by Driver"
@@ -4834,6 +4901,8 @@ function emitAppEvent(type, payload = {}) {
     }
   });
 }
+
+configureOperatorNetSuitePostingCompletionEvents(emitAppEvent);
 
 function updateFulfillmentJob(jobId, patch) {
   const current = fulfillmentJobs.get(jobId) || { id: jobId };
@@ -7957,8 +8026,40 @@ const DELAYED_STATUS_REFRESH_CONFIG = {
     netsuiteType: "PurchOrd",
     updateStatus: updatePurchaseOrderNetSuiteStatus,
     events: ["dispatch.orders.updated", "receiving.order.updated"]
+  },
+  transfer_order: {
+    netsuiteType: "TrnfrOrd",
+    updateStatus: updateTransferOrderNetSuiteStatus,
+    events: ["dispatch.orders.updated", "delivery.order.updated", "receiving.order.updated"]
   }
 };
+
+function enqueuePostRefreshScmReconciliation({ orderType, netsuiteOrderId, tranid }) {
+  if (!["purchase_order", "transfer_order"].includes(orderType)) return;
+  const orderKind = orderType === "transfer_order" ? "TO" : "PO";
+  afterTransactionCommit(async () => {
+    try {
+      await startScmReconciliationRun({
+        triggerSource: "webhook",
+        scope: "order_family",
+        targetOrderKind: orderKind,
+        targetOrderId: netsuiteOrderId,
+        targetOrderRef: tranid,
+        includeTerminalOrders: true,
+        dryRun: false,
+        applyUnambiguous: true,
+        requestedBy: "netsuite-delayed-status-refresh"
+      }, {
+        background: true,
+        operationalSyncRunning: anyNetSuiteSyncRunning
+      });
+    } catch (error) {
+      if (Number(error?.status) !== 409 && error?.code !== "23505") {
+        console.error(`Delayed ${orderKind} status reconciliation could not be queued:`, error.message);
+      }
+    }
+  });
+}
 
 const delayedStatusRefreshWorkerId = `operator-app:${process.pid}:${crypto.randomUUID()}`;
 const delayedStatusRefreshWorker = createDelayedStatusRefreshWorker({
@@ -7970,13 +8071,14 @@ const delayedStatusRefreshWorker = createDelayedStatusRefreshWorker({
     fetchTransactionStatusFromNetSuite(netsuiteOrderId, netsuiteType)
   ),
   fetchSalesOrderLines: fetchDeliveryOrderDetailsFromNetSuite,
-  applyStatus: async ({ orderType, netsuiteOrderId, status, statusText }) => {
+  applyStatus: async ({ orderType, netsuiteOrderId, tranid, status, statusText }) => {
     const refreshConfig = DELAYED_STATUS_REFRESH_CONFIG[orderType];
     if (!refreshConfig) throw new Error(`Unsupported delayed status refresh order type: ${orderType}`);
     const updated = await refreshConfig.updateStatus(netsuiteOrderId, { status, statusText });
     if (orderType === "purchase_order") {
       await reconcileSpecialOrderWebhook({ orderKind: orderType, orderId: netsuiteOrderId });
     }
+    if (updated) enqueuePostRefreshScmReconciliation({ orderType, netsuiteOrderId, tranid });
     return updated;
   },
   applySalesOrderLines: async ({ netsuiteOrderId, lines }) => {
@@ -8006,6 +8108,23 @@ export async function delayedStatusRefreshTick() {
   } catch (error) {
     console.error("Delayed NetSuite status refresh tick failed:", error.message);
     return { skipped: false, claimed: 0, succeeded: 0, retried: 0, failed: 0, stale: 0, error: error.message };
+  }
+}
+
+const scmScheduleStatusRefresh = createScmScheduleStatusRefresh({
+  getSettings: getScmReconciliationSettings,
+  hasActiveReconciliation: hasActiveScmReconciliationRun,
+  listCandidates: listStaleScmScheduleStatusCandidates,
+  operationalSyncRunning: anyNetSuiteSyncRunning,
+  startRun: startScmReconciliationRun
+});
+
+export async function scmScheduleStatusRefreshTick() {
+  try {
+    return await scmScheduleStatusRefresh.runOnce();
+  } catch (error) {
+    console.error("Scheduled stale PO/TO status refresh failed:", error.message);
+    return { started: false, reason: "error", error: error.message };
   }
 }
 
@@ -8125,6 +8244,14 @@ export async function processNetSuiteOrderWebhook(payload = {}, { scheduleDelaye
         requestId: stockRequestTransfer.requestId,
         status: stockRequestTransfer.status || null,
         stale: stockRequestTransfer.stale === true
+      });
+    }
+    if (scheduleDelayedStatus) {
+      await enqueueDelayedStatusRefresh({
+        orderType: "transfer_order",
+        netsuiteOrderId: payload.id,
+        tranid: payload.tranid,
+        availableAt: new Date(Date.now() + DELAYED_STATUS_REFRESH_INITIAL_DELAY_MS)
       });
     }
   }
@@ -9006,6 +9133,16 @@ app.get("/api/scm/smart/planning-runs/:id", async (req, res, next) => {
   try {
     const run = await getSmartScmPlanningRun(req.params.id);
     if (!run) return res.status(404).json({ error: "Smart SCM planning run was not found." });
+    res.json(run);
+  } catch (error) {
+    next(error);
+  }
+});
+
+app.post("/api/scm/smart/planning-runs/:id/approve-po-phase", requireSmartScmWriteAccess, async (req, res, next) => {
+  try {
+    const run = await approveSmartScmPoPhase(req.params.id, operatorId(req));
+    emitAppEvent("scm.smart.updated", { source: "po-phase-approved", planningRunId: run.id });
     res.json(run);
   } catch (error) {
     next(error);
@@ -14662,6 +14799,13 @@ app.post("/api/scm/transfer-dependencies/batches/:id/confirm", async (req, res, 
         const request = await transferDependencyRestPayload({ proposal, batch });
         return createTransferOrderInNetSuite(request.payload, { intercompany: request.intercompany });
       },
+      approveTransferOrder: async ({ transferOrderId, proposal, batch }) => {
+        const request = await transferDependencyRestPayload({ proposal, batch });
+        return updateTransferOrderStatusInNetSuite(transferOrderId, {
+          intercompany: request.intercompany,
+          statusId: "B"
+        });
+      },
       hydrateTransferOrder: hydrateCreatedDependencyTransferOrder,
       findTransferOrder: findCreatedDependencyTransferOrder
     });
@@ -14685,6 +14829,13 @@ app.post("/api/scm/transfer-dependencies/batches/:id/proposals/:proposalId/confi
       createTransferOrder: async ({ proposal, batch }) => {
         const request = await transferDependencyRestPayload({ proposal, batch });
         return createTransferOrderInNetSuite(request.payload, { intercompany: request.intercompany });
+      },
+      approveTransferOrder: async ({ transferOrderId, proposal, batch }) => {
+        const request = await transferDependencyRestPayload({ proposal, batch });
+        return updateTransferOrderStatusInNetSuite(transferOrderId, {
+          intercompany: request.intercompany,
+          statusId: "B"
+        });
       },
       hydrateTransferOrder: hydrateCreatedDependencyTransferOrder,
       findTransferOrder: findCreatedDependencyTransferOrder
@@ -14784,6 +14935,13 @@ app.post("/api/scm/transfer-dependencies/batches/:id/retry", async (req, res, ne
       createTransferOrder: async ({ proposal, batch }) => {
         const request = await transferDependencyRestPayload({ proposal, batch });
         return createTransferOrderInNetSuite(request.payload, { intercompany: request.intercompany });
+      },
+      approveTransferOrder: async ({ transferOrderId, proposal, batch }) => {
+        const request = await transferDependencyRestPayload({ proposal, batch });
+        return updateTransferOrderStatusInNetSuite(transferOrderId, {
+          intercompany: request.intercompany,
+          statusId: "B"
+        });
       },
       hydrateTransferOrder: hydrateCreatedDependencyTransferOrder,
       findTransferOrder: findCreatedDependencyTransferOrder
@@ -15347,7 +15505,8 @@ app.post("/api/scm/schedule", async (req, res, next) => {
       orderRef: req.body?.orderRef || req.body?.order_ref,
       patch: req.body || {},
       updatedBy: operator?.id || req.body?.audit?.sessionId || "",
-      expectedUpdatedAt: requiredScmScheduleRevision(req.body || {})
+      expectedUpdatedAt: requiredScmScheduleRevision(req.body || {}),
+      expectedSplitRevision: req.body?.expectedSplitRevision
     });
     await writeDispatchAudit({
       action: "scm.schedule.updated",
@@ -15373,6 +15532,46 @@ app.post("/api/scm/schedule", async (req, res, next) => {
   }
 });
 
+app.put("/api/scm/schedule/:id/remark", async (req, res, next) => {
+  try {
+    const operator = await getOperatorByToken(bearerToken(req)).catch(() => null);
+    const orderKind = req.body?.orderKind || req.body?.order_kind;
+    await assertScmReconciliationOrderEditable({
+      kind: orderKind,
+      orderRef: req.params.id
+    });
+    const updated = await updateScmScheduleEntry({
+      orderKind,
+      orderRef: req.params.id,
+      patch: {
+        remarkOverride: req.body?.remarkOverride ?? req.body?.remark_override ?? ""
+      },
+      updatedBy: operator?.id || req.body?.audit?.sessionId || "",
+      expectedUpdatedAt: requiredScmScheduleRevision(req.body || {})
+    });
+    await writeDispatchAudit({
+      action: "scm.schedule.remark.updated",
+      entityType: "scm_schedule",
+      entityId: `${updated.order_kind}:${updated.order_ref}`,
+      orderId: updated.order_ref,
+      operatorId: operator?.id,
+      operatorName: operator?.display_name || operator?.username,
+      sessionId: req.body?.audit?.sessionId,
+      source: "scm",
+      after: {
+        remarkOverride: updated.remark_override || ""
+      }
+    }).catch(() => null);
+    emitAppEvent("dispatch.orders.updated", { source: "scm-schedule-remark", orderId: updated.order_ref });
+    res.json({
+      updated,
+      row: await refreshedScmScheduleRow(updated, operator)
+    });
+  } catch (error) {
+    next(error);
+  }
+});
+
 app.put("/api/scm/schedule/:id", async (req, res, next) => {
   try {
     const operator = await getOperatorByToken(bearerToken(req)).catch(() => null);
@@ -15385,7 +15584,8 @@ app.put("/api/scm/schedule/:id", async (req, res, next) => {
       orderRef: req.params.id,
       patch: req.body || {},
       updatedBy: operator?.id || req.body?.audit?.sessionId || "",
-      expectedUpdatedAt: requiredScmScheduleRevision(req.body || {})
+      expectedUpdatedAt: requiredScmScheduleRevision(req.body || {}),
+      expectedSplitRevision: req.body?.expectedSplitRevision
     });
     await writeDispatchAudit({
       action: "scm.schedule.updated",
@@ -15736,6 +15936,8 @@ app.post("/api/dispatch/scm/purchase-order-splits", async (req, res, next) => {
       newPoRef: req.body?.newPoRef,
       pickupPoint: req.body?.pickupPoint,
       destinationLocationId: req.body?.destinationLocationId,
+      status: req.body?.status,
+      remarkOverride: req.body?.remarkOverride,
       lines: req.body?.lines,
       createdBy: operator?.id || req.body?.audit?.sessionId || "",
       details: {
@@ -15761,6 +15963,45 @@ app.post("/api/dispatch/scm/purchase-order-splits", async (req, res, next) => {
     }).catch(() => null);
     emitAppEvent("dispatch.orders.updated", { source: "scm-po-split", type: "PO", orderId: created.split?.splitPoRef });
     res.json({ created, orders: await listScmPurchaseOrdersForResponse({}, req.operator) });
+  } catch (error) {
+    next(error);
+  }
+});
+
+app.get("/api/dispatch/scm/purchase-order-splits/:ref/source-lines", async (req, res, next) => {
+  try {
+    res.json(await getScmPurchaseOrderSplitSourceLines(req.params.ref));
+  } catch (error) {
+    next(error);
+  }
+});
+
+app.put("/api/dispatch/scm/purchase-order-splits/:ref/lines", async (req, res, next) => {
+  try {
+    const operator = await getOperatorByToken(bearerToken(req)).catch(() => null);
+    await assertScmReconciliationOrderEditable({ kind: "PO", orderRef: req.params.ref });
+    const updated = await updateScmPurchaseOrderSplitLines({
+      splitPoRef: req.params.ref,
+      lines: req.body?.lines,
+      expectedRevision: req.body?.expectedRevision,
+      updatedBy: operator?.id || req.body?.audit?.sessionId || ""
+    });
+    await writeDispatchAudit({
+      action: "dispatch.scm_po_split_lines_adjusted",
+      entityType: "purchase_order",
+      entityId: updated.splitPoRef,
+      orderId: updated.splitPoRef,
+      operatorId: operator?.id,
+      operatorName: operator?.display_name || operator?.username,
+      sessionId: req.body?.audit?.sessionId,
+      source: "dispatch-scm",
+      before: { revision: Number(req.body?.expectedRevision) },
+      after: { revision: updated.revision, changes: updated.changes },
+      details: { sourcePoRef: updated.sourcePoRef, lineCount: updated.changes.length }
+    }).catch(() => null);
+    emitAppEvent("dispatch.orders.updated", { source: "scm-po-split-lines", type: "PO", orderId: updated.splitPoRef });
+    emitAppEvent("receiving.order.updated", { source: "scm-po-split-lines", type: "PO", orderId: updated.splitPoId });
+    res.json({ updated, orders: await listScmPurchaseOrdersForResponse({}, req.operator) });
   } catch (error) {
     next(error);
   }
@@ -15806,7 +16047,8 @@ app.put("/api/dispatch/scm/purchase-order-splits/:ref", async (req, res, next) =
     const updated = await updateScmPurchaseOrderSplitRef({
       splitPoRef: req.params.ref,
       newPoRef: req.body?.newPoRef,
-      updatedBy: operator?.id || req.body?.audit?.sessionId || ""
+      updatedBy: operator?.id || req.body?.audit?.sessionId || "",
+      expectedRevision: req.body?.expectedRevision
     });
     await writeDispatchAudit({
       action: "dispatch.scm_po_split_ref_updated",
@@ -15838,7 +16080,9 @@ app.put("/api/dispatch/scm/purchase-order-splits/:ref/destination", async (req, 
     const updated = await updateScmPurchaseOrderSplitDestination({
       splitPoRef: req.params.ref,
       destinationLocationId: req.body?.destinationLocationId,
-      updatedBy: operator?.id || req.body?.audit?.sessionId || ""
+      updatedBy: operator?.id || req.body?.audit?.sessionId || "",
+      expectedUpdatedAt: requiredScmScheduleRevision(req.body || {}),
+      expectedSplitRevision: req.body?.expectedRevision
     });
     await writeDispatchAudit({
       action: "dispatch.scm_po_split_destination_updated",
@@ -15876,7 +16120,8 @@ app.put("/api/dispatch/scm/purchase-order-splits/:ref/pickup", async (req, res, 
     const updated = await updateScmPurchaseOrderSplitPickupYard({
       splitPoRef: req.params.ref,
       pickupPoint: req.body?.pickupPoint,
-      updatedBy: operator?.id || req.body?.audit?.sessionId || ""
+      updatedBy: operator?.id || req.body?.audit?.sessionId || "",
+      expectedRevision: req.body?.expectedRevision
     });
     await writeDispatchAudit({
       action: "dispatch.scm_po_split_pickup_updated",
@@ -15907,7 +16152,8 @@ app.delete("/api/dispatch/scm/purchase-order-splits/:ref", async (req, res, next
     await assertScmReconciliationOrderEditable({ kind: "PO", orderRef: req.params.ref });
     const cancelled = await cancelScmPurchaseOrderSplit({
       splitPoRef: req.params.ref,
-      cancelledBy: operator?.id || req.query.sessionId || ""
+      cancelledBy: operator?.id || req.query.sessionId || "",
+      expectedRevision: req.query.expectedRevision
     });
     await writeDispatchAudit({
       action: "dispatch.scm_po_split_cancelled",
@@ -20427,6 +20673,51 @@ app.post("/api/control/sales-orders/:orderId/reload-cycles/:cycleId/cancel", req
   }
 });
 
+app.get(
+  "/api/control/sales-order-reattempts/:orderRef/current-item-correction-preview",
+  requireOperator,
+  requireAdmin,
+  async (req, res, next) => {
+    try {
+      res.setHeader("Cache-Control", "no-store");
+      res.json({
+        preview: await getSalesOrderReattemptCurrentItemCorrectionPreview(req.params.orderRef)
+      });
+    } catch (error) {
+      next(error);
+    }
+  }
+);
+
+app.post(
+  "/api/control/sales-order-reattempts/:orderRef/current-item-corrections",
+  requireOperator,
+  requireAdmin,
+  async (req, res, next) => {
+    try {
+      const result = await applySalesOrderReattemptCurrentItemCorrection({
+        ...req.body,
+        orderRef: req.params.orderRef
+      }, req.operator);
+      emitAppEvent("dispatch.orders.updated", {
+        source: "sales-order-reattempt-current-item-correction",
+        change: "sales_order_reattempt_item_corrected",
+        orderId: req.params.orderRef,
+        parentOrderId: result.preview?.parentOrderRef || "",
+        refreshOrderPool: true
+      });
+      emitAppEvent("delivery.order.updated", {
+        orderId: result.preview?.parentSalesOrderId || null,
+        reloadCycleId: result.preview?.cycleId || null,
+        source: "sales-order-reattempt-current-item-correction"
+      });
+      res.status(result.idempotent ? 200 : 201).json(result);
+    } catch (error) {
+      next(error);
+    }
+  }
+);
+
 app.get("/api/control/loaded-orders", requireOperator, requireControlAccess, async (req, res, next) => {
   try {
     res.json(await listYardMovements({
@@ -21212,6 +21503,167 @@ app.get("/api/auth/netsuite/callback", async (req, res, next) => {
   }
 });
 
+function operatorNetSuitePostingHttpResult(admission) {
+  if (admission.mode === "local_only") return null;
+  const command = publicOperatorNetSuitePostingCommand(admission.command);
+  if (command.status === "completed") {
+    return {
+      jobId: command.id,
+      status: "complete",
+      result: command.result?.localFinalization || command.result,
+      posting: command
+    };
+  }
+  return {
+    jobId: command.id,
+    status: command.status === "failed" || command.status === "attention" ? "error" : "running",
+    posting: command,
+    ...(command.lastError ? { error: command.lastError } : {})
+  };
+}
+
+app.get("/api/operator/netsuite-posting-policy", requireOperator, requireOperatorAccess, async (req, res, next) => {
+  try {
+    const policy = await getOperatorNetSuitePostingPolicy({
+      functionKey: req.query.functionKey,
+      locationId: req.query.locationId
+    });
+    res.setHeader("cache-control", "no-store");
+    res.json(policy);
+  } catch (error) {
+    next(error);
+  }
+});
+
+app.get("/api/operator/netsuite-posting-jobs/:id", requireOperator, requireOperatorAccess, async (req, res, next) => {
+  try {
+    const command = await getPublicOperatorNetSuitePostingCommand(req.params.id);
+    if (!command) return res.status(404).json({ error: "Operator NetSuite posting job not found." });
+    if (String(command.actorOperatorId) !== String(operatorId(req))
+        && !operatorHasAnyRole(req.operator, ["admin"])) {
+      return res.status(403).json({ error: "This Operator NetSuite posting job belongs to another operator." });
+    }
+    res.setHeader("cache-control", "no-store");
+    res.json(command);
+  } catch (error) {
+    next(error);
+  }
+});
+
+app.get("/api/admin/operator-netsuite-posting/attention", requireOperator, requireAdmin, async (_req, res, next) => {
+  try {
+    res.setHeader("cache-control", "no-store");
+    res.json({
+      schemaVersion: "operator-netsuite-posting-attention-v1",
+      commands: await listPublicOperatorNetSuitePostingAttentionCommands()
+    });
+  } catch (error) {
+    next(error);
+  }
+});
+
+app.post("/api/admin/operator-netsuite-posting/:id/resume", requireOperator, requireAdmin, async (req, res, next) => {
+  try {
+    const reason = String(req.body?.reason || "").trim();
+    if (!reason) {
+      throw Object.assign(new Error("An audit reason is required to resume NetSuite verification."), {
+        status: 400,
+        code: "OPERATOR_NETSUITE_POSTING_RESUME_REASON_REQUIRED"
+      });
+    }
+    const command = await withTransaction(async () => {
+      const resumed = await resumePublicOperatorNetSuitePostingCommand(req.params.id);
+      await writeAudit({
+        actorOperatorId: operatorId(req),
+        source: "admin",
+        action: "operator_netsuite_posting.command.resumed",
+        details: { commandId: resumed.id, reason }
+      });
+      return resumed;
+    });
+    res.setHeader("cache-control", "no-store");
+    res.json({ command });
+  } catch (error) {
+    next(error);
+  }
+});
+
+app.get("/api/admin/sales-order-fulfillment/candidates", requireOperator, requireAdmin, async (req, res, next) => {
+  try {
+    const rawStatuses = Array.isArray(req.query.status) ? req.query.status : [req.query.status];
+    const statuses = rawStatuses
+      .flatMap((value) => String(value || "").split(","))
+      .map((value) => value.trim())
+      .filter(Boolean);
+    res.setHeader("cache-control", "no-store");
+    res.json({
+      schemaVersion: "sales-order-auto-fulfillment-admin-v1",
+      candidates: await listSalesOrderAutoFulfillmentCandidates({
+        statuses,
+        limit: req.query.limit
+      })
+    });
+  } catch (error) {
+    next(error);
+  }
+});
+
+app.post("/api/admin/sales-order-fulfillment/:id/resolve", requireOperator, requireAdmin, async (req, res, next) => {
+  try {
+    const candidate = await resolveSalesOrderAutoFulfillmentCandidate({
+      candidateId: req.params.id,
+      action: req.body?.action,
+      lines: Array.isArray(req.body?.lines) ? req.body.lines : [],
+      reason: req.body?.reason,
+      actorId: operatorId(req)
+    });
+    if (config.netsuite.directAccessEnabled === true && candidate?.status !== "skipped") {
+      void enqueueSalesOrderAutoFulfillmentCandidate(candidate.id);
+    }
+    res.setHeader("cache-control", "no-store");
+    res.json({ candidate });
+  } catch (error) {
+    next(error);
+  }
+});
+
+app.get("/api/admin/sales-order-fulfillment/historical", requireOperator, requireAdmin, async (req, res, next) => {
+  try {
+    res.setHeader("cache-control", "no-store");
+    res.json({
+      schemaVersion: "sales-order-auto-fulfillment-historical-v1",
+      events: await previewHistoricalSalesOrderAutoFulfillmentEvents({
+        search: req.query.search,
+        limit: req.query.limit
+      })
+    });
+  } catch (error) {
+    next(error);
+  }
+});
+
+app.post("/api/admin/sales-order-fulfillment/historical", requireOperator, requireAdmin, async (req, res, next) => {
+  try {
+    const candidates = await queueHistoricalSalesOrderAutoFulfillmentCandidates({
+      completionEventIds: Array.isArray(req.body?.completionEventIds) ? req.body.completionEventIds : [],
+      orderRefs: Array.isArray(req.body?.orderRefs) ? req.body.orderRefs : [],
+      reason: req.body?.reason,
+      actorId: operatorId(req)
+    });
+    if (config.netsuite.directAccessEnabled === true) {
+      for (const candidate of candidates) {
+        if (!["completed", "reconciled", "closed"].includes(candidate.status)) {
+          void enqueueSalesOrderAutoFulfillmentCandidate(candidate.id);
+        }
+      }
+    }
+    res.setHeader("cache-control", "no-store");
+    res.status(202).json({ candidates });
+  } catch (error) {
+    next(error);
+  }
+});
+
 app.use("/api/delivery", requireOperator, requireOperatorAccess);
 app.use("/api/customer-pickup", requireOperator, requireOperatorAccess);
 app.use("/api/receiving", requireOperator, requireOperatorAccess);
@@ -21304,6 +21756,7 @@ app.post("/api/customer-pickup/lookup", async (req, res, next) => {
 
 app.post("/api/customer-pickup/orders/:id/lines/:lineId/confirm", async (req, res, next) => {
   try {
+    await assertOperatorNetSuitePostingOrderMutable({ functionKey: "customer_pickup", orderId: req.params.id, orderType: "sales_order" });
     await confirmCustomerPickupLine(req.params.id, req.params.lineId, req.body || {}, operatorId(req));
     emitAppEvent("delivery.line.confirmed", { orderId: req.params.id, lineId: req.params.lineId, source: "customer-pickup", operatorId: operatorId(req) });
     res.json(await getDeliveryOrder(req.params.id));
@@ -21314,6 +21767,7 @@ app.post("/api/customer-pickup/orders/:id/lines/:lineId/confirm", async (req, re
 
 app.post("/api/customer-pickup/orders/:id/lines/confirm-page", async (req, res, next) => {
   try {
+    await assertOperatorNetSuitePostingOrderMutable({ functionKey: "customer_pickup", orderId: req.params.id, orderType: "sales_order" });
     const result = await confirmCustomerPickupLines(req.params.id, req.body?.lines || [], operatorId(req));
     const order = await getDeliveryOrder(req.params.id);
     emitAppEvent("delivery.line.confirmed", {
@@ -21331,6 +21785,7 @@ app.post("/api/customer-pickup/orders/:id/lines/confirm-page", async (req, res, 
 
 app.post("/api/customer-pickup/orders/:id/clear-draft", async (req, res, next) => {
   try {
+    await assertOperatorNetSuitePostingOrderMutable({ functionKey: "customer_pickup", orderId: req.params.id, orderType: "sales_order" });
     const order = await clearCustomerPickupDraft(req.params.id, operatorId(req));
     emitAppEvent("delivery.line.updated", { orderId: req.params.id, source: "customer-pickup-clear", operatorId: operatorId(req) });
     res.json(order);
@@ -21342,6 +21797,18 @@ app.post("/api/customer-pickup/orders/:id/clear-draft", async (req, res, next) =
 app.post("/api/customer-pickup/orders/:id/load", async (req, res, next) => {
   try {
     const photoDataUrls = requiredPhotoDataUrls(req.body?.photoDataUrls, 0);
+    const admission = await submitOperatorNetSuitePostingAction({
+      requestId: req.body?.requestId,
+      actorOperatorId: operatorId(req),
+      functionKey: "customer_pickup",
+      orderId: req.params.id,
+      orderType: "sales_order",
+      clientLocationId: req.body?.locationId,
+      photoRefs: photoDataUrls,
+      expectedPolicy: req.body?.netSuitePostingPolicy || req.body?.postingPolicy
+    });
+    const posting = operatorNetSuitePostingHttpResult(admission);
+    if (posting) return res.json(posting);
     const result = await recordCustomerPickupLoad(req.params.id, operatorId(req), {
       photoDataUrls
     });
@@ -21815,6 +22282,7 @@ app.get("/api/receiving/orders/:id", async (req, res, next) => {
 
 app.post("/api/receiving/orders/:id/lines/:lineId/confirm", async (req, res, next) => {
   try {
+    await assertOperatorNetSuitePostingOrderMutable({ functionKey: "receiving", orderId: req.params.id, orderType: req.body?.orderType });
     if (req.body?.orderType === "co_order" || String(req.params.id).startsWith("CO-")) {
       const result = await confirmLocalCoReceivingLine(req.params.id, req.params.lineId, req.body || {}, operatorId(req));
       emitAppEvent("receiving.line.confirmed", { orderId: req.params.id, lineId: req.params.lineId, orderType: "co_order", operatorId: operatorId(req) });
@@ -21830,6 +22298,7 @@ app.post("/api/receiving/orders/:id/lines/:lineId/confirm", async (req, res, nex
 
 app.post("/api/receiving/orders/:id/lines/confirm-page", async (req, res, next) => {
   try {
+    await assertOperatorNetSuitePostingOrderMutable({ functionKey: "receiving", orderId: req.params.id, orderType: "purchase_order" });
     const result = await confirmPurchaseOrderReceivingLines(req.params.id, req.body?.lines || [], operatorId(req));
     const order = await getReceivingOrder(req.params.id);
     emitAppEvent("receiving.line.confirmed", {
@@ -21847,6 +22316,7 @@ app.post("/api/receiving/orders/:id/lines/confirm-page", async (req, res, next) 
 
 app.post("/api/receiving/orders/:id/lines/:lineId/unconfirm", async (req, res, next) => {
   try {
+    await assertOperatorNetSuitePostingOrderMutable({ functionKey: "receiving", orderId: req.params.id, orderType: req.body?.orderType });
     if (req.body?.orderType === "co_order" || String(req.params.id).startsWith("CO-")) {
       const result = await unconfirmLocalCoReceivingLine(req.params.id, req.params.lineId, operatorId(req));
       emitAppEvent("receiving.line.unconfirmed", { orderId: req.params.id, lineId: req.params.lineId, orderType: "co_order", operatorId: operatorId(req) });
@@ -21863,6 +22333,18 @@ app.post("/api/receiving/orders/:id/lines/:lineId/unconfirm", async (req, res, n
 app.post("/api/receiving/orders/:id/receive", async (req, res, next) => {
   try {
     req.body = { ...(req.body || {}), photoDataUrls: requiredPhotoDataUrls(req.body?.photoDataUrls) };
+    const admission = await submitOperatorNetSuitePostingAction({
+      requestId: req.body?.requestId,
+      actorOperatorId: operatorId(req),
+      functionKey: "receiving",
+      orderId: req.params.id,
+      orderType: req.body?.orderType,
+      clientLocationId: req.body?.destinationLocationId ?? req.body?.locationId,
+      photoRefs: req.body?.photoDataUrls,
+      expectedPolicy: req.body?.netSuitePostingPolicy || req.body?.postingPolicy
+    });
+    const posting = operatorNetSuitePostingHttpResult(admission);
+    if (posting) return res.json(posting);
     if (req.body?.orderType === "co_order" || String(req.params.id).startsWith("CO-")) {
       const result = await receiveLocalCoOrder(req.params.id, operatorId(req), {
         photoDataUrls: req.body?.photoDataUrls
@@ -21917,7 +22399,40 @@ app.post("/api/receiving/orders/:id/receive", async (req, res, next) => {
 app.get("/api/receiving/receipt-jobs/:jobId", async (req, res, next) => {
   try {
     const job = receivingJobs.get(req.params.jobId);
-    if (!job) return res.status(404).json({ error: "Receiving job not found" });
+    if (!job) {
+      const posting = await getPublicOperatorNetSuitePostingCommand(req.params.jobId);
+      if (!posting) return res.status(404).json({ error: "Receiving job not found" });
+      if (String(posting.actorOperatorId) !== String(operatorId(req))
+          && !operatorHasAnyRole(req.operator, ["admin"])) {
+        return res.status(403).json({ error: "This Receiving job belongs to another operator." });
+      }
+      if (posting.status === "completed") {
+        return res.json({
+          id: posting.id,
+          status: "complete",
+          stage: "complete",
+          message: "NetSuite receipt verified and Receiving completed.",
+          result: posting.result?.localFinalization || posting.result,
+          posting
+        });
+      }
+      if (["attention", "failed"].includes(posting.status)) {
+        return res.json({
+          id: posting.id,
+          status: "error",
+          stage: posting.status,
+          error: posting.lastError || "NetSuite receipt needs Admin attention.",
+          posting
+        });
+      }
+      return res.json({
+        id: posting.id,
+        status: "running",
+        stage: posting.steps.find((step) => step.status !== "posted")?.status || posting.status,
+        message: "Verifying NetSuite Item Receipt before local completion.",
+        posting
+      });
+    }
     res.json(job);
   } catch (error) {
     next(error);
@@ -21926,6 +22441,7 @@ app.get("/api/receiving/receipt-jobs/:jobId", async (req, res, next) => {
 
 app.post("/api/delivery/orders/:id/prepared", async (req, res, next) => {
   try {
+    await assertOperatorNetSuitePostingOrderMutable({ functionKey: "delivery_prep", orderId: req.params.id, orderType: req.body?.orderType });
     await markDeliveryPrepared(req.params.id, req.body || {});
     emitAppEvent("delivery.order.updated", { orderId: req.params.id, change: "prepared" });
     res.json({ ok: true });
@@ -21936,6 +22452,7 @@ app.post("/api/delivery/orders/:id/prepared", async (req, res, next) => {
 
 app.post("/api/delivery/orders/:id/status", async (req, res, next) => {
   try {
+    await assertOperatorNetSuitePostingOrderMutable({ functionKey: "delivery_prep", orderId: req.params.id, orderType: req.body?.orderType });
     await updateDeliveryStatus(req.params.id, req.body?.status, operatorId(req));
     const dependencyProgress = await syncDirectDependencyOperatorProgress(req.params.id);
     const order = await getDeliveryOrder(req.params.id);
@@ -21948,6 +22465,7 @@ app.post("/api/delivery/orders/:id/status", async (req, res, next) => {
 
 app.post("/api/delivery/orders/:id/release-draft", async (req, res, next) => {
   try {
+    await assertOperatorNetSuitePostingOrderMutable({ functionKey: "delivery_prep", orderId: req.params.id, orderType: req.body?.orderType });
     const order = await releaseCurrentDeliveryDraft(req.params.id, operatorId(req));
     emitAppEvent("delivery.order.updated", {
       orderId: req.params.id,
@@ -21963,6 +22481,7 @@ app.post("/api/delivery/orders/:id/release-draft", async (req, res, next) => {
 
 app.post("/api/delivery/orders/:id/lines/:lineId/confirm", async (req, res, next) => {
   try {
+    await assertOperatorNetSuitePostingOrderMutable({ functionKey: "delivery_prep", orderId: req.params.id, orderType: req.body?.orderType });
     await confirmDeliveryLine(req.params.id, req.params.lineId, req.body || {}, operatorId(req));
     const order = await getDeliveryOrder(req.params.id);
     emitAppEvent("delivery.line.confirmed", { orderId: req.params.id, lineId: req.params.lineId, operatorId: operatorId(req) });
@@ -21974,6 +22493,7 @@ app.post("/api/delivery/orders/:id/lines/:lineId/confirm", async (req, res, next
 
 app.post("/api/delivery/orders/:id/lines/confirm-page", async (req, res, next) => {
   try {
+    await assertOperatorNetSuitePostingOrderMutable({ functionKey: "delivery_prep", orderId: req.params.id, orderType: req.body?.orderType });
     const result = await confirmDeliveryLines(req.params.id, req.body?.lines || [], operatorId(req));
     const order = await getDeliveryOrder(req.params.id);
     emitAppEvent("delivery.line.confirmed", { orderId: req.params.id, count: result.confirmed, operatorId: operatorId(req), bulk: true });
@@ -21985,6 +22505,7 @@ app.post("/api/delivery/orders/:id/lines/confirm-page", async (req, res, next) =
 
 app.post("/api/delivery/orders/:id/lines/:lineId/packed-quantity", async (req, res, next) => {
   try {
+    await assertOperatorNetSuitePostingOrderMutable({ functionKey: "delivery_prep", orderId: req.params.id, orderType: req.body?.orderType });
     await setDeliveryLinePackedQuantity(req.params.id, req.params.lineId, req.body || {}, operatorId(req));
     const order = await getDeliveryOrder(req.params.id);
     emitAppEvent("delivery.line.updated", { orderId: req.params.id, lineId: req.params.lineId, change: "packed_quantity", operatorId: operatorId(req) });
@@ -21996,6 +22517,7 @@ app.post("/api/delivery/orders/:id/lines/:lineId/packed-quantity", async (req, r
 
 app.post("/api/delivery/orders/:id/lines/:lineId/unpack", async (req, res, next) => {
   try {
+    await assertOperatorNetSuitePostingOrderMutable({ functionKey: "delivery_prep", orderId: req.params.id, orderType: req.body?.orderType });
     await unpackDeliveryLine(req.params.id, req.params.lineId, req.body || {}, operatorId(req));
     await syncDirectDependencyOperatorProgress(req.params.id);
     const resolvedRequests = await resolveDispatchOperatorRequestsForOrder(req.params.id, operatorId(req)).catch(() => []);
@@ -22009,6 +22531,7 @@ app.post("/api/delivery/orders/:id/lines/:lineId/unpack", async (req, res, next)
 
 app.post("/api/delivery/orders/:id/unpack", async (req, res, next) => {
   try {
+    await assertOperatorNetSuitePostingOrderMutable({ functionKey: "delivery_prep", orderId: req.params.id, orderType: req.body?.orderType });
     await unpackDeliveryOrder(req.params.id, operatorId(req));
     await syncDirectDependencyOperatorProgress(req.params.id);
     const resolvedRequests = await resolveDispatchOperatorRequestsForOrder(req.params.id, operatorId(req)).catch(() => []);
@@ -22022,43 +22545,9 @@ app.post("/api/delivery/orders/:id/unpack", async (req, res, next) => {
 
 app.post("/api/delivery/orders/:id/fulfill", async (req, res, next) => {
   try {
-    req.body = { ...(req.body || {}), photoDataUrls: requiredPhotoDataUrls(req.body?.photoDataUrls) };
-    const jobId = crypto.randomUUID();
-    fulfillmentJobs.set(jobId, {
-      id: jobId,
-      status: "running",
-      orderId: req.params.id,
-      stage: "queued",
-      message: "Fulfillment request received.",
-      startedAt: new Date().toISOString()
-    });
-    res.json({ jobId, status: "running" });
-    Promise.resolve().then(async () => {
-      const result = await runDeliveryFulfillment(req.params.id, req.body || {}, operatorId(req), jobId);
-      updateFulfillmentJob(jobId, {
-        status: "complete",
-        stage: "complete",
-        message: result.itemFulfillmentTranid ? `Created ${result.itemFulfillmentTranid}.` : "Item Fulfillment created.",
-        result,
-        completedAt: new Date().toISOString()
-      });
-      emitAppEvent("delivery.order.fulfilled", { orderId: req.params.id, operatorId: operatorId(req), jobId, itemFulfillmentTranid: result.itemFulfillmentTranid || null });
-    }).catch(async (error) => {
-      const job = fulfillmentJobs.get(jobId);
-      await recordDeliveryFulfillmentFailure(req.params.id, operatorId(req), {
-        photoDataUrls: req.body?.photoDataUrls,
-        payload: job?.payload,
-        error,
-        stage: job?.stage
-      });
-      updateFulfillmentJob(jobId, {
-        status: "error",
-        stage: "error",
-        message: error.message,
-        error: error.message,
-        completedAt: new Date().toISOString()
-      });
-      emitAppEvent("delivery.order.fulfill_failed", { orderId: req.params.id, operatorId: operatorId(req), jobId, error: error.message });
+    res.status(410).json({
+      code: "OPERATOR_FULFILLMENT_ENDPOINT_RETIRED",
+      error: "This legacy fulfillment endpoint is retired. Refresh Operator and complete the load through the current per-yard posting gate."
     });
   } catch (error) {
     next(error);
@@ -22068,6 +22557,18 @@ app.post("/api/delivery/orders/:id/fulfill", async (req, res, next) => {
 app.post("/api/delivery/orders/:id/load", async (req, res, next) => {
   try {
     const photoDataUrls = requiredPhotoDataUrls(req.body?.photoDataUrls);
+    const admission = await submitOperatorNetSuitePostingAction({
+      requestId: req.body?.requestId,
+      actorOperatorId: operatorId(req),
+      functionKey: "delivery_prep",
+      orderId: req.params.id,
+      orderType: req.body?.orderType,
+      clientLocationId: req.body?.locationId,
+      photoRefs: photoDataUrls,
+      expectedPolicy: req.body?.netSuitePostingPolicy || req.body?.postingPolicy
+    });
+    const posting = operatorNetSuitePostingHttpResult(admission);
+    if (posting) return res.json(posting);
     const result = await recordDeliveryLoad(req.params.id, operatorId(req), {
       photoDataUrls,
       requestId: req.body?.requestId
@@ -22729,12 +23230,16 @@ export async function startServer() {
   return app.listen(config.port, () => {
     console.log(`MBBS Yard Server listening on ${config.appBaseUrl}`);
     startNetSuiteMirrorWorkers();
+    startOperatorNetSuitePostingRuntime();
+    startSalesOrderAutoFulfillmentRuntime();
     void delayedStatusRefreshTick();
+    setTimeout(() => void scmScheduleStatusRefreshTick(), 60_000);
     autoSyncTick();
     photoArchiveAutoTick();
     void smartScmAutoTick().catch((error) => console.error("Smart SCM scheduled tick failed:", error));
     setInterval(autoSyncTick, 60000);
     setInterval(() => void delayedStatusRefreshTick(), DELAYED_STATUS_REFRESH_POLL_INTERVAL_MS);
+    setInterval(() => void scmScheduleStatusRefreshTick(), SCM_SCHEDULE_STATUS_REFRESH_INTERVAL_MS);
     setInterval(photoArchiveAutoTick, 60000);
     setInterval(
       () => void smartScmAutoTick().catch((error) => console.error("Smart SCM scheduled tick failed:", error)),

@@ -63,6 +63,13 @@ const MUTANTS = Object.freeze([
     tests: [ADVERSARIAL]
   },
   {
+    name: "the exclusive replay end is labeled as the following local day",
+    source: REPLAY,
+    from: "replayLocalDate(new Date(toTime - 1), timezone)",
+    to: "replayLocalDate(new Date(toTime), timezone)",
+    tests: [ADVERSARIAL]
+  },
+  {
     name: "assigned-order snapshot fallback is removed",
     source: REPLAY,
     from: ": Array.isArray(plan.assignedOrderSnapshots) ? plan.assignedOrderSnapshots : [];",

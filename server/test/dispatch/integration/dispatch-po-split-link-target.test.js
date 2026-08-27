@@ -5,6 +5,7 @@ import { beginRollbackContext, closeDb, query } from "../../../src/db.js";
 import {
   createSalesOrderPoAllocation,
   createScmPurchaseOrderSplit,
+  enrichDispatchOrdersWithPoTargetAllocations,
   getSalesOrderPoAllocationOptions,
   listDispatchOrders,
   listScmPurchaseOrders,
@@ -13,7 +14,7 @@ import {
 
 after(closeDb);
 
-async function seedSplitLinkFixture({ salesPallets = 2 } = {}) {
+async function seedSplitLinkFixture({ salesPallets = 2, createSplit = true } = {}) {
   const suffix = `${Date.now()}${Math.floor(Math.random() * 1000)}`;
   const baseId = 8_930_000_000_000 + Number(suffix.slice(-9)) * 10;
   const purchaseOrderId = baseId + 1;
@@ -104,13 +105,15 @@ async function seedSplitLinkFixture({ salesPallets = 2 } = {}) {
     ]
   );
 
-  const created = await createScmPurchaseOrderSplit({
-    sourcePoRef: purchaseOrderRef,
-    newPoRef: splitRef,
-    destinationLocationId: 15,
-    lines: [{ lineRowId: purchaseLine.rows[0].id, pallets: 7 }],
-    createdBy: "dispatch-po-split-link-regression"
-  });
+  const created = createSplit
+    ? await createScmPurchaseOrderSplit({
+        sourcePoRef: purchaseOrderRef,
+        newPoRef: splitRef,
+        destinationLocationId: 15,
+        lines: [{ lineRowId: purchaseLine.rows[0].id, pallets: 7 }],
+        createdBy: "dispatch-po-split-link-regression"
+      })
+    : null;
 
   return {
     purchaseOrderId,
@@ -120,9 +123,65 @@ async function seedSplitLinkFixture({ salesPallets = 2 } = {}) {
     salesOrderRef,
     salesLine: salesLine.rows[0],
     splitRef,
-    splitLine: created.lines[0]
+    splitLine: created?.lines?.[0] || null
   };
 }
+
+test("Link PO finds an ordinary source PO by its updated PO ref and original NetSuite number", async () => {
+  const rollback = await beginRollbackContext();
+  try {
+    await rollback.run(async () => {
+      const fixture = await seedSplitLinkFixture({ createSplit: false });
+      const updatedPoRef = `${fixture.purchaseOrderRef}-REF`;
+      await query(
+        `UPDATE purchase_orders
+            SET dispatch_ref = $2,
+                dispatch_ref_updated_at = now(),
+                dispatch_ref_updated_by = 'po-ref-link-search-regression'
+          WHERE netsuite_id = $1`,
+        [fixture.purchaseOrderId, updatedPoRef]
+      );
+
+      const options = await getSalesOrderPoAllocationOptions(fixture.salesOrderRef);
+      const poLine = options.poLines.find((line) => Number(line.id) === Number(fixture.sourceLine.id));
+      assert.equal(poLine?.poRef, updatedPoRef,
+        "the current PO ref must be the primary Link PO search identity");
+      assert.equal(poLine?.originalPoRef, fixture.purchaseOrderRef);
+      assert.deepEqual(poLine?.poAliases, [updatedPoRef, fixture.purchaseOrderRef],
+        "the original NetSuite PO number must remain a valid search alias");
+      const targetLine = options.salesLines.find((line) => Number(line.id) === Number(fixture.salesLine.id));
+      const candidate = targetLine?.poCandidates.find((entry) => Number(entry.poLineId) === Number(fixture.sourceLine.id));
+      assert.equal(candidate?.poRef, updatedPoRef);
+      assert.deepEqual(candidate?.poAliases, [updatedPoRef, fixture.purchaseOrderRef]);
+
+      const linkedByUpdatedRef = await createSalesOrderPoAllocation({
+        dispatchTargetRef: fixture.salesOrderRef,
+        salesOrderRef: fixture.salesOrderRef,
+        targetLineKey: targetLine.targetLineKey,
+        poRef: updatedPoRef,
+        targetSignature: options.order.targetSignature,
+        quantities: { pallets: 1 },
+        createdBy: "po-ref-link-search-regression"
+      });
+      assert.equal(linkedByUpdatedRef.poOrderRef, updatedPoRef);
+
+      const linkedByOriginalRef = await createSalesOrderPoAllocation({
+        dispatchTargetRef: fixture.salesOrderRef,
+        salesOrderRef: fixture.salesOrderRef,
+        targetLineKey: targetLine.targetLineKey,
+        poLineId: fixture.sourceLine.id,
+        poRef: fixture.purchaseOrderRef,
+        targetSignature: options.order.targetSignature,
+        quantities: { pallets: 1 },
+        createdBy: "po-ref-link-search-regression"
+      });
+      assert.equal(linkedByOriginalRef.poOrderRef, updatedPoRef,
+        "new allocation evidence must retain the current visible PO ref regardless of the accepted alias");
+    });
+  } finally {
+    await rollback.rollback();
+  }
+});
 
 test("SCM remaining quantity ignores legacy Dispatch links on a split source", async () => {
   const rollback = await beginRollbackContext();
@@ -172,6 +231,41 @@ test("SCM remaining quantity ignores legacy Dispatch links on a split source", a
   }
 });
 
+test("Dispatch enrichment adds a route-only PO residual without changing the SCM source quantity", async () => {
+  const rollback = await beginRollbackContext();
+  try {
+    await rollback.run(async () => {
+      const fixture = await seedSplitLinkFixture({ createSplit: false, salesPallets: 2 });
+      const options = await getSalesOrderPoAllocationOptions(fixture.salesOrderRef);
+      const targetLine = options.salesLines.find((line) => Number(line.id) === Number(fixture.salesLine.id));
+      await createSalesOrderPoAllocation({
+        dispatchTargetRef: fixture.salesOrderRef,
+        salesOrderRef: fixture.salesOrderRef,
+        targetLineKey: targetLine.targetLineKey,
+        poRef: fixture.purchaseOrderRef,
+        poLineId: fixture.sourceLine.id,
+        targetSignature: options.order.targetSignature,
+        quantities: { pallets: 2 },
+        createdBy: "dispatch-po-route-residual-regression"
+      });
+
+      const source = (await listDispatchOrders({ search: fixture.purchaseOrderRef }))
+        .find((order) => order.id === fixture.purchaseOrderRef);
+      const [enriched] = await enrichDispatchOrdersWithPoTargetAllocations([source]);
+
+      assert.equal(source.pallets, 12);
+      assert.equal(source.items[0].pallets, 12);
+      assert.equal(enriched.pallets, 12, "SCM/source PO total is immutable under a Dispatch link");
+      assert.equal(enriched.items[0].pallets, 12);
+      assert.equal(enriched.poRouteProjection?.pallets, 10);
+      assert.equal(enriched.poRouteProjection?.items[0]?.quantity, 100);
+      assert.deepEqual(enriched.poRouteProjection?.targetRefs, [fixture.salesOrderRef]);
+    });
+  } finally {
+    await rollback.rollback();
+  }
+});
+
 test("Link PO requires an active split child instead of its source line", async () => {
   const rollback = await beginRollbackContext();
   try {
@@ -197,6 +291,59 @@ test("Link PO requires an active split child instead of its source line", async 
         }),
         (error) => error?.status === 409 && error?.code === "DISPATCH_PO_SPLIT_SOURCE_REQUIRES_CHILD"
       );
+    });
+  } finally {
+    await rollback.rollback();
+  }
+});
+
+test("Link PO accepts an exact decimal pallet conversion without floating-point overrun", async () => {
+  const rollback = await beginRollbackContext();
+  try {
+    await rollback.run(async () => {
+      const fixture = await seedSplitLinkFixture({ salesPallets: 38, createSplit: false });
+      await query(
+        `UPDATE sales_order_lines
+            SET quantity = 1987.78,
+                pallet_qty = 38,
+                to_plt = 52.31,
+                netsuite_backordered_qty = 1987.78
+          WHERE id = $1`,
+        [fixture.salesLine.id]
+      );
+      await query(
+        `UPDATE purchase_order_lines
+            SET quantity = 2040.09,
+                pallet_qty = 39,
+                to_plt = 52.31
+          WHERE id = $1`,
+        [fixture.sourceLine.id]
+      );
+      const split = await createScmPurchaseOrderSplit({
+        sourcePoRef: fixture.purchaseOrderRef,
+        newPoRef: fixture.splitRef,
+        destinationLocationId: 15,
+        lines: [{ lineRowId: fixture.sourceLine.id, pallets: 39 }],
+        createdBy: "dispatch-po-decimal-conversion-regression"
+      });
+      const options = await getSalesOrderPoAllocationOptions(fixture.salesOrderRef);
+      const targetLine = options.salesLines.find((line) => Number(line.id) === Number(fixture.salesLine.id));
+      const candidate = targetLine?.poCandidates.find((entry) => entry.poRef === fixture.splitRef);
+      assert.ok(candidate, "the 39-pallet split PO must match the 38-pallet SO line");
+
+      const linked = await createSalesOrderPoAllocation({
+        dispatchTargetRef: fixture.salesOrderRef,
+        salesOrderRef: fixture.salesOrderRef,
+        targetLineKey: targetLine.targetLineKey,
+        poLineId: candidate.poLineId,
+        poRef: fixture.splitRef,
+        targetSignature: options.order.targetSignature,
+        quantities: { pallets: 38 },
+        createdBy: "dispatch-po-decimal-conversion-regression"
+      });
+      assert.equal(Number(linked.poOrderId), Number(split.split.splitPoId));
+      assert.equal(linked.pallets, 38);
+      assert.equal(linked.salesQty, 1987.78);
     });
   } finally {
     await rollback.rollback();
@@ -252,6 +399,169 @@ test("a fully linked split child keeps its complete PO Split lines visible", asy
       assert.ok(childItem, "a fully Dispatch-linked active split line must remain visible in PO Split");
       assert.equal(childItem.pallets, 7);
       assert.equal(childItem.quantity, 70);
+    });
+  } finally {
+    await rollback.rollback();
+  }
+});
+
+test("a fully linked PO inherits planned and completed lifecycle from its Driver target", async () => {
+  const rollback = await beginRollbackContext();
+  try {
+    await rollback.run(async () => {
+      const fixture = await seedSplitLinkFixture({ createSplit: false, salesPallets: 12 });
+      const options = await getSalesOrderPoAllocationOptions(fixture.salesOrderRef);
+      const targetLine = options.salesLines.find((line) => Number(line.id) === Number(fixture.salesLine.id));
+      await createSalesOrderPoAllocation({
+        dispatchTargetRef: fixture.salesOrderRef,
+        salesOrderRef: fixture.salesOrderRef,
+        targetLineKey: targetLine.targetLineKey,
+        poLineId: fixture.sourceLine.id,
+        poRef: fixture.purchaseOrderRef,
+        targetSignature: options.order.targetSignature,
+        quantities: { pallets: 12 },
+        createdBy: "dispatch-po-link-lifecycle-regression"
+      });
+      const currentPoRef = `${fixture.purchaseOrderRef}-CURRENT`;
+      await query(
+        `UPDATE purchase_orders
+            SET dispatch_ref = $2,
+                dispatch_ref_updated_at = now(),
+                dispatch_ref_updated_by = 'dispatch-po-link-lifecycle-regression'
+          WHERE netsuite_id = $1`,
+        [fixture.purchaseOrderId, currentPoRef]
+      );
+
+      const plan = await query(
+        `INSERT INTO dispatch_plans (plan_date, status, note)
+         VALUES (current_date, 'confirmed', 'fully linked PO lifecycle regression')
+         RETURNING id, plan_date`,
+        []
+      );
+      const assignment = {
+        dispatchPlanned: true,
+        dispatchPlanId: String(plan.rows[0].id),
+        dispatchPlanDate: String(plan.rows[0].plan_date).slice(0, 10),
+        dispatchTruckPlate: "LINK-PO-12",
+        dispatchLoadName: "Load 12",
+        dispatchDriverName: "Linked Driver"
+      };
+      await query(
+        `INSERT INTO dispatch_plan_order_assignments (
+           plan_id, plan_date, order_ref, planned_order_ref, assignment_kind,
+           load_id, stop_id, assignment, updated_at
+         ) VALUES ($1, $2, $3, $3, 'direct', $4, $5, $6::jsonb, now())`,
+        [
+          plan.rows[0].id,
+          plan.rows[0].plan_date,
+          fixture.salesOrderRef,
+          `linked-load-${fixture.salesOrderId}`,
+          `linked-stop-${fixture.salesOrderId}`,
+          JSON.stringify(assignment)
+        ]
+      );
+
+      const planned = (await listScmSchedule({
+        exactRef: currentPoRef,
+        audience: "operations"
+      })).find((row) => row.orderRef === currentPoRef);
+      assert.equal(planned?.calculatedStatus, "Planned");
+      assert.equal(planned?.driver, "Linked Driver");
+      assert.match(planned?.notes || "", /LINK-PO-12 Load 12/u);
+
+      const jobId = `linked-po-complete-${fixture.salesOrderId}`;
+      await query(
+        `INSERT INTO driver_job_records (
+           job_id, plan_id, plan_date, driver_login, truck_plate,
+           load_id, load_name, stop_id, stop_type, order_refs,
+           status, started_at, completed_at, job_details
+         ) VALUES (
+           $1, $2, $3, 'linked-driver', 'LINK-PO-12',
+           $4, 'Load 12', $5, 'dropoff', $6::jsonb,
+           'complete', now() - interval '5 minutes', now(), $7::jsonb
+         )`,
+        [
+          jobId,
+          plan.rows[0].id,
+          plan.rows[0].plan_date,
+          `linked-load-${fixture.salesOrderId}`,
+          `linked-drop-${fixture.salesOrderId}`,
+          JSON.stringify([fixture.salesOrderRef]),
+          JSON.stringify({
+            orderTypes: ["SO"],
+            orders: [{ orderType: "SO", orderRef: fixture.salesOrderRef }]
+          })
+        ]
+      );
+
+      const completion = await query(
+        `SELECT order_kind, order_ref, completion_evidence_type,
+                completion_evidence_id, metadata
+           FROM dispatch_order_completion_status
+          WHERE order_kind = 'PO' AND lower(order_ref) = lower($1)`,
+        [currentPoRef]
+      );
+      assert.equal(completion.rowCount, 1);
+      assert.equal(completion.rows[0].completion_evidence_type, "driver_job");
+      assert.equal(completion.rows[0].completion_evidence_id, jobId);
+      assert.equal(completion.rows[0].metadata.directPoLink, true);
+
+      const completed = (await listScmSchedule({
+        exactRef: currentPoRef,
+        audience: "scm"
+      })).find((row) => row.orderRef === currentPoRef);
+      assert.equal(completed?.calculatedStatus, "Completed");
+      assert.equal(completed?.dispatchCompletionEvidenceType, "driver_job");
+    });
+  } finally {
+    await rollback.rollback();
+  }
+});
+
+test("a partial PO link cannot complete or hide its unplanned residual route", async () => {
+  const rollback = await beginRollbackContext();
+  try {
+    await rollback.run(async () => {
+      const fixture = await seedSplitLinkFixture({ createSplit: false, salesPallets: 2 });
+      const options = await getSalesOrderPoAllocationOptions(fixture.salesOrderRef);
+      const targetLine = options.salesLines.find((line) => Number(line.id) === Number(fixture.salesLine.id));
+      await createSalesOrderPoAllocation({
+        dispatchTargetRef: fixture.salesOrderRef,
+        salesOrderRef: fixture.salesOrderRef,
+        targetLineKey: targetLine.targetLineKey,
+        poLineId: fixture.sourceLine.id,
+        poRef: fixture.purchaseOrderRef,
+        targetSignature: options.order.targetSignature,
+        quantities: { pallets: 2 },
+        createdBy: "dispatch-po-partial-link-lifecycle-regression"
+      });
+      const jobId = `partial-linked-po-complete-${fixture.salesOrderId}`;
+      await query(
+        `INSERT INTO driver_job_records (
+           job_id, driver_login, stop_type, order_refs,
+           status, started_at, completed_at, job_details
+         ) VALUES (
+           $1, 'partial-linked-driver', 'dropoff', $2::jsonb,
+           'complete', now() - interval '5 minutes', now(), $3::jsonb
+         )`,
+        [
+          jobId,
+          JSON.stringify([fixture.salesOrderRef]),
+          JSON.stringify({
+            orderTypes: ["SO"],
+            orders: [{ orderType: "SO", orderRef: fixture.salesOrderRef }]
+          })
+        ]
+      );
+
+      const completion = await query(
+        `SELECT 1
+           FROM dispatch_order_completion_status
+          WHERE order_kind = 'PO' AND lower(order_ref) = lower($1)`,
+        [fixture.purchaseOrderRef]
+      );
+      assert.equal(completion.rowCount, 0,
+        "the PO must remain open until its ten-pallet residual route is completed");
     });
   } finally {
     await rollback.rollback();

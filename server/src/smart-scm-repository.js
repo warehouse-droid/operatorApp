@@ -1,7 +1,7 @@
 import { query } from "./db.js";
 import { writeAudit } from "./auth-repository.js";
 import { listSmartScmForecastRuns, listSmartScmForecasts, runSmartScmForecast } from "./smart-scm-forecast-repository.js";
-import { getSmartScmPlanningRun, listSmartScmBlanketPlanningPauses, listSmartScmPlanningRuns, listSmartScmProposals, runSmartScmPlan } from "./smart-scm-planning-repository.js";
+import { approveSmartScmPoPhase, getSmartScmPlanningRun, listSmartScmBlanketPlanningPauses, listSmartScmPlanningRuns, listSmartScmProposals, runSmartScmPlan } from "./smart-scm-planning-repository.js";
 import { listSmartScmPrintJobs, listYardPrinters } from "./smart-scm-print-repository.js";
 import { getSmartScmSyncStatus } from "./smart-scm-item-repository.js";
 import { listSmartScmActivePlanningExclusionItemIds, listSmartScmPlanningExclusions } from "./smart-scm-planning-exclusion-repository.js";
@@ -40,6 +40,8 @@ function publicSettings(row) {
     coverageOrderPercentile: number(row.coverage_order_percentile, 0.5),
     coverageHistoryWeeks: Number(row.coverage_history_weeks || 104),
     coveragePriorStrengthOrders: Number(row.coverage_prior_strength_orders || 8),
+    skip12441Enabled: Boolean(row.skip_12441_enabled),
+    inventoryPlanningMode: row.inventory_planning_mode || "integrated",
     modelActiveSegments: row.model_active_segments || {},
     routeMatrix: row.route_matrix || {},
     lastDailyPlanDate: row.last_daily_plan_date,
@@ -79,6 +81,10 @@ export async function updateSmartScmSettings(values = {}, operatorId = null) {
   const coverageOrderPercentile = number(values.coverageOrderPercentile, current.coverage_order_percentile || 0.5);
   const coverageHistoryWeeks = Math.round(number(values.coverageHistoryWeeks, current.coverage_history_weeks || 104));
   const coveragePriorStrengthOrders = Math.round(number(values.coveragePriorStrengthOrders, current.coverage_prior_strength_orders || 8));
+  const skip12441Enabled = values.skip12441Enabled === undefined
+    ? Boolean(current.skip_12441_enabled)
+    : Boolean(values.skip12441Enabled);
+  const inventoryPlanningMode = text(values.inventoryPlanningMode ?? current.inventory_planning_mode ?? "integrated");
   const modelActiveSegments = values.modelActiveSegments && typeof values.modelActiveSegments === "object"
     ? values.modelActiveSegments
     : current.model_active_segments;
@@ -117,6 +123,9 @@ export async function updateSmartScmSettings(values = {}, operatorId = null) {
   if (coveragePriorStrengthOrders < 1 || coveragePriorStrengthOrders > 100) {
     throw Object.assign(new Error("Coverage prior strength must be between 1 and 100 orders."), { status: 400 });
   }
+  if (!new Set(["integrated", "po_then_transfer"]).has(inventoryPlanningMode)) {
+    throw Object.assign(new Error("Inventory planning mode must be integrated or PO then Transfer."), { status: 400 });
+  }
   const result = await query(
     `UPDATE scm_smart_settings
         SET execution_mode = $2,
@@ -140,17 +149,19 @@ export async function updateSmartScmSettings(values = {}, operatorId = null) {
             coverage_prior_strength_orders = $20,
             model_active_segments = $21::jsonb,
             route_matrix = $22::jsonb,
-            updated_by = $23,
+            skip_12441_enabled = $23,
+            inventory_planning_mode = $24,
+            updated_by = $25,
             updated_at = now()
       WHERE id = $1
       RETURNING *`,
-    [1, executionMode, forecastMode, dailyEnabled, dailyTime, timeZone, vendorResponseSlaHours, truckCapacityLbs, fullLoadRatio, holdLoadRatio, formulaAverageWeeks, stockoutBenchmarkWeeks, deliverySafetyFactor, pickupSafetyFactor, zeroDemandCoverageEnabled, zeroDemandPickupOrderCount, zeroDemandDeliveryOrderCount, coverageOrderPercentile, coverageHistoryWeeks, coveragePriorStrengthOrders, JSON.stringify(modelActiveSegments), JSON.stringify(routeMatrix), operatorId]
+    [1, executionMode, forecastMode, dailyEnabled, dailyTime, timeZone, vendorResponseSlaHours, truckCapacityLbs, fullLoadRatio, holdLoadRatio, formulaAverageWeeks, stockoutBenchmarkWeeks, deliverySafetyFactor, pickupSafetyFactor, zeroDemandCoverageEnabled, zeroDemandPickupOrderCount, zeroDemandDeliveryOrderCount, coverageOrderPercentile, coverageHistoryWeeks, coveragePriorStrengthOrders, JSON.stringify(modelActiveSegments), JSON.stringify(routeMatrix), skip12441Enabled, inventoryPlanningMode, operatorId]
   );
   await writeAudit({
     actorOperatorId: operatorId,
     source: "smart_scm",
     action: "smart_scm.settings.update",
-    details: { executionMode, forecastMode, dailyEnabled, dailyTime, timeZone, vendorResponseSlaHours, truckCapacityLbs, fullLoadRatio, holdLoadRatio, formulaAverageWeeks, stockoutBenchmarkWeeks, deliverySafetyFactor, pickupSafetyFactor, zeroDemandCoverageEnabled, zeroDemandPickupOrderCount, zeroDemandDeliveryOrderCount, coverageOrderPercentile, coverageHistoryWeeks, coveragePriorStrengthOrders, modelActiveSegments, routeMatrix }
+    details: { executionMode, forecastMode, dailyEnabled, dailyTime, timeZone, vendorResponseSlaHours, truckCapacityLbs, fullLoadRatio, holdLoadRatio, formulaAverageWeeks, stockoutBenchmarkWeeks, deliverySafetyFactor, pickupSafetyFactor, zeroDemandCoverageEnabled, zeroDemandPickupOrderCount, zeroDemandDeliveryOrderCount, coverageOrderPercentile, coverageHistoryWeeks, coveragePriorStrengthOrders, skip12441Enabled, inventoryPlanningMode, modelActiveSegments, routeMatrix }
   });
   return publicSettings(result.rows[0]);
 }
@@ -283,4 +294,4 @@ export async function smartScmAutoTick() {
 }
 
 export { listSmartScmForecasts, listSmartScmForecastRuns, runSmartScmForecast } from "./smart-scm-forecast-repository.js";
-export { getSmartScmPlanningRun, listSmartScmPlanningRuns, listSmartScmProposals, runSmartScmPlan } from "./smart-scm-planning-repository.js";
+export { approveSmartScmPoPhase, getSmartScmPlanningRun, listSmartScmPlanningRuns, listSmartScmProposals, runSmartScmPlan } from "./smart-scm-planning-repository.js";

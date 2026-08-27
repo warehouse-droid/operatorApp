@@ -65,7 +65,7 @@ test("S11: the guarded client ships in a new atomic Driver shell generation", as
     read("public/driver.js")
   ]);
   assert.match(html, /driver\.js\?v=20260819-driver-route-readiness-v1/u);
-  assert.match(worker, /DRIVER_CACHE_NAME = `\$\{DRIVER_CACHE_PREFIX\}v37`/u);
+  assert.match(worker, /DRIVER_CACHE_NAME = `\$\{DRIVER_CACHE_PREFIX\}v38`/u);
   assert.match(worker, /driver\.js\?v=20260819-driver-route-readiness-v1/u);
   assert.match(driver, /serviceWorker\.register\("\/driver-service-worker\.js\?v=20260819-driver-route-readiness-v1"/u);
 });

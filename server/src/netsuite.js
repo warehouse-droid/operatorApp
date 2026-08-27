@@ -1195,6 +1195,42 @@ export async function fetchItemReceiptFromNetSuite(itemReceiptId) {
   }
 }
 
+/**
+ * Locate the unique IF/IR created for an Operator posting command. The caller
+ * must still read and verify source and line evidence before accepting it.
+ *
+ * @param {unknown} externalId
+ * @param {unknown} transactionType
+ */
+export async function findOperatorNetSuitePostingTransactionByExternalId(externalId, transactionType) {
+  const normalizedExternalId = String(externalId || "").trim();
+  const normalizedType = String(transactionType || "").trim().toUpperCase();
+  if (!/^[A-Za-z0-9_-]{1,180}$/u.test(normalizedExternalId) || !["IF", "IR"].includes(normalizedType)) {
+    throw new Error("A safe Operator NetSuite external ID and IF/IR type are required.");
+  }
+  const netSuiteType = normalizedType === "IF" ? "ItemShip" : "ItemRcpt";
+  const result = await suiteql(`
+    SELECT t.id,
+           t.tranid,
+           t.type,
+           t.externalid,
+           t.createdfrom
+      FROM transaction t
+     WHERE t.type = '${netSuiteType}'
+       AND t.externalid = '${normalizedExternalId}'
+     ORDER BY t.id DESC
+     FETCH FIRST 2 ROWS ONLY
+  `);
+  const rows = result.items || [];
+  if (rows.length > 1) {
+    throw Object.assign(new Error("More than one NetSuite transaction uses the Operator external ID."), {
+      code: "OPERATOR_NETSUITE_POSTING_REMOTE_MISMATCH",
+      ambiguous: true
+    });
+  }
+  return rows[0] || null;
+}
+
 export async function suiteql(q, params = [], options = {}) {
   const run = () => runSuiteql(q, params, options);
   const result = suiteqlQueue.then(run, run);
@@ -2389,6 +2425,66 @@ export async function fetchDeliveryOrderDetailsFromNetSuite(orderId, locationId 
 
   const result = await suiteql(detailQuery);
   return (result.items || []).map(normalizeOpenDeliveryLine);
+}
+
+export async function fetchSalesOrderFulfillmentStateFromNetSuite(orderId) {
+  const id = Number(orderId);
+  if (!Number.isInteger(id) || id <= 0) {
+    throw new Error("A valid numeric NetSuite sales order ID is required.");
+  }
+  const result = await suiteql(`
+    SELECT t.id,
+           t.tranid,
+           t.status,
+           BUILTIN.DF(t.status) AS status_text,
+           tl.uniquekey AS order_line,
+           tl.item AS item_id,
+           BUILTIN.DF(tl.item) AS item_name,
+           i.itemtype AS item_type,
+           tl.quantity,
+           tl.quantityshiprecv AS fulfilled_quantity,
+           tl.location AS location_id,
+           BUILTIN.DF(tl.location) AS location,
+           tl.isclosed AS line_closed
+      FROM transaction t
+      LEFT JOIN transactionline tl
+        ON tl.transaction = t.id
+       AND tl.item IS NOT NULL
+       AND tl.mainline = 'F'
+       AND tl.taxline = 'F'
+      LEFT JOIN item i ON i.id = tl.item
+     WHERE t.id = ${id}
+       AND t.type = 'SalesOrd'
+     ORDER BY tl.uniquekey
+  `);
+  const rows = result.items || [];
+  if (!rows.length) return null;
+  const header = rows[0];
+  const lines = rows.filter((row) => {
+    if (!row.order_line || !["InvtPart", "NonInvtPart"].includes(String(row.item_type || ""))) return false;
+    const itemName = String(row.item_name || "").trim().toUpperCase();
+    return !itemName.startsWith("DELIVERY CHARGE") && !itemName.startsWith("SALES CREDIT");
+  }).map((row) => {
+    const quantity = Math.abs(Number(row.quantity || 0));
+    const fulfilledQuantity = Math.abs(Number(row.fulfilled_quantity || 0));
+    const lineClosed = /^(?:t|true|yes|1)$/iu.test(String(row.line_closed || ""));
+    return {
+      orderLine: Number(row.order_line),
+      itemId: Number(row.item_id),
+      quantity: Number(quantity.toFixed(6)),
+      fulfilledQuantity: Number(fulfilledQuantity.toFixed(6)),
+      remainingQuantity: lineClosed ? 0 : Number(Math.max(quantity - fulfilledQuantity, 0).toFixed(6)),
+      location: row.location_id === null || row.location_id === undefined ? null : Number(row.location_id),
+      lineClosed
+    };
+  });
+  return {
+    id: Number(header.id),
+    tranid: String(header.tranid || ""),
+    status: String(header.status || ""),
+    statusText: String(header.status_text || ""),
+    lines
+  };
 }
 
 export async function fetchDeliveryOrderDetailsBatchFromNetSuite(orderIds) {

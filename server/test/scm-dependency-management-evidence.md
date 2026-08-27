@@ -2,7 +2,8 @@
 
 Date: 2026-08-19 UTC
 
-Status: implemented, verified in the disposable `mbbs-mbt-p1-test` Compose project, and deployed to production on 2026-08-20 UTC.
+Status: the original feature was deployed on 2026-08-20 UTC. The 2026-08-25
+started-job readiness correction is implemented locally and is not yet deployed.
 
 ## Outcome
 
@@ -10,9 +11,13 @@ Status: implemented, verified in the disposable `mbbs-mbt-p1-test` Compose proje
 - A target may have multiple distinct TO dependencies. Re-linking the same TO to the same logical target extends it; moving that TO to another target remains blocked.
 - Dispatch and SCM use the same atomic command, blocker, target-signature, plan-revision, and plan-digest path.
 - Relationship, plan snapshot, Operator materialization, action receipt, and old-manifest supersession commit together or roll back together.
-- A screen-off, suspended, stale, dirty, busy, or mismatched Driver device cannot authorize a route replacement. The request remains pending and the existing route remains usable.
-- Optional Web Push contains only a generic prompt. It cannot install or authorize a route.
-- The exact authenticated Driver device must be visible, online, synchronized, idle, and acknowledge readiness. Readiness lasts two minutes; SCM must then re-preview and explicitly click Apply.
+- A dependency change unrelated to started Driver work no longer waits for a
+  screen-off or suspended Driver PWA. Planned job rows without start/completion
+  evidence are explicitly ignored by the activity blocker.
+- Started or completed jobs for an affected order remain a hard blocker, while
+  activity for an unrelated order remains isolated.
+- Optional Web Push and the readiness endpoints remain non-authoritative; neither
+  can override the started-job blocker.
 - After commit, the old manifest and grant are fenced. Unexpected old events remain review evidence and cannot produce operational effects.
 
 ## Executed gates

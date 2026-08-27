@@ -90,16 +90,148 @@ test("split PO details do not render an Update action", () => {
   `, context);
   assert.doesNotMatch(sourceHtml, /data-action="unsplit-order"/,
     "the split-only recovery action must not leak onto a source PO");
+  assert.match(sourceHtml, /data-scm-field="dropoffPoint"/,
+    "PO Split must expose the same durable destination override as PO\/TO Schedule");
+  assert.match(sourceHtml, /Override all PO lines/,
+    "the destination control must explain that it replaces mixed NetSuite line routing");
 });
 
 test("the PO-split page requests the fixed client with a new cache key", () => {
-  assert.match(page, /dispatch-scm\.js\?v=20260813-po-split-status-v3/);
+  assert.match(page, /dispatch-scm\.js\?v=20260827-split-create-metadata-v1/);
+  assert.match(page, /dispatch\.css\?v=20260827-split-create-metadata-v1/);
+});
+
+test("PO Split renders canonical completion instead of retaining a Planned badge", () => {
+  const context = clientContext();
+  const html = vm.runInContext(`
+    scmLoading = false;
+    selectedScmOrderId = "SPLIT-COMPLETE-L1";
+    scmOrders = [{
+      id: "SPLIT-COMPLETE-L1",
+      type: "PO",
+      isScmSplit: true,
+      sourcePoRef: "SPLIT-COMPLETE",
+      customer: "Completion Vendor",
+      destinationYard: "3445",
+      dispatchPlanDate: "2026-08-25",
+      dispatchTruckPlate: "CE94489",
+      dispatchLoadName: "Load 1",
+      scm: { status: "Completed", etaDate: "2026-08-25" },
+      items: [{ pallets: 22, toPlt: 9, quantity: 198 }]
+    }];
+    renderOrderList();
+  `, context);
+
+  assert.match(html, /scm-completed-badge[^>]*>Completed</);
+  assert.doesNotMatch(html, /scm-planned-badge[^>]*>Planned</);
+});
+
+test("split quantity editor submits complete desired state with its optimistic revision", async () => {
+  const context = clientContext();
+  vm.runInContext(`
+    scmOrders = [{ id: "SPLIT-EDIT-L1", type: "PO", isScmSplit: true, scmSplitRevision: 7 }];
+    selectedScmOrderId = "SPLIT-EDIT-L1";
+    scmSplitEditor = {
+      split: {
+        splitPoRef: "SPLIT-EDIT-L1",
+        sourcePoRef: "SPLIT-EDIT",
+        revision: 7,
+        locked: false
+      },
+      lines: [
+        {
+          sourceLineId: 101,
+          sku: "CURRENT-SKU",
+          inSplit: true,
+          canAdd: false,
+          toPlt: 10,
+          toLyr: 0,
+          toSec: 0,
+          toPcs: 1,
+          current: { pallets: 5, layers: 0, sections: 0, pieces: 0, salesQty: 50 },
+          maximum: { pallets: 12, layers: 0, sections: 0, pieces: 120, salesQty: 120 }
+        },
+        {
+          sourceLineId: 202,
+          sku: "SOURCE-ONLY-SKU",
+          inSplit: false,
+          canAdd: true,
+          toPlt: 10,
+          toLyr: 0,
+          toSec: 0,
+          toPcs: 1,
+          current: { pallets: 0, layers: 0, sections: 0, pieces: 0, salesQty: 0 },
+          maximum: { pallets: 8, layers: 0, sections: 0, pieces: 80, salesQty: 80 }
+        }
+      ]
+    };
+    scmSplitLineInputs = {
+      "101": { pallets: 0, layers: 0, sections: 0, pieces: 0, salesQty: 0 },
+      "202": { pallets: 2, layers: 0, sections: 0, pieces: 0, salesQty: 0 }
+    };
+    renderScm = () => {};
+    loadScmOrders = async () => {};
+    scmApi = async (path, options) => {
+      globalThis.__capturedRequest = { path, options };
+      return { updated: { changes: [{ sourceLineId: 101 }, { sourceLineId: 202 }] } };
+    };
+  `, context);
+
+  await vm.runInContext("saveScmSplitLines()", context);
+  const request = context.__capturedRequest;
+  assert.equal(request.path, "/api/dispatch/scm/purchase-order-splits/SPLIT-EDIT-L1/lines");
+  const payload = JSON.parse(request.options.body);
+  assert.equal(payload.expectedRevision, 7);
+  assert.deepEqual(payload.lines.map((line) => ({
+    sourceLineId: line.sourceLineId,
+    pallets: line.pallets,
+    salesQty: line.salesQty
+  })), [
+    { sourceLineId: 101, pallets: 0, salesQty: 0 },
+    { sourceLineId: 202, pallets: 2, salesQty: 0 }
+  ], "an existing line cleared to zero must remain in the complete desired state");
+});
+
+test("converted split lines never retain a hidden sales quantity after their visible units are cleared", () => {
+  const context = clientContext();
+  const input = vm.runInContext(`scmSplitInputForLine({
+    sourceLineId: 301,
+    toPlt: 10,
+    current: { pallets: 4, layers: 0, sections: 0, pieces: 0, salesQty: 40 }
+  })`, context);
+  assert.equal(input.pallets, 4);
+  assert.equal(input.salesQty, 0,
+    "the hidden derived quantity must not prevent Remove from submitting a true zero");
+});
+
+test("an operational split renders an unplan-first lock instead of editable quantity actions", () => {
+  const context = clientContext();
+  const html = vm.runInContext(`
+    scmSplitEditor = {
+      split: { splitPoRef: "LOCKED-L1", sourcePoRef: "LOCKED", revision: 3, locked: true },
+      lines: [{
+        sourceLineId: 401,
+        sku: "LOCKED-SKU",
+        inSplit: true,
+        canAdd: false,
+        toPlt: 10,
+        current: { pallets: 1, salesQty: 10 },
+        maximum: { pallets: 5, salesQty: 50 }
+      }]
+    };
+    renderScmSplitLineEditor({ id: "LOCKED-L1", isScmSplit: true, scmSplitLocked: true });
+  `, context);
+  assert.match(html, /Unplan\/unlink it before changing any split detail/);
+  assert.match(html, /data-action="save-split-lines"[^>]+disabled/);
+  assert.match(html, /data-action="split-line-qty"[^>]+disabled/);
 });
 
 test("Create PO Ref submits the live modal yard selections instead of stale state", async () => {
   const controls = new Map([
     ['[data-action="split-destination-yard"]', { value: "28" }],
-    ['[data-action="split-pickup-yard"]', { value: "PERMACON Milton" }]
+    ['[data-action="split-pickup-yard"]', { value: "PERMACON Milton" }],
+    ['[data-action="split-initial-status"]', { value: "Priority" }],
+    ['[data-action="split-remark"]', { value: "Deliver before the long weekend." }]
   ]);
   const context = clientContext(controls);
   vm.runInContext(`
@@ -142,6 +274,37 @@ test("Create PO Ref submits the live modal yard selections instead of stale stat
   const payload = JSON.parse(request.options.body);
   assert.equal(payload.destinationLocationId, "28", "the live 2967 destination must be submitted");
   assert.equal(payload.pickupPoint, "PERMACON Milton", "the live pickup-yard selection must be submitted");
+  assert.equal(payload.status, "Priority", "the live initial status must be submitted");
+  assert.equal(payload.remarkOverride, "Deliver before the long weekend.",
+    "the live creation remark must be submitted");
+});
+
+test("Create PO Ref renders only manual status choices and a bounded remark", () => {
+  const context = clientContext();
+  const html = vm.runInContext(`
+    scmSummaryOpen = true;
+    selectedScmOrderId = "POB-CREATE-METADATA";
+    scmOrders = [{
+      id: "POB-CREATE-METADATA",
+      destinationLocationId: 15,
+      items: [{ lineRowId: 711, itemName: "Line", pallets: 2, quantity: 20, toPlt: 10 }]
+    }];
+    scmLineInputs = { "711": { pallets: 1, layers: 0, sections: 0, pieces: 0, salesQty: 0 } };
+    scmSplitInitialStatus = "Hold";
+    scmSplitRemark = "Handle & verify <labels>";
+    renderScmSplitModal();
+  `, context);
+
+  assert.match(html, /data-action="split-initial-status"/);
+  for (const status of ["Queued", "Urgent", "Cancelled", "Hold", "Priority", "Surplus Only", "Book Appt"]) {
+    assert.match(html, new RegExp(`<option value="${status}"`));
+  }
+  for (const controlled of ["Planned", "Partially Done", "In Transit", "Completed", "Reconcile Review"]) {
+    assert.doesNotMatch(html, new RegExp(`<option value="${controlled}"`));
+  }
+  assert.match(html, /<option value="Hold" selected>/);
+  assert.match(html, /data-action="split-remark"[^>]+maxlength="2000"/);
+  assert.match(html, /Handle &amp; verify &lt;labels&gt;/);
 });
 
 async function captureCreatePayload({
@@ -272,4 +435,54 @@ test("split Schedule Save submits the live status revision and retains a failed 
   assert.equal(vm.runInContext("scmOrders[0].scm.status", context), "Priority",
     "a failed request must keep the selected status visible for an intentional retry");
   assert.match(vm.runInContext("scmNotice", context), /Save schedule failed: simulated network failure/);
+});
+
+test("split Schedule Save changes the physical split destination before saving the shared schedule", async () => {
+  const destination = {
+    dataset: { scmField: "dropoffPoint" },
+    type: "select-one",
+    value: "12441"
+  };
+  const controls = new Map([["[data-scm-field]", [destination]]]);
+  const context = clientContext(controls);
+  vm.runInContext(`
+    scmOrders = [{
+      id: "DESTINATION-SPLIT",
+      originalPoRef: "DESTINATION-SPLIT",
+      type: "PO",
+      isScmSplit: true,
+      items: [],
+      scm: {
+        status: "Queued",
+        method: "MBT",
+        dropoffPoint: "3445",
+        updatedAt: "2026-08-24T12:00:00.123Z"
+      }
+    }];
+    selectedScmOrderId = "DESTINATION-SPLIT";
+    renderScm = () => {};
+    loadScmOrders = async () => {};
+    globalThis.__requests = [];
+    scmApi = async (path, options) => {
+      globalThis.__requests.push({ path, options });
+      if (path.endsWith("/destination")) {
+        return { updated: { destinationLocation: "12441", scheduleUpdatedAt: "2026-08-24T12:01:00.456789Z" } };
+      }
+      return { updated: {} };
+    };
+  `, context);
+
+  await vm.runInContext("saveScmScheduleForSelected()", context);
+  const requests = context.__requests;
+  assert.deepEqual(Array.from(requests, (request) => String(request.path)), [
+    "/api/dispatch/scm/purchase-order-splits/DESTINATION-SPLIT/destination",
+    "/api/scm/schedule/DESTINATION-SPLIT"
+  ]);
+  const destinationPatch = JSON.parse(requests[0].options.body);
+  assert.equal(destinationPatch.destinationLocationId, "15");
+  assert.equal(destinationPatch.expectedUpdatedAt, "2026-08-24T12:00:00.123Z");
+  const schedulePatch = JSON.parse(requests[1].options.body);
+  assert.equal(schedulePatch.dropoffPoint, "12441");
+  assert.equal(schedulePatch.expectedUpdatedAt, "2026-08-24T12:01:00.456789Z",
+    "the second save must use the schedule revision created by the destination transaction");
 });

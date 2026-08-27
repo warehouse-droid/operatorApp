@@ -156,8 +156,9 @@ export function calculateMbbsPurchaseRouteAmount(rawInput) {
   const policy = input.mbbsChargingPolicy && typeof input.mbbsChargingPolicy === "object"
     ? input.mbbsChargingPolicy
     : {};
-  if (policy.schemaVersion !== 2 || policy.currency !== "CAD") {
-    return invalid("MBT_RATE_CARD_POLICY_INVALID", "MBBS policy schema version 2 in CAD is required for vendor-route pricing.");
+  const supportedSchema = policy.schemaVersion === 2 || policy.schemaVersion === 3;
+  if (!supportedSchema || policy.currency !== "CAD") {
+    return invalid("MBT_RATE_CARD_POLICY_INVALID", "MBBS policy schema version 2 or 3 in CAD is required for vendor-route pricing.");
   }
   const pricingMethod = String(input.pricingMethod ?? "");
   if (!PRICING_METHODS.has(pricingMethod)) {

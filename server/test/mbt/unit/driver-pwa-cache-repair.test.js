@@ -11,8 +11,8 @@ const PUBLIC = path.resolve(HERE, "../../../public");
 const DRIVER_SOURCE = fs.readFileSync(path.join(PUBLIC, "driver.js"), "utf8");
 const WORKER_SOURCE = fs.readFileSync(path.join(PUBLIC, "driver-service-worker.js"), "utf8");
 const ORIGIN = "https://driver-cache.test";
-const ACTIVE_CACHE = "mbbs-driver-shell-v37";
-const REFRESH_CACHE = "mbbs-driver-shell-refresh-v37";
+const ACTIVE_CACHE = "mbbs-driver-shell-v38";
+const REFRESH_CACHE = "mbbs-driver-shell-refresh-v38";
 const OFFLINE_MODE_URL = `${ORIGIN}/__mbbs_driver_offline_mode__`;
 
 function requestUrl(input) {

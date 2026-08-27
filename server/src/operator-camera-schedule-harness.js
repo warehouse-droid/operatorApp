@@ -72,11 +72,11 @@ includesAll(i18n, [
   '"operator.cameraPreviewNotReady"'
 ], "Bilingual camera strings");
 includesAll(operatorHtml, [
-  "/operator.css?v=20260815-page-confirm-v1",
+  "/operator.css?v=20260825-fulfillment-layout-v1",
   "/vendor/quagga2/quagga.min.js?v=1.12.1",
-  "/operator.js?v=20260815-operator-page-confirm-v1"
+  "/operator.js?v=20260825-fulfillment-layout-v1"
 ], "Operator camera cache busting");
-assert.ok(serviceWorker.includes("mbbs-yard-operator-v141-page-confirm-v1"), "Operator service-worker cache must advance.");
+assert.ok(serviceWorker.includes("mbbs-yard-operator-v142-fulfillment-layout-v1"), "Operator service-worker cache must advance.");
 assert.ok(serviceWorker.includes("/vendor/quagga2/quagga.min.js?v=1.12.1"), "The offline PWA shell must cache the 1D scanner.");
 assert.match(serviceWorker, /cache\.addAll\(APP_SHELL\.map\(\(url\) => new Request\([\s\S]*?cache: "reload"/, "A fresh Operator shell must bypass stale iPhone HTTP cache entries.");
 assert.ok(server.includes('app.use("/vendor/quagga2", express.static(quaggaScannerDir))'), "Server must expose the installed 1D scanner bundle.");
@@ -93,9 +93,9 @@ assert.equal(barcodeHelpers.normalizedPickupCameraCode("[object Object]"), "");
 const quaggaHelpers = Function(`${operator.slice(barcodeHelperStart, barcodeHelperEnd)}; return { pickupQuaggaOrderCode };`)();
 assert.equal(quaggaHelpers.pickupQuaggaOrderCode([{ codeResult: { code: "SOB115348" } }]), "SOB115348");
 includesAll(serviceWorker, [
-  "mbbs-yard-operator-v141-page-confirm-v1",
-  "/i18n.js?v=20260815-customer-pickup-photo-gate-v1",
-  "/operator.js?v=20260815-operator-page-confirm-v1",
+  "mbbs-yard-operator-v142-fulfillment-layout-v1",
+  "/i18n.js?v=20260825-local-status-plan-date-v1",
+  "/operator.js?v=20260825-fulfillment-layout-v1",
   'url.pathname === "/driver"',
   'url.pathname.startsWith("/driver-")'
 ], "Isolated Operator service-worker cache");
@@ -114,6 +114,6 @@ includesAll(schedule, [
   ': ["admin", "scm", "scm_staff", "dispatcher", "yard_manager"]',
   'if (role === "dispatcher") return ["dispatch"];'
 ], "Shared schedule host and dispatcher access");
-assert.ok(scheduleHtml.includes("/scm-schedule.js?v=20260813-status-concurrency-v2"), "Shared schedule client cache busting missing.");
+assert.ok(scheduleHtml.includes("/scm-schedule.js?v=20260827-schedule-remarks-v1"), "Shared schedule client cache busting missing.");
 
 console.log("Operator camera and Dispatch PO/TO Schedule harness passed.");

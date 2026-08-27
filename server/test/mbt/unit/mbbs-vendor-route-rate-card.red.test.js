@@ -5,6 +5,7 @@ import { readFile } from "node:fs/promises";
 import test from "node:test";
 
 import { normalizeLocalRateCardGraph } from "../../../src/mbt/rate-card-configuration-service.js";
+import { DEFAULT_MBBS_RATE_CARD_POLICY_V3 } from "../../../src/mbt/mbbs-rate-card-policy.js";
 
 const migration = await readFile(
   new URL("../../../migrations/166_mbt_mbbs_po_vrma_vendor_route_rates.sql", import.meta.url),
@@ -100,6 +101,16 @@ test("M1 rate-card graph accepts schema-v2 matrix rows and rejects rows on schem
     () => normalizeLocalRateCardGraph(legacy, { sourceKind: "manual" }),
     (error) => error?.code === "MBT_RATE_CARD_INPUT_INVALID"
   );
+});
+
+test("v4 rate-card graph accepts schema-v3 vendor-route rows without changing exact CAD evidence", () => {
+  const v4 = graph();
+  v4.version.versionNumber = 4;
+  v4.mbbsChargingPolicy = structuredClone(DEFAULT_MBBS_RATE_CARD_POLICY_V3);
+
+  const normalized = normalizeLocalRateCardGraph(v4, { sourceKind: "manual" });
+  assert.equal(normalized.mbbsChargingPolicy.schemaVersion, 3);
+  assert.deepEqual(normalized.mbbsVendorRouteRates, graph().mbbsVendorRouteRates);
 });
 
 test("M1 migration owns exact-CAD matrix rows, schema-v1/v2 constraints, and immutable lifecycle triggers", () => {

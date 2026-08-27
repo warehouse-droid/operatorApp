@@ -401,6 +401,23 @@
   margin: 0 0 8px;
 }
 
+.stock-request-decision-editor {
+  display: grid;
+  gap: 10px;
+  border: 2px solid #d78c85;
+  border-radius: 9px;
+  background: #fff5f3;
+  padding: 12px;
+}
+
+.stock-request-decision-editor p {
+  margin: 0;
+}
+
+.stock-request-decision-editor textarea {
+  resize: vertical;
+}
+
 .stock-request-event {
   display: grid;
   gap: 2px;
@@ -410,6 +427,87 @@
 }
 
 @media (max-width: 900px) {
+  body.scm-stock-requests-page.has-app-sidebar,
+  body.sales-stock-requests-page.has-app-sidebar {
+    --app-sidebar-width: 58px !important;
+    padding-left: 58px !important;
+  }
+
+  body.scm-stock-requests-page .app-sidebar,
+  body.sales-stock-requests-page .app-sidebar {
+    width: 58px;
+  }
+
+  body.scm-stock-requests-page .app-sidebar-head,
+  body.sales-stock-requests-page .app-sidebar-head {
+    grid-template-columns: 1fr;
+    padding: 10px 8px;
+  }
+
+  body.scm-stock-requests-page .app-sidebar-brand,
+  body.scm-stock-requests-page .app-sidebar-section-title,
+  body.scm-stock-requests-page .app-sidebar-text,
+  body.sales-stock-requests-page .app-sidebar-brand,
+  body.sales-stock-requests-page .app-sidebar-section-title,
+  body.sales-stock-requests-page .app-sidebar-text {
+    display: none;
+  }
+
+  body.scm-stock-requests-page .app-sidebar-link,
+  body.sales-stock-requests-page .app-sidebar-link {
+    grid-template-columns: 1fr;
+    justify-items: center;
+    padding: 0;
+  }
+
+  body.scm-stock-requests-page .app-sidebar-scroll,
+  body.sales-stock-requests-page .app-sidebar-scroll {
+    padding: 10px 6px;
+  }
+
+  body.scm-stock-requests-page .stock-request-shell,
+  body.sales-stock-requests-page .stock-request-shell {
+    width: calc(100vw - 58px) !important;
+    min-width: 0;
+  }
+
+  body.scm-stock-requests-page .dispatch-topbar,
+  body.sales-stock-requests-page .dispatch-topbar {
+    grid-template-columns: minmax(0, 1fr) auto !important;
+    grid-template-areas:
+      "main language"
+      "actions actions";
+  }
+
+  body.scm-stock-requests-page .dispatch-topbar > div:first-child,
+  body.sales-stock-requests-page .dispatch-topbar > div:first-child {
+    grid-area: main;
+    min-width: 0;
+  }
+
+  body.scm-stock-requests-page .topbar-language,
+  body.sales-stock-requests-page .topbar-language {
+    grid-area: language;
+  }
+
+  body.scm-stock-requests-page .topbar-actions,
+  body.sales-stock-requests-page .topbar-actions {
+    grid-area: actions;
+    min-width: 0;
+    justify-self: end;
+    flex-wrap: wrap;
+  }
+
+  .stock-request-page,
+  .stock-request-toolbar,
+  .stock-request-toolbar > *,
+  .stock-request-tabs,
+  .stock-request-workspace,
+  .stock-request-panel {
+    min-width: 0;
+    max-width: 100%;
+  }
+
   body {
     overflow: auto;
   }

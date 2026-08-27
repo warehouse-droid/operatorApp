@@ -8,6 +8,11 @@ import { beginRollbackContext, closeDb, query, withTransaction } from "../../../
 import { dispatchOrderFromCustomOrder, listDispatchCustomOrders } from "../../../src/dispatch-custom-order-repository.js";
 import { getDeliveryOrder, listDeliveryOrders } from "../../../src/delivery-repository.js";
 import { listMbbsBillingCandidates } from "../../../src/mbt/mbbs-billing-candidate-service.js";
+import {
+  applySalesOrderReattemptCurrentItemCorrection,
+  assertSalesOrderReattemptDriverReady,
+  getSalesOrderReattemptCurrentItemCorrectionPreview
+} from "../../../src/sales-order-reattempt-correction-repository.js";
 import { authorizeSalesOrderReload } from "../../../src/sales-order-reload.js";
 import {
   createReloadCycle,
@@ -249,7 +254,9 @@ test("completed grouped SO creates a selected, planned, non-billable re-attempt 
       assert.equal(persistedPair.rows[0].billing_disposition, "linked_parent_no_charge");
       assert.equal(Number(persistedPair.rows[0].pallet_qty), 16);
       assert.equal(Number(persistedPair.rows[0].weight_lbs), 47_071.9616);
-      assert.equal(persistedPair.rows[0].line_snapshot[0].sku, "HISTORICAL-CG");
+      assert.equal(persistedPair.rows[0].line_snapshot[0].sku, "CURRENT-GN");
+      assert.equal(persistedPair.rows[0].line_snapshot[0].itemId, currentItemId);
+      assert.equal(persistedPair.rows[0].line_snapshot[0].historicalSku, "HISTORICAL-CG");
 
       assert.deepEqual(await listActiveReloadOrders({ locationId: 15 }), [], "Unplanned re-attempt must not reach Operator.");
       await assert.rejects(
@@ -267,7 +274,8 @@ test("completed grouped SO creates a selected, planned, non-billable re-attempt 
       const plannerOrder = dispatchOrderFromCustomOrder(storedChild);
       assert.equal(plannerOrder.salesOrderReattempt, true);
       assert.equal(plannerOrder.parentOrderRef, orderRef);
-      assert.equal(plannerOrder.items[0].sku, "HISTORICAL-CG");
+      assert.equal(plannerOrder.items[0].sku, "CURRENT-GN");
+      assert.equal(plannerOrder.items[0].historicalSku, "HISTORICAL-CG");
       assert.equal(plannerOrder.items[0].pallets, 16);
       assert.equal(plannerOrder.pallets, 16);
       assert.equal(plannerOrder.weight, 47_071.9616);
@@ -320,7 +328,8 @@ test("completed grouped SO creates a selected, planned, non-billable re-attempt 
       assert.equal(operatorOrders[0].dispatch_truck_plate, "REAT-TRUCK");
       assert.equal(operatorOrders[0].dispatch_load_name, "Re-attempt Load 1");
       assert.equal(operatorOrders[0].lines.length, 1);
-      assert.equal(operatorOrders[0].lines[0].sku, "HISTORICAL-CG");
+      assert.equal(operatorOrders[0].lines[0].sku, "CURRENT-GN");
+      assert.equal(operatorOrders[0].lines[0].historicalSku, "HISTORICAL-CG");
 
       const detail = await getDeliveryOrder(orderId);
       assert.equal(detail?.tranid, `${orderRef}-R1`);
@@ -344,7 +353,7 @@ test("completed grouped SO creates a selected, planned, non-billable re-attempt 
       });
       assert.equal(loaded.completed, true);
       assert.equal(loaded.attemptLines.length, 1);
-      assert.equal(loaded.attemptLines[0].sku, "HISTORICAL-CG");
+      assert.equal(loaded.attemptLines[0].sku, "CURRENT-GN");
       assert.equal(loaded.attemptLines[0].packedPallets, 16);
 
       await query(
@@ -380,6 +389,297 @@ test("completed grouped SO creates a selected, planned, non-billable re-attempt 
          UNION ALL
          SELECT '6-balance-' || b.item_id, to_jsonb(b) FROM inventory_balances b WHERE b.item_id = ANY($4::bigint[])`,
         [orderId, groupRef, JSON.stringify([orderRef]), [oldItemId, currentItemId, secondItemId]]
+      );
+      assert.deepEqual(protectedAfter, protectedBefore);
+    });
+  } finally {
+    await rollback.rollback();
+  }
+});
+
+test("completed legacy CG child receives one immutable GN overlay without fabricating Operator load evidence", async () => {
+  const rollback = await beginRollbackContext();
+  try {
+    await rollback.run(async () => {
+      const suffix = Number(String(Date.now()).slice(-7));
+      const orderId = 9_500_000_000 + suffix;
+      const historicalItemId = 8_500_000 + suffix;
+      const currentItemId = historicalItemId + 1;
+      const netsuiteLineId = 4_800_000 + suffix;
+      const orderRef = `SOM-CORR-${suffix}`;
+      const operatorId = `reattempt-correction-${suffix}`;
+      const authorizationRequestId = crypto.randomUUID();
+      const correctionRequestId = crypto.randomUUID();
+
+      await query(
+        `INSERT INTO operators (
+           id, username, display_name, password_hash, password_salt, role, roles, yard_location_ids
+         ) VALUES ($1, $1, 'Re-attempt Correction Admin', 'hash', 'salt', 'admin',
+                   ARRAY['admin']::text[], ARRAY[15]::integer[])`,
+        [operatorId]
+      );
+      await query(
+        `INSERT INTO inventory_items (
+           item_id, item_name, display_name, item_description, item_type, item_type_text,
+           stock_unit, raw, to_plt, to_lyr, to_sec, to_pcs, item_weight, synced_at
+         ) VALUES
+           ($1, 'LEGACY-CG', 'Legacy CG', 'Historical grey', 'InvtPart', 'Inventory Item',
+            'SQFT', '{}'::jsonb, 91.88, 10.21, 0, 0, 32.02, now()),
+           ($2, 'CURRENT-GN', 'Current GN', 'Current granite', 'InvtPart', 'Inventory Item',
+            'SQFT', '{}'::jsonb, 91.88, 10.21, 0, 0, 32.02, now())`,
+        [historicalItemId, currentItemId]
+      );
+      await query(
+        `INSERT INTO sales_orders (
+           netsuite_id, tranid, trandate, customer, status, status_text,
+           outbound_location_id, outbound_location, sales_order_type,
+           operator_status, local_yard_order_status, fulfillment_status,
+           netsuite_active, dispatch_address, dispatch_planned
+         ) VALUES (
+           $1, $2, CURRENT_DATE, 'Correction Customer', 'B', 'Sales Order : Pending Fulfillment',
+           15, '12441', 'Delivery', 'loaded', 'Loaded', 'not_fulfilled', true,
+           '77 Clarence St, Woodbridge, ON L4L 1L4', true
+         )`,
+        [orderId, orderRef]
+      );
+      await query(
+        `INSERT INTO sales_order_lines (
+           sales_order_id, line_id, item_id, item_name, sku, item_description,
+           item_type, quantity, unit, location_id, location,
+           pallet_qty, layer_qty, section_qty, piece_qty,
+           to_plt, to_lyr, to_sec, to_pcs, loaded_qty, loaded_uom,
+           item_weight, netsuite_active, confirmed
+         ) VALUES (
+           $1, $2, $3, 'CURRENT-GN', 'CURRENT-GN', 'Current granite',
+           'InvtPart', 1470.08, 'SQFT', 15, '12441', 16, 0, 0, 0,
+           91.88, 10.21, 0, 0, 1470.08, 'SQFT', 32.02, true, false
+         )`,
+        [orderId, netsuiteLineId, currentItemId]
+      );
+      const sourceLoad = await query(
+        `INSERT INTO operator_load_records (
+           load_type, order_family, order_id, order_ref, operator_id,
+           photo_data_url, photo_data_urls, line_snapshot, response
+         ) VALUES (
+           'sales_order_delivery_load', 'sales_order', $1, $2, $3,
+           'data:image/jpeg;base64,b3JpZ2luYWw=', '["data:image/jpeg;base64,b3JpZ2luYWw="]'::jsonb,
+           $4::jsonb, '{"localYardOrderStatus":"Loaded"}'::jsonb
+         ) RETURNING id`,
+        [orderId, orderRef, operatorId, JSON.stringify([{
+          lineId: String(netsuiteLineId),
+          itemId: String(historicalItemId),
+          itemName: "LEGACY-CG",
+          description: "Historical grey",
+          loadedQty: 1470.08,
+          loadedUom: "SQFT"
+        }])]
+      );
+      const originalPlan = await query(
+        `INSERT INTO dispatch_plans (plan_date, status, note)
+         VALUES (CURRENT_DATE, 'confirmed', 'Immutable original') RETURNING id`
+      );
+      await query(
+        `INSERT INTO driver_job_records (
+           job_id, plan_id, plan_date, driver_login, truck_plate, load_id, load_name,
+           stop_id, stop_type, order_refs, photo_data_urls, status, started_at, completed_at
+         ) VALUES (
+           $1, $2, CURRENT_DATE, 'original-driver', 'ORIGINAL', 'ORIGINAL-L1', 'Original Load',
+           'ORIGINAL-DROP', 'dropoff', $3::jsonb, '[]'::jsonb, 'complete', now() - interval '1 hour', now()
+         )`,
+        [`ORIGINAL-CORR-${suffix}`, originalPlan.rows[0].id, JSON.stringify([orderRef])]
+      );
+
+      const authorizationPreview = await getSalesOrderReattemptAuthorizationPreview(orderId);
+      assert.equal(authorizationPreview.sourceLoadRecordId, Number(sourceLoad.rows[0].id));
+      const cycle = await authorizeSalesOrderReload({
+        orderId,
+        requestId: authorizationRequestId,
+        sourceLoadRecordId: authorizationPreview.sourceLoadRecordId,
+        lineSelections: [{
+          lineKey: authorizationPreview.lines[0].lineKey,
+          palletQty: 16,
+          reason: "Deliver the corrected current colour"
+        }],
+        actor: { id: operatorId }
+      }, {
+        findCycleByRequestId: findReloadCycleByRequestId,
+        findLocalOrderIdentity: findLocalSalesOrderIdentity,
+        assertActorYardAccess: async () => {},
+        refreshOrder: async () => {},
+        withTransaction,
+        lockAuthorizationSnapshot: lockReloadAuthorizationSnapshot,
+        createCycle: createReloadCycle,
+        writeAudit: async () => {}
+      });
+
+      const legacySnapshot = [{
+        ...cycle.reattemptOrder.lineSnapshot[0],
+        itemId: historicalItemId,
+        sku: "LEGACY-CG",
+        itemName: "LEGACY-CG",
+        description: "Historical grey",
+        effectiveItemId: historicalItemId,
+        effectiveSku: "LEGACY-CG",
+        historicalItemId,
+        historicalSku: "LEGACY-CG",
+        currentItemId,
+        currentSku: "CURRENT-GN"
+      }];
+      await query(
+        `UPDATE operator_reload_cycle_lines
+            SET item_id = $2, item_name = 'LEGACY-CG', sku = 'LEGACY-CG',
+                item_description = 'Historical grey', sales_uom = 'SQFT'
+          WHERE cycle_id = $1`,
+        [cycle.id, historicalItemId]
+      );
+      await query(
+        `UPDATE dispatch_custom_orders
+            SET line_snapshot = $2::jsonb
+          WHERE id = $1`,
+        [cycle.reattemptOrderId, JSON.stringify(legacySnapshot)]
+      );
+      await query(
+        `INSERT INTO driver_job_records (
+           job_id, plan_id, plan_date, driver_login, truck_plate, load_id, load_name,
+           stop_id, stop_type, order_refs, photo_data_urls, status, started_at, completed_at
+         ) VALUES (
+           $1, $2, CURRENT_DATE, 'sety', 'CORR-TRUCK', 'CORR-L1', 'Correction Load',
+           'CORR-DROP', 'dropoff', $3::jsonb,
+           '["r2://driver/immutable-correction-photo.jpg"]'::jsonb,
+           'complete', now() - interval '15 minutes', now() - interval '5 minutes'
+         )`,
+        [`CORR-JOB-${suffix}`, originalPlan.rows[0].id, JSON.stringify([cycle.reattemptOrderRef])]
+      );
+      await query(
+        `UPDATE dispatch_custom_orders
+            SET status = 'completed', completed_at = now() - interval '5 minutes', updated_by = 'driver:sety'
+          WHERE id = $1`,
+        [cycle.reattemptOrderId]
+      );
+
+      const protectedBefore = await jsonSnapshot(
+        `SELECT '1-parent' AS sort_key, to_jsonb(parent) AS row FROM sales_orders parent WHERE parent.netsuite_id = $1
+         UNION ALL
+         SELECT '2-source-load', to_jsonb(load) FROM operator_load_records load WHERE load.id = $2
+         UNION ALL
+         SELECT '3-driver-' || driver.id, to_jsonb(driver) FROM driver_job_records driver
+          WHERE driver.order_refs @> $3::jsonb`,
+        [orderId, sourceLoad.rows[0].id, JSON.stringify([cycle.reattemptOrderRef])]
+      );
+      const preview = await getSalesOrderReattemptCurrentItemCorrectionPreview(cycle.reattemptOrderRef);
+      assert.equal(preview.childStatus, "completed");
+      assert.equal(preview.cycleStatus, "authorized");
+      assert.equal(preview.hasOperatorLoad, false);
+      assert.equal(preview.hasCompletedDriverActivity, true);
+      assert.equal(preview.lines[0].beforeSku, "LEGACY-CG");
+      assert.equal(preview.lines[0].afterSku, "CURRENT-GN");
+      assert.equal(preview.lines[0].historicalSku, "LEGACY-CG");
+      assert.equal(preview.lines[0].requiresCorrection, true);
+      assert.equal(preview.lines[0].currentSalesQty, 1470.08);
+      assert.equal(preview.lines[0].currentPalletQty, 16);
+      assert.equal(preview.lines[0].currentQuantitySupportsTarget, true);
+
+      const staleCommand = {
+        orderRef: cycle.reattemptOrderRef,
+        idempotencyKey: correctionRequestId,
+        netsuiteLineId,
+        expectedStateFingerprint: preview.lines[0].expectedStateFingerprint,
+        reason: "Physically verified that Sety delivered CURRENT-GN",
+        physicallyDeliveredCurrentItem: true
+      };
+      await query(
+        `UPDATE sales_order_lines
+            SET quantity = 1400, pallet_qty = 15
+          WHERE sales_order_id = $1 AND line_id = $2`,
+        [orderId, netsuiteLineId]
+      );
+      const unsupported = await getSalesOrderReattemptCurrentItemCorrectionPreview(cycle.reattemptOrderRef);
+      assert.equal(unsupported.canCorrect, false);
+      assert.equal(unsupported.lines[0].currentQuantitySupportsTarget, false);
+      await assert.rejects(
+        applySalesOrderReattemptCurrentItemCorrection(staleCommand, { id: operatorId }),
+        (error) => error?.code === "REATTEMPT_CORRECTION_STALE"
+      );
+      await assert.rejects(
+        applySalesOrderReattemptCurrentItemCorrection({
+          ...staleCommand,
+          idempotencyKey: crypto.randomUUID(),
+          expectedStateFingerprint: unsupported.lines[0].expectedStateFingerprint
+        }, { id: operatorId }),
+        (error) => error?.code === "REATTEMPT_CORRECTION_CURRENT_QUANTITY_UNSUPPORTED"
+      );
+      assert.equal(Number((await query(
+        `SELECT count(*)::int AS count
+           FROM sales_order_reattempt_item_corrections
+          WHERE reattempt_order_id = $1`,
+        [cycle.reattemptOrderId]
+      )).rows[0].count), 0);
+      await query(
+        `UPDATE sales_order_lines
+            SET quantity = 1470.08, pallet_qty = 16
+          WHERE sales_order_id = $1 AND line_id = $2`,
+        [orderId, netsuiteLineId]
+      );
+      const refreshed = await getSalesOrderReattemptCurrentItemCorrectionPreview(cycle.reattemptOrderRef);
+
+      const command = {
+        ...staleCommand,
+        expectedStateFingerprint: refreshed.lines[0].expectedStateFingerprint
+      };
+      const applied = await applySalesOrderReattemptCurrentItemCorrection(command, { id: operatorId });
+      const replay = await applySalesOrderReattemptCurrentItemCorrection(command, { id: operatorId });
+      assert.equal(applied.idempotent, false);
+      assert.equal(replay.idempotent, true);
+      assert.equal(replay.correction.correctionId, applied.correction.correctionId);
+      assert.equal(applied.preview.lines[0].requiresCorrection, false);
+      assert.equal(applied.preview.lines[0].latestCorrection.correctionId, applied.correction.correctionId);
+
+      const stored = await query(
+        `SELECT cycle.status, cycle.completion_source, cycle.operator_load_evidence_missing,
+                cycle.completion_reconciled_by,
+                (SELECT COUNT(*)::int FROM operator_load_records load WHERE load.reload_cycle_id = cycle.id) AS reload_load_count,
+                (SELECT COUNT(*)::int FROM sales_order_reattempt_item_corrections correction
+                  WHERE correction.reattempt_order_id = cycle.reattempt_order_id) AS correction_count
+           FROM operator_reload_cycles cycle
+          WHERE cycle.id = $1`,
+        [cycle.id]
+      );
+      assert.equal(stored.rows[0].status, "completed");
+      assert.equal(stored.rows[0].completion_source, "driver_completion_reconciliation");
+      assert.equal(stored.rows[0].operator_load_evidence_missing, true);
+      assert.equal(stored.rows[0].completion_reconciled_by, operatorId);
+      assert.equal(stored.rows[0].reload_load_count, 0);
+      assert.equal(stored.rows[0].correction_count, 1);
+
+      const [projectedChild] = await listDispatchCustomOrders({
+        search: cycle.reattemptOrderRef,
+        includeCompleted: true
+      });
+      assert.equal(projectedChild.lineSnapshot[0].sku, "CURRENT-GN");
+      assert.equal(projectedChild.lineSnapshot[0].effectiveSku, "CURRENT-GN");
+      assert.equal(projectedChild.lineSnapshot[0].historicalSku, "LEGACY-CG");
+      assert.equal(projectedChild.lineSnapshot[0].pallets, 16);
+      assert.equal(projectedChild.lineSnapshot[0].salesQty, 1470.08);
+
+      await assert.rejects(
+        withTransaction(() => query(
+          `UPDATE sales_order_reattempt_item_corrections SET reason = 'tampered' WHERE id = $1`,
+          [applied.correction.correctionId]
+        )),
+        (error) => /sales_order_reattempt_item_corrections is append-only; UPDATE is not permitted/i.test(error?.message || "")
+      );
+      await assert.rejects(
+        assertSalesOrderReattemptDriverReady([cycle.reattemptOrderRef]),
+        (error) => error?.code === "DRIVER_REATTEMPT_OPERATOR_LOAD_REQUIRED"
+      );
+      const protectedAfter = await jsonSnapshot(
+        `SELECT '1-parent' AS sort_key, to_jsonb(parent) AS row FROM sales_orders parent WHERE parent.netsuite_id = $1
+         UNION ALL
+         SELECT '2-source-load', to_jsonb(load) FROM operator_load_records load WHERE load.id = $2
+         UNION ALL
+         SELECT '3-driver-' || driver.id, to_jsonb(driver) FROM driver_job_records driver
+          WHERE driver.order_refs @> $3::jsonb`,
+        [orderId, sourceLoad.rows[0].id, JSON.stringify([cycle.reattemptOrderRef])]
       );
       assert.deepEqual(protectedAfter, protectedBefore);
     });
