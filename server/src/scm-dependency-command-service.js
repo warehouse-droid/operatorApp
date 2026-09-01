@@ -153,7 +153,19 @@ async function mutateRelationship(command, actor, preview) {
         createdBy: actor.sessionId || actor.id || ""
       };
       const allocations = Array.isArray(payload.lines)
-        ? await createSalesOrderPoAllocations({ ...shared, lines: payload.lines })
+        || Array.isArray(payload.directServicePoLineIds)
+        || Array.isArray(payload.serviceSalesLineKeys)
+        ? await createSalesOrderPoAllocations({
+            ...shared,
+            lines: Array.isArray(payload.lines) ? payload.lines : [{
+              targetLineKey: payload.targetLineKey,
+              salesLineId: payload.salesLineId,
+              poLineId: payload.poLineId,
+              quantities: payload.quantities || payload
+            }],
+            directServicePoLineIds: payload.directServicePoLineIds,
+            serviceSalesLineKeys: payload.serviceSalesLineKeys
+          })
         : [await createSalesOrderPoAllocation({
             ...shared,
             targetLineKey: payload.targetLineKey,

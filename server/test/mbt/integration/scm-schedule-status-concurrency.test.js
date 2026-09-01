@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import test, { after } from "node:test";
 
-import { closeDb, query } from "../../../src/db.js";
+import { beginRollbackContext, closeDb, query } from "../../../src/db.js";
 import {
   createScmPurchaseOrderSplit,
   listScmSchedule,
@@ -127,6 +127,105 @@ test("a loaded schedule revision rejects stale status overwrites and allows a re
   });
   const refreshed = await listScmSchedule({ exactRef: source.purchaseOrderRef });
   assert.equal(refreshed.find((row) => row.orderRef === source.purchaseOrderRef)?.status, "Priority");
+});
+
+test("an unchanged PO reference cannot regress the committed schedule revision", async () => {
+  const rollback = await beginRollbackContext();
+  try {
+    await rollback.run(async () => {
+      const source = await seedPurchaseOrder(21);
+      const visibleRef = `${refPrefix}-VISIBLE-21`;
+      await updatePurchaseOrderDispatchRef({
+        poRef: source.purchaseOrderRef,
+        newRef: visibleRef,
+        updatedBy: "schedule-revision-setup"
+      });
+      await updateScmScheduleEntry({
+        orderKind: "PO",
+        orderRef: visibleRef,
+        patch: { status: "Queued", packingSlipRef: visibleRef },
+        updatedBy: "schedule-revision-initial"
+      });
+      const loaded = await scheduleRevision(visibleRef);
+
+      const saved = await updateScmScheduleEntry({
+        orderKind: "PO",
+        orderRef: visibleRef,
+        patch: { status: "Priority", packingSlipRef: visibleRef },
+        expectedUpdatedAt: loaded.updated_at,
+        updatedBy: "schedule-revision-save"
+      });
+      const committed = await scheduleRevision(visibleRef);
+
+      assert.equal(committed.status, "Priority");
+      assert.equal(new Date(committed.updated_at).toISOString(), new Date(saved.updated_at).toISOString(),
+        "the revision returned by Save must be the revision that actually committed");
+      assert.ok(new Date(committed.updated_at).getTime() > new Date(loaded.updated_at).getTime(),
+        "a successful Save must advance the stored revision");
+
+      await updateScmScheduleEntry({
+        orderKind: "PO",
+        orderRef: visibleRef,
+        patch: { status: "Urgent", packingSlipRef: visibleRef },
+        expectedUpdatedAt: saved.updated_at,
+        updatedBy: "schedule-revision-follow-up"
+      });
+      assert.equal((await scheduleRevision(visibleRef)).status, "Urgent",
+        "the revision returned by one Save must be accepted by the next Save");
+    });
+  } finally {
+    await rollback.rollback();
+  }
+});
+
+test("a changed PO reference returns the final renamed monotonic schedule revision", async () => {
+  const rollback = await beginRollbackContext();
+  try {
+    await rollback.run(async () => {
+      const source = await seedPurchaseOrder(22);
+      const firstVisibleRef = `${refPrefix}-VISIBLE-22-A`;
+      const nextVisibleRef = `${refPrefix}-VISIBLE-22-B`;
+      await updatePurchaseOrderDispatchRef({
+        poRef: source.purchaseOrderRef,
+        newRef: firstVisibleRef,
+        updatedBy: "schedule-rename-revision-setup"
+      });
+      await updateScmScheduleEntry({
+        orderKind: "PO",
+        orderRef: firstVisibleRef,
+        patch: { status: "Queued", packingSlipRef: firstVisibleRef },
+        updatedBy: "schedule-rename-revision-initial"
+      });
+      const loaded = await scheduleRevision(firstVisibleRef);
+
+      const saved = await updateScmScheduleEntry({
+        orderKind: "PO",
+        orderRef: firstVisibleRef,
+        patch: { status: "Priority", packingSlipRef: nextVisibleRef },
+        expectedUpdatedAt: loaded.updated_at,
+        updatedBy: "schedule-rename-revision-save"
+      });
+      const committed = await scheduleRevision(nextVisibleRef);
+
+      assert.equal(saved.order_ref, nextVisibleRef,
+        "Save must return the final identity after Packing Slip / Ref renames the PO");
+      assert.equal(committed.status, "Priority");
+      assert.equal(new Date(committed.updated_at).toISOString(), new Date(saved.updated_at).toISOString());
+      assert.ok(new Date(committed.updated_at).getTime() > new Date(loaded.updated_at).getTime(),
+        "the nested reference synchronization must not reset the schedule to transaction start time");
+
+      await updateScmScheduleEntry({
+        orderKind: "PO",
+        orderRef: nextVisibleRef,
+        patch: { status: "Urgent", packingSlipRef: nextVisibleRef },
+        expectedUpdatedAt: saved.updated_at,
+        updatedBy: "schedule-rename-revision-follow-up"
+      });
+      assert.equal((await scheduleRevision(nextVisibleRef)).status, "Urgent");
+    });
+  } finally {
+    await rollback.rollback();
+  }
 });
 
 test("two status saves from one revision cannot both commit", async () => {

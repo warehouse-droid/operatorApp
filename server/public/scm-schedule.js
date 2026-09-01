@@ -10,7 +10,29 @@ let scmScheduleNotice = "";
 let scmScheduleLoading = false;
 let scmScheduleSavingRef = "";
 let scmScheduleBlanketSavingRef = "";
-let scmScheduleFilters = { view: "dispatch", search: "", status: [], method: "", kind: "", dropoffPoint: "", brand: [], from: "", to: "" };
+let scmScheduleFilters = {
+  view: "dispatch",
+  search: "",
+  status: [],
+  method: "",
+  kind: "",
+  queuedFrom: "",
+  queuedTo: "",
+  pickup: "",
+  dropoffPoint: "",
+  brand: [],
+  contentSearch: "",
+  remarkSearch: "",
+  orderSearch: "",
+  weightMin: "",
+  weightMax: "",
+  packingSearch: "",
+  from: "",
+  to: "",
+  driverSearch: "",
+  slaMin: "",
+  slaMax: ""
+};
 let scmScheduleSelectedRows = new Set();
 let scmScheduleReviewOnly = false;
 let scmScheduleShowReconciliationDetails = false;
@@ -32,6 +54,20 @@ let scmScheduleFormattingRequest = null;
 const SCM_SCHEDULE_SHEET_PREF_KEY = "mbbs.scmSchedule.sheetPreferences.v1";
 const SCM_SCHEDULE_RECONCILIATION_PREF_KEY = "mbbs.scmSchedule.showReconciliationDetails.v1";
 const SCM_SCHEDULE_FILTER_PREF_KEY = "mbbs.scmSchedule.filters.v1";
+const SCM_SCHEDULE_EXTENDED_FILTER_KEYS = new Set([
+  "queuedFrom",
+  "queuedTo",
+  "pickup",
+  "contentSearch",
+  "remarkSearch",
+  "orderSearch",
+  "weightMin",
+  "weightMax",
+  "packingSearch",
+  "driverSearch",
+  "slaMin",
+  "slaMax"
+]);
 const SCM_SCHEDULE_COLUMNS = [
   { key: "select", label: "", width: 40, minWidth: 36, editableOnly: true },
   { key: "date", label: "Date Added", width: 112, minWidth: 84 },
@@ -77,9 +113,11 @@ function normalizeScmSchedulePersistedFilters(value = {}) {
   const rawKind = String(value.kind || value.orderKind || "").trim().toUpperCase();
   const kind = rawKind === "SP.O" ? "Sp.O" : rawKind;
   const method = String(value.method || "").trim();
-  const scmSurface = scmScheduleSurface() === "scm";
+  const surface = scmScheduleSurface();
+  const scmSurface = surface === "scm";
+  const typeFilterSurface = scmSurface || surface === "dispatch";
   return {
-    kind: scmSurface && SCM_TYPES.includes(kind) ? kind : "",
+    kind: typeFilterSurface && SCM_TYPES.includes(kind) ? kind : "",
     method: scmSurface && SCM_METHODS.includes(method) ? method : "",
     status: scmScheduleFilterValues(value.status ?? value.statuses)
       .filter((status) => SCM_STATUS_FILTERS.includes(status))
@@ -222,36 +260,98 @@ function scmScheduleHeaderSelect({ field, value = "", options = [], allLabel = "
 
 function scmScheduleDateFilterSummary({
   from = scmScheduleFilters.from,
-  to = scmScheduleFilters.to
+  to = scmScheduleFilters.to,
+  allLabel = "All ETA",
+  unit = ""
 } = {}) {
-  if (from && to) return `${from} – ${to}`;
-  if (from) return `From ${from}`;
-  if (to) return `To ${to}`;
-  return "All ETA";
+  const cleanFrom = String(from ?? "").trim();
+  const cleanTo = String(to ?? "").trim();
+  const suffix = unit ? ` ${unit}` : "";
+  if (cleanFrom && cleanTo) return `${cleanFrom}${suffix} – ${cleanTo}${suffix}`;
+  if (cleanFrom) return `From ${cleanFrom}${suffix}`;
+  if (cleanTo) return `To ${cleanTo}${suffix}`;
+  return allLabel;
 }
 
-function scmScheduleDateFilterHtml() {
-  const filtered = Boolean(scmScheduleFilters.from || scmScheduleFilters.to);
-  return `<details class="scm-column-date-filter ${filtered ? "filtered" : ""}" data-deferred-column-filter>
-    <summary data-date-filter-summary>${scmScheduleEscape(scmScheduleDateFilterSummary())}</summary>
-    <div class="scm-column-filter-menu align-right">
-      <label><span>ETA from</span><input data-filter="from" type="date" value="${scmScheduleEscape(scmScheduleFilters.from)}" /></label>
-      <label><span>ETA to</span><input data-filter="to" type="date" value="${scmScheduleEscape(scmScheduleFilters.to)}" /></label>
+function scmScheduleTextFilterHtml({ field, label, value = "", alignRight = false } = {}) {
+  const cleanValue = String(value || "").trim();
+  return `<details class="scm-column-deferred-filter ${cleanValue ? "filtered" : ""}" data-deferred-column-filter data-filter-kind="text" data-filter-label="${scmScheduleEscape(label)}" data-filter-all-label="All">
+    <summary data-column-filter-summary title="${scmScheduleEscape(cleanValue || `All ${label}`)}">${scmScheduleEscape(cleanValue || "All")}</summary>
+    <div class="scm-column-filter-menu ${alignRight ? "align-right" : ""}">
+      <label><span>${scmScheduleEscape(label)} contains</span><input data-filter="${scmScheduleEscape(field)}" type="search" value="${scmScheduleEscape(cleanValue)}" autocomplete="off" /></label>
       <div class="scm-column-filter-actions">
-        <button data-action="clear-date-filter" type="button">Clear</button>
+        <button data-action="clear-deferred-filter" type="button">Clear</button>
         <button class="primary" data-action="apply-column-filters" type="button">Apply</button>
       </div>
     </div>
   </details>`;
 }
 
+function scmScheduleRangeFilterHtml({
+  label,
+  fromField,
+  toField,
+  from = "",
+  to = "",
+  inputType = "number",
+  unit = "",
+  allLabel = "All",
+  alignRight = false,
+  min = null
+} = {}) {
+  const cleanFrom = String(from ?? "").trim();
+  const cleanTo = String(to ?? "").trim();
+  const filtered = Boolean(cleanFrom || cleanTo);
+  const summary = scmScheduleDateFilterSummary({ from: cleanFrom, to: cleanTo, allLabel, unit });
+  const minAttribute = min === null ? "" : ` min="${scmScheduleEscape(min)}"`;
+  return `<details class="scm-column-deferred-filter ${filtered ? "filtered" : ""}" data-deferred-column-filter data-filter-kind="range" data-filter-label="${scmScheduleEscape(label)}" data-filter-all-label="${scmScheduleEscape(allLabel)}" data-filter-unit="${scmScheduleEscape(unit)}">
+    <summary data-column-filter-summary title="${scmScheduleEscape(summary)}">${scmScheduleEscape(summary)}</summary>
+    <div class="scm-column-filter-menu ${alignRight ? "align-right" : ""}">
+      <label><span>${scmScheduleEscape(label)} from</span><input data-filter="${scmScheduleEscape(fromField)}" data-filter-bound="from" type="${scmScheduleEscape(inputType)}" value="${scmScheduleEscape(cleanFrom)}"${minAttribute} /></label>
+      <label><span>${scmScheduleEscape(label)} to</span><input data-filter="${scmScheduleEscape(toField)}" data-filter-bound="to" type="${scmScheduleEscape(inputType)}" value="${scmScheduleEscape(cleanTo)}"${minAttribute} /></label>
+      <div class="scm-column-filter-actions">
+        <button data-action="clear-deferred-filter" type="button">Clear</button>
+        <button class="primary" data-action="apply-column-filters" type="button">Apply</button>
+      </div>
+    </div>
+  </details>`;
+}
+
+function scmScheduleDateFilterHtml() {
+  return scmScheduleRangeFilterHtml({
+    label: "ETA",
+    fromField: "from",
+    toField: "to",
+    from: scmScheduleFilters.from,
+    to: scmScheduleFilters.to,
+    inputType: "date",
+    allLabel: "All ETA",
+    alignRight: true
+  });
+}
+
+function scmScheduleQueuedDateFilterHtml() {
+  return scmScheduleRangeFilterHtml({
+    label: "Date added",
+    fromField: "queuedFrom",
+    toField: "queuedTo",
+    from: scmScheduleFilters.queuedFrom,
+    to: scmScheduleFilters.queuedTo,
+    inputType: "date",
+    allLabel: "All dates"
+  });
+}
+
 function scmScheduleColumnFilterHtml(column, {
   showScmWorkingControls = false,
+  showTypeFilter = showScmWorkingControls,
+  showFullColumnFilters = false,
   yardManagerView = false,
   dropoffOptions = [],
   brandOptions = []
 } = {}) {
-  if (column.key === "type" && showScmWorkingControls) {
+  if (column.key === "date" && showFullColumnFilters) return scmScheduleQueuedDateFilterHtml();
+  if (column.key === "type" && showTypeFilter) {
     return scmScheduleHeaderSelect({
       field: "kind",
       value: scmScheduleFilters.kind,
@@ -265,6 +365,13 @@ function scmScheduleColumnFilterHtml(column, {
       value: scmScheduleFilters.method,
       options: SCM_METHODS,
       allLabel: "All Methods"
+    });
+  }
+  if (column.key === "pickup" && showFullColumnFilters) {
+    return scmScheduleTextFilterHtml({
+      field: "pickup",
+      label: "Pickup point",
+      value: scmScheduleFilters.pickup
     });
   }
   if (column.key === "dropoff") {
@@ -283,6 +390,48 @@ function scmScheduleColumnFilterHtml(column, {
       column: true
     });
   }
+  if (column.key === "content" && showFullColumnFilters) {
+    return scmScheduleTextFilterHtml({
+      field: "contentSearch",
+      label: "Content",
+      value: scmScheduleFilters.contentSearch
+    });
+  }
+  if (column.key === "remark" && showFullColumnFilters) {
+    return scmScheduleTextFilterHtml({
+      field: "remarkSearch",
+      label: "Remark",
+      value: scmScheduleFilters.remarkSearch
+    });
+  }
+  if (column.key === "order" && showFullColumnFilters) {
+    return scmScheduleTextFilterHtml({
+      field: "orderSearch",
+      label: "Order number",
+      value: scmScheduleFilters.orderSearch,
+      alignRight: true
+    });
+  }
+  if (column.key === "weight" && showFullColumnFilters) {
+    return scmScheduleRangeFilterHtml({
+      label: "Weight",
+      fromField: "weightMin",
+      toField: "weightMax",
+      from: scmScheduleFilters.weightMin,
+      to: scmScheduleFilters.weightMax,
+      unit: "lb",
+      min: 0,
+      alignRight: true
+    });
+  }
+  if (column.key === "packing" && showFullColumnFilters) {
+    return scmScheduleTextFilterHtml({
+      field: "packingSearch",
+      label: "Packing slip",
+      value: scmScheduleFilters.packingSearch,
+      alignRight: true
+    });
+  }
   if (column.key === "status" && !yardManagerView) {
     return scmScheduleMultiFilterHtml({
       field: "status",
@@ -294,6 +443,25 @@ function scmScheduleColumnFilterHtml(column, {
     });
   }
   if (column.key === "eta" && !yardManagerView) return scmScheduleDateFilterHtml();
+  if (column.key === "driver" && showFullColumnFilters) {
+    return scmScheduleTextFilterHtml({
+      field: "driverSearch",
+      label: "Driver",
+      value: scmScheduleFilters.driverSearch,
+      alignRight: true
+    });
+  }
+  if (column.key === "sla" && showFullColumnFilters) {
+    return scmScheduleRangeFilterHtml({
+      label: "SLA",
+      fromField: "slaMin",
+      toField: "slaMax",
+      from: scmScheduleFilters.slaMin,
+      to: scmScheduleFilters.slaMax,
+      unit: "days",
+      alignRight: true
+    });
+  }
   return "";
 }
 
@@ -408,7 +576,9 @@ function scmScheduleQuery() {
   if (search) params.set("search", search);
   Object.entries(scmScheduleFilters).forEach(([key, value]) => {
     if (key === "search") return;
-    if ((key === "kind" || key === "method") && !scmScheduleCanShowScmWorkingControls()) return;
+    if (key === "kind" && !scmScheduleCanShowTypeFilter()) return;
+    if (key === "method" && !scmScheduleCanShowScmWorkingControls()) return;
+    if (SCM_SCHEDULE_EXTENDED_FILTER_KEYS.has(key) && !scmScheduleCanShowFullColumnFilters()) return;
     if (Array.isArray(value)) {
       value.filter(Boolean).forEach((item) => params.append(key, item));
       return;
@@ -637,6 +807,16 @@ function scmScheduleCanShowScmWorkingControls() {
   return canEditScmSchedule() && scmScheduleCanViewRestrictedOrders();
 }
 
+function scmScheduleCanShowTypeFilter() {
+  return scmScheduleCanShowScmWorkingControls()
+    || String(scmScheduleFilters.view || "").toLowerCase() === "dispatch";
+}
+
+function scmScheduleCanShowFullColumnFilters() {
+  return canEditScmSchedule()
+    || String(scmScheduleFilters.view || "").toLowerCase() === "dispatch";
+}
+
 function scmScheduleCanManageBlankets() {
   return !scmScheduleDispatchHost && !scmScheduleSalesHost && scmScheduleFilters.view === "blanket"
     && scmScheduleCanViewRestrictedOrders();
@@ -725,25 +905,79 @@ function queueScmScheduleSearch(value) {
   }, 350);
 }
 
-function updateScmScheduleDateFilterSummary(details) {
+function updateScmScheduleDeferredFilterSummary(details) {
   if (!details) return;
-  const from = details.querySelector('[data-filter="from"]')?.value || "";
-  const to = details.querySelector('[data-filter="to"]')?.value || "";
-  details.classList.toggle("filtered", Boolean(from || to));
-  const summary = details.querySelector("[data-date-filter-summary]");
-  if (summary) summary.textContent = scmScheduleDateFilterSummary({ from, to });
+  const kind = details.dataset.filterKind || "text";
+  const label = details.dataset.filterLabel || "Filter";
+  const allLabel = details.dataset.filterAllLabel || "All";
+  const unit = details.dataset.filterUnit || "";
+  const inputs = [...details.querySelectorAll("[data-filter]")];
+  let summaryText = allLabel;
+  let filtered = false;
+  if (kind === "range") {
+    const from = inputs.find((input) => input.dataset.filterBound === "from")?.value || "";
+    const to = inputs.find((input) => input.dataset.filterBound === "to")?.value || "";
+    filtered = Boolean(from || to);
+    summaryText = scmScheduleDateFilterSummary({ from, to, allLabel, unit });
+  } else {
+    const value = String(inputs[0]?.value || "").trim();
+    filtered = Boolean(value);
+    summaryText = value || allLabel;
+  }
+  details.classList.toggle("filtered", filtered);
+  const summary = details.querySelector("[data-column-filter-summary]");
+  if (summary) {
+    summary.textContent = summaryText;
+    summary.title = filtered ? summaryText : `All ${label}`;
+  }
 }
 
 function scmScheduleHasColumnFilters() {
   return Boolean(
     scmScheduleFilters.kind
     || scmScheduleFilters.method
+    || scmScheduleFilters.queuedFrom
+    || scmScheduleFilters.queuedTo
+    || scmScheduleFilters.pickup
     || scmScheduleFilters.dropoffPoint
+    || scmScheduleFilters.contentSearch
+    || scmScheduleFilters.remarkSearch
+    || scmScheduleFilters.orderSearch
+    || scmScheduleFilters.weightMin !== ""
+    || scmScheduleFilters.weightMax !== ""
+    || scmScheduleFilters.packingSearch
     || scmScheduleFilters.from
     || scmScheduleFilters.to
+    || scmScheduleFilters.driverSearch
+    || scmScheduleFilters.slaMin !== ""
+    || scmScheduleFilters.slaMax !== ""
     || scmScheduleFilterValues(scmScheduleFilters.status).length
     || scmScheduleFilterValues(scmScheduleFilters.brand).length
   );
+}
+
+function clearScmScheduleColumnFilters() {
+  Object.assign(scmScheduleFilters, {
+    kind: "",
+    method: "",
+    status: [],
+    queuedFrom: "",
+    queuedTo: "",
+    pickup: "",
+    dropoffPoint: "",
+    brand: [],
+    contentSearch: "",
+    remarkSearch: "",
+    orderSearch: "",
+    weightMin: "",
+    weightMax: "",
+    packingSearch: "",
+    from: "",
+    to: "",
+    driverSearch: "",
+    slaMin: "",
+    slaMax: ""
+  });
 }
 
 async function applyScmScheduleFilters() {
@@ -777,13 +1011,16 @@ function selectHtml({ rowId, field, value, options, disabled = false }) {
 function poDestinationOverrideSelectHtml({ rowId, row, options, disabled = false }) {
   const savedOverride = String(row.scheduleDropoffPoint || "").trim();
   const effectiveDestination = String(row.dropoffPoint || "").trim() || "--";
+  const isSplit = row.isScmSplit === true;
+  const destinationSource = isSplit ? "Split confirmation" : "NetSuite";
+  const selectedOptionLabel = (option) => `${scmScheduleEscape(option)}${isSplit ? " (Split confirmation)" : ""}`;
   return `<div class="scm-po-destination-override">
     <select data-row="${scmScheduleEscape(rowId)}" data-field="dropoffPoint" ${disabled ? "disabled" : ""}>
-      <option value="" ${savedOverride ? "" : "selected"}>Use NetSuite lines (${scmScheduleEscape(effectiveDestination)})</option>
-      ${savedOverride && !options.includes(savedOverride) ? `<option value="${scmScheduleEscape(savedOverride)}" selected>${scmScheduleEscape(savedOverride)}</option>` : ""}
-      ${options.map((option) => `<option value="${scmScheduleEscape(option)}" ${savedOverride === option ? "selected" : ""}>${scmScheduleEscape(option)}</option>`).join("")}
+      <option value="" ${savedOverride ? "" : "selected"}>${scmScheduleEscape(effectiveDestination)} (${destinationSource})</option>
+      ${savedOverride && !options.includes(savedOverride) ? `<option value="${scmScheduleEscape(savedOverride)}" selected>${selectedOptionLabel(savedOverride)}</option>` : ""}
+      ${options.map((option) => `<option value="${scmScheduleEscape(option)}" ${savedOverride === option ? "selected" : ""}>${savedOverride === option ? selectedOptionLabel(option) : scmScheduleEscape(option)}</option>`).join("")}
     </select>
-    <small>${savedOverride ? "Overrides all PO lines" : "NetSuite line routing"}</small>
+    <small>${isSplit ? "User-confirmed split routing" : savedOverride ? "Overrides all PO lines" : "NetSuite line routing"}</small>
   </div>`;
 }
 
@@ -936,6 +1173,23 @@ function scmScheduleDisplayRows() {
     .map(({ row }) => row);
 }
 
+function scmScheduleTextFilterMatches(value, filter) {
+  const needle = String(filter || "").trim().toLowerCase();
+  return !needle || String(value || "").toLowerCase().includes(needle);
+}
+
+function scmScheduleNumberFilterMatches(value, minimum, maximum) {
+  const cleanMinimum = String(minimum ?? "").trim();
+  const cleanMaximum = String(maximum ?? "").trim();
+  if (!cleanMinimum && !cleanMaximum) return true;
+  if (value === null || value === undefined || value === "") return false;
+  const number = Number(value);
+  if (!Number.isFinite(number)) return false;
+  if (cleanMinimum && number < Number(cleanMinimum)) return false;
+  if (cleanMaximum && number > Number(cleanMaximum)) return false;
+  return true;
+}
+
 function scmScheduleRowMatchesCurrentFilters(row = {}) {
   if (!scmScheduleCanViewRestrictedOrders() && scmScheduleIsRestrictedOrder(row)) return false;
   const effectiveStatus = scmScheduleEffectiveStatus(row);
@@ -963,6 +1217,10 @@ function scmScheduleRowMatchesCurrentFilters(row = {}) {
   if (scmScheduleFilters.method && row.method !== scmScheduleFilters.method) return false;
   if (scmScheduleFilters.kind === "Sp.O" && !(row.orderKind === "PO" && row.isSpecialOrder)) return false;
   if (scmScheduleFilters.kind && scmScheduleFilters.kind !== "Sp.O" && row.orderKind !== scmScheduleFilters.kind) return false;
+  const queuedDate = String(row.queuedDate || "").slice(0, 10);
+  if (scmScheduleFilters.queuedFrom && (!queuedDate || queuedDate < scmScheduleFilters.queuedFrom)) return false;
+  if (scmScheduleFilters.queuedTo && (!queuedDate || queuedDate > scmScheduleFilters.queuedTo)) return false;
+  if (!scmScheduleTextFilterMatches(row.pickupPoint, scmScheduleFilters.pickup)) return false;
   if (scmScheduleFilters.dropoffPoint) {
     const dropoffPoints = String(row.dropoffPoint || "")
       .replace(/\s+/g, "")
@@ -973,9 +1231,22 @@ function scmScheduleRowMatchesCurrentFilters(row = {}) {
   const brands = scmScheduleFilterValues(scmScheduleFilters.brand)
     .map((brand) => brand.toLowerCase());
   if (brands.length && !brands.includes(String(row.brand || "").trim().toLowerCase())) return false;
+  if (!scmScheduleTextFilterMatches(row.content, scmScheduleFilters.contentSearch)) return false;
+  if (!scmScheduleTextFilterMatches(row.remark, scmScheduleFilters.remarkSearch)) return false;
+  if (!scmScheduleTextFilterMatches([
+    row.orderRef,
+    row.sourceRef,
+    row.dispatchRef,
+    row.displayRef,
+    row.groupRef
+  ].join(" "), scmScheduleFilters.orderSearch)) return false;
+  if (!scmScheduleNumberFilterMatches(row.weightLbs, scmScheduleFilters.weightMin, scmScheduleFilters.weightMax)) return false;
+  if (!scmScheduleTextFilterMatches(row.packingSlipRef, scmScheduleFilters.packingSearch)) return false;
   const etaDate = String(row.etaDate || "").slice(0, 10);
   if (scmScheduleFilters.from && (!etaDate || etaDate < scmScheduleFilters.from)) return false;
   if (scmScheduleFilters.to && (!etaDate || etaDate > scmScheduleFilters.to)) return false;
+  if (!scmScheduleTextFilterMatches(row.driver, scmScheduleFilters.driverSearch)) return false;
+  if (!scmScheduleNumberFilterMatches(row.slaDays, scmScheduleFilters.slaMin, scmScheduleFilters.slaMax)) return false;
 
   const view = String(scmScheduleFilters.view || "").toLowerCase();
   if (view !== "blanket" && row.isBlanket) return false;
@@ -1659,6 +1930,8 @@ function renderScmSchedule() {
   const selectedRows = selectedScmScheduleRows();
   const visiblePresets = scmScheduleVisiblePresets();
   const showScmWorkingControls = scmScheduleCanShowScmWorkingControls();
+  const showTypeFilter = scmScheduleCanShowTypeFilter();
+  const showFullColumnFilters = scmScheduleCanShowFullColumnFilters();
   const yardManagerView = scmScheduleIsYardManagerView();
   const pickupOptions = scheduleOptionList("pickupPoint");
   const dropoffOptions = scheduleOptionList("dropoffPoint");
@@ -1704,6 +1977,8 @@ function renderScmSchedule() {
         <div class="scm-sheet-grid ${editable ? "with-select" : ""}" style="${scmScheduleGridStyle(editable)}">
           ${sheetMetrics.columns.map((column) => scmScheduleHeaderHtml(column, {
             showScmWorkingControls,
+            showTypeFilter,
+            showFullColumnFilters,
             yardManagerView,
             dropoffOptions,
             brandOptions
@@ -1856,7 +2131,7 @@ scmScheduleApp.addEventListener("input", (event) => {
   }
   const deferredDateFilter = event.target.closest("[data-deferred-column-filter] [data-filter]");
   if (deferredDateFilter) {
-    updateScmScheduleDateFilterSummary(deferredDateFilter.closest("[data-deferred-column-filter]"));
+    updateScmScheduleDeferredFilterSummary(deferredDateFilter.closest("[data-deferred-column-filter]"));
     return;
   }
   const control = event.target.closest("[data-sheet-setting]");
@@ -1902,7 +2177,7 @@ scmScheduleApp.addEventListener("change", async (event) => {
   }
   const deferredDateFilter = event.target.closest("[data-deferred-column-filter] [data-filter]");
   if (deferredDateFilter) {
-    updateScmScheduleDateFilterSummary(deferredDateFilter.closest("[data-deferred-column-filter]"));
+    updateScmScheduleDeferredFilterSummary(deferredDateFilter.closest("[data-deferred-column-filter]"));
     return;
   }
   const filter = event.target.closest("[data-filter]");
@@ -2276,24 +2551,18 @@ scmScheduleApp.addEventListener("click", async (event) => {
     return;
   }
 
-  if (action === "clear-date-filter") {
+  if (action === "clear-deferred-filter") {
     const details = target.closest("[data-deferred-column-filter]");
-    details?.querySelectorAll('[data-filter="from"], [data-filter="to"]').forEach((input) => {
+    details?.querySelectorAll("[data-filter]").forEach((input) => {
       input.value = "";
     });
-    updateScmScheduleDateFilterSummary(details);
+    updateScmScheduleDeferredFilterSummary(details);
     await applyScmScheduleFilters();
     return;
   }
 
   if (action === "clear-column-filters") {
-    scmScheduleFilters.kind = "";
-    scmScheduleFilters.method = "";
-    scmScheduleFilters.status = [];
-    scmScheduleFilters.dropoffPoint = "";
-    scmScheduleFilters.brand = [];
-    scmScheduleFilters.from = "";
-    scmScheduleFilters.to = "";
+    clearScmScheduleColumnFilters();
     try {
       await saveScmScheduleFilterPreference();
     } catch (error) {

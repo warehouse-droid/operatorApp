@@ -9,6 +9,7 @@ const repository = fs.readFileSync(new URL("../../../src/dispatch-repository.js"
 const planRepository = fs.readFileSync(new URL("../../../src/dispatch-plan-repository.js", import.meta.url), "utf8");
 const v2Repository = fs.readFileSync(new URL("../../../src/dispatch-planner-v2-repository.js", import.meta.url), "utf8");
 const recovery = fs.readFileSync(new URL("../../../src/dispatch-co-recovery.js", import.meta.url), "utf8");
+const server = fs.readFileSync(new URL("../../../src/server.js", import.meta.url), "utf8");
 
 test("CO cancellation delegates to the global lifecycle guard under the shared planning lock", () => {
   assert.match(repository, /return cancelDispatchCoGlobally\(coRef, \{ requestedBy \}\)/u);
@@ -24,6 +25,10 @@ test("legacy save, restore, confirm, and V2 command writers reject inactive assi
   );
   assert.match(v2Repository, /await assertActiveDispatchCosForPlan\(result\.plan\)/u);
   assert.match(lifecycle, /DISPATCH_CO_NOT_ACTIVE/u);
+  assert.ok(
+    server.match(/status NOT IN \('received', 'loaded', 'completed'\)/gu)?.length >= 2,
+    "stale assignment follow-ups must not rewrite a Driver-completed CO"
+  );
 });
 
 test("the one-off recovery remains exact, audited, and cannot rewrite plan snapshots", () => {

@@ -50,7 +50,7 @@ import {
   listStaleScmScheduleStatusCandidates
 } from "./scm-schedule-status-refresh-repository.js";
 import { buildAuthorizationUrl, exchangeCodeForToken, fetchDeliveryOrdersFromNetSuite, fetchDeliveryOrderFromNetSuite, fetchCustomerPickupOrderFromNetSuite, fetchDeliveryOrderDetailsFromNetSuite, fetchDeliveryOrderDetailsBatchFromNetSuite, fetchTransferDeliveryOrdersFromNetSuite, fetchTransferDeliveryOrderFromNetSuite, fetchTransferOrderDetailsFromNetSuite, fetchTransferOrderVerificationLinesFromNetSuite, fetchTransferOrderByIdFromNetSuite, findTransferOrdersByDependencyMarkerFromNetSuite, findTransferOrdersBySmartScmMarkerFromNetSuite, fetchPurchaseOrdersFromNetSuite, fetchPurchaseOrderFromNetSuite, fetchPurchaseOrderReferenceFromNetSuite, fetchPurchaseOrderDetailsFromNetSuite, fetchTransferReceivingOrdersFromNetSuite, fetchTransferReceivingOrderFromNetSuite, fetchInventoryBalanceForItemFromNetSuite, fetchInventoryBalancesFromNetSuite, fetchInventoryBalancesForItemsFromNetSuite, fetchItemFulfillmentFromNetSuite, fetchItemReceiptFromNetSuite, fetchTransactionProgressFromNetSuite, fetchTransactionStatusFromNetSuite, createPurchaseOrderInNetSuite, createTransferOrderInNetSuite, updateTransferOrderInNetSuite, updateTransferOrderStatusInNetSuite, fetchPickingTicketFromNetSuite, resolveNetSuiteTransferLocations, resolveNetSuiteYardLocations, resolvePalletItemFromNetSuite, transformSalesOrderToItemFulfillment, transformTransferOrderToItemFulfillment, transformPurchaseOrderToItemReceipt, transformTransferOrderToItemReceipt } from "./netsuite.js";
-import { buildTransferDependencyRestPayload, selectSmartScmMarkerTransferOrder, smartScmTransferOrderMemoMarker, transferDependencyMemoMarker, transferDependencyPickingTicketJobKey, transferOrderQuantityRevisionStatusBlock } from "./transfer-dependency-netsuite.js";
+import { buildTransferDependencyRestPayload, selectSmartScmMarkerTransferOrder, smartScmTransferOrderMemoMarker, transferDependencyMemoMarker, transferDependencyPickingTicketJobKey, transferDependencySalesOrderMemo, transferOrderQuantityRevisionStatusBlock } from "./transfer-dependency-netsuite.js";
 import { transferDependencyApprovalStatusAfterPrintBlock } from "./auto-transfer-approval-policy.js";
 import {
   assertScmReconciliationOrderEditable,
@@ -157,6 +157,13 @@ import {
 } from "./dispatch-completion-repository.js";
 import { DISPATCH_VENDOR_WEEK_DAYS, listDispatchVendorYards, listDispatchLocalVendors, saveDispatchVendorYardSchedule, updateDispatchVendorYard, upsertDispatchVendorYard, listDispatchParserRules, updateDispatchParserRule, listOllamaAudit, listDispatchVendorMappings, discoverDispatchVendorMappingsFromPurchaseOrders, updateDispatchVendorMapping, createDispatchLocalVendor, updateDispatchLocalVendor } from "./dispatch-enrichment.js";
 import { listDispatchAudit, writeDispatchAudit } from "./dispatch-audit-repository.js";
+import { repairDispatchCoGroupIdentities } from "./dispatch-co-group-identity-repository.js";
+import {
+  deactivateDispatchGlobalOrderDefinitions,
+  reconcileDispatchGlobalOrderTransitCos,
+  removeDispatchGlobalGroupedMember,
+  syncDispatchGlobalOrderTransitCo
+} from "./dispatch-delivery-group-repository.js";
 import {
   applyActualArrivalRun,
   createHistoricalActualArrivalRun,
@@ -165,7 +172,7 @@ import {
 } from "./dispatch-actual-arrival-repository.js";
 import { actualArrivalWorkerTick } from "./dispatch-actual-arrival-service.js";
 import { runWithAuditContext } from "./audit-context.js";
-import { DispatchPlanDateMismatchError, StaleDispatchPlanSaveError, applyDispatchPlannedAssignment, cleanupBilledSalesOrderFamiliesFromDispatchPlan, confirmDispatchPlan, createDispatchPlan, dispatchPlannedAssignmentMap, dispatchPlannedOrderConflictRefs, dispatchPlannedOrderRefs, getCurrentDispatchPlan, getDispatchPlan, getDispatchPlanRevision, getDispatchPlanSnapshot, listDispatchPlanSnapshots, listDispatchPlans, reopenDispatchPlan, restoreDispatchPlanSnapshot, saveDispatchPlanRecoveryDraft, saveDispatchPlanSnapshot } from "./dispatch-plan-repository.js";
+import { DispatchPlanDateMismatchError, StaleDispatchPlanSaveError, applyDispatchPlannedAssignment, cleanupBilledSalesOrderFamiliesFromDispatchPlan, confirmDispatchPlan, createDispatchPlan, dispatchPlannedOrderRefs, getCurrentDispatchPlan, getDispatchPlan, getDispatchPlanRevision, getDispatchPlanSnapshot, listDispatchPlanSnapshots, listDispatchPlans, reopenDispatchPlan, restoreDispatchPlanSnapshot, saveDispatchPlanRecoveryDraft, saveDispatchPlanSnapshot } from "./dispatch-plan-repository.js";
 import {
   advanceDispatchV2Followup,
   applyDispatchV2Command,
@@ -200,6 +207,29 @@ import {
   replaceDispatchOrderCatalog,
   upsertDispatchOrderCatalog
 } from "./dispatch-order-catalog-repository.js";
+import { getDispatchOrderPoolPolicy } from "./dispatch-order-pool-policy.js";
+import { createSerialExecutor, createSingleFlight, drainBoundedBatches } from "./coalescing-work-queue.js";
+import {
+  claimNetSuiteOrderWebhookNotifications,
+  enqueueNetSuiteOrderWebhook,
+  getNetSuiteOrderWebhookQueueStatus,
+  retryNetSuiteOrderWebhook,
+  setNetSuiteOrderWebhookQueuePaused
+} from "./netsuite-order-webhook-queue-repository.js";
+import {
+  claimScmPurchaseOrderCatalogRefreshes,
+  compactScmPurchaseOrderCard,
+  completeScmPurchaseOrderCatalogRefresh,
+  enqueueScmPurchaseOrderCatalogRefresh,
+  failScmPurchaseOrderCatalogRefresh,
+  getScmPurchaseOrderCatalogOrder,
+  getScmPurchaseOrderCatalogState,
+  listScmPurchaseOrderCatalog,
+  markScmPurchaseOrderCatalogFailed,
+  removeScmPurchaseOrderCatalogOrder,
+  replaceScmPurchaseOrderCatalog,
+  upsertScmPurchaseOrderCatalog
+} from "./scm-purchase-order-catalog-repository.js";
 import { applyActiveTransitCoMetadata, clearCancelledTransitCoMetadata, digestDispatchPlan, evaluateExecutedPrefixPolicy } from "./dispatch-planner-performance.js";
 import { applyDispatchPlanDelta, buildDispatchPlanDelta } from "./dispatch-planner-optimization.js";
 import { DispatchPlanEditLeaseError, acquireDispatchPlanEditLease, assertDispatchPlanEditLease, getDispatchPlanEditLease, heartbeatDispatchPlanEditLease, releaseDispatchPlanEditLease } from "./dispatch-plan-lease-repository.js";
@@ -455,7 +485,6 @@ import {
 } from "./scm-netsuite-po-history-repository.js";
 import {
   getScmNetSuitePoHistoryPdf,
-  processScmNetSuitePoHistoryWebhook,
   refreshScmNetSuitePoHistory,
   registerScmNetSuitePoHistoryCreation,
   updateScmNetSuitePoHistory
@@ -658,56 +687,6 @@ function changedDispatchOperatorRefs(beforePlan = {}, afterPlan = {}) {
   return changed;
 }
 
-function dispatchScmPlacementMap(plan = {}) {
-  const orderById = new Map(
-    (plan.orders || [])
-      .filter((order) => ["PO", "TO"].includes(String(order?.type || "").toUpperCase()))
-      .map((order) => [String(order.id || ""), order])
-  );
-  const placements = new Map();
-  for (const [orderRef, order] of orderById) {
-    placements.set(orderRef, {
-      kind: String(order.type || "").toUpperCase(),
-      order: {
-        id: orderRef,
-        sourceTable: order.sourceTable || "",
-        sourceId: order.sourceId || "",
-        pickup: order.pickup || order.pickupPoint || "",
-        dropoff: order.dropoff || order.dropoffPoint || "",
-        weight: order.weight || order.weightLbs || 0
-      },
-      stops: []
-    });
-  }
-  for (const [truckIndex, truck] of (plan.trucks || []).entries()) {
-    for (const [loadIndex, load] of (truck.loads || []).entries()) {
-      for (const [stopIndex, stop] of (load.stops || []).entries()) {
-        const ref = String(stop?.orderId || "");
-        const placement = placements.get(ref);
-        if (!placement) continue;
-        placement.stops.push({
-          truck: truck.id || truck.plate || truckIndex,
-          load: load.id || load.name || loadIndex,
-          stop: stopIndex,
-          type: stop.type || "",
-          location: stop.location || stop.address || ""
-        });
-      }
-    }
-  }
-  return new Map([...placements].map(([ref, placement]) => [
-    ref,
-    JSON.stringify(placement)
-  ]));
-}
-
-function changedDispatchScmRefs(beforePlan = {}, afterPlan = {}) {
-  const before = dispatchScmPlacementMap(beforePlan);
-  const after = dispatchScmPlacementMap(afterPlan);
-  return [...new Set([...before.keys(), ...after.keys()])]
-    .filter((ref) => before.get(ref) !== after.get(ref));
-}
-
 function dispatchPlacedScmRefs(plan = {}) {
   const scmKindsByRef = new Map(
     (plan.orders || [])
@@ -732,7 +711,7 @@ async function assertNoRestrictedScmDispatchOrders(orderRefs = [], action = "pla
     .filter(Boolean))];
   if (!requestedRefs.length) return;
   const [restrictedRefs, historicalAllowance] = await Promise.all([
-    listRestrictedScmDispatchOrderRefs(),
+    listRestrictedScmDispatchOrderRefs({ exactOrderRefs: requestedRefs }),
     historicalReconciliationDispatchAllowance({ planDate, orderRefs: requestedRefs })
   ]);
   const conflicts = requestedRefs
@@ -1126,42 +1105,8 @@ async function dispatchPlannedAssignmentsFromProjection() {
   return assignments;
 }
 
-async function dispatchPlannedAssignmentsFromLegacySnapshots() {
-  const result = await query(
-    `SELECT p.id, p.plan_date::text AS plan_date, p.status, s.orders, s.trucks
-       FROM dispatch_plans p
-       JOIN dispatch_plan_snapshots s ON s.plan_id = p.id
-      WHERE p.status <> 'cancelled'
-      ORDER BY p.plan_date DESC, p.updated_at DESC`
-  );
-  const assignments = new Map();
-  for (const row of result.rows) {
-    const planAssignments = dispatchPlannedAssignmentMap({
-      id: row.id,
-      planDate: row.plan_date,
-      orders: row.orders || [],
-      trucks: row.trucks || []
-    });
-    for (const [ref, details] of planAssignments.entries()) {
-      if (!assignments.has(ref)) assignments.set(ref, details);
-    }
-  }
-  await removeStaleCoPlannedAssignments(assignments);
-  return assignments;
-}
-
 async function dispatchPlannedAssignmentsFromSnapshots() {
-  if (
-    config.dispatch?.plannerOrderPoolMode === "on"
-    && await dispatchCatalogReadyForReads()
-  ) {
-    try {
-      return await dispatchPlannedAssignmentsFromProjection();
-    } catch (error) {
-      console.error("Dispatch assignment projection read failed; using legacy snapshots:", error.message);
-    }
-  }
-  return dispatchPlannedAssignmentsFromLegacySnapshots();
+  return dispatchPlannedAssignmentsFromProjection();
 }
 
 async function removeStaleCoPlannedAssignments(assignments) {
@@ -1339,14 +1284,30 @@ async function assertNoSnapshotDispatchRefCollision(refNumber) {
 }
 
 function isSnapshotDerivedDispatchOrder(order = {}) {
-  if (!order?.id || order?.type === "CO") return false;
+  if (!order?.id) return false;
+  const type = String(order.type || "").trim().toUpperCase();
+  const childRefs = Array.isArray(order.childOrders) ? order.childOrders : [];
+  const childDetails = Array.isArray(order.childOrderDetails) ? order.childOrderDetails : [];
+  const aggregateCo = type === "CO" && (
+    childRefs.some((ref) => String(ref || "").trim().toUpperCase().startsWith("CO-"))
+    || childDetails.some((child) => (
+      String(child?.type || "").trim().toUpperCase() === "CO"
+      || String(child?.id || "").trim().toUpperCase().startsWith("CO-")
+    ))
+  );
+  if (type === "CO" && !aggregateCo) return false;
   return Boolean(
-    (Array.isArray(order.childOrders) && order.childOrders.length)
+    childRefs.length
     || String(order.originalOrderId || "").trim()
+    || String(order.globalOrderDefinitionKind || "").trim()
+    || String(order.id || "").trim().toUpperCase().startsWith("TO-DRAFT-")
   );
 }
 
-async function listRestrictedScmDispatchOrderRefs() {
+async function listRestrictedScmDispatchOrderRefs({ exactOrderRefs = [] } = {}) {
+  const normalizedExactOrderRefs = [...new Set((Array.isArray(exactOrderRefs) ? exactOrderRefs : [])
+    .map((ref) => String(ref || "").trim().toLowerCase())
+    .filter(Boolean))].slice(0, 200);
   const result = await query(
     `WITH restricted_rows AS (
        SELECT s.order_ref,
@@ -1356,13 +1317,27 @@ async function listRestrictedScmDispatchOrderRefs() {
         WHERE LOWER(BTRIM(COALESCE(s.status, 'Queued'))) IN (
           'hold', 'complete', 'completed', 'cancelled', 'canceled'
         )
+          AND (
+            cardinality($1::text[]) = 0
+            OR s.source_id::text = ANY($1::text[])
+            OR LOWER(BTRIM(s.order_ref)) = ANY($1::text[])
+            OR LOWER(BTRIM(COALESCE(s.display_ref, ''))) = ANY($1::text[])
+            OR LOWER(BTRIM(COALESCE(s.group_ref, ''))) = ANY($1::text[])
+          )
        UNION ALL
        SELECT po.tranid AS order_ref,
               po.dispatch_ref AS display_ref,
               NULL::text AS group_ref
          FROM purchase_orders po
-        WHERE po.is_blanket_po = true
-           OR (
+        WHERE (
+          cardinality($1::text[]) = 0
+          OR po.netsuite_id::text = ANY($1::text[])
+          OR LOWER(BTRIM(po.tranid)) = ANY($1::text[])
+          OR LOWER(BTRIM(COALESCE(po.dispatch_ref, ''))) = ANY($1::text[])
+        )
+          AND (
+            po.is_blanket_po = true
+            OR (
              LOWER(BTRIM(COALESCE(po.initial_scm_status, 'Queued'))) IN (
                'hold', 'complete', 'completed', 'cancelled', 'canceled'
              )
@@ -1389,7 +1364,8 @@ async function listRestrictedScmDispatchOrderRefs() {
                   AND current_state.reconciliation_status IS DISTINCT FROM 'pending'
                   AND COALESCE(BTRIM(current_state.application_status), '') <> ''
              )
-           )
+            )
+          )
        UNION ALL
        SELECT state.source_order_ref AS order_ref,
               NULL::text AS display_ref,
@@ -1398,6 +1374,11 @@ async function listRestrictedScmDispatchOrderRefs() {
         WHERE LOWER(BTRIM(COALESCE(state.application_status, 'Queued'))) IN (
           'hold', 'complete', 'completed', 'cancelled', 'canceled'
         )
+          AND (
+            cardinality($1::text[]) = 0
+            OR state.source_order_netsuite_id::text = ANY($1::text[])
+            OR LOWER(BTRIM(state.source_order_ref)) = ANY($1::text[])
+          )
           AND (
             LOWER(BTRIM(COALESCE(state.application_status, ''))) IN ('complete', 'completed')
             OR NOT EXISTS (
@@ -1441,6 +1422,12 @@ async function listRestrictedScmDispatchOrderRefs() {
           'hold', 'complete', 'completed', 'cancelled', 'canceled'
         )
           AND (
+            cardinality($1::text[]) = 0
+            OR state.source_order_netsuite_id::text = ANY($1::text[])
+            OR LOWER(BTRIM(state.source_order_ref)) = ANY($1::text[])
+            OR LOWER(BTRIM(target.target_ref)) = ANY($1::text[])
+          )
+          AND (
             LOWER(BTRIM(COALESCE(target.target_state->>'applicationStatus', ''))) IN ('complete', 'completed')
             OR NOT EXISTS (
               SELECT 1
@@ -1478,8 +1465,9 @@ async function listRestrictedScmDispatchOrderRefs() {
          restricted_row.order_ref,
          restricted_row.display_ref,
          restricted_row.group_ref
-       ]) ref(value)
-      WHERE COALESCE(BTRIM(ref.value), '') <> ''`
+      ]) ref(value)
+      WHERE COALESCE(BTRIM(ref.value), '') <> ''`,
+    [normalizedExactOrderRefs]
   );
   return new Set(result.rows.map((row) => String(row.order_ref || "").trim()).filter(Boolean));
 }
@@ -1487,15 +1475,36 @@ async function listRestrictedScmDispatchOrderRefs() {
 function dispatchOrderLogicalRefs(order = {}) {
   return [
     order.id,
+    order.netsuiteId,
     order.dispatchRef,
     order.originalPoRef,
+    order.sourcePoRef,
     order.originalOrderId,
     order.sourceOrderId,
     order.scm?.groupRef,
+    ...(Array.isArray(order.sourcePoRefs) ? order.sourcePoRefs : []),
+    ...(Array.isArray(order.correspondingPoRefs) ? order.correspondingPoRefs : []),
     ...(Array.isArray(order.childOrders) ? order.childOrders : []),
     ...(Array.isArray(order.groupAliases) ? order.groupAliases : []),
     ...(Array.isArray(order.childOrderDetails)
       ? order.childOrderDetails.flatMap((child) => [child?.id, child?.originalOrderId])
+      : [])
+  ]
+    .map((ref) => String(ref || "").trim().toLowerCase())
+    .filter(Boolean);
+}
+
+function dispatchOrderScmRestrictionRefs(order = {}) {
+  return [
+    order.id,
+    order.netsuiteId,
+    order.dispatchRef,
+    order.originalPoRef,
+    order.scm?.groupRef,
+    ...(Array.isArray(order.childOrders) ? order.childOrders : []),
+    ...(Array.isArray(order.groupAliases) ? order.groupAliases : []),
+    ...(Array.isArray(order.childOrderDetails)
+      ? order.childOrderDetails.map((child) => child?.id)
       : [])
   ]
     .map((ref) => String(ref || "").trim().toLowerCase())
@@ -1543,18 +1552,86 @@ function snapshotDerivedGroupBelongsToPlan(order = {}, plan = {}) {
   return true;
 }
 
-async function listDispatchSnapshotDerivedOrders({ type = null, search = "" } = {}) {
+async function listDispatchSnapshotDerivedOrders({ type = null, search = "", exactOrderRefs = [] } = {}) {
   const sandbox = isNetSuiteSandboxEnvironment();
   const snapshotSearch = String(search || "").trim().slice(0, 120);
-  const [result, inactiveSplits, blanketPurchaseOrders, localCos] = await Promise.all([
+  const normalizedExactOrderRefs = [...new Set((Array.isArray(exactOrderRefs) ? exactOrderRefs : [])
+    .map((ref) => String(ref || "").trim().toLowerCase())
+    .filter(Boolean))].slice(0, 200);
+  const exactOrderRefSet = new Set(normalizedExactOrderRefs);
+  const [result, globalDefinitions, retiredGlobalDefinitions, inactiveSplits, blanketPurchaseOrders, localCos] = await Promise.all([
     query(
     `SELECT p.id, p.plan_date::text AS plan_date, p.updated_at, s.orders
-       FROM dispatch_plans p
-       JOIN dispatch_plan_snapshots s ON s.plan_id = p.id
+      FROM dispatch_plans p
+      JOIN dispatch_plan_snapshots s ON s.plan_id = p.id
       WHERE p.status <> 'cancelled'
-        AND ($1::text = '' OR s.orders::text ILIKE ('%' || $1 || '%'))
+        AND (
+          (
+            cardinality($2::text[]) = 0
+            AND ($1::text = '' OR s.orders::text ILIKE ('%' || $1 || '%'))
+          )
+          OR (
+            cardinality($2::text[]) > 0
+            AND EXISTS (
+              SELECT 1
+                FROM dispatch_plan_order_assignments assignment
+               WHERE assignment.plan_id = p.id
+                 AND (
+                   LOWER(BTRIM(assignment.order_ref)) = ANY($2::text[])
+                   OR LOWER(BTRIM(assignment.planned_order_ref)) = ANY($2::text[])
+                 )
+            )
+          )
+        )
       ORDER BY p.updated_at DESC, p.plan_date DESC`,
-      [snapshotSearch]
+      [snapshotSearch, normalizedExactOrderRefs]
+    ),
+    query(
+      `SELECT global_order.order_ref, global_order.order_type,
+              global_order.full_order, global_order.search_text
+         FROM (
+           SELECT global_group.group_ref AS order_ref,
+                  global_group.order_type,
+                  global_group.full_order,
+                  global_group.search_text
+             FROM dispatch_global_order_groups global_group
+            WHERE global_group.active = true
+              AND (
+                cardinality($2::text[]) = 0
+                OR lower(global_group.group_ref) = ANY($2::text[])
+                OR EXISTS (
+                  SELECT 1
+                    FROM dispatch_global_order_group_members member
+                   WHERE member.group_ref = global_group.group_ref
+                     AND lower(member.member_order_ref) = ANY($2::text[])
+                )
+              )
+           UNION ALL
+           SELECT global_split.split_ref AS order_ref,
+                  global_split.order_type,
+                  global_split.full_order,
+                  global_split.search_text
+             FROM dispatch_global_order_splits global_split
+            WHERE global_split.active = true
+              AND (
+                cardinality($2::text[]) = 0
+                OR lower(global_split.split_ref) = ANY($2::text[])
+                OR lower(global_split.parent_order_ref) = ANY($2::text[])
+              )
+         ) global_order
+        WHERE ($3::text = '' OR global_order.order_type = $3)
+          AND ($1::text = '' OR global_order.search_text ILIKE ('%' || $1 || '%'))
+        ORDER BY lower(global_order.order_ref)`,
+      [snapshotSearch, normalizedExactOrderRefs, type ? String(type).toUpperCase() : ""]
+    ),
+    query(
+      `SELECT lower(group_ref) AS order_ref
+         FROM dispatch_global_order_groups
+        WHERE active = false
+       UNION
+       SELECT lower(split_ref) AS order_ref
+         FROM dispatch_global_order_splits
+        WHERE active = false`
     ),
     query(
       `SELECT tranid FROM sales_orders WHERE tranid LIKE '%-S%' AND netsuite_active = false
@@ -1572,6 +1649,9 @@ async function listDispatchSnapshotDerivedOrders({ type = null, search = "" } = 
         ORDER BY updated_at DESC, id DESC`
     )
   ]);
+  const retiredGlobalRefs = new Set(retiredGlobalDefinitions.rows
+    .map((row) => String(row.order_ref || "").trim().toLowerCase())
+    .filter(Boolean));
   const inactiveSplitRefs = new Set(inactiveSplits.rows.map((row) => String(row.tranid || "")));
   const blanketPurchaseOrderRefs = new Set(blanketPurchaseOrders.rows.flatMap((row) => [row.tranid, row.dispatch_ref])
     .map((ref) => String(ref || "").trim().toLowerCase())
@@ -1595,11 +1675,22 @@ async function listDispatchSnapshotDerivedOrders({ type = null, search = "" } = 
       sourceOrderRef: String(row.source_order_ref || "").trim(),
       fromYard: String(row.from_location || "").trim(),
       toYard: String(row.to_location || "").trim(),
+      status: String(row.status || "").trim(),
       createdAt: row.created_at || null
     });
   }
   const derivedOrders = new Map();
   const wantedType = type ? String(type).toUpperCase() : "";
+  for (const row of globalDefinitions.rows) {
+    const order = applyActiveTransitCoMetadata(
+      clearCancelledTransitCoMetadata(row.full_order || {}, cancelledLocalCoByRef),
+      activeLocalCoBySource
+    );
+    if (!isSnapshotDerivedDispatchOrder(order)) continue;
+    const id = String(order?.id || row.order_ref || "").trim();
+    if (!id || retiredGlobalRefs.has(id.toLowerCase()) || derivedOrders.has(id)) continue;
+    derivedOrders.set(id, order);
+  }
   for (const row of result.rows) {
     for (const snapshotOrder of row.orders || []) {
       const order = applyActiveTransitCoMetadata(
@@ -1610,7 +1701,12 @@ async function listDispatchSnapshotDerivedOrders({ type = null, search = "" } = 
       if (!snapshotDerivedGroupBelongsToPlan(order, row)) continue;
       if (wantedType && String(order?.type || "").toUpperCase() !== wantedType) continue;
       const id = String(order?.id || "").trim();
+      if (
+        exactOrderRefSet.size
+        && !dispatchOrderLogicalRefs(order).some((ref) => exactOrderRefSet.has(ref))
+      ) continue;
       if (String(order?.type || "").toUpperCase() === "PO" && blanketPurchaseOrderRefs.has(id.toLowerCase())) continue;
+      if (retiredGlobalRefs.has(id.toLowerCase())) continue;
       const fixtureRefs = [id, order?.originalOrderId, ...(Array.isArray(order?.childOrders) ? order.childOrders : [])]
         .map((value) => String(value || "").trim());
       if (!sandbox && fixtureRefs.some((value) => /^TSTDEP-SO-/i.test(value))) continue;
@@ -1643,6 +1739,7 @@ function dispatchOrderMatchesSearch(order = {}, search = "") {
   if (!term) return true;
   return [
     order.id,
+    order.netsuiteId,
     order.type,
     order.dispatchRef,
     order.originalPoRef,
@@ -1720,16 +1817,26 @@ function historicalReconciliationOrder(order = {}, {
   };
 }
 
-async function listDispatchOrdersForResponse({ type = null, search = "", historyPlanDate = "" } = {}) {
+async function loadDispatchOrdersForResponse({
+  type = null,
+  search = "",
+  historyPlanDate = "",
+  exactOrderRefs = []
+} = {}) {
   const searchTerm = String(search || "").trim().slice(0, 120);
+  const normalizedExactOrderRefs = [...new Set((Array.isArray(exactOrderRefs) ? exactOrderRefs : [])
+    .map((ref) => String(ref || "").trim().toLowerCase())
+    .filter(Boolean))].slice(0, 200);
+  const exactIdentityRequest = normalizedExactOrderRefs.length > 0;
   const requestedType = String(type || "").trim().toUpperCase();
   const includeCustom = !requestedType || requestedType === "TO" || requestedType === "CUSTOM";
   const historicalDate = historicalDispatchPlanDate(historyPlanDate);
-  const [orders, customOrders, snapshotOrders, restrictedScmRefs, billedSalesOrders, hiddenScmOrders, completedReconciliationRefs] = await Promise.all([
+  const [orders, customOrders, snapshotOrders, initialRestrictedScmRefs, billedSalesOrders, hiddenScmOrders, completedReconciliationRefs] = await Promise.all([
     listDispatchOrders({
       type,
       search: searchTerm,
-      includeScmLinkedSearchRefs: Boolean(searchTerm)
+      includeScmLinkedSearchRefs: Boolean(searchTerm),
+      exactOrderRefs
     }),
     includeCustom
       ? listDispatchCustomOrders({
@@ -1738,8 +1845,10 @@ async function listDispatchOrdersForResponse({ type = null, search = "", history
           search: searchTerm
         })
       : Promise.resolve([]),
-    listDispatchSnapshotDerivedOrders({ type, search: searchTerm }),
-    listRestrictedScmDispatchOrderRefs(),
+    listDispatchSnapshotDerivedOrders({ type, search: searchTerm, exactOrderRefs: normalizedExactOrderRefs }),
+    exactIdentityRequest
+      ? Promise.resolve(new Set())
+      : listRestrictedScmDispatchOrderRefs(),
     listBilledSalesOrderFamilyRefs(),
     historicalDate && searchTerm
       ? listDispatchOrders({
@@ -1747,13 +1856,23 @@ async function listDispatchOrdersForResponse({ type = null, search = "", history
           search: searchTerm,
           includeHiddenScm: true,
           includeInactiveSalesOrderSearchCandidates: true,
-          includeScmLinkedSearchRefs: true
+          includeScmLinkedSearchRefs: true,
+          exactOrderRefs
         })
       : Promise.resolve([]),
     historicalDate
       ? listCompletedReconciliationDispatchRefs()
       : Promise.resolve(new Set())
   ]);
+  const exactCandidateOrders = [...orders, ...snapshotOrders];
+  const restrictedScmRefs = exactIdentityRequest
+    ? await listRestrictedScmDispatchOrderRefs({
+        exactOrderRefs: [
+          ...normalizedExactOrderRefs,
+          ...exactCandidateOrders.flatMap((order) => dispatchOrderLogicalRefs(order))
+        ]
+      })
+    : initialRestrictedScmRefs;
   const historicalCandidates = historicalDate
     ? [...hiddenScmOrders, ...snapshotOrders].filter((order) => (
         ["SO", "PO", "TO"].includes(String(order?.type || "").trim().toUpperCase())
@@ -1786,9 +1905,11 @@ async function listDispatchOrdersForResponse({ type = null, search = "", history
   ]).filter((order) => !isBilledSalesOrderFamily(order)).filter((order) => {
     if (order.historicalReconciliationComplete === true) return true;
     if (!["PO", "TO", "VRMA"].includes(String(order?.type || "").trim().toUpperCase())) return true;
-    return !dispatchOrderLogicalRefs(order).some((ref) => restrictedScmRefs.has(ref));
+    return !dispatchOrderScmRestrictionRefs(order).some((ref) => restrictedScmRefs.has(ref));
   });
-  const derivedCandidates = searchTerm
+  const derivedCandidates = exactIdentityRequest
+    ? snapshotOrders
+    : searchTerm
     ? snapshotOrders.filter((order) => dispatchOrderMatchesSearch(order, searchTerm))
     : snapshotOrders;
   const derivedOrders = filterDispatchPlanningVisibleOrders(derivedCandidates.map((order) => (
@@ -1796,7 +1917,7 @@ async function listDispatchOrdersForResponse({ type = null, search = "", history
   ))).filter((order) => !isBilledSalesOrderFamily(order)).filter((order) => {
     if (order.historicalReconciliationComplete === true) return true;
     if (!["PO", "TO", "VRMA"].includes(String(order?.type || "").trim().toUpperCase())) return true;
-    return !dispatchOrderLogicalRefs(order).some((ref) => restrictedScmRefs.has(ref));
+    return !dispatchOrderScmRestrictionRefs(order).some((ref) => restrictedScmRefs.has(ref));
   });
   const assigned = await enrichDispatchOrdersWithPlanAssignments(mergeDispatchOrderFeedWithSnapshotDerivedOrders(currentOrders, derivedOrders));
   const poLinked = await enrichDispatchOrdersWithPoTargetAllocations(assigned);
@@ -1809,6 +1930,7 @@ async function listDispatchOrdersForResponse({ type = null, search = "", history
         orderRef: order.id,
         sourceRef: order.originalPoRef || order.originalOrderId || order.id,
         sourceId: order.netsuiteId || order.sourceId || order.raw?.netsuite_id || null,
+        isScmSplit: order.isScmSplit === true,
         status: order.scm?.status || "Queued",
         scheduleId: order.scm?.scheduleId || null,
         updatedAt: order.scm?.updatedAt || null
@@ -1842,12 +1964,32 @@ async function listDispatchOrdersForResponse({ type = null, search = "", history
     .filter((order) => !isBilledSalesOrderFamily(order)).filter((order) => {
     if (order.historicalReconciliationComplete === true) return true;
     if (!["PO", "TO", "VRMA"].includes(String(order?.type || "").trim().toUpperCase())) return true;
-    return !dispatchOrderLogicalRefs(order).some((ref) => restrictedScmRefs.has(ref));
+    return !dispatchOrderScmRestrictionRefs(order).some((ref) => restrictedScmRefs.has(ref));
   });
-  const searchedOrders = searchTerm
+  const searchedOrders = exactIdentityRequest
+    ? visibleOrders
+    : searchTerm
     ? visibleOrders.filter((order) => dispatchOrderMatchesSearch(order, searchTerm))
     : visibleOrders;
   return enrichDispatchOrdersWithCompletionStatus(searchedOrders);
+}
+
+const dispatchOrderResponseSingleFlight = createSingleFlight({
+  key({ type = null, search = "", historyPlanDate = "", exactOrderRefs = [] } = {}) {
+    return JSON.stringify({
+      type: String(type || "").trim().toUpperCase(),
+      search: String(search || "").trim().slice(0, 120).toLowerCase(),
+      historyPlanDate: String(historyPlanDate || "").trim().slice(0, 10),
+      exactOrderRefs: [...new Set((Array.isArray(exactOrderRefs) ? exactOrderRefs : [])
+        .map((ref) => String(ref || "").trim().toLowerCase())
+        .filter(Boolean))].sort()
+    });
+  },
+  worker: loadDispatchOrdersForResponse
+});
+
+function listDispatchOrdersForResponse(options = {}) {
+  return dispatchOrderResponseSingleFlight.run(options);
 }
 
 async function targetedDispatchMutationOrders(orderRefs = []) {
@@ -1855,16 +1997,48 @@ async function targetedDispatchMutationOrders(orderRefs = []) {
     .map((ref) => String(ref || "").trim().toLowerCase())
     .filter(Boolean))];
   if (!refs.length) return [];
-  const feeds = await Promise.all(refs.map((search) => listDispatchOrdersForResponse({ search })));
+  const feeds = await Promise.all(refs.map((search) => listDispatchOrdersForResponse({
+    search,
+    exactOrderRefs: [search]
+  })));
   const byId = new Map();
   for (const feed of feeds) {
     for (const order of feed || []) {
-      if (!dispatchOrderLogicalRefs(order).some((ref) => refs.includes(ref))) continue;
+      // The feed is already source-constrained by exactOrderRefs. Keep every
+      // eligible member because a source ID can resolve to a visible split.
       const key = String(order?.id || "").trim().toLowerCase();
       if (key && !byId.has(key)) byId.set(key, order);
     }
   }
   return [...byId.values()];
+}
+
+async function refreshDispatchOrderCatalogRefsNow(orderRefs = [], {
+  removedOrderRefs = [],
+  source = "dispatch-mutation"
+} = {}) {
+  if (config.dispatch?.plannerOrderPoolMode === "off") return { skipped: true };
+  const refs = [...new Set((orderRefs || []).map((ref) => String(ref || "").trim()).filter(Boolean))];
+  const removedRefs = [...new Set((removedOrderRefs || []).map((ref) => String(ref || "").trim()).filter(Boolean))];
+  try {
+    for (const orderRef of [...new Set([...refs, ...removedRefs])]) {
+      await enqueueDispatchOrderCatalogRefresh({ orderRef, source });
+    }
+    return await catalogRefreshExecutor.run(async () => {
+      const orders = await targetedDispatchMutationOrders(refs);
+      const upserted = orders.length
+        ? await upsertDispatchOrderCatalog({ orders, source })
+        : { upserted: 0, orderRefs: [] };
+      const removed = [];
+      for (const orderRef of removedRefs) {
+        removed.push(await removeDispatchOrderCatalogOrder(orderRef));
+      }
+      return { skipped: false, ...upserted, removed };
+    });
+  } catch (error) {
+    console.error(`Immediate Dispatch order catalog refresh failed (${source}):`, error.message);
+    return { skipped: false, upserted: 0, removed: [], queued: true, error: error.message };
+  }
 }
 
 async function dispatchMutationOrderResponse(req, orderRefs = [], { legacyType = null } = {}) {
@@ -1875,7 +2049,9 @@ async function dispatchMutationOrderResponse(req, orderRefs = [], { legacyType =
   return { orders: await listDispatchOrdersForResponse({ type: legacyType }) };
 }
 
-async function listScmPurchaseOrdersForResponse(filters = {}, operator = null) {
+async function listScmPurchaseOrdersForResponse(filters = {}, operator = null, {
+  includeRestricted = canViewRestrictedScmOrders(operator)
+} = {}) {
   const orders = await listScmPurchaseOrders(filters);
   const reconciliationRows = await enrichScmScheduleWithReconciliation(
     orders.map((order) => ({
@@ -1883,6 +2059,7 @@ async function listScmPurchaseOrdersForResponse(filters = {}, operator = null) {
       orderRef: order.id,
       sourceRef: order.sourcePoRef || order.originalPoRef || order.dispatchRef || order.id,
       sourceId: order.netsuiteId || order.sourceId || order.raw?.netsuite_id || null,
+      isScmSplit: order.isScmSplit === true,
       status: order.scm?.status || "Hold",
       scheduleId: order.scm?.scheduleId || null,
       updatedAt: order.scm?.updatedAt || null,
@@ -1913,8 +2090,36 @@ async function listScmPurchaseOrdersForResponse(filters = {}, operator = null) {
     };
   });
   return filterRestrictedScmOrders(reconciled, {
-    includeRestricted: canViewRestrictedScmOrders(operator)
+    includeRestricted
   });
+}
+
+async function targetedScmPurchaseOrdersForResponse(orderRefs = [], operator = null, options = {}) {
+  const refs = [...new Set((orderRefs || []).map((ref) => String(ref || "").trim()).filter(Boolean))];
+  const feeds = await Promise.all(refs.map((search) => listScmPurchaseOrdersForResponse({
+    search,
+    includeAllDiscoverable: true
+  }, operator, options)));
+  const byRef = new Map();
+  for (const feed of feeds) {
+    for (const order of feed || []) {
+      const key = String(order?.id || "").trim().toLowerCase();
+      if (key && !byRef.has(key)) byRef.set(key, order);
+    }
+  }
+  return [...byRef.values()];
+}
+
+async function scmPurchaseOrderMutationOrders(req, orderRefs = []) {
+  const responseMode = String(req.query?.response || req.get("x-mbbs-response-mode") || "").trim().toLowerCase();
+  if (responseMode !== "targeted") {
+    return listScmPurchaseOrdersForResponse({ includeAllDiscoverable: true }, req.operator);
+  }
+  const orders = await targetedScmPurchaseOrdersForResponse(orderRefs, req.operator);
+  if (orders.length) {
+    await upsertScmPurchaseOrderCatalog({ orders, source: "targeted-mutation-response" });
+  }
+  return orders;
 }
 
 function sendDispatchDependencyConflictResponse(res, conflicts = []) {
@@ -2115,6 +2320,7 @@ function transferDependencyItemQuantitiesMatch(expected, lines = []) {
 async function findCreatedDependencyTransferOrder({ proposal, batch }) {
   const expected = transferDependencyExpectedItemQuantities(proposal);
   if (!expected.size) return null;
+  const conciseMemo = transferDependencySalesOrderMemo(batch.salesOrderRef);
   const exactMarker = transferDependencyMemoMarker(batch.id, proposal.id);
   const legacyMarker = `MBBS dependency batch ${batch.id}`;
   const linked = await query(
@@ -2129,12 +2335,26 @@ async function findCreatedDependencyTransferOrder({ proposal, batch }) {
     `SELECT netsuite_id AS id, tranid, memo
        FROM transfer_orders
       WHERE from_location_id = $1
-        AND to_location_id = $2
+       AND to_location_id = $2
         AND COALESCE(netsuite_active, true) = true
-        AND memo ILIKE $3
-      ORDER BY CASE WHEN memo ILIKE $4 THEN 0 ELSE 1 END, netsuite_id DESC
+        AND (
+          (NULLIF($3, '') IS NOT NULL AND lower(btrim(memo)) = lower(btrim($3)))
+          OR memo ILIKE $4
+        )
+      ORDER BY CASE
+                 WHEN NULLIF($3, '') IS NOT NULL AND lower(btrim(memo)) = lower(btrim($3)) THEN 0
+                 WHEN memo ILIKE $5 THEN 1
+                 ELSE 2
+               END,
+               netsuite_id DESC
       LIMIT 10`,
-    [Number(proposal.fromLocationId), Number(proposal.toLocationId), `%${legacyMarker}%`, `%${exactMarker}%`]
+    [
+      Number(proposal.fromLocationId),
+      Number(proposal.toLocationId),
+      conciseMemo,
+      `%${legacyMarker}%`,
+      `%${exactMarker}%`
+    ]
   );
   const matches = [];
   for (const candidate of local.rows) {
@@ -2161,6 +2381,7 @@ async function findCreatedDependencyTransferOrder({ proposal, batch }) {
     const remote = await findTransferOrdersByDependencyMarkerFromNetSuite({
       batchId: batch.id,
       proposalId: proposal.id,
+      salesOrderRef: batch.salesOrderRef,
       sourceLocationId: locations.source.netsuiteLocationId,
       destinationLocationId: locations.destination.netsuiteLocationId
     });
@@ -2634,11 +2855,11 @@ async function executeSmartScmTransferProposal(proposalId, operator) {
           proposal: {
             lines: prepared.lines,
             palletItemId: palletItem?.id ?? null,
-            palletTransferQuantity: prepared.palletTransferQuantity,
-            memo: `${prepared.memo || "Smart SCM replenishment"} | ${smartScmTransferOrderMemoMarker(prepared.id)}`
+            palletTransferQuantity: prepared.palletTransferQuantity
           },
           batch: { id: `smart-${prepared.id}`, salesOrderRef: `Smart SCM run ${prepared.runId}` },
-          locations
+          locations,
+          memoOverride: smartScmTransferOrderMemoMarker(prepared.id)
         });
         let createError = null;
         try {
@@ -2863,99 +3084,8 @@ async function findDispatchPlanDateConflictsFromProjection({
   return conflicts.sort((a, b) => `${a.planDate}|${a.orderRef}`.localeCompare(`${b.planDate}|${b.orderRef}`));
 }
 
-async function findDispatchPlanDateConflictsFromLegacySnapshots({
-  planId,
-  planDate,
-  orders = [],
-  trucks = [],
-  candidateRefs = []
-} = {}) {
-  const currentRefs = dispatchPlannedOrderRefs({ orders, trucks });
-  if (!currentRefs.size) return [];
-  const searchRefs = [...new Set((candidateRefs || []).map((ref) => String(ref || "").trim()).filter(Boolean))];
-  const result = searchRefs.length ? await query(
-    `SELECT p.id, p.plan_date::text AS plan_date, p.status, s.orders, s.trucks
-       FROM dispatch_plans p
-       JOIN dispatch_plan_snapshots s ON s.plan_id = p.id
-       CROSS JOIN LATERAL (
-         SELECT COALESCE(array_agg(assigned_order.value ->> 'id')
-                  FILTER (WHERE COALESCE(assigned_order.value ->> 'id', '') <> ''), ARRAY[]::text[]) AS order_ids
-           FROM jsonb_array_elements(COALESCE(s.orders, '[]'::jsonb)) assigned_order(value)
-          WHERE assigned_order.value ->> 'id' = ANY($3::text[])
-             OR assigned_order.value ->> 'originalOrderId' = ANY($3::text[])
-             OR (
-               upper(COALESCE(assigned_order.value ->> 'type', '')) <> 'CUSTOM'
-               AND assigned_order.value ->> 'id' ~* '-S[0-9]+$'
-               AND regexp_replace(assigned_order.value ->> 'id', '-S[0-9]+$', '', 'i') = ANY($3::text[])
-             )
-             OR COALESCE(assigned_order.value -> 'childOrders', '[]'::jsonb) ?| $3::text[]
-             OR EXISTS (
-               SELECT 1
-                 FROM unnest($3::text[]) candidate(ref)
-                WHERE jsonb_path_exists(
-                        COALESCE(assigned_order.value -> 'childOrderDetails', '[]'::jsonb),
-                        '$.**.id ? (@ == $ref)',
-                        jsonb_build_object('ref', candidate.ref)
-                      )
-                   OR jsonb_path_exists(
-                        COALESCE(assigned_order.value -> 'childOrderDetails', '[]'::jsonb),
-                        '$.**.originalOrderId ? (@ == $ref)',
-                        jsonb_build_object('ref', candidate.ref)
-                      )
-             )
-       ) related_orders
-      WHERE p.id <> $1
-        AND p.status <> 'cancelled'
-        AND p.plan_date <> $2::date
-        AND EXISTS (
-          SELECT 1
-            FROM jsonb_array_elements(COALESCE(s.trucks, '[]'::jsonb)) truck(value)
-            CROSS JOIN LATERAL jsonb_array_elements(COALESCE(truck.value -> 'loads', '[]'::jsonb)) load(value)
-            CROSS JOIN LATERAL jsonb_array_elements(COALESCE(load.value -> 'stops', '[]'::jsonb)) stop(value)
-           WHERE lower(COALESCE(load.value ->> 'returnOnly', 'false')) <> 'true'
-             AND stop.value ->> 'type' = 'drop'
-             AND (
-               stop.value ->> 'orderId' = ANY($3::text[])
-               OR stop.value ->> 'orderId' = ANY(related_orders.order_ids)
-             )
-        )`,
-    [planId, planDate, searchRefs]
-  ) : await query(
-    `SELECT p.id, p.plan_date::text AS plan_date, p.status, s.orders, s.trucks
-       FROM dispatch_plans p
-       JOIN dispatch_plan_snapshots s ON s.plan_id = p.id
-      WHERE p.id <> $1
-        AND p.status <> 'cancelled'
-        AND p.plan_date <> $2::date`,
-    [planId, planDate]
-  );
-  const conflicts = [];
-  for (const row of result.rows) {
-    const otherPlan = { orders: row.orders || [], trucks: row.trucks || [] };
-    for (const ref of dispatchPlannedOrderConflictRefs({ orders, trucks }, otherPlan)) {
-      conflicts.push({
-        orderRef: ref,
-        planId: String(row.id),
-        planDate: row.plan_date,
-        status: row.status || ""
-      });
-    }
-  }
-  return conflicts.sort((a, b) => `${a.planDate}|${a.orderRef}`.localeCompare(`${b.planDate}|${b.orderRef}`));
-}
-
 async function findDispatchPlanDateConflicts(options = {}) {
-  if (
-    config.dispatch?.plannerOrderPoolMode === "on"
-    && await dispatchCatalogReadyForReads()
-  ) {
-    try {
-      return await findDispatchPlanDateConflictsFromProjection(options);
-    } catch (error) {
-      console.error("Dispatch conflict projection read failed; using legacy snapshots:", error.message);
-    }
-  }
-  return findDispatchPlanDateConflictsFromLegacySnapshots(options);
+  return findDispatchPlanDateConflictsFromProjection(options);
 }
 
 async function findNewDispatchPlanDateConflicts(previousPlan = {}, nextPlan = {}) {
@@ -3075,12 +3205,20 @@ async function dispatchPlansForCoValidation(nextPlan = {}, requiredCoRefs = []) 
   ];
 }
 
-async function findDispatchCoSequenceConflicts(nextPlan = {}) {
+export async function findDispatchCoSequenceConflicts(nextPlan = {}) {
   const sourcePlanDate = String(nextPlan.planDate || "").slice(0, 10);
   const requiredCoRefs = [...new Set((nextPlan.orders || [])
     .map((order) => String(order?.transitCo?.id || "").trim())
     .filter(Boolean))];
   if (!requiredCoRefs.length) return [];
+  const terminalResult = await query(
+    `SELECT LOWER(BTRIM(co_ref)) AS co_ref
+       FROM local_co_orders
+      WHERE LOWER(BTRIM(co_ref)) = ANY($1::text[])
+        AND LOWER(BTRIM(status)) IN ('completed', 'received')`,
+    [requiredCoRefs.map((ref) => ref.toLowerCase())]
+  );
+  const terminalCoRefs = new Set(terminalResult.rows.map((row) => String(row.co_ref || "")));
   const candidatePlans = await dispatchPlansForCoValidation(nextPlan, requiredCoRefs);
   const coOccurrences = new Map();
   for (const plan of candidatePlans) {
@@ -3115,6 +3253,7 @@ async function findDispatchCoSequenceConflicts(nextPlan = {}) {
     if (!sourceRef || !coRef || source?.type === "CO") continue;
     const sourceOccurrences = dispatchOrderDropOccurrences(nextPlan, sourceRef);
     if (!sourceOccurrences.length) continue;
+    if (terminalCoRefs.has(coRef.trim().toLowerCase())) continue;
     const co = coOccurrences.get(coRef);
     if (!co) {
       conflicts.push({ orderRef: sourceRef, coRef, reason: `${sourceRef} requires ${coRef} to be planned first.` });
@@ -3238,7 +3377,7 @@ async function applyDispatchPlanCoAssignments(plan = {}) {
             dispatch_load_name = '',
             dispatch_parking_spot = '',
             updated_at = now()
-      WHERE status NOT IN ('received', 'loaded')
+      WHERE status NOT IN ('received', 'loaded', 'completed')
         AND (
           dispatch_plan_id = $1
           OR dispatch_plan_date = $2::date
@@ -3257,7 +3396,7 @@ async function applyDispatchPlanCoAssignments(plan = {}) {
               dispatch_parking_spot = $6,
               updated_at = now()
         WHERE co_ref = $1
-          AND status NOT IN ('received', 'loaded')`,
+          AND status NOT IN ('received', 'loaded', 'completed')`,
       [
         assignment.coRef,
         assignment.planId,
@@ -4190,7 +4329,7 @@ function uniqueDriverCompletedCustomOrders(orders = []) {
   });
 }
 
-async function completeDriverJobOperationalEffects({
+export async function completeDriverJobOperationalEffects({
   driverLogin,
   job,
   routeJobs = [],
@@ -4862,9 +5001,32 @@ async function applyDriverOfflineReviewResolution({ event, action, effectiveJobI
   });
 }
 
+function normalizedCatalogEventOrderType(payload = {}) {
+  const raw = String(payload.orderType || payload.orderKind || payload.type || "").trim();
+  const compact = raw.toLowerCase().replace(/[^a-z0-9]/g, "");
+  if (["po", "purchord", "purchaseorder"].includes(compact)) return "PO";
+  if (["to", "trnfrord", "transferorder"].includes(compact)) return "TO";
+  if (["so", "salesord", "salesorder"].includes(compact)) return "SO";
+  return raw.toUpperCase();
+}
+
+export function scmPurchaseOrderCatalogRefreshRequest(payload = {}) {
+  const orderType = normalizedCatalogEventOrderType(payload);
+  if (orderType && orderType !== "PO") return null;
+  const explicitRef = String(payload.orderRef || payload.tranid || payload.orderId || "").trim();
+  return {
+    orderRef: payload.refreshOrderPool === true ? "" : explicitRef,
+    source: String(payload.source || payload.change || "dispatch.orders.updated")
+  };
+}
+
 function emitAppEvent(type, payload = {}) {
   afterTransactionCommit(() => {
-    if (type === "dispatch.orders.updated" && config.dispatch?.plannerOrderPoolMode !== "off") {
+    if (
+      type === "dispatch.orders.updated"
+      && payload.catalogAlreadyQueued !== true
+      && config.dispatch?.plannerOrderPoolMode !== "off"
+    ) {
       const explicitRef = String(payload.orderRef || payload.orderId || payload.tranid || "").trim();
       const orderType = String(payload.orderType || payload.orderKind || payload.type || "").trim().toUpperCase();
       void enqueueDispatchOrderCatalogRefresh({
@@ -4872,6 +5034,29 @@ function emitAppEvent(type, payload = {}) {
         orderType,
         source: String(payload.source || payload.change || "dispatch.orders.updated")
       }).catch((error) => console.error("Dispatch order catalog enqueue failed:", error.message));
+    }
+    if (type === "dispatch.co.updated" && config.dispatch?.plannerOrderPoolMode !== "off") {
+      const refs = [...new Set([
+        payload.coRef,
+        payload.orderRef,
+        payload.orderId,
+        payload.sourceOrderRef
+      ].map((ref) => String(ref || "").trim()).filter(Boolean))];
+      for (const orderRef of refs) {
+        void enqueueDispatchOrderCatalogRefresh({
+          orderRef,
+          source: String(payload.source || "dispatch.co.updated")
+        }).catch((error) => console.error("Dispatch CO catalog enqueue failed:", error.message));
+      }
+    }
+    if (type === "dispatch.orders.updated" && payload.catalogAlreadyQueued !== true) {
+      const refresh = scmPurchaseOrderCatalogRefreshRequest(payload);
+      if (refresh) {
+        void enqueueScmPurchaseOrderCatalogRefresh({
+          orderRef: refresh.orderRef,
+          source: refresh.source
+        }).catch((error) => console.error("SCM PO catalog enqueue failed:", error.message));
+      }
     }
     if (
       ["dispatch.plan.saved", "dispatch.plan.confirmed", "dispatch.plan.reopened", "dispatch.plan.created", "dispatch.plan.cleared"].includes(type)
@@ -8128,7 +8313,10 @@ export async function scmScheduleStatusRefreshTick() {
   }
 }
 
-export async function processNetSuiteOrderWebhook(payload = {}, { scheduleDelayedStatus = true } = {}) {
+export async function processNetSuiteOrderWebhook(payload = {}, {
+  scheduleDelayedStatus = true,
+  emitEvents = true
+} = {}) {
   const type = webhookRecordType(payload.recordType || payload.type || payload.orderType);
   if (!type) throw new Error("Unsupported NetSuite webhook record type.");
   if (!payload.id || !payload.tranid) throw new Error("Webhook payload requires id and tranid.");
@@ -8274,24 +8462,26 @@ export async function processNetSuiteOrderWebhook(payload = {}, { scheduleDelaye
     action: "netsuite.webhook.order",
     details: { netsuiteOrderId: payload.id, recordType: type, tranid: payload.tranid, eventType: payload.eventType || "", results }
   });
-  emitAppEvent("dispatch.orders.updated", { orderId: payload.id, tranid: payload.tranid, source: "netsuite-webhook" });
-  emitAppEvent("delivery.order.updated", { orderId: payload.id, tranid: payload.tranid, source: "netsuite-webhook" });
-  emitAppEvent("receiving.order.updated", { orderId: payload.id, tranid: payload.tranid, source: "netsuite-webhook" });
-  if (stockRequestTransfer?.matched && !stockRequestTransfer.stale) {
-    emitAppEvent("stock-request.updated", {
-      source: "netsuite-webhook",
-      requestId: stockRequestTransfer.requestId,
-      transferId: stockRequestTransfer.transferId,
-      status: stockRequestTransfer.status || null
-    });
-  }
-  if (specialStockRequest?.matched) {
-    emitSpecialStockUpdate("netsuite-webhook", {
-      requestId: specialStockRequest.requestId,
-      orderId: payload.id,
-      orderKind: type,
-      attention: specialStockRequest.attention === true
-    });
+  if (emitEvents) {
+    emitAppEvent("dispatch.orders.updated", { orderId: payload.id, tranid: payload.tranid, source: "netsuite-webhook" });
+    emitAppEvent("delivery.order.updated", { orderId: payload.id, tranid: payload.tranid, source: "netsuite-webhook" });
+    emitAppEvent("receiving.order.updated", { orderId: payload.id, tranid: payload.tranid, source: "netsuite-webhook" });
+    if (stockRequestTransfer?.matched && !stockRequestTransfer.stale) {
+      emitAppEvent("stock-request.updated", {
+        source: "netsuite-webhook",
+        requestId: stockRequestTransfer.requestId,
+        transferId: stockRequestTransfer.transferId,
+        status: stockRequestTransfer.status || null
+      });
+    }
+    if (specialStockRequest?.matched) {
+      emitSpecialStockUpdate("netsuite-webhook", {
+        requestId: specialStockRequest.requestId,
+        orderId: payload.id,
+        orderKind: type,
+        attention: specialStockRequest.attention === true
+      });
+    }
   }
   return { ok: true, orderId: payload.id, tranid: payload.tranid, recordType: type, results, stockRequestTransfer, specialStockRequest };
 }
@@ -8393,9 +8583,17 @@ app.post("/api/internal/netsuite-sync/events", requireNetSuiteMirrorSignature, a
   }
 });
 
+function isHighFrequencyPollRequest(req) {
+  const requestPath = String(req.path || "").replace(/\/+$/u, "");
+  return requestPath === "/api/webhooks/netsuite/order"
+    || requestPath === "/api/scm/print-agent/lease"
+    || /^\/api\/scm\/print-agent\/jobs\/[^/]+\/heartbeat$/u.test(requestPath);
+}
+
 app.use((req, res, next) => {
   if (!req.path.startsWith("/api/")
       || !MUTATING_API_METHODS.has(req.method)
+      || isHighFrequencyPollRequest(req)
       || req.get("x-mbbs-rollback-test") === "1") {
     return next();
   }
@@ -8484,18 +8682,24 @@ app.post("/api/webhooks/netsuite/order", async (req, res, next) => {
     if (providedBuffer.length !== expectedBuffer.length || !crypto.timingSafeEqual(providedBuffer, expectedBuffer)) {
       return res.status(401).json({ error: "Invalid webhook secret." });
     }
-    const result = await withTransaction(async () => {
-      const order = await processNetSuiteOrderWebhook(req.body);
-      const poHistory = await processScmNetSuitePoHistoryWebhook(req.body);
-      if (poHistory.event) {
-        afterTransactionCommit(() => emitAppEvent(poHistory.event.name, poHistory.event.data));
-      }
-      return {
-        ...order,
-        appCreatedPoHistoryMatched: poHistory.matched === true
-      };
+    let queued;
+    try {
+      queued = await enqueueNetSuiteOrderWebhook({
+        payload: req.body || {},
+        rawBody: req.rawBody || ""
+      });
+    } catch (error) {
+      if (error instanceof TypeError && !error.status) error.status = 400;
+      throw error;
+    }
+    res.status(202).json({
+      accepted: true,
+      queued: queued.status === "queued",
+      duplicate: queued.duplicate === true,
+      superseded: queued.superseded === true,
+      coalesced: Number(queued.coalesced || 0),
+      queueId: queued.id
     });
-    res.json(result);
   } catch (error) {
     await writeAudit({
       actorType: "system",
@@ -11124,13 +11328,38 @@ async function saveScmVendorYard(req, res, next) {
 app.post("/api/scm/local-vendors/:id/yards", requireSmartScmWriteAccess, saveScmVendorYard);
 app.put("/api/scm/local-vendors/:id/yards/:yardRowId", requireSmartScmWriteAccess, saveScmVendorYard);
 
-app.get("/api/dispatch/config", (req, res) => {
-  res.json({
-    googleMapsApiKey: config.googleMapsApiKey,
-    driverOrientedPlanning: Boolean(config.dispatch?.driverOrientedPlanning),
-    plannerOrderPoolMode: config.dispatch?.plannerOrderPoolMode || "off",
-    plannerCommandMode: config.dispatch?.plannerCommandMode || "off"
-  });
+app.get("/api/dispatch/config", async (_req, res, next) => {
+  try {
+    const orderPoolPolicy = await dispatchOrderPoolRuntimePolicy();
+    dispatchPrivateNoStore(res);
+    res.json({
+      googleMapsApiKey: config.googleMapsApiKey,
+      driverOrientedPlanning: Boolean(config.dispatch?.driverOrientedPlanning),
+      plannerOrderPoolMode: orderPoolPolicy.runtimeMode,
+      plannerOrderPool: {
+        deploymentMode: orderPoolPolicy.deploymentMode,
+        configured: orderPoolPolicy.configured,
+        effective: orderPoolPolicy.effective,
+        readModelReady: orderPoolPolicy.readModelReady,
+        catalogReady: orderPoolPolicy.catalogReady,
+        assignmentsReady: orderPoolPolicy.assignmentsReady,
+        catalogInitialized: orderPoolPolicy.catalogInitialized,
+        catalogPopulationSafe: orderPoolPolicy.catalogPopulationSafe,
+        catalogSettled: orderPoolPolicy.catalogSettled,
+        shadowMatchCount: orderPoolPolicy.shadowMatchCount,
+        shadowMismatchCount: orderPoolPolicy.shadowMismatchCount,
+        requiredShadowMatchCount: orderPoolPolicy.requiredShadowMatchCount,
+        shadowVerified: orderPoolPolicy.shadowVerified,
+        activationReady: orderPoolPolicy.activationReady,
+        activationBlockReason: orderPoolPolicy.activationBlockReason,
+        fallbackReason: orderPoolPolicy.fallbackReason,
+        catalogGeneration: Number(orderPoolPolicy.catalogState.generation || 0)
+      },
+      plannerCommandMode: config.dispatch?.plannerCommandMode || "off"
+    });
+  } catch (error) {
+    next(error);
+  }
 });
 
 app.get("/api/dispatch/forecast", async (req, res, next) => {
@@ -12271,14 +12500,10 @@ app.get("/api/dispatch/v2/bootstrap", async (req, res, next) => {
   }
 });
 
-async function dispatchCatalogReadyForReads() {
-  try {
-    const state = await getDispatchOrderCatalogState();
-    return state.ready && state.assignmentsReady;
-  } catch (error) {
-    console.error("Dispatch order catalog readiness check failed:", error.message);
-    return false;
-  }
+async function dispatchOrderPoolRuntimePolicy() {
+  return getDispatchOrderPoolPolicy({
+    deploymentMode: config.dispatch?.plannerOrderPoolMode || "off"
+  });
 }
 
 async function legacyDispatchOrderPool({ type = "", search = "", historyPlanDate = "" } = {}) {
@@ -12305,9 +12530,8 @@ app.get("/api/dispatch/v2/order-pool", async (req, res, next) => {
       await requireDispatchV2PlanEditLease(req, historyPlanDate);
       return res.json(await legacyDispatchOrderPool({ type, search, historyPlanDate }));
     }
-    const mode = config.dispatch?.plannerOrderPoolMode || "off";
-    const ready = mode !== "off" && await dispatchCatalogReadyForReads();
-    if (mode === "on" && ready) {
+    const policy = await dispatchOrderPoolRuntimePolicy();
+    if (policy.effective) {
       return res.json(await listDispatchOrderPool({
         type,
         search,
@@ -12316,14 +12540,25 @@ app.get("/api/dispatch/v2/order-pool", async (req, res, next) => {
       }));
     }
     const legacy = await legacyDispatchOrderPool({ type, search });
-    if (mode === "shadow" && ready) {
-      const shadowLimit = Math.min(Math.max(Number(req.query.limit) || 50, 1), 100);
+    if (
+      policy.runtimeMode === "shadow"
+      && policy.readModelReady
+      && !policy.shadowVerified
+      && policy.shadowMismatchCount === 0
+    ) {
+      const shadowLimit = Math.min(Math.max(Number(req.query.limit) || 50, 1), 200);
       void listDispatchOrderPool({ type, search, limit: req.query.limit })
-        .then((optimized) => recordDispatchOrderPoolShadowComparison({
-          requestKey: JSON.stringify({ type, search }),
-          legacy: legacy.orders.slice(0, shadowLimit),
-          optimized: optimized.orders
-        }))
+        .then((optimized) => {
+          // The legacy and catalog feeds intentionally use different ordering.
+          // Verify complete bounded result sets only; comparing two truncated
+          // pages would turn a harmless order difference into a false mismatch.
+          if (legacy.orders.length >= shadowLimit || optimized.nextCursor) return null;
+          return recordDispatchOrderPoolShadowComparison({
+            requestKey: JSON.stringify({ type, search }),
+            legacy: legacy.orders.slice(0, shadowLimit),
+            optimized: optimized.orders.slice(0, shadowLimit)
+          });
+        })
         .catch((error) => console.error("Dispatch order-pool shadow comparison failed:", error.message));
     }
     res.json(legacy);
@@ -12337,10 +12572,9 @@ app.get("/api/dispatch/v2/order-feed/:id", async (req, res, next) => {
   try {
     dispatchPrivateNoStore(res);
     let order = null;
-    if (
-      config.dispatch?.plannerOrderPoolMode === "on"
-      && await dispatchCatalogReadyForReads()
-    ) order = await getDispatchOrderCatalogOrder(req.params.id);
+    if ((await dispatchOrderPoolRuntimePolicy()).effective) {
+      order = await getDispatchOrderCatalogOrder(req.params.id);
+    }
     if (!order) order = (await targetedDispatchMutationOrders([req.params.id]))[0] || null;
     if (!order) return res.status(404).json({ error: "Dispatch order not found", code: "DISPATCH_ORDER_NOT_FOUND" });
     res.json({ order });
@@ -12400,7 +12634,7 @@ async function prepareDispatchV2ReplaceCommand(previousPlan = {}, command = {}) 
   };
 
   await assertNewDispatchOrdersCanBePlanned(previousPlan, candidate, "save this plan");
-  const changedScmRefs = changedDispatchScmRefs(previousPlan, candidate);
+  const changedScmRefs = changedPlacedDispatchScmAssignmentRefs(previousPlan, candidate);
   await assertScmReconciliationOrderEditable({ orderRefs: changedScmRefs });
   await assertNoRestrictedScmDispatchOrders(
     changedPlacedDispatchScmAssignmentRefs(previousPlan, candidate),
@@ -12923,7 +13157,7 @@ app.post("/api/dispatch/plan-snapshots/:snapshotId/restore", requireOperator, re
     restoreCandidate = await canonicalizeDispatchCustomOrdersInPlan(restoreCandidate, {
       previousPlan: currentPlanBeforeRestore
     });
-    const changedScmRefs = changedDispatchScmRefs(currentPlanBeforeRestore, restoreCandidate);
+    const changedScmRefs = changedPlacedDispatchScmAssignmentRefs(currentPlanBeforeRestore, restoreCandidate);
     await assertScmReconciliationOrderEditable({ orderRefs: changedScmRefs });
     await assertNewDispatchOrdersCanBePlanned(
       currentPlanBeforeRestore,
@@ -13110,7 +13344,7 @@ app.put("/api/dispatch/plans/:id", reportDispatchSaveTiming, requireOperator, re
     });
     cleanTrucks = scheduleCandidate.trucks || [];
     recoveryCandidate = { ...recoveryCandidate, trucks: cleanTrucks };
-    const changedScmRefs = changedDispatchScmRefs(previousPlan, {
+    const changedScmRefs = changedPlacedDispatchScmAssignmentRefs(previousPlan, {
       ...previousPlan,
       orders: cleanOrders,
       trucks: cleanTrucks
@@ -13143,6 +13377,11 @@ app.put("/api/dispatch/plans/:id", reportDispatchSaveTiming, requireOperator, re
       previousPlan,
       { orders: cleanOrders }
     );
+    const retiredGlobalOrderRefs = [...new Set((Array.isArray(req.body?.retiredGlobalOrderRefs)
+      ? req.body.retiredGlobalOrderRefs
+      : [])
+      .map((ref) => String(ref || "").trim())
+      .filter(Boolean))].slice(0, 200);
     const explicitOperatorAlertRefs = Array.isArray(req.body?.audit?.details?.operatorAlertRefs)
       ? req.body.audit.details.operatorAlertRefs.map((ref) => String(ref || "").trim()).filter(Boolean)
       : [];
@@ -13150,6 +13389,7 @@ app.put("/api/dispatch/plans/:id", reportDispatchSaveTiming, requireOperator, re
     if (
       previousPlan
       && !explicitOperatorAlertRefs.length
+      && !retiredGlobalOrderRefs.length
       && !dispatchPlanDataChanged(
         { orders: previousPlan.orders || [], trucks: previousPlan.trucks || [] },
         { orders: cleanOrders, trucks: cleanTrucks }
@@ -13218,7 +13458,8 @@ app.put("/api/dispatch/plans/:id", reportDispatchSaveTiming, requireOperator, re
       summary: storedSummary,
       baseRevision: forceSave || saveMode === "truck_sequence" ? null : req.body?.baseRevision,
       planDate: req.body?.planDate || req.body?.date || "",
-      sessionId: req.body?.audit?.sessionId || ""
+      sessionId: req.body?.audit?.sessionId || "",
+      retiredGlobalOrderRefs
     });
     const followupWarnings = [];
     const followupContext = {
@@ -15104,6 +15345,18 @@ app.get("/api/scm/schedule", async (req, res, next) => {
       brand: req.query.brand || "",
       from: req.query.from || "",
       to: req.query.to || "",
+      queuedFrom: req.query.queuedFrom || "",
+      queuedTo: req.query.queuedTo || "",
+      pickup: req.query.pickup || "",
+      contentSearch: req.query.contentSearch || "",
+      remarkSearch: req.query.remarkSearch || "",
+      orderSearch: req.query.orderSearch || "",
+      weightMin: req.query.weightMin || "",
+      weightMax: req.query.weightMax || "",
+      packingSearch: req.query.packingSearch || "",
+      driverSearch: req.query.driverSearch || "",
+      slaMin: req.query.slaMin || "",
+      slaMax: req.query.slaMax || "",
       view: req.query.view || "",
       audience: includeRestricted ? "scm" : "operations"
     });
@@ -15910,6 +16163,62 @@ app.post("/api/scm/vrma-orders/:id/complete-override", requireSmartScmWriteAcces
   }
 });
 
+app.get("/api/dispatch/scm/v2/purchase-orders", async (req, res, next) => {
+  try {
+    dispatchPrivateNoStore(res);
+    const filters = {
+      search: req.query.search || "",
+      poType: req.query.poType || "",
+      dropoff: req.query.dropoff || "",
+      vendor: req.query.vendor || "",
+      pickupPoint: req.query.pickupPoint || ""
+    };
+    const state = await getScmPurchaseOrderCatalogState();
+    const includeRestricted = canViewRestrictedScmOrders(req.operator);
+    if (state.ready) {
+      return res.json(await listScmPurchaseOrderCatalog({
+        ...filters,
+        cursor: req.query.cursor || "",
+        limit: req.query.limit,
+        includeRestricted
+      }));
+    }
+    const legacy = await listScmPurchaseOrdersForResponse({
+      ...filters,
+      includeAllDiscoverable: true
+    }, req.operator);
+    const cards = legacy.map(compactScmPurchaseOrderCard).sort((left, right) => (
+      Date.parse(right.updatedAt || "") - Date.parse(left.updatedAt || "")
+      || String(right.id || "").localeCompare(String(left.id || ""), undefined, { numeric: true })
+    )).slice(0, 200);
+    res.json({
+      orders: cards,
+      nextCursor: "",
+      ready: false,
+      source: "bounded-legacy",
+      catalogRevision: state.generation
+    });
+  } catch (error) {
+    next(error);
+  }
+});
+
+app.get("/api/dispatch/scm/v2/purchase-orders/:ref", async (req, res, next) => {
+  try {
+    dispatchPrivateNoStore(res);
+    const includeRestricted = canViewRestrictedScmOrders(req.operator);
+    let order = await getScmPurchaseOrderCatalogOrder(req.params.ref, { includeRestricted });
+    if (!order) {
+      order = (await targetedScmPurchaseOrdersForResponse([req.params.ref], req.operator))
+        .find((candidate) => String(candidate.id || "").toLowerCase() === String(req.params.ref || "").toLowerCase()) || null;
+    }
+    if (!order) return res.status(404).json({ error: "Purchase order not found", code: "SCM_PURCHASE_ORDER_NOT_FOUND" });
+    res.json({ order });
+  } catch (error) {
+    next(error);
+  }
+});
+
 app.get("/api/dispatch/scm/purchase-orders", async (req, res, next) => {
   try {
     res.json(await listScmPurchaseOrdersForResponse({
@@ -15917,7 +16226,8 @@ app.get("/api/dispatch/scm/purchase-orders", async (req, res, next) => {
       poType: req.query.poType || "",
       dropoff: req.query.dropoff || "",
       vendor: req.query.vendor || "",
-      pickupPoint: req.query.pickupPoint || ""
+      pickupPoint: req.query.pickupPoint || "",
+      includeAllDiscoverable: true
     }, req.operator));
   } catch (error) {
     next(error);
@@ -15962,7 +16272,10 @@ app.post("/api/dispatch/scm/purchase-order-splits", async (req, res, next) => {
       }
     }).catch(() => null);
     emitAppEvent("dispatch.orders.updated", { source: "scm-po-split", type: "PO", orderId: created.split?.splitPoRef });
-    res.json({ created, orders: await listScmPurchaseOrdersForResponse({}, req.operator) });
+    res.json({
+      created,
+      orders: await scmPurchaseOrderMutationOrders(req, [created.split?.splitPoRef, created.split?.sourcePoRef])
+    });
   } catch (error) {
     next(error);
   }
@@ -16001,7 +16314,10 @@ app.put("/api/dispatch/scm/purchase-order-splits/:ref/lines", async (req, res, n
     }).catch(() => null);
     emitAppEvent("dispatch.orders.updated", { source: "scm-po-split-lines", type: "PO", orderId: updated.splitPoRef });
     emitAppEvent("receiving.order.updated", { source: "scm-po-split-lines", type: "PO", orderId: updated.splitPoId });
-    res.json({ updated, orders: await listScmPurchaseOrdersForResponse({}, req.operator) });
+    res.json({
+      updated,
+      orders: await scmPurchaseOrderMutationOrders(req, [updated.splitPoRef, updated.sourcePoRef])
+    });
   } catch (error) {
     next(error);
   }
@@ -16034,7 +16350,10 @@ app.put("/api/dispatch/scm/purchase-orders/:ref/ref", async (req, res, next) => 
     }).catch(() => null);
     emitAppEvent("dispatch.orders.updated", { source: "scm-po-ref", type: "PO", orderId: updated.displayRef });
     emitAppEvent("receiving.order.updated", { source: "scm-po-ref", type: "PO", orderId: updated.poId });
-    res.json({ updated, orders: await listScmPurchaseOrdersForResponse({}, req.operator) });
+    res.json({
+      updated,
+      orders: await scmPurchaseOrderMutationOrders(req, [updated.displayRef, updated.poRef])
+    });
   } catch (error) {
     next(error);
   }
@@ -16067,7 +16386,10 @@ app.put("/api/dispatch/scm/purchase-order-splits/:ref", async (req, res, next) =
       }
     }).catch(() => null);
     emitAppEvent("dispatch.orders.updated", { source: "scm-po-split-rename", type: "PO", orderId: updated.newPoRef });
-    res.json({ updated, orders: await listScmPurchaseOrdersForResponse({}, req.operator) });
+    res.json({
+      updated,
+      orders: await scmPurchaseOrderMutationOrders(req, [updated.newPoRef, updated.sourcePoRef])
+    });
   } catch (error) {
     next(error);
   }
@@ -16107,7 +16429,10 @@ app.put("/api/dispatch/scm/purchase-order-splits/:ref/destination", async (req, 
     }).catch(() => null);
     emitAppEvent("dispatch.orders.updated", { source: "scm-po-split-destination", type: "PO", orderId: updated.splitPoRef });
     emitAppEvent("receiving.order.updated", { source: "scm-po-split-destination", type: "PO", orderId: updated.splitPoId });
-    res.json({ updated, orders: await listScmPurchaseOrdersForResponse({}, req.operator) });
+    res.json({
+      updated,
+      orders: await scmPurchaseOrderMutationOrders(req, [updated.splitPoRef, updated.sourcePoRef])
+    });
   } catch (error) {
     next(error);
   }
@@ -16140,7 +16465,10 @@ app.put("/api/dispatch/scm/purchase-order-splits/:ref/pickup", async (req, res, 
     }).catch(() => null);
     emitAppEvent("dispatch.orders.updated", { source: "scm-po-split-pickup", type: "PO", orderId: updated.splitPoRef });
     emitAppEvent("receiving.order.updated", { source: "scm-po-split-pickup", type: "PO", orderId: updated.splitPoId });
-    res.json({ updated, orders: await listScmPurchaseOrdersForResponse({}, req.operator) });
+    res.json({
+      updated,
+      orders: await scmPurchaseOrderMutationOrders(req, [updated.splitPoRef, updated.sourcePoRef])
+    });
   } catch (error) {
     next(error);
   }
@@ -16172,7 +16500,11 @@ app.delete("/api/dispatch/scm/purchase-order-splits/:ref", async (req, res, next
       }
     }).catch(() => null);
     emitAppEvent("dispatch.orders.updated", { source: "scm-po-split-cancelled", type: "PO", orderId: cancelled.splitPoRef });
-    res.json({ cancelled, orders: await listScmPurchaseOrdersForResponse({}, req.operator) });
+    await removeScmPurchaseOrderCatalogOrder(cancelled.splitPoRef);
+    res.json({
+      cancelled,
+      orders: await scmPurchaseOrderMutationOrders(req, [cancelled.sourcePoRef])
+    });
   } catch (error) {
     next(error);
   }
@@ -16436,6 +16768,12 @@ app.post("/api/dispatch/orders/:id/po-allocations", async (req, res, next) => {
       targetRef: req.params.id,
       payload: {
         poRef: req.body?.poRef,
+        directServicePoLineIds: Array.isArray(req.body?.directServicePoLineIds)
+          ? req.body.directServicePoLineIds
+          : undefined,
+        serviceSalesLineKeys: Array.isArray(req.body?.serviceSalesLineKeys)
+          ? req.body.serviceSalesLineKeys
+          : undefined,
         ...(Array.isArray(req.body?.lines)
           ? { lines: req.body.lines }
           : {
@@ -16508,6 +16846,10 @@ app.post("/api/dispatch/split-orders/unsplit", async (req, res, next) => {
       orderType: req.body?.orderType,
       splitOrderIds: req.body?.splitOrderIds
     });
+    await deactivateDispatchGlobalOrderDefinitions(result.deactivated || []);
+    for (const splitRef of result.deactivated || []) {
+      await removeDispatchOrderCatalogOrder(splitRef);
+    }
     await writeDispatchAudit({
       action: "dispatch_split_orders_deactivated",
       entityType: "order",
@@ -16548,7 +16890,8 @@ app.post("/api/dispatch/co-orders", reportDispatchCoTiming("co_upsert"), async (
         loadName: req.body?.loadName,
         parkingSpot: req.body?.parkingSpot
       },
-      requestedBy: req.body?.audit?.sessionId || ""
+      requestedBy: req.body?.audit?.sessionId || "",
+      reactivateCancelled: req.body?.reactivateCancelled === true
     });
     await writeDispatchAudit({
       action: "co_saved_to_local_db",
@@ -16559,6 +16902,13 @@ app.post("/api/dispatch/co-orders", reportDispatchCoTiming("co_upsert"), async (
       after: co,
       details: { sourceOrderRef: co.source_order_ref, fromYard: co.from_location, toYard: co.to_location }
     }).catch(() => null);
+    await syncDispatchGlobalOrderTransitCo({
+      sourceOrderRef: co.source_order_ref,
+      co
+    });
+    await refreshDispatchOrderCatalogRefsNow([co.source_order_ref, co.co_ref], {
+      source: "dispatch-co-created"
+    });
     emitAppEvent("dispatch.co.updated", { coRef: co.co_ref, sourceOrderRef: co.source_order_ref, sourceSessionId: req.body?.audit?.sessionId });
     emitAppEvent("delivery.order.updated", { orderRef: co.source_order_ref, coRef: co.co_ref, source: "dispatch-co" });
     res.json({ co });
@@ -16580,11 +16930,23 @@ app.delete("/api/dispatch/co-orders/:coRef", async (req, res, next) => {
       sessionId: req.query.sessionId,
       after: cancelled
     }).catch(() => null);
-    emitAppEvent("dispatch.co.updated", { coRef: req.params.coRef, cancelled: true, sourceSessionId: req.query.sessionId });
+    const sourceOrderRef = cancelled.source_order_ref || cancelled.sourceOrderRef || "";
+    await syncDispatchGlobalOrderTransitCo({
+      sourceOrderRef,
+      co: cancelled,
+      cancelled: true
+    });
+    await removeDispatchGlobalGroupedMember(req.params.coRef);
+    await deactivateDispatchGlobalOrderDefinitions([req.params.coRef]);
+    await refreshDispatchOrderCatalogRefsNow([sourceOrderRef], {
+      removedOrderRefs: [req.params.coRef],
+      source: "dispatch-co-cancelled"
+    });
+    emitAppEvent("dispatch.co.updated", { coRef: req.params.coRef, sourceOrderRef, cancelled: true, sourceSessionId: req.query.sessionId });
     emitAppEvent("delivery.order.updated", { coRef: req.params.coRef, cancelled: true, source: "dispatch-co" });
     res.json({
       cancelled,
-      ...await dispatchMutationOrderResponse(req, [cancelled.source_order_ref || cancelled.sourceOrderRef])
+      ...await dispatchMutationOrderResponse(req, [sourceOrderRef])
     });
   } catch (error) {
     next(error);
@@ -16651,7 +17013,7 @@ app.put("/api/dispatch/plan", async (req, res, next) => {
       trucks: cleanTrucks
     });
     cleanTrucks = scheduleCandidate.trucks || [];
-    const changedScmRefs = changedDispatchScmRefs(previousPlan, {
+    const changedScmRefs = changedPlacedDispatchScmAssignmentRefs(previousPlan, {
       ...previousPlan,
       orders: cleanOrders,
       trucks: cleanTrucks
@@ -16683,6 +17045,11 @@ app.put("/api/dispatch/plan", async (req, res, next) => {
       previousPlan,
       { orders: payload.orders }
     );
+    const retiredGlobalOrderRefs = [...new Set((Array.isArray(req.body?.retiredGlobalOrderRefs)
+      ? req.body.retiredGlobalOrderRefs
+      : [])
+      .map((ref) => String(ref || "").trim())
+      .filter(Boolean))].slice(0, 200);
     const explicitOperatorAlertRefs = Array.isArray(req.body?.audit?.details?.operatorAlertRefs)
       ? req.body.audit.details.operatorAlertRefs.map((ref) => String(ref || "").trim()).filter(Boolean)
       : [];
@@ -16690,6 +17057,7 @@ app.put("/api/dispatch/plan", async (req, res, next) => {
     if (
       previousPlan
       && !explicitOperatorAlertRefs.length
+      && !retiredGlobalOrderRefs.length
       && !dispatchPlanDataChanged(
         { orders: previousPlan.orders || [], trucks: previousPlan.trucks || [] },
         { orders: payload.orders, trucks: payload.trucks }
@@ -16728,7 +17096,8 @@ app.put("/api/dispatch/plan", async (req, res, next) => {
       orders: payload.orders,
       trucks: payload.trucks,
       summary: await dispatchPlanSummaryWithSetup(req.body?.summary || {}),
-      baseRevision: saveMode === "truck_sequence" ? null : req.body?.baseRevision
+      baseRevision: saveMode === "truck_sequence" ? null : req.body?.baseRevision,
+      retiredGlobalOrderRefs
     });
     await syncOrderDependenciesFromDispatchPlan(savedPlan, {
       allowEstablishedUngroupTargets: dependencyStructureChanges.safeUngroupTargets
@@ -19991,6 +20360,37 @@ app.get("/api/admin/public-sales", requireOperator, requireAdmin, async (_req, r
   }
 });
 
+app.get("/api/admin/netsuite-order-webhook-queue", requireOperator, requireAdmin, async (req, res, next) => {
+  try {
+    res.json(await getNetSuiteOrderWebhookQueueStatus({ recentLimit: req.query.limit }));
+  } catch (error) {
+    next(error);
+  }
+});
+
+app.put("/api/admin/netsuite-order-webhook-queue", requireOperator, requireAdmin, async (req, res, next) => {
+  try {
+    res.json(await setNetSuiteOrderWebhookQueuePaused({
+      paused: req.body?.paused === true,
+      reason: req.body?.reason || "",
+      actor: req.operator?.id || req.operator?.username || "admin"
+    }));
+  } catch (error) {
+    next(error);
+  }
+});
+
+app.post("/api/admin/netsuite-order-webhook-queue/:id/retry", requireOperator, requireAdmin, async (req, res, next) => {
+  try {
+    res.json(await retryNetSuiteOrderWebhook({
+      id: req.params.id,
+      actor: req.operator?.id || req.operator?.username || "admin"
+    }));
+  } catch (error) {
+    next(error);
+  }
+});
+
 app.put("/api/admin/public-sales", requireOperator, requireAdmin, async (req, res, next) => {
   try {
     const settings = await updateSalesPortalSettings({ enabled: req.body?.enabled }, req.operator.id);
@@ -23014,7 +23414,10 @@ let dispatchV2CheckpointRetentionRunning = false;
 let dispatchV2CheckpointTickRunning = false;
 let dispatchActualArrivalTickRunning = false;
 let dispatchOrderCatalogTickRunning = false;
+let scmPurchaseOrderCatalogTickRunning = false;
+let netSuiteOrderWebhookNotificationTickRunning = false;
 const dispatchActualArrivalWorkerId = `operator-app:${process.pid}:${crypto.randomUUID()}`;
+const catalogRefreshExecutor = createSerialExecutor();
 
 function dispatchV2PatchOrderRefs(patch = {}) {
   return [...new Set([
@@ -23093,7 +23496,13 @@ export async function dispatchV2CheckpointRetentionTick() {
   if (dispatchV2CheckpointRetentionRunning) return { skipped: true, deleted: 0, checkpointIds: [] };
   dispatchV2CheckpointRetentionRunning = true;
   try {
-    return { skipped: false, ...await pruneExpiredDispatchV2Checkpoints({ retentionDays: 7, batchSize: 500 }) };
+    const result = await drainBoundedBatches({
+      batchSize: 5,
+      maxBatches: 20,
+      yieldBetween: () => new Promise((resolve) => setTimeout(resolve, 250)),
+      worker: ({ batchSize }) => pruneExpiredDispatchV2Checkpoints({ retentionDays: 7, batchSize })
+    });
+    return { skipped: false, ...result };
   } catch (error) {
     console.error("Dispatch v2 checkpoint retention failed:", error.message);
     return { skipped: false, deleted: 0, checkpointIds: [], error: error.message };
@@ -23130,28 +23539,32 @@ export async function dispatchOrderCatalogTick() {
     summary.claimed = refreshes.length;
     for (const refresh of refreshes) {
       try {
-        const requestedType = String(refresh.orderType || "").trim().toUpperCase();
-        if (refresh.orderRef) {
-          const orders = await targetedDispatchMutationOrders([refresh.orderRef]);
-          if (orders.length) await upsertDispatchOrderCatalog({
-            orders,
-            source: refresh.source || "targeted-refresh"
-          });
-          else await removeDispatchOrderCatalogOrder(refresh.orderRef);
-        } else {
-          const orders = await listDispatchOrdersForResponse({ type: requestedType || null });
-          await replaceDispatchOrderCatalog({
-            orders,
-            source: refresh.source || "full-refresh",
-            type: requestedType
-          });
-          const state = await getDispatchOrderCatalogState();
-          if (!state.assignmentsReady) await backfillDispatchPlanProjections();
-          await markDispatchOrderCatalogReady({
-            source: refresh.source || "full-refresh",
-            assignmentsReady: true
-          });
-        }
+        await catalogRefreshExecutor.run(async () => {
+          const requestedType = String(refresh.orderType || "").trim().toUpperCase();
+          if (refresh.orderRef) {
+            const orders = await targetedDispatchMutationOrders([refresh.orderRef]);
+            if (orders.length) await upsertDispatchOrderCatalog({
+              orders,
+              source: refresh.source || "targeted-refresh"
+            });
+            else await removeDispatchOrderCatalogOrder(refresh.orderRef);
+          } else {
+            const orders = await listDispatchOrdersForResponse({ type: requestedType || null });
+            await replaceDispatchOrderCatalog({
+              orders,
+              source: refresh.source || "full-refresh",
+              type: requestedType
+            });
+            const state = await getDispatchOrderCatalogState();
+            const projection = state.assignmentsReady
+              ? { ready: true }
+              : await backfillDispatchPlanProjections({ batchSize: 25 });
+            await markDispatchOrderCatalogReady({
+              source: refresh.source || "full-refresh",
+              assignmentsReady: projection.ready === true
+            });
+          }
+        });
         await completeDispatchOrderCatalogRefresh(refresh.id);
         summary.completed += 1;
       } catch (error) {
@@ -23164,6 +23577,90 @@ export async function dispatchOrderCatalogTick() {
     return summary;
   } finally {
     dispatchOrderCatalogTickRunning = false;
+  }
+}
+
+export async function scmPurchaseOrderCatalogTick() {
+  if (scmPurchaseOrderCatalogTickRunning) {
+    return { skipped: true, claimed: 0, completed: 0, failed: 0 };
+  }
+  scmPurchaseOrderCatalogTickRunning = true;
+  const summary = { skipped: false, claimed: 0, completed: 0, failed: 0 };
+  try {
+    const refreshes = await claimScmPurchaseOrderCatalogRefreshes({ limit: 10 });
+    summary.claimed = refreshes.length;
+    for (const refresh of refreshes) {
+      try {
+        await catalogRefreshExecutor.run(async () => {
+          if (refresh.orderRef) {
+            const orders = await targetedScmPurchaseOrdersForResponse([refresh.orderRef], null, {
+              includeRestricted: true
+            });
+            if (orders.length) {
+              await upsertScmPurchaseOrderCatalog({
+                orders,
+                source: refresh.source || "targeted-refresh"
+              });
+            } else {
+              await removeScmPurchaseOrderCatalogOrder(refresh.orderRef);
+            }
+          } else {
+            const orders = await listScmPurchaseOrdersForResponse({
+              includeAllDiscoverable: true,
+              unbounded: true
+            }, null, { includeRestricted: true });
+            await replaceScmPurchaseOrderCatalog({
+              orders,
+              source: refresh.source || "full-refresh"
+            });
+          }
+        });
+        await completeScmPurchaseOrderCatalogRefresh(refresh.id);
+        summary.completed += 1;
+      } catch (error) {
+        summary.failed += 1;
+        await failScmPurchaseOrderCatalogRefresh(refresh.id, error);
+        if (!refresh.orderRef) await markScmPurchaseOrderCatalogFailed(error);
+        console.error(`SCM purchase-order catalog refresh ${refresh.id} failed:`, error.message);
+      }
+    }
+    return summary;
+  } finally {
+    scmPurchaseOrderCatalogTickRunning = false;
+  }
+}
+
+export async function netSuiteOrderWebhookNotificationTick() {
+  if (netSuiteOrderWebhookNotificationTickRunning) {
+    return { skipped: true, notified: 0 };
+  }
+  netSuiteOrderWebhookNotificationTickRunning = true;
+  try {
+    const notifications = await claimNetSuiteOrderWebhookNotifications({ limit: 100 });
+    if (!notifications.length) return { skipped: false, notified: 0 };
+    const payload = {
+      source: "netsuite-order-webhook-queue",
+      catalogAlreadyQueued: true,
+      count: notifications.length
+    };
+    emitAppEvent("dispatch.orders.updated", payload);
+    emitAppEvent("delivery.order.updated", payload);
+    emitAppEvent("receiving.order.updated", payload);
+    const smartNotifications = notifications.filter(
+      (notification) => notification.poHistoryEvent === "scm.smart.updated"
+    );
+    if (smartNotifications.length) {
+      emitAppEvent("scm.smart.updated", {
+        ...payload,
+        count: smartNotifications.length
+      });
+    }
+    return { skipped: false, notified: notifications.length };
+  } catch (error) {
+    console.error("NetSuite order webhook notification tick failed:", error.message);
+    return { skipped: false, notified: 0, error: error.message };
+  } finally {
+    netSuiteOrderWebhookNotificationTickRunning = false;
   }
 }
 
@@ -23223,9 +23720,27 @@ export async function dispatchActualArrivalTick() {
 export async function startServer() {
   await recoverInterruptedSyncState();
   await recoverInterruptedPhotoArchive();
+  const coGroupIdentityRepair = await repairDispatchCoGroupIdentities();
+  if (coGroupIdentityRepair.repaired > 0) {
+    console.log(
+      `Repaired ${coGroupIdentityRepair.repaired} Dispatch CO group identity plan(s): ${coGroupIdentityRepair.mappings
+        .map((mapping) => `${mapping.oldRef}->${mapping.newRef}`)
+        .join(", ")}.`
+    );
+  }
+  const globalCoProjectionRepair = await reconcileDispatchGlobalOrderTransitCos();
+  if (globalCoProjectionRepair.updated > 0) {
+    console.log(`Repaired CO pickup metadata on ${globalCoProjectionRepair.updated} global Dispatch order definition(s).`);
+  }
   const dispatchV2SummaryRepair = await repairDispatchV2SummaryMarkers();
   if (dispatchV2SummaryRepair.repaired > 0) {
     console.log(`Repaired ${dispatchV2SummaryRepair.repaired} Dispatch V2 summary marker(s) for ${dispatchV2SummaryRepair.date}.`);
+  }
+  if (config.dispatch?.plannerOrderPoolMode !== "off") {
+    const projectionBackfill = await backfillDispatchPlanProjections({ batchSize: 25 });
+    console.log(
+      `Dispatch assignment projection ready=${projectionBackfill.ready}; projected=${projectionBackfill.projected}; remaining=${projectionBackfill.remaining}.`
+    );
   }
   return app.listen(config.port, () => {
     console.log(`MBBS Yard Server listening on ${config.appBaseUrl}`);
@@ -23261,8 +23776,14 @@ export async function startServer() {
         .catch((error) => console.error("Dispatch order catalog startup failed:", error.message));
       setInterval(() => void dispatchOrderCatalogTick(), 10000);
     }
+    void enqueueScmPurchaseOrderCatalogRefresh({ source: "startup" })
+      .then(() => scmPurchaseOrderCatalogTick())
+      .catch((error) => console.error("SCM purchase-order catalog startup failed:", error.message));
+    setInterval(() => void scmPurchaseOrderCatalogTick(), 10000);
+    setTimeout(() => void netSuiteOrderWebhookNotificationTick(), 1000);
+    setInterval(() => void netSuiteOrderWebhookNotificationTick(), 1000);
     setTimeout(() => void dispatchV2CheckpointRetentionTick(), 60000);
-    setInterval(() => void dispatchV2CheckpointRetentionTick(), 24 * 60 * 60 * 1000);
+    setInterval(() => void dispatchV2CheckpointRetentionTick(), 15 * 60 * 1000);
     if (config.dispatch?.plannerCommandMode === "on") {
       setTimeout(() => void dispatchV2CheckpointTick(), 10000);
       setInterval(() => void dispatchV2CheckpointTick(), 30000);

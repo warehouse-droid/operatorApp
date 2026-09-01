@@ -398,7 +398,15 @@ export async function authenticateYardPrinterAgent(token, agentId = "") {
   const printer = result.rows[0];
   if (!printer || !safeEqual(printer.agent_token_hash, tokenHash) || !printer.enabled) return null;
   await query(
-    `UPDATE scm_yard_printers SET status = 'online', last_seen_at = now(), last_error = NULL WHERE location_id = $1`,
+    `UPDATE scm_yard_printers
+        SET status = 'online', last_seen_at = now(), last_error = NULL
+      WHERE location_id = $1
+        AND (
+          status IS DISTINCT FROM 'online'
+          OR last_error IS NOT NULL
+          OR last_seen_at IS NULL
+          OR last_seen_at < now() - interval '1 minute'
+        )`,
     [printer.location_id]
   );
   return printer;
@@ -578,7 +586,10 @@ export async function leaseYardPrintJob(agentToken, agentId = "", agentVersion =
   if (!printer) throw Object.assign(new Error("Valid enabled printer-agent credentials are required."), { status: 401 });
   const reportedAgentVersion = Math.min(1000, Math.max(1, Math.floor(Number(agentVersion) || 1)));
   await query(
-    "UPDATE scm_yard_printers SET agent_version = $2 WHERE location_id = $1",
+    `UPDATE scm_yard_printers
+        SET agent_version = $2
+      WHERE location_id = $1
+        AND agent_version IS DISTINCT FROM $2`,
     [printer.location_id, reportedAgentVersion]
   );
   printer.agent_version = reportedAgentVersion;

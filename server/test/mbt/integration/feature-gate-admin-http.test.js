@@ -25,6 +25,7 @@ const EXPECTED_FLAGS = Object.freeze([
   "operator_customer_pickup_photo_required",
   "sales_stock_request_over_availability",
   "special_stock_request_workflow",
+  "dispatch_optimized_order_pool",
   "operator_netsuite_customer_pickup_if_3445",
   "operator_netsuite_receiving_ir_3445",
   "operator_netsuite_delivery_prep_if_3445",
@@ -133,6 +134,10 @@ test("P3-F29 Admin gate inventory is private, complete, and keeps live integrati
   assert.equal(gate(allowed.payload, "driver_offline_mode").environmentAllowed, true);
   assert.equal(gate(allowed.payload, "operator_customer_pickup_photo_required").environmentAllowed, true);
   assert.equal(gate(allowed.payload, "special_stock_request_workflow").environmentAllowed, true);
+  assert.equal(gate(allowed.payload, "dispatch_optimized_order_pool").configured, false);
+  assert.equal(gate(allowed.payload, "dispatch_optimized_order_pool").effective, false);
+  assert.equal(gate(allowed.payload, "dispatch_optimized_order_pool").deploymentGuarded, true);
+  assert.ok(gate(allowed.payload, "dispatch_optimized_order_pool").dispatchOrderPool);
   assert.equal(gate(allowed.payload, "operator_netsuite_delivery_prep_if_12441").configured, false);
   assert.equal(gate(allowed.payload, "operator_netsuite_delivery_prep_if_12441").environmentAllowed, false);
   assert.equal(gate(allowed.payload, "operator_netsuite_delivery_prep_if_12441").effective, false);
@@ -240,6 +245,33 @@ test("P3-F29 Admin gate commands are audited, revision-guarded, idempotent, and 
     [[commandKey, `mbt-gate-off-${RUN_ID}`]]
   );
   assert.deepEqual(evidence.rows[0], { audits: 2, receipts: 2 });
+});
+
+test("Dispatch optimized pool gate rejects activation until its rollout ceiling is ready", async () => {
+  const initial = await request("/api/mbt/config/gates", { token: tokens.get("admin") });
+  assert.equal(initial.response.status, 200, JSON.stringify(initial.payload));
+  const original = gate(initial.payload, "dispatch_optimized_order_pool");
+  assert.equal(original.configured, false);
+  assert.equal(original.environmentAllowed, false);
+  assert.equal(original.effective, false);
+
+  const blocked = await request("/api/mbt/config/gates/dispatch_optimized_order_pool", {
+    token: tokens.get("admin"),
+    method: "PUT",
+    headers: { "idempotency-key": `dispatch-order-pool-gate-on-${RUN_ID}` },
+    body: {
+      enabled: true,
+      expectedRevision: original.revision,
+      reason: "Verify the optimized pool Admin cutover remains behind its deployment and readiness ceiling"
+    }
+  });
+  assert.equal(blocked.response.status, 409, JSON.stringify(blocked.payload));
+  assert.equal(blocked.payload.code, "DISPATCH_ORDER_POOL_NOT_READY");
+
+  const unchanged = await request("/api/mbt/config/gates", { token: tokens.get("admin") });
+  const unchangedGate = gate(unchanged.payload, "dispatch_optimized_order_pool");
+  assert.equal(unchangedGate.configured, false);
+  assert.equal(unchangedGate.effective, false);
 });
 
 test("Admin independently controls the Driver PWA offline mode advertised to devices", async () => {

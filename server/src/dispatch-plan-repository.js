@@ -1,7 +1,11 @@
 import { query, withTransaction } from "./db.js";
-import { assertActiveDispatchCosForPlan } from "./dispatch-co-lifecycle.js";
+import { canonicalizeDispatchCoGroupIdentities } from "./dispatch-co-group-identity.js";
+import { assertActiveDispatchCosForPlan, reconcileDispatchPlanLocalCos } from "./dispatch-co-lifecycle.js";
 import { canonicalizeDispatchCustomOrdersInPlan } from "./dispatch-custom-order-repository.js";
-import { syncDispatchDeliveryGroupsFromPlan } from "./dispatch-delivery-group-repository.js";
+import {
+  deactivateDispatchGlobalOrderDefinitions,
+  syncDispatchDeliveryGroupsFromPlan
+} from "./dispatch-delivery-group-repository.js";
 import {
   dispatchLoadAssignment,
   dispatchLoadAssignmentDefaults,
@@ -198,7 +202,7 @@ function cleanPlanDate(value) {
 
 function planRow(row) {
   if (!row) return null;
-  const plan = {
+  const plan = canonicalizeDispatchCoGroupIdentities({
     id: row.id,
     revision: Number(row.revision || 0),
     planDate: row.plan_date instanceof Date ? row.plan_date.toISOString().slice(0, 10) : String(row.plan_date || "").slice(0, 10),
@@ -211,7 +215,7 @@ function planRow(row) {
     orders: row.orders || [],
     trucks: row.trucks || [],
     summary: row.summary || {}
-  };
+  });
   return { ...plan, digest: digestDispatchPlan(plan) };
 }
 
@@ -801,7 +805,7 @@ async function sanitizeDispatchPlan(plan) {
 
 async function sanitizedSnapshotDetail(row, { current = false } = {}) {
   const rawTrucks = normalizedSnapshotTrucks(row);
-  const sanitized = await sanitizeDispatchPlan({
+  const sanitized = await sanitizeDispatchPlan(canonicalizeDispatchCoGroupIdentities({
     id: String(row.plan_id || row.id || ""),
     planDate: row.plan_date,
     status: row.status || "",
@@ -809,7 +813,7 @@ async function sanitizedSnapshotDetail(row, { current = false } = {}) {
     orders: Array.isArray(row.orders) ? row.orders : [],
     trucks: rawTrucks,
     summary: row.summary || {}
-  });
+  }));
   const orders = sanitized?.orders || [];
   const trucks = sanitized?.trucks || [];
   return {
@@ -873,7 +877,9 @@ export async function createDispatchPlan({ planDate, note = "", status = "draft"
      ON CONFLICT (plan_id) DO NOTHING`,
     [plan.id, JSON.stringify(initialSummary), initialDigest]
   );
-  return getDispatchPlan(plan.id);
+  const created = await getDispatchPlan(plan.id);
+  await syncDispatchPlannerReadProjections(created);
+  return created;
 }
 
 export async function getDispatchPlan(planId) {
@@ -889,7 +895,7 @@ export async function getDispatchPlan(planId) {
 
 export async function getDispatchPlanRevision(planId) {
   const result = await query(
-    `SELECT p.id, p.revision, p.updated_at, s.saved_at
+    `SELECT p.id, p.revision, p.updated_at, s.saved_at, s.plan_digest
        FROM dispatch_plans p
        LEFT JOIN dispatch_plan_snapshots s ON s.plan_id = p.id
       WHERE p.id = $1`,
@@ -900,6 +906,7 @@ export async function getDispatchPlanRevision(planId) {
   return {
     id: String(row.id),
     revision: Number(row.revision || 0),
+    digest: row.plan_digest || "",
     savedAt: row.saved_at || row.updated_at,
     updatedAt: row.updated_at,
     updatedBySessionId: ""
@@ -1434,7 +1441,15 @@ export async function saveDispatchPlanRecoveryDraft(planId, {
   });
 }
 
-export async function saveDispatchPlanSnapshot(planId, { orders = [], trucks = [], summary = {}, baseRevision = null, planDate = "", sessionId = "" } = {}) {
+export async function saveDispatchPlanSnapshot(planId, {
+  orders = [],
+  trucks = [],
+  summary = {},
+  baseRevision = null,
+  planDate = "",
+  sessionId = "",
+  retiredGlobalOrderRefs = []
+} = {}) {
   return withTransaction(async () => {
     await lockDispatchFleetPlanning();
     const currentPlan = await query(
@@ -1468,7 +1483,7 @@ export async function saveDispatchPlanSnapshot(planId, { orders = [], trucks = [
       orders: [...(previousPlan.orders || []), ...(Array.isArray(orders) ? orders : [])],
       trucks: [...(previousPlan.trucks || []), ...(Array.isArray(trucks) ? trucks : [])]
     }, { operation: "save" });
-    const canonicalPlan = await canonicalizeDispatchCustomOrdersInPlan({
+    const canonicalPlan = await reconcileDispatchPlanLocalCos(await canonicalizeDispatchCustomOrdersInPlan({
       id: String(planId),
       planDate: expectedPlanDate,
       orders: Array.isArray(orders) ? orders : [],
@@ -1477,7 +1492,7 @@ export async function saveDispatchPlanSnapshot(planId, { orders = [], trucks = [
     }, {
       previousPlan,
       lockRows: true
-    });
+    }));
     await assertCustomOrderPlanDateExclusivity(canonicalPlan, {
       previousPlan
     });
@@ -1609,9 +1624,19 @@ export async function saveDispatchPlanSnapshot(planId, { orders = [], trucks = [
     await syncDispatchDeliveryGroupsFromPlan({
       id: planId,
       planDate: expectedPlanDate,
-      orders: storedPlan.orders,
-      trucks: storedPlan.trucks
+      revision: cleanPlan.revision,
+      orders: cleanPlan.orders,
+      trucks: cleanPlan.trucks
     });
+    const retainedRefs = new Set((cleanPlan.orders || [])
+      .map((order) => String(order?.id || "").trim().toLowerCase())
+      .filter(Boolean));
+    await deactivateDispatchGlobalOrderDefinitions((Array.isArray(retiredGlobalOrderRefs)
+      ? retiredGlobalOrderRefs
+      : [])
+      .map((ref) => String(ref || "").trim())
+      .filter((ref) => ref && !retainedRefs.has(ref.toLowerCase()))
+      .slice(0, 200));
     await syncDispatchPlannerReadProjections({
       ...storedPlan,
       id: planId,
@@ -1708,7 +1733,7 @@ export async function restoreDispatchPlanSnapshot(snapshotId, { sessionId = "" }
               || dispatchLoadAssignmentDefaults.ownYards
           })
     );
-    const canonicalPlan = await canonicalizeDispatchCustomOrdersInPlan({
+    const canonicalPlan = await reconcileDispatchPlanLocalCos(await canonicalizeDispatchCustomOrdersInPlan({
       ...sanitizedPlan,
       planDate: currentDate
     }, {
@@ -1719,7 +1744,7 @@ export async function restoreDispatchPlanSnapshot(snapshotId, { sessionId = "" }
         trucks: current.trucks || []
       },
       lockRows: true
-    });
+    }));
     await assertCustomOrderPlanDateExclusivity(canonicalPlan, {
       previousPlan: {
         id: current.id,
@@ -1807,6 +1832,7 @@ export async function restoreDispatchPlanSnapshot(snapshotId, { sessionId = "" }
     await syncDispatchDeliveryGroupsFromPlan({
       id: source.plan_id,
       planDate: currentDate,
+      revision: Number(current.revision || 0) + 1,
       orders: cleanPlan.orders,
       trucks: cleanPlan.trucks
     });
@@ -1877,10 +1903,10 @@ async function confirmDispatchPlanTransaction(planId, { note = "", binBoundary =
         return getDispatchPlan(planId);
       }
     }
-    const canonicalPlan = await canonicalizeDispatchCustomOrdersInPlan(currentPlan, {
+    const canonicalPlan = await reconcileDispatchPlanLocalCos(await canonicalizeDispatchCustomOrdersInPlan(currentPlan, {
       previousPlan: currentPlan,
       lockRows: true
-    });
+    }));
     await assertCustomOrderPlanDateExclusivity(canonicalPlan, { previousPlan: currentPlan });
     await assertSpecialStockHandoffPlanning(canonicalPlan);
     const sanitizedPlan = await sanitizeDispatchPlan(canonicalPlan);

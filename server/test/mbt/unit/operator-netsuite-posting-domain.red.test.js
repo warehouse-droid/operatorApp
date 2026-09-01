@@ -20,8 +20,8 @@ const POLICY = Object.freeze({
   yardCode: "12441"
 });
 
-function selected({ orderLine, quantity, location = 15, localOrderKey = "SO:-1", localLineId = "-101" }) {
-  return { orderLine, quantity, location, localOrderKey, localLineId };
+function selected({ orderLine, quantity, location = 15, localOrderKey = "SO:-1", localLineId = "-101", ...rest }) {
+  return { orderLine, quantity, location, localOrderKey, localLineId, ...rest };
 }
 
 function target(overrides = {}) {
@@ -186,6 +186,32 @@ test("P4/P7 invalid or conflicting source data fails before a command can be cla
     input({ targets: [target({ sourceNetSuiteId: -1 })] }),
     input({ targets: [target({ selectedLines: [selected({ orderLine: 1, quantity: 0 })] })] }),
     input({ targets: [target({
+      selectedLines: [selected({ orderLine: 1, quantity: 1, sourceLineKey: "wrong-stable-key" })],
+      availableLines: [{ orderLine: 1, location: 15, sourceLineKey: "stable-key" }]
+    })] }),
+    input({ targets: [target({
+      selectedLines: [selected({ orderLine: 1, quantity: 3, sourceLineKey: "stable-key" })],
+      availableLines: [{
+        orderLine: 1,
+        location: 15,
+        sourceLineKey: "stable-key",
+        orderedQuantity: 2,
+        remainingQuantity: 2
+      }]
+    })] }),
+    input({ targets: [target({
+      availableLines: [{
+        orderLine: 1,
+        location: 15,
+        linkedTransactions: [{ id: 1, ref: "CM1", type: "CM", quantity: 1 }]
+      }]
+    })] }),
+    input({ targets: [target({
+      availableLines: [{ orderLine: 1, location: 15, orderedQuantity: 10 }]
+    }), target({
+      availableLines: [{ orderLine: 1, location: 15, orderedQuantity: 11 }]
+    })] }),
+    input({ targets: [target({
       selectedLines: [
         selected({ orderLine: 1, quantity: 1, location: 15 }),
         selected({ orderLine: 1, quantity: 1, location: 28 })
@@ -198,4 +224,132 @@ test("P4/P7 invalid or conflicting source data fails before a command can be cla
       (error) => error?.status === 400 && error?.code === "OPERATOR_NETSUITE_POSTING_INPUT_INVALID"
     );
   }
+});
+
+test("R2/M2 live progress caps the remote IR while the stable local receipt payload is retained", () => {
+  const localPayload = {
+    item: {
+      items: [{ orderLine: 4850690, quantity: 5, itemReceive: true, location: 1 }]
+    }
+  };
+  const draft = buildOperatorNetSuitePostingDraft(input({
+    functionKey: "receiving",
+    transactionType: "IR",
+    policy: {
+      ...POLICY,
+      gateKey: "operator_netsuite_receiving_ir_3445",
+      functionKey: "receiving",
+      transactionType: "IR",
+      locationId: 1,
+      yardCode: "3445"
+    },
+    localOperation: { kind: "receiving_receipt", orderId: "968798", orderType: "purchase_order" },
+    localPayload,
+    localOrderKeys: ["receiving:purchase_order:968798"],
+    targets: [target({
+      sourceOrderKind: "PO",
+      sourceNetSuiteId: 968798,
+      sourceOrderRef: "POB03782",
+      selectedLines: [selected({
+        orderLine: 1,
+        quantity: 5,
+        location: 1,
+        sourceLineKey: "4850690",
+        localOrderKey: "receiving:purchase_order:968798",
+        localLineId: "po-line-1"
+      })],
+      availableLines: [{
+        orderLine: 1,
+        sourceLineKey: "4850690",
+        location: 1,
+        orderedQuantity: 10,
+        completedQuantity: 7,
+        remainingQuantity: 3,
+        linkedTransactions: [{ id: 991, ref: "IR991", type: "IR", quantity: 7 }]
+      }]
+    })]
+  }));
+
+  assert.equal(draft.steps.length, 1);
+  assert.equal(draft.steps[0].payload.item.items[0].orderLine, 1);
+  assert.equal(draft.steps[0].payload.item.items[0].quantity, 3);
+  assert.deepEqual(draft.inputSnapshot.localPayload, localPayload);
+  assert.deepEqual(draft.lineReconciliation.lines.map((line) => ({
+    sourceLineKey: line.sourceLineKey,
+    requestedQuantity: line.requestedQuantity,
+    postedQuantity: line.postedQuantity,
+    reconciledQuantity: line.reconciledQuantity
+  })), [{
+    sourceLineKey: "4850690",
+    requestedQuantity: 5,
+    postedQuantity: 3,
+    reconciledQuantity: 2
+  }]);
+});
+
+test("R1 a fully completed source creates no transform step but retains linked evidence", () => {
+  const localPayload = {
+    item: { items: [{ orderLine: 4866005, quantity: 5, itemReceive: true, location: 15 }] }
+  };
+  const draft = buildOperatorNetSuitePostingDraft(input({
+    localPayload,
+    targets: [target({
+      sourceNetSuiteId: 972607,
+      sourceOrderRef: "SOB119026",
+      selectedLines: [selected({
+        orderLine: 1,
+        quantity: 5,
+        sourceLineKey: "4866005",
+        localOrderKey: "customer_pickup:sales_order:972607",
+        localLineId: "391614"
+      })],
+      availableLines: [{
+        orderLine: 1,
+        sourceLineKey: "4866005",
+        location: 15,
+        orderedQuantity: 5,
+        completedQuantity: 5,
+        remainingQuantity: 0,
+        linkedTransactions: [{ id: 881, ref: "IF881", type: "IF", quantity: 5 }]
+      }]
+    })]
+  }));
+
+  assert.equal(draft.steps.length, 0);
+  assert.equal(draft.lineReconciliation.lines[0].postedQuantity, 0);
+  assert.equal(draft.lineReconciliation.lines[0].reconciledQuantity, 5);
+  assert.deepEqual(draft.lineReconciliation.lines[0].linkedTransactions, [
+    { id: 881, ref: "IF881", type: "IF", quantity: 5 }
+  ]);
+  assert.deepEqual(draft.inputSnapshot.localPayload, localPayload);
+});
+
+test("R3 split children share one authoritative remaining-quantity cap", () => {
+  const sharedAvailable = [{
+    orderLine: 1,
+    sourceLineKey: "parent-key",
+    location: 15,
+    orderedQuantity: 10,
+    completedQuantity: 5,
+    remainingQuantity: 5
+  }];
+  const draft = buildOperatorNetSuitePostingDraft(input({
+    localOrderKeys: ["SO:-1", "SO:-2"],
+    targets: [
+      target({
+        selectedLines: [selected({ orderLine: 1, quantity: 4, sourceLineKey: "parent-key", localOrderKey: "SO:-1" })],
+        availableLines: sharedAvailable
+      }),
+      target({
+        selectedLines: [selected({ orderLine: 1, quantity: 4, sourceLineKey: "parent-key", localOrderKey: "SO:-2", localLineId: "-102" })],
+        availableLines: sharedAvailable
+      })
+    ]
+  }));
+
+  assert.equal(draft.steps.length, 1);
+  assert.equal(draft.steps[0].payload.item.items[0].quantity, 5);
+  assert.equal(draft.lineReconciliation.lines[0].requestedQuantity, 8);
+  assert.equal(draft.lineReconciliation.lines[0].postedQuantity, 5);
+  assert.equal(draft.lineReconciliation.lines[0].reconciledQuantity, 3);
 });

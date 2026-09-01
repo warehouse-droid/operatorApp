@@ -99,6 +99,7 @@ test("same-tab reload validates and resumes Edit Mode without releasing the leas
     ["GET /api/dispatch/setup", (route) => json(route, { drivers: [], trucks: [], ownYards: [], planning: {} })],
     ["GET /api/dispatch/vendor-yards", (route) => json(route, [])],
     ["GET /api/dispatch/orders", (route) => json(route, [])],
+    ["GET /api/dispatch/planned-assignments", (route) => json(route, [])],
     ["GET /api/dispatch/plans", (route) => json(route, [])],
     ["GET /api/dispatch/driver-job-statuses", (route) => json(route, [])],
     ["GET /api/dispatch/driver-truck-switches/attention", (route) => json(route, [])],

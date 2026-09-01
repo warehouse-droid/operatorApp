@@ -21,62 +21,109 @@ export async function listClosedNetSuiteOrders(orderRefs = []) {
   const refs = normalizeNetSuiteOrderRefs(orderRefs);
   if (!refs.length) return [];
   const result = await query(
-    `WITH requested(requested_ref) AS (
-       SELECT DISTINCT UPPER(BTRIM(value))
-         FROM unnest($1::text[]) input(value)
-        WHERE BTRIM(value) <> ''
+    `WITH requested(requested_ref, numeric_id) AS (
+       SELECT normalized.requested_ref,
+              CASE
+                WHEN normalized.requested_ref ~ '^-?[0-9]{1,19}$'
+                 AND normalized.requested_ref::numeric BETWEEN
+                       -9223372036854775808::numeric AND 9223372036854775807::numeric
+                THEN normalized.requested_ref::bigint
+                ELSE NULL
+              END AS numeric_id
+         FROM (
+           SELECT DISTINCT UPPER(BTRIM(value)) AS requested_ref
+             FROM unnest($1::text[]) input(value)
+            WHERE BTRIM(value) <> ''
+         ) normalized
      ),
-     so_resolved AS (
-       SELECT DISTINCT requested.requested_ref,
-              COALESCE(membership.source_so_id, candidate.netsuite_id) AS source_id
+     so_candidates AS (
+       SELECT requested.requested_ref, candidate.netsuite_id AS candidate_id
          FROM requested
          JOIN sales_orders candidate
            ON upper(BTRIM(candidate.tranid)) = requested.requested_ref
-           OR candidate.netsuite_id::text = requested.requested_ref
+       UNION
+       SELECT requested.requested_ref, candidate.netsuite_id AS candidate_id
+         FROM requested
+         JOIN sales_orders candidate ON candidate.netsuite_id = requested.numeric_id
+        WHERE requested.numeric_id IS NOT NULL
+     ),
+     so_resolved AS (
+       SELECT DISTINCT candidate.requested_ref,
+              COALESCE(membership.source_so_id, candidate.candidate_id) AS source_id
+         FROM so_candidates candidate
          LEFT JOIN dispatch_scm_so_splits membership
-           ON membership.source_so_id = candidate.netsuite_id
-           OR membership.split_so_id = candidate.netsuite_id
+           ON membership.split_so_id = candidate.candidate_id
        UNION
        SELECT requested.requested_ref, membership.source_so_id
          FROM requested
          JOIN dispatch_scm_so_splits membership
            ON upper(BTRIM(membership.source_so_ref)) = requested.requested_ref
-           OR upper(BTRIM(membership.split_so_ref)) = requested.requested_ref
+       UNION
+       SELECT requested.requested_ref, membership.source_so_id
+         FROM requested
+         JOIN dispatch_scm_so_splits membership
+           ON upper(BTRIM(membership.split_so_ref)) = requested.requested_ref
      ),
-     po_resolved AS (
-       SELECT DISTINCT requested.requested_ref,
-              COALESCE(membership.source_po_id, candidate.netsuite_id) AS source_id
+     po_candidates AS (
+       SELECT requested.requested_ref, candidate.netsuite_id AS candidate_id
          FROM requested
          JOIN purchase_orders candidate
            ON upper(BTRIM(candidate.tranid)) = requested.requested_ref
-           OR upper(BTRIM(COALESCE(candidate.dispatch_ref, ''))) = requested.requested_ref
-           OR candidate.netsuite_id::text = requested.requested_ref
+       UNION
+       SELECT requested.requested_ref, candidate.netsuite_id AS candidate_id
+         FROM requested
+         JOIN purchase_orders candidate
+           ON upper(BTRIM(candidate.dispatch_ref)) = requested.requested_ref
+       UNION
+       SELECT requested.requested_ref, candidate.netsuite_id AS candidate_id
+         FROM requested
+         JOIN purchase_orders candidate ON candidate.netsuite_id = requested.numeric_id
+        WHERE requested.numeric_id IS NOT NULL
+     ),
+     po_resolved AS (
+       SELECT DISTINCT candidate.requested_ref,
+              COALESCE(membership.source_po_id, candidate.candidate_id) AS source_id
+         FROM po_candidates candidate
          LEFT JOIN dispatch_scm_po_splits membership
-           ON membership.source_po_id = candidate.netsuite_id
-           OR membership.split_po_id = candidate.netsuite_id
+           ON membership.split_po_id = candidate.candidate_id
        UNION
        SELECT requested.requested_ref, membership.source_po_id
          FROM requested
          JOIN dispatch_scm_po_splits membership
            ON upper(BTRIM(membership.source_po_ref)) = requested.requested_ref
-           OR upper(BTRIM(membership.split_po_ref)) = requested.requested_ref
+       UNION
+       SELECT requested.requested_ref, membership.source_po_id
+         FROM requested
+         JOIN dispatch_scm_po_splits membership
+           ON upper(BTRIM(membership.split_po_ref)) = requested.requested_ref
      ),
-     to_resolved AS (
-       SELECT DISTINCT requested.requested_ref,
-              COALESCE(membership.source_to_id, candidate.netsuite_id) AS source_id
+     to_candidates AS (
+       SELECT requested.requested_ref, candidate.netsuite_id AS candidate_id
          FROM requested
          JOIN transfer_orders candidate
            ON upper(BTRIM(candidate.tranid)) = requested.requested_ref
-           OR candidate.netsuite_id::text = requested.requested_ref
+       UNION
+       SELECT requested.requested_ref, candidate.netsuite_id AS candidate_id
+         FROM requested
+         JOIN transfer_orders candidate ON candidate.netsuite_id = requested.numeric_id
+        WHERE requested.numeric_id IS NOT NULL
+     ),
+     to_resolved AS (
+       SELECT DISTINCT candidate.requested_ref,
+              COALESCE(membership.source_to_id, candidate.candidate_id) AS source_id
+         FROM to_candidates candidate
          LEFT JOIN dispatch_scm_to_splits membership
-           ON membership.source_to_id = candidate.netsuite_id
-           OR membership.split_to_id = candidate.netsuite_id
+           ON membership.split_to_id = candidate.candidate_id
        UNION
        SELECT requested.requested_ref, membership.source_to_id
          FROM requested
          JOIN dispatch_scm_to_splits membership
            ON upper(BTRIM(membership.source_to_ref)) = requested.requested_ref
-           OR upper(BTRIM(membership.split_to_ref)) = requested.requested_ref
+       UNION
+       SELECT requested.requested_ref, membership.source_to_id
+         FROM requested
+         JOIN dispatch_scm_to_splits membership
+           ON upper(BTRIM(membership.split_to_ref)) = requested.requested_ref
      ),
      closed_orders AS (
        SELECT resolved.requested_ref, 'SO'::text AS kind,

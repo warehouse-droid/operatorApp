@@ -62,12 +62,17 @@ const baseOrderDraft = () => ({
   ancillaryLines: [{ itemId: 1987, quantity: 1, rate: 250 }]
 });
 
+const caseOptions = (authorizedStoreLocationIds = [1]) => ({
+  authorizedStoreLocationIds,
+  minimumRequiredDate: "2026-08-26"
+});
+
 function errorCode(fn, code) {
   assert.throws(fn, (error) => error?.code === code, `expected ${code}`);
 }
 
 test("Sales submits one normalized multi-line special case for one vendor", () => {
-  const normalized = normalizeSpecialCaseDraft(baseCase(), { authorizedStoreLocationIds: [1, 28] });
+  const normalized = normalizeSpecialCaseDraft(baseCase(), caseOptions([1, 28]));
   assert.equal(normalized.storeLocationId, 1);
   assert.equal(normalized.vendorName, "Techo-Bloc");
   assert.equal(normalized.lines.length, 2);
@@ -80,17 +85,17 @@ test("Sales submits one normalized multi-line special case for one vendor", () =
 
 test("case validation rejects hostile quantities, unauthorized stores, and missing lines atomically", () => {
   errorCode(
-    () => normalizeSpecialCaseDraft({ ...baseCase(), storeLocationId: 15 }, { authorizedStoreLocationIds: [1] }),
+    () => normalizeSpecialCaseDraft({ ...baseCase(), storeLocationId: 15 }, caseOptions()),
     "SPECIAL_CASE_STORE_FORBIDDEN"
   );
   errorCode(
-    () => normalizeSpecialCaseDraft({ ...baseCase(), lines: [] }, { authorizedStoreLocationIds: [1] }),
+    () => normalizeSpecialCaseDraft({ ...baseCase(), lines: [] }, caseOptions()),
     "SPECIAL_CASE_LINES_INVALID"
   );
   for (const quantity of [0, -1, Number.NaN, Number.POSITIVE_INFINITY, 1_000_000_001]) {
     const draft = baseCase();
     draft.lines[0].quantity = quantity;
-    errorCode(() => normalizeSpecialCaseDraft(draft, { authorizedStoreLocationIds: [1] }), "SPECIAL_CASE_QUANTITY_INVALID");
+    errorCode(() => normalizeSpecialCaseDraft(draft, caseOptions()), "SPECIAL_CASE_QUANTITY_INVALID");
   }
 });
 
@@ -117,19 +122,19 @@ test("initial lines use only the approved UOMs and a three-working-day minimum",
 });
 
 test("case validation covers malformed records, dates, IDs, line caps, and bounded text", () => {
-  errorCode(() => normalizeSpecialCaseDraft(null, { authorizedStoreLocationIds: [1] }), "SPECIAL_CASE_INVALID");
-  errorCode(() => normalizeSpecialCaseDraft({ ...baseCase(), storeLocationId: 99 }, { authorizedStoreLocationIds: [99] }), "SPECIAL_CASE_STORE_INVALID");
-  errorCode(() => normalizeSpecialCaseDraft({ ...baseCase(), inquiryDate: "21-Aug-2026" }, { authorizedStoreLocationIds: [1] }), "SPECIAL_CASE_INQUIRY_DATE_INVALID");
-  errorCode(() => normalizeSpecialCaseDraft({ ...baseCase(), inquiryDate: "2026-02-30" }, { authorizedStoreLocationIds: [1] }), "SPECIAL_CASE_INQUIRY_DATE_INVALID");
-  errorCode(() => normalizeSpecialCaseDraft({ ...baseCase(), lines: [null] }, { authorizedStoreLocationIds: [1] }), "SPECIAL_CASE_LINES_INVALID");
+  errorCode(() => normalizeSpecialCaseDraft(null, caseOptions()), "SPECIAL_CASE_INVALID");
+  errorCode(() => normalizeSpecialCaseDraft({ ...baseCase(), storeLocationId: 99 }, caseOptions([99])), "SPECIAL_CASE_STORE_INVALID");
+  errorCode(() => normalizeSpecialCaseDraft({ ...baseCase(), inquiryDate: "21-Aug-2026" }, caseOptions()), "SPECIAL_CASE_INQUIRY_DATE_INVALID");
+  errorCode(() => normalizeSpecialCaseDraft({ ...baseCase(), inquiryDate: "2026-02-30" }, caseOptions()), "SPECIAL_CASE_INQUIRY_DATE_INVALID");
+  errorCode(() => normalizeSpecialCaseDraft({ ...baseCase(), lines: [null] }, caseOptions()), "SPECIAL_CASE_LINES_INVALID");
   errorCode(
-    () => normalizeSpecialCaseDraft({ ...baseCase(), lines: Array.from({ length: 101 }, () => baseCase().lines[0]) }, { authorizedStoreLocationIds: [1] }),
+    () => normalizeSpecialCaseDraft({ ...baseCase(), lines: Array.from({ length: 101 }, () => baseCase().lines[0]) }, caseOptions()),
     "SPECIAL_CASE_LINES_INVALID"
   );
-  errorCode(() => normalizeSpecialCaseDraft({ ...baseCase(), remarks: "x".repeat(8_001) }, { authorizedStoreLocationIds: [1] }), "SPECIAL_FIELD_TOO_LONG");
+  errorCode(() => normalizeSpecialCaseDraft({ ...baseCase(), remarks: "x".repeat(8_001) }, caseOptions()), "SPECIAL_FIELD_TOO_LONG");
   const withIds = normalizeSpecialCaseDraft({
     ...baseCase(), customerId: 800833, vendorId: 3243, estimateId: 14078
-  }, { authorizedStoreLocationIds: [1] });
+  }, caseOptions());
   assert.deepEqual([withIds.customerId, withIds.vendorId, withIds.estimateId], [800833, 3243, 14078]);
 });
 

@@ -1,0 +1,66 @@
+{
+  "schemaVersion": "operator-workload-replay-v1",
+  "timezone": "America/Toronto",
+  "localDate": "2026-08-27",
+  "capturedFrom": "2026-08-27T04:00:00.000Z",
+  "capturedTo": "2026-08-28T01:52:52.693Z",
+  "privacy": {
+    "identifiers": "anonymous-counts-only",
+    "rawPayloads": false,
+    "customerData": false,
+    "addresses": false,
+    "items": false
+  },
+  "eventTotals": [
+    { "kind": "printer_idle_lease", "count": 25565, "averageEvidenceBytes": 329 },
+    { "kind": "netsuite_line_update", "count": 6867, "averageEvidenceBytes": 119 },
+    { "kind": "netsuite_receiving_line_update", "count": 1070, "averageEvidenceBytes": 97 },
+    { "kind": "netsuite_line_discover", "count": 517, "averageEvidenceBytes": 1754 },
+    { "kind": "delayed_status_refresh", "count": 381, "averageEvidenceBytes": 492 },
+    { "kind": "order_webhook", "count": 330, "averageEvidenceBytes": 233 },
+    { "kind": "delayed_status_missing", "count": 153, "averageEvidenceBytes": 474 },
+    { "kind": "netsuite_receiving_line_discover", "count": 74, "averageEvidenceBytes": 1463 },
+    { "kind": "dispatch_replace_plan", "count": 43, "averageEvidenceBytes": 106141 },
+    { "kind": "ollama_parse", "count": 53, "averageEvidenceBytes": 106 }
+  ],
+  "webhookEntityMultiplicity": [
+    { "eventsPerEntity": 1, "entities": 150, "averageSpanSeconds": 0, "maxSpanSeconds": 0 },
+    { "eventsPerEntity": 2, "entities": 50, "averageSpanSeconds": 1026, "maxSpanSeconds": 8566 },
+    { "eventsPerEntity": 3, "entities": 10, "averageSpanSeconds": 1580, "maxSpanSeconds": 5032 },
+    { "eventsPerEntity": 4, "entities": 2, "averageSpanSeconds": 2925, "maxSpanSeconds": 5307 },
+    { "eventsPerEntity": 5, "entities": 4, "averageSpanSeconds": 6585, "maxSpanSeconds": 18063 },
+    { "eventsPerEntity": 6, "entities": 1, "averageSpanSeconds": 13218, "maxSpanSeconds": 13218 },
+    { "eventsPerEntity": 8, "entities": 2, "averageSpanSeconds": 8059, "maxSpanSeconds": 15661 }
+  ],
+  "webhookTypes": [
+    { "recordType": "sales_order", "eventType": "create", "events": 178, "entities": 178 },
+    { "recordType": "sales_order", "eventType": "edit", "events": 99, "entities": 71 },
+    { "recordType": "transfer_order", "eventType": "edit", "events": 31, "entities": 12 },
+    { "recordType": "transfer_order", "eventType": "create", "events": 8, "entities": 8 },
+    { "recordType": "purchase_order", "eventType": "create", "events": 7, "entities": 7 },
+    { "recordType": "purchase_order", "eventType": "edit", "events": 5, "entities": 4 },
+    { "recordType": "transfer_order", "eventType": "approve", "events": 2, "entities": 2 }
+  ],
+  "delayedRefreshLatencyMs": [
+    { "outcome": "succeeded", "count": 270, "average": 4341, "p95": 11598, "maximum": 69887 },
+    { "outcome": "retry", "count": 247, "average": 4467, "p95": 13166, "maximum": 83430 },
+    { "outcome": "failed", "count": 17, "average": 5885, "p95": 17611, "maximum": 20891 }
+  ],
+  "peakFiveMinutes": {
+    "startedAt": "2026-08-27T20:15:00.000Z",
+    "events": 395,
+    "printerIdleLeases": 102,
+    "orderWebhooks": 4,
+    "lineWork": 217
+  },
+  "observedContainerSamples": [
+    { "appCpuPercent": 10.89, "databaseCpuPercent": 93.89, "ollamaCpuPercent": 0 },
+    { "appCpuPercent": 0.43, "databaseCpuPercent": 5.10, "ollamaCpuPercent": 0 }
+  ],
+  "preChangeLatencyMs": {
+    "dispatchOrderLoad": 14200,
+    "poInitialLoad": 1688,
+    "poLinkedReferenceSearch": 10000,
+    "snapshotAssignmentRead": 1602
+  }
+}

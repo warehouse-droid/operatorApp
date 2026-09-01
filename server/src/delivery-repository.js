@@ -621,7 +621,7 @@ function formatLoadUnits(units, field) {
   return visible.map((unit) => `${roundQuantity(unit[field])} ${unit.label}`).join(" / ");
 }
 
-function buildDeliveryLoadValidation(order) {
+function buildDeliveryLoadValidation(order, { allowNetSuiteCompleted = false } = {}) {
   const issues = [];
   for (const line of order.lines || []) {
     if (line.linked_quantity_blocked) {
@@ -637,7 +637,8 @@ function buildDeliveryLoadValidation(order) {
       });
       continue;
     }
-    const lineDeleted = !line.netsuite_active || line.sync_exception === "line_deleted";
+    const lineDeleted = !allowNetSuiteCompleted
+      && (!line.netsuite_active || line.sync_exception === "line_deleted");
     const units = loadLineUnits(line).map((unit) => lineDeleted ? { ...unit, required: 0 } : unit);
     const packedSalesQty = linePackedSalesQuantity(line);
     if (packedSalesQty <= 0) continue;
@@ -2357,12 +2358,18 @@ function buildDeliveryPrepNotifications({ locationId = null, salesActive = [], t
   };
 }
 
-export async function getDeliveryOrder(id) {
+export async function getDeliveryOrder(id, { includeNetSuiteClosed = false } = {}) {
   if (isVrmaDeliveryRef(id)) return getVrmaDeliveryPrepOrder(id);
   if (isLocalCoRef(id)) return getLocalCoDeliveryOrder(id);
   if (isDispatchGroupOrderId(id)) return getDispatchGroupDeliveryOrder(id);
   const sandboxFixtures = isNetSuiteSandboxEnvironment();
   const sandboxSql = sandboxFixtures ? "true" : "false";
+  const salesVisibilitySql = includeNetSuiteClosed
+    ? "true"
+    : `NOT ${netSuiteClosedOrderFamilySql("sales_orders", "SO")}`;
+  const transferVisibilitySql = includeNetSuiteClosed
+    ? "true"
+    : `NOT ${netSuiteClosedOrderFamilySql("transfer_orders", "TO")}`;
   const order = await query(
     `WITH delivery_order_source AS (
        SELECT netsuite_id, tranid, trandate, customer_id, customer, status, status_text,
@@ -2380,7 +2387,7 @@ export async function getDeliveryOrder(id) {
               NULL::bigint AS destination_location_id, NULL::text AS destination_location
 	       FROM sales_orders
 	       WHERE (COALESCE(is_test_fixture, false) = false OR ${sandboxSql})
-	         AND NOT ${netSuiteClosedOrderFamilySql("sales_orders", "SO")}
+	         AND ${salesVisibilitySql}
        UNION ALL
        SELECT netsuite_id, tranid, trandate, NULL::bigint AS customer_id, NULL::text AS customer,
               status, status_text, NULL::numeric AS foreign_total, NULL::bigint AS order_location_id,
@@ -2397,7 +2404,7 @@ export async function getDeliveryOrder(id) {
               to_location_id AS destination_location_id, to_location AS destination_location
 	       FROM transfer_orders
 	       WHERE from_location_id IS NOT NULL
-	         AND NOT ${netSuiteClosedOrderFamilySql("transfer_orders", "TO")}
+	         AND ${transferVisibilitySql}
      ),
      delivery_line_source AS (
        SELECT sales_order_id AS order_id, id, line_id, item_id, item_name, sku,
@@ -3881,11 +3888,26 @@ async function recordVrmaDeliveryLoad(order, operatorId, { photoDataUrls }) {
   };
 }
 
-export async function recordDeliveryLoad(orderId, operatorId, { photoDataUrls, requestId } = {}) {
-  await assertNoClosedNetSuiteOrders([orderId], "be loaded by Operator");
+/**
+ * @param {any} orderId
+ * @param {any} operatorId
+ * @param {{photoDataUrls?: any[], requestId?: any, allowNetSuiteCompleted?: boolean}} [options]
+ */
+export async function recordDeliveryLoad(orderId, operatorId, {
+  photoDataUrls,
+  requestId,
+  allowNetSuiteCompleted = false
+} = {}) {
+  if (!allowNetSuiteCompleted) {
+    await assertNoClosedNetSuiteOrders([orderId], "be loaded by Operator");
+  }
   const photos = requirePhotoReferences(photoDataUrls);
   if (isDispatchGroupOrderId(orderId)) {
-    return recordGroupedDeliveryLoad(orderId, operatorId, { photoDataUrls: photos, requestId });
+    return recordGroupedDeliveryLoad(orderId, operatorId, {
+      photoDataUrls: photos,
+      requestId,
+      allowNetSuiteCompleted
+    });
   }
   if (/^\d+$/.test(String(orderId || ""))) {
     const reloadCycle = await getActiveReloadCycleForOrder(Number(orderId));
@@ -3900,14 +3922,14 @@ export async function recordDeliveryLoad(orderId, operatorId, { photoDataUrls, r
       if (existingReload && Number(existingReload.salesOrderId) === Number(orderId)) return existingReload;
     }
   }
-  const order = await getDeliveryOrder(orderId);
+  const order = await getDeliveryOrder(orderId, { includeNetSuiteClosed: allowNetSuiteCompleted });
   if (!order) throw new Error("Delivery order not found.");
   if (order.order_type === "co_order") return recordLocalCoDeliveryLoad(order, operatorId, { photoDataUrls: photos });
   if (isVrmaDeliveryOrder(order)) return recordVrmaDeliveryLoad(order, operatorId, { photoDataUrls: photos });
   if (!["packed", "loaded"].includes(order.operator_status)) {
     throw new Error("Order must be packed before loading.");
   }
-  const validation = buildDeliveryLoadValidation(order);
+  const validation = buildDeliveryLoadValidation(order, { allowNetSuiteCompleted });
   if (!validation.ok) {
     const error = new Error("Packed quantity must be corrected before loading.");
     error.code = "DELIVERY_LOAD_VALIDATION_FAILED";
@@ -3939,7 +3961,9 @@ export async function recordDeliveryLoad(orderId, operatorId, { photoDataUrls, r
     );
   }
 
-  const loadedSnapshotOrder = await getDeliveryOrder(orderId);
+  const loadedSnapshotOrder = await getDeliveryOrder(orderId, {
+    includeNetSuiteClosed: allowNetSuiteCompleted
+  });
   const remainingLines = (loadedSnapshotOrder.lines || []).filter((line) => {
     if (!line.netsuite_active || !["InvtPart", "NonInvtPart"].includes(line.item_type || "")) return false;
     return lineRequiredSalesQuantity(line) > lineLoadedSalesQuantity(line) + linePackedSalesQuantity(line) + 0.000001;
@@ -4026,8 +4050,10 @@ export async function recordDeliveryLoad(orderId, operatorId, { photoDataUrls, r
   };
 }
 
-export async function recordCustomerPickupLoad(orderId, operatorId, { photoDataUrls }) {
-  await assertNoClosedNetSuiteOrders([orderId], "be loaded as Customer Pick-Up");
+export async function recordCustomerPickupLoad(orderId, operatorId, { photoDataUrls, allowNetSuiteCompleted = false }) {
+  if (!allowNetSuiteCompleted) {
+    await assertNoClosedNetSuiteOrders([orderId], "be loaded as Customer Pick-Up");
+  }
   const photoRequirement = await getOperatorCustomerPickupPhotoRequirement();
   let photos;
   try {
@@ -4043,7 +4069,7 @@ export async function recordCustomerPickupLoad(orderId, operatorId, { photoDataU
     photoRequirementRevision: photoRequirement.revision,
     photoEvidenceCount: photos.length
   };
-  const order = await getDeliveryOrder(orderId);
+  const order = await getDeliveryOrder(orderId, { includeNetSuiteClosed: allowNetSuiteCompleted });
   if (!order || !isPickupOrder(order)) throw new Error("Customer pickup sales order not found.");
   const confirmedLines = (order.lines || []).filter((line) => {
     return positiveQuantity(line.packed_pallet_qty)
@@ -4053,7 +4079,7 @@ export async function recordCustomerPickupLoad(orderId, operatorId, { photoDataU
       + positiveQuantity(line.packed_sales_qty) > 0;
   });
   if (!confirmedLines.length) throw new Error("Confirm at least one pickup line before loading.");
-  const validation = buildDeliveryLoadValidation(order);
+  const validation = buildDeliveryLoadValidation(order, { allowNetSuiteCompleted });
   if (!validation.ok) {
     const error = new Error("Packed quantity must be corrected before loading.");
     error.code = "DELIVERY_LOAD_VALIDATION_FAILED";
@@ -4116,7 +4142,9 @@ export async function recordCustomerPickupLoad(orderId, operatorId, { photoDataU
     [orderId]
   );
 
-  const refreshed = await getDeliveryOrder(orderId);
+  const refreshed = await getDeliveryOrder(orderId, {
+    includeNetSuiteClosed: allowNetSuiteCompleted
+  });
   const remainingLines = (refreshed.lines || []).filter((line) => {
     return lineRequiredSalesQuantity(line) > lineLoadedSalesQuantity(line);
   });
@@ -4799,7 +4827,11 @@ function groupedReloadRequestId(requestId, reloadIndex) {
   return `${hex.slice(0, 8)}-${hex.slice(8, 12)}-4${hex.slice(13, 16)}-a${hex.slice(17, 20)}-${hex.slice(20)}`;
 }
 
-async function recordGroupedDeliveryLoad(groupId, operatorId, { photoDataUrls, requestId }) {
+async function recordGroupedDeliveryLoad(groupId, operatorId, {
+  photoDataUrls,
+  requestId,
+  allowNetSuiteCompleted = false
+}) {
   const photos = requirePhotoReferences(photoDataUrls);
   const groupOrder = await getDispatchGroupDeliveryOrder(groupId);
   if (!groupOrder) throw new Error("Grouped delivery order not found.");
@@ -4812,7 +4844,9 @@ async function recordGroupedDeliveryLoad(groupId, operatorId, { photoDataUrls, r
       return { ...existing, groupLoad: true, netSuiteUpdated: false };
     }
   }
-  const childOrders = (await Promise.all(groupChildOrderIds(groupOrder).map((id) => getDeliveryOrder(id)))).filter(Boolean);
+  const childOrders = (await Promise.all(groupChildOrderIds(groupOrder).map((id) => getDeliveryOrder(id, {
+    includeNetSuiteClosed: allowNetSuiteCompleted
+  })))).filter(Boolean);
   if (childOrders.some((child) => child.reload_authorized) && !requestId) {
     throw Object.assign(new Error("A valid re-load request ID is required."), { status: 400 });
   }
@@ -4820,7 +4854,7 @@ async function recordGroupedDeliveryLoad(groupId, operatorId, { photoDataUrls, r
   const validations = [];
   for (const child of childOrders) {
     if (!(child.lines || []).some(lineHasPackedQuantity)) continue;
-    const validation = buildDeliveryLoadValidation(child);
+    const validation = buildDeliveryLoadValidation(child, { allowNetSuiteCompleted });
     if (!validation.ok) validations.push(...(validation.issues || []).map((issue) => ({ ...issue, orderRef: child.tranid })));
   }
   if (validations.length) {
@@ -4842,7 +4876,8 @@ async function recordGroupedDeliveryLoad(groupId, operatorId, { photoDataUrls, r
       : undefined;
     const result = await recordDeliveryLoad(child.netsuite_id, operatorId, {
       photoDataUrls: photos,
-      requestId: childRequestId
+      requestId: childRequestId,
+      allowNetSuiteCompleted
     });
     if (result?.id) {
       await query(

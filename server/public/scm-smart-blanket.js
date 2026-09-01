@@ -344,7 +344,7 @@ function smartBlanketOrders() {
     .map((stop) => stop.name || stop.destinationName)).filter(Boolean))]
     .sort((left, right) => left.localeCompare(right, undefined, { numeric: true }));
   return `<section class="smart-section smart-blanket-section">
-    <div class="smart-section-head"><div><h2>Blanket orders</h2><p>Reserve current Smart SCM demand from open blanket balances. Sources are consumed oldest first; regular vendor PO proposals remain paused while blanket quantity is available, but TO planning remains active.</p></div><div class="smart-actions">${smartCanWrite() ? `<button class="smart-button primary" data-smart-action="build-blanket-plan" type="button">Calculate releases</button>` : ""}<button class="smart-button" data-smart-action="refresh-blanket-workspace" type="button">Refresh</button></div></div>
+    <div class="smart-section-head"><div><h2>Blanket orders</h2><p>Reserve current Smart SCM demand from open blanket balances. Sources are consumed oldest first; uncovered demand remains in regular PO/TO planning.</p></div><div class="smart-actions">${smartCanWrite() ? `<button class="smart-button primary" data-smart-action="build-blanket-plan" type="button">Calculate releases</button>` : ""}<button class="smart-button" data-smart-action="refresh-blanket-workspace" type="button">Refresh</button></div></div>
     <div class="smart-blanket-workspace">
       <aside class="smart-blanket-sidebar" aria-label="Purchase order pools">
         <div class="smart-blanket-sidebar-tabs" role="tablist" aria-label="Purchase order type">

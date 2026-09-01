@@ -181,6 +181,28 @@ test("P6 an unavailable command is read without any remote or local mutation", a
   assert.equal(harness.calls.finalize, 0);
 });
 
+test("R1 a fully reconciled zero-step command finalizes locally without any NetSuite mutation", async () => {
+  const harness = processorHarness({ steps: [] });
+  harness.state.command.inputSnapshot.lineReconciliation = {
+    schemaVersion: "operator-netsuite-line-reconciliation-v1",
+    lines: [{
+      sourceLineKey: "4866005",
+      requestedQuantity: 5,
+      postedQuantity: 0,
+      reconciledQuantity: 5,
+      authoritative: true
+    }]
+  };
+  const completed = await harness.processor.process("aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa");
+  assert.equal(completed.status, "completed");
+  assert.equal(harness.calls.find, 0);
+  assert.equal(harness.calls.transform, 0);
+  assert.equal(harness.calls.fetch, 0);
+  assert.equal(harness.calls.finalize, 1);
+  assert.equal(harness.state.renewals.length, 1);
+  assert.deepEqual(completed.result.transactions, []);
+});
+
 test("P6 a lost transform response recovers by external ID and never transforms twice", async () => {
   const timeout = Object.assign(new Error("response lost"), { code: "NETSUITE_REQUEST_TIMEOUT" });
   const harness = processorHarness({
@@ -257,6 +279,19 @@ test("P6/P8 verification rejects a wrong source, external ID, transaction type, 
     id: 8001,
     transactionRef: "IF8001"
   });
+  const lineFieldRecord = remoteRecord(targetStep);
+  lineFieldRecord.item.items = lineFieldRecord.item.items.map(({ orderLine, ...item }) => ({
+    ...item,
+    line: orderLine
+  }));
+  assert.equal(verifyOperatorNetSuitePostingRecord(targetStep, lineFieldRecord).id, 8001);
+  const restLocationRecord = remoteRecord(targetStep);
+  restLocationRecord.item.items[0].location = { id: "15", refName: "12441" };
+  assert.equal(
+    verifyOperatorNetSuitePostingRecord(targetStep, restLocationRecord).id,
+    8001,
+    "NetSuite REST record references expose location through an id field."
+  );
   const invalid = [
     { ...remoteRecord(targetStep), createdFromId: 999 },
     { ...remoteRecord(targetStep), externalId: "different" },

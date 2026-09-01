@@ -3,6 +3,7 @@ import test from "node:test";
 
 import {
   DISPATCH_RISKY_INTERACTION_KEYS,
+  buildDispatchHistoricalReplayArtifact,
   buildDispatchHistoricalReplayReport,
   compareDispatchReplayProjections,
   sanitizeDispatchReplayPlan
@@ -143,8 +144,94 @@ test("DPO-14 replay derives truthful Toronto-local labels for a custom exclusive
     from: "2026-08-11T04:00:00.000Z",
     to: "2026-08-25T04:00:00.000Z",
     timezone: "America/Toronto",
-    localDates: ["2026-08-11", "2026-08-24"]
+    localDates: ["2026-08-11", "2026-08-24"],
+    localDayCount: 14
   });
+});
+
+test("DPO-18 seven-day replay accounts for every captured row and proves the local-day boundary", () => {
+  const plan = sanitizeDispatchReplayPlan(interactingPlan(), { salt: "seven-day-test" });
+  const capture = {
+    schemaVersion: 1,
+    window: {
+      from: "2026-08-21T04:00:00.000Z",
+      to: "2026-08-28T04:00:00.000Z",
+      timezone: "America/Toronto"
+    },
+    sourceCounts: {
+      dispatch_plan_commands: 1,
+      dispatch_plan_snapshot_history: 0,
+      dispatch_audit_log: 0,
+      scm_netsuite_po_history_changes: 1,
+      scm_reconciliation_audit_events: 1,
+      netsuite_mirror_events: 0,
+      driver_offline_events: 0,
+      driver_job_records: 1,
+      dispatch_order_completion_events: 0,
+      driver_job_corrections: 0
+    },
+    historicalActionCounts: { commands: { save: 1 } },
+    events: [{
+      stream: "dispatch",
+      id: "dispatch-plan",
+      serverAt: "2026-08-21T04:00:01.000Z",
+      sourceSequence: 1,
+      action: "save",
+      payload: { action: "save" },
+      planState: plan
+    }, {
+      stream: "scm",
+      id: "scm-change",
+      serverAt: "2026-08-22T04:00:01.000Z",
+      sourceSequence: 1,
+      action: "scm_po_history_changed",
+      before: {},
+      after: {}
+    }, {
+      stream: "netsuite",
+      id: "netsuite-change",
+      serverAt: "2026-08-23T04:00:01.000Z",
+      sourceSequence: 1,
+      action: "upsert",
+      payload: { eventType: "upsert" }
+    }, {
+      stream: "driver",
+      id: "driver-job",
+      serverAt: "2026-08-24T04:00:01.000Z",
+      sourceSequence: 1,
+      action: "driver_job_completed",
+      before: {},
+      after: {}
+    },
+    ...[
+      "dispatch_plan_snapshot_history",
+      "dispatch_audit_log",
+      "netsuite_mirror_events",
+      "driver_offline_events",
+      "dispatch_order_completion_events",
+      "driver_job_corrections"
+    ].map((source, index) => ({
+      stream: source.includes("driver") || source.includes("completion") ? "driver"
+        : source.includes("netsuite") ? "netsuite" : "dispatch",
+      id: `gap-${index}`,
+      serverAt: "2026-08-21T04:00:00.000Z",
+      sourceSequence: 0,
+      action: `coverage_gap:${source}`
+    }))]
+  };
+
+  const artifact = buildDispatchHistoricalReplayArtifact({ capture, expectedLocalDayCount: 7 });
+  assert.equal(artifact.window.localDayCount, 7);
+  assert.equal(artifact.captureValidation.sourceRecordCount, 4);
+  assert.equal(artifact.captureValidation.zeroSourceCount, 6);
+  assert.equal(artifact.eventsProcessed, 10);
+  assert.equal(artifact.assertions.exactLocalDayWindow, true);
+  assert.equal(artifact.assertions.everySourceRowAccountedFor, true);
+  assert.equal(artifact.assertions.noProjectionMismatch, true);
+  assert.deepEqual(artifact.historicalActionCounts, capture.historicalActionCounts);
+
+  const wrongWindow = buildDispatchHistoricalReplayArtifact({ capture, expectedLocalDayCount: 8 });
+  assert.equal(wrongWindow.assertions.exactLocalDayWindow, false);
 });
 
 test("DPO-14 sparse historical shapes remain private, deterministic, and visibly incomplete", () => {

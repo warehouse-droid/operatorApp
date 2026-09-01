@@ -17,6 +17,12 @@ import {
   normalizeSalesOrderReconciliationType
 } from "./sales-order-reconciliation.js";
 import { assertNoClosedNetSuiteOrders } from "./netsuite-closed-order-repository.js";
+import {
+  scmActiveSplitExceedsSource,
+  scmPlannedQuantityChangeRequiresReview,
+  scmScheduleHasOperationalPlanningEvidence
+} from "./scm-reconcile-review-policy.js";
+import { scmManualSplitHasOperationalStatusAuthority } from "./scm-manual-split-authority.js";
 
 const EPSILON = 0.000001;
 const RECONCILIATION_SCHEMA_VERSION = "mbbs.ifir.reconciliation.v1";
@@ -88,7 +94,8 @@ export function scmScheduleEffectiveReconciliationStatus({
   reconciliationStatus = "",
   reconciliationReconciledAt = null,
   reconciliationApplicationStatus = "",
-  blockingReview = false
+  blockingReview = false,
+  preserveOperationalStatus = false
 } = {}) {
   const currentScheduleStatus = text(scheduleStatus) || "Queued";
   const currentReconciliationStatus = text(reconciliationStatus).toLowerCase();
@@ -96,6 +103,7 @@ export function scmScheduleEffectiveReconciliationStatus({
   if (["complete", "completed"].includes(currentScheduleStatus.toLowerCase())) {
     return "Completed";
   }
+  if (preserveOperationalStatus) return currentScheduleStatus;
   if (blockingReview || currentReconciliationStatus === "review") return "Reconcile Review";
   if (["complete", "completed"].includes(currentReconciliationApplicationStatus.toLowerCase())) {
     return "Completed";
@@ -2021,11 +2029,12 @@ export async function loadLocalScmReconciliationOrder(kind, sourceOrderId) {
             schedule.id AS schedule_id,
             schedule.status AS schedule_status,
             schedule.eta_date AS schedule_eta_date,
-            schedule.updated_at AS schedule_updated_at
+            schedule.updated_at AS schedule_updated_at,
+            schedule.dispatch_plan_id AS schedule_dispatch_plan_id
        FROM transfer_orders transfer
        LEFT JOIN LATERAL (
          SELECT candidate.id, candidate.status, candidate.eta_date,
-                candidate.updated_at
+                candidate.updated_at, candidate.dispatch_plan_id
            FROM scm_transport_schedule candidate
           WHERE candidate.order_kind = 'TO'
             AND (
@@ -2110,7 +2119,13 @@ export async function loadLocalScmReconciliationOrder(kind, sourceOrderId) {
     localStatus: row.schedule_status || "Queued",
     localStatusScheduleId: positiveId(row.schedule_id),
     localStatusUpdatedAt: row.schedule_updated_at || null,
-    dispatchPlanned: row.dispatch_planned === true || Boolean(row.schedule_id),
+    dispatchPlanned: scmScheduleHasOperationalPlanningEvidence({
+      sourceDispatchPlanned: row.dispatch_planned === true,
+      scheduleId: row.schedule_id,
+      scheduleStatus: row.schedule_status,
+      scheduleEtaDate: row.schedule_eta_date,
+      scheduleDispatchPlanId: row.schedule_dispatch_plan_id
+    }),
     dispatchPlanDate: row.schedule_eta_date || row.dispatch_plan_date || null,
     dispatchPlannedAt: row.schedule_updated_at || row.dispatch_planned_at || null,
     lastModifiedAt: row.status_updated_at || row.synced_at || null,
@@ -2204,7 +2219,16 @@ async function loadSplitLineTargets(order, sourceLine) {
               COALESCE(NULLIF(child_line.location, ''), child.destination_location) AS target_destination_location,
               schedule.eta_date,
               schedule.status AS schedule_status,
-              schedule.updated_at AS schedule_updated_at
+              schedule.updated_at AS schedule_updated_at,
+              EXISTS (
+                SELECT 1
+                  FROM dispatch_plan_order_assignments assignment
+                  JOIN dispatch_plans plan
+                    ON plan.id = assignment.plan_id
+                   AND plan.status <> 'cancelled'
+                 WHERE lower(assignment.order_ref) = lower(split_header.split_po_ref)
+                    OR lower(NULLIF(assignment.planned_order_ref, '')) = lower(split_header.split_po_ref)
+              ) AS has_active_dispatch_assignment
          FROM dispatch_scm_po_split_lines split_line
          JOIN dispatch_scm_po_splits split_header
            ON split_header.id = split_line.split_id
@@ -2240,6 +2264,7 @@ async function loadSplitLineTargets(order, sourceLine) {
         ? row.schedule_updated_at
         : null,
       plannedEta: row.eta_date,
+      hasActiveDispatchAssignment: row.has_active_dispatch_assignment === true,
       createdAt: row.created_at
     }));
   }
@@ -2908,11 +2933,15 @@ function addTargetProgress(targets, allocation, progressKind, lineIdentity = "")
       exactAllocation: true,
       hidden: false,
       hasActivePlan: Boolean(allocation.actualDispatchAt || allocation.plannedEta),
+      hasActiveDispatchAssignment: allocation.hasActiveDispatchAssignment === true,
       allocationMethods: new Set(),
       lineIdentities: new Set()
     });
   }
   const target = targets.get(ref);
+  if (allocation.hasActiveDispatchAssignment === true) {
+    target.hasActiveDispatchAssignment = true;
+  }
   const identity = text(lineIdentity) || String(allocation.targetLocalLineId || allocation.ledgerLineId || "");
   if (!target.lineIdentities.has(identity)) {
     target.lineIdentities.add(identity);
@@ -2953,6 +2982,141 @@ async function targetPreviousStatuses(kind, refs) {
     [kind, refs.map((ref) => ref.toLowerCase())]
   );
   return new Map(result.rows.map((row) => [text(row.order_ref).toLowerCase(), row]));
+}
+
+function stableReconciliationJson(value) {
+  if (Array.isArray(value)) return value.map(stableReconciliationJson);
+  if (!value || typeof value !== "object") {
+    return typeof value === "number" && !Number.isFinite(value) ? null : value;
+  }
+  return Object.fromEntries(Object.keys(value).sort().flatMap((key) => (
+    value[key] === undefined
+      ? []
+      : [[key, stableReconciliationJson(value[key])]]
+  )));
+}
+
+function reconciliationConflictFingerprint({
+  reason = "",
+  details = {},
+  order = {},
+  family = {},
+  exactAllocation = false,
+  targets = {},
+  lines = []
+} = {}) {
+  const cleanDetails = details && typeof details === "object"
+    ? structuredClone(details)
+    : {};
+  delete cleanDetails.conflictFingerprint;
+  const targetValues = targets instanceof Map
+    ? [...targets.values()]
+    : Object.values(targets && typeof targets === "object" ? targets : {});
+  const normalizedTargets = targetValues.map((target) => ({
+    orderRef: text(target.orderRef),
+    orderId: text(target.orderId),
+    targetKind: text(target.targetKind),
+    destinationLocationId: text(target.destinationLocationId),
+    ordered: reconciliationQuantity(target.ordered),
+    fulfilled: reconciliationQuantity(target.fulfilled),
+    received: reconciliationQuantity(target.received),
+    evidencedFulfilled: reconciliationQuantity(target.evidencedFulfilled),
+    evidencedReceived: reconciliationQuantity(target.evidencedReceived),
+    exactAllocation: target.exactAllocation === true,
+    hidden: target.forceVisible === true
+      ? false
+      : reconciliationQuantity(target.ordered) <= EPSILON,
+    hasActivePlan: target.hasActivePlan === true,
+    inheritedFamilyCompletion: target.inheritedFamilyCompletion === true,
+    allocationMethods: [...(target.allocationMethods || [])].map(text).filter(Boolean).sort()
+  })).sort((left, right) => left.orderRef.localeCompare(right.orderRef));
+  const normalizedLines = (Array.isArray(lines) ? lines : []).map((line) => ({
+    lineKey: text(line.lineKey),
+    itemId: text(line.itemId),
+    sku: text(line.sku),
+    unit: text(line.unit),
+    stage: text(line.stage),
+    logicalLineIdentity: text(line.logicalLineIdentity),
+    identityIssue: text(line.identityIssue),
+    identityStatus: text(line.identityStatus),
+    allocationQuality: text(line.allocationQuality),
+    locationId: text(line.locationId),
+    ordered: reconciliationQuantity(line.ordered),
+    fulfilled: reconciliationQuantity(line.fulfilled),
+    received: reconciliationQuantity(line.received),
+    remaining: reconciliationQuantity(line.remaining)
+  })).sort((left, right) => (
+    `${left.stage}:${left.lineKey}:${left.itemId}`.localeCompare(
+      `${right.stage}:${right.lineKey}:${right.itemId}`
+    )
+  ));
+  const payload = stableReconciliationJson({
+    reason: text(reason),
+    details: cleanDetails,
+    source: {
+      statusCode: text(order.status ?? order.netsuite_status_code),
+      statusText: text(order.statusText ?? order.netsuite_status_text),
+      sourceLocationId: text(order.sourceLocationId ?? order.source_location_id),
+      destinationLocationId: text(
+        order.destinationLocationId ?? order.destination_location_id
+      )
+    },
+    family: {
+      ordered: reconciliationQuantity(family.ordered),
+      fulfilled: reconciliationQuantity(family.fulfilled),
+      received: reconciliationQuantity(family.received),
+      abandoned: reconciliationQuantity(family.abandoned),
+      remaining: reconciliationQuantity(family.remaining),
+      destinationRemaining: reconciliationQuantity(family.destinationRemaining)
+    },
+    exactAllocation: exactAllocation === true,
+    targets: normalizedTargets,
+    lines: normalizedLines
+  });
+  return crypto.createHash("sha256").update(JSON.stringify(payload)).digest("hex");
+}
+
+function persistedReconciliationConflictFingerprint(state = {}, review = {}) {
+  const orderSnapshot = state.order_snapshot && typeof state.order_snapshot === "object"
+    ? state.order_snapshot
+    : {};
+  const quantitySummary = state.quantity_summary && typeof state.quantity_summary === "object"
+    ? state.quantity_summary
+    : {};
+  const proposedState = state.proposed_state && typeof state.proposed_state === "object"
+    ? state.proposed_state
+    : {};
+  return reconciliationConflictFingerprint({
+    reason: review.reason,
+    details: review.details,
+    order: {
+      ...orderSnapshot,
+      status: orderSnapshot.status ?? state.netsuite_status_code,
+      statusText: orderSnapshot.statusText ?? state.netsuite_status_text,
+      sourceLocationId: orderSnapshot.sourceLocationId ?? state.source_location_id,
+      destinationLocationId: orderSnapshot.destinationLocationId
+        ?? state.destination_location_id
+    },
+    family: quantitySummary.family || proposedState.quantities || {},
+    exactAllocation: state.exact_allocation === true,
+    targets: quantitySummary.targets || proposedState.targets || {},
+    lines: proposedState.lines || []
+  });
+}
+
+async function acceptedReconciliationConflictMatches({ order, fingerprint }) {
+  if (!fingerprint) return false;
+  const result = await query(
+    `SELECT 1
+       FROM scm_reconciliation_review_cases
+      WHERE case_key = $1
+        AND status = 'resolved'
+        AND resolution_action = 'accept'
+        AND details->>'conflictFingerprint' = $2
+      LIMIT 1`,
+    [`${order.kind}:${order.id}:reconciliation_conflict`, fingerprint]
+  );
+  return Boolean(result.rows[0]);
 }
 
 async function upsertBlockingReview({
@@ -3257,9 +3421,15 @@ async function applyTargetScheduleStates(order, orderStateId, targetStates, bloc
     if (!state.orderRef) continue;
     const isSourceTarget = text(state.orderRef).toLowerCase()
       === text(order.scheduleRef || order.tranid).toLowerCase();
+    const isManualPoSplit = order.kind === "PO" && state.targetKind === "po_split";
+    const preserveManualSplitOperationalStatus = isManualPoSplit
+      && state.preserveOperationalStatus === true;
     const operationalStatus = isSourceTarget
       ? text(order.localStatus) || (order.kind === "PO" ? "Hold" : "Queued")
-      : "Queued";
+      : isManualPoSplit
+        ? text(state.applicationStatus) || "Hold"
+        : "Queued";
+    const reconciliationBlocked = preserveManualSplitOperationalStatus ? false : blocked;
     await query(
       `INSERT INTO scm_transport_schedule (
          order_kind, order_ref, status, reconciliation_order_state_id,
@@ -3273,7 +3443,7 @@ async function applyTargetScheduleStates(order, orderStateId, targetStates, bloc
          reconciliation_order_state_id = EXCLUDED.reconciliation_order_state_id,
          reconciliation_blocked = EXCLUDED.reconciliation_blocked,
          last_reconciled_at = now()`,
-      [order.kind, state.orderRef, operationalStatus, orderStateId, blocked]
+      [order.kind, state.orderRef, operationalStatus, orderStateId, reconciliationBlocked]
     );
   }
   await applyAffectedScheduleGroupRollups(order.kind, Object.values(targetStates)
@@ -3579,17 +3749,21 @@ export async function reconcileScmOrderFamily({
         );
         continue;
       }
-      if (
-        Math.abs(
-          reconciliationQuantity(line.localOrderedQuantityBeforeAuthoritative)
-            - reconciliationQuantity(line.quantity)
-        ) > EPSILON
-      ) {
+      const localOrderedQuantity = reconciliationQuantity(
+        line.localOrderedQuantityBeforeAuthoritative
+      );
+      const authoritativeOrderedQuantity = reconciliationQuantity(line.quantity);
+      const plannedQuantityRequiresReview = scmPlannedQuantityChangeRequiresReview({
+        orderKind: order.kind,
+        localOrderedQuantity,
+        authoritativeOrderedQuantity
+      });
+      if (plannedQuantityRequiresReview) {
         reasons.push(
           `NetSuite changed planned source line ${line.sourceLineKey || line.orderLine}`
           + `${line.itemName || line.sku ? ` (${line.itemName || line.sku})` : ""}`
-          + ` from ${reconciliationQuantity(line.localOrderedQuantityBeforeAuthoritative)}`
-          + ` to ${reconciliationQuantity(line.quantity)} ${line.unit || "units"}.`
+          + ` from ${localOrderedQuantity}`
+          + ` to ${authoritativeOrderedQuantity} ${line.unit || "units"}.`
         );
       }
     }
@@ -3787,15 +3961,13 @@ export async function reconcileScmOrderFamily({
         );
       }
     }
-    if (
-      splitCurrent > reconciliationQuantity(line.quantity) + EPSILON
-      && (
-        lineHasPinnedAllocation
-        || splitTargets.some((target) => target.actualDispatchAt || target.plannedEta)
-      )
-    ) {
+    if (scmActiveSplitExceedsSource({
+      activeSplitQuantity: splitCurrent,
+      authoritativeSourceQuantity: line.quantity
+    })) {
       reasons.push(
-        `The NetSuite quantity decrease would alter a planned, operational, or pinned split for ${line.sku || line.itemName || line.sourceLineKey}.`
+        `Active split quantity ${splitCurrent} exceeds the amended NetSuite source quantity ${reconciliationQuantity(line.quantity)}`
+        + ` for ${line.sku || line.itemName || line.sourceLineKey}.`
       );
     }
     const parentResidual = Math.max(reconciliationQuantity(line.quantity) - splitCurrent, 0);
@@ -3918,14 +4090,6 @@ export async function reconcileScmOrderFamily({
     reasons.push(...identityDiagnostics);
   }
 
-  if (
-    previous
-    && reconciliationQuantity(previous.ordered_qty) > orderedTotal + EPSILON
-    && anyPlannedTarget
-  ) {
-    reasons.push("The NetSuite quantity decrease would alter a split that is already planned or operational.");
-  }
-
   const previousReconciledTimestamp = timestampValue(previous?.reconciled_at);
   const localStatusUpdatedTimestamp = timestampValue(order.localStatusUpdatedAt);
   const localScheduleIsNewer = Number(order.localStatusScheduleId) > 0
@@ -3997,6 +4161,54 @@ export async function reconcileScmOrderFamily({
     );
   }
   const reconciliationReason = [...new Set(reasons.filter(Boolean))].join(" ");
+  const lineSummary = linePlans.map((plan) => ({
+    lineKey: plan.line.sourceLineKey,
+    itemId: plan.line.itemId,
+    itemName: plan.line.itemName,
+    sku: plan.line.sku,
+    unit: plan.line.unit,
+    stage: plan.line.stage,
+    logicalLineIdentity: plan.line.logicalLineIdentity,
+    identityIssue: plan.line.identityIssue,
+    locationId: plan.line.locationId,
+    ordered: plan.line.quantity,
+    fulfilled: plan.fulfilled,
+    received: plan.received,
+    remaining: Math.max(
+      reconciliationQuantity(plan.line.quantity)
+        - (order.kind === "TO" ? plan.fulfilled : plan.received),
+      0
+    ),
+    identityStatus: plan.identityStatus,
+    allocationQuality: plan.allocationQuality
+  }));
+  const reviewDetails = {
+    unmatchedLines: matched.unmatched.map((row) => ({
+      transactionType: row.transaction_type,
+      transactionId: row.netsuite_transaction_id,
+      transactionLineKey: row.netsuite_line_key,
+      sourceOrderLineKey: row.source_order_line_key,
+      itemId: row.item_id,
+      quantity: row.quantity
+    })),
+    unexplainedReceiptLocations
+  };
+  const conflictFingerprint = reconciliationReason
+    ? reconciliationConflictFingerprint({
+      reason: reconciliationReason,
+      details: reviewDetails,
+      order,
+      family: familyDerived.quantities,
+      exactAllocation,
+      targets,
+      lines: lineSummary
+    })
+    : "";
+  if (conflictFingerprint) reviewDetails.conflictFingerprint = conflictFingerprint;
+  const acceptedCurrentEvidence = reconciliationReason
+    ? await acceptedReconciliationConflictMatches({ order, fingerprint: conflictFingerprint })
+    : false;
+  const activeReconciliationReason = acceptedCurrentEvidence ? "" : reconciliationReason;
 
   const previousStatusByRef = await targetPreviousStatuses(order.kind, [...targets.keys()]);
   const targetStates = {};
@@ -4028,6 +4240,7 @@ export async function reconcileScmOrderFamily({
           || "Queued";
     const inheritedFamilyCompletion = target.inheritedFamilyCompletion === true;
     const hidden = target.forceVisible === true ? false : target.ordered <= EPSILON;
+    const manualSplitOperationalStatus = text(previousSchedule.status) || "Hold";
     const calculated = derivePoToReconciliationState({
       kind: order.kind,
       statusText: order.statusText,
@@ -4048,14 +4261,22 @@ export async function reconcileScmOrderFamily({
       evidencedReceivedQty: target.evidencedReceived,
       derivedState: calculated
     });
+    const preserveManualSplitOperationalStatus = order.kind === "PO"
+      && target.targetKind === "po_split"
+      && scmManualSplitHasOperationalStatusAuthority(manualSplitOperationalStatus, {
+        hasActivePlan: target.hasActiveDispatchAssignment === true,
+        derivedStatus: derived.applicationStatus
+      });
     const preserveLocalCompletion = previousScheduleCompleted
       && derived.lifecycle?.closed !== true
       && derived.lifecycle?.cancelled !== true;
-    const applicationStatus = inheritedFamilyCompletion
+    const applicationStatus = preserveManualSplitOperationalStatus
+      ? manualSplitOperationalStatus
+      : inheritedFamilyCompletion
       ? "Completed"
       : preserveLocalCompletion
         ? "Completed"
-        : reconciliationReason && !hidden
+        : activeReconciliationReason && !hidden
           ? "Reconcile Review"
           : hidden
             ? "Cancelled"
@@ -4064,14 +4285,19 @@ export async function reconcileScmOrderFamily({
       ...plainTargetState(target),
       hidden,
       applicationStatus,
-      reconciliationStatus: inheritedFamilyCompletion
+      preserveOperationalStatus: preserveManualSplitOperationalStatus,
+      reconciliationStatus: preserveManualSplitOperationalStatus
         ? "ok"
-        : reconciliationReason
+        : inheritedFamilyCompletion
+        ? "ok"
+        : activeReconciliationReason
           ? "review"
           : derived.reconciliationStatus,
-      reason: inheritedFamilyCompletion
+      reason: preserveManualSplitOperationalStatus
+        ? ""
+        : inheritedFamilyCompletion
         ? "Completed from the fully received source TO; the active split line ledger is incomplete."
-        : reconciliationReason || derived.reason,
+        : activeReconciliationReason || derived.reason,
       abandoned: derived.quantities.abandoned,
       remaining: derived.quantities.remaining,
       destinationRemaining: derived.quantities.destinationRemaining
@@ -4082,32 +4308,10 @@ export async function reconcileScmOrderFamily({
     (max, row) => Math.max(max, Number(row.latest_event_id || 0)),
     0
   ) || null;
-  const lineSummary = linePlans.map((plan) => ({
-    lineKey: plan.line.sourceLineKey,
-    itemId: plan.line.itemId,
-    itemName: plan.line.itemName,
-    sku: plan.line.sku,
-    unit: plan.line.unit,
-    stage: plan.line.stage,
-    logicalLineIdentity: plan.line.logicalLineIdentity,
-    identityIssue: plan.line.identityIssue,
-    locationId: plan.line.locationId,
-    ordered: plan.line.quantity,
-    fulfilled: plan.fulfilled,
-    received: plan.received,
-    remaining: Math.max(
-      reconciliationQuantity(plan.line.quantity)
-        - (order.kind === "TO" ? plan.fulfilled : plan.received),
-      0
-    ),
-    identityStatus: plan.identityStatus,
-    allocationQuality: plan.allocationQuality
-  }));
-
   const state = await upsertOrderState({
     order,
     derived: familyDerived,
-    reconciliationReason,
+    reconciliationReason: activeReconciliationReason,
     reconciliationSource: source,
     exactAllocation,
     runId,
@@ -4166,22 +4370,17 @@ export async function reconcileScmOrderFamily({
     await upsertBlockingReview({
       orderStateId: state.id,
       order,
-      reason: reconciliationReason,
-      details: {
-        unmatchedLines: matched.unmatched.map((row) => ({
-          transactionType: row.transaction_type,
-          transactionId: row.netsuite_transaction_id,
-          transactionLineKey: row.netsuite_line_key,
-          sourceOrderLineKey: row.source_order_line_key,
-          itemId: row.item_id,
-          quantity: row.quantity
-        })),
-        unexplainedReceiptLocations
-      },
+      reason: activeReconciliationReason,
+      details: reviewDetails,
       runId,
       eventId: lastEventId
     });
-    await applyTargetScheduleStates(order, state.id, targetStates, Boolean(reconciliationReason));
+    await applyTargetScheduleStates(
+      order,
+      state.id,
+      targetStates,
+      Boolean(activeReconciliationReason)
+    );
   }
 
   const result = {
@@ -4191,10 +4390,14 @@ export async function reconcileScmOrderFamily({
     sourceOrderRef: order.tranid,
     dryRun: dryRun === true,
     recovered: recovered === true,
-    applicationStatus: reconciliationReason ? "Reconcile Review" : familyDerived.applicationStatus,
+    applicationStatus: activeReconciliationReason
+      ? "Reconcile Review"
+      : familyDerived.applicationStatus,
     calculatedApplicationStatus: familyDerived.applicationStatus,
-    reconciliationStatus: reconciliationReason ? "review" : familyDerived.reconciliationStatus,
-    reason: reconciliationReason || familyDerived.reason,
+    reconciliationStatus: activeReconciliationReason
+      ? "review"
+      : familyDerived.reconciliationStatus,
+    reason: activeReconciliationReason || familyDerived.reason,
     exactAllocation,
     quantities: familyDerived.quantities,
     targets: targetStates,
@@ -6242,7 +6445,14 @@ export async function enrichScmScheduleWithReconciliation(rows = [], {
         };
       }
     }
-    const scheduleReviewBlocked = row.reconciliationBlocked === true;
+    const preserveManualSplitOperationalStatus = kind === "PO"
+      && row.isScmSplit === true
+      && scmManualSplitHasOperationalStatusAuthority(row.status, {
+        hasActivePlan: row.dispatchPlanned === true,
+        derivedStatus: row.calculatedStatus
+      });
+    const scheduleReviewBlocked = !preserveManualSplitOperationalStatus
+      && row.reconciliationBlocked === true;
     const state = match?.state;
     if (!state) {
       const next = {
@@ -6259,10 +6469,13 @@ export async function enrichScmScheduleWithReconciliation(rows = [], {
       || {};
     if (target.hidden === true && !completedView) continue;
     const cases = Array.isArray(state.review_cases) ? state.review_cases : [];
-    const isReview = scheduleReviewBlocked
+    const isReview = !preserveManualSplitOperationalStatus && (
+      scheduleReviewBlocked
       || state.reconciliation_status === "review"
-      || cases.some((item) => item.severity === "blocking");
-    const isPending = state.reconciliation_status === "pending";
+      || cases.some((item) => item.severity === "blocking")
+    );
+    const isPending = !preserveManualSplitOperationalStatus
+      && state.reconciliation_status === "pending";
     if (reviewOnly && !isReview) continue;
     const quantities = {
       ordered: numericJson(target.ordered ?? state.ordered_qty),
@@ -6281,13 +6494,16 @@ export async function enrichScmScheduleWithReconciliation(rows = [], {
       effectiveStatus = match.groupedRollup
         ? currentTargetStatus || state.application_status
         : scmScheduleEffectiveReconciliationStatus({
-          scheduleStatus: row.calculatedStatus || row.status,
+          scheduleStatus: preserveManualSplitOperationalStatus
+            ? row.status
+            : row.calculatedStatus || row.status,
           scheduleId: row.scheduleId,
           scheduleUpdatedAt: row.updatedAt,
           reconciliationStatus: state.reconciliation_status,
           reconciliationReconciledAt: state.reconciled_at,
           reconciliationApplicationStatus: currentTargetStatus || state.application_status,
-          blockingReview: isReview
+          blockingReview: isReview,
+          preserveOperationalStatus: preserveManualSplitOperationalStatus
         });
     }
     const displayedReason = isReview
@@ -7082,6 +7298,25 @@ export async function resolveScmReconciliationReview({
     if (action === "allocate" && !requested.length) {
       throw Object.assign(new Error("Enter at least one split allocation."), { status: 400 });
     }
+    let acceptedConflictFingerprint = "";
+    if (action === "accept" && review.review_code === "reconciliation_conflict") {
+      acceptedConflictFingerprint = text(review.details?.conflictFingerprint)
+        || persistedReconciliationConflictFingerprint(state, review);
+      const acceptedDetails = {
+        ...(review.details && typeof review.details === "object" ? review.details : {}),
+        conflictFingerprint: acceptedConflictFingerprint
+      };
+      if (text(review.details?.conflictFingerprint) !== acceptedConflictFingerprint) {
+        await query(
+          `UPDATE scm_reconciliation_review_cases
+              SET details = $2::jsonb,
+                  updated_at = now()
+            WHERE id = $1`,
+          [review.id, JSON.stringify(acceptedDetails)]
+        );
+        review.details = acceptedDetails;
+      }
+    }
     const audit = await insertReconciliationAuditEvent({
       eventKey: `manual:resolution:${crypto.randomUUID()}`,
       source: "manual",
@@ -7091,7 +7326,12 @@ export async function resolveScmReconciliationReview({
       parentOrderKind: source.kind,
       parentOrderId: source.id,
       parentOrderRef: source.tranid,
-      payload: { resolution: cleanResolution, note: cleanNote, allocations: requested },
+      payload: {
+        resolution: cleanResolution,
+        note: cleanNote,
+        allocations: requested,
+        ...(acceptedConflictFingerprint ? { conflictFingerprint: acceptedConflictFingerprint } : {})
+      },
       actor: cleanActor
     });
     const resolutionResult = await query(
@@ -7105,7 +7345,12 @@ export async function resolveScmReconciliationReview({
         cleanActor,
         text(actorRole) || "admin",
         cleanNote,
-        JSON.stringify({ orderKind: source.kind, orderRef, allocations: requested }),
+        JSON.stringify({
+          orderKind: source.kind,
+          orderRef,
+          allocations: requested,
+          ...(acceptedConflictFingerprint ? { conflictFingerprint: acceptedConflictFingerprint } : {})
+        }),
         audit.event.id
       ]
     );
@@ -7264,6 +7509,12 @@ export async function resolveScmReconciliationReview({
         && typeof quantitySummary.targets === "object"
         ? quantitySummary.targets
         : {};
+      const acceptedScheduleStatuses = await targetPreviousStatuses(
+        source.kind,
+        Object.entries(acceptedTargets).map(([targetRef, target]) =>
+          target?.orderRef || targetRef
+        )
+      );
       for (const [targetRef, target] of Object.entries(acceptedTargets)) {
         const ordered = reconciliationQuantity(target.ordered);
         const fulfilled = reconciliationQuantity(target.fulfilled);
@@ -7280,23 +7531,56 @@ export async function resolveScmReconciliationReview({
           hasActivePlan: target.hasActivePlan === true,
           hasOperationalActivity: fulfilled > EPSILON || received > EPSILON
         });
-        target.applicationStatus = target.hidden === true
-          ? "Cancelled"
-          : derived.applicationStatus;
-        target.reconciliationStatus = derived.reconciliationStatus;
-        target.reason = derived.reason || "";
+        const acceptedTargetRef = target.orderRef || targetRef;
+        const acceptedSchedule = acceptedScheduleStatuses.get(
+          text(acceptedTargetRef).toLowerCase()
+        ) || {};
+        const preservedOperationalStatus = text(acceptedSchedule.status) || "Hold";
+        const stateReconciledAt = timestampValue(state.reconciled_at);
+        const scheduleUpdatedAt = timestampValue(acceptedSchedule.updated_at);
+        const preserveNewerSplitRevision = source.kind === "PO"
+          && target.targetKind === "po_split"
+          && Number(acceptedSchedule.id) > 0
+          && stateReconciledAt !== null
+          && scheduleUpdatedAt !== null
+          && scheduleUpdatedAt > stateReconciledAt;
+        const preserveSplitOperationalStatus = source.kind === "PO"
+          && target.targetKind === "po_split"
+          && (
+            preserveNewerSplitRevision
+            || scmManualSplitHasOperationalStatusAuthority(preservedOperationalStatus, {
+              hasActivePlan: target.hasActiveDispatchAssignment === true,
+              derivedStatus: derived.applicationStatus
+            })
+          );
+        target.applicationStatus = preserveSplitOperationalStatus
+          ? preservedOperationalStatus
+          : target.hidden === true
+            ? "Cancelled"
+            : derived.applicationStatus;
+        target.reconciliationStatus = preserveSplitOperationalStatus
+          ? "ok"
+          : derived.reconciliationStatus;
+        target.reason = preserveSplitOperationalStatus ? "" : derived.reason || "";
         target.abandoned = derived.quantities.abandoned;
         target.remaining = derived.quantities.remaining;
         target.destinationRemaining = derived.quantities.destinationRemaining;
         await query(
           `UPDATE scm_transport_schedule
               SET reconciliation_blocked = false,
-                  status = $3,
-                  updated_by = $4,
-                  updated_at = now()
+                  status = CASE WHEN $5::boolean THEN status ELSE $3 END,
+                  updated_by = CASE WHEN $6::boolean THEN updated_by ELSE $4 END,
+                  updated_at = CASE WHEN $6::boolean THEN updated_at ELSE now() END
             WHERE reconciliation_order_state_id = $1
               AND lower(order_ref) = lower($2)`,
-          [state.id, target.orderRef || targetRef, target.applicationStatus, cleanActor]
+          [
+            state.id,
+            acceptedTargetRef,
+            target.applicationStatus,
+            cleanActor,
+            preserveSplitOperationalStatus,
+            preserveNewerSplitRevision
+          ]
         );
       }
       quantitySummary.targets = acceptedTargets;
@@ -7328,7 +7612,11 @@ export async function resolveScmReconciliationReview({
                 status = CASE WHEN status = 'Reconcile Review' THEN $2 ELSE status END,
                 updated_by = $3,
                 updated_at = now()
-          WHERE reconciliation_order_state_id = $1`,
+          WHERE reconciliation_order_state_id = $1
+            AND (
+              reconciliation_blocked IS DISTINCT FROM false
+              OR status = 'Reconcile Review'
+            )`,
         [state.id, state.application_status, cleanActor]
       );
       await applyAffectedScheduleGroupRollups(source.kind, [

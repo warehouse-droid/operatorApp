@@ -70,9 +70,10 @@ function allowlistedStatuses(value) {
 export function normalizeScmSchedulePreference(patch = {}, { surface } = {}) {
   const normalizedSurface = normalizeScmSchedulePreferenceSurface(surface ?? patch.surface);
   const scmSurface = normalizedSurface === "scm";
+  const typeFilterSurface = scmSurface || normalizedSurface === "dispatch";
   return {
     surface: normalizedSurface,
-    kind: scmSurface
+    kind: typeFilterSurface
       ? allowlistedKind(patch.kind ?? patch.orderKind)
       : "",
     method: scmSurface

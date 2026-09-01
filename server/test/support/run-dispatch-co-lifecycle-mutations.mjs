@@ -10,11 +10,14 @@ const LIFECYCLE = path.resolve("src/dispatch-co-lifecycle.js");
 const PLAN_REPOSITORY = path.resolve("src/dispatch-plan-repository.js");
 const RECOVERY = path.resolve("src/dispatch-co-recovery.js");
 const DISPATCH_REPOSITORY = path.resolve("src/dispatch-repository.js");
+const RECEIVING_REPOSITORY = path.resolve("src/receiving-repository.js");
+const SERVER = path.resolve("src/server.js");
 const DISPATCH_CLIENT = path.resolve("public/dispatch.js");
 const TESTS = Object.freeze([
   "test/dispatch/frontend/dispatch-co-global-lifecycle.contract.test.js",
   "test/dispatch/unit/dispatch-co-lifecycle-wiring.test.js",
   "test/dispatch/integration/dispatch-co-global-lifecycle.red.test.js",
+  "test/dispatch/integration/dispatch-co-driver-completion-lifecycle.red.test.js",
   "test/dispatch/integration/dispatch-co-recovery.test.js"
 ]);
 const MUTANTS = Object.freeze([
@@ -33,12 +36,67 @@ const MUTANTS = Object.freeze([
   {
     name: "active global CO metadata is not rehydrated",
     target: LIFECYCLE,
-    from: `  const orders = (plan.orders || []).map((order) => applyActiveTransitCoMetadata(
-    clearCancelledTransitCoMetadata(order, cancelledByRef),
-    activeBySource
-  ));`,
-    to: `  const orders = (plan.orders || []).map((order) =>
-    clearCancelledTransitCoMetadata(order, cancelledByRef));`
+    from: `    let next = applyActiveTransitCoMetadata(
+      clearCancelledTransitCoMetadata(order, cancelledByRef),
+      activeBySource
+    );`,
+    to: `    let next = clearCancelledTransitCoMetadata(order, cancelledByRef);`
+  },
+  {
+    name: "cancelled CO card survives stale plan reconciliation",
+    target: LIFECYCLE,
+    from: "    if (isCoRef(ref) && invalidCoRefs.has(ref.toLowerCase())) return null;",
+    to: "    if (false && isCoRef(ref) && invalidCoRefs.has(ref.toLowerCase())) return null;"
+  },
+  {
+    name: "group-only snapshot no longer protects its active CO child",
+    target: LIFECYCLE,
+    from: `        const containsTarget = [...loadRefs].some((ref) =>
+          ref === target || (membership.get(ref) || []).some((childRef) => childRef.toLowerCase() === target)
+        );`,
+    to: `        const containsTarget = [...loadRefs].some((ref) => ref === target);`
+  },
+  {
+    name: "stale CO stops are retained and poison unrelated planning",
+    target: LIFECYCLE,
+    from: "  const removedOrderRefs = new Set([...invalidCoRefs].filter(isCoRef));",
+    to: "  const removedOrderRefs = new Set();"
+  },
+  {
+    name: "stale client can reactivate a cancelled CO",
+    target: DISPATCH_REPOSITORY,
+    from: "      reactivateCancelled === true",
+    to: "      true"
+  },
+  {
+    name: "Driver-completed CO can be cancelled back into a false terminal state",
+    target: LIFECYCLE,
+    from: "    if (!co || [\"received\", \"loaded\", \"completed\"].includes(String(co.status || \"\").toLowerCase())) return null;",
+    to: "    if (!co || [\"received\", \"loaded\"].includes(String(co.status || \"\").toLowerCase())) return null;"
+  },
+  {
+    name: "Driver-completed CO can be overwritten by a repeated upsert",
+    target: DISPATCH_REPOSITORY,
+    from: "     WHERE local_co_orders.status NOT IN ('cancelled', 'completed')\n        OR (local_co_orders.status = 'cancelled' AND $14::boolean)",
+    to: "     WHERE local_co_orders.status <> 'cancelled'\n        OR (local_co_orders.status = 'cancelled' AND $14::boolean)"
+  },
+  {
+    name: "received CO returns to the Dispatch planning pool",
+    target: DISPATCH_REPOSITORY,
+    from: "      WHERE co.status IN ('pending_load', 'planned')",
+    to: "      WHERE co.status IN ('pending_load', 'planned', 'received')"
+  },
+  {
+    name: "transport-completed CO cannot proceed through destination Receiving",
+    target: RECEIVING_REPOSITORY,
+    from: "  if (![\"planned\", \"completed\"].includes(String(co.status || \"\").toLowerCase())) {",
+    to: "  if (String(co.status || \"\").toLowerCase() !== \"planned\") {"
+  },
+  {
+    name: "stale plan assignment follow-up can rewrite a Driver-completed CO",
+    target: SERVER,
+    from: "          AND status NOT IN ('received', 'loaded', 'completed')",
+    to: "          AND status NOT IN ('received', 'loaded')"
   },
   {
     name: "legacy save omits the inactive-CO race assertion",

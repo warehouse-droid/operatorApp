@@ -26,6 +26,18 @@ const MUTANTS = Object.freeze([
     to: "  return true;"
   }),
   Object.freeze({
+    name: "selected direct-customer service fee returns to the yard",
+    target: "src/dispatch-po-route-projection.js",
+    from: "  const directLineIds = new Set(directLines.map((line) => text(line.poLineId)).filter(Boolean));",
+    to: "  const directLineIds = new Set();"
+  }),
+  Object.freeze({
+    name: "serialized direct-customer service evidence is discarded",
+    target: "src/dispatch-po-route-projection.js",
+    from: "    const parsed = JSON.parse(details);",
+    to: "    const parsed = {};"
+  }),
+  Object.freeze({
     name: "negative hostile allocation inflates PO residual freight",
     target: "src/dispatch-po-route-projection.js",
     from: "  return Math.max(number(allocation[snake] ?? allocation[camel]), 0);",

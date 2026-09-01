@@ -97,3 +97,148 @@ The user separately authorized production deployment on 2026-08-20 UTC.
 - The application, PostgreSQL, and Ollama containers were healthy after cutover. The Driver PWA version remained `2026.08.12.3`; offline mode remained disabled at revision 3. Dispatch Driver-oriented planning remained enabled.
 - `DISPATCH_PLANNER_ORDER_POOL_MODE` and `DISPATCH_PLANNER_COMMAND_MODE` remained `off`, preserving the legacy planner until a separately authorized shadow/on cutover. The SCM Dependency Manager itself is live and authentication-protected.
 - The bounded storage cleanup completed successfully, retained the three newest dumps including the deployment backup, and preserved both release and rollback images. The disposable test project and its exact test image were removed after deployment.
+
+---
+
+## Partial multi-source quantity and CO routing amendment
+
+Date: 2026-08-27 UTC
+
+Status: implemented, verified, and deployed to production on 2026-08-28 UTC.
+
+### Accepted behavior
+
+- A TO allocation remains immutable audit evidence, while its effective route
+  contribution is capped per item by the TO's current outbound quantity (or
+  receiving quantity when outbound evidence is unavailable).
+- A partial TO is valid. It must not raise attention merely because its current
+  quantity is below the linked SO allocation; the unserved quantity remains on
+  the SO's ordinary outbound route.
+- Item budgets are isolated and conserved when one TO contributes to multiple SO
+  lines. Replenishment TOs remain timing prerequisites and never add their source
+  or transit-CO location to the SO route.
+- A direct TO contributes a pickup only while it has positive effective sales
+  material. An explicitly zero direct contribution creates neither an empty
+  pickup nor a route-validation blocker.
+- An active CO for a direct TO redirects that operational pickup to the CO
+  destination; cancelling the CO restores the canonical TO source. COs attached
+  to replenishment TOs remain operationally invisible to the SO route.
+- Missing linked material-line identity, inactive TOs, terminal TOs with work in
+  progress, and the existing execution/lifecycle blockers remain real attention
+  conditions.
+
+### Test-first evidence
+
+The production assertions were written before the implementation changes:
+
+- The first focused run passed the unchanged controls and failed the mixed
+  partial-TO case because the old sync path raised quantity attention.
+- The anonymized replay failed only its two reduced-quantity shapes (`D003` and
+  `D005`) with the legacy "quantity is below its linked Sales Order allocation"
+  behavior.
+- The four-TO/one-PO case independently failed when a zero-contribution direct TO
+  left its source in the SO route. The implementation was then changed to make
+  effective material, rather than the saved allocation, authoritative for route
+  contribution.
+
+The executable specification now includes scenarios 19 through 28 in
+`test/scm-dependency-management-spec.md`.
+
+### Current-data audit and replay
+
+A read-only production audit examined all 123 dependency records and all 301
+saved dependency lines across 108 SO targets; it made no production mutations.
+
+- Nine targets have more than one non-cancelled TO dependency: eight have two
+  replenishment TOs and one has two direct TOs. The current maximum is two TOs,
+  so the synthetic three- and four-TO cases extend beyond today's data.
+- Eleven active/attention dependencies (25 lines across 10 targets) are captured
+  in the pseudonymized executable replay fixture. It covers every currently
+  planning-relevant dependency shape, including direct, replenishment, partial
+  quantity, multiple TOs, and an active direct transit CO.
+- The other 112 delivered, received-local, or cancelled records were included in
+  the aggregate invariant audit and remain covered by the lifecycle/rollback
+  harnesses rather than being represented as active planning cases.
+- The audit found no negative saved allocations, missing SO/TO headers,
+  zero-line dependencies, or active missing-material identities. It found one
+  active quantity-limited dependency and one legacy quantity-only attention row.
+  That legacy attention row will clear on its next TO sync only after this
+  amendment is deployed.
+- Sixty-three active CO records were considered by the overlay audit. One matched
+  a direct dependency and one matched a replenishment dependency; both routing
+  modes are exercised explicitly.
+
+### Extreme and randomized cases
+
+- Four TOs plus one direct PO: two direct TOs, two replenishment TOs, partial and
+  zero current quantities, residual base-yard fulfillment, cancellation, and
+  deterministic CO overlays.
+- Ten SO lines: three lines direct through `TO0001`, three lines waiting on
+  replenishment through `TO0002`, and four lines direct through a PO. Every line
+  is owned exactly once and all ten remain on the customer drop.
+- A fixed random seed chooses CO overlays for direct and replenishment TOs in both
+  extreme cases. Direct CO cancellation restores the canonical pickup;
+  replenishment CO creation/cancellation cannot change the SO route.
+- Property tests run 500 generated allocation sets per invariant, covering up to
+  12 same-item allocations plus independent item budgets, receiving fallback,
+  fractional conversions, unknown quantities, and zero/direct routing
+  boundaries.
+
+### Executed gates
+
+| Gate | Result |
+| --- | --- |
+| Focused behavior/database/replay suite | 49/49 passed |
+| Quantity module coverage | 100% statements, 98.36% branches, 100% functions, 100% lines |
+| Focused mutation suite | 16/16 mutants killed (100%); sources restored and 32/32 baseline tests passed |
+| Full SCM dependency gauntlet | Passed |
+| Order-dependency rollback harness | Passed |
+| Dispatch-link rollback harness | Passed |
+| CO lifecycle regression | 27/27 passed in a freshly migrated disposable database |
+| PO/residual-route regression | 39/39 passed; internal Driver route harness also passed 96 checks |
+| Focused ESLint and legacy syntax | Passed with zero warnings |
+| Dependency licenses | 396 packages passed; the pre-existing `buffers@0.1.1` metadata exception remains documented |
+| Changed-source secret scan | 29 paths checked; no high-confidence findings |
+| Diff whitespace validation | Passed |
+
+All database tests used an isolated PostgreSQL 18 container and the repository's
+Node 20 test image. No dependency was added. No browser UI source changed for
+this amendment, so route projection, physical-visit, frontend contract, and
+Driver/CO lifecycle tests were used instead of claiming a new manual browser or
+device run.
+
+### 2026-08-28 deployment boundary
+
+- The release was built as an exact two-file layer on the previously deployed
+  CO transit-source image. Unrelated local Dispatch/MBT worktree changes were
+  excluded from the build context's `COPY` instructions.
+- Release image: `mbbs-operator-app-app:to-dependency-quantity-20260828T005509Z`,
+  image ID `sha256:ba047cf6acf6129b5ddd9a3ded5a1ef6e0b7087e8821ef4a88f6cf748176cdc4`.
+- Rollback image: `mbbs-operator-app-app:rollback-pre-to-quantity-20260828T005509Z`,
+  image ID `sha256:af91cdbe08422eb32b56dd33806f2bdb537271e2fddb2d688cb101495d75351e`.
+- Backup: `docker/backups/pre-to-quantity-20260828T005509Z.dump`, 253,857,980
+  bytes, SHA-256
+  `896409d1dcb00aa35fe7bb9f8859275e159398b278da2348378dad3473e3f16f`.
+  PostgreSQL successfully listed the custom-format restore catalog before the
+  container-side temporary copy was removed.
+- No migration was required. Only the application container was recreated.
+  PostgreSQL and Ollama retained their original
+  `2026-08-14T13:14:47Z` start times and remained healthy.
+- The running source hashes exactly match the tested files:
+  `c841bbd3bdaf3a655445bb991bb9afbd04745fd68e2125454ad4323a7324dbb2`
+  for `order-dependency-quantity.js` and
+  `a5346d0ec7ec4f4d8a4ded60be33cfb7304dfc7e85991edb481c731a0e006efb`
+  for `order-dependency-repository.js`.
+- The production health endpoint returned
+  `{"ok":true,"app":"MBBS Yard Server"}`. Startup logs contained only the
+  normal server-listening message.
+- A read-only production projection loaded all 11 then-planning dependencies
+  across 10 targets before reconciliation, found one quantity-limited line, one
+  active transit CO, no replenishment dependency in a direct manifest, and no
+  zero-contribution direct pickup.
+- The single legacy quantity-only attention dependency had no execution
+  progress. Its normal transactional TO sync cleared attention while retaining
+  the `quantityLimited` diagnostic. Because that replenishment was already
+  complete, the existing lifecycle rule moved it to delivered. The final
+  read-only projection had zero legacy quantity-attention rows and zero
+  quantity-limited attention rows.

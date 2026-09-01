@@ -241,8 +241,8 @@ assert.deepEqual(
 
 const dispatchResponse = sourceSection(
   serverSource,
-  "async function listDispatchOrdersForResponse",
-  "async function listScmPurchaseOrdersForResponse",
+  "async function loadDispatchOrdersForResponse",
+  "const dispatchOrderResponseSingleFlight",
   "Dispatch order response"
 );
 assertLateVisibilityGate(dispatchResponse, "Dispatch order response", {

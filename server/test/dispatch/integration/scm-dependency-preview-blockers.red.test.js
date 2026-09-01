@@ -88,6 +88,43 @@ async function setDriverOfflineMode(enabled) {
   );
 }
 
+async function seedCancelledDependencyWithoutExecution(seeded) {
+  const sales = await query(
+    "SELECT netsuite_id, outbound_location_id, outbound_location FROM sales_orders WHERE tranid = $1",
+    [seeded.targetRef]
+  );
+  const transfer = await query(
+    `SELECT netsuite_id, from_location_id, from_location,
+            to_location_id, to_location
+       FROM transfer_orders
+      WHERE tranid = $1`,
+    [seeded.transferRef]
+  );
+  const dependency = await query(
+    `INSERT INTO order_dependencies (
+       sales_order_id, sales_order_ref, dispatch_target_ref, dispatch_target_kind,
+       transfer_order_id, transfer_order_ref, dependency_mode, same_load_required,
+       status, source_location_id, source_location,
+       accounting_destination_location_id, accounting_destination_location,
+       reconciliation_status
+     ) VALUES (
+       $1, $2, $2, 'normal', $3, $4, 'yard_replenishment', false,
+       'cancelled', $5, $6, $7, $8, 'pending'
+     ) RETURNING id`,
+    [
+      sales.rows[0].netsuite_id,
+      seeded.targetRef,
+      transfer.rows[0].netsuite_id,
+      seeded.transferRef,
+      transfer.rows[0].from_location_id,
+      transfer.rows[0].from_location,
+      transfer.rows[0].to_location_id || sales.rows[0].outbound_location_id,
+      transfer.rows[0].to_location || sales.rows[0].outbound_location
+    ]
+  );
+  return Number(dependency.rows[0].id);
+}
+
 async function seedReusedPurchaseSplitRef(suffix) {
   const base = 9_920_000_000 + Number.parseInt(suffix.slice(0, 5), 16);
   const sourcePoId = base + 1;
@@ -205,6 +242,108 @@ test("shared preview allows untouched work but blocks once Operator line work st
       assert.equal(started.allowed, false);
       assert.equal(started.blockers[0].code, "OPERATOR_ACTIVITY_STARTED");
       assert.ok(started.blockers[0].details.refs.includes(seeded.targetRef));
+    });
+  } finally {
+    await rollback.rollback();
+  }
+});
+
+test("cancelled dependency with zero execution and CO-only Driver activity does not block a new TO link", async () => {
+  const rollback = await beginRollbackContext();
+  try {
+    await rollback.run(async () => {
+      const seeded = await seedTargetAndTransfer(crypto.randomUUID().slice(0, 8));
+      const dependencyId = await seedCancelledDependencyWithoutExecution(seeded);
+      await query(
+        `INSERT INTO driver_job_records (
+           job_id, plan_date, driver_login, stop_type, order_refs,
+           status, started_at
+         ) VALUES ($1, '2099-08-20', 'co-only-driver', 'dropoff', $2::jsonb,
+                   'in_progress', now())`,
+        [`co-only-${crypto.randomUUID()}`, JSON.stringify([`CO-${seeded.transferRef}`])]
+      );
+      const command = {
+        action: "link_to",
+        targetRef: seeded.targetRef,
+        planDate: "2099-08-20",
+        payload: { transferOrderRef: seeded.transferRef }
+      };
+
+      const untouched = await previewScmDependencyMutation(command, {
+        id: "scm",
+        sessionId: "scm-cancelled-preview"
+      });
+      assert.equal(untouched.allowed, true);
+      assert.equal(
+        untouched.blockers.some((blocker) => blocker.code === "DEPENDENCY_EXECUTION_STARTED"),
+        false
+      );
+      assert.equal(
+        untouched.blockers.some((blocker) => blocker.code === "DRIVER_ACTIVITY_STARTED"),
+        false,
+        "CO-TO activity is not exact activity for the underlying TO."
+      );
+
+      const jobId = `actual-to-${crypto.randomUUID()}`;
+      await query(
+        `INSERT INTO driver_job_records (
+           job_id, plan_date, driver_login, stop_type, order_refs,
+           status, started_at
+         ) VALUES ($1, '2099-08-20', 'to-driver', 'pickup', $2::jsonb,
+                   'in_progress', now())`,
+        [jobId, JSON.stringify([seeded.transferRef])]
+      );
+      const actualToStarted = await previewScmDependencyMutation(command, {
+        id: "scm",
+        sessionId: "scm-cancelled-preview"
+      });
+      assert.equal(actualToStarted.allowed, false);
+      assert.deepEqual(
+        actualToStarted.blockers.find((blocker) => blocker.code === "DRIVER_ACTIVITY_STARTED")?.details.jobIds,
+        [jobId]
+      );
+      assert.ok(Number.isInteger(dependencyId));
+    });
+  } finally {
+    await rollback.rollback();
+  }
+});
+
+test("cancelled dependency with physical progress remains an execution blocker", async () => {
+  const rollback = await beginRollbackContext();
+  try {
+    await rollback.run(async () => {
+      const seeded = await seedTargetAndTransfer(crypto.randomUUID().slice(0, 8));
+      const dependencyId = await seedCancelledDependencyWithoutExecution(seeded);
+      const salesLine = await query(
+        "SELECT item_id, item_name, unit FROM sales_order_lines WHERE id = $1",
+        [seeded.salesLineId]
+      );
+      await query(
+        `INSERT INTO order_dependency_lines (
+           dependency_id, sales_line_id, item_id, item_name, unit,
+           allocated_quantity, piece_qty, loaded_quantity
+         ) VALUES ($1, $2, $3, $4, $5, 1, 1, 1)`,
+        [
+          dependencyId,
+          seeded.salesLineId,
+          salesLine.rows[0].item_id,
+          salesLine.rows[0].item_name,
+          salesLine.rows[0].unit
+        ]
+      );
+
+      const preview = await previewScmDependencyMutation({
+        action: "link_to",
+        targetRef: seeded.targetRef,
+        planDate: "2099-08-20",
+        payload: { transferOrderRef: seeded.transferRef }
+      }, { id: "scm", sessionId: "scm-progress-preview" });
+      assert.equal(preview.allowed, false);
+      assert.deepEqual(
+        preview.blockers.find((blocker) => blocker.code === "DEPENDENCY_EXECUTION_STARTED")?.details.dependencyIds,
+        [dependencyId]
+      );
     });
   } finally {
     await rollback.rollback();

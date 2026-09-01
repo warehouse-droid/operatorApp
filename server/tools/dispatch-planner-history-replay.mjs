@@ -4,14 +4,17 @@ import path from "node:path";
 
 import { pool } from "../src/db.js";
 import {
-  buildDispatchHistoricalReplayReport,
+  buildDispatchHistoricalReplayArtifact,
   sanitizeDispatchReplayPlan
 } from "../src/dispatch-planner-replay.js";
 
 const from = String(process.argv[2] || "2026-08-05T04:00:00.000Z");
 const to = String(process.argv[3] || "2026-08-19T04:00:00.000Z");
 const output = path.resolve(process.argv[4] || "test-artifacts/dispatch-planner-replay/two-week-2026-08-05_2026-08-18.json");
-const salt = String(process.env.DISPATCH_REPLAY_SALT || "dispatch-planner-replay-2026-v1");
+const captureOutput = process.env.DISPATCH_REPLAY_CAPTURE_OUTPUT
+  ? path.resolve(process.env.DISPATCH_REPLAY_CAPTURE_OUTPUT) : "";
+const expectedLocalDayCount = Number(process.env.DISPATCH_REPLAY_EXPECTED_LOCAL_DAYS || 0);
+const salt = String(process.env.DISPATCH_REPLAY_SALT || crypto.randomBytes(32).toString("hex"));
 
 function pseudonym(namespace, value) {
   return `${namespace}_${crypto.createHash("sha256").update(`${salt}\0${namespace}\0${String(value ?? "")}`).digest("hex").slice(0, 16)}`;
@@ -36,9 +39,13 @@ function actionCount(rows, key = "action") {
 }
 
 const client = await pool.connect();
-let report;
+let capture;
 try {
   await client.query("BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY");
+  const readOnly = await client.query("SHOW transaction_read_only");
+  if (readOnly.rows[0]?.transaction_read_only !== "on") {
+    throw new Error("Dispatch history capture requires a read-only database transaction.");
+  }
   const params = [from, to];
   const commands = await client.query(
       `SELECT id, plan_id, plan_date::text, command_type, applied_revision, result -> 'plan' AS plan, created_at
@@ -70,11 +77,12 @@ try {
         ORDER BY created_at, id`, params);
   const scmEvents = await client.query(
       `SELECT id, source, event_type, action, validation_status,
-              COALESCE(occurred_at, received_at, created_at) AS event_at,
+              created_at AS server_at,
+              COALESCE(occurred_at, received_at, created_at) AS source_event_at,
               payload IS NOT NULL AS has_payload
          FROM scm_reconciliation_audit_events
         WHERE created_at >= $1::timestamptz AND created_at < $2::timestamptz
-        ORDER BY COALESCE(occurred_at, received_at, created_at), id`, params);
+        ORDER BY created_at, id`, params);
   const offlineEvents = await client.query(
       `SELECT id, event_type, status, client_sequence,
               device_occurred_at, server_received_at, server_applied_at,
@@ -151,7 +159,7 @@ try {
     if (row.has_before && row.has_after) {
       event.before = { present: true };
       event.after = { present: true };
-    } else if (row.has_details) {event.payload = { action: row.action, source: row.source || "" };}
+    } else if (row.has_details) {event.payload = { action: row.action, source: pseudonym("SOURCE", row.source) };}
     events.push(event);
   }
   for (const row of scmChanges.rows) {
@@ -168,14 +176,15 @@ try {
     events.push({
       stream: "netsuite",
       id: eventId("netsuite", "scm_reconciliation", row.id),
-      serverAt: iso(row.event_at),
+      serverAt: iso(row.server_at),
+      occurredAt: iso(row.source_event_at, row.server_at),
       sourceSequence: Number(row.id),
       action: row.action || row.event_type,
       ...(row.has_payload ? { payload: {
         eventType: row.event_type || "",
         action: row.action || "",
         validationStatus: row.validation_status || "",
-        source: row.source || ""
+        source: pseudonym("SOURCE", row.source)
       } } : {})
     });
   }
@@ -189,7 +198,7 @@ try {
       ...(row.has_payload ? { payload: {
         entityType: row.entity_type || "",
         changeType: row.change_type || "",
-        source: row.source || ""
+        source: pseudonym("SOURCE", row.source)
       } } : {})
     });
   }
@@ -266,25 +275,26 @@ try {
     });
   }
 
-  report = buildDispatchHistoricalReplayReport({
-    events,
+  capture = {
+    schemaVersion: 1,
+    capturedAt: new Date().toISOString(),
     window: { from, to, timezone: "America/Toronto" },
-    sourceCounts
-  });
-  report.historicalActionCounts = {
-    dispatch: actionCount(audits.rows),
-    commands: actionCount(commands.rows, "command_type"),
-    netsuiteDerived: actionCount(scmEvents.rows),
-    driverOffline: actionCount(offlineEvents.rows, "event_type")
-  };
-  report.assertions = {
-    everyEventCompared: report.projectionComparisons === report.eventsProcessed,
-    noProjectionMismatch: report.mismatchCount === 0,
-    hasDispatchEvidence: report.streamCounts.dispatch > 0,
-    hasScmEvidence: report.streamCounts.scm > 0,
-    hasNetSuiteDerivedEvidence: report.streamCounts.netsuite > 0,
-    hasDriverEvidence: report.streamCounts.driver > 0,
-    gapsExplicit: report.gapCount === 0 || report.gapSamples.length > 0
+    privacy: {
+      identifiers: "sha256-randomly-salted-pseudonyms",
+      names: "excluded",
+      addresses: "excluded",
+      photos: "excluded",
+      rawPayloads: "excluded",
+      rawSources: "excluded"
+    },
+    sourceCounts,
+    historicalActionCounts: {
+      dispatch: actionCount(audits.rows),
+      commands: actionCount(commands.rows, "command_type"),
+      netsuiteDerived: actionCount(scmEvents.rows),
+      driverOffline: actionCount(offlineEvents.rows, "event_type")
+    },
+    events
   };
   await client.query("COMMIT");
 } catch (error) {
@@ -295,6 +305,11 @@ try {
   await pool.end();
 }
 
+const report = buildDispatchHistoricalReplayArtifact({ capture, expectedLocalDayCount });
+if (captureOutput) {
+  await mkdir(path.dirname(captureOutput), { recursive: true });
+  await writeFile(captureOutput, `${JSON.stringify(capture, null, 2)}\n`, "utf8");
+}
 await mkdir(path.dirname(output), { recursive: true });
 await writeFile(output, `${JSON.stringify(report, null, 2)}\n`, "utf8");
 if (Object.values(report.assertions).some((passed) => passed !== true)) {
@@ -302,6 +317,7 @@ if (Object.values(report.assertions).some((passed) => passed !== true)) {
 }
 process.stdout.write(`${JSON.stringify({
   output,
+  captureOutput: captureOutput || undefined,
   eventsProcessed: report.eventsProcessed,
   projectionComparisons: report.projectionComparisons,
   mismatchCount: report.mismatchCount,

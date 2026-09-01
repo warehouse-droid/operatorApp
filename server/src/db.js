@@ -7,7 +7,8 @@ const transactionStorage = new AsyncLocalStorage();
 let savepointSeq = 0;
 
 export const pool = new Pool({
-  connectionString: config.databaseUrl
+  connectionString: config.databaseUrl,
+  options: "-c jit=off"
 });
 
 export async function query(text, params = []) {

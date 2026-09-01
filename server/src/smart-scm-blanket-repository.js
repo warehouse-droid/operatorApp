@@ -22,6 +22,8 @@ import {
 import { getSmartScmRouteRule, smartScmRouteRuleKey } from "./smart-scm-route-repository.js";
 import { smartScmVendorUnitPriceEdit } from "./smart-scm-vendor-unit-price.js";
 import { applySmartScmVendorPalletUnitPrice } from "./smart-scm-vendor-unit-price-repository.js";
+import { listSmartScmBlanketPoolRows } from "./smart-scm-blanket-pool-repository.js";
+import { smartScmBlanketCoverageSnapshot } from "./smart-scm-blanket-coverage.js";
 
 const EPSILON = 0.000001;
 const BLANKET_PENDING_ALLOCATION_STATUSES = Object.freeze(["reserved", "held"]);
@@ -64,6 +66,73 @@ function payloadFingerprint(value) {
 function integer(value) {
   const parsed = Number(value);
   return Number.isSafeInteger(parsed) && parsed > 0 ? parsed : null;
+}
+
+async function blanketSplitPalletLines(confirmed = [], sourcePoId = null) {
+  const materialSourceLineIds = [...new Set(confirmed
+    .map((entry) => integer(entry?.allocation?.source_line_id))
+    .filter(Boolean))];
+  if (!materialSourceLineIds.length) return [];
+  const sourceId = integer(sourcePoId);
+  if (!sourceId) throw httpError("The Blanket source PO identity is missing.", 409, "SCM_BLANKET_PALLET_SOURCE_MISSING");
+  const relations = await query(
+    `SELECT material.id AS source_line_id,
+            pallet.id AS pallet_source_line_id
+       FROM purchase_order_lines material
+       LEFT JOIN LATERAL (
+         SELECT candidate.id
+           FROM purchase_order_lines candidate
+          WHERE candidate.purchase_order_id = material.purchase_order_id
+            AND candidate.netsuite_active = true
+            AND UPPER(BTRIM(COALESCE(NULLIF(candidate.sku, ''), candidate.item_name, ''))) = 'PALLET'
+          ORDER BY
+            CASE
+              WHEN candidate.line_id IS NOT NULL
+               AND material.line_id IS NOT NULL
+               AND candidate.line_id >= material.line_id THEN 0
+              ELSE 1
+            END,
+            ABS(COALESCE(candidate.line_id, candidate.id) - COALESCE(material.line_id, material.id)),
+            candidate.id
+          LIMIT 1
+       ) pallet ON true
+      WHERE material.purchase_order_id = $1
+        AND material.id = ANY($2::bigint[])
+        AND material.netsuite_active = true`,
+    [sourceId, materialSourceLineIds]
+  );
+  const palletSourceByMaterial = new Map(relations.rows.map((row) => [
+    Number(row.source_line_id),
+    integer(row.pallet_source_line_id)
+  ]));
+  const missingMaterialLineId = materialSourceLineIds.find((lineId) => !palletSourceByMaterial.get(lineId));
+  if (missingMaterialLineId) {
+    throw httpError(
+      `The Blanket source PO has no active PALLET row for material line ${missingMaterialLineId}.`,
+      409,
+      "SCM_BLANKET_PALLET_SOURCE_MISSING"
+    );
+  }
+  const grouped = new Map();
+  for (const entry of confirmed) {
+    const quantity = round(positive(entry.releasedPallets));
+    if (quantity <= EPSILON) continue;
+    const sourceLineId = integer(entry.allocation?.source_line_id);
+    const palletSourceLineId = palletSourceByMaterial.get(sourceLineId);
+    const destinationLocationId = integer(entry.allocation?.destination_location_id);
+    if (!palletSourceLineId || !destinationLocationId) {
+      throw httpError("A confirmed Blanket line has incomplete PALLET lineage.", 409, "SCM_BLANKET_PALLET_SOURCE_MISSING");
+    }
+    const key = `${palletSourceLineId}:${destinationLocationId}`;
+    const current = grouped.get(key) || {
+      lineRowId: palletSourceLineId,
+      salesQty: 0,
+      destinationLocationId
+    };
+    current.salesQty = round(current.salesQty + quantity);
+    grouped.set(key, current);
+  }
+  return [...grouped.values()];
 }
 
 function blanketSourceLineMatchesProposal(source = {}, proposal = {}, itemId = null) {
@@ -196,135 +265,7 @@ async function blanketPoolLineRows({
   limit = 10000,
   offset = 0
 } = {}) {
-  const cleanSearch = text(search).slice(0, 160);
-  const selectedSourcePoId = integer(sourcePoId);
-  const maxRows = Math.min(20000, Math.max(1, Number(limit) || 10000));
-  const rowOffset = Math.max(0, Number(offset) || 0);
-  const result = await query(
-    `WITH sales_alloc AS (
-       SELECT po_line_id,
-              SUM(allocated_pallet_qty) AS pallet_qty,
-              SUM(allocated_sales_qty) AS sales_qty
-         FROM dispatch_so_po_allocations
-        WHERE status = 'active'
-        GROUP BY po_line_id
-     ), split_alloc AS (
-       SELECT split_line.source_line_id,
-              SUM(split_line.pallet_qty) AS pallet_qty,
-              SUM(split_line.sales_qty) AS sales_qty
-         FROM dispatch_scm_po_split_lines split_line
-         JOIN dispatch_scm_po_splits split_header
-           ON split_header.id = split_line.split_id
-          AND split_header.status = 'active'
-        GROUP BY split_line.source_line_id
-     ), blanket_alloc AS (
-       SELECT allocation.source_line_id,
-              SUM(CASE
-                WHEN allocation.status = 'reserved' THEN allocation.reserved_pallets
-                WHEN allocation.status = 'held' THEN allocation.held_pallets
-                ELSE 0
-              END) AS pallet_qty,
-              SUM(CASE
-                WHEN allocation.status = 'reserved' THEN allocation.reserved_sales_qty
-                WHEN allocation.status = 'held' THEN allocation.held_sales_qty
-                ELSE 0
-              END) AS sales_qty
-         FROM scm_smart_blanket_allocations allocation
-        WHERE allocation.status = ANY($6::text[])
-        GROUP BY allocation.source_line_id
-     ), calculated AS (
-       SELECT po.netsuite_id AS source_po_id,
-              po.tranid AS source_po_ref,
-              po.trandate,
-              po.vendor_id,
-              po.vendor,
-              COALESCE(NULLIF(po.dispatch_vendor_yard, ''), NULLIF(po.source_location, ''), po.vendor) AS pickup_point,
-              po.status_text,
-              po.is_blanket_po,
-              po.blanket_flagged_at,
-              po.blanket_flagged_by,
-              line.id AS source_line_id,
-              line.line_id,
-              line.item_id,
-              line.item_name,
-              line.sku,
-              line.item_description,
-              line.unit,
-              line.to_plt,
-              line.to_lyr,
-              line.to_sec,
-              line.to_pcs,
-              CASE WHEN COALESCE(line.item_weight, 0) > 0 AND COALESCE(line.to_plt, 0) > 0
-                   THEN line.item_weight * line.to_plt ELSE 0 END AS pallet_weight_lbs,
-              GREATEST(COALESCE(line.quantity, 0), 0) AS ordered_sales_qty,
-              GREATEST(COALESCE(line.netsuite_received_baseline_qty, line.netsuite_received_qty, 0), 0) AS received_baseline_sales_qty,
-              COALESCE(sales.sales_qty, 0) + COALESCE(split.sales_qty, 0) AS allocated_sales_qty,
-              COALESCE(blanket.sales_qty, 0) AS reserved_sales_qty,
-              GREATEST(
-                COALESCE(line.quantity, 0)
-                - COALESCE(line.netsuite_received_baseline_qty, line.netsuite_received_qty, 0)
-                - COALESCE(sales.sales_qty, 0)
-                - COALESCE(split.sales_qty, 0)
-                - COALESCE(blanket.sales_qty, 0),
-                0
-              ) AS remaining_sales_qty,
-              CASE WHEN COALESCE(line.to_plt, 0) > 0 THEN GREATEST(LEAST(
-                FLOOR((GREATEST(
-                  COALESCE(line.quantity, 0)
-                  - COALESCE(line.netsuite_received_baseline_qty, line.netsuite_received_qty, 0)
-                  - COALESCE(sales.sales_qty, 0)
-                  - COALESCE(split.sales_qty, 0)
-                  - COALESCE(blanket.sales_qty, 0),
-                  0
-                ) / line.to_plt) + 0.000001),
-                CASE WHEN COALESCE(line.pallet_qty, 0) > 0
-                  THEN GREATEST(
-                    COALESCE(line.pallet_qty, 0)
-                    - COALESCE(sales.pallet_qty, 0)
-                    - COALESCE(split.pallet_qty, 0)
-                    - COALESCE(blanket.pallet_qty, 0),
-                    0
-                  )
-                  ELSE FLOOR((GREATEST(
-                    COALESCE(line.quantity, 0)
-                    - COALESCE(line.netsuite_received_baseline_qty, line.netsuite_received_qty, 0)
-                    - COALESCE(sales.sales_qty, 0)
-                    - COALESCE(split.sales_qty, 0)
-                    - COALESCE(blanket.sales_qty, 0),
-                    0
-                  ) / line.to_plt) + 0.000001)
-                END
-              ), 0) ELSE 0 END AS remaining_pallets
-         FROM purchase_orders po
-         JOIN purchase_order_lines line
-           ON line.purchase_order_id = po.netsuite_id
-          AND line.netsuite_active = true
-         LEFT JOIN sales_alloc sales ON sales.po_line_id = line.id
-         LEFT JOIN split_alloc split ON split.source_line_id = line.id
-         LEFT JOIN blanket_alloc blanket ON blanket.source_line_id = line.id
-        WHERE po.netsuite_active = true
-          AND line.item_id IS NOT NULL
-          AND COALESCE(line.to_plt, 0) > 0
-          AND COALESCE(line.item_weight, 0) > 0
-          AND (po.status_text ILIKE '%Pending Receipt%' OR po.status_text ILIKE '%Partially Received%')
-          AND NOT EXISTS (
-            SELECT 1
-              FROM dispatch_scm_po_splits child_split
-             WHERE child_split.split_po_id = po.netsuite_id
-          )
-          AND ($1::bigint IS NULL OR po.netsuite_id = $1)
-          AND ($2::boolean IS NULL OR po.is_blanket_po = $2)
-          AND ($3 = '' OR concat_ws(' ', po.tranid, po.vendor, po.dispatch_vendor_yard,
-                 po.source_location, line.item_id::text, line.item_name, line.sku, line.item_description) ILIKE '%' || $3 || '%')
-     )
-     SELECT *
-       FROM calculated
-      WHERE remaining_pallets > 0
-      ORDER BY trandate NULLS LAST, source_po_id, source_line_id
-      LIMIT $4 OFFSET $5`,
-    [selectedSourcePoId, isBlanket, cleanSearch, maxRows, rowOffset, BLANKET_PENDING_ALLOCATION_STATUSES]
-  );
-  return result.rows;
+  return listSmartScmBlanketPoolRows({ search, isBlanket, sourcePoId, limit, offset });
 }
 
 async function openSourcePurchaseOrderRows({ search = "", isBlanket = null, limit = 500, offset = 0 } = {}) {
@@ -562,6 +503,32 @@ function blanketProposalKey(source = {}, loadIndex = 0) {
   return `blanket:${blanketProposalSourceKey(source)}:load:${Number(loadIndex)}`;
 }
 
+export function smartScmBlanketDraftGroupsForPlanning({ states = [] } = {}) {
+  const groupsBySource = new Map();
+  for (const state of (Array.isArray(states) ? states : [])
+    .filter((candidate) => positive(candidate.blanketCoveragePallets) >= 1
+      && candidate.policy?.temporarily_excluded !== true)
+    .sort(demandSort)) {
+    for (const allocation of state.blanketCoverageAllocations || []) {
+      const source = allocation.source || {};
+      const pallets = positive(allocation.pallets);
+      if (pallets < 1) continue;
+      const line = smartScmProposalLineForState(state, pallets, {
+        blanketPool: true,
+        blanketSourcePoId: Number(source.source_po_id),
+        blanketSourcePoRef: source.source_po_ref,
+        blanketSourceLineId: Number(source.source_line_id),
+        blanketRemainingBeforePallets: positive(allocation.sourceRemainingBeforePallets)
+      });
+      const proposalSource = smartScmBlanketProposalSourceForState(source, state);
+      const key = blanketProposalSourceKey(proposalSource);
+      if (!groupsBySource.has(key)) groupsBySource.set(key, { source: proposalSource, lines: [] });
+      groupsBySource.get(key).lines.push(line);
+    }
+  }
+  return [...groupsBySource.values()];
+}
+
 export function smartScmBlanketProposalSourceMatchesPolicy(proposal = {}, policy = {}) {
   if (!smartScmBlanketPolicyHasVendorYardOverride(policy)) return true;
   const expectedId = integer(policy.vendor_yard_id);
@@ -679,7 +646,9 @@ async function insertBlanketProposal(runId, source, load, loadIndex, settings, l
     );
     const proposalLineId = Number(inserted.rows[0].id);
     let remaining = positive(line.proposedPallets);
+    const plannedSourceLineId = integer(line.reason?.blanketSourceLineId);
     const candidates = lineage.filter((entry) => Number(entry.item_id) === Number(line.itemId)
+      && (!plannedSourceLineId || Number(entry.source_line_id) === plannedSourceLineId)
       && positive(entry.remainingForLineage) > EPSILON);
     for (const entry of candidates) {
       if (remaining <= EPSILON) break;
@@ -710,10 +679,9 @@ export async function buildSmartScmBlanketPlan(operatorId = null) {
     // transaction-scoped advisory lock through the ready/failed transition
     // prevents two concurrent requests from exposing overlapping current plans.
     await query("SELECT pg_advisory_xact_lock(hashtext('smart-scm-blanket-plan-build'))");
-    const [planning, poolRows] = await Promise.all([
-      loadSmartScmPlanningDemandStates({ includeTemporarilyExcluded: false }),
-      blanketPoolLineRows({ isBlanket: true, limit: 20000 })
-    ]);
+    const planning = await loadSmartScmPlanningDemandStates({ includeTemporarilyExcluded: false });
+    const poolRows = planning.blanketPoolRows || [];
+    const coverageSnapshot = smartScmBlanketCoverageSnapshot(planning.states);
     const created = await query(
       `INSERT INTO scm_smart_planning_runs (
          status, trigger_source, forecast_run_id, settings_snapshot, created_by, plan_kind
@@ -723,33 +691,7 @@ export async function buildSmartScmBlanketPlan(operatorId = null) {
     );
     const nextRunId = Number(created.rows[0].id);
     try {
-    const mutablePool = poolRows.map((row) => ({ ...row, remainingForPlanning: Math.floor(positive(row.remaining_pallets)) }));
-    const lineDraftsBySource = new Map();
-    for (const state of planning.states
-      .filter((candidate) => positive(candidate.requiredPallets) >= 1 && candidate.policy.temporarily_excluded !== true)
-      .sort(demandSort)) {
-      let needed = Math.floor(positive(state.requiredPallets));
-      const candidates = mutablePool.filter((row) => Number(row.item_id) === Number(state.policy.item_id)
-        && Math.abs(positive(row.to_plt) - positive(state.toPlt)) <= EPSILON
-        && positive(row.remainingForPlanning) >= 1);
-      for (const source of candidates) {
-        if (needed < 1) break;
-        const pallets = Math.min(needed, Math.floor(positive(source.remainingForPlanning)));
-        const line = smartScmProposalLineForState(state, pallets, {
-          blanketPool: true,
-          blanketSourcePoId: Number(source.source_po_id),
-          blanketSourcePoRef: source.source_po_ref,
-          blanketSourceLineId: Number(source.source_line_id),
-          blanketRemainingBeforePallets: positive(source.remainingForPlanning)
-        });
-        const proposalSource = smartScmBlanketProposalSourceForState(source, state);
-        const key = blanketProposalSourceKey(proposalSource);
-        if (!lineDraftsBySource.has(key)) lineDraftsBySource.set(key, { source: proposalSource, lines: [] });
-        lineDraftsBySource.get(key).lines.push(line);
-        source.remainingForPlanning = round(positive(source.remainingForPlanning) - pallets);
-        needed -= pallets;
-      }
-    }
+    const blanketDraftGroups = smartScmBlanketDraftGroupsForPlanning({ states: planning.states });
 
     const proposalIds = [];
     await withTransaction(async () => {
@@ -773,7 +715,7 @@ export async function buildSmartScmBlanketPlan(operatorId = null) {
           WHERE plan_kind = 'blanket' AND id <> $1 AND status IN ('running', 'ready')`,
         [nextRunId]
       );
-      for (const { source, lines } of lineDraftsBySource.values()) {
+      for (const { source, lines } of blanketDraftGroups) {
         const routeRule = planning.routeRules.get(smartScmRouteRuleKey(sourceIdentity(source)));
         const loads = smartScmPackWholePalletLines(lines, positive(planning.settings.truck_capacity_lbs, 78000), {
           proposalType: "PO",
@@ -791,10 +733,11 @@ export async function buildSmartScmBlanketPlan(operatorId = null) {
         }
       }
       const totals = {
+        ...coverageSnapshot,
         proposals: proposalIds.length,
         poProposals: proposalIds.length,
         toProposals: 0,
-        sourcePurchaseOrders: new Set([...lineDraftsBySource.values()]
+        sourcePurchaseOrders: new Set(blanketDraftGroups
           .map(({ source }) => Number(source.source_po_id))).size,
         poolPallets: round(poolRows.reduce((sum, row) => sum + positive(row.remaining_pallets), 0))
       };
@@ -3163,19 +3106,21 @@ async function finalizeBlanketVendorWorkflow(releaseOrProposalId, values, operat
         current.salesQty = round(current.salesQty + entry.releasedSalesQty);
         splitLines.set(key, current);
       }
+      const palletLines = await blanketSplitPalletLines(confirmed, proposal.blanket_source_po_id);
       split = await createScmPurchaseOrderSplit({
         sourcePoRef: release.source_po_ref,
         newPoRef: splitRef,
         pickupPoint: proposal.source_name || proposal.plant || "",
         destinationLocationId: confirmed[0].allocation.destination_location_id,
-        lines: [...splitLines.values()],
+        lines: [...splitLines.values(), ...palletLines],
         createdBy: operatorText(operatorId),
         blanketReleaseId: Number(release.id),
         extendSplitId: release.split_id ? Number(release.split_id) : null,
         details: {
           source: "smart-scm-blanket",
           blanketReleaseId: Number(release.id),
-          blanketProposalId: Number(release.proposal_id)
+          blanketProposalId: Number(release.proposal_id),
+          palletLineMode: "derived-from-confirmed-material"
         }
       });
     }

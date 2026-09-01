@@ -862,6 +862,38 @@ export async function fetchSalesOrderReturnLinesFromNetSuite(salesOrderId) {
   return items;
 }
 
+/**
+ * Read the authoritative source item sublist used by NetSuite transform
+ * requests. This deliberately exposes only the three source record types used
+ * by Operator IR/IF posting and cannot be used as a generic REST transport.
+ *
+ * @param {unknown} sourceOrderKind
+ * @param {unknown} sourceOrderId
+ * @param {{rest?: Function}} [dependencies]
+ */
+export async function fetchOperatorNetSuiteSourceItemLinesFromNetSuite(
+  sourceOrderKind,
+  sourceOrderId,
+  { rest = netsuiteRest } = {}
+) {
+  const id = Number(sourceOrderId);
+  const kind = String(sourceOrderKind || "").trim().toUpperCase();
+  const recordType = {
+    SO: "salesOrder",
+    PO: "purchaseOrder",
+    TO: "transferOrder"
+  }[kind];
+  if (!recordType || !Number.isSafeInteger(id) || id <= 0) {
+    throw new Error("A valid SO, PO, or TO source and positive NetSuite ID are required.");
+  }
+  const result = await rest(`/record/v1/${recordType}/${id}?expandSubResources=true`, { method: "GET" });
+  const items = result.data?.item?.items;
+  if (!Array.isArray(items)) {
+    throw new Error(`NetSuite ${kind} source item subresource was not expanded.`);
+  }
+  return items;
+}
+
 export async function updateTransferOrderStatusInNetSuite(orderId, { intercompany = false, statusId = "B" } = {}) {
   const id = Number(orderId);
   if (!Number.isInteger(id) || id <= 0) throw new Error("A valid numeric NetSuite transfer order ID is required.");
@@ -1175,7 +1207,7 @@ export async function fetchItemFulfillmentFromNetSuite(itemFulfillmentId) {
   const id = Number(itemFulfillmentId);
   if (!Number.isInteger(id) || id <= 0) return null;
   try {
-    const result = await netsuiteRest(`/record/v1/itemFulfillment/${id}`, { method: "GET" });
+    const result = await netsuiteRest(`/record/v1/itemFulfillment/${id}?expandSubResources=true`, { method: "GET" });
     return result.data || null;
   } catch (error) {
     if (String(error.message).includes("NetSuite REST failed: 404")) return null;
@@ -1187,7 +1219,7 @@ export async function fetchItemReceiptFromNetSuite(itemReceiptId) {
   const id = Number(itemReceiptId);
   if (!Number.isInteger(id) || id <= 0) return null;
   try {
-    const result = await netsuiteRest(`/record/v1/itemReceipt/${id}`, { method: "GET" });
+    const result = await netsuiteRest(`/record/v1/itemReceipt/${id}?expandSubResources=true`, { method: "GET" });
     return result.data || null;
   } catch (error) {
     if (String(error.message).includes("NetSuite REST failed: 404")) return null;
@@ -1201,34 +1233,79 @@ export async function fetchItemReceiptFromNetSuite(itemReceiptId) {
  *
  * @param {unknown} externalId
  * @param {unknown} transactionType
+ * @param {unknown} sourceNetSuiteId
+ * @param {{ queryAll?: Function, fetchItemFulfillment?: Function, fetchItemReceipt?: Function }} [dependencies]
  */
-export async function findOperatorNetSuitePostingTransactionByExternalId(externalId, transactionType) {
+export async function findOperatorNetSuitePostingTransactionByExternalId(
+  externalId,
+  transactionType,
+  sourceNetSuiteId,
+  dependencies = {}
+) {
   const normalizedExternalId = String(externalId || "").trim();
   const normalizedType = String(transactionType || "").trim().toUpperCase();
+  const sourceId = Number(sourceNetSuiteId);
   if (!/^[A-Za-z0-9_-]{1,180}$/u.test(normalizedExternalId) || !["IF", "IR"].includes(normalizedType)) {
     throw new Error("A safe Operator NetSuite external ID and IF/IR type are required.");
   }
+  if (!Number.isSafeInteger(sourceId) || sourceId <= 0) {
+    throw new Error("A valid Operator NetSuite source transaction ID is required for IF/IR recovery.");
+  }
   const netSuiteType = normalizedType === "IF" ? "ItemShip" : "ItemRcpt";
-  const result = await suiteql(`
-    SELECT t.id,
-           t.tranid,
-           t.type,
-           t.externalid,
-           t.createdfrom
-      FROM transaction t
-     WHERE t.type = '${netSuiteType}'
-       AND t.externalid = '${normalizedExternalId}'
-     ORDER BY t.id DESC
-     FETCH FIRST 2 ROWS ONLY
+  const queryAll = typeof dependencies.queryAll === "function" ? dependencies.queryAll : suiteqlAll;
+  const fetchFulfillment = typeof dependencies.fetchItemFulfillment === "function"
+    ? dependencies.fetchItemFulfillment
+    : fetchItemFulfillmentFromNetSuite;
+  const fetchReceipt = typeof dependencies.fetchItemReceipt === "function"
+    ? dependencies.fetchItemReceipt
+    : fetchItemReceiptFromNetSuite;
+  // NetSuite can return UNEXPECTED_ERROR for transaction.externalid and
+  // transaction.createdfrom on ItemShip/ItemRcpt SuiteQL rows. Traverse the
+  // authoritative transaction link instead, then read each candidate record
+  // through REST so recovery still verifies the exact external identity.
+  const linkedRows = await queryAll(`
+    SELECT next_transaction.id,
+           next_transaction.tranid,
+           next_transaction.type
+      FROM NextTransactionLineLink transaction_link
+      JOIN transaction next_transaction
+        ON next_transaction.id = transaction_link.nextdoc
+     WHERE transaction_link.previousdoc = ${sourceId}
+       AND next_transaction.type = '${netSuiteType}'
+     ORDER BY next_transaction.id DESC
   `);
-  const rows = result.items || [];
-  if (rows.length > 1) {
+  const candidateIds = [...new Set(linkedRows
+    .map((row) => Number(row.id))
+    .filter((id) => Number.isSafeInteger(id) && id > 0))];
+  const matches = [];
+  for (const id of candidateIds) {
+    const record = normalizedType === "IF"
+      ? await fetchFulfillment(id)
+      : await fetchReceipt(id);
+    if (!record) {
+      throw Object.assign(new Error("A linked NetSuite posting transaction could not be read for exact recovery."), {
+        code: "OPERATOR_NETSUITE_POSTING_RESULT_UNVERIFIED",
+        ambiguous: true
+      });
+    }
+    const recordExternalId = String(record.externalId ?? record.externalid ?? "").trim();
+    if (recordExternalId !== normalizedExternalId) continue;
+    matches.push({
+      id,
+      tranid: record.tranId ?? record.tranid ?? linkedRows.find((row) => Number(row.id) === id)?.tranid,
+      type: netSuiteType,
+      externalid: recordExternalId,
+      createdfrom: sourceId,
+      record
+    });
+  }
+  if (matches.length > 1) {
     throw Object.assign(new Error("More than one NetSuite transaction uses the Operator external ID."), {
       code: "OPERATOR_NETSUITE_POSTING_REMOTE_MISMATCH",
       ambiguous: true
     });
   }
-  return rows[0] || null;
+  return matches[0] || null;
 }
 
 export async function suiteql(q, params = [], options = {}) {
@@ -3262,6 +3339,7 @@ export async function fetchTransferOrderByIdFromNetSuite(orderId) {
 export async function findTransferOrdersByDependencyMarkerFromNetSuite({
   batchId,
   proposalId = null,
+  salesOrderRef = "",
   sourceLocationId,
   destinationLocationId
 } = {}) {
@@ -3277,9 +3355,13 @@ export async function findTransferOrdersByDependencyMarkerFromNetSuite({
     ? `MBBS DEPENDENCY BATCH ${batch} PROPOSAL ${proposal}`
     : "";
   const legacyMarker = `MBBS DEPENDENCY BATCH ${batch}`;
-  const markerFilter = exactMarker
-    ? `(UPPER(t.memo) LIKE '%${exactMarker}%' OR UPPER(t.memo) LIKE '%${legacyMarker}%')`
-    : `UPPER(t.memo) LIKE '%${legacyMarker}%'`;
+  const orderRef = String(salesOrderRef || "").trim().toUpperCase().replaceAll("'", "''");
+  const memoFilters = [
+    ...(orderRef ? [`UPPER(TRIM(NVL(t.memo, ''))) = 'FOR ${orderRef}'`] : []),
+    ...(exactMarker ? [`UPPER(t.memo) LIKE '%${exactMarker}%'`] : []),
+    `UPPER(t.memo) LIKE '%${legacyMarker}%'`
+  ];
+  const markerFilter = `(${memoFilters.join(" OR ")})`;
   const result = await suiteql(`
     SELECT DISTINCT
       t.id,

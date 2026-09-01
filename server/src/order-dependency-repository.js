@@ -5,6 +5,11 @@ import { writeDispatchAudit } from "./dispatch-audit-repository.js";
 import { resolveDispatchSalesTarget } from "./dispatch-order-target-repository.js";
 import { dispatchLoadAssignment } from "./dispatch-load-assignment.js";
 import {
+  dependencyHasEffectiveMaterial,
+  dependencyQuantityConversionDisplay as conversionDisplay,
+  resolveDependencyLineContributions
+} from "./order-dependency-quantity.js";
+import {
   dispatchLocationsShareYard,
   uniqueDispatchLocations
 } from "./dispatch-location.js";
@@ -44,6 +49,7 @@ export {
   transferDependencyApprovalStatusAfterPrintBlock,
   transferDependencyCreationOutcome
 };
+export { resolveDependencyLineContributions } from "./order-dependency-quantity.js";
 
 function number(value) {
   const parsed = Number(String(value ?? 0).replaceAll(",", ""));
@@ -204,38 +210,6 @@ export function calculateTransferProposalPallets(lines = []) {
   };
 }
 
-function conversionDisplay(quantity, line = {}) {
-  let remaining = number(quantity);
-  const result = { palletQty: 0, layerQty: 0, sectionQty: 0, pieceQty: 0 };
-  const conversions = [
-    ["palletQty", number(line.toPlt ?? line.to_plt)],
-    ["layerQty", number(line.toLyr ?? line.to_lyr)],
-    ["sectionQty", number(line.toSec ?? line.to_sec)],
-    ["pieceQty", number(line.toPcs ?? line.to_pcs)]
-  ];
-  let hasConversion = false;
-  let smallestConversion = null;
-  for (const [field, conversion] of conversions) {
-    if (!conversion || remaining <= EPSILON) continue;
-    hasConversion = true;
-    if (!smallestConversion || conversion < smallestConversion.conversion) {
-      smallestConversion = { field, conversion };
-    }
-    const units = Math.floor((remaining / conversion) + EPSILON);
-    if (units > 0) {
-      result[field] = units;
-      remaining = Math.max(0, Number((remaining - (units * conversion)).toFixed(6)));
-    }
-  }
-  if (hasConversion && remaining > EPSILON && smallestConversion) {
-    result[smallestConversion.field] = Number((
-      result[smallestConversion.field] + (remaining / smallestConversion.conversion)
-    ).toFixed(6));
-  }
-  if (!hasConversion) result.pieceQty = number(quantity);
-  return result;
-}
-
 export function transferProposalConversionSelection(quantity, line = {}) {
   const salesQty = number(quantity);
   const conversions = {
@@ -373,7 +347,13 @@ function serializeLine(row = {}) {
     locallyReceivedQuantity: number(row.locally_received_quantity),
     lineRole: row.line_role || "sales_allocation",
     targetLineKey: row.dispatch_target_line_key || "",
-    sourceOrderRef: row.source_order_ref || ""
+    sourceOrderRef: row.source_order_ref || "",
+    transferOutboundQuantity: nullableNumber(row.transfer_outbound_quantity),
+    transferReceivingQuantity: nullableNumber(row.transfer_receiving_quantity),
+    toPlt: number(row.resolved_to_plt),
+    toLyr: number(row.resolved_to_lyr),
+    toSec: number(row.resolved_to_sec),
+    toPcs: number(row.resolved_to_pcs)
   };
 }
 
@@ -392,11 +372,11 @@ function aggregateDependencyManifestItems(lines = []) {
       sectionQty: 0,
       pieceQty: 0
     };
-    item.quantity += number(line.allocatedQuantity);
-    item.palletQty += number(line.palletQty);
-    item.layerQty += number(line.layerQty);
-    item.sectionQty += number(line.sectionQty);
-    item.pieceQty += number(line.pieceQty);
+    item.quantity += number(line.effectiveAllocatedQuantity ?? line.allocatedQuantity);
+    item.palletQty += number(line.effectivePalletQty ?? line.palletQty);
+    item.layerQty += number(line.effectiveLayerQty ?? line.layerQty);
+    item.sectionQty += number(line.effectiveSectionQty ?? line.sectionQty);
+    item.pieceQty += number(line.effectivePieceQty ?? line.pieceQty);
     items.set(key, item);
   }
   return [...items.values()];
@@ -404,6 +384,9 @@ function aggregateDependencyManifestItems(lines = []) {
 
 function serializeDependency(row = {}, lines = []) {
   const dispatchTargetRef = row.dispatch_target_ref || row.sales_order_ref;
+  const transitCoRef = text(row.transit_co_ref);
+  const transitDestination = text(row.transit_to_location);
+  const hasTransitRedirect = Boolean(transitCoRef && transitDestination);
   return {
     id: row.id,
     salesOrderId: row.sales_order_id,
@@ -417,8 +400,13 @@ function serializeDependency(row = {}, lines = []) {
     mode: row.dependency_mode,
     sameLoadRequired: row.same_load_required,
     status: row.status,
-    sourceLocationId: row.source_location_id,
-    sourceLocation: row.source_location,
+    sourceLocationId: hasTransitRedirect
+      ? (row.transit_to_location_id ?? row.source_location_id)
+      : row.source_location_id,
+    sourceLocation: hasTransitRedirect ? transitDestination : row.source_location,
+    dependencySourceLocationId: row.source_location_id,
+    dependencySourceLocation: row.source_location,
+    transitCoRef: hasTransitRedirect ? transitCoRef : "",
     accountingDestinationLocationId: row.accounting_destination_location_id,
     accountingDestinationLocation: row.accounting_destination_location,
     plannedPlanId: row.planned_plan_id,
@@ -456,6 +444,11 @@ async function loadDependencies({ salesOrderRef = "", transferOrderRef = "", inc
   if (!includeCancelled) clauses.push("d.status <> 'cancelled'");
   const rows = await query(
     `SELECT d.*,
+            transit_co.co_ref AS transit_co_ref,
+            transit_co.from_location_id AS transit_from_location_id,
+            transit_co.from_location AS transit_from_location,
+            transit_co.to_location_id AS transit_to_location_id,
+            transit_co.to_location AS transit_to_location,
             t.receiving_status AS transfer_receiving_status,
             t.status AS transfer_status,
             t.status_text AS transfer_status_text,
@@ -469,6 +462,16 @@ async function loadDependencies({ salesOrderRef = "", transferOrderRef = "", inc
             state.destination_remaining_qty AS transfer_destination_remaining_qty
        FROM order_dependencies d
        LEFT JOIN transfer_orders t ON t.netsuite_id = d.transfer_order_id
+       LEFT JOIN LATERAL (
+         SELECT co.co_ref, co.from_location_id, co.from_location,
+                co.to_location_id, co.to_location
+           FROM local_co_orders co
+          WHERE co.source_order_ref = d.transfer_order_ref
+            AND co.status <> 'cancelled'
+            AND NULLIF(BTRIM(co.to_location), '') IS NOT NULL
+          ORDER BY co.updated_at DESC, co.id DESC
+          LIMIT 1
+       ) transit_co ON true
        LEFT JOIN scm_reconciliation_order_state state
          ON state.order_kind = 'TO'
         AND state.source_order_netsuite_id = d.transfer_order_id
@@ -480,11 +483,26 @@ async function loadDependencies({ salesOrderRef = "", transferOrderRef = "", inc
   const ids = rows.rows.map((row) => row.id);
   const lineRows = await query(
     `SELECT dl.*, COALESCE(sl.item_weight, i.item_weight, 0) AS item_weight,
-            source_sales.tranid AS source_order_ref
+            source_sales.tranid AS source_order_ref,
+            transfer_quantity.outbound_quantity AS transfer_outbound_quantity,
+            transfer_quantity.receiving_quantity AS transfer_receiving_quantity,
+            COALESCE(sl.to_plt, i.to_plt, 0) AS resolved_to_plt,
+            COALESCE(sl.to_lyr, i.to_lyr, 0) AS resolved_to_lyr,
+            COALESCE(sl.to_sec, i.to_sec, 0) AS resolved_to_sec,
+            COALESCE(sl.to_pcs, i.to_pcs, 0) AS resolved_to_pcs
        FROM order_dependency_lines dl
+       JOIN order_dependencies dependency ON dependency.id = dl.dependency_id
        LEFT JOIN sales_order_lines sl ON sl.id = dl.sales_line_id
        LEFT JOIN sales_orders source_sales ON source_sales.netsuite_id = sl.sales_order_id
        LEFT JOIN inventory_items i ON i.item_id = dl.item_id
+       LEFT JOIN LATERAL (
+         SELECT SUM(line.quantity) FILTER (WHERE line.line_stage = 'outbound') AS outbound_quantity,
+                SUM(line.quantity) FILTER (WHERE line.line_stage = 'receiving') AS receiving_quantity
+           FROM transfer_order_lines line
+          WHERE line.transfer_order_id = dependency.transfer_order_id
+            AND line.item_id = dl.item_id
+            AND COALESCE(line.netsuite_active, true)
+       ) transfer_quantity ON true
       WHERE dl.dependency_id = ANY($1::bigint[])
       ORDER BY dl.dependency_id, dl.item_name, dl.id`,
     [ids]
@@ -494,7 +512,10 @@ async function loadDependencies({ salesOrderRef = "", transferOrderRef = "", inc
     if (!byDependency.has(String(line.dependency_id))) byDependency.set(String(line.dependency_id), []);
     byDependency.get(String(line.dependency_id)).push(serializeLine(line));
   }
-  return rows.rows.map((row) => serializeDependency(row, byDependency.get(String(row.id)) || []));
+  return rows.rows.map((row) => serializeDependency(
+    row,
+    resolveDependencyLineContributions(byDependency.get(String(row.id)) || [])
+  ));
 }
 
 export async function listOrderDependencies(filters = {}) {
@@ -4508,7 +4529,8 @@ export async function enrichDispatchOrdersWithDependencies(orders = []) {
       const direct = salesDependencies.filter((dependency) => dependency.mode === "direct_to_customer" && dependency.status !== "cancelled");
       const replenishment = salesDependencies.filter((dependency) => dependency.mode === "yard_replenishment" && dependency.status !== "cancelled");
       const waitingReplenishment = replenishment.filter((dependency) => !dependency.transferReceived);
-      const directPickupManifest = direct.map((dependency) => ({
+      const routedDirect = direct.filter(dependencyHasEffectiveMaterial);
+      const directPickupManifest = routedDirect.map((dependency) => ({
         dependencyId: dependency.id,
         salesOrderRef: dependency.salesOrderRef,
         transferOrderRef: dependency.transferOrderRef,
@@ -4523,7 +4545,7 @@ export async function enrichDispatchOrdersWithDependencies(orders = []) {
           ...directPickupManifest.map((entry) => entry.location).filter(Boolean)
         ]),
         orderDependencies: salesDependencies,
-        dependencyDirectPickup: direct.length > 0,
+        dependencyDirectPickup: routedDirect.length > 0,
         dependencyWaitingForTransfer: waitingReplenishment.length > 0,
         dependencyAttention: salesDependencies.some((dependency) =>
           dependency.status === "attention" && !dependency.transferReceived
@@ -4533,7 +4555,7 @@ export async function enrichDispatchOrdersWithDependencies(orders = []) {
         directPickupManifest,
         dependencyLabels: [...new Set([
           ...salesDependencies.map((dependency) => `Requires ${dependency.transferOrderRef}`),
-          ...(direct.length ? ["Direct pickup"] : []),
+          ...(routedDirect.length ? ["Direct pickup"] : []),
           ...(waitingReplenishment.length ? ["Waiting for transfer"] : []),
           ...(uncoveredQuantity > EPSILON ? [`Uncovered shortage ${uncoveredQuantity}`] : []),
           ...(salesDependencies.some((dependency) => dependency.reconciliationStatus === "required") ? ["NetSuite reconciliation required"] : [])
@@ -4817,6 +4839,7 @@ export async function validateDispatchPlanDependencies(plan = {}) {
     }
     if (!salesAssignments.length) continue;
     if (dependency.mode === "direct_to_customer") {
+      if (!dependencyHasEffectiveMaterial(dependency)) continue;
       const assignedLoad = (plan.trucks || []).flatMap((truck) => truck.loads || [])
         .find((load) => String(load.id || "") === String(salesAssignment.loadId || ""));
       const dropIndex = (assignedLoad?.stops || []).findIndex((stop) => {
@@ -5433,7 +5456,9 @@ export async function syncOrderDependenciesForTransferOrder(transferOrderId) {
     for (const dependency of dependencies.rows) {
       const lines = await query(
         `SELECT dl.*, out_line.quantity AS outbound_quantity,
+                out_line.id AS outbound_line_id,
                 in_line.quantity AS receiving_quantity,
+                in_line.id AS receiving_line_id,
                 in_line.netsuite_received_qty
            FROM order_dependency_lines dl
            LEFT JOIN transfer_order_lines out_line ON out_line.id = dl.transfer_outbound_line_id
@@ -5494,25 +5519,30 @@ export async function syncOrderDependenciesForTransferOrder(transferOrderId) {
         continue;
       }
       const unavailable = dependency.transfer_active === false || Boolean(terminalStatus);
-      const reduced = lines.rows
+      const missingMaterialLine = lines.rows
         .filter((line) => line.line_role !== "pallet")
+        .some((line) => !line.outbound_line_id && !line.receiving_line_id);
+      const quantityLimited = lines.rows
+        .filter((line) => line.line_role === "sales_allocation")
         .some((line) => {
           const available = line.outbound_quantity ?? line.receiving_quantity;
-          return available === null || available === undefined || number(available) + EPSILON < number(line.allocated_quantity);
+          return available !== null
+            && available !== undefined
+            && number(available) + EPSILON < number(line.allocated_quantity);
         });
       const reconciled = lines.rows.length > 0 && lines.rows.every((line) =>
         number(line.netsuite_received_qty) + EPSILON >= number(line.allocated_quantity)
       );
       const beforeDelivery = !["delivered", "received_local"].includes(dependency.status);
-      const attention = beforeDelivery && (unavailable || reduced);
+      const attention = beforeDelivery && (unavailable || missingMaterialLine);
       const replenishmentComplete = dependency.dependency_mode === "yard_replenishment"
         && (reconciled || transferOrderReceiptEvidenceComplete(dependency));
       const attentionReason = terminalStatus
         ? `${dependency.transfer_order_ref} is ${terminalStatus} in NetSuite and has already started or has execution progress that requires review.`
         : dependency.transfer_active === false
           ? `${dependency.transfer_order_ref} is no longer active in NetSuite.`
-        : reduced
-          ? `${dependency.transfer_order_ref} quantity is below its linked Sales Order allocation.`
+        : missingMaterialLine
+          ? `${dependency.transfer_order_ref} no longer contains a linked material line.`
           : null;
       const resumedStatus = lines.rows.some((line) => number(line.loaded_quantity) > EPSILON) ? "in_transit" : "active";
       await query(
@@ -5537,7 +5567,13 @@ export async function syncOrderDependenciesForTransferOrder(transferOrderId) {
           WHERE id = $1`,
         [dependency.id, attention, attentionReason, reconciled, resumedStatus, replenishmentComplete]
       );
-      results.push({ dependencyId: dependency.id, attention, attentionReason, reconciled });
+      results.push({
+        dependencyId: dependency.id,
+        attention,
+        attentionReason,
+        reconciled,
+        quantityLimited
+      });
     }
     return results;
   });

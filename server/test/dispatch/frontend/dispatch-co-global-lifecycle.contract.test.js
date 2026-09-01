@@ -37,3 +37,17 @@ test("explicit CO cancellation confirms first and clears local state only after 
     "server cancellation must succeed before the browser removes the CO relationship"
   );
 });
+
+test("CO creation persists a bounded preview before mutating the browser plan", () => {
+  const submitBranch = sourceBetween(
+    'if (form.dataset.form === "transit-co")',
+    'if (form.dataset.form === "edit-order-details")'
+  );
+  const preview = submitBranch.indexOf("previewTransitCoForOrder");
+  const persisted = submitBranch.indexOf("await saveTransitCoToServer");
+  const applied = submitBranch.indexOf("upsertTransitCoForOrder", persisted);
+  assert.ok(preview >= 0 && persisted > preview && applied > persisted,
+    "CO creation must persist its non-mutating preview before applying it to the live plan");
+  assert.doesNotMatch(submitBranch, /structuredClone/u,
+    "CO failure handling must not copy the full Dispatch order graph");
+});

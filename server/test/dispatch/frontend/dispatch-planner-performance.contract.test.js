@@ -81,12 +81,17 @@ test("DP-11: CO updates are targeted and do not fetch, merge, or render the whol
 
 test("DP-12: ordinary order events patch only the pool and preserve its scroll position", () => {
   const queuedRefresh = functionBody("queueDispatchOrderPoolRefresh");
-  assert.match(queuedRefresh, /loadDispatchOrders\(/u);
-  assert.match(queuedRefresh, /renderDispatchOrderPoolPatch\(/u);
-  assert.match(queuedRefresh, /renderDispatchNoticePatch\(/u);
-  assert.doesNotMatch(queuedRefresh, /restoreServerPlan|loadDriverJobStatuses|refreshPlannedAssignments/u);
-  assert.doesNotMatch(queuedRefresh, /renderDispatchPlannerPatch|renderGoogleMapPreview/u);
-  assert.doesNotMatch(queuedRefresh, /\brender\(\{\s*save:/u);
+  const refreshWorker = functionBody("runQueuedDispatchOrderPoolRefresh");
+  assert.match(queuedRefresh, /orderPoolRefreshInFlight/u);
+  assert.match(queuedRefresh, /orderPoolRefreshTrailing\s*=\s*true/u);
+  assert.match(refreshWorker, /loadDispatchOrders\(/u);
+  assert.match(refreshWorker, /renderDispatchOrderPoolPatch\(/u);
+  assert.match(refreshWorker, /renderDispatchNoticePatch\(/u);
+  assert.match(refreshWorker, /orderPoolRefreshInFlight\s*=\s*false[\s\S]*orderPoolRefreshTrailing/u,
+    "Events received during a refresh must collapse into one trailing refresh.");
+  assert.doesNotMatch(refreshWorker, /restoreServerPlan|loadDriverJobStatuses|refreshPlannedAssignments/u);
+  assert.doesNotMatch(refreshWorker, /renderDispatchPlannerPatch|renderGoogleMapPreview/u);
+  assert.doesNotMatch(refreshWorker, /\brender\(\{\s*save:/u);
 
   const events = functionBody("connectEvents");
   assert.match(events, /dispatch\.orders\.updated[\s\S]*queueDispatchOrderPoolRefresh/u);
@@ -205,12 +210,17 @@ test("DP-05/DP-16 frontend: normal autosave uses guarded semantic deltas with a 
 test("DPO-10 frontend: indexed search is bounded, cancellable, paged, and hydrated before mutation", () => {
   const search = functionBody("loadDispatchOrderSearch");
   assert.match(search, /plannerOrderPoolMode\s*===\s*["']on["']/u);
+  assert.match(search, /plannerOrderPoolMode\s*===\s*["']shadow["']/u);
+  assert.match(search, /versionedPool/u);
   assert.match(search, /AbortController/u);
   assert.match(search, /\/api\/dispatch\/v2\/order-pool/u);
   const schedule = functionBody("scheduleDispatchOrderSearch");
   assert.match(schedule, /225/u);
   const load = functionBody("loadDispatchOrders");
-  assert.match(load, /limit:\s*["']50["']/u);
+  assert.match(load, /plannerOrderPoolMode\s*===\s*["']shadow["']/u,
+    "Shadow mode must exercise the versioned endpoint while the server still returns the legacy result.");
+  assert.match(load, /versionedPool/u);
+  assert.match(load, /limit:\s*["']200["']/u);
   assert.match(load, /nextCursor|cursor/u);
   const hydrate = functionBody("hydrateDispatchOrder");
   assert.match(hydrate, /dispatchOrderHydrationPromises/u);
@@ -314,6 +324,24 @@ test("DP-16 startup: the compact plan is on the critical path but the full order
   const criticalWait = /await\s+Promise\.all\(\[([\s\S]*?)\]\)/u.exec(init)?.[1] || "";
   assert.doesNotMatch(criticalWait, /loadDispatchOrders|loadPlanHistory/u);
   assert.match(init, /renderDispatchOrderPoolPatch\(|renderDispatchPlannerPatch\(/u);
+});
+
+test("date-plan switching reuses the date-independent order pool after its first successful load", () => {
+  assert.match(dispatchSource, /let\s+dispatchOrderPoolLoaded\s*=\s*false/u);
+  const refresh = functionBody("loadDispatchOrderPoolForPlanSwitch");
+  assert.match(refresh, /dispatchOrderPoolLoaded/u);
+  assert.match(refresh, /isDispatchHistoryEditMode\(\)/u);
+  assert.match(refresh, /return\s+loadDispatchOrders\(\)/u);
+
+  const handlerStart = dispatchSource.indexOf('if (event.target?.id === "planDateInput")');
+  assert.notEqual(handlerStart, -1, "Expected the date-plan switch handler.");
+  const handler = dispatchSource.slice(handlerStart, handlerStart + 1_800);
+  assert.match(handler, /loadDispatchOrderPoolForPlanSwitch\(\)/u);
+  assert.doesNotMatch(
+    handler,
+    /Promise\.all\(\[loadDispatchOrders\(\),\s*loadMbtBinFrontLegs\(\)\]\)/u,
+    "Switching dates must not reload a global pool that is already in memory."
+  );
 });
 
 test("history edit mode scopes reconciliation-complete feeds to a leased past date", () => {
@@ -591,18 +619,24 @@ test("DP-11 backend: a targeted refresh does not hydrate every historical snapsh
   assert.notEqual(snapshotStart, -1);
   const snapshotLoader = serverSource.slice(snapshotStart, snapshotStart + 3_500);
   assert.match(snapshotLoader, /search\s*=\s*["']{2}/u);
+  assert.match(snapshotLoader, /exactOrderRefs\s*=\s*\[\]/u);
   assert.match(snapshotLoader, /s\.orders::text\s+ILIKE/u);
+  assert.match(snapshotLoader, /dispatch_plan_order_assignments/u);
 
-  const feedStart = serverSource.indexOf("async function listDispatchOrdersForResponse(");
+  const feedStart = serverSource.indexOf("async function loadDispatchOrdersForResponse(");
   assert.notEqual(feedStart, -1);
   const feed = serverSource.slice(feedStart, feedStart + 2_500);
-  assert.match(feed, /listDispatchSnapshotDerivedOrders\(\{\s*type,\s*search:\s*searchTerm\s*\}\)/u);
+  assert.match(
+    feed,
+    /listDispatchSnapshotDerivedOrders\(\{\s*type,\s*search:\s*searchTerm,\s*exactOrderRefs:\s*normalizedExactOrderRefs\s*\}\)/u
+  );
+  assert.match(serverSource, /dispatchOrderResponseSingleFlight[\s\S]*worker:\s*loadDispatchOrdersForResponse/u);
 });
 
 test("DP-29 backend: snapshot-derived groups reconcile both cancelled and active global COs before entering the order feed", () => {
   const snapshotStart = serverSource.indexOf("async function listDispatchSnapshotDerivedOrders(");
   assert.notEqual(snapshotStart, -1);
-  const snapshotLoader = serverSource.slice(snapshotStart, snapshotStart + 5_000);
+  const snapshotLoader = serverSource.slice(snapshotStart, snapshotStart + 12_000);
   assert.match(snapshotLoader, /SELECT\s+co_ref,\s*source_order_ref,[\s\S]*?status[\s\S]*?FROM\s+local_co_orders/u);
   assert.match(snapshotLoader, /String\(row\.status[\s\S]*?===\s*["']cancelled["']/u);
   assert.match(
@@ -616,5 +650,29 @@ test("DP-29 backend: snapshot-derived groups reconcile both cancelled and active
   assert.match(
     serverSource,
     /import\s*\{[^}]*applyActiveTransitCoMetadata[^}]*clearCancelledTransitCoMetadata[^}]*\}\s*from\s*["']\.\/dispatch-planner-performance\.js["']/u
+  );
+});
+
+test("cached order pools refresh global assignment ownership before edit, plan reuse, and jump", () => {
+  const enterEdit = functionBody("enterDispatchEditMode");
+  const loadPlan = functionBody("loadPlanForDate");
+  const restorePlan = functionBody("restoreServerPlan");
+  const jump = functionBody("jumpToPlannedOrder");
+  const events = functionBody("connectEvents");
+
+  assert.match(enterEdit, /await\s+refreshPlannedAssignments\(\)/u,
+    "Entering Edit Mode must clear assignment flags left by an earlier plan revision.");
+  assert.match(loadPlan, /await\s+refreshPlannedAssignments\(\)/u,
+    "A date switch must not reuse stale cross-date assignment flags from the cached pool.");
+  assert.match(restorePlan, /await\s+refreshPlannedAssignments\(\)/u,
+    "A remote plan refresh must update assignment flags before merging the saved snapshot.");
+  assert.match(jump, /await\s+refreshPlannedAssignments\(\)/u,
+    "Jump-to-plan must revalidate a possibly stale card before trusting its date.");
+  assert.match(jump, /is no longer planned\. The order pool has been refreshed\./u,
+    "A concurrently unplanned order must not report a missing load as though it were still planned.");
+  assert.match(
+    events,
+    /payload\.planDate\s*&&\s*payload\.planDate\s*!==\s*currentPlanDate[\s\S]*refreshPlannedAssignments\(\)/u,
+    "A plan change on another date must still refresh global assignment ownership."
   );
 });

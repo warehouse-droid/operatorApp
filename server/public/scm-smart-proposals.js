@@ -448,6 +448,11 @@ function smartProposalDecisionEvidence(line) {
     ["Source transfer limit", reason.sourceMaximumTransferablePallets, " PLT", 2]
   ].filter(([, value]) => value !== null && value !== undefined && value !== "" && Number.isFinite(Number(value)));
   const labels = evidence.map(([label, value, suffix, places]) => `<span>${smartEscape(label)}: ${smartNumber(value, places)}${suffix}</span>`);
+  const blanketCoveragePallets = Number(reason.blanketCoveragePallets);
+  const residualRequiredPallets = Number(reason.residualRequiredPallets);
+  if (Number.isFinite(blanketCoveragePallets) && blanketCoveragePallets > 0) {
+    labels.unshift(`<span>Blanket coverage: ${smartNumber(blanketCoveragePallets, 2)} PLT · PO/TO residual: ${smartNumber(Number.isFinite(residualRequiredPallets) ? residualRequiredPallets : 0, 2)} PLT</span>`);
+  }
   if (destinationPolicyInvalid) labels.unshift("<span>Destination changed · rebuild plan for yard policy evidence</span>");
   if (reason.lowerStockPolicyEnabled && !destinationPolicyInvalid) {
     const standardSafety = smartReasonNumber(reason, "standardSafetyStockPallets");
@@ -728,10 +733,13 @@ smartPlans = function smartPlansV2() {
   const destinations = [...new Set(all.flatMap((proposal) => smartProposalStops(proposal).map((stop) => stop.name)).filter(Boolean))].sort((a, b) => a.localeCompare(b, undefined, { numeric: true }));
   const selectedCount = smartState.selectedProposalIds.size;
   const exclusionCount = typeof smartPlanningExclusionCount === "function" ? smartPlanningExclusionCount() : 0;
+  const exclusionLabel = typeof smartPlanningControlLabel === "function"
+    ? smartPlanningControlLabel()
+    : `Coverage & pauses (${smartNumber(exclusionCount, 0)})`;
   const exclusionPanel = typeof smartPlanningExclusionPanel === "function" ? smartPlanningExclusionPanel() : "";
   return `<section class="smart-section smart-plan-section">
     <div class="smart-plan-sticky">
-    <div class="smart-section-head"><div><h2>PO / TO proposal review</h2><p>Automatic packing respects configured truck capacity. Manual quantities may exceed it and will be flagged; Split moves a line into its own held load.</p></div><div class="smart-actions smart-plan-header-actions">${smartProposalColumnControls()}<button class="smart-button warn" data-smart-action="toggle-planning-exclusions" type="button">Paused items (${smartNumber(exclusionCount, 0)})</button>${smartCanWrite() ? `${plan?.status === "ready" ? `<button class="smart-button" data-smart-action="open-manual-load" type="button">Add load</button>` : ""}<button class="smart-button" data-smart-action="group-proposals" type="button" ${selectedCount < 2 ? "disabled" : ""}>Group selected (${selectedCount})</button><button class="smart-button primary" data-smart-action="run-plan" type="button">Build new plan</button>` : ""}</div></div>
+    <div class="smart-section-head"><div><h2>PO / TO proposal review</h2><p>Automatic packing respects configured truck capacity. Manual quantities may exceed it and will be flagged; Split moves a line into its own held load.</p></div><div class="smart-actions smart-plan-header-actions">${smartProposalColumnControls()}<button class="smart-button warn" data-smart-action="toggle-planning-exclusions" type="button">${smartEscape(exclusionLabel)}</button>${smartCanWrite() ? `${plan?.status === "ready" ? `<button class="smart-button" data-smart-action="open-manual-load" type="button">Add load</button>` : ""}<button class="smart-button" data-smart-action="group-proposals" type="button" ${selectedCount < 2 ? "disabled" : ""}>Group selected (${selectedCount})</button><button class="smart-button primary" data-smart-action="run-plan" type="button">Build new plan</button>` : ""}</div></div>
     <div class="smart-toolbar smart-plan-toolbar">
       <select id="smartPlanRun"><option value="">Select a run</option>${runs.map((run) => `<option value="${run.id}" ${Number(plan?.id) === Number(run.id) ? "selected" : ""}>#${run.id} · ${smartDate(run.completedAt, true)} · r${run.revision}</option>`).join("")}</select>
       <input id="smartPlanSearch" type="search" value="${smartEscape(smartState.planSearch)}" placeholder="Item, vendor, yard, or memo" />

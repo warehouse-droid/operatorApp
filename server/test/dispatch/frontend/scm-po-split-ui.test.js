@@ -8,6 +8,7 @@ const publicUrl = new URL("../../../public/", import.meta.url);
 const clientUrl = new URL("dispatch-scm.js", publicUrl);
 const client = fs.readFileSync(clientUrl, "utf8");
 const page = fs.readFileSync(new URL("dispatch-scm.html", publicUrl), "utf8");
+const styles = fs.readFileSync(new URL("dispatch.css", publicUrl), "utf8");
 
 function clientContext(controls = new Map()) {
   const scmApp = {
@@ -94,11 +95,23 @@ test("split PO details do not render an Update action", () => {
     "PO Split must expose the same durable destination override as PO\/TO Schedule");
   assert.match(sourceHtml, /Override all PO lines/,
     "the destination control must explain that it replaces mixed NetSuite line routing");
+  assert.match(sourceHtml, /12441 \(NetSuite\)/,
+    "the retained NetSuite destination must be labelled directly and concisely");
+  assert.match(sourceHtml, /scm-mini-row scm-mini-routing-row/,
+    "schedule controls should occupy a dedicated first row");
+  assert.match(sourceHtml, /scm-mini-row scm-mini-notes-row/,
+    "destination, remark, and actions should occupy a balanced second row");
 });
 
 test("the PO-split page requests the fixed client with a new cache key", () => {
-  assert.match(page, /dispatch-scm\.js\?v=20260827-split-create-metadata-v1/);
-  assert.match(page, /dispatch\.css\?v=20260827-split-create-metadata-v1/);
+  assert.match(page, /dispatch-scm\.js\?v=20260831-live-schedule-v1/);
+  assert.match(page, /dispatch\.css\?v=20260831-live-schedule-v1/);
+});
+
+test("the PO Split schedule panel uses a responsive two-row layout", () => {
+  assert.match(styles, /\.scm-mini-routing-row\s*\{[^}]*grid-template-columns:/s);
+  assert.match(styles, /\.scm-mini-notes-row\s*\{[^}]*grid-template-columns:/s);
+  assert.match(styles, /@media \(max-width: 1100px\)[\s\S]*\.scm-mini-notes-row\s*\{[^}]*minmax\(0, 1fr\)/);
 });
 
 test("PO Split renders canonical completion instead of retaining a Planned badge", () => {
@@ -427,7 +440,7 @@ test("split Schedule Save submits the live status revision and retains a failed 
 
   await vm.runInContext("saveScmScheduleForSelected()", context);
   const request = context.__capturedRequest;
-  assert.equal(request.path, "/api/scm/schedule/STATUS-SPLIT");
+  assert.equal(request.path, "/api/scm/schedule/STATUS-SPLIT?includeSchedule=false");
   const payload = JSON.parse(request.options.body);
   assert.equal(payload.status, "Priority", "the status visible when Save is clicked must be submitted");
   assert.equal(payload.expectedUpdatedAt, "2026-08-13T20:00:00.123Z",
@@ -435,6 +448,133 @@ test("split Schedule Save submits the live status revision and retains a failed 
   assert.equal(vm.runInContext("scmOrders[0].scm.status", context), "Priority",
     "a failed request must keep the selected status visible for an intentional retry");
   assert.match(vm.runInContext("scmNotice", context), /Save schedule failed: simulated network failure/);
+});
+
+test("PO Split Save prefers a newer hydrated schedule over its stale catalog card", async () => {
+  const context = clientContext();
+  vm.runInContext(`
+    scmOrders = [{
+      id: "3022130415",
+      type: "PO",
+      items: [],
+      scm: {
+        status: "Queued",
+        method: "MBT",
+        pickupPoint: "Stale catalog yard",
+        updatedAt: "2026-08-31T02:29:06.620731Z"
+      }
+    }];
+    scmOrderDetail = {
+      id: "3022130415",
+      type: "PO",
+      items: [],
+      scm: {
+        status: "Planned",
+        method: "Vendor",
+        pickupPoint: "Live schedule yard",
+        updatedAt: "2026-08-31T02:29:33.265579Z"
+      }
+    };
+    selectedScmOrderId = "3022130415";
+    renderScm = () => {};
+    globalThis.__selectedBeforeSave = scmSelectedOrder();
+    scmApi = async (path, options) => {
+      globalThis.__capturedRequest = { path, options };
+      return { row: {
+        orderKind: "PO",
+        orderRef: "3022130415",
+        status: "Planned",
+        method: "Vendor",
+        pickupPoint: "Live schedule yard",
+        updatedAt: "2026-08-31T02:29:34.000001Z"
+      } };
+    };
+  `, context);
+
+  assert.equal(context.__selectedBeforeSave.scm.status, "Planned",
+    "the hydrated live status must not be replaced by an older list card");
+  assert.equal(context.__selectedBeforeSave.scm.pickupPoint, "Live schedule yard");
+  await vm.runInContext("saveScmScheduleForSelected()", context);
+  const payload = JSON.parse(context.__capturedRequest.options.body);
+  assert.equal(payload.expectedUpdatedAt, "2026-08-31T02:29:33.265579Z",
+    "Save must protect the newest live schedule revision loaded for the selected PO");
+});
+
+test("PO Split compares exact microsecond schedule revisions in both merge directions", () => {
+  const context = clientContext();
+  vm.runInContext(`
+    scmOrders = [{
+      id: "MICROSECOND-PO",
+      scm: { status: "Queued", marker: "card-old", updatedAt: "2026-08-31T02:29:33.265100Z" }
+    }];
+    scmOrderDetail = {
+      id: "MICROSECOND-PO",
+      scm: { status: "Planned", marker: "detail-new", updatedAt: "2026-08-31T02:29:33.265579Z" }
+    };
+    selectedScmOrderId = "MICROSECOND-PO";
+  `, context);
+  assert.equal(vm.runInContext("scmSelectedOrder().scm.marker", context), "detail-new",
+    "detail must win when it is newer inside the same millisecond");
+
+  vm.runInContext(`
+    scmOrders[0].scm = {
+      status: "Hold",
+      marker: "card-new",
+      updatedAt: "2026-08-31T02:29:33.265900Z"
+    };
+  `, context);
+  assert.equal(vm.runInContext("scmSelectedOrder().scm.marker", context), "card-new",
+    "a later targeted card refresh must win over older hydrated detail");
+});
+
+test("property matrix: PO Split always selects the greatest exact schedule revision", () => {
+  const context = clientContext();
+  for (let index = 0; index < 128; index += 1) {
+    const cardMicros = (index * 7919) % 1000;
+    let detailMicros = (index * 3571 + 17) % 1000;
+    if (detailMicros === cardMicros) {
+      detailMicros = (detailMicros + 1) % 1000;
+    }
+    const cardRevision = `2026-08-31T02:29:33.265${String(cardMicros).padStart(3, "0")}Z`;
+    const detailRevision = `2026-08-31T02:29:33.265${String(detailMicros).padStart(3, "0")}Z`;
+    vm.runInContext(`
+      scmOrders = [{ id: "PROPERTY-REVISION", scm: {
+        marker: "card", updatedAt: ${JSON.stringify(cardRevision)}
+      } }];
+      scmOrderDetail = { id: "PROPERTY-REVISION", scm: {
+        marker: "detail", updatedAt: ${JSON.stringify(detailRevision)}
+      } };
+      selectedScmOrderId = "PROPERTY-REVISION";
+    `, context);
+    assert.equal(
+      vm.runInContext("scmSelectedOrder().scm.marker", context),
+      detailMicros > cardMicros ? "detail" : "card",
+      `${cardRevision} versus ${detailRevision}`
+    );
+  }
+});
+
+test("adversarial schedule revision values fail toward the valid or hydrated state", () => {
+  const context = clientContext();
+  const select = (cardRevision, detailRevision) => vm.runInContext(`
+    scmOrders = [{ id: "ADVERSARIAL-REVISION", scm: {
+      marker: "card", updatedAt: ${JSON.stringify(cardRevision)}
+    } }];
+    scmOrderDetail = { id: "ADVERSARIAL-REVISION", scm: {
+      marker: "detail", updatedAt: ${JSON.stringify(detailRevision)}
+    } };
+    selectedScmOrderId = "ADVERSARIAL-REVISION";
+    scmSelectedOrder().scm.marker;
+  `, context);
+
+  assert.equal(select("2026-08-31T02:29:33.265579Z", "not-a-timestamp"), "card");
+  assert.equal(select("<script>alert(1)</script>", "2026-08-31T02:29:33.265579Z"), "detail");
+  assert.equal(select("", ""), "detail", "the later hydrated response wins when neither row exists yet");
+  assert.equal(
+    select("2026-08-31T02:29:33.265579Z", "2026-08-31T02:29:33.265579Z"),
+    "detail",
+    "equal revisions prefer the complete hydrated detail"
+  );
 });
 
 test("split Schedule Save changes the physical split destination before saving the shared schedule", async () => {
@@ -451,6 +591,7 @@ test("split Schedule Save changes the physical split destination before saving t
       originalPoRef: "DESTINATION-SPLIT",
       type: "PO",
       isScmSplit: true,
+      destinationYard: "3445",
       items: [],
       scm: {
         status: "Queued",
@@ -476,7 +617,7 @@ test("split Schedule Save changes the physical split destination before saving t
   const requests = context.__requests;
   assert.deepEqual(Array.from(requests, (request) => String(request.path)), [
     "/api/dispatch/scm/purchase-order-splits/DESTINATION-SPLIT/destination",
-    "/api/scm/schedule/DESTINATION-SPLIT"
+    "/api/scm/schedule/DESTINATION-SPLIT?includeSchedule=false"
   ]);
   const destinationPatch = JSON.parse(requests[0].options.body);
   assert.equal(destinationPatch.destinationLocationId, "15");
@@ -485,4 +626,92 @@ test("split Schedule Save changes the physical split destination before saving t
   assert.equal(schedulePatch.dropoffPoint, "12441");
   assert.equal(schedulePatch.expectedUpdatedAt, "2026-08-24T12:01:00.456789Z",
     "the second save must use the schedule revision created by the destination transaction");
+  assert.equal(vm.runInContext("scmOrders[0].destinationYard", context), "12441",
+    "the saved physical destination must immediately become the local NetSuite baseline");
+});
+
+test("successful Schedule Save applies its authoritative row without a stale catalog reload", async () => {
+  const status = {
+    dataset: { scmField: "status" },
+    type: "select-one",
+    value: "Hold"
+  };
+  const remark = {
+    dataset: { scmField: "remarkOverride" },
+    type: "textarea",
+    value: "Hold for revised appointment"
+  };
+  const controls = new Map([["[data-scm-field]", [status, remark]]]);
+  const context = clientContext(controls);
+  vm.runInContext(`
+    scmOrders = [{
+      id: "SCHEDULE-FRESH-L1",
+      type: "PO",
+      isScmSplit: true,
+      items: [],
+      scm: { status: "Queued", remarkOverride: "Old remark", updatedAt: "2026-08-29T10:00:00.000Z" }
+    }];
+    selectedScmOrderId = "SCHEDULE-FRESH-L1";
+    renderScm = () => {};
+    globalThis.__reloads = 0;
+    loadScmOrders = async () => {
+      globalThis.__reloads += 1;
+      scmOrders[0].scm.status = "Queued";
+      scmOrders[0].scm.remarkOverride = "Old remark";
+    };
+    scmApi = async (path) => {
+      globalThis.__savedPath = path;
+      return { row: {
+        orderKind: "PO",
+        orderRef: "SCHEDULE-FRESH-L1",
+        method: "MBT",
+        status: "Hold",
+        remarkOverride: "Hold for revised appointment",
+        scheduleDropoffPoint: "",
+        pickupPoint: "Vendor yard",
+        updatedAt: "2026-08-29T10:01:00.123456Z"
+      } };
+    };
+  `, context);
+
+  await vm.runInContext("saveScmScheduleForSelected()", context);
+  assert.equal(context.__savedPath, "/api/scm/schedule/SCHEDULE-FRESH-L1?includeSchedule=false");
+  assert.equal(context.__reloads, 0,
+    "the authoritative mutation response must not be replaced by an eventually refreshed list");
+  assert.equal(vm.runInContext("scmOrders[0].scm.status", context), "Hold");
+  assert.equal(vm.runInContext("scmOrders[0].scm.remarkOverride", context), "Hold for revised appointment");
+  assert.equal(vm.runInContext("scmOrders[0].scm.updatedAt", context), "2026-08-29T10:01:00.123456Z");
+});
+
+test("locked split remark save keeps the authoritative remark visible", async () => {
+  const remark = { value: "Driver confirmed revised dock" };
+  const controls = new Map([['[data-scm-field="remarkOverride"]', remark]]);
+  const context = clientContext(controls);
+  vm.runInContext(`
+    scmOrders = [{
+      id: "REMARK-FRESH-L1",
+      type: "PO",
+      isScmSplit: true,
+      items: [],
+      scm: { status: "Planned", remarkOverride: "Old remark", updatedAt: "2026-08-29T11:00:00.000Z" }
+    }];
+    selectedScmOrderId = "REMARK-FRESH-L1";
+    renderScm = () => {};
+    globalThis.__reloads = 0;
+    loadScmOrders = async () => { globalThis.__reloads += 1; };
+    scmApi = async () => ({ row: {
+      orderKind: "PO",
+      orderRef: "REMARK-FRESH-L1",
+      method: "MBT",
+      status: "Planned",
+      remarkOverride: "Driver confirmed revised dock",
+      scheduleDropoffPoint: "",
+      updatedAt: "2026-08-29T11:01:00.654321Z"
+    } });
+  `, context);
+
+  await vm.runInContext("saveScmRemarkForSelected()", context);
+  assert.equal(context.__reloads, 0);
+  assert.equal(vm.runInContext("scmOrders[0].scm.remarkOverride", context), "Driver confirmed revised dock");
+  assert.equal(vm.runInContext("scmOrders[0].scm.updatedAt", context), "2026-08-29T11:01:00.654321Z");
 });

@@ -66,6 +66,7 @@ const manualItemId = itemId + 3;
 const coveredItemId = itemId + 4;
 const repeatedSalesOrderId = salesOrderId + 1;
 const createdTransferIds = [9873000000 + suffix, 9874000000 + suffix];
+const secondDirectTransferId = 9874500000 + suffix + 10000;
 const salesOrderRef = `TSTDEP-SO-HARNESS-${suffix}`;
 
 function check(condition, message, details = {}) {
@@ -262,8 +263,8 @@ try {
     check(palletPayloadLine?.custcol_pcs === 2,
       "The ancillary PALLET line must write its count to the NetSuite PCS column.",
       { palletPayloadLine });
-    check(restPayload.memo.includes("MBBS dependency batch 42 proposal 99"),
-      "Each NetSuite TO must carry a proposal-specific recovery marker.", { memo: restPayload.memo });
+    check(restPayload.memo === "for SO-PAYLOAD-TEST",
+      "Each Auto Transfer TO must use only the concise Sales Order memo.", { memo: restPayload.memo });
     const zeroPalletPayload = buildTransferDependencyRestPayload({
       proposal: {
         id: 100,
@@ -2847,15 +2848,26 @@ try {
       Number(outboundLine.rows[0].allocated_quantity) - 1
     ]);
     const reducedSync = await syncOrderDependenciesForTransferOrder(dependency.transferOrderId);
-    check(reducedSync[0]?.attention === true, "Reduced NetSuite TO quantity must put its dependency into attention.", { reducedSync });
+    const reducedDependency = (await listOrderDependencies({ salesOrderRef }))[0];
+    const reducedLine = reducedDependency.lines.find((line) => String(line.itemId) === String(itemId));
+    check(reducedSync[0]?.attention === false
+      && reducedDependency.status === "active"
+      && Number(reducedLine?.allocatedQuantity) === Number(outboundLine.rows[0].allocated_quantity)
+      && Number(reducedLine?.effectiveAllocatedQuantity) === Number(outboundLine.rows[0].allocated_quantity) - 1,
+    "A reduced TO must remain plannable and contribute only its current quantity while preserving the saved allocation.",
+    { reducedSync, reducedDependency, reducedLine });
     await query("UPDATE transfer_order_lines SET quantity = $2 WHERE id = $1", [
       outboundLine.rows[0].transfer_outbound_line_id,
       outboundLine.rows[0].allocated_quantity
     ]);
     const restoredSync = await syncOrderDependenciesForTransferOrder(dependency.transferOrderId);
     const restoredDependency = (await listOrderDependencies({ salesOrderRef }))[0];
-    check(restoredSync[0]?.attention === false && restoredDependency.status === "active",
-      "Corrected NetSuite TO quantity should clear attention and resume the dependency.", { restoredSync, restoredDependency });
+    const restoredLine = restoredDependency.lines.find((line) => String(line.itemId) === String(itemId));
+    check(restoredSync[0]?.attention === false
+      && restoredDependency.status === "active"
+      && Number(restoredLine?.effectiveAllocatedQuantity) === Number(outboundLine.rows[0].allocated_quantity),
+    "Restored NetSuite TO quantity should restore the full effective contribution without changing the saved allocation.",
+    { restoredSync, restoredDependency, restoredLine });
 
     const transferFixture = await query(
       `SELECT netsuite_id AS id, tranid, trandate::text, from_location_id AS source_location_id,
@@ -3171,6 +3183,135 @@ try {
                  'complete', now() - interval '1 minute', now())`,
       [`dep-drop-${suffix}`, planId, loadId, JSON.stringify([salesOrderRef])]
     );
+    const secondTransfer = await fakeHydrateTransferOrder(secondDirectTransferId, {
+      fromLocationId: dependency.dependencySourceLocationId,
+      fromLocation: dependency.dependencySourceLocation,
+      toLocationId: dependency.accountingDestinationLocationId,
+      toLocation: dependency.accountingDestinationLocation,
+      palletItemId,
+      palletTransferQuantity: dependency.lines
+        .filter((entry) => entry.lineRole === "pallet")
+        .reduce((total, entry) => total + Number(entry.allocatedQuantity || 0), 0),
+      lines: dependency.lines.map((entry) => ({
+        itemId: entry.itemId,
+        itemName: entry.itemName,
+        unit: entry.unit,
+        proposedQuantity: entry.allocatedQuantity,
+        palletQty: entry.palletQty,
+        layerQty: entry.layerQty,
+        sectionQty: entry.sectionQty,
+        pieceQty: entry.pieceQty
+      }))
+    });
+    const secondDependency = await query(
+      `INSERT INTO order_dependencies (
+         sales_order_id, sales_order_ref, transfer_order_id, transfer_order_ref,
+         dependency_mode, same_load_required, status,
+         source_location_id, source_location,
+         accounting_destination_location_id, accounting_destination_location,
+         planned_plan_id, planned_date, planned_truck_plate, planned_load_id, planned_load_name,
+         reconciliation_status, dispatch_target_ref, dispatch_target_kind, created_by
+       ) VALUES (
+         $1, $2, $3, $4, 'direct_to_customer', true, 'in_transit',
+         $5, $6, $7, $8,
+         $9, DATE '2097-07-13', 'DEP-TRUCK', $10, 'Load 1',
+         'pending', $2, 'normal', 'dependency-harness'
+       )
+       RETURNING id`,
+      [
+        salesOrderId,
+        salesOrderRef,
+        secondDirectTransferId,
+        secondTransfer.tranid,
+        dependency.dependencySourceLocationId,
+        dependency.dependencySourceLocation,
+        dependency.accountingDestinationLocationId,
+        dependency.accountingDestinationLocation,
+        planId,
+        loadId
+      ]
+    );
+    await query(
+      `INSERT INTO order_dependency_lines (
+         dependency_id, sales_line_id, transfer_outbound_line_id, transfer_receiving_line_id,
+         item_id, item_name, unit, allocated_quantity,
+         pallet_qty, layer_qty, section_qty, piece_qty,
+         loaded_quantity, delivered_quantity, locally_received_quantity,
+         locally_received_pallet_qty, locally_received_layer_qty,
+         locally_received_section_qty, locally_received_piece_qty,
+         line_role, dispatch_target_line_key
+       )
+       SELECT $2, source_line.sales_line_id,
+              outbound.id, receiving.id,
+              source_line.item_id, source_line.item_name, source_line.unit, source_line.allocated_quantity,
+              source_line.pallet_qty, source_line.layer_qty,
+              source_line.section_qty, source_line.piece_qty,
+              source_line.allocated_quantity, 0, 0, 0, 0, 0, 0,
+              source_line.line_role, source_line.dispatch_target_line_key
+         FROM order_dependency_lines source_line
+         LEFT JOIN LATERAL (
+           SELECT transfer_line.id
+             FROM transfer_order_lines transfer_line
+            WHERE transfer_line.transfer_order_id = $3
+              AND transfer_line.line_stage = 'outbound'
+              AND transfer_line.item_id = source_line.item_id
+            ORDER BY transfer_line.id
+            LIMIT 1
+         ) outbound ON true
+         LEFT JOIN LATERAL (
+           SELECT transfer_line.id
+             FROM transfer_order_lines transfer_line
+            WHERE transfer_line.transfer_order_id = $3
+              AND transfer_line.line_stage = 'receiving'
+              AND transfer_line.item_id = source_line.item_id
+            ORDER BY transfer_line.id
+            LIMIT 1
+         ) receiving ON true
+        WHERE source_line.dependency_id = $1`,
+      [dependency.id, secondDependency.rows[0].id, secondDirectTransferId]
+    );
+    await query(
+      "UPDATE order_dependencies SET planned_load_id = $2 WHERE id = $1",
+      [secondDependency.rows[0].id, `${loadId}-OTHER`]
+    );
+    let mismatchedSecondDependencyBlocked = false;
+    try {
+      await completeDirectDependenciesForSalesOrderDrop({
+        salesOrderRefs: [salesOrderRef],
+        driverJobId: `dep-drop-${suffix}`,
+        planId,
+        planDate: "2097-07-13",
+        truckPlate: "DEP-TRUCK",
+        loadId,
+        loadName: "Load 1"
+      });
+    } catch (error) {
+      mismatchedSecondDependencyBlocked = /another planned load/i.test(error.message);
+    }
+    const rolledBackMultiDependencyAttempt = await query(
+      `SELECT d.id, d.status, d.direct_receipt_job_id,
+              COALESCE(SUM(line.locally_received_quantity), 0)::numeric AS locally_received_quantity,
+              COUNT(receipt.id)::int AS receipt_count
+         FROM order_dependencies d
+         LEFT JOIN order_dependency_lines line ON line.dependency_id = d.id
+         LEFT JOIN order_dependency_receipts receipt ON receipt.dependency_id = d.id
+        WHERE d.id = ANY($1::bigint[])
+        GROUP BY d.id
+        ORDER BY d.id`,
+      [[dependency.id, secondDependency.rows[0].id]]
+    );
+    check(
+      mismatchedSecondDependencyBlocked
+        && rolledBackMultiDependencyAttempt.rows.every((entry) => entry.direct_receipt_job_id === null
+          && Number(entry.locally_received_quantity) === 0
+          && entry.receipt_count === 0),
+      "A failure on the second direct TO must roll back every receipt effect for the customer stop.",
+      { mismatchedSecondDependencyBlocked, rolledBackMultiDependencyAttempt: rolledBackMultiDependencyAttempt.rows }
+    );
+    await query(
+      "UPDATE order_dependencies SET planned_load_id = $2 WHERE id = $1",
+      [secondDependency.rows[0].id, loadId]
+    );
     const inventoryBefore = await query(
       "SELECT quantity_available FROM inventory_balances WHERE item_id = $1 AND location_id = 15",
       [itemId]
@@ -3184,7 +3325,7 @@ try {
       loadId,
       loadName: "Load 1"
     });
-    check(receipt.completed.length === 1, "Customer drop should create one local direct receipt.", { receipt });
+    check(receipt.completed.length === 2, "One customer drop should complete both linked direct TO receipts.", { receipt });
     const repeated = await completeDirectDependenciesForSalesOrderDrop({
       salesOrderRefs: [salesOrderRef],
       driverJobId: `dep-drop-${suffix}`,
@@ -3194,17 +3335,27 @@ try {
       loadId,
       loadName: "Load 1"
     });
-    check(repeated.completed.length === 0 && repeated.alreadyCompleted.length === 1, "Repeated customer drop must be idempotent.", { repeated });
+    check(repeated.completed.length === 0 && repeated.alreadyCompleted.length === 2, "Repeated multi-TO customer drop must be idempotent.", { repeated });
     const inventoryAfter = await query(
       "SELECT quantity_available FROM inventory_balances WHERE item_id = $1 AND location_id = 15",
       [itemId]
     );
     check(Number(inventoryBefore.rows[0].quantity_available) === Number(inventoryAfter.rows[0].quantity_available), "Direct local receipt must not increase destination inventory.");
     const receiptCount = await query(
-      "SELECT COUNT(*)::int AS count FROM order_dependency_receipts WHERE dependency_id = $1",
-      [dependency.id]
+      `SELECT COUNT(*)::int AS count,
+              COUNT(DISTINCT dependency_id)::int AS dependency_count,
+              COUNT(DISTINCT driver_job_id)::int AS job_count
+         FROM order_dependency_receipts
+        WHERE dependency_id = ANY($1::bigint[])`,
+      [[dependency.id, secondDependency.rows[0].id]]
     );
-    check(receiptCount.rows[0].count === 1, "Direct receipt history must be written exactly once.", { receiptCount: receiptCount.rows[0] });
+    check(
+      receiptCount.rows[0].count === 2
+        && receiptCount.rows[0].dependency_count === 2
+        && receiptCount.rows[0].job_count === 1,
+      "Each direct TO must retain one receipt while sharing the same completed driver job.",
+      { receiptCount: receiptCount.rows[0] }
+    );
 
     await query(
       `UPDATE transfer_order_lines

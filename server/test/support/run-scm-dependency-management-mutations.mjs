@@ -14,6 +14,16 @@ const UNIT_TESTS = Object.freeze([
 const DATABASE_TESTS = Object.freeze([
   "test/mbt/integration/driver-route-superseded-fence.red.test.js"
 ]);
+const QUANTITY_PROPERTY_TESTS = Object.freeze([
+  "test/dispatch/property/order-dependency-quantity.property.test.js"
+]);
+const QUANTITY_INTEGRATION_TESTS = Object.freeze([
+  "test/dispatch/integration/order-dependency-multi-to-extension.red.test.js",
+  "test/dispatch/integration/order-dependency-quantity-replay.red.test.js"
+]);
+const CO_COMPATIBILITY_TESTS = Object.freeze([
+  "test/dispatch/integration/dispatch-co-global-lifecycle.red.test.js"
+]);
 
 /** @type {ReadonlyArray<{name: string, target: string, from: string, to: string, tests: readonly string[]}>} */
 const MUTANTS = Object.freeze([
@@ -72,6 +82,62 @@ const MUTANTS = Object.freeze([
     from: "  if (!result.rowCount) return null;\n  if (!touch) return mapGrant(result.rows[0]);",
     to: "  if (!result.rowCount) return { grantId: \"unsafe-mutant\" };\n  if (!touch) return mapGrant(result.rows[0]);",
     tests: DATABASE_TESTS
+  },
+  {
+    name: "partial TO contribution ignores the current TO quantity cap",
+    target: "src/order-dependency-quantity.js",
+    from: "      : Math.min(allocated, Math.max(0, number(remaining)));",
+    to: "      : allocated;",
+    tests: QUANTITY_PROPERTY_TESTS
+  },
+  {
+    name: "multiple item allocations share one TO quantity budget",
+    target: "src/order-dependency-quantity.js",
+    from: "    const itemKey = String(line.itemId || line.itemName || line.id);\n    const remaining = remainingByItem.get(itemKey);",
+    to: "    const itemKey = \"shared-item-budget\";\n    const remaining = remainingByItem.get(itemKey);",
+    tests: QUANTITY_PROPERTY_TESTS
+  },
+  {
+    name: "receiving quantity cannot supply a missing outbound projection",
+    target: "src/order-dependency-quantity.js",
+    from: "    remainingByItem.set(itemKey, outbound ?? receiving);",
+    to: "    remainingByItem.set(itemKey, outbound);",
+    tests: QUANTITY_PROPERTY_TESTS
+  },
+  {
+    name: "direct pickup manifest uses the stale saved allocation",
+    target: "src/order-dependency-repository.js",
+    from: "    item.quantity += number(line.effectiveAllocatedQuantity ?? line.allocatedQuantity);",
+    to: "    item.quantity += number(line.allocatedQuantity);",
+    tests: QUANTITY_INTEGRATION_TESTS
+  },
+  {
+    name: "reduced TO quantity becomes an attention blocker again",
+    target: "src/order-dependency-repository.js",
+    from: "      const attention = beforeDelivery && (unavailable || missingMaterialLine);",
+    to: "      const attention = beforeDelivery && (unavailable || missingMaterialLine || quantityLimited);",
+    tests: QUANTITY_INTEGRATION_TESTS
+  },
+  {
+    name: "zero-contribution direct dependency still creates a pickup",
+    target: "src/order-dependency-repository.js",
+    from: "      const routedDirect = direct.filter(dependencyHasEffectiveMaterial);",
+    to: "      const routedDirect = direct;",
+    tests: QUANTITY_INTEGRATION_TESTS
+  },
+  {
+    name: "zero-contribution direct dependency still blocks route validation",
+    target: "src/order-dependency-repository.js",
+    from: "      if (!dependencyHasEffectiveMaterial(dependency)) continue;",
+    to: "      if (false) continue;",
+    tests: QUANTITY_INTEGRATION_TESTS
+  },
+  {
+    name: "legacy CO dependency with unknown lines loses its routed pickup",
+    target: "src/order-dependency-quantity.js",
+    from: "  if (!materialLines.length) return true;",
+    to: "  if (!materialLines.length) return false;",
+    tests: CO_COMPATIBILITY_TESTS
   }
 ]);
 

@@ -16,7 +16,10 @@ fixed_files=(
   src/mbt/feature-gate-catalog.js
   src/mbt/router.js
   src/netsuite.js
+  src/netsuite-closed-order-repository-harness.js
   src/server.js
+  src/delivery-repository.js
+  src/receiving-repository.js
   src/operator-netsuite-posting-adapter.js
   src/operator-netsuite-posting-admission.js
   src/operator-netsuite-posting-controller.js
@@ -30,6 +33,7 @@ fixed_files=(
   src/operator-netsuite-posting-service.js
   src/operator-netsuite-posting-targets.js
   test/operator-netsuite-posting-gates-spec.md
+  test/operator-netsuite-line-mapping-spec.md
   test/mbt/operator-netsuite-posting-gates-evidence.md
   test/mbt/adversarial/operator-netsuite-posting-adversarial.test.js
   test/mbt/concurrency/operator-netsuite-posting-concurrency.test.js

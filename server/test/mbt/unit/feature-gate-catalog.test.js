@@ -17,7 +17,24 @@ const environmentOpen = Object.freeze({
   billingOperationsEnabled: true,
   customerSyncEnabled: true,
   netSuiteWritesEnabled: true,
-  netSuiteDirectAccessEnabled: true
+  netSuiteDirectAccessEnabled: true,
+  dispatchOrderPoolMode: "on",
+  dispatchOrderPoolReady: true,
+  dispatchOrderPoolActivationReady: true,
+  dispatchOrderPoolActivationBlockReason: "ready",
+  dispatchOrderPoolStatus: "ready",
+  dispatchOrderPoolCatalogReady: true,
+  dispatchOrderPoolAssignmentsReady: true,
+  dispatchOrderPoolCatalogCount: 2400,
+  dispatchOrderPoolLegacyCount: 2400,
+  dispatchOrderPoolPendingRefreshCount: 0,
+  dispatchOrderPoolShadowMatchCount: 3,
+  dispatchOrderPoolShadowMismatchCount: 0,
+  dispatchOrderPoolRequiredShadowMatchCount: 3,
+  dispatchOrderPoolGeneration: 8,
+  dispatchOrderPoolLastShadowComparisonAt: "2026-08-27T12:01:00.000Z",
+  dispatchOrderPoolLastFullRefreshAt: "2026-08-27T12:00:00.000Z",
+  dispatchOrderPoolLastError: ""
 });
 
 function flags(enabled = []) {
@@ -44,6 +61,7 @@ test("Admin catalog exposes four default-off completion-owned SO IF gates", () =
     "operator_customer_pickup_photo_required",
     "sales_stock_request_over_availability",
     "special_stock_request_workflow",
+    "dispatch_optimized_order_pool",
     "operator_netsuite_customer_pickup_if_3445",
     "operator_netsuite_receiving_ir_3445",
     "operator_netsuite_delivery_prep_if_3445",
@@ -70,7 +88,7 @@ test("Admin catalog exposes four default-off completion-owned SO IF gates", () =
     "mbt_customer_sync",
     "mbt_netsuite_writes"
   ]);
-  assert.deepEqual(MBT_ADMIN_WRITABLE_GATE_KEYS, MBT_ADMIN_GATE_KEYS.slice(0, 28));
+  assert.deepEqual(MBT_ADMIN_WRITABLE_GATE_KEYS, MBT_ADMIN_GATE_KEYS.slice(0, 29));
   for (const flagKey of MBT_ADMIN_GATE_KEYS.filter((key) => key.startsWith("dispatch_netsuite_sales_order_if_"))) {
     const selected = gate(materializeMbtAdminGates({ flags: flags([]), environment: environmentOpen }), flagKey);
     assert.equal(selected.gateGroup, "dispatch_sales_order_fulfillment");
@@ -78,6 +96,34 @@ test("Admin catalog exposes four default-off completion-owned SO IF gates", () =
     assert.equal(selected.configured, false);
     assert.equal(selected.effective, false);
   }
+  const optimizedPool = gate(
+    materializeMbtAdminGates({ flags: flags([]), environment: environmentOpen }),
+    "dispatch_optimized_order_pool"
+  );
+  assert.equal(optimizedPool.configured, false);
+  assert.equal(optimizedPool.environmentAllowed, true);
+  assert.equal(optimizedPool.activationReady, true);
+  assert.equal(optimizedPool.effective, false);
+  assert.equal(optimizedPool.deploymentGuarded, true);
+  assert.deepEqual(optimizedPool.dispatchOrderPool, {
+    deploymentMode: "on",
+    status: "ready",
+    ready: true,
+    activationReady: true,
+    activationBlockReason: "ready",
+    catalogReady: true,
+    assignmentsReady: true,
+    catalogCount: 2400,
+    legacyCount: 2400,
+    pendingRefreshCount: 0,
+    shadowMatchCount: 3,
+    shadowMismatchCount: 0,
+    requiredShadowMatchCount: 3,
+    generation: 8,
+    lastShadowComparisonAt: "2026-08-27T12:01:00.000Z",
+    lastFullRefreshAt: "2026-08-27T12:00:00.000Z",
+    lastError: ""
+  });
 });
 
 test("P3-F29 effective state requires both deployment and database root/specific gates", () => {
@@ -136,6 +182,19 @@ test("P3-F29 effective state requires both deployment and database root/specific
   assert.equal(gate(directAccessClosed, "dispatch_netsuite_sales_order_if_12441").environmentAllowed, false);
   assert.equal(gate(directAccessClosed, "dispatch_netsuite_sales_order_if_12441").effective, false);
   assert.equal(gate(directAccessClosed, "driver_offline_mode").effective, true);
+
+  const dispatchReadModelClosed = materializeMbtAdminGates({
+    flags: allEnabled,
+    environment: {
+      ...environmentOpen,
+      dispatchOrderPoolAssignmentsReady: false,
+      dispatchOrderPoolReady: false,
+      dispatchOrderPoolActivationReady: false
+    }
+  });
+  assert.equal(gate(dispatchReadModelClosed, "dispatch_optimized_order_pool").configured, true);
+  assert.equal(gate(dispatchReadModelClosed, "dispatch_optimized_order_pool").environmentAllowed, false);
+  assert.equal(gate(dispatchReadModelClosed, "dispatch_optimized_order_pool").effective, false);
 });
 
 test("P3-F29 a missing database row remains visible, inactive, locked, and revisionless", () => {

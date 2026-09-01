@@ -83,6 +83,50 @@ test("DPO-02b compact PO cards retain source-to-ref identities for indexed searc
   assert.match(dispatchOrderSearchText(order), /sn1398449/u);
 });
 
+test("DPO-02c compact cards retain bounded completed transit CO evidence", () => {
+  const card = compactDispatchOrderCard({
+    id: "SOA07512",
+    type: "SO",
+    sourceYard: "2967",
+    pickupLocations: ["12441"],
+    transitCo: {
+      id: "CO-SOA07512",
+      fromYard: "2967",
+      toYard: "12441",
+      status: "completed",
+      source: "local-db",
+      raw: { giant: "x".repeat(50_000), credential: "must-not-leak" }
+    }
+  });
+
+  assert.deepEqual(card.transitCo, {
+    id: "CO-SOA07512",
+    fromYard: "2967",
+    toYard: "12441",
+    status: "completed",
+    source: "local-db"
+  });
+  assert.deepEqual(card.pickupLocations, ["12441"]);
+  assert.doesNotMatch(JSON.stringify(card), /must-not-leak/u);
+  assert.ok(JSON.stringify(card).length < 2_000);
+});
+
+test("DPO-02d compact cards retain global derived-order provenance", () => {
+  const card = compactDispatchOrderCard({
+    id: "TO-DRAFT-GLOBAL-1",
+    type: "TO",
+    globalOrderDefinition: true,
+    globalOrderDefinitionKind: "consolidation",
+    globalOrderSourcePlanId: "41",
+    globalOrderSourcePlanDate: "2026-08-31"
+  });
+
+  assert.equal(card.globalOrderDefinition, true);
+  assert.equal(card.globalOrderDefinitionKind, "consolidation");
+  assert.equal(card.globalOrderSourcePlanId, "41");
+  assert.equal(card.globalOrderSourcePlanDate, "2026-08-31");
+});
+
 test("DPO-03 keyed plan delta round-trips and is idempotent", () => {
   const before = {
     planDate: "2026-08-20",

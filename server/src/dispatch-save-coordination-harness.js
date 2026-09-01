@@ -160,6 +160,43 @@ assert.equal(
   true,
   "A persisted group carrying foreign snapshot provenance must be ignored on restore."
 );
+const globalGroupDefinition = {
+  id: "GOB-119005-119006",
+  type: "SO",
+  childOrders: ["SOB119005", "SOB119006"],
+  globalGroupDefinition: true,
+  globalGroupSourcePlanId: "261",
+  globalGroupSourcePlanDate: "2026-08-28",
+  groupPlanId: "",
+  groupPlanDate: ""
+};
+assert.equal(
+  catalogStructureConflictsWithSavedPlan(globalGroupDefinition, {
+    id: "262",
+    planDate: "2026-08-29",
+    orders: []
+  }),
+  false,
+  "A global group definition must remain available on a different empty plan."
+);
+assert.equal(
+  catalogStructureConflictsWithSavedPlan(globalGroupDefinition, {
+    id: "262",
+    planDate: "2026-08-29",
+    orders: [{ id: "SOB119005" }]
+  }),
+  true,
+  "A global group must not replace an already materialized raw member in a saved plan."
+);
+assert.equal(
+  savedGroupStructureConflictsWithPlan(globalGroupDefinition, {
+    id: "262",
+    planDate: "2026-08-29",
+    orders: []
+  }),
+  true,
+  "An unassigned foreign saved copy must defer to the global group definition."
+);
 assert.equal(
   savedGroupStructureConflictsWithPlan({
     ...resurrectedGroup,
@@ -654,6 +691,24 @@ assert.match(groupOrderSource, /groupPlanId:\s*currentPlan\?\.id/,
   "A local group must retain the plan that owns its dependency structure.");
 assert.match(groupOrderSource, /groupPlanDate:\s*currentPlanDate/,
   "A local group must retain its owning plan date.");
+const planOwnedOrderSource = sourceSlice(
+  "function isDispatchPlanOwnedOrder",
+  "function trucksWithTimingMetadata",
+  "global group plan materialization"
+);
+assert.match(planOwnedOrderSource, /order\.globalGroupDefinition\s*===\s*true/,
+  "An unassigned global group must have an explicit plan-materialization rule.");
+assert.match(planOwnedOrderSource, /groupPlanId\s*===\s*currentPlanId/,
+  "Only a global group materialized onto the loaded plan may be persisted with it.");
+const addOrderSource = sourceSlice(
+  "function addOrderToLoad",
+  "function pullExistingStop",
+  "global group assignment materialization"
+);
+assert.match(addOrderSource, /order\.groupPlanId\s*=\s*String\(currentPlan\?\.id/,
+  "Assigning a global group must materialize its group ownership onto the loaded plan.");
+assert.match(addOrderSource, /order\.groupPlanDate\s*=\s*String\(currentPlanDate/,
+  "Assigning a global group must materialize the loaded plan date.");
 const openToLinkSource = sourceSlice(
   'if (action === "open-to-link-modal")',
   'if (action === "order-type-tab")',

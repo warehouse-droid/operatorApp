@@ -579,6 +579,21 @@ async function verifyBackendCanonicalization(runId) {
   const unrelated = canonicalPlan.trucks[0].loads[0].stops.find((stop) => stop.orderId === "SO-UNRELATED");
   assert.equal(unrelated?.location, "Unrelated stop", "Canonicalization must not rewrite another order's stops.");
 
+  const missingStableIdPlan = submittedCustomPlan(stored);
+  delete missingStableIdPlan.orders[0].customOrderId;
+  delete missingStableIdPlan.orders[0].raw.custom_order_id;
+  const rehydratedStableIdPlan = await canonicalizeDispatchCustomOrdersInPlan(missingStableIdPlan);
+  assert.equal(
+    rehydratedStableIdPlan.orders[0].customOrderId,
+    stored.id,
+    "An assigned Custom Order with an exact canonical reference must recover its stable database ID."
+  );
+  assert.deepEqual(
+    customStops(rehydratedStableIdPlan, stored.refNumber).map((stop) => stop.type),
+    ["pick", "drop"],
+    "Stable-ID recovery must preserve the assigned Custom Order route."
+  );
+
   const aliasHijackRef = `SOB-HIJACK-${runId}`;
   const aliasHijackPlan = submittedCustomPlan(stored, { clientRef: aliasHijackRef });
   await expectPlanError(
@@ -593,6 +608,20 @@ async function verifyBackendCanonicalization(runId) {
     canonicalizeDispatchCustomOrdersInPlan(refMismatchPlan),
     /reference|ref|identity|match/i,
     "A mismatched dispatch reference must be rejected even when order.id and customOrderId are valid."
+  );
+  const conflictingIdentity = await createDispatchCustomOrder(
+    validInput(`CUSTOM-CANON-CONFLICT-${runId}`),
+    "custom-order-harness"
+  );
+  const conflictingIdentityPlan = submittedCustomPlan(stored, {
+    clientRef: conflictingIdentity.refNumber,
+    clientDispatchRef: conflictingIdentity.refNumber
+  });
+  await assert.rejects(
+    canonicalizeDispatchCustomOrdersInPlan(conflictingIdentityPlan),
+    (error) => error instanceof DispatchCustomOrderPlanError
+      && error.code === "DISPATCH_CUSTOM_ORDER_PLAN_ID_MISMATCH",
+    "An explicit stable ID must never be replaced by another Custom Order found through the submitted reference."
   );
 
   const duplicateDropPlan = submittedCustomPlan(stored);

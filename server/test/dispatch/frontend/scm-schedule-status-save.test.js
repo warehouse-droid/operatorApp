@@ -65,8 +65,9 @@ test("PO/TO Schedule submits an explicit order-wide PO destination override", ()
   const patch = vm.runInContext('collectRowPatch("PO::STATUS-SPLIT")', context);
   assert.equal(patch.dropoffPoint, "12441");
   assert.match(client, /function poDestinationOverrideSelectHtml/u);
-  assert.match(client, /Use NetSuite lines/u,
-    "the user must be able to clear a local override and restore retained NetSuite line routing");
+  assert.match(client, /const destinationSource = isSplit \? "Split confirmation" : "NetSuite"/u,
+    "the retained route must disclose whether the split confirmation or NetSuite owns it");
+  assert.match(client, /\$\{scmScheduleEscape\(effectiveDestination\)\} \(\$\{destinationSource\}\)/u);
   assert.match(client, /Overrides all PO lines/u);
 });
 

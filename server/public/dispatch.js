@@ -497,6 +497,8 @@ let orderSearchError = "";
 let orderSearchAbortController = null;
 let dispatchOrderPoolNextCursor = "";
 let dispatchOrderPoolLoadingMore = false;
+let dispatchOrderPoolLoaded = false;
+let dispatchOrderPoolLoadPromise = null;
 const dispatchOrderHydrationPromises = new Map();
 let modalType = "";
 let modalOrderId = "";
@@ -585,6 +587,9 @@ let planPollInFlight = false;
 let eventSource = null;
 let remoteRefreshTimer = null;
 let orderPoolRefreshTimer = null;
+let orderPoolRefreshInFlight = false;
+let orderPoolRefreshTrailing = false;
+let orderPoolRefreshReason = "";
 let orderClickTimer = null;
 let undoStack = [];
 let redoStack = [];
@@ -595,6 +600,7 @@ let isApplyingHistory = false;
 let pendingOperatorAlertRefs = new Set();
 let nextSaveNeedsOrderPoolRefresh = false;
 let pendingTargetedOrderRefreshRefs = new Set();
+let pendingGlobalOrderRetireRefs = new Set();
 let nextPlanSaveMode = "";
 let pendingPlanMutationAction = "dispatch_plan_autosaved";
 let plannedAssignmentRefs = new Set();
@@ -751,6 +757,7 @@ function applyAtomicDependencyMutationPayload(payload) {
 
 async function runAtomicDispatchDependencyMutation({ url, method = "POST", payload = {} } = {}) {
   await saveCurrentPlanNow();
+  await refreshDispatchDependencyPlanFence();
   const dependencyPayload = typeof payload === "function" ? payload() : payload;
   const response = await fetch(url, {
     method,
@@ -763,6 +770,28 @@ async function runAtomicDispatchDependencyMutation({ url, method = "POST", paylo
   if (!response.ok) throw new Error(await dispatchErrorMessage(response));
   const result = await response.json();
   return { payload: result, applied: applyAtomicDependencyMutationPayload(result) };
+}
+
+async function refreshDispatchDependencyPlanFence() {
+  if (!currentPlan?.id) return null;
+  const response = await fetch(`/api/dispatch/plans/${encodeURIComponent(currentPlan.id)}/revision`, {
+    headers: { "Cache-Control": "no-cache" }
+  });
+  if (!response.ok) throw new Error(await dispatchErrorMessage(response));
+  const fence = await response.json();
+  if (String(fence.id || "") !== String(currentPlan.id || "")) {
+    throw new Error("The Dispatch plan changed. Refresh and preview the dependency again.");
+  }
+  currentPlan = {
+    ...currentPlan,
+    revision: Number(fence.revision || 0),
+    digest: fence.digest
+  };
+  minimumPlanRevisionToApply = {
+    planId: String(currentPlan.id || ""),
+    revision: Number(currentPlan.revision || 0)
+  };
+  return fence;
 }
 
 function clearPlanEditHeartbeat() {
@@ -917,6 +946,7 @@ async function enterDispatchEditMode() {
   if (dispatchPlannerSnapshotState !== "ready") {
     throw new Error("Wait until the current Dispatch snapshot is verified before entering Edit Mode.");
   }
+  await refreshPlannedAssignments();
   const response = await fetch("/api/dispatch/plan-edit-lease/acquire", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
@@ -2213,6 +2243,7 @@ function isMbbsSpecialLinkLine(line = {}) {
 }
 
 function isOperationalDispatchItem(item = {}) {
+  if (item.dispatchServiceFee === true) return false;
   if (isMbbsSpecialLinkLine(item)) return true;
   const itemLabel = `${item.sku || ""} ${item.itemName || item.item_name || ""}`.trim();
   const itemType = `${item.itemType || item.item_type || ""} ${item.itemTypeText || item.item_type_text || ""}`.trim();
@@ -2406,16 +2437,22 @@ function poLinkMatchMeta(line = {}, poLineId, poRef) {
 
 function currentPoLinkBoardState(orderRef) {
   const draft = getLinkModalDraft("po", orderRef);
+  const servicePoLineIds = new Set((draft.directServicePoLineIds || []).map(String));
+  const serviceTargetLineKeys = new Set((draft.serviceSalesLineKeys || []).map(String));
   const poLines = poLinkLinesForRef(draft.ref);
-  const salesLines = (poAllocationOptions?.salesLines || []).filter(
-    (line) => poLinkCandidateLinesForSalesLine(line, draft.ref).length
+  const salesLines = poAllocationOptions?.salesLines || [];
+  const materialPoLines = poLines.filter(
+    (line) => !servicePoLineIds.has(String(line.id))
   );
-  const pendingLine = salesLines.find(
+  const materialSalesLines = salesLines.filter(
+    (line) => !serviceTargetLineKeys.has(String(line.targetLineKey))
+  );
+  const pendingLine = materialSalesLines.find(
     (line) => String(line.targetLineKey) === String(draft.pendingSoLineKey || "")
   ) || null;
-  const connections = salesLines.map((line) => {
+  const connections = materialSalesLines.map((line) => {
     const poLineId = String(draft.poLineIds[line.targetLineKey] || "");
-    const poLine = poLines.find((candidate) => String(candidate.id) === poLineId);
+    const poLine = materialPoLines.find((candidate) => String(candidate.id) === poLineId);
     const matchMeta = poLine ? poLinkMatchMeta(line, poLine.id, draft.ref) : null;
     return poLine && matchMeta ? { line, poLine, matchMeta } : null;
   }).filter(Boolean);
@@ -2424,7 +2461,18 @@ function currentPoLinkBoardState(orderRef) {
     counts.set(key, (counts.get(key) || 0) + 1);
     return counts;
   }, new Map());
-  return { draft, poLines, salesLines, pendingLine, connections, linkedCountByPo };
+  return {
+    draft,
+    poLines,
+    salesLines,
+    materialPoLines,
+    materialSalesLines,
+    servicePoLineIds,
+    serviceTargetLineKeys,
+    pendingLine,
+    connections,
+    linkedCountByPo
+  };
 }
 
 function refreshPoLinkBoardInPlace(orderRef) {
@@ -2436,16 +2484,25 @@ function refreshPoLinkBoardInPlace(orderRef) {
 
   for (const card of board.querySelectorAll("[data-po-map-so]")) {
     const targetLineKey = String(card.dataset.targetLineKey || "");
+    const shell = card.closest(".po-match-card");
+    const serviceFeeOnly = state.serviceTargetLineKeys.has(targetLineKey);
     const mappedPoId = String(state.draft.poLineIds[targetLineKey] || "");
-    const mappedPoLine = state.poLines.find((line) => String(line.id) === mappedPoId);
-    const selected = targetLineKey === String(state.draft.pendingSoLineKey || "");
-    card.classList.toggle("mapped", Boolean(mappedPoLine));
-    card.classList.toggle("selected", selected);
+    const mappedPoLine = serviceFeeOnly
+      ? null
+      : state.materialPoLines.find((line) => String(line.id) === mappedPoId);
+    const selected = !serviceFeeOnly && targetLineKey === String(state.draft.pendingSoLineKey || "");
+    shell?.classList.toggle("mapped", Boolean(mappedPoLine));
+    shell?.classList.toggle("selected", selected);
+    shell?.classList.toggle("service-fee", serviceFeeOnly);
+    card.disabled = serviceFeeOnly;
+    card.draggable = !serviceFeeOnly;
     card.setAttribute("aria-pressed", selected ? "true" : "false");
     const status = card.querySelector(".po-match-card-state");
     if (status) {
       status.classList.toggle("connected", Boolean(mappedPoLine));
-      status.textContent = mappedPoLine
+      status.textContent = serviceFeeOnly
+        ? "Service fee only · No physical pickup"
+        : mappedPoLine
         ? `Connected to PO line ${mappedPoLine.lineId || mappedPoLine.id}`
         : "Drag or click to connect";
     }
@@ -2453,22 +2510,30 @@ function refreshPoLinkBoardInPlace(orderRef) {
 
   for (const card of board.querySelectorAll("[data-po-map-po]")) {
     const poLineId = String(card.dataset.poLineId || "");
-    const matchMeta = state.pendingLine ? poLinkMatchMeta(state.pendingLine, poLineId, state.draft.ref) : null;
+    const shell = card.closest(".po-match-card");
+    const serviceFeeOnly = state.servicePoLineIds.has(poLineId);
+    const matchMeta = !serviceFeeOnly && state.pendingLine
+      ? poLinkMatchMeta(state.pendingLine, poLineId, state.draft.ref)
+      : null;
     const linkedCount = state.linkedCountByPo.get(poLineId) || 0;
     const stateClass = !state.pendingLine ? "waiting" : (matchMeta ? (matchMeta.exactMatch ? "exact" : "compatible") : "incompatible");
-    card.classList.remove("waiting", "exact", "compatible", "incompatible");
-    card.classList.add(stateClass);
-    card.classList.toggle("mapped", linkedCount > 0);
-    card.setAttribute("aria-disabled", state.pendingLine && !matchMeta ? "true" : "false");
+    shell?.classList.remove("waiting", "exact", "compatible", "incompatible");
+    if (!serviceFeeOnly) shell?.classList.add(stateClass);
+    shell?.classList.toggle("mapped", linkedCount > 0);
+    shell?.classList.toggle("service-fee", serviceFeeOnly);
+    card.disabled = serviceFeeOnly;
+    card.setAttribute("aria-disabled", serviceFeeOnly || (state.pendingLine && !matchMeta) ? "true" : "false");
     const status = card.querySelector(".po-match-card-state");
     if (status) {
-      const stateText = !state.pendingLine ? "Select SO first" : (matchMeta ? (matchMeta.exactMatch ? "Exact match" : "Manual match allowed") : "Different item");
-      status.textContent = `${stateText}${linkedCount ? ` · ${linkedCount} connection(s)` : ""}`;
+      const stateText = !state.pendingLine ? "Select SO first" : (matchMeta ? (matchMeta.exactMatch ? "Exact match" : "Manual match allowed") : "Different item / UOM");
+      status.textContent = serviceFeeOnly
+        ? "Service fee only · No physical pickup"
+        : `${stateText}${linkedCount ? ` · ${linkedCount} connection(s)` : ""}`;
     }
   }
 
   const counts = board.querySelector("[data-po-match-counts]");
-  if (counts) counts.textContent = `${state.connections.length} matched · ${state.salesLines.length - state.connections.length} remaining`;
+  if (counts) counts.textContent = `${state.connections.length} matched · ${state.materialSalesLines.length - state.connections.length} remaining`;
   const connectorList = board.querySelector('[data-po-match-scroll="connections"]');
   if (connectorList) {
     connectorList.innerHTML = state.connections.map(({ line, poLine, matchMeta }) => `
@@ -2489,7 +2554,7 @@ function refreshPoLinkBoardInPlace(orderRef) {
     const line = salesByKey.get(targetLineKey);
     if (!line) continue;
     const poLineId = String(state.draft.poLineIds[targetLineKey] || "");
-    const poLine = state.poLines.find((candidate) => String(candidate.id) === poLineId);
+    const poLine = state.materialPoLines.find((candidate) => String(candidate.id) === poLineId);
     const matchMeta = poLine ? poLinkMatchMeta(line, poLine.id, state.draft.ref) : null;
     const connected = Boolean(poLine && matchMeta);
     const quantities = state.draft.quantities[targetLineKey] || {};
@@ -2512,10 +2577,15 @@ function refreshPoLinkBoardInPlace(orderRef) {
 function setPoLineMatch(orderRef, targetLineKey, poLineId) {
   captureActiveLinkModalDraft();
   const draft = getLinkModalDraft("po", orderRef);
+  const serviceTargetLineKeys = new Set((draft.serviceSalesLineKeys || []).map(String));
   const salesLine = (poAllocationOptions?.salesLines || []).find(
     (line) => String(line.targetLineKey) === String(targetLineKey)
+      && !serviceTargetLineKeys.has(String(line.targetLineKey))
   );
-  const poLine = poLinkLinesForRef(draft.ref).find((line) => String(line.id) === String(poLineId));
+  const servicePoLineIds = new Set((draft.directServicePoLineIds || []).map(String));
+  const poLine = poLinkLinesForRef(draft.ref).find(
+    (line) => String(line.id) === String(poLineId) && !servicePoLineIds.has(String(line.id))
+  );
   const matchMeta = salesLine ? poLinkMatchMeta(salesLine, poLineId, draft.ref) : null;
   if (!salesLine || !poLine || !matchMeta) return false;
 
@@ -2540,6 +2610,17 @@ function removePoLineMatch(orderRef, targetLineKey) {
   if (!refreshPoLinkBoardInPlace(orderRef)) renderActiveLinkModalInPlace();
 }
 
+function clearPoLinkServiceFeeMatches(draft = {}) {
+  const servicePoLineIds = new Set((draft.directServicePoLineIds || []).map(String));
+  const serviceTargetLineKeys = new Set((draft.serviceSalesLineKeys || []).map(String));
+  for (const [targetLineKey, poLineId] of Object.entries(draft.poLineIds || {})) {
+    if (!serviceTargetLineKeys.has(String(targetLineKey)) && !servicePoLineIds.has(String(poLineId))) continue;
+    draft.poLineIds[targetLineKey] = "";
+    draft.quantities[targetLineKey] = {};
+  }
+  if (serviceTargetLineKeys.has(String(draft.pendingSoLineKey || ""))) draft.pendingSoLineKey = "";
+}
+
 function applyPoLinkDefaultsForRef(orderRef, poRef) {
   const options = poAllocationOptions || {};
   const draft = getLinkModalDraft("po", orderRef);
@@ -2548,12 +2629,30 @@ function applyPoLinkDefaultsForRef(orderRef, poRef) {
   if (!normalizedRef || !selectedPoLines.length) return false;
   draft.quantities = {};
   draft.poLineIds = {};
+  const selectedAllocations = (options.allocations || [])
+    .filter((allocation) => String(allocation.poOrderRef || "").trim().toLowerCase() === normalizedRef);
+  draft.directServicePoLineIds = selectedAllocations
+    .flatMap((allocation) => allocation.directServicePoLines || [])
+    .map((line) => String(line.poLineId || ""))
+    .filter(Boolean);
+  draft.serviceSalesLineKeys = selectedAllocations
+    .flatMap((allocation) => allocation.serviceSalesLines || [])
+    .map((line) => String(line.targetLineKey || ""))
+    .filter(Boolean);
+  const servicePoLineIds = new Set(draft.directServicePoLineIds.map(String));
+  const serviceTargetLineKeys = new Set(draft.serviceSalesLineKeys.map(String));
+  const materialPoLines = selectedPoLines.filter((line) => !servicePoLineIds.has(String(line.id)));
   draft.pendingSoLineKey = "";
   for (const line of options.salesLines || []) {
+    if (serviceTargetLineKeys.has(String(line.targetLineKey))) {
+      draft.poLineIds[line.targetLineKey] = "";
+      draft.quantities[line.targetLineKey] = {};
+      continue;
+    }
     const units = availableUnitsForLine(line);
     const candidateMeta = (line.poCandidates || []).filter((candidate) => poLinkRefMatches(candidate, normalizedRef));
     const candidateIds = new Set(candidateMeta.map((candidate) => String(candidate.poLineId)));
-    const candidates = selectedPoLines.filter((poLine) => candidateIds.has(String(poLine.id)));
+    const candidates = materialPoLines.filter((poLine) => candidateIds.has(String(poLine.id)));
     const exactIds = new Set(candidateMeta.filter((candidate) => candidate.exactMatch).map((candidate) => String(candidate.poLineId)));
     const exactCandidates = candidates.filter((poLine) => exactIds.has(String(poLine.id)));
     const selected = exactCandidates.length === 1 ? exactCandidates[0] : (candidates.length === 1 ? candidates[0] : null);
@@ -2913,6 +3012,15 @@ function canonicalDispatchOrderType(value, id = "") {
   return "SO";
 }
 
+function isAggregateDispatchCoGroup(order = {}) {
+  if (canonicalDispatchOrderType(order.type, order.id) !== "CO") return false;
+  return (order.childOrders || []).some((ref) => String(ref || "").trim().toUpperCase().startsWith("CO-"))
+    || (order.childOrderDetails || []).some((child) => (
+      canonicalDispatchOrderType(child?.type, child?.id) === "CO"
+      || String(child?.id || "").trim().toUpperCase().startsWith("CO-")
+    ));
+}
+
 function flattenDispatchGroupMembers(order = {}) {
   const leafDetails = [];
   const leafIndexById = new Map();
@@ -2967,7 +3075,10 @@ function flattenDispatchGroupMembers(order = {}) {
     );
     for (const childId of childIds) {
       const detail = detailById.get(childId) || { id: childId, type: fallbackType };
-      if (Array.isArray(detail.childOrders) && detail.childOrders.length) {
+      const preserveDirectCo = canonicalDispatchOrderType(order.type, order.id) === "CO"
+        && canonicalDispatchOrderType(detail.type, detail.id) === "CO"
+        && !isAggregateDispatchCoGroup(detail);
+      if (Array.isArray(detail.childOrders) && detail.childOrders.length && !preserveDirectCo) {
         visit(detail, { fallbackType: detail.type || fallbackType });
       } else {
         addLeaf(childId, detail, fallbackType);
@@ -3218,6 +3329,17 @@ function normalizeOrder(order) {
   const pickupLocations = uniqueDispatchLocationLabels(
     order.transitCo?.toYard ? [order.transitCo.toYard] : basePickupLocations
   );
+  const effectiveSourceYard = order.transitCo?.toYard
+    || order.sourceYard
+    || pickupLocations[0]
+    || "";
+  const transitOriginalSourceYard = order.transitCo
+    ? order.transitOriginalSourceYard
+      || order.transitCo.fromYard
+      || order.sourceYard
+      || basePickupLocations[0]
+      || ""
+    : order.transitOriginalSourceYard;
   const dropoffs = normalizePoDropoffs(order, type, items);
   const rawPoRouteProjection = type === "PO" && order.poRouteProjection?.version
     ? order.poRouteProjection
@@ -3255,6 +3377,8 @@ function normalizeOrder(order) {
     layers: Number(order.layers || 0),
     salesQty: Number(order.salesQty || 0),
     weight: Number(order.weight || 0),
+    sourceYard: effectiveSourceYard,
+    ...(transitOriginalSourceYard ? { transitOriginalSourceYard } : {}),
     pickupLocations,
     dropoffs,
     ...(poRouteProjection ? { poRouteProjection } : {}),
@@ -3302,6 +3426,8 @@ function relatedTransitCo(order) {
 function isTransitCoPlanned(order) {
   if (!order?.transitCo?.id) return true;
   const coOrder = relatedTransitCo(order);
+  const status = String(order.transitCo?.status || coOrder?.status || coOrder?.localYardOrderStatus || "").trim().toLowerCase();
+  if (["completed", "received"].includes(status)) return true;
   return allAssignedOrderIds().has(order.transitCo.id) || Boolean(coOrder?.dispatchPlanned);
 }
 
@@ -3555,6 +3681,8 @@ function coTimingViolation(order) {
   if (!order?.transitCo?.id) return "";
   const coId = order.transitCo.id;
   const coOrder = relatedTransitCo(order);
+  const status = String(order.transitCo?.status || coOrder?.status || coOrder?.localYardOrderStatus || "").trim().toLowerCase();
+  if (["completed", "received"].includes(status)) return "";
   const coInCurrentPlan = isOrderAssignedInCurrentPlan(coId);
   const coPlannedDate = coInCurrentPlan ? currentPlanDate : String(coOrder?.dispatchPlanDate || "").slice(0, 10);
   if (!coPlannedDate) return `${order.id} requires ${coId} to be planned first.`;
@@ -4000,18 +4128,19 @@ async function loadDispatchOrderSearch(term, sequence) {
     orderSearchAbortController?.abort();
     orderSearchAbortController = new AbortController();
     const optimizedPool = dispatchConfig.plannerOrderPoolMode === "on";
+    const versionedPool = optimizedPool || dispatchConfig.plannerOrderPoolMode === "shadow";
     const request = dispatchOrderFeedRequest({ search: term });
-    const params = new URLSearchParams({ search: term, limit: "50" });
+    const params = new URLSearchParams({ search: term, limit: "200" });
     if (isDispatchHistoryEditMode()) params.set("historyPlanDate", currentPlanDate);
     const response = await fetch(
-      optimizedPool ? `/api/dispatch/v2/order-pool?${params.toString()}` : request.url,
+      versionedPool ? `/api/dispatch/v2/order-pool?${params.toString()}` : request.url,
       { headers: request.headers, signal: orderSearchAbortController.signal }
     );
     if (!response.ok) throw new Error(await response.text());
     const payload = await response.json();
-    const feed = optimizedPool ? payload.orders : payload;
+    const feed = versionedPool ? payload.orders : payload;
     if (sequence !== orderSearchSequence || term !== searchText.trim()) return;
-    dispatchOrderPoolNextCursor = optimizedPool ? payload.nextCursor || "" : "";
+    dispatchOrderPoolNextCursor = versionedPool ? payload.nextCursor || "" : "";
     mergeDispatchOrderSearchFeed(feed);
     orderSearchError = "";
   } catch (error) {
@@ -4090,33 +4219,51 @@ async function refreshPlannedAssignments() {
 }
 
 async function loadDispatchOrders({ sync = false, append = false } = {}) {
-  try {
-    const optimizedPool = !sync && dispatchConfig.plannerOrderPoolMode === "on";
-    const request = dispatchOrderFeedRequest({ sync });
-    const params = new URLSearchParams({ type: activeOrderType === "BIN" ? "SO" : activeOrderType, limit: "50" });
-    if (append && dispatchOrderPoolNextCursor) params.set("cursor", dispatchOrderPoolNextCursor);
-    if (isDispatchHistoryEditMode()) params.set("historyPlanDate", currentPlanDate);
-    const response = await fetch(optimizedPool ? `/api/dispatch/v2/order-pool?${params.toString()}` : request.url, {
-      method: sync ? "POST" : "GET",
-      headers: request.headers
-    });
-    if (!response.ok) throw new Error(await response.text());
-    const payload = await response.json();
-    if (optimizedPool) {
-      dispatchOrderPoolNextCursor = payload.nextCursor || "";
-      if (append) mergeDispatchOrderSearchFeed(payload.orders || []);
-      else applyDispatchOrderFeed(payload.orders || []);
-    } else {
-      dispatchOrderPoolNextCursor = "";
-      applyDispatchOrderFeed(sync ? payload.orders : payload);
+  if (!sync && !append && dispatchOrderPoolLoadPromise) return dispatchOrderPoolLoadPromise;
+  const requestPromise = (async () => {
+    try {
+      const optimizedPool = !sync && dispatchConfig.plannerOrderPoolMode === "on";
+      const versionedPool = optimizedPool
+        || (!sync && dispatchConfig.plannerOrderPoolMode === "shadow");
+      const request = dispatchOrderFeedRequest({ sync });
+      const params = new URLSearchParams({ type: activeOrderType === "BIN" ? "SO" : activeOrderType, limit: "200" });
+      if (append && dispatchOrderPoolNextCursor) params.set("cursor", dispatchOrderPoolNextCursor);
+      if (isDispatchHistoryEditMode()) params.set("historyPlanDate", currentPlanDate);
+      const response = await fetch(versionedPool ? `/api/dispatch/v2/order-pool?${params.toString()}` : request.url, {
+        method: sync ? "POST" : "GET",
+        headers: request.headers
+      });
+      if (!response.ok) throw new Error(await response.text());
+      const payload = await response.json();
+      if (versionedPool) {
+        dispatchOrderPoolNextCursor = payload.nextCursor || "";
+        if (append) mergeDispatchOrderSearchFeed(payload.orders || []);
+        else applyDispatchOrderFeed(payload.orders || []);
+      } else {
+        dispatchOrderPoolNextCursor = "";
+        applyDispatchOrderFeed(sync ? payload.orders : payload);
+      }
+      dispatchOrderPoolLoaded = true;
+      routeNotice = sync ? "Orders refreshed from local DB." : routeNotice;
+      return true;
+    } catch (error) {
+      routeNotice = sync ? `Order refresh failed: ${error.message}` : routeNotice;
+      applyDispatchOrderFeed(orderCatalog);
+      return false;
     }
-    routeNotice = sync ? "Orders refreshed from local DB." : routeNotice;
-    return true;
-  } catch (error) {
-    routeNotice = sync ? `Order refresh failed: ${error.message}` : routeNotice;
-    applyDispatchOrderFeed(orderCatalog);
-    return false;
+  })();
+  if (sync || append) return requestPromise;
+  dispatchOrderPoolLoadPromise = requestPromise;
+  try {
+    return await requestPromise;
+  } finally {
+    if (dispatchOrderPoolLoadPromise === requestPromise) dispatchOrderPoolLoadPromise = null;
   }
+}
+
+async function loadDispatchOrderPoolForPlanSwitch() {
+  if (dispatchOrderPoolLoaded && !isDispatchHistoryEditMode()) return true;
+  return loadDispatchOrders();
 }
 
 async function loadMoreDispatchOrders() {
@@ -4126,7 +4273,7 @@ async function loadMoreDispatchOrders() {
   try {
     const term = searchText.trim();
     if (term && dispatchConfig.plannerOrderPoolMode === "on") {
-      const params = new URLSearchParams({ search: term, limit: "50", cursor: dispatchOrderPoolNextCursor });
+      const params = new URLSearchParams({ search: term, limit: "200", cursor: dispatchOrderPoolNextCursor });
       const response = await fetch(`/api/dispatch/v2/order-pool?${params.toString()}`);
       if (!response.ok) throw new Error(await dispatchErrorMessage(response));
       const payload = await response.json();
@@ -4393,6 +4540,8 @@ function getLinkModalDraft(type, orderRef) {
       ref: "",
       mode: "direct_to_customer",
       poLineIds: {},
+      directServicePoLineIds: [],
+      serviceSalesLineKeys: [],
       quantities: {},
       targetSignature: "",
       structureWarning: "",
@@ -4435,6 +4584,12 @@ function captureActiveLinkModalDraft() {
       }
       draft.quantities[row.dataset.targetLineKey] = quantities;
     }
+    draft.directServicePoLineIds = [...app.querySelectorAll("[data-po-direct-service-line]:checked")]
+      .map((input) => String(input.value || ""))
+      .filter(Boolean);
+    draft.serviceSalesLineKeys = [...app.querySelectorAll("[data-so-service-fee-line]:checked")]
+      .map((input) => String(input.value || ""))
+      .filter(Boolean);
   }
 }
 
@@ -5178,6 +5333,7 @@ function planPayload(savedAt = new Date()) {
   ]);
   const payloadPlanId = currentPlan?.id || null;
   const payloadPlanDate = currentPlan?.planDate || currentPlanDate;
+  const visibleOrderRefs = new Set(orders.map((order) => String(order?.id || "")).filter(Boolean));
   return {
     planId: payloadPlanId,
     planDate: payloadPlanDate,
@@ -5186,6 +5342,8 @@ function planPayload(savedAt = new Date()) {
     saveMode: nextPlanSaveMode || "",
     savedAt: savedAt.toISOString(),
     mutationAction: pendingPlanMutationAction,
+    retiredGlobalOrderRefs: [...pendingGlobalOrderRetireRefs]
+      .filter((ref) => !visibleOrderRefs.has(ref)),
     refreshOrderPool: Boolean(nextSaveNeedsOrderPoolRefresh),
     summary: planSummary(),
     orders: orders
@@ -5298,9 +5456,27 @@ function reduceDispatchPlanCommand(state, command) {
 }
 
 function isDispatchPlanOwnedOrder(order = {}) {
+  const currentPlanId = String(currentPlan?.id || "").trim();
+  const currentDate = String(currentPlan?.planDate || currentPlanDate || "").slice(0, 10);
+  if (order.globalGroupDefinition === true) {
+    const sourcePlanId = String(order.globalGroupSourcePlanId || "").trim();
+    const sourcePlanDate = String(order.globalGroupSourcePlanDate || "").slice(0, 10);
+    return Boolean(
+      currentPlanId
+      && sourcePlanId === currentPlanId
+      && (!currentDate || !sourcePlanDate || sourcePlanDate === currentDate)
+    );
+  }
+  if (order.globalOrderDefinition === true) {
+    const sourcePlanId = String(order.globalOrderSourcePlanId || "").trim();
+    const sourcePlanDate = String(order.globalOrderSourcePlanDate || "").slice(0, 10);
+    return Boolean(
+      currentPlanId
+      && sourcePlanId === currentPlanId
+      && (!currentDate || !sourcePlanDate || sourcePlanDate === currentDate)
+    );
+  }
   if (Array.isArray(order.childOrders) && order.childOrders.length > 0) {
-    const currentPlanId = String(currentPlan?.id || "").trim();
-    const currentDate = String(currentPlan?.planDate || currentPlanDate || "").slice(0, 10);
     const groupPlanId = String(order.groupPlanId || "").trim();
     const groupPlanDate = String(order.groupPlanDate || "").slice(0, 10);
     const sourcePlanId = String(order.dispatchSnapshotSourcePlanId || "").trim();
@@ -5315,6 +5491,7 @@ function isDispatchPlanOwnedOrder(order = {}) {
     )) return false;
   }
   return ["CO", "CUSTOM", "GROUP"].includes(String(order.type || "").toUpperCase())
+    || String(order.id || "").toUpperCase().startsWith("TO-DRAFT-")
     || Boolean(order.originalOrderId)
     || Boolean(order.transitCo)
     || Boolean(order.planOwned)
@@ -5441,7 +5618,10 @@ function savedPlanHash(saved = {}) {
 }
 
 function payloadRequiresSave(payload = {}, nextHash = stablePlanHashPayload(payload), forceSave = false) {
-  const requiresFollowup = payload.refreshOrderPool || payload.saveMode || pendingOperatorAlertRefs.size;
+  const requiresFollowup = payload.refreshOrderPool
+    || payload.saveMode
+    || pendingOperatorAlertRefs.size
+    || (payload.retiredGlobalOrderRefs || []).length;
   return forceSave || requiresFollowup || nextHash !== lastSavedPlanHash;
 }
 
@@ -5598,6 +5778,7 @@ function transitSourceOrderType(order) {
 }
 
 function transitCoSourceRef(coOrder) {
+  if ((coOrder?.childOrders || []).length || (coOrder?.childOrderDetails || []).length) return "";
   const id = String(coOrder?.id || "");
   return coOrder?.sourceOrderId
     || coOrder?.relatedSoId
@@ -5708,6 +5889,10 @@ function catalogStructureConflictsWithSavedPlan(catalogOrder = {}, savedPlan = {
   ].map((ref) => String(ref || "").trim()).filter(Boolean);
   const groupPlanId = String(catalogOrder.groupPlanId || "").trim();
   const groupPlanDate = String(catalogOrder.groupPlanDate || "").slice(0, 10);
+  if (catalogOrder.globalGroupDefinition === true) {
+    if (catalogOrderId && savedOrderIds.has(catalogOrderId)) return false;
+    return groupedRefs.some((ref) => savedOrderIds.has(ref));
+  }
   if (groupedRefs.length && (
     (sourcePlanId && groupPlanId && sourcePlanId !== groupPlanId)
     || (sourcePlanDate && groupPlanDate && sourcePlanDate !== groupPlanDate)
@@ -5746,7 +5931,14 @@ function savedGroupStructureConflictsWithPlan(order = {}, savedPlan = {}) {
   const groupPlanDate = String(order.groupPlanDate || "").slice(0, 10);
   const sourcePlanId = String(order.dispatchSnapshotSourcePlanId || "").trim();
   const sourcePlanDate = String(order.dispatchSnapshotSourcePlanDate || "").slice(0, 10);
+  const globalSourcePlanId = String(order.globalGroupSourcePlanId || "").trim();
+  const globalSourcePlanDate = String(order.globalGroupSourcePlanDate || "").slice(0, 10);
   return Boolean(
+    (order.globalGroupDefinition === true && (
+      (savedPlanId && globalSourcePlanId && globalSourcePlanId !== savedPlanId)
+      || (savedPlanDate && globalSourcePlanDate && globalSourcePlanDate !== savedPlanDate)
+    ))
+    ||
     (savedPlanId && (
       (groupPlanId && groupPlanId !== savedPlanId)
       || (sourcePlanId && sourcePlanId !== savedPlanId)
@@ -5944,6 +6136,7 @@ function dispatchIncrementalSaveRequest(targetPlanId, payload, options) {
     ? {
         planDelta: buildDispatchPlanWireDelta(lastAcknowledgedPlanState, payload),
         actionName: payload.mutationAction || "dispatch_plan_autosaved",
+        retiredGlobalOrderRefs: payload.retiredGlobalOrderRefs || [],
         operatorAlertRefs,
         refreshOrderPool: Boolean(payload.refreshOrderPool)
       }
@@ -5953,6 +6146,7 @@ function dispatchIncrementalSaveRequest(targetPlanId, payload, options) {
         trucks: payload.trucks || [],
         summary: payload.summary || {},
         actionName: payload.mutationAction || "dispatch_plan_autosaved",
+        retiredGlobalOrderRefs: payload.retiredGlobalOrderRefs || [],
         operatorAlertRefs,
         refreshOrderPool: Boolean(payload.refreshOrderPool)
       };
@@ -5993,6 +6187,7 @@ async function savePlanToServer(payload, { retryOnStale = true, forceSave = fals
     const operatorAlertRefs = [...pendingOperatorAlertRefs];
     const refreshOrderPool = Boolean(payload.refreshOrderPool);
     const targetedOrderRefs = [...pendingTargetedOrderRefreshRefs];
+    const retiredGlobalOrderRefs = [...(payload.retiredGlobalOrderRefs || [])];
     const saveMode = payload.saveMode || "";
     const incrementalSave = shouldUseDispatchIncrementalSave(payload, { forceSave });
     autosaveDebug("savePlanToServer:start", {
@@ -6150,6 +6345,7 @@ async function savePlanToServer(payload, { retryOnStale = true, forceSave = fals
           nextSaveNeedsOrderPoolRefresh = false;
           targetedOrderRefs.forEach((ref) => pendingTargetedOrderRefreshRefs.delete(ref));
         }
+        retiredGlobalOrderRefs.forEach((ref) => pendingGlobalOrderRetireRefs.delete(ref));
         if (saveMode === "truck_sequence") nextPlanSaveMode = "";
         clearLocalPlanDirty(payload.savedAt, saveGeneration);
         loadDispatchForecast({ renderAfter: true }).catch(() => null);
@@ -6185,6 +6381,7 @@ async function savePlanToServer(payload, { retryOnStale = true, forceSave = fals
         nextSaveNeedsOrderPoolRefresh = false;
         targetedOrderRefs.forEach((ref) => pendingTargetedOrderRefreshRefs.delete(ref));
       }
+      retiredGlobalOrderRefs.forEach((ref) => pendingGlobalOrderRetireRefs.delete(ref));
       if (saveMode === "truck_sequence") nextPlanSaveMode = "";
       if (payload.mutationAction === pendingPlanMutationAction) pendingPlanMutationAction = "dispatch_plan_autosaved";
       clearLocalPlanDirty(payload.savedAt, saveGeneration);
@@ -6756,6 +6953,9 @@ async function resetDispatchAfterOrderDataClear() {
   clearTimeout(saveTimer);
   clearTimeout(remoteRefreshTimer);
   clearTimeout(orderPoolRefreshTimer);
+  orderPoolRefreshTimer = null;
+  orderPoolRefreshTrailing = false;
+  orderPoolRefreshReason = "";
   dispatchStorageRemove(DISPATCH_PLAN_KEY);
   currentPlan = null;
   lastSavedAt = "";
@@ -6826,6 +7026,7 @@ async function loadPlanForDate(planDate = currentPlanDate, { createIfMissing = t
     if (candidate?.id) currentPlan = compactCurrentPlan(candidate);
     dispatchStorageSet(DISPATCH_PLAN_DATE_KEY, currentPlanDate);
     await loadDriverJobStatuses();
+    await refreshPlannedAssignments();
     const applied = applyDispatchPlanSnapshotResult(snapshot);
     if (applied.invalid) throw new Error(dispatchPlannerSnapshotError);
     try {
@@ -6893,6 +7094,7 @@ async function restoreServerPlan() {
       routeNotice = "Remote update available. Your unsaved changes are still visible.";
       return false;
     }
+    await refreshPlannedAssignments();
     isApplyingRemotePlan = true;
     currentPlanDate = saved.planDate || currentPlanDate;
     await loadDriverJobStatuses();
@@ -6940,23 +7142,45 @@ async function pollServerPlan() {
   }
 }
 
-function queueDispatchOrderPoolRefresh(reason = "Order data updated.") {
-  window.clearTimeout(orderPoolRefreshTimer);
-  orderPoolRefreshTimer = window.setTimeout(async () => {
-    try {
-      if (!await loadDispatchOrders()) throw new Error("the order feed request failed");
-      if (reason) routeNotice = reason;
-      renderDispatchNoticePatch();
-      renderDispatchOrderPoolPatch();
-      if (modalType === "to-link") {
-        loadOrderDependencyOptions(orderById(modalOrderId)).catch(() => null);
-      } else if (modalType === "po-link") {
-        loadPoAllocationOptions(modalOrderId).catch(() => null);
-      }
-    } catch (error) {
-      routeNotice = `Order-pool refresh failed: ${error.message}`;
-      renderDispatchNoticePatch();
+async function runQueuedDispatchOrderPoolRefresh() {
+  if (orderPoolRefreshInFlight) {
+    orderPoolRefreshTrailing = true;
+    return;
+  }
+  orderPoolRefreshInFlight = true;
+  const reason = orderPoolRefreshReason;
+  try {
+    if (!await loadDispatchOrders()) throw new Error("the order feed request failed");
+    if (reason) routeNotice = reason;
+    renderDispatchNoticePatch();
+    renderDispatchOrderPoolPatch();
+    if (modalType === "to-link") {
+      loadOrderDependencyOptions(orderById(modalOrderId)).catch(() => null);
+    } else if (modalType === "po-link") {
+      loadPoAllocationOptions(modalOrderId).catch(() => null);
     }
+  } catch (error) {
+    routeNotice = `Order-pool refresh failed: ${error.message}`;
+    renderDispatchNoticePatch();
+  } finally {
+    orderPoolRefreshInFlight = false;
+    if (orderPoolRefreshTrailing) {
+      orderPoolRefreshTrailing = false;
+      queueDispatchOrderPoolRefresh(orderPoolRefreshReason);
+    }
+  }
+}
+
+function queueDispatchOrderPoolRefresh(reason = "Order data updated.") {
+  orderPoolRefreshReason = reason || orderPoolRefreshReason;
+  if (orderPoolRefreshInFlight) {
+    orderPoolRefreshTrailing = true;
+    return;
+  }
+  window.clearTimeout(orderPoolRefreshTimer);
+  orderPoolRefreshTimer = window.setTimeout(() => {
+    orderPoolRefreshTimer = null;
+    void runQueuedDispatchOrderPoolRefresh();
   }, 350);
 }
 
@@ -7015,7 +7239,12 @@ function connectEvents() {
     }
 
     if (["dispatch.plan.saved", "dispatch.plan.confirmed", "dispatch.plan.reopened"].includes(event.type)) {
-      if (payload.planDate && payload.planDate !== currentPlanDate) return;
+      if (payload.planDate && payload.planDate !== currentPlanDate) {
+        refreshPlannedAssignments()
+          .then(() => renderDispatchOrderPoolPatch())
+          .catch(() => null);
+        return;
+      }
       autosaveDebug("sse:planEvent", {
         type: event.type,
         sourceSessionId: payload.sourceSessionId || "",
@@ -7131,7 +7360,14 @@ function isOrderPlannedOnAnotherDate(order = {}) {
 }
 
 function isOrderPlannedOutsideCurrentPlan(order = {}) {
-  return Boolean(order?.dispatchPlanned && !isOrderAssignedInCurrentPlan(order.id));
+  if (!order?.dispatchPlanned || isOrderAssignedInCurrentPlan(order.id)) return false;
+  const assignmentPlanId = String(order.dispatchPlanId || "").trim();
+  const activePlanId = String(currentPlan?.id || "").trim();
+  if (assignmentPlanId && activePlanId && assignmentPlanId === activePlanId) return false;
+  const assignmentPlanDate = String(order.dispatchPlanDate || "").slice(0, 10);
+  const activePlanDate = String(currentPlanDate || "").slice(0, 10);
+  if (!assignmentPlanId && assignmentPlanDate && assignmentPlanDate === activePlanDate) return false;
+  return true;
 }
 
 function orderPlannedElsewhereText(order = {}) {
@@ -7143,14 +7379,25 @@ function orderPlannedElsewhereText(order = {}) {
 }
 
 async function jumpToPlannedOrder(orderId) {
+  await refreshPlannedAssignments();
   const order = orderById(orderId);
   const targetDate = String(order?.dispatchPlanDate || "").slice(0, 10);
-  if (!order || !targetDate) return false;
+  if (!order?.dispatchPlanned || !targetDate) {
+    routeNotice = `${orderId} is no longer planned. The order pool has been refreshed.`;
+    render({ save: false });
+    return false;
+  }
   routeNotice = `Loading ${targetDate} plan for ${order.id}...`;
   render({ save: false });
   await loadPlanForDate(targetDate, { createIfMissing: false });
   const assignment = orderAssignment(order.id);
   if (!assignment.load) {
+    const refreshed = orderById(order.id);
+    if (!refreshed?.dispatchPlanned) {
+      routeNotice = `${order.id} is no longer planned. The order pool has been refreshed.`;
+      render({ save: false });
+      return false;
+    }
     routeNotice = `${order.id} is marked planned on ${targetDate}, but the load was not found.`;
     render({ save: false });
     return false;
@@ -12012,12 +12259,20 @@ function renderPoLinkMatchBoard(order, salesLines, poLines, draft) {
     return `<div class="po-match-empty">No lines found for <strong>${escapeHtml(draft.ref)}</strong>. Choose a purchase order from the list.</div>`;
   }
 
-  const pendingLine = salesLines.find(
+  const servicePoLineIds = new Set((draft.directServicePoLineIds || []).map(String));
+  const serviceTargetLineKeys = new Set((draft.serviceSalesLineKeys || []).map(String));
+  const materialPoLines = selectedPoLines.filter(
+    (line) => !servicePoLineIds.has(String(line.id))
+  );
+  const materialSalesLines = salesLines.filter(
+    (line) => !serviceTargetLineKeys.has(String(line.targetLineKey))
+  );
+  const pendingLine = materialSalesLines.find(
     (line) => String(line.targetLineKey) === String(draft.pendingSoLineKey || "")
   );
-  const connections = salesLines.map((line) => {
+  const connections = materialSalesLines.map((line) => {
     const poLineId = String(draft.poLineIds[line.targetLineKey] || "");
-    const poLine = selectedPoLines.find((candidate) => String(candidate.id) === poLineId);
+    const poLine = materialPoLines.find((candidate) => String(candidate.id) === poLineId);
     const matchMeta = poLine ? poLinkMatchMeta(line, poLine.id, draft.ref) : null;
     return poLine && matchMeta ? { line, poLine, matchMeta } : null;
   }).filter(Boolean);
@@ -12026,31 +12281,49 @@ function renderPoLinkMatchBoard(order, salesLines, poLines, draft) {
     counts.set(key, (counts.get(key) || 0) + 1);
     return counts;
   }, new Map());
-  const unmatchedCount = salesLines.length - connections.length;
+  const unmatchedCount = materialSalesLines.length - connections.length;
 
   return `
     <div class="po-match-guide">
       <strong>Match PO and SO lines</strong>
-      <span>Drag an SO card onto its PO card. You can also click the SO card, then click the PO card.</span>
+      <span>Drag or click to connect material lines. Check Service fee only for a non-physical line.</span>
     </div>
     <div class="po-match-board">
       <section class="po-match-column po-match-so-column">
         <header><span>1</span><div><strong>Sales order lines</strong><small>${salesLines.length} line(s)</small></div></header>
         <div class="po-match-card-list" data-po-match-scroll="so">
           ${salesLines.map((line) => {
+            const serviceFeeOnly = serviceTargetLineKeys.has(String(line.targetLineKey));
+            const serviceFeeSelectable = line.serviceFeeSelectable || serviceFeeOnly;
             const mappedPoId = String(draft.poLineIds[line.targetLineKey] || "");
-            const mappedPoLine = selectedPoLines.find((candidate) => String(candidate.id) === mappedPoId);
-            const selected = String(draft.pendingSoLineKey || "") === String(line.targetLineKey);
+            const mappedPoLine = serviceFeeOnly
+              ? null
+              : materialPoLines.find((candidate) => String(candidate.id) === mappedPoId);
+            const selected = !serviceFeeOnly
+              && String(draft.pendingSoLineKey || "") === String(line.targetLineKey);
             return `
-              <button class="po-match-card po-match-so-card ${mappedPoLine ? "mapped" : ""} ${selected ? "selected" : ""}"
-                data-action="select-po-map-so" data-po-map-so="true" data-target-line-key="${escapeHtml(line.targetLineKey || "")}"
-                draggable="true" type="button" aria-pressed="${selected ? "true" : "false"}">
-                <span class="po-match-card-top"><b>${escapeHtml(line.sourceOrderRef || order.id)}</b><em>SO line ${escapeHtml(line.lineId || line.id || "--")}</em></span>
-                <strong>${escapeHtml(line.sku || line.itemName)}</strong>
-                <span class="po-match-card-description">${escapeHtml(line.description || "No description")}</span>
-                <span class="po-match-card-qty">Open ${escapeHtml(availableQtyTextForLine(line))}</span>
-                ${mappedPoLine ? `<span class="po-match-card-state connected">Connected to PO line ${escapeHtml(mappedPoLine.lineId || mappedPoLine.id)}</span>` : `<span class="po-match-card-state">Drag or click to connect</span>`}
-              </button>
+              <article class="po-match-card po-match-so-card ${mappedPoLine ? "mapped" : ""} ${selected ? "selected" : ""} ${serviceFeeOnly ? "service-fee" : ""}">
+                <button class="po-match-card-select" data-action="select-po-map-so" data-po-map-so="true"
+                  data-target-line-key="${escapeHtml(line.targetLineKey || "")}" draggable="${serviceFeeOnly ? "false" : "true"}"
+                  type="button" aria-pressed="${selected ? "true" : "false"}" ${serviceFeeOnly ? "disabled" : ""}>
+                  <span class="po-match-card-top"><b>${escapeHtml(line.sourceOrderRef || order.id)}</b><em>SO line ${escapeHtml(line.lineId || line.id || "--")}</em></span>
+                  <strong>${escapeHtml(line.sku || line.itemName)}</strong>
+                  <span class="po-match-card-description">${escapeHtml(line.description || "No description")}</span>
+                  <span class="po-match-card-qty">Open ${escapeHtml(availableQtyTextForLine(line))}</span>
+                  ${serviceFeeOnly
+                    ? `<span class="po-match-card-state">Service fee only · No physical pickup</span>`
+                    : mappedPoLine
+                      ? `<span class="po-match-card-state connected">Connected to PO line ${escapeHtml(mappedPoLine.lineId || mappedPoLine.id)}</span>`
+                      : `<span class="po-match-card-state">Drag or click to connect</span>`}
+                </button>
+                ${serviceFeeSelectable ? `
+                  <label class="po-match-service-toggle">
+                    <input type="checkbox" data-so-service-fee-line value="${escapeHtml(line.targetLineKey || "")}" ${serviceFeeOnly ? "checked" : ""} />
+                    <span>Service fee only</span>
+                    <em>No physical pickup</em>
+                  </label>
+                ` : ""}
+              </article>
             `;
           }).join("") || `<div class="po-match-empty">No SO lines available.</div>`}
         </div>
@@ -12077,20 +12350,33 @@ function renderPoLinkMatchBoard(order, salesLines, poLines, draft) {
         <header><span>3</span><div><strong>${escapeHtml(selectedPoLines[0]?.poRef || draft.ref)} lines</strong><small>${selectedPoLines.length} line(s)</small></div></header>
         <div class="po-match-card-list" data-po-match-scroll="po">
           ${selectedPoLines.map((poLine) => {
-            const matchMeta = pendingLine ? poLinkMatchMeta(pendingLine, poLine.id, draft.ref) : null;
+            const serviceFeeOnly = servicePoLineIds.has(String(poLine.id));
+            const serviceFeeSelectable = poLine.serviceFeeSelectable || serviceFeeOnly;
+            const matchMeta = !serviceFeeOnly && pendingLine
+              ? poLinkMatchMeta(pendingLine, poLine.id, draft.ref)
+              : null;
             const linkedCount = linkedCountByPo.get(String(poLine.id)) || 0;
             const stateClass = !pendingLine ? "waiting" : (matchMeta ? (matchMeta.exactMatch ? "exact" : "compatible") : "incompatible");
-            const stateText = !pendingLine ? "Select SO first" : (matchMeta ? (matchMeta.exactMatch ? "Exact match" : "Manual match allowed") : "Different item");
+            const stateText = !pendingLine ? "Select SO first" : (matchMeta ? (matchMeta.exactMatch ? "Exact match" : "Manual match allowed") : "Different item / UOM");
             return `
-              <button class="po-match-card po-match-po-card ${stateClass} ${linkedCount ? "mapped" : ""}"
-                data-action="select-po-map-po" data-po-map-po="true" data-po-line-id="${poLine.id}" type="button"
-                aria-disabled="${pendingLine && !matchMeta ? "true" : "false"}">
-                <span class="po-match-card-top"><b>${escapeHtml(poLine.poRef)}</b><em>PO line ${escapeHtml(poLine.lineId || poLine.id || "--")}</em></span>
-                <strong>${escapeHtml(poLine.sku || poLine.itemName)}</strong>
-                <span class="po-match-card-description">${escapeHtml(poLine.description || "No description")}</span>
-                <span class="po-match-card-qty">Open ${escapeHtml(availableQtyTextForLine(poLine))}</span>
-                <span class="po-match-card-state">${escapeHtml(stateText)}${linkedCount ? ` · ${linkedCount} connection(s)` : ""}</span>
-              </button>
+              <article class="po-match-card po-match-po-card ${serviceFeeOnly ? "service-fee" : stateClass} ${linkedCount ? "mapped" : ""}">
+                <button class="po-match-card-select" data-action="select-po-map-po" data-po-map-po="true"
+                  data-po-line-id="${escapeHtml(poLine.id)}" type="button"
+                  aria-disabled="${serviceFeeOnly || (pendingLine && !matchMeta) ? "true" : "false"}" ${serviceFeeOnly ? "disabled" : ""}>
+                  <span class="po-match-card-top"><b>${escapeHtml(poLine.poRef)}</b><em>PO line ${escapeHtml(poLine.lineId || poLine.id || "--")}</em></span>
+                  <strong>${escapeHtml(poLine.sku || poLine.itemName)}</strong>
+                  <span class="po-match-card-description">${escapeHtml(poLine.description || "No description")}</span>
+                  <span class="po-match-card-qty">Open ${escapeHtml(availableQtyTextForLine(poLine))}</span>
+                  <span class="po-match-card-state">${serviceFeeOnly ? "Service fee only · No physical pickup" : `${escapeHtml(stateText)}${linkedCount ? ` · ${linkedCount} connection(s)` : ""}`}</span>
+                </button>
+                ${serviceFeeSelectable ? `
+                  <label class="po-match-service-toggle">
+                    <input type="checkbox" data-po-direct-service-line value="${escapeHtml(poLine.id)}" ${serviceFeeOnly ? "checked" : ""} />
+                    <span>Service fee only</span>
+                    <em>No physical pickup</em>
+                  </label>
+                ` : ""}
+              </article>
             `;
           }).join("")}
         </div>
@@ -12103,15 +12389,26 @@ function renderPoLinkModal(order) {
   const options = poAllocationOptions;
   const draft = getLinkModalDraft("po", order.id);
   draft.poLineIds ||= {};
+  draft.directServicePoLineIds ||= [];
+  draft.serviceSalesLineKeys ||= [];
   draft.pendingSoLineKey ||= "";
   const salesLines = options?.salesLines || [];
   const poLines = options?.poLines || [];
   const allocations = options?.allocations || [];
   const poRefs = [...new Map(poLines.map((line) => [line.poRef, line])).values()];
   const selectedPoLines = poLinkLinesForRef(draft.ref);
-  const matchableSalesLines = selectedPoLines.length
-    ? salesLines.filter((line) => poLinkCandidateLinesForSalesLine(line, draft.ref).length)
-    : salesLines;
+  const selectedDirectServiceIds = new Set((draft.directServicePoLineIds || []).map(String));
+  const selectedServiceSalesKeys = new Set((draft.serviceSalesLineKeys || []).map(String));
+  const materialPoLines = selectedPoLines.filter(
+    (line) => !selectedDirectServiceIds.has(String(line.id))
+  );
+  const materialSalesLines = salesLines.filter(
+    (line) => !selectedServiceSalesKeys.has(String(line.targetLineKey))
+  );
+  const selectedPoHasAllocation = allocations.some(
+    (allocation) => String(allocation.poOrderRef || "").trim().toLowerCase() === String(draft.ref || "").trim().toLowerCase()
+  );
+  const matchableSalesLines = materialSalesLines;
   return `
     <div class="modal-backdrop show" data-link-modal="true">
       <section class="dispatch-modal wide-modal">
@@ -12148,7 +12445,7 @@ function renderPoLinkModal(order) {
                 `).join("")}
               </datalist>
             </label>
-            ${renderPoLinkMatchBoard(order, matchableSalesLines, poLines, draft)}
+            ${renderPoLinkMatchBoard(order, salesLines, selectedPoLines, draft)}
             <div class="po-link-quantity-heading">
               <strong>Connected quantities</strong>
               <span>Only connected SO lines can be entered below.</span>
@@ -12157,7 +12454,7 @@ function renderPoLinkModal(order) {
               ${matchableSalesLines.map((line, index) => {
                 const units = availableUnitsForLine(line);
                 const selectedPoLineId = String(draft.poLineIds[line.targetLineKey] || "");
-                const selectedPoLine = selectedPoLines.find((poLine) => String(poLine.id) === selectedPoLineId);
+                const selectedPoLine = materialPoLines.find((poLine) => String(poLine.id) === selectedPoLineId);
                 const matchMeta = selectedPoLine ? poLinkMatchMeta(line, selectedPoLine.id, draft.ref) : null;
                 const selectedPoHasItem = Boolean(selectedPoLine && matchMeta);
                 const values = Object.fromEntries(units.map(([field]) => [field, draft.quantities[line.targetLineKey]?.[field] ?? 0]));
@@ -12181,12 +12478,12 @@ function renderPoLinkModal(order) {
               `; }).join("")}
             </div>
             <div class="warning-detail">
-              Item code controls which cards can connect. MBBS-Special requires the same sales/purchase UOM and always links by Sales Qty. Manual PLT/LYR/SEC/PCS remain operational display quantities and follow the linked Sales Qty coverage.
+              Item code and UOM together control which cards can connect; a UOM mismatch is a different item. MBBS-Special always links by Sales Qty. Manual PLT/LYR/SEC/PCS remain operational display quantities and follow the linked Sales Qty coverage.
             </div>
             <div class="modal-status" data-modal-status></div>
             <div class="modal-footer">
               <button data-action="close-modal" type="button">Cancel</button>
-              <button class="primary" ${matchableSalesLines.length && !draft.structureWarning ? "" : "disabled"} type="submit">Connect PO Quantity</button>
+              <button class="primary" ${(matchableSalesLines.length || selectedPoHasAllocation) && !draft.structureWarning ? "" : "disabled"} type="submit">Connect PO Quantity</button>
             </div>
           </form>
           ${!poAllocationLoading && !salesLines.length ? `<div class="empty-drop">No SO item line was found.</div>` : ""}
@@ -13099,6 +13396,11 @@ function addOrderToLoad(orderId, loadId, type = "drop", location = "", insertInd
       return false;
     }
   }
+  if (type === "drop" && order.globalGroupDefinition === true && order.childOrders?.length) {
+    order.groupPlanId = String(currentPlan?.id || "");
+    order.groupPlanDate = String(currentPlanDate || "").slice(0, 10);
+    order.planOwned = true;
+  }
   selectedOrderId = orderId;
   selectedLoadId = loadId;
   logDispatchAudit({
@@ -13530,6 +13832,16 @@ function applyGroupedOrderPlanning(grouped, planning = {}) {
   routeNotice = `${grouped.id} grouped in ${planning.truck?.plate || "truck"} ${load.name}.`;
 }
 
+function coGroupSelectionBlockReason(groupItems = []) {
+  const coFlags = groupItems.map((item) =>
+    String(item?.type || "").trim().toUpperCase() === "CO"
+      || String(item?.id || "").trim().toUpperCase().startsWith("CO-")
+  );
+  return coFlags.some(Boolean) && coFlags.some((flag) => !flag)
+    ? "CO orders can only be grouped with other CO orders."
+    : "";
+}
+
 function groupOrder(orderId) {
   const selected = selectedOrders();
   const groupItems = selected.length > 1 ? selected : [];
@@ -13539,6 +13851,11 @@ function groupOrder(orderId) {
   }
   if (groupItems.some((item) => item.type === "CUSTOM")) {
     routeNotice = "Custom Orders cannot be grouped. Plan each Custom Order separately.";
+    return false;
+  }
+  const coBlockReason = coGroupSelectionBlockReason(groupItems);
+  if (coBlockReason) {
+    routeNotice = coBlockReason;
     return false;
   }
   const blockReason = mixedYardGroupBlockReason(groupItems);
@@ -13606,6 +13923,10 @@ function groupOrder(orderId) {
 }
 
 function groupedDispatchOrderId(groupItems = []) {
+  const allCo = groupItems.length > 0 && groupItems.every((item) =>
+    String(item?.type || "").trim().toUpperCase() === "CO"
+      || String(item?.id || "").trim().toUpperCase().startsWith("CO-")
+  );
   const parsed = groupItems.map((item) => {
     const id = String(item?.id || "").trim().toUpperCase();
     const match = id.match(/\b(SO[A-Z]|TO[A-Z]|PO[A-Z])\D*(\d+)/i) || id.match(/^([A-Z]+)[^\d]*(\d+)/);
@@ -13619,7 +13940,8 @@ function groupedDispatchOrderId(groupItems = []) {
   }).sort((a, b) => a.prefix.localeCompare(b.prefix) || a.sortNumber - b.sortNumber || a.sortSuffix.localeCompare(b.sortSuffix) || a.number.localeCompare(b.number));
   const prefixes = [...new Set(parsed.map((item) => item.prefix).filter(Boolean))];
   const prefix = prefixes.length === 1 ? prefixes[0] : `G${prefixes.map((item) => item.replace(/^G/i, "")).join("")}`;
-  return `${prefix}-${parsed.map((item) => item.number).join("-")}`;
+  const groupedRef = `${prefix}-${parsed.map((item) => item.number).join("-")}`;
+  return allCo ? `CO-${groupedRef}` : groupedRef;
 }
 
 function dispatchOrderIdExists(id, excludedIds = new Set()) {
@@ -13722,6 +14044,9 @@ function consolidatePick(orderId, sourceYard) {
     orders.unshift({
       id: draftId,
       type: "TO",
+      sourceOrderId: order.id,
+      globalOrderDefinitionKind: "consolidation",
+      planOwned: true,
       customer: "Consolidate Pick",
       address: `${sourceYard} to ${targetYard}`,
       sourceYard,
@@ -13750,23 +14075,22 @@ function consolidatePick(orderId, sourceYard) {
   selectedOrderIds = new Set([draftId]);
 }
 
-function upsertTransitCoForOrder(orderId, fromYard, toYard) {
+function previewTransitCoForOrder(orderId, fromYard, toYard) {
   const order = orderById(orderId);
   if (!order || !supportsTransitCoForOrder(order)) return null;
   if (!fromYard || !toYard || sameDispatchLocation(fromYard, toYard)) return null;
-  const beforeOrder = summarizeOrder(order);
   const coId = order.transitCo?.id || `CO-${order.id}`;
-  const beforeCo = summarizeOrder(orderById(coId));
-  applyTransitPickupToOrder(order, {
+  const projectedOrder = { ...order };
+  applyTransitPickupToOrder(projectedOrder, {
     coId,
     fromYard,
     toYard,
     createdAt: order.transitCo?.createdAt || new Date().toISOString()
   });
-  order.notes = order.notes?.includes(`Transit via ${toYard}`)
-    ? order.notes
-    : `Transit via ${toYard}. ${order.notes || ""}`.trim();
-  const sourceOrderType = transitSourceOrderType(order);
+  projectedOrder.notes = projectedOrder.notes?.includes(`Transit via ${toYard}`)
+    ? projectedOrder.notes
+    : `Transit via ${toYard}. ${projectedOrder.notes || ""}`.trim();
+  const sourceOrderType = transitSourceOrderType(projectedOrder);
 
   const coOrder = normalizeOrder({
     ...(orderById(coId) || {}),
@@ -13776,17 +14100,17 @@ function upsertTransitCoForOrder(orderId, fromYard, toYard) {
     address: hubAddress(toYard),
     sourceYard: fromYard,
     destinationYard: toYard,
-    expectedDeliveryDate: order.expectedDeliveryDate || "",
+    expectedDeliveryDate: projectedOrder.expectedDeliveryDate || "",
     windowStart: "",
     windowEnd: "",
-    pallets: order.pallets,
-    layers: order.layers,
-    items: (order.items || []).map((item) => ({ ...item })),
-    salesQty: order.salesQty,
-    committedQty: order.salesQty,
-    weight: order.weight,
+    pallets: projectedOrder.pallets,
+    layers: projectedOrder.layers,
+    items: (projectedOrder.items || []).map((item) => ({ ...item })),
+    salesQty: projectedOrder.salesQty,
+    committedQty: projectedOrder.salesQty,
+    weight: projectedOrder.weight,
     pickupLocations: [fromYard],
-    unloadMinutes: order.unloadMinutes,
+    unloadMinutes: projectedOrder.unloadMinutes,
     travelMinutes: yardTravelMinutes(fromYard, toYard),
     sourceOrderId: order.id,
     relatedSoId: order.type === "SO" ? order.id : "",
@@ -13795,13 +14119,31 @@ function upsertTransitCoForOrder(orderId, fromYard, toYard) {
     relatedCustomOrderId: sourceOrderType === "CUSTOM" ? order.id : "",
     transitOrder: true,
     groupKey: `${fromYard} to ${toYard}`,
-    childOrders: order.childOrders || [],
-    childOrderDetails: order.childOrderDetails || [],
+    childOrders: projectedOrder.childOrders || [],
+    childOrderDetails: projectedOrder.childOrderDetails || [],
     sourceOrderType,
     notes: `Local transit depot order for ${order.id}. No NetSuite order.`
   });
 
-  const existingIndex = orders.findIndex((item) => item.id === coId);
+  return { sourceOrder: projectedOrder, coOrder };
+}
+
+function upsertTransitCoForOrder(orderId, fromYard, toYard, preview = null) {
+  const order = orderById(orderId);
+  const projection = preview || previewTransitCoForOrder(orderId, fromYard, toYard);
+  if (!order || !projection) return null;
+  const beforeOrder = summarizeOrder(order);
+  const beforeCo = summarizeOrder(orderById(projection.coOrder.id));
+  applyTransitPickupToOrder(order, {
+    coId: projection.coOrder.id,
+    fromYard,
+    toYard,
+    createdAt: projection.sourceOrder.transitCo?.createdAt
+  });
+  order.notes = projection.sourceOrder.notes;
+  const coOrder = projection.coOrder;
+
+  const existingIndex = orders.findIndex((item) => item.id === coOrder.id);
   if (existingIndex >= 0) orders[existingIndex] = coOrder;
   else {
     const sourceIndex = orders.findIndex((item) => item.id === order.id);
@@ -13811,8 +14153,8 @@ function upsertTransitCoForOrder(orderId, fromYard, toYard) {
   logDispatchAudit({
     action: beforeCo ? "co_updated" : "co_initiated",
     entityType: "order",
-    entityId: coId,
-    orderId: coId,
+    entityId: coOrder.id,
+    orderId: coOrder.id,
     before: { sourceOrder: beforeOrder, coOrder: beforeCo },
     after: { sourceOrder: summarizeOrder(order), coOrder: summarizeOrder(coOrder) },
     details: { sourceOrderId: order.id, fromYard, toYard }
@@ -13829,6 +14171,7 @@ async function saveTransitCoToServer(sourceOrder, coOrder) {
       sourceOrderRef: sourceOrder.id,
       fromYard: coOrder.sourceYard,
       toYard: coOrder.destinationYard,
+      reactivateCancelled: true,
       order: {
         ...coOrder,
         customer: sourceOrder.customer,
@@ -14037,12 +14380,16 @@ app.addEventListener("dragstart", (event) => {
   }
   const poMapSo = event.target.closest("[data-po-map-so]");
   if (poMapSo) {
+    if (poMapSo.disabled) {
+      event.preventDefault();
+      return;
+    }
     captureActiveLinkModalDraft();
     const draft = getLinkModalDraft("po", modalOrderId);
     draft.pendingSoLineKey = poMapSo.dataset.targetLineKey || "";
     refreshPoLinkBoardInPlace(modalOrderId);
     dragged = { type: "po-map-so", targetLineKey: poMapSo.dataset.targetLineKey };
-    poMapSo.classList.add("dragging");
+    poMapSo.closest(".po-match-card")?.classList.add("dragging");
     event.dataTransfer.effectAllowed = "link";
     event.dataTransfer.setData("text/plain", poMapSo.dataset.targetLineKey);
     return;
@@ -14281,10 +14628,10 @@ app.addEventListener("dragover", (event) => {
     return;
   }
   const poMapTarget = event.target.closest("[data-po-map-po]");
-  if (dragged?.type === "po-map-so" && poMapTarget) {
+  if (dragged?.type === "po-map-so" && poMapTarget && !poMapTarget.disabled) {
     event.preventDefault();
     event.dataTransfer.dropEffect = "link";
-    poMapTarget.classList.add("drag-over");
+    poMapTarget.closest(".po-match-card")?.classList.add("drag-over");
     return;
   }
   const list = event.target.closest(".stop-list, .preview-stop-list");
@@ -14306,7 +14653,7 @@ app.addEventListener("dragleave", (event) => {
   const instructionZone = event.target.closest("[data-delivery-instruction-drop-zone]");
   if (instructionZone && !instructionZone.contains(event.relatedTarget)) instructionZone.classList.remove("drag-over");
   event.target.closest("[data-load-card]")?.classList.remove("mbt-bin-drag-over");
-  event.target.closest("[data-po-map-po]")?.classList.remove("drag-over");
+  event.target.closest("[data-po-map-po]")?.closest(".po-match-card")?.classList.remove("drag-over");
   event.target.closest(".stop-list, .preview-stop-list")?.classList.remove("drag-over");
   event.target.closest(".preview-stop-child, .stop-card, .preview-stop")?.classList.remove("drag-over", "insert-before", "insert-after");
   event.target.closest(".timeline-drop-zone")?.classList.remove("drag-over");
@@ -14354,13 +14701,13 @@ app.addEventListener("drop", (event) => {
     return;
   }
   const poMapTarget = event.target.closest("[data-po-map-po]");
-  if (dragged?.type === "po-map-so" && poMapTarget) {
+  if (dragged?.type === "po-map-so" && poMapTarget && !poMapTarget.disabled) {
     event.preventDefault();
-    poMapTarget.classList.remove("drag-over");
+    poMapTarget.closest(".po-match-card")?.classList.remove("drag-over");
     const connected = setPoLineMatch(modalOrderId, dragged.targetLineKey, poMapTarget.dataset.poLineId);
     dragged = null;
     if (!connected) {
-      setModalFormStatus(poMapTarget.closest("form"), "These lines have different item codes and cannot be connected.", "error");
+      setModalFormStatus(poMapTarget.closest("form"), "These lines have different item codes or UOMs and cannot be connected.", "error");
     }
     return;
   }
@@ -14716,6 +15063,7 @@ app.addEventListener("click", async (event) => {
     return;
   }
   if (action === "select-po-map-so") {
+    if (button.disabled) return;
     captureActiveLinkModalDraft();
     const draft = getLinkModalDraft("po", modalOrderId);
     draft.pendingSoLineKey = button.dataset.targetLineKey || "";
@@ -14723,6 +15071,7 @@ app.addEventListener("click", async (event) => {
     return;
   }
   if (action === "select-po-map-po") {
+    if (button.disabled) return;
     captureActiveLinkModalDraft();
     const draft = getLinkModalDraft("po", modalOrderId);
     const form = button.closest("form");
@@ -14731,7 +15080,7 @@ app.addEventListener("click", async (event) => {
       return;
     }
     if (!setPoLineMatch(modalOrderId, draft.pendingSoLineKey, button.dataset.poLineId)) {
-      setModalFormStatus(form, "These lines have different item codes and cannot be connected.", "error");
+      setModalFormStatus(form, "These lines have different item codes or UOMs and cannot be connected.", "error");
     }
     return;
   }
@@ -14828,7 +15177,12 @@ app.addEventListener("click", async (event) => {
   if (action === "ungroup-order") {
     const grouped = orderById(actionOrderId);
     const refreshRefs = [...(grouped?.childOrders || [])];
-    ungroupOrder(actionOrderId);
+    const restored = ungroupOrder(actionOrderId);
+    if (!restored) {
+      render({ save: false });
+      return;
+    }
+    pendingGlobalOrderRetireRefs.add(actionOrderId);
     requestTargetedOrderPoolRefresh(refreshRefs);
     commitPlanMutation("ungroup_order");
     return;
@@ -15032,11 +15386,17 @@ app.addEventListener("click", async (event) => {
     return;
   }
   if (action === "confirm-group") {
-    const before = selectedOrders().map(summarizeOrder);
+    const selectedBefore = selectedOrders();
+    const before = selectedBefore.map(summarizeOrder);
+    const replacedGroupRefs = selectedBefore
+      .filter((order) => Array.isArray(order.childOrders) && order.childOrders.length)
+      .map((order) => String(order.id || ""))
+      .filter(Boolean);
     if (!groupOrder(button.dataset.order)) {
       render({ save: false });
       return;
     }
+    replacedGroupRefs.forEach((ref) => pendingGlobalOrderRetireRefs.add(ref));
     requestTargetedOrderPoolRefresh([selectedOrderId]);
     logDispatchAudit({
       action: "orders_grouped",
@@ -15585,7 +15945,13 @@ app.addEventListener("change", (event) => {
     return;
   }
   if (["po-link", "to-link"].includes(modalType) && event.target.closest('[data-link-modal="true"]')) {
+    const serviceFeeChoiceChanged = modalType === "po-link"
+      && event.target.matches("[data-so-service-fee-line], [data-po-direct-service-line]");
     captureActiveLinkModalDraft();
+    if (serviceFeeChoiceChanged) {
+      clearPoLinkServiceFeeMatches(getLinkModalDraft("po", modalOrderId));
+      renderActiveLinkModalInPlace();
+    }
     return;
   }
   if (event.target?.dataset?.stopTimeOverride !== undefined) {
@@ -15636,7 +16002,7 @@ app.addEventListener("change", (event) => {
         }
         if (isDispatchPlanEditor()) await releaseDispatchEditMode();
         const result = await loadPlanForDate(nextDate, { createIfMissing: false });
-        await Promise.all([loadDispatchOrders(), loadMbtBinFrontLegs()]);
+        await Promise.all([loadDispatchOrderPoolForPlanSwitch(), loadMbtBinFrontLegs()]);
         return result;
       })
       .then((result) => {
@@ -16201,7 +16567,10 @@ app.addEventListener("submit", async (event) => {
       setModalFormStatus(form, "Enter a PO number before connecting.", "error");
       return;
     }
-    if (!lines.length) {
+    const hasExistingPoLink = (poAllocationOptions?.allocations || []).some(
+      (allocation) => String(allocation.poOrderRef || "").trim().toLowerCase() === poRef.toLowerCase()
+    );
+    if (!lines.length && !hasExistingPoLink) {
       setModalFormStatus(form, "Enter quantity for at least one connected SO item.", "error");
       return;
     }
@@ -16225,6 +16594,8 @@ app.addEventListener("submit", async (event) => {
       payload: {
         poRef,
         lines,
+        directServicePoLineIds: draft.directServicePoLineIds || [],
+        serviceSalesLineKeys: draft.serviceSalesLineKeys || [],
         targetSignature: draft.targetSignature,
         audit: { sessionId: dispatchSessionId }
       }
@@ -16266,18 +16637,17 @@ app.addEventListener("submit", async (event) => {
       return;
     }
     const submitButton = form.querySelector("button[type='submit']");
-    const beforeOrders = structuredClone(orders);
-    const beforeOrderCatalog = structuredClone(orderCatalog);
-    const beforeAssignedEvidence = structuredClone(assignedOrderEvidenceById);
     if (submitButton) {
       submitButton.disabled = true;
       submitButton.textContent = "Creating...";
     }
     setEditFormStatus(form, "Creating the local CO...", "info");
     try {
-      const coOrder = upsertTransitCoForOrder(order.id, transitFromYard, transitToYard);
-      if (!coOrder) throw new Error("The selected CO route is invalid.");
-      await saveTransitCoToServer(orderById(order.id) || order, coOrder);
+      const preview = previewTransitCoForOrder(order.id, transitFromYard, transitToYard);
+      if (!preview) throw new Error("The selected CO route is invalid.");
+      await saveTransitCoToServer(preview.sourceOrder, preview.coOrder);
+      const coOrder = upsertTransitCoForOrder(order.id, transitFromYard, transitToYard, preview);
+      if (!coOrder) throw new Error("The source order is no longer available. Refresh Dispatch Planning.");
       activeOrderType = "CO";
       requestTargetedOrderPoolRefresh([order.id, coOrder.id]);
       modalType = "";
@@ -16286,9 +16656,6 @@ app.addEventListener("submit", async (event) => {
       clearActiveRouteEstimates();
       commitPlanMutation("co_created");
     } catch (error) {
-      orders = beforeOrders;
-      orderCatalog = beforeOrderCatalog;
-      assignedOrderEvidenceById = beforeAssignedEvidence;
       if (submitButton) {
         submitButton.disabled = false;
         submitButton.textContent = "Create CO";
@@ -16324,15 +16691,14 @@ app.addEventListener("submit", async (event) => {
     setEditFormStatus(form, "Saving dispatch info...", "info");
     const localCoOnlySource = ["VRMA", "CUSTOM"].includes(transitSourceOrderType(order));
     if (wantsTransitCo && localCoOnlySource) {
-      const beforeOrders = structuredClone(orders);
-      const beforeOrderCatalog = structuredClone(orderCatalog);
-      const beforeAssignedEvidence = structuredClone(assignedOrderEvidenceById);
       if (submitButton) submitButton.textContent = "Creating...";
       setEditFormStatus(form, "Creating the local CO...", "info");
       try {
-        const coOrder = upsertTransitCoForOrder(order.id, transitFromYard, transitToYard);
-        if (!coOrder) throw new Error("The selected CO route is invalid.");
-        await saveTransitCoToServer(orderById(order.id) || order, coOrder);
+        const preview = previewTransitCoForOrder(order.id, transitFromYard, transitToYard);
+        if (!preview) throw new Error("The selected CO route is invalid.");
+        await saveTransitCoToServer(preview.sourceOrder, preview.coOrder);
+        const coOrder = upsertTransitCoForOrder(order.id, transitFromYard, transitToYard, preview);
+        if (!coOrder) throw new Error("The source order is no longer available. Refresh Dispatch Planning.");
         activeOrderType = "CO";
         requestTargetedOrderPoolRefresh([order.id, coOrder.id]);
         modalType = "";
@@ -16341,9 +16707,6 @@ app.addEventListener("submit", async (event) => {
         clearActiveRouteEstimates();
         commitPlanMutation("co_created");
       } catch (error) {
-        orders = beforeOrders;
-        orderCatalog = beforeOrderCatalog;
-        assignedOrderEvidenceById = beforeAssignedEvidence;
         if (submitButton) {
           submitButton.disabled = false;
           submitButton.textContent = "Save Dispatch Info";

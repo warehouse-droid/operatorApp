@@ -17,8 +17,10 @@ function positiveInteger(value) {
 
 /** @param {unknown} value */
 function numberValue(value) {
-  if (value && typeof value === "object" && Object.hasOwn(value, "value")) {
-    return Number(/** @type {{value?: unknown}} */ (value).value);
+  if (value && typeof value === "object") {
+    const reference = /** @type {{value?: unknown, id?: unknown}} */ (value);
+    if (Object.hasOwn(reference, "value")) {return Number(reference.value);}
+    if (Object.hasOwn(reference, "id")) {return Number(reference.id);}
   }
   return Number(value);
 }
@@ -83,7 +85,7 @@ function itemsByUniqueLine(items, subject) {
   /** @type {Map<number, Record<string, any>>} */
   const indexed = new Map();
   for (const item of items) {
-    const orderLine = Number(item.orderLine ?? item.orderline);
+    const orderLine = Number(item.orderLine ?? item.orderline ?? item.line);
     if (!Number.isSafeInteger(orderLine) || indexed.has(orderLine)) {
       throw mismatch(`The ${subject} NetSuite transaction has ambiguous line identities.`);
     }

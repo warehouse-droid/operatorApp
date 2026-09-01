@@ -69,9 +69,11 @@ export function validateSmartScmPlanningRunSnapshot({ states = [], proposals = [
       itemId: identity.itemId,
       itemName: identity.itemName,
       requiredPallets: 0,
-      proposedPallets: 0
+      proposedPallets: 0,
+      blanketCoveragePallets: 0
     };
     sku.requiredPallets += number(state.requiredPallets);
+    sku.blanketCoveragePallets += number(state.blanketCoveragePallets);
     skuTotals.set(identity.itemId, sku);
   }
 
@@ -179,6 +181,10 @@ export function validateSmartScmPlanningRunSnapshot({ states = [], proposals = [
     const capacity = number(state.capacity);
     const minimumOrder = number(state.minimumOrder, 1);
     const requiredPallets = number(state.requiredPallets);
+    const blanketCoveragePallets = number(state.blanketCoveragePallets);
+    const residualRequiredPallets = state.residualRequiredPallets === undefined
+      ? requiredPallets
+      : number(state.residualRequiredPallets);
     const availablePallets = number(state.availablePallets);
     const expected = calculateSmartScmOrderRequirement({
       positionPallets,
@@ -192,10 +198,11 @@ export function validateSmartScmPlanningRunSnapshot({ states = [], proposals = [
       phases: {}
     };
     const proposedPallets = number(coverage.proposedPallets);
+    const combinedCoveragePallets = proposedPallets + blanketCoveragePallets;
     const policyFinalPosition = positionPallets + requiredPallets;
-    const proposalFinalPosition = positionPallets + proposedPallets;
+    const proposalFinalPosition = positionPallets + combinedCoveragePallets;
     const finalAbovePsl = Math.max(0, proposalFinalPosition - preferred);
-    if (proposedPallets > EPSILON) {
+    if (combinedCoveragePallets > EPSILON) {
       maximumFinalAbovePslPallets = Math.max(maximumFinalAbovePslPallets, finalAbovePsl);
     }
     if (positionPallets < rop - EPSILON) underRopCount += 1;
@@ -211,6 +218,24 @@ export function validateSmartScmPlanningRunSnapshot({ states = [], proposals = [
         minimumOrder,
         requiredPallets,
         expectedRequiredPallets: expected.requiredPallets
+      });
+    }
+    if (blanketCoveragePallets < -EPSILON
+      || blanketCoveragePallets > Math.floor(requiredPallets) + EPSILON) {
+      addFailure("invalid_blanket_coverage", {
+        ...identity,
+        requiredPallets,
+        blanketCoveragePallets
+      });
+    }
+    const expectedResidualPallets = Math.max(0, requiredPallets - blanketCoveragePallets);
+    if (Math.abs(residualRequiredPallets - expectedResidualPallets) > EPSILON) {
+      addFailure("blanket_residual_mismatch", {
+        ...identity,
+        requiredPallets,
+        blanketCoveragePallets,
+        residualRequiredPallets,
+        expectedResidualPallets: round(expectedResidualPallets)
       });
     }
     if (positionPallets < rop - EPSILON
@@ -239,29 +264,32 @@ export function validateSmartScmPlanningRunSnapshot({ states = [], proposals = [
         });
       }
     }
-    if (proposedPallets > requiredPallets + EPSILON) {
+    if (combinedCoveragePallets > requiredPallets + EPSILON) {
       coverageAboveRequiredCount += 1;
       addFailure("coverage_exceeds_required", {
         ...identity,
         requiredPallets,
         proposedPallets: round(proposedPallets),
-        excessPallets: round(proposedPallets - requiredPallets),
+        blanketCoveragePallets: round(blanketCoveragePallets),
+        combinedCoveragePallets: round(combinedCoveragePallets),
+        excessPallets: round(combinedCoveragePallets - requiredPallets),
         phases: coverage.phases
       });
-    } else if (requiredPallets > proposedPallets + EPSILON) {
+    } else if (requiredPallets > combinedCoveragePallets + EPSILON) {
       coverageBelowRequiredCount += 1;
       addWarning("coverage_below_required", {
         ...identity,
         requiredPallets,
         proposedPallets: round(proposedPallets),
-        uncoveredPallets: round(requiredPallets - proposedPallets),
+        blanketCoveragePallets: round(blanketCoveragePallets),
+        combinedCoveragePallets: round(combinedCoveragePallets),
+        uncoveredPallets: round(requiredPallets - combinedCoveragePallets),
         temporarilyExcluded: state.policy?.temporarily_excluded === true,
-        blanketPlanningExcluded: state.policy?.blanket_po_planning_excluded === true,
         phases: coverage.phases
       });
     }
     const allowedPslOvershoot = Math.max(1, minimumOrder);
-    if (proposedPallets > EPSILON
+    if (combinedCoveragePallets > EPSILON
       && proposalFinalPosition > preferred + allowedPslOvershoot + EPSILON) {
       finalPositionFarAbovePslCount += 1;
       addFailure("final_position_far_above_psl", {
@@ -270,6 +298,8 @@ export function validateSmartScmPlanningRunSnapshot({ states = [], proposals = [
         preferred,
         requiredPallets,
         proposedPallets: round(proposedPallets),
+        blanketCoveragePallets: round(blanketCoveragePallets),
+        combinedCoveragePallets: round(combinedCoveragePallets),
         proposalFinalPosition: round(proposalFinalPosition),
         abovePslPallets: round(proposalFinalPosition - preferred),
         allowedPslOvershoot
@@ -296,6 +326,9 @@ export function validateSmartScmPlanningRunSnapshot({ states = [], proposals = [
       minimumOrder: round(minimumOrder),
       requiredPallets: round(requiredPallets),
       proposedPallets: round(proposedPallets),
+      blanketCoveragePallets: round(blanketCoveragePallets),
+      residualRequiredPallets: round(residualRequiredPallets),
+      combinedCoveragePallets: round(combinedCoveragePallets),
       policyFinalPosition: round(policyFinalPosition),
       proposalFinalPosition: round(proposalFinalPosition),
       urgent: Boolean(state.urgent),
@@ -305,14 +338,17 @@ export function validateSmartScmPlanningRunSnapshot({ states = [], proposals = [
 
   let skuCoverageAboveRequiredCount = 0;
   for (const sku of skuTotals.values()) {
-    if (sku.proposedPallets > sku.requiredPallets + EPSILON) {
+    const combinedCoveragePallets = sku.proposedPallets + sku.blanketCoveragePallets;
+    if (combinedCoveragePallets > sku.requiredPallets + EPSILON) {
       skuCoverageAboveRequiredCount += 1;
       addFailure("sku_coverage_exceeds_required", {
         itemId: sku.itemId,
         itemName: sku.itemName,
         requiredPallets: round(sku.requiredPallets),
         proposedPallets: round(sku.proposedPallets),
-        excessPallets: round(sku.proposedPallets - sku.requiredPallets)
+        blanketCoveragePallets: round(sku.blanketCoveragePallets),
+        combinedCoveragePallets: round(combinedCoveragePallets),
+        excessPallets: round(combinedCoveragePallets - sku.requiredPallets)
       });
     }
   }
@@ -327,6 +363,11 @@ export function validateSmartScmPlanningRunSnapshot({ states = [], proposals = [
     proposalLineCount,
     totalRequiredPallets: round(states.reduce((sum, state) => sum + number(state.requiredPallets), 0)),
     totalProposedPallets: round([...coverageByItemYard.values()].reduce((sum, row) => sum + number(row.proposedPallets), 0)),
+    totalBlanketCoveragePallets: round(states.reduce((sum, state) => sum + number(state.blanketCoveragePallets), 0)),
+    totalCombinedCoveragePallets: round(
+      [...coverageByItemYard.values()].reduce((sum, row) => sum + number(row.proposedPallets), 0)
+        + states.reduce((sum, state) => sum + number(state.blanketCoveragePallets), 0)
+    ),
     zeroAvailableShortageCount,
     zeroAvailableNotUrgentCount,
     coverageAboveRequiredCount,

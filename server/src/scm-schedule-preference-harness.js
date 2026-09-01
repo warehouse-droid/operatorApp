@@ -30,8 +30,9 @@ for (const expected of [
   assert(client.includes(expected), `Schedule preference client is missing ${expected}.`);
 }
 assert(
-  client.includes('(key === "kind" || key === "method") && !scmScheduleCanShowScmWorkingControls()'),
-  "Hidden SCM-only Type and Method preferences can still constrain another schedule view."
+  client.includes('key === "kind" && !scmScheduleCanShowTypeFilter()')
+    && client.includes('key === "method" && !scmScheduleCanShowScmWorkingControls()'),
+  "Hidden Type or Method preferences can still constrain an unsupported schedule view."
 );
 const applyHandler = client.match(/async function applyScmScheduleFilters\(\) \{([\s\S]*?)\n\}/)?.[1] || "";
 assert(applyHandler.includes("saveScmScheduleFilterPreference()"), "Apply does not persist the signed-in user's filters.");
@@ -52,7 +53,7 @@ for (const expected of [
 ]) {
   assert(server.includes(expected), `Schedule preference routes are missing ${expected}.`);
 }
-assert(html.includes("/scm-schedule.js?v=20260827-schedule-remarks-v1"),
+assert(html.includes("/scm-schedule.js?v=20260829-netsuite-destination-label-v1"),
   "Schedule preference client cache bust is missing.");
 assert(migration.includes("PRIMARY KEY (operator_id, surface)"), "Schedule preferences are not isolated by user and surface.");
 assert(migration.includes("REFERENCES operators(id) ON DELETE CASCADE"), "Deleted staff accounts retain schedule preferences.");
@@ -92,11 +93,11 @@ assert.deepEqual(
   }, { surface: "dispatch" }),
   {
     surface: "dispatch",
-    kind: "",
+    kind: "TO",
     method: "",
     status: ["Completed"]
   },
-  "Dispatch must not persist hidden SCM-only Type or Method filters."
+  "Dispatch must persist its visible Type filter but never its hidden Method filter."
 );
 assert.throws(
   () => normalizeScmSchedulePreference({ status: ["Not a status"] }, { surface: "scm" }),
@@ -163,7 +164,7 @@ try {
       method: "Vendor",
       status: ["Completed"]
     });
-    assert.equal(dispatchSaved.kind, "");
+    assert.equal(dispatchSaved.kind, "PO");
     assert.equal(dispatchSaved.method, "");
     assert.deepEqual(dispatchSaved.status, ["Completed"]);
   });

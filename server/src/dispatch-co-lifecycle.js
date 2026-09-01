@@ -1,4 +1,5 @@
 import { query, withTransaction } from "./db.js";
+import { canonicalizeDispatchCoGroupIdentities } from "./dispatch-co-group-identity.js";
 import { DISPATCH_FLEET_PLANNING_LOCK } from "./dispatch-fleet-status.js";
 import {
   applyActiveTransitCoMetadata,
@@ -25,6 +26,9 @@ function orderRefs(order = {}) {
     if (ref) refs.add(ref);
     const coRef = text(candidate.transitCo?.id);
     if (coRef) refs.add(coRef);
+    for (const childRef of Array.isArray(candidate.childOrders) ? candidate.childOrders : []) {
+      if (text(childRef)) refs.add(text(childRef));
+    }
     for (const child of Array.isArray(candidate.childOrderDetails) ? candidate.childOrderDetails : []) visit(child);
   };
   visit(order);
@@ -39,21 +43,59 @@ function stopOrderRefs(stop = {}) {
     stop.order_ref,
     stop.tranid,
     ...(Array.isArray(stop.orderRefs) ? stop.orderRefs : []),
-    ...(Array.isArray(stop.order_refs) ? stop.order_refs : [])
+    ...(Array.isArray(stop.order_refs) ? stop.order_refs : []),
+    ...(Array.isArray(stop.groupedOrderRefs) ? stop.groupedOrderRefs : []),
+    ...(Array.isArray(stop.grouped_order_refs) ? stop.grouped_order_refs : [])
   ].map(text).filter(Boolean))];
+}
+
+function isCoRef(value) {
+  return text(value).toUpperCase().startsWith("CO-");
+}
+
+function isAggregateCoGroup(order = {}) {
+  if (text(order.type).toUpperCase() !== "CO") return false;
+  return (Array.isArray(order.childOrders) ? order.childOrders : []).some(isCoRef)
+    || (Array.isArray(order.childOrderDetails) ? order.childOrderDetails : []).some((child) =>
+      text(child?.type).toUpperCase() === "CO" || isCoRef(orderRef(child))
+    );
+}
+
+function coRefsInOrder(order = {}) {
+  const refs = [...orderRefs(order)].filter(isCoRef);
+  if (!isAggregateCoGroup(order)) return refs;
+  const aggregateRef = orderRef(order).toLowerCase();
+  return refs.filter((ref) => ref.toLowerCase() !== aggregateRef);
+}
+
+function coMembershipByOrder(plan = {}) {
+  return new Map((Array.isArray(plan.orders) ? plan.orders : [])
+    .map((order) => [orderRef(order).toLowerCase(), coRefsInOrder(order)])
+    .filter(([ref]) => ref));
 }
 
 function assignedCoRefs(plan = {}) {
   const refs = new Set();
+  const membership = coMembershipByOrder(plan);
+  const add = (candidate) => {
+    const ref = text(candidate);
+    if (!ref) return;
+    const memberRefs = membership.get(ref.toLowerCase()) || [];
+    if (memberRefs.length) {
+      for (const childRef of memberRefs) refs.add(childRef);
+    } else if (isCoRef(ref)) {
+      refs.add(ref);
+    }
+  };
   for (const truck of Array.isArray(plan.trucks) ? plan.trucks : []) {
     for (const load of Array.isArray(truck?.loads) ? truck.loads : []) {
       for (const candidate of Array.isArray(load?.orders) ? load.orders : []) {
         const ref = typeof candidate === "string" ? text(candidate) : orderRef(candidate);
-        if (ref.toUpperCase().startsWith("CO-")) refs.add(ref);
+        add(ref);
       }
       for (const stop of Array.isArray(load?.stops) ? load.stops : []) {
         for (const ref of stopOrderRefs(stop)) {
-          if (ref.toUpperCase().startsWith("CO-")) refs.add(ref);
+          add(ref);
         }
       }
     }
@@ -66,6 +108,7 @@ function planConflictRows(planRows = [], coRef = "") {
   const conflicts = [];
   for (const row of planRows || []) {
     if (String(row.status || "").toLowerCase() === "cancelled") continue;
+    const membership = coMembershipByOrder(row);
     for (const truck of Array.isArray(row.trucks) ? row.trucks : []) {
       for (const load of Array.isArray(truck?.loads) ? truck.loads : []) {
         const loadRefs = new Set();
@@ -76,7 +119,10 @@ function planConflictRows(planRows = [], coRef = "") {
         for (const stop of Array.isArray(load?.stops) ? load.stops : []) {
           for (const ref of stopOrderRefs(stop)) loadRefs.add(ref.toLowerCase());
         }
-        if (!loadRefs.has(target)) continue;
+        const containsTarget = [...loadRefs].some((ref) =>
+          ref === target || (membership.get(ref) || []).some((childRef) => childRef.toLowerCase() === target)
+        );
+        if (!containsTarget) continue;
         conflicts.push({
           planId: text(row.id || row.plan_id),
           planDate: planDate(row.plan_date || row.planDate),
@@ -128,7 +174,7 @@ async function lockDispatchCoLifecycle() {
 
 async function activePlanRows() {
   const result = await query(
-    `SELECT p.id::text, p.plan_date::text AS plan_date, p.status, s.trucks
+    `SELECT p.id::text, p.plan_date::text AS plan_date, p.status, s.orders, s.trucks
        FROM dispatch_plans p
        LEFT JOIN dispatch_plan_snapshots s ON s.plan_id = p.id
       WHERE p.status <> 'cancelled'
@@ -149,7 +195,7 @@ export async function cancelDispatchCoGlobally(coRef, { requestedBy = "" } = {})
       [cleanRef]
     );
     const co = localResult.rows[0];
-    if (!co || ["received", "loaded"].includes(String(co.status || "").toLowerCase())) return null;
+    if (!co || ["received", "loaded", "completed"].includes(String(co.status || "").toLowerCase())) return null;
 
     const rows = await activePlanRows();
     const conflicts = planConflictRows(rows, cleanRef);
@@ -212,13 +258,33 @@ export async function assertActiveDispatchCosForPlan(plan = {}) {
 
 export async function reconcileDispatchPlanLocalCos(plan) {
   if (!plan) return null;
+  plan = canonicalizeDispatchCoGroupIdentities(plan);
   const sourceRefs = new Set();
   const coRefs = new Set();
-  for (const order of Array.isArray(plan.orders) ? plan.orders : []) {
-    for (const ref of orderRefs(order)) {
-      if (ref.toUpperCase().startsWith("CO-")) coRefs.add(ref);
-      else sourceRefs.add(ref);
+  const transitFallbackByRef = new Map();
+  const collect = (order = {}) => {
+    const ref = orderRef(order);
+    if (ref && !(isCoRef(ref) && isAggregateCoGroup(order))) {
+      (isCoRef(ref) ? coRefs : sourceRefs).add(ref);
     }
+    const transitRef = text(order.transitCo?.id);
+    if (transitRef) {
+      coRefs.add(transitRef);
+      transitFallbackByRef.set(transitRef.toLowerCase(), {
+        coRef: transitRef,
+        sourceOrderRef: ref,
+        fromYard: text(order.transitCo?.fromYard || order.transitOriginalSourceYard),
+        toYard: text(order.transitCo?.toYard)
+      });
+    }
+    for (const childRef of Array.isArray(order.childOrders) ? order.childOrders : []) {
+      const cleanRef = text(childRef);
+      if (cleanRef) (isCoRef(cleanRef) ? coRefs : sourceRefs).add(cleanRef);
+    }
+    for (const child of Array.isArray(order.childOrderDetails) ? order.childOrderDetails : []) collect(child);
+  };
+  for (const order of Array.isArray(plan.orders) ? plan.orders : []) {
+    collect(order);
   }
   if (!sourceRefs.size && !coRefs.size) return plan;
   const result = await query(
@@ -230,6 +296,7 @@ export async function reconcileDispatchPlanLocalCos(plan) {
     [[...sourceRefs].map((ref) => ref.toLowerCase()), [...coRefs].map((ref) => ref.toLowerCase())]
   );
   const cancelledByRef = new Map();
+  const activeByRef = new Map();
   const activeBySource = new Map();
   for (const row of result.rows) {
     const record = {
@@ -237,17 +304,119 @@ export async function reconcileDispatchPlanLocalCos(plan) {
       sourceOrderRef: text(row.source_order_ref),
       fromYard: text(row.from_location),
       toYard: text(row.to_location),
+      status: text(row.status),
       createdAt: row.created_at || null
     };
     if (String(row.status || "").toLowerCase() === "cancelled") {
       cancelledByRef.set(record.coRef.toLowerCase(), record);
-    } else if (!activeBySource.has(record.sourceOrderRef.toLowerCase())) {
-      activeBySource.set(record.sourceOrderRef.toLowerCase(), record);
+    } else {
+      activeByRef.set(record.coRef.toLowerCase(), record);
+      if (!activeBySource.has(record.sourceOrderRef.toLowerCase())) {
+        activeBySource.set(record.sourceOrderRef.toLowerCase(), record);
+      }
     }
   }
-  const orders = (plan.orders || []).map((order) => applyActiveTransitCoMetadata(
-    clearCancelledTransitCoMetadata(order, cancelledByRef),
-    activeBySource
-  ));
-  return orders.some((order, index) => order !== plan.orders[index]) ? { ...plan, orders } : plan;
+  const invalidCoRefs = new Set([...coRefs]
+    .map((ref) => ref.toLowerCase())
+    .filter((ref) => !activeByRef.has(ref)));
+  for (const ref of invalidCoRefs) {
+    if (!cancelledByRef.has(ref)) {
+      cancelledByRef.set(ref, transitFallbackByRef.get(ref) || { coRef: ref, fromYard: "", toYard: "" });
+    }
+  }
+
+  const removedOrderRefs = new Set([...invalidCoRefs].filter(isCoRef));
+  const aggregateGroup = (order, childOrderDetails) => {
+    const sum = (field) => childOrderDetails.reduce((total, child) => total + Number(child?.[field] || 0), 0);
+    return {
+      ...order,
+      childOrders: childOrderDetails.map(orderRef).filter(Boolean),
+      childOrderDetails,
+      items: childOrderDetails.flatMap((child) => Array.isArray(child.items) ? child.items : []),
+      pallets: sum("pallets"),
+      layers: sum("layers"),
+      sections: sum("sections"),
+      pieces: sum("pieces"),
+      salesQty: sum("salesQty"),
+      weight: sum("weight"),
+      unloadMinutes: sum("unloadMinutes"),
+      travelMinutes: Math.max(0, ...childOrderDetails.map((child) => Number(child?.travelMinutes || 0))),
+      pickupLocations: [...new Set(childOrderDetails.flatMap((child) => child.pickupLocations || []).map(text).filter(Boolean))],
+      customer: `${childOrderDetails.length} orders grouped`,
+      sourceOrderId: "",
+      relatedSoId: "",
+      relatedToId: "",
+      relatedCustomOrderId: "",
+      transitCo: null
+    };
+  };
+  const reconcileOrder = (order) => {
+    const ref = orderRef(order);
+    if (isCoRef(ref) && !isAggregateCoGroup(order) && invalidCoRefs.has(ref.toLowerCase())) return null;
+    let next = applyActiveTransitCoMetadata(
+      clearCancelledTransitCoMetadata(order, cancelledByRef),
+      activeBySource
+    );
+    const originalChildren = Array.isArray(next.childOrderDetails) ? next.childOrderDetails : [];
+    const childOrderDetails = originalChildren.map(reconcileOrder).filter(Boolean);
+    const listedChildren = Array.isArray(next.childOrders) ? next.childOrders.map(text).filter(Boolean) : [];
+    const retainedListed = listedChildren.filter((childRef) =>
+      !isCoRef(childRef) || !invalidCoRefs.has(childRef.toLowerCase())
+    );
+    const isCoGroup = text(next.type).toUpperCase() === "CO" && listedChildren.some(isCoRef);
+    if (isCoGroup) {
+      const retainedByRef = new Map(childOrderDetails.map((child) => [orderRef(child).toLowerCase(), child]));
+      const retainedDetails = retainedListed.map((childRef) => retainedByRef.get(childRef.toLowerCase())).filter(Boolean);
+      if (!retainedListed.length) {
+        if (ref) removedOrderRefs.add(ref.toLowerCase());
+        return null;
+      }
+      next = retainedDetails.length === retainedListed.length
+        ? aggregateGroup(next, retainedDetails)
+        : {
+            ...next,
+            childOrders: retainedListed,
+            childOrderDetails: retainedDetails,
+            sourceOrderId: "",
+            relatedSoId: "",
+            relatedToId: "",
+            relatedCustomOrderId: "",
+            transitCo: null
+          };
+    } else if (childOrderDetails.some((child, index) => child !== originalChildren[index])
+      || childOrderDetails.length !== originalChildren.length) {
+      next = { ...next, childOrderDetails };
+    }
+    return next;
+  };
+  const orders = (plan.orders || []).map(reconcileOrder).filter(Boolean);
+  const cleanReferenceList = (values = []) => values.map(text)
+    .filter((ref) => ref && !removedOrderRefs.has(ref.toLowerCase()));
+  const trucks = (Array.isArray(plan.trucks) ? plan.trucks : []).map((truck) => ({
+    ...truck,
+    loads: (Array.isArray(truck?.loads) ? truck.loads : []).map((load) => ({
+      ...load,
+      ...(Array.isArray(load.orders) ? {
+        orders: load.orders.filter((candidate) => {
+          const ref = typeof candidate === "string" ? text(candidate) : orderRef(candidate);
+          return !ref || !removedOrderRefs.has(ref.toLowerCase());
+        })
+      } : {}),
+      stops: (Array.isArray(load.stops) ? load.stops : []).flatMap((stop) => {
+        const refs = stopOrderRefs(stop);
+        if (!refs.some((ref) => removedOrderRefs.has(ref.toLowerCase()))) return [stop];
+        const retained = cleanReferenceList(refs);
+        if (!retained.length) return [];
+        const next = { ...stop };
+        for (const key of ["orderRefs", "order_refs", "groupedOrderRefs", "grouped_order_refs"]) {
+          if (Array.isArray(next[key])) next[key] = cleanReferenceList(next[key]);
+        }
+        for (const key of ["orderId", "order_id", "orderRef", "order_ref", "tranid"]) {
+          if (next[key] && removedOrderRefs.has(text(next[key]).toLowerCase())) next[key] = retained[0];
+        }
+        return [next];
+      })
+    }))
+  }));
+  return { ...plan, orders, trucks };
 }

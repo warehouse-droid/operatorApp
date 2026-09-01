@@ -183,7 +183,7 @@ async function dependencyExecutionIds({ dependencyIds = [], transferRefs = [] } 
           OR dependency.transfer_order_ref = ANY($2::text[])
         )
         AND (
-          dependency.status NOT IN ('active', 'attention')
+          dependency.status NOT IN ('active', 'attention', 'cancelled')
           OR COALESCE(line.loaded_quantity, 0) > 0
           OR COALESCE(line.delivered_quantity, 0) > 0
           OR COALESCE(line.locally_received_quantity, 0) > 0

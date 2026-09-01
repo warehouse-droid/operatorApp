@@ -20,6 +20,11 @@ assert.match(migration, /SET execution_mode = 'live'/);
 assert.match(netSuite, /findTransferOrdersBySmartScmMarkerFromNetSuite/);
 assert.match(server, /recoverSmartScmTransferOrder/);
 assert.match(server, /markerMatch = await recoverSmartScmTransferOrder/);
+assert.match(
+  server,
+  /memoOverride:\s*smartScmTransferOrderMemoMarker\(prepared\.id\)/,
+  "Smart SCM TO creation must send only its compact recovery marker as the memo."
+);
 assert.match(server, /fetchPickingTicketFromNetSuite\(transferOrderId,\s*\{\s*locationId:/);
 
 assert.match(

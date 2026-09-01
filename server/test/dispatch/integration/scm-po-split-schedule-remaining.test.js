@@ -9,7 +9,7 @@ import {
 
 after(closeDb);
 
-test("PO/TO Schedule shows only the source PO quantity remaining after active splits", async () => {
+test("PO/TO Schedule shows only source PO residual and hides a fully split source", async () => {
   const rollback = await beginRollbackContext();
   try {
     await rollback.run(async () => {
@@ -17,6 +17,7 @@ test("PO/TO Schedule shows only the source PO quantity remaining after active sp
       const purchaseOrderId = 8_760_000_000_000 + Number(suffix.slice(-9));
       const purchaseOrderRef = `PO-SCHEDULE-REMAINING-${suffix}`;
       const splitRef = `SN-SCHEDULE-REMAINING-${suffix}`;
+      const finalSplitRef = `SN-SCHEDULE-FINAL-${suffix}`;
       const sku = `SPLIT-SCHEDULE-SKU-${suffix}`;
       const sourceLine = await query(
         `WITH inserted_order AS (
@@ -79,6 +80,31 @@ test("PO/TO Schedule shows only the source PO quantity remaining after active sp
       assert.equal(child.totalPalletQty, 7);
       assert.equal(child.weightLbs, 175);
       assert.match(child.content, new RegExp(`${sku} 7 PLT`));
+
+      const finalSplit = await createScmPurchaseOrderSplit({
+        sourcePoRef: purchaseOrderRef,
+        newPoRef: finalSplitRef,
+        destinationLocationId: 1,
+        lines: [{ lineRowId: sourceLine.rows[0].id, pallets: 5 }],
+        createdBy: "split-schedule-regression"
+      });
+
+      const fullySplitRows = await listScmSchedule({ exactRef: purchaseOrderRef });
+      assert.equal(
+        fullySplitRows.some((row) => String(row.sourceId) === String(purchaseOrderId)),
+        false,
+        "a source PO with no quantity remaining after active splits must be hidden"
+      );
+
+      await query(
+        `UPDATE dispatch_scm_po_splits
+            SET status = 'cancelled', cancelled_at = now()
+          WHERE id = $1`,
+        [finalSplit.split.id]
+      );
+      const partiallyRestoredRows = await listScmSchedule({ exactRef: purchaseOrderRef });
+      const partiallyRestored = partiallyRestoredRows.find((row) => String(row.sourceId) === String(purchaseOrderId));
+      assert.equal(partiallyRestored?.totalPalletQty, 5, "cancelling one split must restore only its source residual");
 
       await query(
         `UPDATE dispatch_scm_po_splits

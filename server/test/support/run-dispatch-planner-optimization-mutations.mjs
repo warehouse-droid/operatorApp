@@ -13,6 +13,13 @@ const ADVERSARIAL = "test/dispatch/adversarial/dispatch-planner-history-replay.t
 
 const MUTANTS = Object.freeze([
   {
+    name: "completed transit CO evidence is discarded from compact cards",
+    source: OPTIMIZATION,
+    from: "const transitCo = compactTransitCo(order.transitCo);",
+    to: "const transitCo = undefined;",
+    tests: [UNIT]
+  },
+  {
     name: "legacy orderRef and tranid identities are discarded",
     source: OPTIMIZATION,
     from: "value.id || value.orderId || value.orderRef || value.tranid || value.refNumber || value.plate || fallback",

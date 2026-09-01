@@ -25,10 +25,13 @@ for (const expected of [
 
 const predicateStart = client.indexOf("function scmScheduleRowMatchesCurrentFilters");
 const predicateEnd = client.indexOf("function moveScmScheduleMapEntry", predicateStart);
+const predicateHelpersStart = client.indexOf("function scmScheduleTextFilterMatches");
 const statusHelperStart = client.indexOf("function scmScheduleFirstValue");
 const statusHelperEnd = client.indexOf("function scmScheduleReconciliationStatus", statusHelperStart);
 assert(predicateStart >= 0 && predicateEnd > predicateStart,
   "The targeted row filter predicate could not be isolated.");
+assert(predicateHelpersStart >= 0 && predicateHelpersStart < predicateStart,
+  "The targeted row column-filter helpers could not be isolated.");
 assert(statusHelperStart >= 0 && statusHelperEnd > statusHelperStart,
   "The effective-status helper dependency could not be isolated.");
 const predicateContext = {
@@ -38,10 +41,22 @@ const predicateContext = {
     status: ["Hold"],
     method: "Vendor",
     kind: "PO",
+    queuedFrom: "2026-07-31",
+    queuedTo: "2026-08-01",
+    pickup: "alliance",
     dropoffPoint: "3445",
     brand: ["Acme"],
+    contentSearch: "needle",
+    remarkSearch: "priority",
+    orderSearch: "po-needle",
+    weightMin: "900",
+    weightMax: "1100",
+    packingSearch: "pack-77",
     from: "2026-08-01",
-    to: "2026-08-03"
+    to: "2026-08-03",
+    driverSearch: "alex",
+    slaMin: "1",
+    slaMax: "3"
   },
   scmScheduleReviewOnly: false,
   scmScheduleCanViewRestrictedOrders: () => true,
@@ -50,21 +65,41 @@ const predicateContext = {
   scmScheduleNeedsReconciliationReview: () => false
 };
 vm.runInNewContext(`${client.slice(statusHelperStart, statusHelperEnd)}
+  ${client.slice(predicateHelpersStart, predicateStart)}
   ${client.slice(predicateStart, predicateEnd)}
   const matching = {
     orderRef: "PO-NEEDLE", party: "Acme Vendor", content: "Needle item",
     status: "Hold", method: "Vendor", orderKind: "PO", dropoffPoint: "3445 + 12441",
-    brand: "Acme", etaDate: "2026-08-02", isBlanket: false
+    brand: "Acme", queuedDate: "2026-08-01", pickupPoint: "Alliance yard",
+    remark: "Priority shipment", weightLbs: 1000, packingSlipRef: "PACK-77",
+    etaDate: "2026-08-02", driver: "Alex", slaDays: 1, isBlanket: false
   };
   result = {
     matching: scmScheduleRowMatchesCurrentFilters(matching),
     wrongSearch: scmScheduleRowMatchesCurrentFilters({ ...matching, orderRef: "PO-OTHER", content: "Other item" }),
     wrongStatus: scmScheduleRowMatchesCurrentFilters({ ...matching, status: "Queued" }),
-    wrongBrand: scmScheduleRowMatchesCurrentFilters({ ...matching, brand: "Other" })
+    wrongBrand: scmScheduleRowMatchesCurrentFilters({ ...matching, brand: "Other" }),
+    wrongPickup: scmScheduleRowMatchesCurrentFilters({ ...matching, pickupPoint: "Other yard" }),
+    wrongRemark: scmScheduleRowMatchesCurrentFilters({ ...matching, remark: "Routine" }),
+    wrongWeight: scmScheduleRowMatchesCurrentFilters({ ...matching, weightLbs: 1200 }),
+    wrongPacking: scmScheduleRowMatchesCurrentFilters({ ...matching, packingSlipRef: "OTHER" }),
+    wrongDriver: scmScheduleRowMatchesCurrentFilters({ ...matching, driver: "Sam" }),
+    wrongSla: scmScheduleRowMatchesCurrentFilters({ ...matching, slaDays: 4 })
   };`, predicateContext);
 assert.deepEqual(
   JSON.parse(JSON.stringify(predicateContext.result)),
-  { matching: true, wrongSearch: false, wrongStatus: false, wrongBrand: false },
+  {
+    matching: true,
+    wrongSearch: false,
+    wrongStatus: false,
+    wrongBrand: false,
+    wrongPickup: false,
+    wrongRemark: false,
+    wrongWeight: false,
+    wrongPacking: false,
+    wrongDriver: false,
+    wrongSla: false
+  },
   "Global search and every selected column filter must be applied conjunctively to a refreshed row."
 );
 

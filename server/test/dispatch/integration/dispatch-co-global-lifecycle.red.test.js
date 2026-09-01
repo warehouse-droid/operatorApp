@@ -4,9 +4,17 @@ import assert from "node:assert/strict";
 import crypto from "node:crypto";
 import test, { after, before } from "node:test";
 
-import { createDispatchPlan, saveDispatchPlanSnapshot } from "../../../src/dispatch-plan-repository.js";
-import { cancelLocalCoOrder } from "../../../src/dispatch-repository.js";
+import {
+  createDispatchPlan,
+  getDispatchPlanRevision,
+  saveDispatchPlanSnapshot
+} from "../../../src/dispatch-plan-repository.js";
+import { cancelLocalCoOrder, listDispatchOrders, upsertLocalCoOrder } from "../../../src/dispatch-repository.js";
 import { query } from "../../../src/db.js";
+import {
+  enrichDispatchOrdersWithDependencies,
+  listOrderDependencies
+} from "../../../src/order-dependency-repository.js";
 import { createDispatchV2Fixture } from "../support/dispatch-v2-fixture.js";
 
 let fixture;
@@ -96,6 +104,22 @@ async function coJson(coRef) {
   const result = await query("SELECT to_jsonb(co) AS value FROM local_co_orders co WHERE co_ref = $1", [coRef]);
   return result.rows[0]?.value;
 }
+
+test("the lightweight plan fence includes the persisted snapshot digest", async () => {
+  const plan = await createDispatchPlan({
+    planDate: testDate(21),
+    note: "dependency fence digest regression"
+  });
+  const fence = await getDispatchPlanRevision(plan.id);
+  const persisted = (await query(
+    "SELECT plan_digest FROM dispatch_plan_snapshots WHERE plan_id = $1",
+    [plan.id]
+  )).rows[0]?.plan_digest;
+
+  assert.equal(fence?.id, String(plan.id));
+  assert.equal(fence?.digest, persisted);
+  assert.match(fence?.digest || "", /^[0-9a-f]{64}$/u);
+});
 
 test("a CO planned on another date cannot be cancelled and reports its owning route", async () => {
   const sourceRef = `GOA-GLOBAL-${suffix}-1`;
@@ -221,6 +245,157 @@ test("a CO referenced only by a cancelled plan can still be cancelled", async ()
   assert.equal((await coJson(coRef))?.status, "cancelled");
 });
 
+test("an active TO transit CO redirects its direct dependency and cancellation restores the original source", async () => {
+  const numericSeed = Number.parseInt(suffix, 16);
+  const salesOrderId = 6_000_000_000 + (numericSeed * 2);
+  const transferOrderId = salesOrderId + 1;
+  const salesOrderRef = `SOA-CO-DEPENDENCY-${suffix}`;
+  const transferOrderRef = `TOA-CO-DEPENDENCY-${suffix}`;
+  const coRef = `CO-${transferOrderRef}`;
+
+  await query(
+    `INSERT INTO sales_orders (
+       netsuite_id, tranid, trandate, customer, status, status_text,
+       outbound_location_id, outbound_location, operator_status,
+       local_yard_order_status, fulfillment_status, netsuite_active, is_test_fixture
+     ) VALUES (
+       $1, $2, current_date, 'CO dependency routing fixture', 'B', 'Pending Fulfillment',
+       15, '12441', 'open', 'Open', 'not_fulfilled', true, true
+     )`,
+    [salesOrderId, salesOrderRef]
+  );
+  await query(
+    `INSERT INTO transfer_orders (
+       netsuite_id, tranid, trandate, status, status_text,
+       from_location_id, from_location, to_location_id, to_location,
+       outbound_operator_status, local_yard_order_status, fulfillment_status,
+       dispatch_planned, netsuite_active
+     ) VALUES (
+       $1, $2, current_date, 'B', 'Pending Fulfillment',
+       28, '2967', 15, '12441',
+       'open', 'Open', 'not_fulfilled', false, true
+     )`,
+    [transferOrderId, transferOrderRef]
+  );
+  await query(
+    `INSERT INTO order_dependencies (
+       sales_order_id, sales_order_ref, dispatch_target_ref, dispatch_target_kind,
+       transfer_order_id, transfer_order_ref, dependency_mode, same_load_required,
+       status, source_location_id, source_location,
+       accounting_destination_location_id, accounting_destination_location,
+       reconciliation_status
+     ) VALUES (
+       $1, $2, $2, 'normal', $3, $4, 'direct_to_customer', true,
+       'active', 28, '2967', 15, '12441', 'pending'
+     )`,
+    [salesOrderId, salesOrderRef, transferOrderId, transferOrderRef]
+  );
+  await seedLocalCo({ coRef, sourceRef: transferOrderRef, toYard: "150" });
+
+  const activeDependencies = await listOrderDependencies({ salesOrderRef });
+  assert.equal(activeDependencies.length, 1);
+  assert.equal(activeDependencies[0].sourceLocation, "150");
+  assert.equal(activeDependencies[0].dependencySourceLocation, "2967");
+  assert.equal(activeDependencies[0].transitCoRef, coRef);
+
+  const [activeOrder] = await enrichDispatchOrdersWithDependencies([{
+    id: salesOrderRef,
+    type: "SO",
+    sourceYard: "12441",
+    pickupLocations: ["12441"],
+    items: []
+  }]);
+  assert.equal(activeOrder.directPickupManifest[0].location, "150");
+  assert.deepEqual(activeOrder.pickupLocations, ["12441", "150"]);
+
+  const cancelled = await cancelLocalCoOrder(coRef, { requestedBy: `co-dependency-${suffix}` });
+  assert.equal(cancelled?.status, "cancelled");
+
+  const cancelledDependencies = await listOrderDependencies({ salesOrderRef });
+  assert.equal(cancelledDependencies[0].sourceLocation, "2967");
+  assert.equal(cancelledDependencies[0].dependencySourceLocation, "2967");
+  assert.equal(cancelledDependencies[0].transitCoRef, "");
+
+  const [cancelledOrder] = await enrichDispatchOrdersWithDependencies([{
+    id: salesOrderRef,
+    type: "SO",
+    sourceYard: "12441",
+    pickupLocations: ["12441"],
+    items: []
+  }]);
+  assert.equal(cancelledOrder.directPickupManifest[0].location, "2967");
+  assert.deepEqual(cancelledOrder.pickupLocations, ["12441", "2967"]);
+});
+
+test("the global TO feed exposes the CO depot as both pickupLocations and sourceYard", async () => {
+  const numericSeed = Number.parseInt(suffix, 16);
+  const transferOrderId = 7_000_000_000_000 + numericSeed;
+  const transferOrderRef = `TOA-GLOBAL-PICKUP-${suffix}`;
+  const coRef = `CO-${transferOrderRef}`;
+  await query(
+    `INSERT INTO transfer_orders (
+       netsuite_id, tranid, trandate, status, status_text,
+       from_location_id, from_location, to_location_id, to_location,
+       outbound_operator_status, local_yard_order_status, fulfillment_status,
+       dispatch_planned, netsuite_active
+     ) VALUES (
+       $1, $2, current_date, 'B', 'Transfer Order : Pending Fulfillment',
+       28, '2967', 26, '150',
+       'open', 'Open', 'not_fulfilled', false, true
+     )`,
+    [transferOrderId, transferOrderRef]
+  );
+  await query(
+    `INSERT INTO transfer_order_lines (
+       line_stage, transfer_order_id, line_id, item_id, item_name, sku,
+       quantity, unit, location_id, location, pallet_qty, to_plt,
+       netsuite_active, raw
+     ) VALUES (
+       'outbound', $1, $2, $3, 'Global CO pickup item', $4,
+       10, 'EA', 28, '2967', 1, 10, true, '{}'::jsonb
+     )`,
+    [transferOrderId, transferOrderId + 1, transferOrderId + 2, `GLOBAL-CO-${suffix}`]
+  );
+  await upsertLocalCoOrder({
+    sourceOrderRef: transferOrderRef,
+    fromYard: "2967",
+    toYard: "12441",
+    order: {
+      id: coRef,
+      type: "CO",
+      sourceOrderType: "TO",
+      sourceYard: "2967",
+      destinationYard: "12441",
+      pickupLocations: ["2967"],
+      items: [{
+        lineId: transferOrderId + 1,
+        itemId: transferOrderId + 2,
+        sku: `GLOBAL-CO-${suffix}`,
+        quantity: 10,
+        pallets: 1,
+        toPlt: 10
+      }]
+    },
+    requestedBy: `global-pickup-${suffix}`,
+    reactivateCancelled: true
+  });
+
+  const feed = await listDispatchOrders({
+    search: transferOrderRef,
+    exactOrderRefs: [transferOrderRef]
+  });
+  const source = feed.find((order) => order.id === transferOrderRef);
+  const co = feed.find((order) => order.id === coRef);
+  assert.ok(source, "the source TO must remain globally addressable");
+  assert.equal(source.sourceYard, "12441");
+  assert.deepEqual(source.pickupLocations, ["12441"]);
+  assert.equal(source.transitOriginalSourceYard, "2967");
+  assert.equal(source.transitCo?.id, coRef);
+  assert.ok(co, "the CO must be returned by an exact source-order lookup");
+  assert.equal(co.sourceOrderId, transferOrderRef);
+  assert.equal(co.sourceOrderType, "TO");
+});
+
 test("concurrent plan ownership and cancellation cannot commit a planned cancelled CO", async () => {
   const sourceRef = `GOA-GLOBAL-${suffix}-RACE`;
   const coRef = `CO-${sourceRef}`;
@@ -254,4 +429,176 @@ test("concurrent plan ownership and cancellation cannot commit a planned cancell
     assert.equal(saveResult.status, "rejected");
     assert.equal(saveResult.reason?.code, "DISPATCH_CO_NOT_ACTIVE");
   }
+});
+
+test("a cancelled CO is scrubbed from a stale save without blocking unrelated planning", async () => {
+  const sourceRef = `SOA-GLOBAL-${suffix}-STALE`;
+  const unrelatedRef = `SOA-GLOBAL-${suffix}-UNRELATED`;
+  const coRef = `CO-${sourceRef}`;
+  await seedLocalCo({ coRef, sourceRef, status: "cancelled" });
+  const plan = await seedPlan({ date: testDate(19), status: "draft" });
+  const revision = Number((await query(
+    "SELECT revision FROM dispatch_plans WHERE id = $1",
+    [plan.id]
+  )).rows[0].revision);
+
+  await saveDispatchPlanSnapshot(plan.id, {
+    planDate: plan.planDate,
+    baseRevision: revision,
+    orders: [
+      {
+        id: sourceRef,
+        type: "SO",
+        pickupLocations: ["150"],
+        sourceYard: "150",
+        transitCo: { id: coRef, fromYard: "2967", toYard: "150" },
+        transitOriginalPickupLocations: ["2967"],
+        transitOriginalSourceYard: "2967"
+      },
+      coOrder(coRef, sourceRef),
+      { id: unrelatedRef, type: "SO", pickupLocations: ["12441"], sourceYard: "12441" }
+    ],
+    trucks: [{
+      id: "",
+      plate: "",
+      loads: [{
+        id: "stale-co-and-unrelated",
+        name: "Stale CO and unrelated work",
+        stops: [
+          { id: "stale-co-pick", type: "pick", orderId: coRef, location: "2967" },
+          { id: "stale-co-drop", type: "drop", orderId: coRef, location: "150" },
+          { id: "unrelated-drop", type: "drop", orderId: unrelatedRef, location: "Customer" }
+        ]
+      }]
+    }],
+    summary: {},
+    sessionId: `co-global-${suffix}-stale-save`
+  });
+
+  const saved = (await query(
+    "SELECT orders, trucks FROM dispatch_plan_snapshots WHERE plan_id = $1",
+    [plan.id]
+  )).rows[0];
+  const savedText = JSON.stringify(saved);
+  assert.doesNotMatch(savedText, new RegExp(coRef),
+    "cancelled CO cards, metadata, and physical stops must be removed atomically");
+  assert.match(savedText, new RegExp(unrelatedRef),
+    "an unrelated plan edit must still commit when stale CO state is auto-reconciled");
+  const restoredSource = saved.orders.find((order) => order.id === sourceRef);
+  assert.equal(restoredSource?.transitCo ?? null, null);
+});
+
+test("a mixed CO group drops only its cancelled child and still protects its active child", async () => {
+  const cancelledSource = `SOA-GLOBAL-${suffix}-GROUP-CANCELLED`;
+  const activeSource = `SOA-GLOBAL-${suffix}-GROUP-ACTIVE`;
+  const cancelledRef = `CO-${cancelledSource}`;
+  const activeRef = `CO-${activeSource}`;
+  const groupRef = `GOA-GLOBAL-${suffix}-CO-GROUP`;
+  const truckPlate = `CO-GROUP-${suffix}`;
+  await seedLocalCo({ coRef: cancelledRef, sourceRef: cancelledSource, status: "cancelled" });
+  await seedLocalCo({ coRef: activeRef, sourceRef: activeSource });
+  await query("INSERT INTO dispatch_trucks (plate, active) VALUES ($1, true)", [truckPlate]);
+  const plan = await seedPlan({ date: testDate(20), status: "draft" });
+  const revision = Number((await query(
+    "SELECT revision FROM dispatch_plans WHERE id = $1",
+    [plan.id]
+  )).rows[0].revision);
+
+  await saveDispatchPlanSnapshot(plan.id, {
+    planDate: plan.planDate,
+    baseRevision: revision,
+    orders: [{
+      ...coOrder(groupRef, cancelledSource),
+      id: groupRef,
+      sourceOrderId: cancelledSource,
+      relatedSoId: cancelledSource,
+      childOrders: [cancelledRef, activeRef],
+      childOrderDetails: [
+        { ...coOrder(cancelledRef, cancelledSource), pallets: 1, weight: 100 },
+        { ...coOrder(activeRef, activeSource), pallets: 2, weight: 200 }
+      ],
+      pallets: 3,
+      weight: 300
+    }],
+    trucks: [{
+      id: truckPlate,
+      plate: truckPlate,
+      loads: [{
+        id: "co-group-load",
+        name: "CO group load",
+        stops: [{
+          id: "co-group-stop",
+          type: "pick",
+          orderId: groupRef,
+          groupedOrderRefs: [cancelledRef, activeRef],
+          location: "2967"
+        }]
+      }]
+    }],
+    summary: {},
+    sessionId: `co-global-${suffix}-group-save`
+  });
+
+  const saved = (await query(
+    "SELECT orders, trucks FROM dispatch_plan_snapshots WHERE plan_id = $1",
+    [plan.id]
+  )).rows[0];
+  assert.doesNotMatch(JSON.stringify(saved), new RegExp(cancelledRef));
+  assert.match(JSON.stringify(saved), new RegExp(activeRef));
+  const group = saved.orders.find((order) => order.id === groupRef);
+  assert.deepEqual(group?.childOrders, [activeRef]);
+  assert.equal(group?.pallets, 2);
+  assert.equal(group?.weight, 200);
+  assert.equal(group?.sourceOrderId || "", "");
+  assert.deepEqual(saved.trucks[0].loads[0].stops[0].groupedOrderRefs, [activeRef]);
+
+  const groupOnlyTrucks = structuredClone(saved.trucks);
+  delete groupOnlyTrucks[0].loads[0].stops[0].groupedOrderRefs;
+  await query(
+    "UPDATE dispatch_plan_snapshots SET trucks = $2::jsonb WHERE plan_id = $1",
+    [plan.id, JSON.stringify(groupOnlyTrucks)]
+  );
+
+  await query(
+    `UPDATE local_co_orders
+        SET dispatch_plan_id = NULL,
+            dispatch_plan_date = NULL,
+            dispatch_truck_plate = NULL,
+            dispatch_load_name = NULL
+      WHERE co_ref = $1`,
+    [activeRef]
+  );
+
+  await assert.rejects(
+    cancelLocalCoOrder(activeRef, { requestedBy: `co-global-${suffix}-group-cancel` }),
+    (error) => error?.code === "DISPATCH_CO_ALREADY_PLANNED"
+  );
+});
+
+test("a stale client cannot implicitly reactivate a cancelled CO", async () => {
+  const sourceRef = `SOA-GLOBAL-${suffix}-RECREATE`;
+  const coRef = `CO-${sourceRef}`;
+  await seedLocalCo({ coRef, sourceRef, status: "cancelled" });
+
+  await assert.rejects(
+    upsertLocalCoOrder({
+      sourceOrderRef: sourceRef,
+      fromYard: "2967",
+      toYard: "150",
+      order: { id: coRef, type: "CO", sourceOrderId: sourceRef, items: [] },
+      requestedBy: `co-global-${suffix}-stale-client`
+    }),
+    (error) => error?.code === "DISPATCH_CO_CANCELLED"
+  );
+  assert.equal((await coJson(coRef))?.status, "cancelled");
+
+  const recreated = await upsertLocalCoOrder({
+    sourceOrderRef: sourceRef,
+    fromYard: "2967",
+    toYard: "150",
+    order: { id: coRef, type: "CO", sourceOrderId: sourceRef, items: [] },
+    requestedBy: `co-global-${suffix}-explicit-recreate`,
+    reactivateCancelled: true
+  });
+  assert.equal(recreated.status, "pending_load");
 });

@@ -175,10 +175,10 @@ assert.match(blanketCss, /@media \(max-width: 1000px\)[\s\S]*grid-template-colum
 assert.match(blanketCss, /@media \(max-width: 1000px\)[\s\S]*min-height: 0;[\s\S]*grid-template-rows: auto auto/,
   "Stacked Blanket layouts must reset desktop viewport sizing.");
 
-assert.match(exclusions, /Automatic — Blanket balance/);
-assert.match(exclusions, /Blanket PO covered/);
-assert.match(exclusions, /Vendor PO planning paused/);
-assert.match(exclusions, /TO remains available/);
+assert.match(exclusions, /Automatic — Blanket coverage/);
+assert.match(exclusions, /Blanket coverage/);
+assert.match(exclusions, /Uncovered demand remains eligible for PO\/TO planning/);
+assert.doesNotMatch(exclusions, /Vendor PO planning paused/);
 assert.match(exclusions, /combinedActiveCount/);
 assert.match(exclusionsCss, /smart-planning-exclusion-row-automatic/);
 assert.match(proposalEditor, /proposal\.proposal_origin === "blanket"[\s\S]*must be edited from the Blanket order tab/,

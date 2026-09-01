@@ -57,8 +57,35 @@ function postingEvidence(command) {
       externalId: step.externalId,
       transactionId: step.netSuiteTransactionId,
       transactionRef: step.netSuiteTransactionRef
-    }))
+    })),
+    lineReconciliation: command?.inputSnapshot?.lineReconciliation || null
   };
+}
+
+/** @param {Record<string, any>} command */
+function authoritativeLineReconciliation(command) {
+  const reconciliation = command?.inputSnapshot?.lineReconciliation;
+  const lines = Array.isArray(reconciliation?.lines) ? reconciliation.lines : [];
+  return lines.length > 0 && lines.every((/** @type {Record<string, any>} */ line) => line?.authoritative !== false
+    && Number(line?.reconciledQuantity) >= 0);
+}
+
+/** @param {Record<string, any>} command */
+// Linked evidence can span multiple lines and receipts; every guard is part of
+// proving that one header identity is safe to retain locally.
+// eslint-disable-next-line complexity
+function uniqueReconciledReceipt(command) {
+  const lines = command?.inputSnapshot?.lineReconciliation?.lines || [];
+  const receipts = new Map();
+  for (const line of lines) {
+    for (const transaction of line?.linkedTransactions || []) {
+      if (String(transaction?.type).toUpperCase() !== "IR") {continue;}
+      const id = Number(transaction?.id);
+      if (!Number.isSafeInteger(id) || id <= 0) {continue;}
+      receipts.set(id, { id, ref: String(transaction?.ref || "") });
+    }
+  }
+  return receipts.size === 1 ? [...receipts.values()][0] : null;
 }
 
 /** @param {Record<string, any>} localResult */
@@ -104,7 +131,8 @@ export function createOperatorNetSuitePostingFinalizer({
   /** @param {Record<string, any>} command @param {Record<string, any>} operation @param {string[]} photos */
   async function customerPickupFinalization(command, operation, photos) {
       const result = await finalizeCustomerPickup(operation.orderId, command.actorOperatorId, {
-        photoDataUrls: photos
+        photoDataUrls: photos,
+        allowNetSuiteCompleted: true
       });
       await persistLoadEvidence(result, command);
       const completed = { ...result, operatorNetSuitePosting: postingEvidence(command) };
@@ -116,7 +144,8 @@ export function createOperatorNetSuitePostingFinalizer({
   async function deliveryPrepFinalization(command, operation, photos) {
       const result = await finalizeDeliveryLoad(operation.orderId, command.actorOperatorId, {
         photoDataUrls: photos,
-        requestId: command.requestId
+        requestId: command.requestId,
+        allowNetSuiteCompleted: true
       });
       await persistLoadEvidence(result, command);
       const dependencyProgress = result.localOnly
@@ -128,20 +157,35 @@ export function createOperatorNetSuitePostingFinalizer({
   }
 
   /** @param {Record<string, any>} command @param {Record<string, any>} operation @param {string[]} photos */
+  // This is the single local IR finalization boundary for both a verified new
+  // receipt and an authoritative zero-step reconciliation.
+  // eslint-disable-next-line complexity
   async function receivingFinalization(command, operation, photos) {
-    if ((command.steps || []).length !== 1 || command.steps[0].transactionType !== "IR") {
+    const steps = command.steps || [];
+    const reconciledWithoutPost = steps.length === 0 && authoritativeLineReconciliation(command);
+    if ((!reconciledWithoutPost && steps.length !== 1)
+        || (steps.length === 1 && steps[0].transactionType !== "IR")) {
       throw Object.assign(new Error("Receiving finalization requires one verified Item Receipt."), {
         status: 409,
         code: "OPERATOR_NETSUITE_POSTING_FINALIZER_UNSUPPORTED"
       });
     }
-    const step = command.steps[0];
+    const step = steps[0] || null;
+    const existingReceipt = reconciledWithoutPost ? uniqueReconciledReceipt(command) : null;
+    const payload = command?.inputSnapshot?.localPayload || step?.payload;
+    if (!payload?.item?.items?.length) {
+      throw Object.assign(new Error("Receiving finalization requires the stable local receipt payload."), {
+        status: 409,
+        code: "OPERATOR_NETSUITE_POSTING_FINALIZER_UNSUPPORTED"
+      });
+    }
     const result = await finalizeReceivingReceipt(operation.orderId, command.actorOperatorId, {
       photoDataUrls: photos,
-      payload: step.payload,
+      payload,
       response: { operatorNetSuitePosting: postingEvidence(command) },
-      itemReceiptId: step.netSuiteTransactionId,
-      itemReceiptTranid: step.netSuiteTransactionRef
+      itemReceiptId: step?.netSuiteTransactionId ?? existingReceipt?.id ?? null,
+      itemReceiptTranid: step?.netSuiteTransactionRef ?? existingReceipt?.ref ?? null,
+      allowNetSuiteCompleted: true
     });
     if (operation.orderType === "transfer_order") {
       await syncTransferDependencies(operation.orderId);

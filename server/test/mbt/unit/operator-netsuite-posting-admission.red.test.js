@@ -33,13 +33,14 @@ const ON_POLICY = Object.freeze({
 });
 
 function harness({ resolution = RESOLUTION, policy = ON_POLICY } = {}) {
-  const calls = { resolve: 0, policy: 0, preflight: 0, create: 0, accepted: 0 };
+  const calls = { resolve: 0, policy: 0, preflight: 0, create: 0, accepted: 0, draft: null };
   const admission = createOperatorNetSuitePostingAdmission({
     resolveTargets: async () => { calls.resolve += 1; return structuredClone(resolution); },
     getPolicy: async () => { calls.policy += 1; return structuredClone(policy); },
     preflight: async () => { calls.preflight += 1; },
     createCommand: async (draft) => {
       calls.create += 1;
+      calls.draft = draft;
       return { replayed: false, command: { id: draft.requestId, status: "queued", inputHash: draft.inputHash } };
     },
     onAccepted: async () => { calls.accepted += 1; }
@@ -124,4 +125,17 @@ test("P5/P9 one accepted canonical draft is durable and scheduled after admissio
   assert.equal(calls.create, 1);
   assert.equal(calls.preflight, 1);
   assert.equal(calls.accepted, 1);
+});
+
+test("R1 admission freezes the stable local payload separately from the remote transform payload", async () => {
+  const localPayload = {
+    item: { items: [{ orderLine: 4850690, quantity: 5, itemReceive: true, location: 1 }] }
+  };
+  const { admission, calls } = harness({
+    resolution: { ...RESOLUTION, localPayload }
+  });
+  await admission(input());
+  assert.deepEqual(calls.draft.localPayload, localPayload);
+  assert.deepEqual(calls.draft.inputSnapshot.localPayload, localPayload);
+  assert.equal(calls.draft.steps[0].payload.item.items[0].orderLine, 1);
 });

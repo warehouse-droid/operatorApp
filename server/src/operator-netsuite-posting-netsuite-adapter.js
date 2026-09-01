@@ -20,6 +20,16 @@ function unsupported(message) {
 }
 
 /**
+ * @param {Record<string, any>} found
+ * @param {Record<string, any>} step
+ * @param {Function} fetchById
+ */
+async function readableFoundRecord(found, step, fetchById) {
+  if (found.record && typeof found.record === "object") {return found.record;}
+  return fetchById(step, Number(found.id));
+}
+
+/**
  * @param {object} dependencies
  * @param {Function} dependencies.findTransactionByExternalId
  * @param {Function} dependencies.transformSalesOrderToItemFulfillment
@@ -46,10 +56,14 @@ export function createOperatorNetSuitePostingAdapter({
 
   return {
     async findByExternalId(/** @type {Record<string, any>} */ step) {
-      const found = await findTransactionByExternalId(step.externalId, step.transactionType);
+      const found = await findTransactionByExternalId(
+        step.externalId,
+        step.transactionType,
+        step.sourceNetSuiteId
+      );
       if (!found) {return null;}
       const id = Number(found.id);
-      const record = await fetchById(step, id);
+      const record = await readableFoundRecord(found, step, fetchById);
       if (!record) {
         throw Object.assign(new Error("The external-ID transaction exists but its record cannot be read."), {
           code: "OPERATOR_NETSUITE_POSTING_RESULT_UNVERIFIED",

@@ -1,0 +1,17 @@
+{
+  "all": false,
+  "check-coverage": false,
+  "exclude-after-remap": true,
+  "extension": [
+    ".js",
+    ".mjs"
+  ],
+  "include": [
+    "src/dispatch-custom-order-repository.js",
+    "src/netsuite-order-webhook-queue-repository.js"
+  ],
+  "reporter": [
+    "text",
+    "json"
+  ]
+}

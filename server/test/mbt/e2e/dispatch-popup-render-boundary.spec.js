@@ -25,6 +25,7 @@ const dispatchFixtures = new Map([
   ["/api/dispatch/vendor-yards", []],
   ["/api/dispatch/setup", { drivers: [], trucks: [], ownYards: [], planning: {} }],
   ["/api/dispatch/orders", orders],
+  ["/api/dispatch/planned-assignments", []],
   ["/api/dispatch/plans", []],
   ["/api/dispatch/plans/current", {
     exists: false, planDate, id: null, revision: 0, orders: [], trucks: []

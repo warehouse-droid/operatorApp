@@ -4,6 +4,7 @@ import test, { after } from "node:test";
 import { beginRollbackContext, closeDb, query } from "../../../src/db.js";
 import {
   createSalesOrderPoAllocation,
+  createSalesOrderPoAllocations,
   createScmPurchaseOrderSplit,
   enrichDispatchOrdersWithPoTargetAllocations,
   getSalesOrderPoAllocationOptions,
@@ -177,6 +178,359 @@ test("Link PO finds an ordinary source PO by its updated PO ref and original Net
       });
       assert.equal(linkedByOriginalRef.poOrderRef, updatedPoRef,
         "new allocation evidence must retain the current visible PO ref regardless of the accepted alias");
+    });
+  } finally {
+    await rollback.rollback();
+  }
+});
+
+test("Link PO treats an ordinary item with a different UOM as a different item", async () => {
+  const rollback = await beginRollbackContext();
+  try {
+    await rollback.run(async () => {
+      const fixture = await seedSplitLinkFixture({ createSplit: false });
+      await query(
+        "UPDATE purchase_order_lines SET unit = 'CASE' WHERE id = $1",
+        [fixture.sourceLine.id]
+      );
+
+      const options = await getSalesOrderPoAllocationOptions(fixture.salesOrderRef);
+      const targetLine = options.salesLines.find(
+        (line) => Number(line.id) === Number(fixture.salesLine.id)
+      );
+      assert.equal(
+        targetLine?.poCandidates.some(
+          (candidate) => Number(candidate.poLineId) === Number(fixture.sourceLine.id)
+        ),
+        false,
+        "the same item code must not make EA and CASE compatible"
+      );
+
+      await assert.rejects(
+        createSalesOrderPoAllocation({
+          dispatchTargetRef: fixture.salesOrderRef,
+          salesOrderRef: fixture.salesOrderRef,
+          targetLineKey: targetLine.targetLineKey,
+          poLineId: fixture.sourceLine.id,
+          poRef: fixture.purchaseOrderRef,
+          targetSignature: options.order.targetSignature,
+          quantities: { pallets: 1 },
+          createdBy: "po-uom-identity-regression"
+        }),
+        (error) => error?.code === "DISPATCH_PO_LINK_UOM_MISMATCH"
+      );
+    });
+  } finally {
+    await rollback.rollback();
+  }
+});
+
+test("MBBS-Special Link PO maps descriptions across NetSuite line-break formatting", async () => {
+  const rollback = await beginRollbackContext();
+  try {
+    await rollback.run(async () => {
+      const fixture = await seedSplitLinkFixture({ createSplit: false });
+      const dispatchRef = `#263165-${Date.now()}`;
+      await query(
+        `UPDATE purchase_orders
+            SET dispatch_ref = $2,
+                dispatch_ref_updated_at = now(),
+                dispatch_ref_updated_by = 'special-link-description-regression'
+          WHERE netsuite_id = $1`,
+        [fixture.purchaseOrderId, dispatchRef]
+      );
+      await query(
+        `UPDATE purchase_order_lines
+            SET item_id = 2055,
+                item_name = 'MBBS-Special Order',
+                sku = 'MBBS-Special Order',
+                item_type = 'NonInvtPart',
+                item_type_text = 'Non Inventory Item',
+                item_description = $2,
+                quantity = 65.38,
+                unit = 'SQFT',
+                pallet_qty = 0,
+                piece_qty = 14,
+                to_plt = 0,
+                to_pcs = 0
+          WHERE id = $1`,
+        [
+          fixture.sourceLine.id,
+          "OnyxBlack:CopingWall:Flamed:2 Edge Rockface:\n2x14x48  \n4.67sqft/pc"
+        ]
+      );
+      await query(
+        `UPDATE sales_order_lines
+            SET item_id = 2055,
+                item_name = 'MBBS-Special Order',
+                sku = 'MBBS-Special Order',
+                item_type = 'NonInvtPart',
+                item_type_text = 'Non Inventory Item',
+                item_description = $2,
+                quantity = 65.38,
+                unit = 'SQFT',
+                pallet_qty = 0,
+                piece_qty = 14,
+                to_plt = 0,
+                to_pcs = 0,
+                netsuite_backordered_qty = 65.38
+          WHERE id = $1`,
+        [
+          fixture.salesLine.id,
+          "MBBS-Special Order\nOnyxBlack:CopingWall:Flamed:2 Edge Rockface:2x14x48  4.67sqft/pc"
+        ]
+      );
+
+      const options = await getSalesOrderPoAllocationOptions(fixture.salesOrderRef);
+      const salesLine = options.salesLines.find((line) => Number(line.id) === Number(fixture.salesLine.id));
+      const candidate = salesLine?.poCandidates.find(
+        (entry) => Number(entry.poLineId) === Number(fixture.sourceLine.id)
+      );
+      assert.equal(candidate?.poRef, dispatchRef);
+      assert.equal(candidate?.unitMatch, true);
+      assert.equal(candidate?.descriptionMatch, true,
+        "line breaks and spaces around punctuation must not turn the correct PO line into a manual mismatch");
+      assert.equal(candidate?.exactMatch, true,
+        "the production-shaped #263165 mapping must be eligible for automatic one-to-one selection");
+    });
+  } finally {
+    await rollback.rollback();
+  }
+});
+
+test("Link PO can route an unmatched MBBS-Special fee with the customer instead of a yard", async () => {
+  const rollback = await beginRollbackContext();
+  try {
+    await rollback.run(async () => {
+      const fixture = await seedSplitLinkFixture({ createSplit: false, salesPallets: 12 });
+      const feeLine = await query(
+        `INSERT INTO purchase_order_lines (
+           purchase_order_id, line_id, item_id, item_name, sku,
+           item_description, item_type, item_type_text, quantity, unit,
+           location_id, location, pallet_qty, layer_qty, section_qty, piece_qty,
+           to_plt, to_lyr, to_sec, to_pcs,
+           received_pallet_qty, received_layer_qty, received_section_qty,
+           received_piece_qty, netsuite_received_qty, netsuite_received_baseline_qty,
+           item_weight, netsuite_active, synced_at, raw
+         ) VALUES (
+           $1, $2, 2055, 'MBBS-Special Order', 'MBBS-Special Order',
+           'Split Pallet Fee', 'NonInvtPart', 'Non Inventory Item', 1, 'EACH',
+           15, '12441', 0, 0, 0, 0,
+           0, 0, 0, 0,
+           0, 0, 0, 0, 0, 0,
+           0, true, now(), '{}'::jsonb
+         ) RETURNING *`,
+        [fixture.purchaseOrderId, fixture.purchaseOrderId + 99]
+      );
+
+      const options = await getSalesOrderPoAllocationOptions(fixture.salesOrderRef);
+      const serviceLine = options.poLines.find(
+        (line) => Number(line.id) === Number(feeLine.rows[0].id)
+      );
+      assert.equal(serviceLine?.directToCustomerEligible, true,
+        "a non-stock split fee needs an explicit direct-customer route option");
+      const targetLine = options.salesLines.find(
+        (line) => Number(line.id) === Number(fixture.salesLine.id)
+      );
+
+      await createSalesOrderPoAllocations({
+        dispatchTargetRef: fixture.salesOrderRef,
+        salesOrderRef: fixture.salesOrderRef,
+        poRef: fixture.purchaseOrderRef,
+        targetSignature: options.order.targetSignature,
+        lines: [{
+          salesLineId: fixture.salesLine.id,
+          targetLineKey: targetLine.targetLineKey,
+          poLineId: fixture.sourceLine.id,
+          quantities: { pallets: 12 }
+        }],
+        directServicePoLineIds: [feeLine.rows[0].id],
+        createdBy: "direct-special-fee-regression"
+      });
+
+      const refreshed = await getSalesOrderPoAllocationOptions(fixture.salesOrderRef);
+      assert.ok(
+        refreshed.allocations.some((allocation) =>
+          allocation.directServicePoLines?.some(
+            (line) => Number(line.poLineId) === Number(feeLine.rows[0].id)
+          )
+        ),
+        "the selected service routing must remain durable with the PO relationship"
+      );
+      await createSalesOrderPoAllocations({
+        dispatchTargetRef: fixture.salesOrderRef,
+        salesOrderRef: fixture.salesOrderRef,
+        poRef: fixture.purchaseOrderRef,
+        targetSignature: refreshed.order.targetSignature,
+        lines: [],
+        directServicePoLineIds: [],
+        createdBy: "direct-special-fee-clear-regression"
+      });
+      const cleared = await getSalesOrderPoAllocationOptions(fixture.salesOrderRef);
+      assert.equal(
+        cleared.allocations.some((allocation) => allocation.directServicePoLines?.length),
+        false,
+        "the route choice can be cleared without allocating material twice"
+      );
+      await createSalesOrderPoAllocations({
+        dispatchTargetRef: fixture.salesOrderRef,
+        salesOrderRef: fixture.salesOrderRef,
+        poRef: fixture.purchaseOrderRef,
+        targetSignature: cleared.order.targetSignature,
+        lines: [],
+        directServicePoLineIds: [feeLine.rows[0].id],
+        createdBy: "direct-special-fee-reselect-regression"
+      });
+      const source = (await listDispatchOrders({ type: "PO", search: fixture.purchaseOrderRef }))
+        .find((order) => order.id === fixture.purchaseOrderRef);
+      const [enriched] = await enrichDispatchOrdersWithPoTargetAllocations([source]);
+      assert.equal(enriched.poRouteProjection?.hasResidual, false);
+      assert.equal(
+        enriched.poRouteProjection?.items.some(
+          (item) => Number(item.lineRowId) === Number(feeLine.rows[0].id)
+        ),
+        false,
+        "the fee must not be planned as stock returning to 12441/3445"
+      );
+    });
+  } finally {
+    await rollback.rollback();
+  }
+});
+
+test("Link PO lets the user classify mismatched MBBS-Special SO and PO lines as service fees", async () => {
+  const rollback = await beginRollbackContext();
+  try {
+    await rollback.run(async () => {
+      const fixture = await seedSplitLinkFixture({ createSplit: false, salesPallets: 12 });
+      const poFee = await query(
+        `INSERT INTO purchase_order_lines (
+           purchase_order_id, line_id, item_id, item_name, sku,
+           item_description, item_type, item_type_text, quantity, unit,
+           location_id, location, pallet_qty, layer_qty, section_qty, piece_qty,
+           to_plt, to_lyr, to_sec, to_pcs,
+           received_pallet_qty, received_layer_qty, received_section_qty,
+           received_piece_qty, netsuite_received_qty, netsuite_received_baseline_qty,
+           item_weight, netsuite_active, synced_at, raw
+         ) VALUES (
+           $1, $2, 2055, 'MBBS-Special Order', 'MBBS-Special Order',
+           'MBBS-Special Order cutting fee', 'NonInvtPart', 'Non Inventory Item', 1, 'EACH',
+           15, '12441', 0, 0, 0, 1,
+           0, 0, 0, 1,
+           0, 0, 0, 0, 0, 0,
+           0, true, now(), '{}'::jsonb
+         ) RETURNING *`,
+        [fixture.purchaseOrderId, fixture.purchaseOrderId + 199]
+      );
+      const soFee = await query(
+        `INSERT INTO sales_order_lines (
+           sales_order_id, line_id, item_id, item_name, sku,
+           item_description, item_type, item_type_text, quantity, unit,
+           pallet_qty, layer_qty, section_qty, piece_qty,
+           to_plt, to_lyr, to_sec, to_pcs,
+           netsuite_committed_qty, netsuite_backordered_qty,
+           netsuite_active, location_id, location
+         ) VALUES (
+           $1, $2, 2055, 'MBBS-Special Order', 'MBBS-Special Order',
+           'MBBS-Special Order cutting fee', 'NonInvtPart', 'Non Inventory Item', 1, 'PC',
+           0, 0, 0, 1,
+           0, 0, 0, 1,
+           0, 1, true, 15, '12441'
+         ) RETURNING *`,
+        [fixture.salesOrderId, fixture.salesOrderId + 199]
+      );
+
+      const options = await getSalesOrderPoAllocationOptions(fixture.salesOrderRef);
+      const materialTarget = options.salesLines.find(
+        (line) => Number(line.id) === Number(fixture.salesLine.id)
+      );
+      const serviceTarget = options.salesLines.find(
+        (line) => Number(line.id) === Number(soFee.rows[0].id)
+      );
+      const servicePoLine = options.poLines.find(
+        (line) => Number(line.id) === Number(poFee.rows[0].id)
+      );
+      assert.equal(serviceTarget?.serviceFeeSelectable, true);
+      assert.equal(servicePoLine?.serviceFeeSelectable, true);
+      assert.equal(
+        serviceTarget?.poCandidates.some(
+          (candidate) => Number(candidate.poLineId) === Number(poFee.rows[0].id)
+        ),
+        false,
+        "PC and EACH remain different items even when both lines are fees"
+      );
+
+      await assert.rejects(
+        createSalesOrderPoAllocations({
+          dispatchTargetRef: fixture.salesOrderRef,
+          salesOrderRef: fixture.salesOrderRef,
+          poRef: fixture.purchaseOrderRef,
+          targetSignature: options.order.targetSignature,
+          lines: [{
+            targetLineKey: serviceTarget.targetLineKey,
+            poLineId: poFee.rows[0].id,
+            quantities: { salesQty: 1 }
+          }],
+          serviceSalesLineKeys: [serviceTarget.targetLineKey],
+          directServicePoLineIds: [poFee.rows[0].id]
+        }),
+        (error) => error?.code === "DISPATCH_PO_SERVICE_LINE_CONFLICT",
+        "a service-fee choice must not also create a physical material allocation"
+      );
+
+      await createSalesOrderPoAllocations({
+        dispatchTargetRef: fixture.salesOrderRef,
+        salesOrderRef: fixture.salesOrderRef,
+        poRef: fixture.purchaseOrderRef,
+        targetSignature: options.order.targetSignature,
+        lines: [{
+          salesLineId: fixture.salesLine.id,
+          targetLineKey: materialTarget.targetLineKey,
+          poLineId: fixture.sourceLine.id,
+          quantities: { pallets: 12 }
+        }],
+        serviceSalesLineKeys: [serviceTarget.targetLineKey],
+        directServicePoLineIds: [poFee.rows[0].id],
+        createdBy: "explicit-special-service-fee-regression"
+      });
+
+      const refreshed = await getSalesOrderPoAllocationOptions(fixture.salesOrderRef);
+      assert.ok(refreshed.allocations.some((allocation) =>
+        allocation.serviceSalesLines?.some(
+          (line) => line.targetLineKey === serviceTarget.targetLineKey
+        )
+      ));
+      assert.ok(refreshed.allocations.some((allocation) =>
+        allocation.directServicePoLines?.some(
+          (line) => Number(line.poLineId) === Number(poFee.rows[0].id)
+        )
+      ));
+
+      const sourceSo = (await listDispatchOrders({ type: "SO", search: fixture.salesOrderRef }))
+        .find((order) => order.id === fixture.salesOrderRef);
+      const [enrichedSo] = await enrichDispatchOrdersWithPoTargetAllocations([sourceSo]);
+      const enrichedFee = enrichedSo.items.find(
+        (line) => Number(line.lineRowId) === Number(soFee.rows[0].id)
+      );
+      assert.equal(enrichedFee?.dispatchServiceFee, true,
+        "the selected SO fee must no longer require a physical yard pickup");
+      assert.equal(
+        enrichedSo.poPickupManifest.flatMap((entry) => entry.items || [])
+          .some((line) => Number(line.itemId) === 2055),
+        false,
+        "the selected SO fee must not become a vendor pickup item"
+      );
+
+      const sourcePo = (await listDispatchOrders({ type: "PO", search: fixture.purchaseOrderRef }))
+        .find((order) => order.id === fixture.purchaseOrderRef);
+      const [enrichedPo] = await enrichDispatchOrdersWithPoTargetAllocations([sourcePo]);
+      assert.equal(
+        enrichedPo.poRouteProjection?.items.some(
+          (line) => Number(line.lineRowId) === Number(poFee.rows[0].id)
+        ),
+        false,
+        "the selected PO fee must not create a yard residual"
+      );
     });
   } finally {
     await rollback.rollback();
@@ -508,6 +862,7 @@ test("a fully linked PO inherits planned and completed lifecycle from its Driver
 
       const completed = (await listScmSchedule({
         exactRef: currentPoRef,
+        status: ["Completed"],
         audience: "scm"
       })).find((row) => row.orderRef === currentPoRef);
       assert.equal(completed?.calculatedStatus, "Completed");

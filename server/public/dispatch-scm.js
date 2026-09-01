@@ -4,6 +4,10 @@ const languageToggle = () => window.MBBS_I18N?.toggleHtml() || "";
 
 let scmOperator = null;
 let scmOrders = [];
+let scmOrderDetail = null;
+let scmOrderDetailRequest = 0;
+let scmOrdersRequest = 0;
+let scmOrdersAbortController = null;
 let selectedScmOrderId = "";
 let scmSearch = "";
 let scmPoTypeFilter = "";
@@ -19,7 +23,7 @@ let scmLoading = false;
 let scmSummaryOpen = false;
 let scmDestinationLocationId = "";
 let scmPickupPoint = "";
-let scmSplitInitialStatus = "Queued";
+let scmSplitInitialStatus = "Hold";
 let scmSplitRemark = "";
 let scmGroupSelection = new Set();
 let scmSplitEditor = null;
@@ -44,6 +48,7 @@ const SCM_MANUAL_STATUSES = [
   "Surplus Only",
   "Book Appt"
 ];
+const SCM_TARGETED_RESPONSE = "response=targeted";
 
 function escapeHtml(value) {
   return String(value ?? "")
@@ -64,6 +69,16 @@ async function scmApi(path, options = {}) {
   });
   if (!response.ok) throw new Error(await response.text());
   return response.json();
+}
+
+function scmTargetedMutationOptions(options = {}) {
+  return {
+    ...options,
+    headers: {
+      ...(options.headers || {}),
+      "X-MBBS-Response-Mode": SCM_TARGETED_RESPONSE.split("=")[1]
+    }
+  };
 }
 
 function scmNumber(value) {
@@ -155,7 +170,31 @@ function scmPlannedLabel(order = {}) {
 }
 
 function scmSelectedOrder() {
-  return scmOrders.find((order) => String(order.id) === String(selectedScmOrderId)) || null;
+  const card = scmOrders.find((order) => String(order.id) === String(selectedScmOrderId)) || null;
+  if (!card) return null;
+  if (String(scmOrderDetail?.id || "") !== String(card.id || "")) return card;
+  const scheduleRevision = (order = {}) => {
+    const value = String(order?.scm?.updatedAt || "").trim();
+    const milliseconds = Date.parse(value);
+    const fractional = value.match(/\.(\d+)(?:Z|[+-]\d{2}:?\d{2})$/i)?.[1] || "";
+    return {
+      milliseconds: Number.isFinite(milliseconds) ? milliseconds : Number.NEGATIVE_INFINITY,
+      fractional: fractional.padEnd(9, "0").slice(0, 9)
+    };
+  };
+  const cardRevision = scheduleRevision(card);
+  const detailRevision = scheduleRevision(scmOrderDetail);
+  const detailIsAtLeastAsFresh = detailRevision.milliseconds > cardRevision.milliseconds
+    || (detailRevision.milliseconds === cardRevision.milliseconds
+      && detailRevision.fractional >= cardRevision.fractional);
+  return {
+    ...scmOrderDetail,
+    ...card,
+    scm: detailIsAtLeastAsFresh
+      ? scmOrderDetail.scm || card.scm || {}
+      : card.scm || scmOrderDetail.scm || {},
+    catalogHydrated: true
+  };
 }
 
 function scmLocationIdFromText(value) {
@@ -245,7 +284,7 @@ function scmLiveSplitInitialStatus() {
     scmApp.querySelector('[data-action="split-initial-status"]')?.value || ""
   ).trim();
   if (SCM_MANUAL_STATUSES.includes(selected)) scmSplitInitialStatus = selected;
-  if (!SCM_MANUAL_STATUSES.includes(scmSplitInitialStatus)) scmSplitInitialStatus = "Queued";
+  if (!SCM_MANUAL_STATUSES.includes(scmSplitInitialStatus)) scmSplitInitialStatus = "Hold";
   return scmSplitInitialStatus;
 }
 
@@ -334,6 +373,30 @@ async function loadScmSplitEditor(order = scmSelectedOrder(), { render = true } 
     scmNotice = `Split items failed to load: ${error.message}`;
   }
   if (render) renderScm();
+}
+
+async function loadScmOrderDetail(orderRef = selectedScmOrderId, { render = true } = {}) {
+  const cleanRef = String(orderRef || "").trim();
+  const request = ++scmOrderDetailRequest;
+  if (!cleanRef) {
+    scmOrderDetail = null;
+    if (render) renderScm();
+    return null;
+  }
+  if (String(scmOrderDetail?.id || "") !== cleanRef) scmOrderDetail = null;
+  if (render) renderScm();
+  try {
+    const payload = await scmApi(`/api/dispatch/scm/v2/purchase-orders/${encodeURIComponent(cleanRef)}`);
+    if (request !== scmOrderDetailRequest || String(selectedScmOrderId) !== cleanRef) return null;
+    scmOrderDetail = { ...(payload.order || {}), catalogHydrated: true };
+    return scmOrderDetail;
+  } catch (error) {
+    if (request !== scmOrderDetailRequest) return null;
+    scmNotice = `Purchase-order detail failed to load: ${error.message}`;
+    return null;
+  } finally {
+    if (render && request === scmOrderDetailRequest) renderScm();
+  }
 }
 
 function scmOrderCanGroup(order = {}) {
@@ -451,17 +514,26 @@ function restoreScmScroll(state) {
 }
 
 async function loadScmOrders() {
+  const request = ++scmOrdersRequest;
+  scmOrdersAbortController?.abort();
+  const controller = new AbortController();
+  scmOrdersAbortController = controller;
   scmLoading = true;
   renderScm();
   try {
     const params = new URLSearchParams();
+    params.set("limit", "200");
     if (scmSearch) params.set("search", scmSearch);
     if (scmPoTypeFilter) params.set("poType", scmPoTypeFilter);
     if (scmDropoffFilter) params.set("dropoff", scmDropoffFilter);
     if (scmVendorFilter) params.set("vendor", scmVendorFilter);
     if (scmPickupFilter) params.set("pickupPoint", scmPickupFilter);
-    const query = params.toString() ? `?${params.toString()}` : "";
-    scmOrders = (await scmApi(`/api/dispatch/scm/purchase-orders${query}`)).sort(compareScmOrders);
+    const query = `?${params.toString()}`;
+    const payload = await scmApi(`/api/dispatch/scm/v2/purchase-orders${query}`, {
+      signal: controller.signal
+    });
+    if (request !== scmOrdersRequest) return;
+    scmOrders = Array.isArray(payload.orders) ? payload.orders : [];
     if (scmInitialOrderRef && !scmInitialOrderApplied) {
       const initialNeedle = scmInitialOrderRef.toLowerCase();
       const initialOrder = scmOrders.find((order) => [
@@ -477,23 +549,73 @@ async function loadScmOrders() {
     }
     if (selectedScmOrderId && !scmOrders.some((order) => String(order.id) === String(selectedScmOrderId))) {
       selectedScmOrderId = "";
+      scmOrderDetail = null;
       scmLineInputs = {};
     }
     const validGroupIds = new Set(scmOrders.map((order) => String(order.id)));
     scmGroupSelection = new Set([...scmGroupSelection].filter((id) => validGroupIds.has(String(id))));
     if (!selectedScmOrderId && scmOrders[0]) selectedScmOrderId = scmOrders[0].id;
-    if (!scmRenameRef && selectedScmOrderId) {
-      const selected = scmOrders.find((order) => String(order.id) === String(selectedScmOrderId));
-      scmRenameRef = scmOrderIsSplit(selected) ? selected?.id || "" : selected?.dispatchRef || "";
-    }
-    const selected = scmOrders.find((order) => String(order.id) === String(selectedScmOrderId));
-    await loadScmSplitEditor(selected, { render: false });
-  } catch (error) {
-    scmNotice = `SCM PO list failed: ${error.message}`;
-  } finally {
+    scmOrderDetail = null;
     scmLoading = false;
     renderScm();
+    await loadScmOrderDetail(selectedScmOrderId, { render: false });
+    if (request !== scmOrdersRequest) return;
+    const selected = scmSelectedOrder();
+    if (!scmRenameRef && selectedScmOrderId) {
+      scmRenameRef = scmOrderIsSplit(selected) ? selected?.id || "" : selected?.dispatchRef || "";
+    }
+    await loadScmSplitEditor(selected, { render: false });
+  } catch (error) {
+    if (error?.name === "AbortError") return;
+    scmNotice = `SCM PO list failed: ${error.message}`;
+  } finally {
+    if (request === scmOrdersRequest) {
+      scmLoading = false;
+      renderScm();
+    }
   }
+}
+
+function mergeAuthoritativeScmOrders(targetedOrders = []) {
+  for (const candidate of targetedOrders || []) {
+    const candidateRef = String(candidate?.id || "").trim();
+    if (!candidateRef) continue;
+    const hydrated = { ...candidate, catalogHydrated: true };
+    const index = scmOrders.findIndex((order) => String(order.id || "").toLowerCase() === candidateRef.toLowerCase());
+    if (index >= 0) scmOrders[index] = hydrated;
+    else scmOrders.unshift(hydrated);
+    if (String(selectedScmOrderId || "").trim().toLowerCase() === candidateRef.toLowerCase()) {
+      scmOrderDetail = hydrated;
+    }
+  }
+}
+
+function applyAuthoritativeScmDestination(payload = {}, orderRef = "", fallback = {}) {
+  mergeAuthoritativeScmOrders(payload.orders || []);
+  const ref = String(orderRef || "").trim().toLowerCase();
+  const destinationYard = String(payload.updated?.destinationLocation || fallback.text || "").trim();
+  const destinationLocationId = String(payload.updated?.destinationLocationId || fallback.id || "").trim();
+  if (!ref || !destinationYard) return;
+  const apply = (order) => String(order?.id || "").trim().toLowerCase() === ref
+    ? { ...order, destinationYard, destinationLocationId: destinationLocationId || order.destinationLocationId }
+    : order;
+  scmOrders = scmOrders.map(apply);
+  if (String(scmOrderDetail?.id || "").trim().toLowerCase() === ref) scmOrderDetail = apply(scmOrderDetail);
+}
+
+async function refreshScmOrder(orderRef, targetedOrders = [], { removeRefs = [] } = {}) {
+  const cleanRef = String(orderRef || "").trim();
+  const removed = new Set(removeRefs.map((ref) => String(ref || "").trim().toLowerCase()).filter(Boolean));
+  if (removed.size) {
+    scmOrders = scmOrders.filter((order) => !removed.has(String(order.id || "").trim().toLowerCase()));
+  }
+  selectedScmOrderId = cleanRef;
+  scmOrderDetail = null;
+  mergeAuthoritativeScmOrders(targetedOrders);
+  if (scmOrderDetail) {
+    await loadScmSplitEditor(scmSelectedOrder(), { render: false });
+  }
+  renderScm();
 }
 
 function renderScmListFilters() {
@@ -619,6 +741,9 @@ function renderSelectedOrder() {
       </section>
     `;
   }
+  if (order.catalogHydrated !== true) {
+    return `<section class="scm-detail-panel empty-detail"><h2>${escapeHtml(order.id)}</h2><p>${t("common.loading", "Loading...")}</p></section>`;
+  }
   const isSplit = scmOrderIsSplit(order);
   const visibleItems = scmFilteredItems(order);
   const lineRows = isSplit ? renderScmSplitLineEditor(order) : visibleItems.map((item) => {
@@ -698,29 +823,36 @@ function renderScmScheduleMiniPanel(order = {}) {
   const effectiveDestination = order.destinationYard
     || SCM_DESTINATION_YARDS.find((yard) => yard.id === scmDefaultDestinationLocationId(order))?.text
     || "NetSuite line destinations";
+  const destinationSource = isSplit ? "Split confirmation" : "NetSuite";
   const destinationOverrideControl = `<label class="scm-po-destination-override"><span>${t("dispatch.destinationOverride", "Destination Override")}</span><select data-scm-field="dropoffPoint" ${splitLocked ? "disabled" : ""}>
-    <option value="" ${savedDestinationOverride ? "" : "selected"}>${t("dispatch.useNetsuiteLineDestinations", "Use NetSuite line destinations")} (${escapeHtml(effectiveDestination)})</option>
+    <option value="" ${savedDestinationOverride ? "" : "selected"}>${escapeHtml(effectiveDestination)} (${destinationSource})</option>
     ${SCM_DESTINATION_YARDS.map((yard) => `<option value="${yard.text}" ${yard.text === savedDestinationOverride ? "selected" : ""}>${yard.text}</option>`).join("")}
   </select><small>${t("dispatch.overrideAllPoLines", "Override all PO lines when a yard is selected.")}</small></label>`;
   return `
     <section class="scm-mini-panel">
       <div class="scm-mini-grid">
-        <label><span>Method</span><select data-scm-field="method" ${splitLocked ? "disabled" : ""}>
-          ${["MBT", "Vendor", "Customer Pickup"].map((value) => `<option value="${value}" ${currentMethod === value ? "selected" : ""}>${value}</option>`).join("")}
-        </select></label>
-        <label><span>Status</span>${statusIsManual
-          ? `<select data-scm-field="status" ${splitLocked ? "disabled" : ""}>${SCM_MANUAL_STATUSES.map((value) => `<option value="${value}" ${currentStatus === value ? "selected" : ""}>${value}</option>`).join("")}</select>`
-          : `<input value="${escapeHtml(currentStatus)}" readonly />`}</label>
-        ${renderScmPickupYardControl(order, { action: isSplit ? "existing-split-pickup-yard" : "existing-pickup-yard", field: !isSplit, disabled: splitLocked })}
-        <label class="checkbox-line"><input data-scm-field="isSpecialOrder" type="checkbox" ${scm.isSpecialOrder ? "checked" : ""} ${splitLocked ? "disabled" : ""} /> <span>Sp.O</span></label>
-        ${isSplit
-          ? `<label><span>${t("dispatch.changeRef", "Change Ref")}</span><input data-action="rename-ref" value="${escapeHtml(scmRenameRef || order.id || "")}" autocomplete="off" ${splitLocked ? "disabled" : ""} /></label>`
-          : `<label><span>Packing Slip / Ref</span><input data-scm-field="packingSlipRef" value="${escapeHtml(scm.packingSlipRef || order.dispatchRef || "")}" /></label>`}
-        ${destinationOverrideControl}
-        <label class="scm-remark-field"><span>Remark</span><textarea data-scm-field="remarkOverride" rows="2" maxlength="2000" placeholder="Add remark">${escapeHtml(remarkOverride)}</textarea><small>${remarkOverride ? "Local remark" : "Shared with PO / TO Schedule"}</small></label>
-        <button data-action="save-scm-schedule" data-kind="${escapeHtml(orderKind)}" type="button" ${scmLoading || splitLocked ? "disabled" : ""}>${scmLoading ? "Saving..." : "Save Schedule"}</button>
-        ${splitLocked ? `<button data-action="save-scm-remark" data-kind="${escapeHtml(orderKind)}" type="button" ${scmLoading ? "disabled" : ""}>${scmLoading ? "Saving..." : "Save Remark"}</button>` : ""}
-        ${isSplit ? `<button class="danger-button" data-action="unsplit-order" type="button" ${splitLocked ? "disabled" : ""}>${t("dispatch.unsplit", "Unsplit")}</button>` : ""}
+        <div class="scm-mini-row scm-mini-routing-row">
+          <label class="scm-mini-method-field"><span>Method</span><select data-scm-field="method" ${splitLocked ? "disabled" : ""}>
+            ${["MBT", "Vendor", "Customer Pickup"].map((value) => `<option value="${value}" ${currentMethod === value ? "selected" : ""}>${value}</option>`).join("")}
+          </select></label>
+          <label class="scm-mini-status-field"><span>Status</span>${statusIsManual
+            ? `<select data-scm-field="status" ${splitLocked ? "disabled" : ""}>${SCM_MANUAL_STATUSES.map((value) => `<option value="${value}" ${currentStatus === value ? "selected" : ""}>${value}</option>`).join("")}</select>`
+            : `<input value="${escapeHtml(currentStatus)}" readonly />`}</label>
+          ${renderScmPickupYardControl(order, { action: isSplit ? "existing-split-pickup-yard" : "existing-pickup-yard", field: !isSplit, disabled: splitLocked })}
+          <label class="checkbox-line scm-mini-special-field"><input data-scm-field="isSpecialOrder" type="checkbox" ${scm.isSpecialOrder ? "checked" : ""} ${splitLocked ? "disabled" : ""} /> <span>Sp.O</span></label>
+          ${isSplit
+            ? `<label class="scm-mini-reference-field"><span>${t("dispatch.changeRef", "Change Ref")}</span><input data-action="rename-ref" value="${escapeHtml(scmRenameRef || order.id || "")}" autocomplete="off" ${splitLocked ? "disabled" : ""} /></label>`
+            : `<label class="scm-mini-reference-field"><span>Packing Slip / Ref</span><input data-scm-field="packingSlipRef" value="${escapeHtml(scm.packingSlipRef || order.dispatchRef || "")}" /></label>`}
+        </div>
+        <div class="scm-mini-row scm-mini-notes-row">
+          ${destinationOverrideControl}
+          <label class="scm-remark-field"><span>Remark</span><textarea data-scm-field="remarkOverride" rows="2" maxlength="2000" placeholder="Add remark">${escapeHtml(remarkOverride)}</textarea><small>${remarkOverride ? "Local remark" : "Shared with PO / TO Schedule"}</small></label>
+          <div class="scm-mini-actions">
+            <button data-action="save-scm-schedule" data-kind="${escapeHtml(orderKind)}" type="button" ${scmLoading || splitLocked ? "disabled" : ""}>${scmLoading ? "Saving..." : "Save Schedule"}</button>
+            ${splitLocked ? `<button data-action="save-scm-remark" data-kind="${escapeHtml(orderKind)}" type="button" ${scmLoading ? "disabled" : ""}>${scmLoading ? "Saving..." : "Save Remark"}</button>` : ""}
+            ${isSplit ? `<button class="danger-button" data-action="unsplit-order" type="button" ${splitLocked ? "disabled" : ""}>${t("dispatch.unsplit", "Unsplit")}</button>` : ""}
+          </div>
+        </div>
       </div>
       ${currentGroup ? `<div class="scm-group-tools compact"><strong>${escapeHtml(currentGroup)}</strong><button class="danger-button" data-action="cancel-scm-group" data-group="${escapeHtml(currentGroup)}" type="button">Ungroup</button></div>` : ""}
     </section>
@@ -860,7 +992,7 @@ async function createScmSplit() {
   scmNotice = "Creating SCM split...";
   renderScm();
   try {
-    const payload = await scmApi("/api/dispatch/scm/purchase-order-splits", {
+    const payload = await scmApi("/api/dispatch/scm/purchase-order-splits", scmTargetedMutationOptions({
       method: "POST",
       body: JSON.stringify({
         sourcePoRef: order.originalPoRef || order.id,
@@ -872,17 +1004,17 @@ async function createScmSplit() {
         lines,
         audit: { sessionId: sessionStorage.getItem("mbbs.dispatch.sessionId") || "" }
       })
-    });
+    }));
     const createdRef = payload.created?.split?.splitPoRef || scmRef;
     scmNotice = `Created ${createdRef}. It is now searchable under PO.`;
     scmRef = "";
     scmDestinationLocationId = "";
     scmPickupPoint = "";
-    scmSplitInitialStatus = "Queued";
+    scmSplitInitialStatus = "Hold";
     scmSplitRemark = "";
     scmSummaryOpen = false;
     scmLineInputs = {};
-    await loadScmOrders();
+    await refreshScmOrder(order.id, payload.orders || []);
   } catch (error) {
     scmNotice = `Create split failed: ${error.message}`;
   } finally {
@@ -899,19 +1031,19 @@ async function updateScmPoRef({ clear = false } = {}) {
   scmNotice = clear ? "Clearing PO ref..." : "Updating PO ref...";
   renderScm();
   try {
-    const payload = await scmApi(`/api/dispatch/scm/purchase-orders/${encodeURIComponent(order.originalPoRef || order.id)}/ref`, {
+    const payload = await scmApi(`/api/dispatch/scm/purchase-orders/${encodeURIComponent(order.originalPoRef || order.id)}/ref`, scmTargetedMutationOptions({
       method: "PUT",
       body: JSON.stringify({
         newRef,
         audit: { sessionId: sessionStorage.getItem("mbbs.dispatch.sessionId") || "" }
       })
-    });
+    }));
     selectedScmOrderId = payload.updated?.displayRef || order.originalPoRef || order.id;
     scmRenameRef = payload.updated?.dispatchRef || "";
     scmNotice = payload.updated?.dispatchRef
       ? `Updated PO ref to ${payload.updated.displayRef}.`
       : `Cleared PO ref. Showing ${payload.updated?.poRef || selectedScmOrderId}.`;
-    await loadScmOrders();
+    await refreshScmOrder(selectedScmOrderId, payload.orders || [], { removeRefs: [order.id] });
   } catch (error) {
     scmNotice = `Update PO ref failed: ${error.message}`;
   } finally {
@@ -933,18 +1065,18 @@ async function updateScmSplitRef() {
   scmNotice = "Updating split ref...";
   renderScm();
   try {
-    const payload = await scmApi(`/api/dispatch/scm/purchase-order-splits/${encodeURIComponent(order.id)}`, {
+    const payload = await scmApi(`/api/dispatch/scm/purchase-order-splits/${encodeURIComponent(order.id)}`, scmTargetedMutationOptions({
       method: "PUT",
       body: JSON.stringify({
         newPoRef: newRef,
         expectedRevision: scmSplitEditor?.split?.revision ?? order.scmSplitRevision,
         audit: { sessionId: sessionStorage.getItem("mbbs.dispatch.sessionId") || "" }
       })
-    });
+    }));
     selectedScmOrderId = payload.updated?.newPoRef || newRef;
     scmRenameRef = selectedScmOrderId;
     scmNotice = `Updated split ref to ${selectedScmOrderId}.`;
-    await loadScmOrders();
+    await refreshScmOrder(selectedScmOrderId, payload.orders || [], { removeRefs: [order.id] });
   } catch (error) {
     scmNotice = `Update ref failed: ${error.message}`;
   } finally {
@@ -990,19 +1122,27 @@ async function updateScmSplit() {
     let updatedRef = null;
     let updatedDestination = null;
     let updatedPickup = null;
+    const targetedByRef = new Map();
+    const collectTargetedOrders = (payload = {}) => {
+      for (const candidate of payload.orders || []) {
+        const key = String(candidate?.id || "").trim().toLowerCase();
+        if (key) targetedByRef.set(key, candidate);
+      }
+    };
     const audit = { sessionId: sessionStorage.getItem("mbbs.dispatch.sessionId") || "" };
     if (refChanged) {
-      const refPayload = await scmApi(`/api/dispatch/scm/purchase-order-splits/${encodeURIComponent(currentRef)}`, {
+      const refPayload = await scmApi(`/api/dispatch/scm/purchase-order-splits/${encodeURIComponent(currentRef)}`, scmTargetedMutationOptions({
         method: "PUT",
         body: JSON.stringify({ newPoRef: newRef, expectedRevision: currentRevision, audit })
-      });
+      }));
+      collectTargetedOrders(refPayload);
       currentRef = refPayload.updated?.newPoRef || newRef;
       currentRevision = Number(refPayload.updated?.revision || currentRevision + 1);
       scheduleUpdatedAt = refPayload.updated?.scheduleUpdatedAt || scheduleUpdatedAt;
       updatedRef = currentRef;
     }
     if (destinationChanged) {
-      const destinationPayload = await scmApi(`/api/dispatch/scm/purchase-order-splits/${encodeURIComponent(currentRef)}/destination`, {
+      const destinationPayload = await scmApi(`/api/dispatch/scm/purchase-order-splits/${encodeURIComponent(currentRef)}/destination`, scmTargetedMutationOptions({
         method: "PUT",
         body: JSON.stringify({
           destinationLocationId: nextDestinationId,
@@ -1010,16 +1150,18 @@ async function updateScmSplit() {
           expectedRevision: currentRevision,
           audit
         })
-      });
+      }));
+      collectTargetedOrders(destinationPayload);
       currentRevision = Number(destinationPayload.updated?.revision || currentRevision + 1);
       scheduleUpdatedAt = destinationPayload.updated?.scheduleUpdatedAt || scheduleUpdatedAt;
       updatedDestination = destinationPayload.updated?.destinationLocation || SCM_DESTINATION_YARDS.find((yard) => yard.id === nextDestinationId)?.text || "";
     }
     if (pickupChanged) {
-      const pickupPayload = await scmApi(`/api/dispatch/scm/purchase-order-splits/${encodeURIComponent(currentRef)}/pickup`, {
+      const pickupPayload = await scmApi(`/api/dispatch/scm/purchase-order-splits/${encodeURIComponent(currentRef)}/pickup`, scmTargetedMutationOptions({
         method: "PUT",
         body: JSON.stringify({ pickupPoint: nextPickupPoint, expectedRevision: currentRevision, audit })
-      });
+      }));
+      collectTargetedOrders(pickupPayload);
       currentRevision = Number(pickupPayload.updated?.revision || currentRevision + 1);
       updatedPickup = pickupPayload.updated?.pickupPoint || nextPickupPoint;
     }
@@ -1033,7 +1175,9 @@ async function updateScmSplit() {
       updatedPickup ? `pickup ${updatedPickup}` : ""
     ].filter(Boolean).join(" and ");
     scmNotice = scmNotice ? `Updated split ${scmNotice}.` : "Updated split order.";
-    await loadScmOrders();
+    await refreshScmOrder(selectedScmOrderId, [...targetedByRef.values()], {
+      removeRefs: refChanged ? [order.id] : []
+    });
   } catch (error) {
     scmNotice = `Update split failed: ${error.message}`;
   } finally {
@@ -1060,16 +1204,16 @@ async function saveScmSplitLines() {
   scmNotice = "Saving split quantities...";
   renderScm();
   try {
-    const payload = await scmApi(`/api/dispatch/scm/purchase-order-splits/${encodeURIComponent(order.id)}/lines`, {
+    const payload = await scmApi(`/api/dispatch/scm/purchase-order-splits/${encodeURIComponent(order.id)}/lines`, scmTargetedMutationOptions({
       method: "PUT",
       body: JSON.stringify({
         expectedRevision: scmSplitEditor.split.revision,
         lines,
         audit: { sessionId: sessionStorage.getItem("mbbs.dispatch.sessionId") || "" }
       })
-    });
+    }));
     scmNotice = `Updated ${payload.updated?.changes?.length || 0} split item line(s).`;
-    await loadScmOrders();
+    await refreshScmOrder(order.id, payload.orders || []);
   } catch (error) {
     scmNotice = `Split quantity update failed: ${error.message}`;
   } finally {
@@ -1090,15 +1234,15 @@ async function unsplitScmOrder() {
       sessionId: sessionStorage.getItem("mbbs.dispatch.sessionId") || "",
       expectedRevision: String(scmSplitEditor?.split?.revision ?? order.scmSplitRevision ?? 1)
     });
-    await scmApi(`/api/dispatch/scm/purchase-order-splits/${encodeURIComponent(order.id)}?${params}`, {
+    const payload = await scmApi(`/api/dispatch/scm/purchase-order-splits/${encodeURIComponent(order.id)}?${params}`, scmTargetedMutationOptions({
       method: "DELETE"
-    });
+    }));
     scmNotice = `${order.id} was unsplit. Quantity returned to ${order.sourcePoRef || "source PO"}.`;
     selectedScmOrderId = order.sourcePoRef || "";
     scmRenameRef = "";
     scmLineInputs = {};
     scmLineSearch = "";
-    await loadScmOrders();
+    await refreshScmOrder(selectedScmOrderId, payload.orders || [], { removeRefs: [order.id] });
   } catch (error) {
     scmNotice = `Unsplit failed: ${error.message}`;
   } finally {
@@ -1119,6 +1263,42 @@ function collectScmSchedulePatch(order = scmSelectedOrder()) {
     patch[field.dataset.scmField] = field.type === "checkbox" ? field.checked : field.value;
   });
   return patch;
+}
+
+function applyAuthoritativeScmScheduleRow(row = null, orderRef = "") {
+  if (!row || typeof row !== "object") return false;
+  const ref = String(row.orderRef || orderRef || "").trim().toLowerCase();
+  if (!ref) return false;
+  const value = (key, fallback = "") => Object.prototype.hasOwnProperty.call(row, key)
+    ? row[key] ?? ""
+    : fallback;
+  const apply = (order) => {
+    if (String(order?.id || "").trim().toLowerCase() !== ref) return order;
+    const current = order.scm || {};
+    return {
+      ...order,
+      scm: {
+        ...current,
+        scheduleId: value("scheduleId", current.scheduleId || null),
+        method: value("method", current.method || "MBT"),
+        status: value("status", current.status || "Queued"),
+        isSpecialOrder: Boolean(value("isSpecialOrder", current.isSpecialOrder)),
+        pickupPoint: value("pickupPoint", current.pickupPoint || ""),
+        dropoffPoint: value("scheduleDropoffPoint", current.dropoffPoint || ""),
+        packingSlipRef: value("packingSlipRef", current.packingSlipRef || ""),
+        groupRef: value("groupRef", current.groupRef || ""),
+        etaDate: value("etaDate", current.etaDate || ""),
+        etaTime: value("etaTime", current.etaTime || ""),
+        driver: value("driver", current.driver || ""),
+        notes: value("notes", current.notes || ""),
+        remarkOverride: value("remarkOverride", current.remarkOverride || ""),
+        updatedAt: value("updatedAt", current.updatedAt || null)
+      }
+    };
+  };
+  scmOrders = scmOrders.map(apply);
+  if (String(scmOrderDetail?.id || "").trim().toLowerCase() === ref) scmOrderDetail = apply(scmOrderDetail);
+  return true;
 }
 
 async function saveScmScheduleForSelected() {
@@ -1142,7 +1322,7 @@ async function saveScmScheduleForSelected() {
       && requestedDestination.toLowerCase() !== previousDestinationOverride.toLowerCase()) {
       const destination = SCM_DESTINATION_YARDS.find((yard) => yard.text === requestedDestination);
       if (!destination) throw new Error("Select a supported MBBS destination yard.");
-      const destinationPayload = await scmApi(`/api/dispatch/scm/purchase-order-splits/${encodeURIComponent(order.id)}/destination`, {
+      const destinationPayload = await scmApi(`/api/dispatch/scm/purchase-order-splits/${encodeURIComponent(order.id)}/destination`, scmTargetedMutationOptions({
         method: "PUT",
         body: JSON.stringify({
           destinationLocationId: destination.id,
@@ -1150,12 +1330,13 @@ async function saveScmScheduleForSelected() {
           expectedRevision: patch.expectedSplitRevision,
           audit: { sessionId: sessionStorage.getItem("mbbs.dispatch.sessionId") || "" }
         })
-      });
+      }));
+      applyAuthoritativeScmDestination(destinationPayload, order.id, destination);
       splitDestinationUpdated = true;
       patch.expectedUpdatedAt = destinationPayload.updated?.scheduleUpdatedAt || patch.expectedUpdatedAt;
       patch.expectedSplitRevision = destinationPayload.updated?.revision || patch.expectedSplitRevision;
     }
-    await scmApi(`/api/scm/schedule/${encodeURIComponent(order.id)}`, {
+    const payload = await scmApi(`/api/scm/schedule/${encodeURIComponent(order.id)}?includeSchedule=false`, {
       method: "PUT",
       body: JSON.stringify({
         ...patch,
@@ -1163,7 +1344,7 @@ async function saveScmScheduleForSelected() {
       })
     });
     scmNotice = `Saved SCM schedule for ${order.id}.`;
-    await loadScmOrders();
+    if (!applyAuthoritativeScmScheduleRow(payload.row, order.id)) await loadScmOrders();
   } catch (error) {
     scmNotice = splitDestinationUpdated
       ? `Destination updated, but the remaining schedule save failed: ${error.message}`
@@ -1193,7 +1374,7 @@ async function saveScmRemarkForSelected() {
       })
     });
     scmNotice = `Saved remark for ${payload.row?.orderRef || order.id}.`;
-    await loadScmOrders();
+    if (!applyAuthoritativeScmScheduleRow(payload.row, order.id)) await loadScmOrders();
   } catch (error) {
     scmNotice = `Remark save failed: ${error.message}`;
   } finally {
@@ -1277,6 +1458,8 @@ scmApp.addEventListener("click", async (event) => {
       scmGroupSelection = new Set();
     }
     const selected = scmOrders.find((order) => String(order.id) === String(selectedScmOrderId));
+    scmOrderDetail = null;
+    scmOrderDetailRequest += 1;
     scmLineInputs = {};
     scmLineSearch = "";
       scmRenameRef = scmOrderIsSplit(selected) ? selected?.id || "" : selected?.dispatchRef || "";
@@ -1285,7 +1468,8 @@ scmApp.addEventListener("click", async (event) => {
     scmNotice = "";
     scmSummaryOpen = false;
     renderScm();
-    await loadScmSplitEditor(selected);
+    await loadScmOrderDetail(selected?.id || "", { render: false });
+    await loadScmSplitEditor(scmSelectedOrder());
   }
   if (action === "refresh") {
     await loadScmOrders();
@@ -1312,7 +1496,7 @@ scmApp.addEventListener("click", async (event) => {
     scmSummaryOpen = true;
     scmDestinationLocationId = scmDefaultDestinationLocationId(scmSelectedOrder());
     scmPickupPoint = scmDefaultPickupPoint(scmSelectedOrder());
-    scmSplitInitialStatus = "Queued";
+    scmSplitInitialStatus = "Hold";
     scmSplitRemark = "";
     scmNotice = "";
     renderScm();
@@ -1321,7 +1505,7 @@ scmApp.addEventListener("click", async (event) => {
     scmSummaryOpen = false;
     scmDestinationLocationId = "";
     scmPickupPoint = "";
-    scmSplitInitialStatus = "Queued";
+    scmSplitInitialStatus = "Hold";
     scmSplitRemark = "";
     renderScm();
   }
@@ -1381,7 +1565,7 @@ scmApp.addEventListener("input", (event) => {
   if (target.id === "scmSearchInput") {
     scmSearch = target.value;
     clearTimeout(window.__scmSearchTimer);
-    window.__scmSearchTimer = setTimeout(loadScmOrders, 250);
+    window.__scmSearchTimer = setTimeout(loadScmOrders, 300);
     return;
   }
   if (target.dataset.action === "new-ref") {
@@ -1434,7 +1618,7 @@ scmApp.addEventListener("change", (event) => {
     scmPickupPoint = target.value;
   }
   if (target.dataset.action === "split-initial-status") {
-    scmSplitInitialStatus = SCM_MANUAL_STATUSES.includes(target.value) ? target.value : "Queued";
+    scmSplitInitialStatus = SCM_MANUAL_STATUSES.includes(target.value) ? target.value : "Hold";
   }
   if (target.dataset.action === "filter-dropoff") {
     scmDropoffFilter = target.value;

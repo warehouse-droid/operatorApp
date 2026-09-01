@@ -687,3 +687,99 @@ test("Driver shows the full source PO at vendor pickup and only the residual at 
     );
   }
 });
+
+test("a selected MBBS-Special handling fee travels with the customer and never becomes a yard residual", () => {
+  const po = {
+    id: "#263165",
+    type: "PO",
+    sourceYard: "Porcea/STONEarch",
+    destinationYard: "3445",
+    items: [
+      {
+        lineRowId: "material-line",
+        itemId: 2055,
+        sku: "MBBS-Special Order",
+        description: "OnyxBlack:CopingWall:Flamed:2 Edge Rockface",
+        unit: "SQFT",
+        quantity: 65.38
+      },
+      {
+        lineRowId: "split-fee-line",
+        itemId: 2055,
+        sku: "MBBS-Special Order",
+        description: "Split Pallet Fee",
+        unit: "EACH",
+        quantity: 1
+      }
+    ]
+  };
+  const allocations = [{
+    id: 263165,
+    status: "active",
+    dispatch_target_ref: "SOB118896",
+    sales_order_ref: "SOB118896",
+    po_order_ref: "#263165",
+    po_line_id: "material-line",
+    allocated_sales_qty: 65.38,
+    details: {
+      directServicePoLines: [{
+        poLineId: "split-fee-line",
+        itemId: 2055,
+        description: "Split Pallet Fee",
+        unit: "EACH",
+        quantity: 1
+      }]
+    }
+  }];
+
+  const projected = projectPurchaseOrderRouteResidual(po, allocations).poRouteProjection;
+
+  assert.equal(projected.hasResidual, false,
+    "the non-stock fee must not create a standalone PO route back to an MBBS yard");
+  assert.deepEqual(projected.items, []);
+  assert.deepEqual(projected.directServiceLines, [{
+    poLineId: "split-fee-line",
+    itemId: 2055,
+    description: "Split Pallet Fee",
+    unit: "EACH",
+    quantity: 1
+  }]);
+});
+
+test("Driver never displays an explicitly selected SO service fee as a physical item", () => {
+  const order = {
+    id: "SO-SERVICE-FEE",
+    type: "SO",
+    customer: "Service Fee Customer",
+    items: [
+      {
+        lineRowId: "material",
+        itemId: 2055,
+        sku: "MBBS-Special Material",
+        unit: "SQFT",
+        quantity: 10,
+        poAllocatedSalesQty: 10
+      },
+      {
+        lineRowId: "cutting-fee",
+        itemId: 2055,
+        sku: "MBBS-Special Order",
+        description: "MBBS-Special Order cutting fee",
+        unit: "PC",
+        pieces: 1,
+        quantity: 1,
+        poAllocatedPieces: 1,
+        poAllocatedSalesQty: 1,
+        dispatchServiceFee: true
+      }
+    ]
+  };
+
+  for (const context of [
+    { stopType: "pickup", pickupLocation: "Vendor Yard", orderType: "SO", plan: {} },
+    { stopType: "dropoff", orderType: "SO", plan: {} }
+  ]) {
+    const detail = driverOrderDetailsFromPlan(order.id, order, context);
+    assert.deepEqual(detail.items.map((item) => item.sku), ["MBBS-Special Material"]);
+  }
+});

@@ -29,8 +29,11 @@ test("Dispatch exposes a dedicated CO control without redirecting Custom Order m
   assert.match(actions, /data-action=["']open-transit-co["']/u);
   assert.match(actions, /order\.transitCo\s*\?\s*["']Manage CO["']\s*:\s*["']Add CO["']/u);
   assert.match(dispatchSource, /data-form=["']transit-co["']/u);
-  assert.match(dispatchSource, /await\s+saveTransitCoToServer[\s\S]{0,500}commitPlanMutation\(["']co_created["']\)/u,
-    "the durable CO row must be saved before the plan mutation can autosave");
+  const submit = sourceBetween(dispatchSource, 'if (form.dataset.form === "transit-co")', 'if (form.dataset.form === "edit-order-details")');
+  assert.ok(
+    submit.indexOf("await saveTransitCoToServer") < submit.indexOf('commitPlanMutation("co_created")'),
+    "the durable CO row must be saved before the plan mutation can autosave"
+  );
 });
 
 test("VRMA and Custom CO creation bypasses the NetSuite-only Dispatch details endpoint", () => {

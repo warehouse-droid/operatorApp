@@ -1,0 +1,12 @@
+{
+  "all": false,
+  "check-coverage": false,
+  "exclude-after-remap": true,
+  "extension": [".js", ".mjs"],
+  "include": [
+    "src/dispatch-delivery-group-repository.js",
+    "src/dispatch-order-catalog-repository.js",
+    "src/scm-dependency-preview-service.js"
+  ],
+  "reporter": ["text", "json"]
+}

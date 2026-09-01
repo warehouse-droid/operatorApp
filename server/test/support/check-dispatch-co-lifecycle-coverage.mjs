@@ -21,7 +21,11 @@ const files = [
       ["global cancellation rejection", "throw new DispatchCoAlreadyPlannedError(cleanRef, conflicts);"],
       ["serialized cancellation write", "SET status = 'cancelled',"],
       ["save/cancel inactive assertion", "if (conflicts.length) throw new DispatchCoNotActiveError(conflicts);"],
-      ["global relationship hydration", "const orders = (plan.orders || []).map((order) => applyActiveTransitCoMetadata("]
+      ["global relationship hydration", "let next = applyActiveTransitCoMetadata("],
+      ["inactive relationship classification", "const invalidCoRefs = new Set([...coRefs]"],
+      ["cancelled CO card removal", "if (isCoRef(ref) && invalidCoRefs.has(ref.toLowerCase())) return null;"],
+      ["mixed CO group reduction", "? aggregateGroup(next, retainedDetails)"],
+      ["targeted stale stop cleanup", "const retained = cleanReferenceList(refs);"]
     ]
   },
   {
@@ -45,6 +49,20 @@ const files = [
     path: path.resolve("src/dispatch-plan-repository.js"),
     probes: [
       ["legacy save lifecycle assertion", "await assertActiveDispatchCosForPlan({"]
+    ]
+  },
+  {
+    path: path.resolve("src/dispatch-repository.js"),
+    probes: [
+      ["completed CO planning-pool exclusion", "WHERE co.status IN ('pending_load', 'planned')"],
+      ["completed CO upsert protection", "WHERE local_co_orders.status NOT IN ('cancelled', 'completed')"],
+      ["completed CO conflict response", "{ code: \"DISPATCH_CO_COMPLETED\", status: 409, coRef }"]
+    ]
+  },
+  {
+    path: path.resolve("src/receiving-repository.js"),
+    probes: [
+      ["transport-completed CO receiving admission", "if (![\"planned\", \"completed\"].includes(String(co.status || \"\").toLowerCase())) {"]
     ]
   }
 ];

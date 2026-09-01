@@ -35,7 +35,11 @@ includesAll(schedule, [
   "renderScheduleTableRows({ pickupOptions, dropoffOptions })",
   "schedule-groups?includeSchedule=false",
   "?includeSchedule=false`",
-  'status: [], method: "", kind: "", dropoffPoint: "", brand: []',
+  "status: []",
+  'method: ""',
+  'kind: ""',
+  'dropoffPoint: ""',
+  "brand: []",
   "scmScheduleMultiFilterHtml",
   "data-multi-filter-option",
   "queueScmScheduleSearch",
@@ -53,13 +57,31 @@ const scheduleQueryContext = {
     status: ["Hold", "Queued"],
     method: "Vendor",
     kind: "PO",
+    queuedFrom: "2026-07-01",
+    queuedTo: "2026-07-31",
+    pickup: "Vendor Yard",
     dropoffPoint: "3445",
     brand: ["Acme"],
+    contentSearch: "cement",
+    remarkSearch: "call",
+    orderSearch: "POB",
+    weightMin: "100",
+    weightMax: "5000",
+    packingSearch: "PACK",
     from: "2026-08-01",
-    to: "2026-08-31"
+    to: "2026-08-31",
+    driverSearch: "Alex",
+    slaMin: "1",
+    slaMax: "30"
   },
   scmScheduleReviewOnly: true,
   scmScheduleCanShowScmWorkingControls: () => true,
+  scmScheduleCanShowTypeFilter: () => true,
+  scmScheduleCanShowFullColumnFilters: () => true,
+  SCM_SCHEDULE_EXTENDED_FILTER_KEYS: new Set([
+    "queuedFrom", "queuedTo", "pickup", "contentSearch", "remarkSearch", "orderSearch",
+    "weightMin", "weightMax", "packingSearch", "driverSearch", "slaMin", "slaMax"
+  ]),
   URLSearchParams
 };
 vm.runInNewContext(
@@ -73,10 +95,22 @@ for (const [key, value] of [
   ["view", "scm working"],
   ["method", "Vendor"],
   ["kind", "PO"],
+  ["queuedFrom", "2026-07-01"],
+  ["queuedTo", "2026-07-31"],
+  ["pickup", "Vendor Yard"],
   ["dropoffPoint", "3445"],
   ["brand", "Acme"],
+  ["contentSearch", "cement"],
+  ["remarkSearch", "call"],
+  ["orderSearch", "POB"],
+  ["weightMin", "100"],
+  ["weightMax", "5000"],
+  ["packingSearch", "PACK"],
   ["from", "2026-08-01"],
   ["to", "2026-08-31"],
+  ["driverSearch", "Alex"],
+  ["slaMin", "1"],
+  ["slaMax", "30"],
   ["reconciliationStatus", "review"]
 ]) assert.equal(combinedScheduleParams.get(key), value,
   `${key} must remain active alongside global search.`);
@@ -140,17 +174,19 @@ includesAll(css, [
 includesAll(repository, [
   "createPurchaseOrderDispatchEnricher({ allowOllama: false })",
   'schedulePoEnricher(po, { mappedLocalVendor: po.local_vendor || "" })',
-  "plan_order_types AS MATERIALIZED",
-  "JOIN plan_order_types plan_order",
-  "plan_order.plan_id = snap.plan_id",
+  "direct_planned AS MATERIALIZED",
+  "FROM dispatch_plan_order_assignments assignment",
+  "p.id = assignment.plan_id",
+  "upper(assignment.assignment->>'dispatchOrderKind')",
+  "SELECT direct.*, 0 AS source_priority FROM direct_planned direct",
   "normalizeScmScheduleFilterValues",
   "cardinality($2::text[]) = 0",
   "status = ANY($2::text[])",
   "cardinality($6::text[]) = 0",
   "normalizeScmScheduleFilterValues(status)",
   'String(view || "").trim().toLowerCase()',
-  "load.value->>'driverName'",
-  "load.value->>'truckPlate'",
+  "assignment.assignment->>'dispatchDriverName'",
+  "assignment.assignment->>'dispatchTruckPlate'",
   "NULLIF(s.dispatch_assignment_note, '')",
   "dispatch_assignment_note = EXCLUDED.dispatch_assignment_note"
 ], "Batched enrichment, type-safe planning, multi-value filters, and conjunctive global search");
@@ -170,8 +206,8 @@ includesAll(enrichment, [
   "options.allowOllama !== false"
 ], "Reusable PO enrichment context");
 assert.equal((server.match(/req\.query\.includeSchedule === "false"/g) || []).length, 3, "Schedule mutations must support omitting unused full-list responses.");
-assert.ok(scheduleHtml.includes("/scm-schedule.js?v=20260827-schedule-remarks-v1"), "Schedule cache bust missing.");
-assert.ok(poHtml.includes("/dispatch-scm.js?v=20260827-schedule-remarks-v1"), "PO Split cache bust missing.");
+assert.ok(scheduleHtml.includes("/scm-schedule.js?v=20260829-netsuite-destination-label-v1"), "Schedule cache bust missing.");
+assert.ok(poHtml.includes("/dispatch-scm.js?v=20260829-schedule-freshness-v1"), "PO Split cache bust missing.");
 assert.ok(vrmaHtml.includes("/scm-vrma.js?v=20260730-vrma-delete-v1"), "VRMA cache bust missing.");
 
 const poStart = poSplit.indexOf("function scmNumber");

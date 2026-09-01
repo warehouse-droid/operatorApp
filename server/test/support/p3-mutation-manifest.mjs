@@ -45,6 +45,18 @@ export const P3_DEDICATED_MUTATION_RUNNERS = Object.freeze([
     ])
   }),
   Object.freeze({
+    runner: "run-dispatch-co-group-identity-mutations.mjs",
+    adminUrlEnvironment: null,
+    sourcePaths: Object.freeze([
+      "public/dispatch.js",
+      "src/dispatch-co-group-identity.js",
+      "src/dispatch-co-group-identity-repository.js",
+      "src/dispatch-co-lifecycle.js",
+      "src/dispatch-repository.js",
+      "src/server.js"
+    ])
+  }),
+  Object.freeze({
     runner: "run-dispatch-co-lifecycle-mutations.mjs",
     adminUrlEnvironment: null,
     sourcePaths: Object.freeze([
@@ -52,7 +64,9 @@ export const P3_DEDICATED_MUTATION_RUNNERS = Object.freeze([
       "src/dispatch-co-lifecycle.js",
       "src/dispatch-co-recovery.js",
       "src/dispatch-plan-repository.js",
-      "src/dispatch-repository.js"
+      "src/dispatch-repository.js",
+      "src/receiving-repository.js",
+      "src/server.js"
     ])
   }),
   Object.freeze({
@@ -90,6 +104,14 @@ export const P3_DEDICATED_MUTATION_RUNNERS = Object.freeze([
     ])
   }),
   Object.freeze({
+    runner: "run-dispatch-planning-stale-identity-location-mutations.mjs",
+    adminUrlEnvironment: null,
+    sourcePaths: Object.freeze([
+      "src/dispatch-custom-order-repository.js",
+      "src/netsuite-order-webhook-queue-repository.js"
+    ])
+  }),
+  Object.freeze({
     runner: "run-dispatch-po-route-residual-mutations.mjs",
     adminUrlEnvironment: null,
     sourcePaths: Object.freeze([
@@ -115,6 +137,15 @@ export const P3_DEDICATED_MUTATION_RUNNERS = Object.freeze([
       "src/dispatch-plan-repository.js",
       "src/dispatch-planner-v2-repository.js",
       "src/server.js"
+    ])
+  }),
+  Object.freeze({
+    runner: "run-dispatch-unplan-freshness-mutations.mjs",
+    adminUrlEnvironment: null,
+    sourcePaths: Object.freeze([
+      "public/dispatch.html",
+      "public/dispatch.js",
+      "src/dispatch-plan-repository.js"
     ])
   }),
   Object.freeze({
@@ -161,6 +192,16 @@ export const P3_DEDICATED_MUTATION_RUNNERS = Object.freeze([
     runner: "run-frontdesk-mutations.mjs",
     adminUrlEnvironment: null,
     sourcePaths: Object.freeze(["src/mbt/frontdesk-service.js"])
+  }),
+  Object.freeze({
+    runner: "run-global-order-pool-dependency-preview-mutations.mjs",
+    adminUrlEnvironment: null,
+    sourcePaths: Object.freeze([
+      "public/dispatch.js",
+      "src/dispatch-delivery-group-repository.js",
+      "src/dispatch-order-catalog-repository.js",
+      "src/scm-dependency-preview-service.js"
+    ])
   }),
   Object.freeze({
     runner: "run-mbbs-cross-charge-v4-mutations.mjs",
@@ -313,6 +354,19 @@ export const P3_DEDICATED_MUTATION_RUNNERS = Object.freeze([
     ])
   }),
   Object.freeze({
+    runner: "run-scm-authoritative-schedule-status-mutations.mjs",
+    adminUrlEnvironment: null,
+    sourcePaths: Object.freeze([
+      "migrations/183_scm_authoritative_schedule_status.sql",
+      "src/driver-repository.js",
+      "src/netsuite-delayed-status-refresh-policy.js",
+      "src/netsuite-delayed-status-refresh-service.js",
+      "src/scm-reconciliation.js",
+      "src/scm-schedule-status-refresh-repository.js",
+      "src/scm-schedule-status-refresh.js"
+    ])
+  }),
+  Object.freeze({
     runner: "run-scm-dependency-management-mutations.mjs",
     adminUrlEnvironment: null,
     sourcePaths: Object.freeze([
@@ -324,17 +378,69 @@ export const P3_DEDICATED_MUTATION_RUNNERS = Object.freeze([
     ])
   }),
   Object.freeze({
+    runner: "run-scm-manual-split-authority-mutations.mjs",
+    adminUrlEnvironment: null,
+    sourcePaths: Object.freeze([
+      "public/dispatch-scm.js",
+      "src/dispatch-repository.js",
+      "src/scm-manual-split-authority-repository.js",
+      "src/scm-manual-split-authority.js",
+      "src/scm-purchase-order-catalog-repository.js",
+      "src/scm-purchase-order-catalog-status.js",
+      "src/scm-reconciliation-repository.js",
+      "src/server.js"
+    ])
+  }),
+  Object.freeze({
+    runner: "run-scm-po-group-rollup-recovery-mutations.mjs",
+    adminUrlEnvironment: null,
+    sourcePaths: Object.freeze(["src/scm-reconciliation-group-schedule.js"])
+  }),
+  Object.freeze({
+    runner: "run-scm-po-split-live-schedule-mutations.mjs",
+    adminUrlEnvironment: null,
+    sourcePaths: Object.freeze(["src/dispatch-repository.js"])
+  }),
+  Object.freeze({
     runner: "run-scm-po-split-ref-reuse-mutations.mjs",
     adminUrlEnvironment: null,
     sourcePaths: Object.freeze(["src/dispatch-repository.js"])
+  }),
+  Object.freeze({
+    runner: "run-scm-po-split-status-consistency-mutations.mjs",
+    adminUrlEnvironment: null,
+    sourcePaths: Object.freeze(["src/scm-purchase-order-catalog-status.js"])
   }),
   Object.freeze({
     runner: "run-scm-po-split-ui-mutations.mjs",
     adminUrlEnvironment: null,
     sourcePaths: Object.freeze([
       "public/dispatch-scm.html",
-      "public/dispatch-scm.js"
+      "public/dispatch-scm.js",
+      "public/dispatch.css"
     ])
+  }),
+  Object.freeze({
+    runner: "run-scm-reconcile-review-automation-mutations.mjs",
+    adminUrlEnvironment: null,
+    sourcePaths: Object.freeze([
+      "src/scm-reconcile-review-policy.js",
+      "src/scm-reconciliation-repository.js",
+      "src/server.js"
+    ])
+  }),
+  Object.freeze({
+    runner: "run-scm-schedule-loading-mutations.mjs",
+    adminUrlEnvironment: null,
+    sourcePaths: Object.freeze([
+      "src/dispatch-planner-v2-repository.js",
+      "src/dispatch-repository.js"
+    ])
+  }),
+  Object.freeze({
+    runner: "run-scm-schedule-remark-mutations.mjs",
+    adminUrlEnvironment: null,
+    sourcePaths: Object.freeze(["src/scm-schedule-remark.js"])
   }),
   Object.freeze({
     runner: "run-scm-schedule-status-mutations.mjs",
@@ -347,9 +453,32 @@ export const P3_DEDICATED_MUTATION_RUNNERS = Object.freeze([
     ])
   }),
   Object.freeze({
+    runner: "run-scm-split-receipt-allocation-mutations.mjs",
+    adminUrlEnvironment: null,
+    sourcePaths: Object.freeze([
+      "src/scm-reconciliation-repository.js",
+      "src/scm-split-receipt-allocation.js"
+    ])
+  }),
+  Object.freeze({
+    runner: "run-scm-split-status-evidence-precedence-mutations.mjs",
+    adminUrlEnvironment: null,
+    sourcePaths: Object.freeze(["src/scm-split-status-evidence-precedence.js"])
+  }),
+  Object.freeze({
     runner: "run-smart-scm-blanket-merge-mutations.mjs",
     adminUrlEnvironment: null,
     sourcePaths: Object.freeze(["src/smart-scm-blanket-repository.js"])
+  }),
+  Object.freeze({
+    runner: "run-smart-scm-blanket-residual-coverage-mutations.mjs",
+    adminUrlEnvironment: null,
+    sourcePaths: Object.freeze([
+      "src/smart-scm-blanket-coverage.js",
+      "src/smart-scm-blanket-repository.js",
+      "src/smart-scm-planning-repository.js",
+      "src/smart-scm-run-validator.js"
+    ])
   }),
   Object.freeze({
     runner: "run-smart-scm-manual-controls-mutations.mjs",
@@ -361,6 +490,17 @@ export const P3_DEDICATED_MUTATION_RUNNERS = Object.freeze([
       "public/scm-smart-vendor.js",
       "src/smart-scm-planning-repository.js",
       "src/smart-scm-blanket-repository.js"
+    ])
+  }),
+  Object.freeze({
+    runner: "run-smart-scm-phased-po-split-mutations.mjs",
+    adminUrlEnvironment: null,
+    sourcePaths: Object.freeze([
+      "src/scm-po-split-adjustment.js",
+      "src/scm-schedule-route-options.js",
+      "src/smart-scm-phased-planning.js",
+      "src/smart-scm-planning-repository.js",
+      "src/smart-scm-skip-12441.js"
     ])
   }),
   Object.freeze({

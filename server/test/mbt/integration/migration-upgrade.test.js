@@ -31,7 +31,8 @@ const MBT_FOUNDATION_MIGRATIONS = Object.freeze([
  *   tokenHash: string,
  *   truckId: string,
  *   planId: string,
- *   scheduleId: string
+ *   scheduleId: string,
+ *   completedCoRefs: string[]
  * }>}
  */
 async function seedRepresentativeSchema101Records(client) {
@@ -132,6 +133,18 @@ async function seedRepresentativeSchema101Records(client) {
           reference: "UPGRADE-SO-001",
           type: "SO",
           stops: [{ id: "upgrade-stop-1", location: "12441" }]
+        }, {
+          id: "GOB-UPGRADE-001-002",
+          type: "SO",
+          customer: "2 orders grouped",
+          childOrders: ["SOB-UPGRADE-001", "SOB-UPGRADE-002"],
+          childOrderDetails: [
+            { id: "SOB-UPGRADE-001", type: "SO" },
+            { id: "SOB-UPGRADE-002", type: "SO" }
+          ],
+          groupPlanId: planId,
+          groupPlanDate: "2099-07-31",
+          planOwned: true
         }]),
         JSON.stringify([{
           id: truckId,
@@ -173,13 +186,40 @@ async function seedRepresentativeSchema101Records(client) {
        RETURNING id::text AS id`,
       ["2026-08-03T00:05:00.000Z"]
     );
+    const completedCoRefs = ["CO-UPGRADE-OPEN", "CO-UPGRADE-CANCELLED-FIRST"];
+    await client.query(
+      `INSERT INTO local_co_orders (
+         co_ref, source_order_ref, from_location_id, from_location,
+         to_location_id, to_location, status, delivery_order_id,
+         created_by, created_at, updated_at, details
+       ) VALUES
+         ($1, 'SO-UPGRADE-OPEN', 28, '2967', 15, '12441', 'pending_load',
+          -910001, 'mbt-upgrade-test', $3, $3, '{}'::jsonb),
+         ($2, 'SO-UPGRADE-CANCELLED', 28, '2967', 15, '12441', 'cancelled',
+          -910002, 'mbt-upgrade-test', $3, $3,
+          jsonb_build_object('cancelledAt', $3::timestamptz, 'cancelledBy', 'mbt-upgrade-test'))`,
+      [completedCoRefs[0], completedCoRefs[1], "2026-08-03T00:06:00.000Z"]
+    );
+    await client.query(
+      `INSERT INTO driver_job_records (
+         job_id, plan_date, driver_login, truck_plate, load_id, load_name,
+         stop_id, stop_type, order_refs, status, started_at, completed_at, job_details
+       ) VALUES (
+         'CO-UPGRADE-COMPLETION', '2026-08-03', 'mbt-upgrade-driver',
+         'UPGRADE-CO-TRUCK', 'UPGRADE-CO-LOAD', 'Upgrade CO Load',
+         'UPGRADE-CO-DROP', 'dropoff', $1::jsonb, 'complete', $2, $2,
+         jsonb_build_object('orderTypes', jsonb_build_array('CO'))
+       )`,
+      [JSON.stringify(completedCoRefs), "2026-08-03T00:07:00.000Z"]
+    );
     await client.query("COMMIT");
     return {
       operatorId,
       tokenHash,
       truckId,
       planId,
-      scheduleId: scheduleResult.rows[0].id
+      scheduleId: scheduleResult.rows[0].id,
+      completedCoRefs
     };
   } catch (error) {
     await client.query("ROLLBACK");
@@ -370,9 +410,72 @@ test("F06/F16: schema-101 upgrade preserves representative legacy records and is
     assert.match(firstRunner.stdout, /Applied 182_dispatch_direct_po_link_execution\.sql/);
     assert.match(firstRunner.stdout, /Applied 183_scm_authoritative_schedule_status\.sql/);
     assert.match(firstRunner.stdout, /Applied 184_scm_schedule_remarks\.sql/);
+    assert.match(firstRunner.stdout, /Applied 185_dispatch_optimized_order_pool_gate\.sql/);
+    assert.match(firstRunner.stdout, /Applied 186_application_workload_read_models\.sql/);
+    assert.match(firstRunner.stdout, /Applied 187_dispatch_date_switch_lookup_indexes\.sql/);
+    assert.match(firstRunner.stdout, /Applied 188_scm_schedule_loading_read_path\.sql/);
+
+    assert.match(firstRunner.stdout, /Applied 189_direct_dependency_shared_driver_receipt\.sql/);
+    assert.match(firstRunner.stdout, /Applied 190_dispatch_global_order_groups\.sql/);
+    assert.match(firstRunner.stdout, /Applied 191_driver_completed_co_lifecycle\.sql/);
+    assert.match(firstRunner.stdout, /Applied 192_dispatch_global_derived_orders\.sql/);
 
     const after = await captureLegacyState(client, ids);
-    assert.deepEqual(after, before, "Migrations 102-184 must not rewrite representative schema-101 field values.");
+    assert.deepEqual(after, before, "Migrations 102-192 must not rewrite representative schema-101 field values.");
+
+    const repairedCos = await client.query(
+      `SELECT local.co_ref, local.status, canonical.status AS canonical_status,
+              local.details->>'driverCompletionJobId' AS completion_job_id,
+              local.details->>'completedAfterCancellation' AS completed_after_cancellation,
+              local.details ? 'cancelledAt' AS retained_cancellation
+         FROM local_co_orders local
+         JOIN co_orders canonical ON canonical.id = local.id
+        WHERE local.co_ref = ANY($1::text[])
+        ORDER BY local.co_ref`,
+      [ids.completedCoRefs]
+    );
+    assert.deepEqual(repairedCos.rows, [
+      {
+        co_ref: "CO-UPGRADE-CANCELLED-FIRST",
+        status: "completed",
+        canonical_status: "completed",
+        completion_job_id: "CO-UPGRADE-COMPLETION",
+        completed_after_cancellation: "true",
+        retained_cancellation: true
+      },
+      {
+        co_ref: "CO-UPGRADE-OPEN",
+        status: "completed",
+        canonical_status: "completed",
+        completion_job_id: "CO-UPGRADE-COMPLETION",
+        completed_after_cancellation: "false",
+        retained_cancellation: false
+      }
+    ]);
+
+    const globalGroup = await client.query(
+      `SELECT group_row.group_ref,
+              group_row.source_plan_id::text AS source_plan_id,
+              group_row.source_plan_date::text AS source_plan_date,
+              group_row.active,
+              group_row.full_order ->> 'globalGroupDefinition' AS global_definition,
+              ARRAY(
+                SELECT member.member_order_ref
+                  FROM dispatch_global_order_group_members member
+                 WHERE member.group_ref = group_row.group_ref
+                 ORDER BY member.position
+              ) AS member_refs
+         FROM dispatch_global_order_groups group_row
+        WHERE group_row.group_ref = 'GOB-UPGRADE-001-002'`
+    );
+    assert.deepEqual(globalGroup.rows, [{
+      group_ref: "GOB-UPGRADE-001-002",
+      source_plan_id: ids.planId,
+      source_plan_date: "2099-07-31",
+      active: true,
+      global_definition: "true",
+      member_refs: ["SOB-UPGRADE-001", "SOB-UPGRADE-002"]
+    }], "Migration 190 must backfill an existing plan-owned group into the global pool projection.");
 
     const scheduleRemark = await client.query(
       `SELECT remark_override
@@ -616,10 +719,10 @@ test("F06/F16: schema-101 upgrade preserves representative legacy records and is
       immutable_trigger: true
     }]);
 
-    assert.equal(receiptsBeforeNoOp.rowCount, 184);
+    assert.equal(receiptsBeforeNoOp.rowCount, 192);
     assert.equal(
       receiptsBeforeNoOp.rows.at(-1)?.filename,
-      "184_scm_schedule_remarks.sql"
+      "192_dispatch_global_derived_orders.sql"
     );
     assert.deepEqual(
       receiptsBeforeNoOp.rows

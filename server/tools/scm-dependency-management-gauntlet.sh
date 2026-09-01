@@ -12,6 +12,7 @@ fi
 
 echo "[scm-dependency-gauntlet] focused behavior and database contracts"
 npm run test:scm-dependency-management
+npm run coverage:order-dependency-quantity
 
 echo "[scm-dependency-gauntlet] static, source-state, and historical replay gates"
 npm run lint:scm-dependency-management
@@ -31,6 +32,8 @@ node test/support/scan-diff-secrets.mjs \
   src/driver-route-change-service.js \
   src/driver-route-push.js \
   src/order-dependency-repository.js \
+  src/order-dependency-quantity.js \
+  src/order-dependency-harness.js \
   src/scm-dependency-command-service.js \
   src/scm-dependency-management-policy.js \
   src/scm-dependency-management-repository.js \
@@ -44,6 +47,10 @@ node test/support/scan-diff-secrets.mjs \
   public/scm-dependency-management.html \
   public/scm-dependency-management.js \
   test/scm-dependency-management-spec.md \
+  test/dispatch/integration/order-dependency-multi-to-extension.red.test.js \
+  test/dispatch/integration/order-dependency-quantity-replay.red.test.js \
+  test/dispatch/property/order-dependency-quantity.property.test.js \
+  test/fixtures/order-dependency-quantity-replay.json \
   test/support/run-scm-dependency-management-mutations.mjs \
   tools/scm-dependency-management-gauntlet.sh \
   package.json package-lock.json

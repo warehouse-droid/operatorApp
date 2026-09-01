@@ -6,7 +6,11 @@ import {
   smartScmNetSuiteCreateFailureIsAmbiguous
 } from "./smart-scm-purchase-service.js";
 import { normalizeSmartScmVendorDecision } from "./smart-scm-vendor-repository.js";
-import { selectSmartScmMarkerTransferOrder, smartScmTransferOrderMemoMarker } from "./transfer-dependency-netsuite.js";
+import {
+  buildTransferDependencyRestPayload,
+  selectSmartScmMarkerTransferOrder,
+  smartScmTransferOrderMemoMarker
+} from "./transfer-dependency-netsuite.js";
 
 try {
   const sourceLine = { id: 71, proposedPallets: 6 };
@@ -60,6 +64,22 @@ try {
   assert.equal(smartScmNetSuiteCreateFailureIsAmbiguous(Object.assign(new Error("upstream failed"), { status: 503 })), true);
   assert.equal(smartScmNetSuiteCreateFailureIsAmbiguous(Object.assign(new Error("request rejected"), { status: 400 })), false);
   assert.equal(smartScmTransferOrderMemoMarker(601), "MBBS-SCM:601");
+  const smartTransferPayload = buildTransferDependencyRestPayload({
+    proposal: {
+      id: 32418,
+      palletItemId: null,
+      palletTransferQuantity: 0,
+      lines: [{ itemId: 601, itemName: "A", proposedQuantity: 40 }]
+    },
+    batch: { id: "smart-32418", salesOrderRef: "Smart SCM run 77" },
+    locations: {
+      source: { netsuiteLocationId: 101, subsidiaryId: 1 },
+      destination: { netsuiteLocationId: 128, subsidiaryId: 1 },
+      intercompany: false
+    },
+    memoOverride: smartScmTransferOrderMemoMarker(32418)
+  });
+  assert.equal(smartTransferPayload.memo, "MBBS-SCM:32418");
   assert.equal(selectSmartScmMarkerTransferOrder([], { proposalId: 601 }), null);
   assert.equal(selectSmartScmMarkerTransferOrder([{
     id: "9901",

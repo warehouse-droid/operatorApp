@@ -81,3 +81,15 @@ The deployed cancellation service was exercised inside an outer rollback transac
 ## Cleanup
 
 The disposable `mbbs-co-global-red` database/container/network, both gauntlet projects, and the five generated test images were removed. Production app, database, and Ollama services remained healthy.
+
+## 2026-08-30 Driver-completed grouped-CO incident
+
+Production plan `263` carried `CO-SOA07510` and `CO-SOA07512` as one grouped transfer from yard `2967` to yard `12441`. Driver PWA record `2347` completed that drop at 2026-08-30 21:47 UTC. The final customer address for `SOA07512` is different, so the source SO correctly remains eligible for a later customer-delivery route from `12441`.
+
+The inconsistency was in the transfer lifecycle: the general Driver completion ledger deliberately supports billable `SO`, `TO`, `PO`, `VRMA`, and `CUSTOM` kinds, but not local `CO`/`CO_ORDER`. Driver evidence therefore blocked re-execution while `local_co_orders` and its canonical mirror never advanced. `CO-SOA07510` also had an earlier cancellation, followed by later physical delivery, which left contradictory audit and operational states.
+
+Before implementation, the isolated schema-190 regression produced the expected RED failures: a normal `pending_load` CO and an earlier-cancelled CO both remained unchanged after a terminal Driver drop. Pickup-only and incomplete-drop controls stayed green.
+
+Migration 191 adds a dedicated, non-billable projection from terminal CO drop evidence to `completed`, plus an idempotent historical backfill. Repository guards keep completed/received COs out of Dispatch and prevent stale saves, cancellation, or upsert from reopening them. Receiving accepts `completed` as the transport-arrived state and moves it to `received` only after normal yard confirmation.
+
+Pre-deployment verification completed with the focused regression at 4/4, migration 101-to-191 upgrade/idempotency replay green, readiness contracts at 16/16, strict lint and TypeScript green, and a mutation score of 17/17 killed (100%) followed by a green source-restoration run. The fresh one-command gauntlet also passed 83 surrounding Dispatch files, 23 load-assignment checks, the link rollback harness, and 22/22 changed-line execution probes; its scoped secret and source-state boundaries were green.

@@ -487,7 +487,7 @@ try {
         createdBy: "dispatch-link-harness"
       });
     } catch (error) {
-      uomMismatchRejected = error.code === "DISPATCH_MBBS_SPECIAL_UOM_MISMATCH";
+      uomMismatchRejected = error.code === "DISPATCH_PO_LINK_UOM_MISMATCH";
     }
     assert(uomMismatchRejected, "MBBS-Special linking must reject a different purchase UOM.");
 

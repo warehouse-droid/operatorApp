@@ -34,6 +34,10 @@ reset_database
 
 echo "[dispatch-co] focused lifecycle, recovery, property, and concurrency suite"
 "${compose[@]}" --profile tools run --rm test npm run test:dispatch-co-lifecycle
+"${compose[@]}" --profile tools run --rm test \
+  node --test --test-concurrency=1 \
+    test/mbt/integration/migration-upgrade.test.js \
+    test/mbt/integration/p3-predeploy-readiness.test.js
 
 echo "[dispatch-co] related Dispatch regression suites"
 "${compose[@]}" --profile tools run --rm test npm run test:dispatch:performance
@@ -53,10 +57,14 @@ echo "[dispatch-co] syntax, lint, and type checks"
     src/dispatch-planner-performance.js \
     src/dispatch-planner-v2-repository.js \
     src/dispatch-repository.js \
+    src/receiving-repository.js \
     src/server.js \
     test/dispatch/frontend/dispatch-co-global-lifecycle.contract.test.js \
     test/dispatch/integration/dispatch-co-global-lifecycle.red.test.js \
+    test/dispatch/integration/dispatch-co-driver-completion-lifecycle.red.test.js \
     test/dispatch/integration/dispatch-co-recovery.test.js \
+    test/mbt/integration/migration-upgrade.test.js \
+    test/mbt/integration/p3-predeploy-readiness.test.js \
     test/dispatch/property/dispatch-performance-command.property.test.js \
     test/dispatch/unit/dispatch-co-lifecycle-wiring.test.js \
     test/dispatch/unit/dispatch-performance-contract.test.js \
@@ -82,6 +90,7 @@ echo "[dispatch-co] dependency, secret, and source-state boundaries"
 "${compose[@]}" --profile tools run --rm test \
   node test/support/scan-diff-secrets.mjs \
     Dockerfile \
+    migrations/191_driver_completed_co_lifecycle.sql \
     package.json \
     public/dispatch.js \
     src/dispatch-co-lifecycle.js \
@@ -90,17 +99,20 @@ echo "[dispatch-co] dependency, secret, and source-state boundaries"
     src/dispatch-planner-performance.js \
     src/dispatch-planner-v2-repository.js \
     src/dispatch-repository.js \
+    src/receiving-repository.js \
     src/server.js \
     test/dispatch-co-global-lifecycle-evidence.md \
     test/dispatch-co-global-lifecycle-spec.md \
     test/dispatch/frontend/dispatch-co-global-lifecycle.contract.test.js \
     test/dispatch/integration/dispatch-co-global-lifecycle.red.test.js \
+    test/dispatch/integration/dispatch-co-driver-completion-lifecycle.red.test.js \
     test/dispatch/integration/dispatch-co-recovery.test.js \
     test/dispatch/property/dispatch-performance-command.property.test.js \
     test/dispatch/unit/dispatch-co-lifecycle-wiring.test.js \
     test/dispatch/unit/dispatch-performance-contract.test.js \
     test/support/check-dispatch-co-lifecycle-coverage.mjs \
     test/support/run-dispatch-co-lifecycle-mutations.mjs \
+    tools/mbt-predeploy-readiness.mjs \
     tools/dispatch-co-lifecycle-gauntlet.sh \
     tools/dispatch-co-lifecycle-source-state.sh \
     tools/recover-co-goa-3464-3470-6922.js

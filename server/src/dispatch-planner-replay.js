@@ -56,6 +56,12 @@ function replayLocalDate(value, timeZone) {
   return `${values.year}-${values.month}-${values.day}`;
 }
 
+function localDayOrdinal(value) {
+  const match = /^(\d{4})-(\d{2})-(\d{2})$/u.exec(text(value));
+  if (!match) {return Number.NaN;}
+  return Math.floor(Date.UTC(Number(match[1]), Number(match[2]) - 1, Number(match[3])) / 86_400_000);
+}
+
 function normalizeReplayWindow(window = {}) {
   if (!window || typeof window !== "object") {return {};}
   const fromTime = Date.parse(window.from);
@@ -63,13 +69,17 @@ function normalizeReplayWindow(window = {}) {
   if (!Number.isFinite(fromTime) || !Number.isFinite(toTime) || toTime <= fromTime) {return window;}
   const timezone = text(window.timezone) || "America/Toronto";
   try {
+    const localDates = [
+      replayLocalDate(new Date(fromTime), timezone),
+      replayLocalDate(new Date(toTime - 1), timezone)
+    ];
+    const firstDay = localDayOrdinal(localDates[0]);
+    const lastDay = localDayOrdinal(localDates[1]);
     return {
       ...window,
       timezone,
-      localDates: [
-        replayLocalDate(new Date(fromTime), timezone),
-        replayLocalDate(new Date(toTime - 1), timezone)
-      ]
+      localDates,
+      localDayCount: Number.isFinite(firstDay) && Number.isFinite(lastDay) ? lastDay - firstDay + 1 : 0
     };
   } catch {
     return window;
@@ -416,5 +426,92 @@ export function buildDispatchHistoricalReplayReport({ events = [], window = {}, 
     historicalInteractionGaps: DISPATCH_RISKY_INTERACTION_KEYS
       .filter((key) => Number(interactionCoverage[key] || 0) === 0),
     causalDigest
+  };
+}
+
+const REPLAY_SOURCE_STREAMS = Object.freeze({
+  dispatch_plan_commands: "dispatch",
+  dispatch_plan_snapshot_history: "dispatch",
+  dispatch_audit_log: "dispatch",
+  scm_netsuite_po_history_changes: "scm",
+  scm_reconciliation_audit_events: "netsuite",
+  netsuite_mirror_events: "netsuite",
+  driver_offline_events: "driver",
+  driver_job_records: "driver",
+  dispatch_order_completion_events: "driver",
+  driver_job_corrections: "driver"
+});
+
+function nonNegativeCount(value) {
+  const count = Number(value);
+  return Number.isSafeInteger(count) && count >= 0 ? count : Number.NaN;
+}
+
+export function buildDispatchHistoricalReplayArtifact({ capture = {}, expectedLocalDayCount = 0 } = {}) {
+  const events = Array.isArray(capture?.events) ? capture.events : [];
+  const sourceCounts = capture?.sourceCounts && typeof capture.sourceCounts === "object"
+    ? capture.sourceCounts : {};
+  const report = buildDispatchHistoricalReplayReport({
+    events,
+    window: capture?.window || {},
+    sourceCounts
+  });
+  const entries = Object.entries(sourceCounts);
+  const countsValid = entries.length > 0 && entries.every(([, value]) => Number.isFinite(nonNegativeCount(value)));
+  const sourceRecordCount = countsValid
+    ? entries.reduce((total, [, value]) => total + nonNegativeCount(value), 0) : 0;
+  const zeroSourceCount = countsValid
+    ? entries.filter(([, value]) => nonNegativeCount(value) === 0).length : 0;
+  const expectedEventCount = sourceRecordCount + zeroSourceCount;
+  const sourceStreamCounts = { dispatch: 0, scm: 0, netsuite: 0, driver: 0 };
+  for (const [source, value] of entries) {
+    const stream = REPLAY_SOURCE_STREAMS[source];
+    const count = nonNegativeCount(value);
+    if (stream && Number.isFinite(count)) {sourceStreamCounts[stream] += count;}
+  }
+  const fromTime = Date.parse(report.window?.from);
+  const toTime = Date.parse(report.window?.to);
+  const eventsWithinWindow = Number.isFinite(fromTime) && Number.isFinite(toTime)
+    && events.every((event) => {
+      const eventTime = Date.parse(event?.serverAt);
+      return Number.isFinite(eventTime) && eventTime >= fromTime && eventTime < toTime;
+    });
+  const eventIds = events.map((event) => text(event?.id)).filter(Boolean);
+  const requestedDays = Number(expectedLocalDayCount || 0);
+  const exactLocalDayWindow = requestedDays > 0
+    ? report.window?.localDayCount === requestedDays
+    : Number(report.window?.localDayCount || 0) > 0;
+
+  return {
+    ...report,
+    historicalActionCounts: stableValue(capture?.historicalActionCounts || {}),
+    captureDigest: crypto.createHash("sha256").update(stableJson({
+      schemaVersion: capture?.schemaVersion,
+      window: capture?.window,
+      sourceCounts,
+      events
+    })).digest("hex"),
+    captureValidation: {
+      sourceRecordCount,
+      zeroSourceCount,
+      expectedEventCount,
+      capturedEventCount: events.length,
+      sourceStreamCounts
+    },
+    assertions: {
+      captureSchemaSupported: Number(capture?.schemaVersion) === 1,
+      sourceCountsValid: countsValid,
+      exactLocalDayWindow,
+      everySourceRowAccountedFor: countsValid && events.length === expectedEventCount,
+      eventsWithinWindow,
+      eventIdsUnique: eventIds.length === events.length && new Set(eventIds).size === events.length,
+      everyEventCompared: report.projectionComparisons === report.eventsProcessed,
+      noProjectionMismatch: report.mismatchCount === 0,
+      hasDispatchEvidence: sourceStreamCounts.dispatch > 0,
+      hasScmEvidence: sourceStreamCounts.scm > 0,
+      hasNetSuiteDerivedEvidence: sourceStreamCounts.netsuite > 0,
+      hasDriverEvidence: sourceStreamCounts.driver > 0,
+      gapsExplicit: report.gapCount === 0 || report.gapSamples.length > 0
+    }
   };
 }

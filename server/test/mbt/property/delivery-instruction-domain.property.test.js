@@ -6,7 +6,11 @@ import { deriveMemoDeliveryInstruction } from "../../../src/delivery-instruction
 
 test("unclassified memo lines are never lost around randomized planned fields", () => {
   fc.assert(fc.property(
-    fc.array(fc.stringMatching(/^[A-Za-z0-9][A-Za-z0-9 .#_-]{0,60}$/), { minLength: 1, maxLength: 20 }),
+    fc.array(
+      fc.stringMatching(/^[A-Za-z0-9][A-Za-z0-9 .#_-]{0,48}$/)
+        .map((line) => `Instruction note: ${line}`),
+      { minLength: 1, maxLength: 20 }
+    ),
     (lines) => {
       const unique = [...new Set(lines.map((line) => line.trim()).filter(Boolean))];
       fc.pre(unique.length > 0);

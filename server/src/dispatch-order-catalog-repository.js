@@ -6,7 +6,7 @@ import {
   dispatchOrderSearchText
 } from "./dispatch-planner-optimization.js";
 
-const MAX_POOL_LIMIT = 100;
+const MAX_POOL_LIMIT = 200;
 const MAX_SEARCH_LENGTH = 120;
 
 function text(value) {
@@ -34,6 +34,18 @@ function sortDate(order = {}) {
   return safeDate(order.expectedDeliveryDate || order.deliveryDate || order.shipDate || order.tranDate);
 }
 
+function activityAt(order = {}) {
+  const parsed = new Date(
+    order.updatedAt
+    || order.updated_at
+    || order.syncedAt
+    || order.synced_at
+    || order.scm?.updatedAt
+    || ""
+  );
+  return Number.isFinite(parsed.getTime()) ? parsed.toISOString() : new Date(0).toISOString();
+}
+
 function catalogRows(orders = [], source = "") {
   const rows = [];
   const seen = new Set();
@@ -52,7 +64,8 @@ function catalogRows(orders = [], source = "") {
       card: compactDispatchOrderCard(order),
       full_order: { ...order, catalogHydrated: true },
       source: text(source),
-      source_updated_at: order.updatedAt || order.updated_at || order.syncedAt || null
+      source_updated_at: activityAt(order),
+      activity_at: activityAt(order)
     });
   }
   return rows;
@@ -63,15 +76,15 @@ async function upsertRows(rows = []) {
   const result = await query(
     `INSERT INTO dispatch_order_catalog_entries (
        order_ref, order_type, eligible, sort_date, sort_key, search_text,
-       card, full_order, source, source_updated_at
+       card, full_order, source, source_updated_at, activity_at
      )
      SELECT source.order_ref, source.order_type, source.eligible, source.sort_date,
             source.sort_key, source.search_text, source.card, source.full_order,
-            source.source, source.source_updated_at
+            source.source, source.source_updated_at, source.activity_at
        FROM jsonb_to_recordset($1::jsonb) AS source(
          order_ref text, order_type text, eligible boolean, sort_date date,
          sort_key text, search_text text, card jsonb, full_order jsonb,
-         source text, source_updated_at timestamptz
+         source text, source_updated_at timestamptz, activity_at timestamptz
        )
      ON CONFLICT (lower(order_ref)) DO UPDATE
        SET order_ref = EXCLUDED.order_ref,
@@ -84,6 +97,7 @@ async function upsertRows(rows = []) {
            full_order = EXCLUDED.full_order,
            source = EXCLUDED.source,
            source_updated_at = EXCLUDED.source_updated_at,
+           activity_at = EXCLUDED.activity_at,
            catalog_revision = dispatch_order_catalog_entries.catalog_revision + 1,
            updated_at = now()
      RETURNING order_ref`,
@@ -130,6 +144,9 @@ export async function replaceDispatchOrderCatalog({ orders = [], source = "", ty
               source = $1,
               catalog_count = (SELECT count(*)::int FROM dispatch_order_catalog_entries),
               legacy_count = $2,
+              shadow_match_count = 0,
+              shadow_mismatch_count = 0,
+              last_shadow_comparison_at = NULL,
               last_full_refresh_at = now(),
               last_error = '',
               updated_at = now()
@@ -148,9 +165,29 @@ export async function getDispatchOrderCatalogOrder(ref) {
   const cleanRef = text(ref);
   if (!cleanRef) return null;
   const result = await query(
-    `SELECT full_order
-       FROM dispatch_order_catalog_entries
-      WHERE lower(order_ref) = lower($1)
+    `SELECT candidate.full_order
+       FROM (
+         SELECT global_group.full_order, 0 AS priority
+           FROM dispatch_global_order_groups global_group
+         WHERE global_group.active = true
+            AND lower(global_group.group_ref) = lower($1)
+         UNION ALL
+         SELECT global_split.full_order, 1 AS priority
+           FROM dispatch_global_order_splits global_split
+          WHERE global_split.active = true
+            AND lower(global_split.split_ref) = lower($1)
+         UNION ALL
+         SELECT catalog.full_order, 2 AS priority
+           FROM dispatch_order_catalog_entries catalog
+          WHERE lower(catalog.order_ref) = lower($1)
+            AND NOT EXISTS (
+              SELECT 1
+                FROM dispatch_global_order_splits retired_split
+               WHERE retired_split.active = false
+                 AND lower(retired_split.split_ref) = lower(catalog.order_ref)
+            )
+       ) candidate
+      ORDER BY candidate.priority
       LIMIT 1`,
     [cleanRef]
   );
@@ -195,6 +232,7 @@ function decodeCursor(value) {
       !parsed
       || ![0, 1].includes(Number(parsed.e))
       || typeof parsed.d !== "string"
+      || !Number.isFinite(Date.parse(parsed.d))
       || typeof parsed.k !== "string"
       || typeof parsed.r !== "string"
       || parsed.k.length > 500
@@ -229,21 +267,112 @@ export async function listDispatchOrderPool({
   type = "",
   search = "",
   cursor = "",
-  limit = 50
+  limit = 200
 } = {}) {
   const requestedType = text(type).toUpperCase();
   const searchTerm = text(search).slice(0, MAX_SEARCH_LENGTH).toLowerCase();
   const decoded = decodeCursor(cursor);
-  const safeLimit = Math.min(Math.max(Number(limit) || 50, 1), MAX_POOL_LIMIT);
+  const safeLimit = Math.min(Math.max(Number(limit) || 200, 1), MAX_POOL_LIMIT);
   const result = await query(
-    `SELECT catalog.order_ref, catalog.card, catalog.sort_key,
-            COALESCE(catalog.sort_date::text, '') AS cursor_date,
+    `WITH pool_catalog AS (
+       SELECT catalog.order_ref, catalog.order_type, catalog.eligible,
+              catalog.search_text, catalog.card, catalog.activity_at
+         FROM dispatch_order_catalog_entries catalog
+        WHERE NOT EXISTS (
+          SELECT 1
+            FROM dispatch_global_order_groups global_group
+           WHERE global_group.active = true
+             AND lower(global_group.group_ref) = lower(catalog.order_ref)
+        )
+          AND NOT EXISTS (
+            SELECT 1
+              FROM dispatch_global_order_splits global_split
+             WHERE global_split.active = true
+               AND lower(global_split.split_ref) = lower(catalog.order_ref)
+          )
+          AND NOT EXISTS (
+            SELECT 1
+              FROM dispatch_global_order_splits retired_split
+             WHERE retired_split.active = false
+               AND lower(retired_split.split_ref) = lower(catalog.order_ref)
+          )
+       UNION ALL
+       SELECT global_split.split_ref, global_split.order_type,
+              global_split.eligible, global_split.search_text,
+              global_split.card, global_split.updated_at
+         FROM dispatch_global_order_splits global_split
+        WHERE global_split.active = true
+          AND NOT EXISTS (
+            SELECT 1
+              FROM dispatch_global_order_groups global_group
+             WHERE global_group.active = true
+               AND lower(global_group.group_ref) = lower(global_split.split_ref)
+          )
+       UNION ALL
+       SELECT global_group.group_ref, global_group.order_type,
+              global_group.eligible, global_group.search_text,
+              global_group.card, global_group.updated_at
+         FROM dispatch_global_order_groups global_group
+        WHERE global_group.active = true
+          AND EXISTS (
+            SELECT 1
+              FROM dispatch_global_order_group_members member
+             WHERE member.group_ref = global_group.group_ref
+          )
+          AND NOT EXISTS (
+            SELECT 1
+              FROM dispatch_global_order_group_members member
+             WHERE member.group_ref = global_group.group_ref
+               AND NOT (
+                 EXISTS (
+                   SELECT 1
+                     FROM dispatch_order_catalog_entries member_catalog
+                    WHERE lower(member_catalog.order_ref) = lower(member.member_order_ref)
+                      AND member_catalog.eligible = true
+                 )
+                 OR EXISTS (
+                   SELECT 1
+                     FROM dispatch_global_order_splits member_split
+                    WHERE member_split.active = true
+                      AND member_split.eligible = true
+                      AND lower(member_split.split_ref) = lower(member.member_order_ref)
+                 )
+                 OR EXISTS (
+                   SELECT 1
+                     FROM dispatch_global_order_groups member_group
+                    WHERE member_group.active = true
+                      AND member_group.eligible = true
+                      AND lower(member_group.group_ref) = lower(member.member_order_ref)
+                 )
+               )
+          )
+     ), visible_catalog AS (
+       SELECT candidate.*
+         FROM pool_catalog candidate
+        WHERE NOT EXISTS (
+          SELECT 1
+            FROM dispatch_global_order_group_members member
+            JOIN dispatch_global_order_groups global_group
+              ON global_group.group_ref = member.group_ref
+             AND global_group.active = true
+           WHERE lower(member.member_order_ref) = lower(candidate.order_ref)
+             AND member.hides_member = true
+        )
+          AND NOT EXISTS (
+            SELECT 1
+              FROM dispatch_global_order_splits global_split
+             WHERE global_split.active = true
+               AND global_split.definition_kind = 'split'
+               AND lower(global_split.parent_order_ref) = lower(candidate.order_ref)
+          )
+     )
+     SELECT catalog.order_ref, catalog.card, catalog.activity_at,
             CASE WHEN $2 <> '' AND lower(catalog.order_ref) = $2 THEN 1 ELSE 0 END AS exact_rank,
             assignment.plan_id::text AS plan_id,
             assignment.plan_date::text AS plan_date,
             assignment.planned_order_ref,
             assignment.assignment
-       FROM dispatch_order_catalog_entries catalog
+       FROM visible_catalog catalog
        LEFT JOIN LATERAL (
          SELECT candidate.plan_id, candidate.plan_date, candidate.planned_order_ref,
                 candidate.assignment
@@ -267,23 +396,18 @@ export async function listDispatchOrderPool({
           OR CASE WHEN $2 <> '' AND lower(catalog.order_ref) = $2 THEN 1 ELSE 0 END < $3
           OR (
             CASE WHEN $2 <> '' AND lower(catalog.order_ref) = $2 THEN 1 ELSE 0 END = $3
-            AND (
-              COALESCE(catalog.sort_date::text, '9999-12-31'),
-              lower(catalog.sort_key),
-              lower(catalog.order_ref)
-            ) > ($4, $5, $6)
+            AND (catalog.activity_at, lower(catalog.order_ref)) < ($4::timestamptz, $5)
           )
         )
       ORDER BY exact_rank DESC,
-               COALESCE(catalog.sort_date, '9999-12-31'::date),
-               lower(catalog.sort_key), lower(catalog.order_ref)
-      LIMIT $7`,
+               catalog.activity_at DESC,
+               lower(catalog.order_ref) DESC
+      LIMIT $6`,
     [
       requestedType,
       searchTerm,
       decoded?.e ?? null,
-      decoded?.d || "",
-      decoded?.k || "",
+      decoded?.d || new Date(0).toISOString(),
       decoded?.r || "",
       safeLimit + 1
     ]
@@ -296,8 +420,8 @@ export async function listDispatchOrderPool({
     orders: page.map((row) => ({ ...row.card, ...assignmentFields(row) })),
     nextCursor: hasMore && last ? encodeCursor({
       e: Number(last.exact_rank || 0),
-      d: last.cursor_date || "9999-12-31",
-      k: text(last.sort_key).toLowerCase(),
+      d: new Date(last.activity_at).toISOString(),
+      k: text(last.order_ref).toLowerCase(),
       r: text(last.order_ref).toLowerCase()
     }) : "",
     ready: state.ready,
@@ -310,6 +434,8 @@ export async function getDispatchOrderCatalogState() {
   const result = await query(
     `SELECT state.status, state.generation, state.source, state.catalog_count,
             state.legacy_count, state.assignments_ready,
+            state.shadow_match_count, state.shadow_mismatch_count,
+            state.last_shadow_comparison_at,
             state.last_full_refresh_at, state.last_error, state.updated_at,
             (SELECT count(*)::int
                FROM dispatch_order_catalog_refresh_outbox refresh
@@ -326,7 +452,10 @@ export async function getDispatchOrderCatalogState() {
     catalogCount: Number(row.catalog_count || 0),
     legacyCount: Number(row.legacy_count || 0),
     assignmentsReady: row.assignments_ready === true,
+    shadowMatchCount: Number(row.shadow_match_count || 0),
+    shadowMismatchCount: Number(row.shadow_mismatch_count || 0),
     pendingRefreshCount: Number(row.pending_refresh_count || 0),
+    lastShadowComparisonAt: row.last_shadow_comparison_at || null,
     lastFullRefreshAt: row.last_full_refresh_at || null,
     lastError: row.last_error || "",
     updatedAt: row.updated_at || null
@@ -367,26 +496,40 @@ function refreshKey({ orderRef: ref = "", orderType: type = "" } = {}) {
 export async function enqueueDispatchOrderCatalogRefresh({ orderRef: ref = "", orderType: type = "", source = "" } = {}) {
   const cleanRef = text(ref);
   const cleanType = text(type).toUpperCase();
-  const result = await query(
-    `INSERT INTO dispatch_order_catalog_refresh_outbox (
-       refresh_key, order_ref, order_type, source, status, available_at
-     ) VALUES ($1, $2, $3, $4, 'pending', now())
-     ON CONFLICT (refresh_key) DO UPDATE
-       SET order_type = CASE
-             WHEN dispatch_order_catalog_refresh_outbox.order_type = '' THEN EXCLUDED.order_type
-             ELSE dispatch_order_catalog_refresh_outbox.order_type
-           END,
-           source = EXCLUDED.source,
-           status = 'pending',
-           available_at = now(),
-           completed_at = NULL,
-           last_error = '',
-           updated_at = now()
-     RETURNING id::text, order_ref, order_type, status`,
-    [refreshKey({ orderRef: cleanRef, orderType: cleanType }), cleanRef, cleanType, text(source)]
-  );
-  const row = result.rows[0];
-  return { id: row.id, orderRef: row.order_ref, orderType: row.order_type, status: row.status };
+  return withTransaction(async () => {
+    await query("SELECT pg_advisory_xact_lock(hashtext($1))", ["dispatch-order-catalog-refresh"]);
+    const result = await query(
+      `INSERT INTO dispatch_order_catalog_refresh_outbox (
+         refresh_key, order_ref, order_type, source, status, available_at
+       ) VALUES ($1, $2, $3, $4, 'pending', now())
+       ON CONFLICT (refresh_key) DO UPDATE
+         SET order_type = CASE
+               WHEN dispatch_order_catalog_refresh_outbox.order_type = '' THEN EXCLUDED.order_type
+               ELSE dispatch_order_catalog_refresh_outbox.order_type
+             END,
+             source = EXCLUDED.source,
+             status = 'pending',
+             available_at = now(),
+             completed_at = NULL,
+             last_error = '',
+             updated_at = now()
+       RETURNING id::text, order_ref, order_type, status`,
+      [refreshKey({ orderRef: cleanRef, orderType: cleanType }), cleanRef, cleanType, text(source)]
+    );
+    const row = result.rows[0];
+    if (!cleanRef) {
+      await query(
+        `UPDATE dispatch_order_catalog_refresh_outbox
+            SET status = 'complete', completed_at = now(), last_error = '', updated_at = now()
+          WHERE id <> $1
+            AND order_ref <> ''
+            AND status IN ('pending', 'failed')
+            AND ($2 = '' OR order_type = $2)`,
+        [row.id, cleanType]
+      );
+    }
+    return { id: row.id, orderRef: row.order_ref, orderType: row.order_type, status: row.status };
+  });
 }
 
 export async function claimDispatchOrderCatalogRefreshes({ limit = 25 } = {}) {
@@ -460,17 +603,30 @@ export async function recordDispatchOrderPoolShadowComparison({ requestKey = "",
   const optimizedRefs = refs(optimized);
   const legacyDigest = digest(legacyRefs);
   const optimizedDigest = digest(optimizedRefs);
-  if (legacyDigest === optimizedDigest) return { matches: true, legacyDigest, optimizedDigest };
-  await query(
-    `INSERT INTO dispatch_planner_shadow_mismatches (
-       comparison_kind, request_key, legacy_digest, optimized_digest, details
-     ) VALUES ('order_pool', $1, $2, $3, $4::jsonb)`,
-    [text(requestKey).slice(0, 500), legacyDigest, optimizedDigest, JSON.stringify({
-      legacyOnly: legacyRefs.filter((ref) => !optimizedRefs.includes(ref)).slice(0, 100),
-      optimizedOnly: optimizedRefs.filter((ref) => !legacyRefs.includes(ref)).slice(0, 100),
-      legacyCount: legacyRefs.length,
-      optimizedCount: optimizedRefs.length
-    })]
-  );
-  return { matches: false, legacyDigest, optimizedDigest };
+  const matches = legacyDigest === optimizedDigest;
+  await withTransaction(async () => {
+    await query(
+      `UPDATE dispatch_order_catalog_state
+          SET shadow_match_count = shadow_match_count + CASE WHEN $1 THEN 1 ELSE 0 END,
+              shadow_mismatch_count = shadow_mismatch_count + CASE WHEN $1 THEN 0 ELSE 1 END,
+              last_shadow_comparison_at = now(),
+              updated_at = now()
+        WHERE singleton = true`,
+      [matches]
+    );
+    if (!matches) {
+      await query(
+        `INSERT INTO dispatch_planner_shadow_mismatches (
+           comparison_kind, request_key, legacy_digest, optimized_digest, details
+         ) VALUES ('order_pool', $1, $2, $3, $4::jsonb)`,
+        [text(requestKey).slice(0, 500), legacyDigest, optimizedDigest, JSON.stringify({
+          legacyOnly: legacyRefs.filter((ref) => !optimizedRefs.includes(ref)).slice(0, 100),
+          optimizedOnly: optimizedRefs.filter((ref) => !legacyRefs.includes(ref)).slice(0, 100),
+          legacyCount: legacyRefs.length,
+          optimizedCount: optimizedRefs.length
+        })]
+      );
+    }
+  });
+  return { matches, legacyDigest, optimizedDigest };
 }

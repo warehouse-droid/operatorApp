@@ -26,26 +26,31 @@ async function preflightExistingLocalCompletion(input, resolution) {
     const operation = resolution.localOperation;
     if (operation.kind === "customer_pickup_load") {
       await recordCustomerPickupLoad(operation.orderId, input.actorOperatorId, {
-        photoDataUrls: input.photoRefs
+        photoDataUrls: input.photoRefs,
+        allowNetSuiteCompleted: resolution.allowNetSuiteCompleted === true
       });
       return;
     }
     if (operation.kind === "delivery_prep_load") {
       await recordDeliveryLoad(operation.orderId, input.actorOperatorId, {
         photoDataUrls: input.photoRefs,
-        requestId: input.requestId
+        requestId: input.requestId,
+        allowNetSuiteCompleted: resolution.allowNetSuiteCompleted === true
       });
       return;
     }
     if (operation.kind === "receiving_receipt") {
-      const order = await getReceivableReceivingOrder(operation.orderId);
-      const payload = buildItemReceiptPayload(order, order.receivableLines);
+      const order = await getReceivableReceivingOrder(operation.orderId, {
+        includeNetSuiteClosed: resolution.allowNetSuiteCompleted === true
+      });
+      const payload = resolution.localPayload || buildItemReceiptPayload(order, order.receivableLines);
       await recordReceivingReceipt(operation.orderId, input.actorOperatorId, {
         photoDataUrls: input.photoRefs,
         payload,
         response: { preflight: true },
         itemReceiptId: null,
-        itemReceiptTranid: null
+        itemReceiptTranid: null,
+        allowNetSuiteCompleted: resolution.allowNetSuiteCompleted === true
       });
       if (operation.orderType === "transfer_order") {
         await syncOrderDependenciesForTransferOrder(operation.orderId);

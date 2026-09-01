@@ -110,6 +110,44 @@ function positiveQuantity(value) {
   return Number(normalized.toFixed(6));
 }
 
+/** @param {unknown} value @param {string} label */
+function optionalNonNegativeQuantity(value, label) {
+  if (value === null || value === undefined || value === "") {return null;}
+  const normalized = Number(value);
+  if (!Number.isFinite(normalized) || normalized < 0) {
+    throw inputError(`${label} must be a non-negative finite quantity.`);
+  }
+  return Number(normalized.toFixed(6));
+}
+
+/** @param {unknown} value */
+function optionalText(value) {
+  const normalized = String(value ?? "").trim();
+  return normalized || null;
+}
+
+/** @param {unknown[]} values */
+function normalizedAliases(values) {
+  return [...new Set(values
+    .flat()
+    .map((value) => String(value ?? "").trim())
+    .filter(Boolean))].sort((left, right) => left.localeCompare(right, undefined, { numeric: true }));
+}
+
+/** @param {unknown} value */
+function normalizedLinkedTransactions(value) {
+  if (!Array.isArray(value)) {return [];}
+  return value.map((entry) => {
+    if (!entry || typeof entry !== "object") {throw inputError("Linked NetSuite transaction evidence must be an object.");}
+    const id = positiveInteger(entry.id, "Linked NetSuite transaction ID");
+    const ref = requiredText(entry.ref ?? id, "Linked NetSuite transaction reference");
+    const type = requiredText(entry.type, "Linked NetSuite transaction type").toUpperCase();
+    if (!["IF", "IR"].includes(type)) {throw inputError("Linked NetSuite transaction evidence must be IF or IR.");}
+    const quantity = positiveQuantity(entry.quantity);
+    return { id, ref, type, quantity };
+  }).sort((left, right) => left.id - right.id || left.ref.localeCompare(right.ref));
+}
+
 /** @param {unknown} value */
 function hash(value) {
   return crypto.createHash("sha256").update(stableCanonicalJson(value)).digest("hex");
@@ -126,21 +164,53 @@ function assertKindForTransaction(kind, transactionType) {
 
 /** @param {Record<string, unknown>} line */
 function normalizedSelectedLine(line) {
+  const sourceLineKey = optionalText(line.sourceLineKey);
   return {
     orderLine: positiveInteger(line.orderLine, "NetSuite order line"),
     quantity: positiveQuantity(line.quantity),
     location: optionalLocation(line.location),
     localOrderKey: requiredText(line.localOrderKey, "Local order key"),
-    localLineId: requiredText(line.localLineId, "Local line ID")
+    localLineId: requiredText(line.localLineId, "Local line ID"),
+    ...(sourceLineKey ? { sourceLineKey } : {})
   };
 }
 
 /** @param {Record<string, unknown>} line */
 function normalizedAvailableLine(line) {
+  const sourceLineKey = optionalText(line.sourceLineKey) || String(positiveInteger(line.orderLine, "Available NetSuite order line"));
+  const sourceLineAliases = normalizedAliases([line.sourceLineAliases || [], sourceLineKey]);
   return {
     orderLine: positiveInteger(line.orderLine, "Available NetSuite order line"),
-    location: optionalLocation(line.location)
+    location: optionalLocation(line.location),
+    sourceLineKey,
+    sourceLineAliases,
+    orderedQuantity: optionalNonNegativeQuantity(line.orderedQuantity, "Ordered NetSuite quantity"),
+    completedQuantity: optionalNonNegativeQuantity(line.completedQuantity, "Completed NetSuite quantity"),
+    remainingQuantity: optionalNonNegativeQuantity(line.remainingQuantity, "Remaining NetSuite quantity"),
+    linkedTransactions: normalizedLinkedTransactions(line.linkedTransactions)
   };
+}
+
+/** @param {number | null} left @param {number | null} right @param {string} label */
+function mergeOptionalQuantity(left, right, label) {
+  if (left !== null && right !== null && Math.abs(left - right) > 0.000001) {
+    throw inputError(`One NetSuite order line cannot use conflicting ${label}.`);
+  }
+  return left ?? right;
+}
+
+/** @param {Record<string, any>[]} left @param {Record<string, any>[]} right */
+function mergeLinkedTransactions(left, right) {
+  const merged = new Map();
+  for (const entry of [...left, ...right]) {
+    const key = `${entry.type}:${entry.id}:${entry.ref}`;
+    const current = merged.get(key);
+    if (current && Math.abs(current.quantity - entry.quantity) > 0.000001) {
+      throw inputError("One linked NetSuite transaction cannot use conflicting quantities.");
+    }
+    merged.set(key, entry);
+  }
+  return [...merged.values()].sort((a, b) => a.id - b.id || a.ref.localeCompare(b.ref));
 }
 
 /** @param {number | null} left @param {number | null} right */
@@ -226,9 +296,28 @@ export function buildOperatorNetSuitePostingDraft(input = {}) {
     for (const rawLine of availableLines) {
       const line = normalizedAvailableLine(rawLine);
       const current = group.availableByLine.get(line.orderLine);
+      if (current
+          && current.sourceLineKey !== line.sourceLineKey
+          && !current.sourceLineAliases.some((/** @type {string} */ alias) => line.sourceLineAliases.includes(alias))) {
+        throw inputError("One NetSuite REST line cannot use conflicting stable source-line identities.");
+      }
       group.availableByLine.set(line.orderLine, {
         orderLine: line.orderLine,
-        location: current ? mergeLocation(current.location, line.location) : line.location
+        location: current ? mergeLocation(current.location, line.location) : line.location,
+        sourceLineKey: current?.sourceLineKey || line.sourceLineKey,
+        sourceLineAliases: normalizedAliases([current?.sourceLineAliases || [], line.sourceLineAliases]),
+        orderedQuantity: current
+          ? mergeOptionalQuantity(current.orderedQuantity, line.orderedQuantity, "ordered quantities")
+          : line.orderedQuantity,
+        completedQuantity: current
+          ? mergeOptionalQuantity(current.completedQuantity, line.completedQuantity, "completed quantities")
+          : line.completedQuantity,
+        remainingQuantity: current
+          ? mergeOptionalQuantity(current.remainingQuantity, line.remainingQuantity, "remaining quantities")
+          : line.remainingQuantity,
+        linkedTransactions: current
+          ? mergeLinkedTransactions(current.linkedTransactions, line.linkedTransactions)
+          : line.linkedTransactions
       });
     }
     for (const rawLine of selectedLines) {
@@ -236,11 +325,16 @@ export function buildOperatorNetSuitePostingDraft(input = {}) {
       if (!group.availableByLine.has(line.orderLine)) {
         throw inputError("A selected NetSuite line is absent from the available source lines.");
       }
+      const available = group.availableByLine.get(line.orderLine);
+      if (line.sourceLineKey && !available.sourceLineAliases.includes(line.sourceLineKey)) {
+        throw inputError("A selected stable source-line identity does not match its NetSuite REST line.");
+      }
       const current = group.selectedByLine.get(line.orderLine);
       group.selectedByLine.set(line.orderLine, {
         orderLine: line.orderLine,
         quantity: Number(((current?.quantity || 0) + line.quantity).toFixed(6)),
-        location: current ? mergeLocation(current.location, line.location) : line.location
+        location: current ? mergeLocation(current.location, line.location) : line.location,
+        sourceLineKey: current?.sourceLineKey || line.sourceLineKey || available.sourceLineKey
       });
       group.lineSnapshot.push(line);
     }
@@ -250,27 +344,86 @@ export function buildOperatorNetSuitePostingDraft(input = {}) {
     left.sourceOrderKind.localeCompare(right.sourceOrderKind)
       || left.sourceNetSuiteId - right.sourceNetSuiteId
   ));
-  const steps = sortedGroups.map((group, index) => {
-    const stepIndex = index + 1;
-    const externalId = operatorNetSuiteExternalId(requestId, stepIndex);
+  const plannedGroups = sortedGroups.map((group) => {
+    const reconciliationLines = [];
+    const postedByLine = new Map();
+    for (const available of group.availableByLine.values()) {
+      const selected = group.selectedByLine.get(available.orderLine);
+      if (!selected) {continue;}
+      const requestedQuantity = selected.quantity;
+      if (available.orderedQuantity !== null
+          && requestedQuantity > available.orderedQuantity + 0.000001) {
+        throw inputError("A selected quantity exceeds the authoritative NetSuite source-line quantity.");
+      }
+      const authoritative = available.remainingQuantity !== null;
+      const postedQuantity = Number((authoritative
+        ? Math.min(requestedQuantity, available.remainingQuantity)
+        : requestedQuantity).toFixed(6));
+      const reconciledQuantity = Number(Math.max(requestedQuantity - postedQuantity, 0).toFixed(6));
+      postedByLine.set(available.orderLine, postedQuantity);
+      const localLines = group.lineSnapshot
+        .filter((/** @type {Record<string, any>} */ line) => line.orderLine === available.orderLine)
+        .map((/** @type {Record<string, any>} */ line) => ({
+          localOrderKey: line.localOrderKey,
+          localLineId: line.localLineId,
+          quantity: line.quantity,
+          ...(line.sourceLineKey ? { sourceLineKey: line.sourceLineKey } : {})
+        })).sort((/** @type {Record<string, any>} */ left, /** @type {Record<string, any>} */ right) => left.localOrderKey.localeCompare(right.localOrderKey)
+          || left.localLineId.localeCompare(right.localLineId));
+      reconciliationLines.push({
+        sourceOrderKind: group.sourceOrderKind,
+        sourceNetSuiteId: group.sourceNetSuiteId,
+        sourceOrderRef: group.sourceOrderRef,
+        orderLine: available.orderLine,
+        sourceLineKey: available.sourceLineKey,
+        sourceLineAliases: available.sourceLineAliases,
+        requestedQuantity,
+        postedQuantity,
+        reconciledQuantity,
+        authoritative,
+        orderedQuantity: available.orderedQuantity,
+        completedQuantity: available.completedQuantity,
+        remainingQuantityBefore: available.remainingQuantity,
+        remainingQuantityAfter: authoritative
+          ? Number(Math.max(available.remainingQuantity - postedQuantity, 0).toFixed(6))
+          : null,
+        linkedTransactions: available.linkedTransactions,
+        localLines
+      });
+    }
     const payloadLines = [...group.availableByLine.values()]
       .sort((left, right) => left.orderLine - right.orderLine)
       .map((available) => {
         const selected = group.selectedByLine.get(available.orderLine);
-        return payloadItem(selected
+        const postedQuantity = postedByLine.get(available.orderLine) || 0;
+        return payloadItem(selected && postedQuantity > 0
           ? {
               ...selected,
+              quantity: postedQuantity,
               selected: true,
               location: mergeLocation(selected.location, available.location)
             }
           : { ...available, selected: false });
       });
-    const payload = { externalId, item: { items: payloadLines } };
     const lineSnapshot = [...group.lineSnapshot].sort((left, right) => (
       left.orderLine - right.orderLine
         || left.localOrderKey.localeCompare(right.localOrderKey)
         || left.localLineId.localeCompare(right.localLineId)
     ));
+    return {
+      group,
+      payloadLines,
+      lineSnapshot,
+      reconciliationLines,
+      hasPost: [...postedByLine.values()].some((quantity) => quantity > 0)
+    };
+  });
+  const postingPlans = plannedGroups.filter((plan) => plan.hasPost);
+  const steps = postingPlans.map((plan, index) => {
+    const { group, payloadLines, lineSnapshot } = plan;
+    const stepIndex = index + 1;
+    const externalId = operatorNetSuiteExternalId(requestId, stepIndex);
+    const payload = { externalId, item: { items: payloadLines } };
     return {
       stepIndex,
       sourceOrderKind: group.sourceOrderKind,
@@ -283,6 +436,18 @@ export function buildOperatorNetSuitePostingDraft(input = {}) {
       lineSnapshot
     };
   });
+  const lineReconciliation = {
+    schemaVersion: "operator-netsuite-line-reconciliation-v1",
+    lines: plannedGroups.flatMap((plan) => plan.reconciliationLines).sort((left, right) => (
+      left.sourceOrderKind.localeCompare(right.sourceOrderKind)
+        || left.sourceNetSuiteId - right.sourceNetSuiteId
+        || left.orderLine - right.orderLine
+        || left.sourceLineKey.localeCompare(right.sourceLineKey, undefined, { numeric: true })
+    ))
+  };
+  const localPayload = input.localPayload === undefined || input.localPayload === null
+    ? null
+    : canonicalValue(input.localPayload);
   const photoRefs = [...new Set((Array.isArray(input.photoRefs) ? input.photoRefs : [])
     .map((value) => String(value || "").trim())
     .filter(Boolean))].sort();
@@ -304,6 +469,8 @@ export function buildOperatorNetSuitePostingDraft(input = {}) {
     photoRefs,
     claims,
     localOperation,
+    localPayload,
+    lineReconciliation,
     steps
   };
   return {
@@ -315,6 +482,8 @@ export function buildOperatorNetSuitePostingDraft(input = {}) {
     photoRefs,
     claims,
     localOperation,
+    localPayload,
+    lineReconciliation,
     steps,
     inputHash: hash(inputSnapshot),
     inputSnapshot

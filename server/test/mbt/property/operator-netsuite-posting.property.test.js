@@ -88,3 +88,66 @@ test("P4/P5 property: split quantities aggregate once and permutation cannot cha
     }
   ), { numRuns: 300 });
 });
+
+test("R2/R3 property: live remaining quantity is a shared cap across every split permutation", () => {
+  fc.assert(fc.property(
+    fc.array(fc.integer({ min: 1, max: 1_000 }), { minLength: 1, maxLength: 12 }),
+    fc.nat(),
+    (quantities, seed) => {
+      const requested = quantities.reduce((sum, value) => sum + value, 0);
+      const remaining = seed % (requested + 1);
+      const authoritativeInput = (reverseTargets) => {
+        const targets = quantities.map((quantity, index) => ({
+          sourceOrderKind: "SO",
+          sourceNetSuiteId: 99001,
+          sourceOrderRef: "SO-PROPERTY",
+          selectedLines: [{
+            orderLine: 1,
+            quantity,
+            location: 15,
+            sourceLineKey: "stable-1",
+            localOrderKey: `delivery_prep:sales_order:${index + 1}`,
+            localLineId: `line-${index + 1}`
+          }],
+          availableLines: [{
+            orderLine: 1,
+            location: 15,
+            sourceLineKey: "stable-1",
+            orderedQuantity: requested,
+            completedQuantity: requested - remaining,
+            remainingQuantity: remaining
+          }]
+        }));
+        return buildOperatorNetSuitePostingDraft({
+          requestId: REQUEST_ID,
+          actorOperatorId: "property-operator",
+          functionKey: "delivery_prep",
+          transactionType: "IF",
+          policy: {
+            gateKey: "operator_netsuite_delivery_prep_if_12441",
+            revision: 9,
+            effective: true,
+            functionKey: "delivery_prep",
+            transactionType: "IF",
+            locationId: 15,
+            yardCode: "12441"
+          },
+          photoRefs: ["r2://operator/property.jpg"],
+          localOrderKeys: quantities.map((_, index) => `delivery_prep:sales_order:${index + 1}`),
+          localOperation: { kind: "delivery_prep_load", orderId: "group-property", orderType: "group_order" },
+          targets: reverseTargets ? targets.reverse() : targets
+        });
+      };
+      const forward = authoritativeInput(false);
+      const reversed = authoritativeInput(true);
+      assert.equal(forward.steps.length, remaining > 0 ? 1 : 0);
+      if (remaining > 0) {
+        assert.equal(forward.steps[0].payload.item.items[0].quantity, remaining);
+      }
+      assert.equal(forward.lineReconciliation.lines[0].requestedQuantity, requested);
+      assert.equal(forward.lineReconciliation.lines[0].postedQuantity, remaining);
+      assert.equal(forward.lineReconciliation.lines[0].reconciledQuantity, requested - remaining);
+      assert.equal(forward.inputHash, reversed.inputHash);
+    }
+  ), { numRuns: 300 });
+});

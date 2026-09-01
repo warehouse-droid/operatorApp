@@ -1,0 +1,146 @@
+{
+  "schemaVersion": "order-dependency-quantity-replay-v1",
+  "capturedAt": "2026-08-27T23:35:00Z",
+  "scope": "all production dependencies in active or attention status",
+  "dependencyCount": 11,
+  "lineCount": 25,
+  "dependencies": [
+    {
+      "key": "D001",
+      "targetKey": "S001",
+      "mode": "direct_to_customer",
+      "status": "active",
+      "baseYard": "12441",
+      "sourceYard": "150",
+      "lines": [
+        { "itemKey": "I001", "role": "sales_allocation", "allocated": 54, "toOutbound": 54 }
+      ]
+    },
+    {
+      "key": "D002",
+      "targetKey": "S002",
+      "mode": "direct_to_customer",
+      "status": "active",
+      "baseYard": "12441",
+      "sourceYard": "3445",
+      "lines": [
+        { "itemKey": "I002", "role": "sales_allocation", "allocated": 63.95, "toOutbound": 63.95 },
+        { "itemKey": "I003", "role": "sales_allocation", "allocated": 1, "toOutbound": 1 }
+      ]
+    },
+    {
+      "key": "D003",
+      "targetKey": "S003",
+      "mode": "yard_replenishment",
+      "status": "attention",
+      "attentionReasonClass": "reduced_quantity_only",
+      "baseYard": "2967",
+      "sourceYard": "3445",
+      "lines": [
+        { "itemKey": "I004", "role": "sales_allocation", "allocated": 240, "toOutbound": 60 },
+        { "itemKey": "PALLET", "role": "pallet", "allocated": 4, "toOutbound": 1 }
+      ]
+    },
+    {
+      "key": "D004",
+      "targetKey": "S004",
+      "mode": "direct_to_customer",
+      "status": "active",
+      "baseYard": "12441",
+      "sourceYard": "3445",
+      "lines": [
+        { "itemKey": "I005", "role": "sales_allocation", "allocated": 20, "toOutbound": 20 },
+        { "itemKey": "PALLET", "role": "pallet", "allocated": 1, "toOutbound": 1 }
+      ]
+    },
+    {
+      "key": "D005",
+      "targetKey": "S005",
+      "mode": "direct_to_customer",
+      "status": "active",
+      "baseYard": "12441",
+      "sourceYard": "2967",
+      "lines": [
+        { "itemKey": "I006", "role": "sales_allocation", "allocated": 509.89, "toOutbound": 541.78 },
+        { "itemKey": "I007", "role": "sales_allocation", "allocated": 6, "toOutbound": 0 },
+        { "itemKey": "PALLET", "role": "sales_allocation", "allocated": 6, "toOutbound": 6 }
+      ]
+    },
+    {
+      "key": "D006",
+      "targetKey": "S006",
+      "mode": "direct_to_customer",
+      "status": "active",
+      "baseYard": "12441",
+      "sourceYard": "3445",
+      "lines": [
+        { "itemKey": "I008", "role": "sales_allocation", "allocated": 89.79, "toOutbound": 89.79 },
+        { "itemKey": "PALLET", "role": "pallet", "allocated": 3, "toOutbound": 3 }
+      ]
+    },
+    {
+      "key": "D007",
+      "targetKey": "S007",
+      "mode": "yard_replenishment",
+      "status": "active",
+      "baseYard": "3445",
+      "sourceYard": "2967",
+      "lines": [
+        { "itemKey": "I009", "role": "sales_allocation", "allocated": 139.95, "toOutbound": 139.95 },
+        { "itemKey": "PALLET", "role": "pallet", "allocated": 2, "toOutbound": 2 }
+      ]
+    },
+    {
+      "key": "D008",
+      "targetKey": "S008",
+      "mode": "yard_replenishment",
+      "status": "active",
+      "baseYard": "3445",
+      "sourceYard": "2967",
+      "lines": [
+        { "itemKey": "I010", "role": "sales_allocation", "allocated": 83, "toOutbound": 83 },
+        { "itemKey": "PALLET", "role": "pallet", "allocated": 2, "toOutbound": 2 }
+      ]
+    },
+    {
+      "key": "D009",
+      "targetKey": "S009",
+      "mode": "yard_replenishment",
+      "status": "active",
+      "baseYard": "3445",
+      "sourceYard": "2967",
+      "lines": [
+        { "itemKey": "I011", "role": "sales_allocation", "allocated": 107, "toOutbound": 107 },
+        { "itemKey": "PALLET", "role": "pallet", "allocated": 2, "toOutbound": 2 }
+      ]
+    },
+    {
+      "key": "D010",
+      "targetKey": "S010",
+      "mode": "direct_to_customer",
+      "status": "active",
+      "baseYard": "2967",
+      "sourceYard": "3445",
+      "transitDestination": "12441",
+      "lines": [
+        { "itemKey": "I012", "role": "sales_allocation", "allocated": 36, "toOutbound": 36 },
+        { "itemKey": "I013", "role": "sales_allocation", "allocated": 2, "toOutbound": 2 },
+        { "itemKey": "I014", "role": "sales_allocation", "allocated": 129, "toOutbound": 129 },
+        { "itemKey": "PALLET", "role": "pallet", "allocated": 3, "toOutbound": 3 }
+      ]
+    },
+    {
+      "key": "D011",
+      "targetKey": "S010",
+      "mode": "direct_to_customer",
+      "status": "active",
+      "baseYard": "2967",
+      "sourceYard": "12441",
+      "lines": [
+        { "itemKey": "I015", "role": "sales_allocation", "allocated": 543.92, "toOutbound": 543.92 },
+        { "itemKey": "I016", "role": "sales_allocation", "allocated": 41.84, "toOutbound": 41.84 },
+        { "itemKey": "PALLET", "role": "sales_allocation", "allocated": 7, "toOutbound": 7 }
+      ]
+    }
+  ]
+}

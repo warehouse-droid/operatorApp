@@ -90,6 +90,7 @@
       "test:scm-schedule-row-refresh",
       "test:scm-schedule-formatting",
       "test:scm-schedule-column-filters",
+      "test:scm-schedule-column-filter-integration",
       "test:scm-menu-navigation",
       "test:scm-vendor-management",
       "test:scm-vendor-management-integration",

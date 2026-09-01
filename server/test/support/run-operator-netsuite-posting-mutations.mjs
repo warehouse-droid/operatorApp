@@ -55,6 +55,42 @@ const MUTANTS = Object.freeze([
     to: "(current?.quantity || 0) - line.quantity"
   }),
   Object.freeze({
+    name: "live remaining quantity no longer caps a transform",
+    target: "src/operator-netsuite-posting-domain.js",
+    from: "Math.min(requestedQuantity, available.remainingQuantity)",
+    to: "requestedQuantity"
+  }),
+  Object.freeze({
+    name: "fully reconciled lines still create a remote transform step",
+    target: "src/operator-netsuite-posting-domain.js",
+    from: "hasPost: [...postedByLine.values()].some((quantity) => quantity > 0)",
+    to: "hasPost: [...postedByLine.values()].some((quantity) => quantity >= 0)"
+  }),
+  Object.freeze({
+    name: "stable SuiteQL keys are sent as REST transform lines",
+    target: "src/operator-netsuite-posting-targets.js",
+    from: "restOrderLine: line?.identityStatus === \"exact\" ? exactRestSourceLine(line, sourceItems) : null",
+    to: "restOrderLine: line?.identityStatus === \"exact\" ? positiveInteger(line.sourceLineKey) : null"
+  }),
+  Object.freeze({
+    name: "source item fetch returns REST subresource link stubs",
+    target: "src/netsuite.js",
+    from: "`/record/v1/${recordType}/${id}?expandSubResources=true`",
+    to: "`/record/v1/${recordType}/${id}/item`"
+  }),
+  Object.freeze({
+    name: "expanded source item rows are read from the wrong envelope",
+    target: "src/netsuite.js",
+    from: "const items = result.data?.item?.items;",
+    to: "const items = result.data?.items;"
+  }),
+  Object.freeze({
+    name: "linked NetSuite IR IF evidence is ignored",
+    target: "src/operator-netsuite-posting-targets.js",
+    from: "Math.max(positiveNumber(line.cumulativeProgressQuantity), linkedQuantity)",
+    to: "positiveNumber(line.cumulativeProgressQuantity)"
+  }),
+  Object.freeze({
     name: "deterministic external ID loses its request binding",
     target: "src/operator-netsuite-posting-domain.js",
     from: "return `MBBS-OP-${normalizedRequestId}-${normalizedStep}`;",
@@ -65,6 +101,30 @@ const MUTANTS = Object.freeze([
     target: "src/operator-netsuite-posting-adapter.js",
     from: "if (actualLocation !== Number(expected.location)) {",
     to: "if (false && actualLocation !== Number(expected.location)) {"
+  }),
+  Object.freeze({
+    name: "NetSuite REST id references are ignored during exact verification",
+    target: "src/operator-netsuite-posting-adapter.js",
+    from: "if (Object.hasOwn(reference, \"id\")) {return Number(reference.id);}",
+    to: "if (Object.hasOwn(reference, \"id\")) {return Number(reference.value);}"
+  }),
+  Object.freeze({
+    name: "external-ID recovery is no longer scoped to its source transaction",
+    target: "src/operator-netsuite-posting-netsuite-adapter.js",
+    from: "      const found = await findTransactionByExternalId(\n        step.externalId,\n        step.transactionType,\n        step.sourceNetSuiteId\n      );",
+    to: "      const found = await findTransactionByExternalId(\n        step.externalId,\n        step.transactionType\n      );"
+  }),
+  Object.freeze({
+    name: "linked IF IR recovery ignores the exact source transaction",
+    target: "src/netsuite.js",
+    from: "     WHERE transaction_link.previousdoc = ${sourceId}",
+    to: "     WHERE transaction_link.previousdoc > 0"
+  }),
+  Object.freeze({
+    name: "linked IF IR recovery accepts a different external ID",
+    target: "src/netsuite.js",
+    from: "    if (recordExternalId !== normalizedExternalId) continue;",
+    to: "    if (false && recordExternalId !== normalizedExternalId) continue;"
   }),
   Object.freeze({
     name: "external-ID recovery lookup is skipped",
@@ -93,14 +153,20 @@ const MUTANTS = Object.freeze([
   Object.freeze({
     name: "local reattempt child is posted",
     target: "src/operator-netsuite-posting-targets.js",
-    from: "if (functionKey === \"delivery_prep\" && localOnlyDeliveryOrder(child)) {continue;}",
-    to: "if (false && functionKey === \"delivery_prep\" && localOnlyDeliveryOrder(child)) {continue;}"
+    from: "(functionKey === \"delivery_prep\" && localOnlyDeliveryOrder(child))",
+    to: "(false && functionKey === \"delivery_prep\" && localOnlyDeliveryOrder(child))"
   }),
   Object.freeze({
     name: "delivery finalization skips direct dependency progress",
     target: "src/operator-netsuite-posting-finalizer.js",
     from: "        : await syncDirectDependencies(operation.orderId);",
     to: "        : null;"
+  }),
+  Object.freeze({
+    name: "receiving finalization loses the stable local payload",
+    target: "src/operator-netsuite-posting-finalizer.js",
+    from: "const payload = command?.inputSnapshot?.localPayload || step?.payload;",
+    to: "const payload = step?.payload;"
   }),
   Object.freeze({
     name: "in-process command deduplication is removed",

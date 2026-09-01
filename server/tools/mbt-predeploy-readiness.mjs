@@ -124,7 +124,19 @@ export const REQUIRED_MBT_P3_MIGRATIONS = Object.freeze([
   "177_special_stock_request_two_stage_handoff.sql",
   "178_operator_netsuite_posting_gates.sql",
   "179_sales_order_reattempt_current_item_corrections.sql",
-  "180_sales_order_completion_fulfillment.sql"
+  "180_sales_order_completion_fulfillment.sql",
+  "181_smart_scm_phased_planning_po_split_editing.sql",
+  "182_dispatch_direct_po_link_execution.sql",
+  "183_scm_authoritative_schedule_status.sql",
+  "184_scm_schedule_remarks.sql",
+  "185_dispatch_optimized_order_pool_gate.sql",
+  "186_application_workload_read_models.sql",
+  "187_dispatch_date_switch_lookup_indexes.sql",
+  "188_scm_schedule_loading_read_path.sql",
+  "189_direct_dependency_shared_driver_receipt.sql",
+  "190_dispatch_global_order_groups.sql",
+  "191_driver_completed_co_lifecycle.sql",
+  "192_dispatch_global_derived_orders.sql"
 ]);
 
 export const REQUIRED_MBT_P3_FLAGS = Object.freeze([

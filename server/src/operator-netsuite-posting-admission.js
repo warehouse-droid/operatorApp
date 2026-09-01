@@ -86,6 +86,7 @@ export function createOperatorNetSuitePostingAdmission({
       photoRefs: input.photoRefs,
       localOrderKeys: actionableResolution.localOrderKeys,
       localOperation: actionableResolution.localOperation,
+      localPayload: actionableResolution.localPayload,
       targets: actionableResolution.targets
     });
     const created = await createCommand(draft);

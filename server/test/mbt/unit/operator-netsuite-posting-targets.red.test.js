@@ -3,8 +3,10 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 
+import { fetchOperatorNetSuiteSourceItemLinesFromNetSuite } from "../../../src/netsuite.js";
 import { buildOperatorNetSuitePostingDraft } from "../../../src/operator-netsuite-posting-domain.js";
 import {
+  createOperatorNetSuitePostingLiveSourceFetcher,
   createOperatorNetSuitePostingRealSourceResolver,
   createOperatorNetSuitePostingTargetResolver,
   createOperatorNetSuiteReceivingOrderReader
@@ -289,28 +291,50 @@ test("G1 a deferred gate lookup does not require posting-only packed line eviden
   );
 });
 
-test("P4 production lineage adapter chooses SO, PO, TO, and split parents with the exact line offset", async () => {
+test("P4/M2/M3 production lineage adapter chooses SO, PO, TO, and split parents with authoritative transform lines", async () => {
   const calls = [];
   const resolveSource = createOperatorNetSuitePostingRealSourceResolver({
     query: async (sql, values) => {
       calls.push([sql, values]);
       if (sql.includes("dispatch_scm_so_splits")) {return { rows: [{ source_id: 900, source_ref: "SOA900" }] };}
       if (sql.includes("dispatch_scm_to_splits")) {return { rows: [{ source_id: 901, source_ref: "TOB901" }] };}
-      if (sql.includes("sales_order_lines")) {return { rows: [{ order_line: 1, location_id: 15 }] };}
-      if (sql.includes("purchase_order_lines")) {return { rows: [{ order_line: 2, location_id: 28 }] };}
-      if (sql.includes("transfer_order_lines")) {return { rows: [{ order_line: 3, location_id: null }] };}
+      if (sql.includes("sales_order_lines")) {return { rows: [{ source_line_key: 1001, location_id: 15 }] };}
+      if (sql.includes("purchase_order_lines")) {return { rows: [{ source_line_key: 1002, location_id: 28 }] };}
+      if (sql.includes("transfer_order_lines")) {
+        return { rows: [{ source_line_key: values?.[1] === "receiving" ? 1004 : 1003, location_id: null }] };
+      }
       return { rows: [] };
-    }
+    },
+    fetchLiveSource: async ({ sourceOrderKind, sourceNetSuiteId }) => ({
+      sourceOrderKind,
+      sourceNetSuiteId,
+      sourceOrderRef: sourceOrderKind === "SO" ? "SOA-LIVE" : sourceOrderKind === "PO" ? "POB-LIVE" : "TOB-LIVE",
+      lines: sourceOrderKind === "SO"
+        ? [{ sourceLineKey: "1001", sourceLineAliases: ["1001"], restOrderLine: 1, quantity: 10, completedQuantity: 0, remainingQuantity: 10, location: 15, identityStatus: "exact" }]
+        : sourceOrderKind === "PO"
+          ? [{ sourceLineKey: "1002", sourceLineAliases: ["1002"], restOrderLine: 2, quantity: 10, completedQuantity: 0, remainingQuantity: 10, location: 28, identityStatus: "exact" }]
+          : [
+              { sourceLineKey: "1003", sourceLineAliases: ["1003"], restOrderLine: 3, logicalLineIdentity: "to-line", stage: "outbound", quantity: 10, completedQuantity: 0, remainingQuantity: 10, location: null, identityStatus: "exact" },
+              { sourceLineKey: "1004", sourceLineAliases: ["1004"], restOrderLine: 3, logicalLineIdentity: "to-line", stage: "receiving", quantity: 10, completedQuantity: 0, remainingQuantity: 10, location: null, identityStatus: "exact" }
+            ],
+      linkedTransactions: []
+    })
   });
 
   assert.deepEqual(await resolveSource(salesOrder({ id: 701 }), { functionKey: "delivery_prep" }), {
-    sourceOrderKind: "SO", sourceNetSuiteId: 701, sourceOrderRef: "SOA101", availableLines: [{ orderLine: 1, location: 15 }]
+    sourceOrderKind: "SO", sourceNetSuiteId: 701, sourceOrderRef: "SOA101", availableLines: [{
+      sourceLineKey: "1001", sourceLineAliases: ["1001"], orderLine: 1, location: 15,
+      orderedQuantity: 10, completedQuantity: 0, remainingQuantity: 10, linkedTransactions: []
+    }]
   });
   assert.deepEqual(await resolveSource(purchaseOrder({ id: 702 }), { functionKey: "receiving" }), {
-    sourceOrderKind: "PO", sourceNetSuiteId: 702, sourceOrderRef: "POB303", availableLines: [{ orderLine: 2, location: 28 }]
+    sourceOrderKind: "PO", sourceNetSuiteId: 702, sourceOrderRef: "POB303", availableLines: [{
+      sourceLineKey: "1002", sourceLineAliases: ["1002"], orderLine: 2, location: 28,
+      orderedQuantity: 10, completedQuantity: 0, remainingQuantity: 10, linkedTransactions: []
+    }]
   });
-  assert.deepEqual((await resolveSource(transferOrder({ id: 703 }), { functionKey: "delivery_prep" })).availableLines, [{ orderLine: 4, location: null }]);
-  assert.deepEqual((await resolveSource(transferOrder({ id: 704 }), { functionKey: "receiving" })).availableLines, [{ orderLine: 3, location: null }]);
+  assert.equal((await resolveSource(transferOrder({ id: 703 }), { functionKey: "delivery_prep" })).availableLines[0].orderLine, 3);
+  assert.equal((await resolveSource(transferOrder({ id: 704 }), { functionKey: "receiving" })).availableLines[0].orderLine, 3);
 
   const splitSo = salesOrder({ id: -11, ref: "SOA900-S1" });
   assert.equal((await resolveSource(splitSo, { functionKey: "delivery_prep" })).sourceNetSuiteId, 900);
@@ -332,4 +356,365 @@ test("P4 production lineage and receiving adapters return null or local CO witho
   assert.deepEqual(await readReceivingOrder("CO-81", "co_order"), { id: "CO-81" });
   assert.deepEqual(await readReceivingOrder(82, "purchase_order"), { id: 82 });
   assert.deepEqual(calls.map(([kind]) => kind), ["co", "remote"]);
+});
+
+test("M1 live REST source fetch expands item rows instead of returning subresource link stubs", async () => {
+  const calls = [];
+  const expected = [
+    { orderLine: 1, item: { id: "5168" }, quantity: 104.91 },
+    { orderLine: 2, item: { id: "1784" }, quantity: 1 }
+  ];
+  const rows = await fetchOperatorNetSuiteSourceItemLinesFromNetSuite("SO", 972607, {
+    rest: async (path, options) => {
+      calls.push([path, options]);
+      return { data: { item: { items: expected } } };
+    }
+  });
+
+  assert.deepEqual(rows, expected);
+  assert.deepEqual(calls, [[
+    "/record/v1/salesOrder/972607?expandSubResources=true",
+    { method: "GET" }
+  ]]);
+});
+
+test("M1 regression: SOB119026 stable SuiteQL keys map to authoritative REST order lines", async () => {
+  const resolveSource = createOperatorNetSuitePostingRealSourceResolver({
+    query: async (sql) => {
+      if (sql.includes("sales_order_lines")) {
+        return {
+          rows: [
+            { source_line_key: 4866005, location_id: 15 },
+            { source_line_key: 4866006, location_id: 15 }
+          ]
+        };
+      }
+      return { rows: [] };
+    },
+    fetchLiveSource: async () => ({
+      sourceOrderKind: "SO",
+      sourceNetSuiteId: 972607,
+      sourceOrderRef: "SOB119026",
+      lines: [
+        {
+          sourceLineKey: "4866005",
+          sourceLineAliases: ["4866005"],
+          restOrderLine: 1,
+          quantity: 104.91,
+          completedQuantity: 0,
+          remainingQuantity: 104.91,
+          location: 15,
+          identityStatus: "exact"
+        },
+        {
+          sourceLineKey: "4866006",
+          sourceLineAliases: ["4866006"],
+          restOrderLine: 2,
+          quantity: 1,
+          completedQuantity: 0,
+          remainingQuantity: 1,
+          location: 15,
+          identityStatus: "exact"
+        }
+      ],
+      linkedTransactions: []
+    })
+  });
+
+  const resolvedSource = await resolveSource(salesOrder({ id: 972607, ref: "SOB119026" }), {
+    functionKey: "customer_pickup"
+  });
+
+  assert.deepEqual(resolvedSource.availableLines.map((entry) => ({
+    sourceLineKey: entry.sourceLineKey,
+    orderLine: entry.orderLine
+  })), [
+    { sourceLineKey: "4866005", orderLine: 1 },
+    { sourceLineKey: "4866006", orderLine: 2 }
+  ]);
+  assert.equal(resolvedSource.availableLines.some((entry) => entry.orderLine === 4866005), false);
+});
+
+test("M3 TO fulfillment and receipt aliases resolve to the same visible REST transform line", async () => {
+  const resolveSource = createOperatorNetSuitePostingRealSourceResolver({
+    query: async (sql, values) => {
+      if (sql.includes("transfer_order_lines")) {
+        return {
+          rows: [{
+            source_line_key: values?.[1] === "receiving" ? 4868179 : 4868177,
+            location_id: null
+          }]
+        };
+      }
+      return { rows: [] };
+    },
+    fetchLiveSource: async () => ({
+      sourceOrderKind: "TO",
+      sourceNetSuiteId: 972958,
+      sourceOrderRef: "TOB00987",
+      lines: [
+        {
+          stage: "outbound",
+          logicalLineIdentity: "transfer-anchor:4868177",
+          sourceLineKey: "4868177",
+          sourceLineAliases: ["4868177", "4868178"],
+          restOrderLine: 1,
+          quantity: 594.51,
+          completedQuantity: 0,
+          remainingQuantity: 594.51,
+          location: null,
+          identityStatus: "exact"
+        },
+        {
+          stage: "receiving",
+          logicalLineIdentity: "transfer-anchor:4868177",
+          sourceLineKey: "4868179",
+          sourceLineAliases: ["4868179"],
+          restOrderLine: 1,
+          quantity: 594.51,
+          completedQuantity: 0,
+          remainingQuantity: 594.51,
+          location: null,
+          identityStatus: "exact"
+        }
+      ],
+      linkedTransactions: []
+    })
+  });
+  const order = transferOrder({ id: 972958, ref: "TOB00987" });
+  const outbound = await resolveSource(order, { functionKey: "delivery_prep" });
+  const receiving = await resolveSource(order, { functionKey: "receiving" });
+  assert.equal(outbound.availableLines[0].sourceLineKey, "4868177");
+  assert.equal(receiving.availableLines[0].sourceLineKey, "4868179");
+  assert.equal(outbound.availableLines[0].orderLine, 1);
+  assert.equal(receiving.availableLines[0].orderLine, 1);
+});
+
+test("E1 ambiguous live line identity fails before a transform payload can be created", async () => {
+  const resolveSource = createOperatorNetSuitePostingRealSourceResolver({
+    query: async (sql) => sql.includes("sales_order_lines")
+      ? { rows: [{ source_line_key: 4866005, location_id: 15 }] }
+      : { rows: [] },
+    fetchLiveSource: async () => ({
+      sourceOrderKind: "SO",
+      sourceNetSuiteId: 972607,
+      sourceOrderRef: "SOB119026",
+      lines: [{
+        sourceLineKey: "4866005",
+        sourceLineAliases: ["4866005", "4866006"],
+        restOrderLine: null,
+        quantity: 5,
+        completedQuantity: 0,
+        remainingQuantity: 5,
+        location: 15,
+        identityStatus: "ambiguous"
+      }],
+      linkedTransactions: []
+    })
+  });
+  await assert.rejects(
+    resolveSource(salesOrder({ id: 972607, ref: "SOB119026" }), { functionKey: "customer_pickup" }),
+    (error) => error?.code === "OPERATOR_NETSUITE_POSTING_LINE_MAPPING_UNRESOLVED"
+  );
+});
+
+test("R1 live linked IF evidence closes the remaining quantity without losing the stable source key", async () => {
+  const fetchLiveSource = createOperatorNetSuitePostingLiveSourceFetcher({
+    fetchReconciliationOrders: async () => [{
+      id: 972607,
+      kind: "SO",
+      tranid: "SOB119026",
+      sourceLocationId: 15,
+      lines: [{
+        sourceLineKey: "4866005",
+        sourceLineAliases: ["4866005"],
+        orderLine: 1,
+        orderLineAliases: ["1"],
+        stage: "outbound",
+        itemId: 501,
+        quantity: 5,
+        cumulativeProgressQuantity: 0,
+        identityStatus: "exact"
+      }]
+    }],
+    fetchSourceItemLines: async () => [{ orderLine: 1, item: { id: 501 } }],
+    fetchLinkedTransactions: async () => [{
+      sourceOrderId: 972607,
+      sourceLineKey: "4866005",
+      sourceOrderLine: 1,
+      transactionId: 881,
+      transactionRef: "IF881",
+      transactionType: "ItemShip",
+      quantity: 5,
+      statusText: "Shipped"
+    }]
+  });
+
+  const live = await fetchLiveSource({ sourceOrderKind: "SO", sourceNetSuiteId: 972607 });
+  assert.equal(live.lines[0].restOrderLine, 1);
+  assert.equal(live.lines[0].completedQuantity, 5);
+  assert.equal(live.lines[0].remainingQuantity, 0);
+  assert.deepEqual(live.lines[0].linkedTransactions, [
+    { id: 881, ref: "IF881", type: "IF", quantity: 5 }
+  ]);
+  assert.equal(live.lines[0].sourceLineKey, "4866005");
+});
+
+test("M3 live TO receipt evidence inherits the visible outbound REST transform line", async () => {
+  const fetchLiveSource = createOperatorNetSuitePostingLiveSourceFetcher({
+    fetchReconciliationOrders: async () => [{
+      id: 972958,
+      kind: "TO",
+      tranid: "TOB00987",
+      lines: [{
+        sourceLineKey: "4868177",
+        sourceLineAliases: ["4868177", "4868178"],
+        orderLine: 1,
+        orderLineAliases: ["1", "2"],
+        logicalLineIdentity: "transfer-anchor:4868177",
+        stage: "outbound",
+        itemId: 501,
+        quantity: 10,
+        cumulativeProgressQuantity: 10,
+        identityStatus: "exact"
+      }, {
+        sourceLineKey: "4868179",
+        sourceLineAliases: ["4868179"],
+        orderLine: 3,
+        orderLineAliases: ["3"],
+        logicalLineIdentity: "transfer-anchor:4868177",
+        stage: "receiving",
+        itemId: 501,
+        quantity: 10,
+        cumulativeProgressQuantity: 4,
+        identityStatus: "exact"
+      }]
+    }],
+    fetchSourceItemLines: async () => [{ orderLine: 1, item: { id: 501 } }],
+    fetchLinkedTransactions: async () => []
+  });
+
+  const live = await fetchLiveSource({ sourceOrderKind: "TO", sourceNetSuiteId: 972958 });
+  assert.deepEqual(live.lines.map((entry) => [entry.stage, entry.restOrderLine, entry.remainingQuantity]), [
+    ["outbound", 1, 0],
+    ["receiving", 1, 6]
+  ]);
+});
+
+test("E1 live source evidence rejects invalid sources, missing records, duplicate REST rows, and wrong items", async () => {
+  const unused = async () => [];
+  const invalid = createOperatorNetSuitePostingLiveSourceFetcher({
+    fetchReconciliationOrders: unused,
+    fetchSourceItemLines: unused,
+    fetchLinkedTransactions: unused
+  });
+  await assert.rejects(
+    invalid({ sourceOrderKind: "XX", sourceNetSuiteId: 0 }),
+    (error) => error?.code === "OPERATOR_NETSUITE_POSTING_LINE_MAPPING_UNRESOLVED"
+  );
+  await assert.rejects(
+    invalid({ sourceOrderKind: "SO", sourceNetSuiteId: 1 }),
+    (error) => error?.code === "OPERATOR_NETSUITE_POSTING_LINE_MAPPING_UNRESOLVED"
+  );
+
+  const sourceOrder = {
+    id: 1,
+    kind: "SO",
+    tranid: "SO-E1",
+    lines: [{
+      sourceLineKey: "stable-1",
+      sourceLineAliases: ["stable-1"],
+      orderLine: 1,
+      orderLineAliases: ["1"],
+      stage: "outbound",
+      itemId: 501,
+      quantity: 5,
+      identityStatus: "exact"
+    }]
+  };
+  for (const sourceItems of [
+    [{ orderLine: 1, item: { id: 501 } }, { orderLine: 1, item: { id: 501 } }],
+    [{ orderLine: 1, item: { id: 999 } }]
+  ]) {
+    const fetchLiveSource = createOperatorNetSuitePostingLiveSourceFetcher({
+      fetchReconciliationOrders: async () => [sourceOrder],
+      fetchSourceItemLines: async () => sourceItems,
+      fetchLinkedTransactions: unused
+    });
+    const live = await fetchLiveSource({ sourceOrderKind: "SO", sourceNetSuiteId: 1 });
+    assert.equal(live.lines[0].identityStatus, "ambiguous");
+    assert.equal(live.lines[0].restOrderLine, null);
+  }
+});
+
+test("E1 a TO receipt without a visible outbound anchor remains ambiguous", async () => {
+  const fetchLiveSource = createOperatorNetSuitePostingLiveSourceFetcher({
+    fetchReconciliationOrders: async () => [{
+      id: 2,
+      kind: "TO",
+      tranid: "TO-E1",
+      lines: [{
+        sourceLineKey: "receipt-only",
+        sourceLineAliases: ["receipt-only"],
+        orderLine: 3,
+        orderLineAliases: ["3"],
+        logicalLineIdentity: "missing-anchor",
+        stage: "receiving",
+        itemId: 501,
+        quantity: 5,
+        identityStatus: "exact"
+      }]
+    }],
+    fetchSourceItemLines: async () => [{ orderLine: 3, item: { id: 501 } }],
+    fetchLinkedTransactions: async () => []
+  });
+  const live = await fetchLiveSource({ sourceOrderKind: "TO", sourceNetSuiteId: 2 });
+  assert.equal(live.lines[0].identityStatus, "ambiguous");
+  assert.match(live.lines[0].identityIssue, /visible source-line anchor/u);
+});
+
+test("R1 PO linked receipt matching accepts retained aliases and excludes voided evidence", async () => {
+  const fetchLiveSource = createOperatorNetSuitePostingLiveSourceFetcher({
+    fetchReconciliationOrders: async () => [{
+      id: 3,
+      kind: "PO",
+      tranid: "PO-R1",
+      destinationLocationId: 1,
+      lines: [{
+        sourceLineKey: "stable-po",
+        sourceLineAliases: ["stable-po"],
+        orderLine: 2,
+        orderLineAliases: ["2"],
+        stage: "receiving",
+        itemId: 501,
+        quantity: 5,
+        cumulativeProgressQuantity: 1,
+        identityStatus: "exact"
+      }]
+    }],
+    fetchSourceItemLines: async () => [{ orderLine: 2 }],
+    fetchLinkedTransactions: async () => [{
+      sourceOrderId: 3,
+      transactionId: 90,
+      transactionRef: "IR90",
+      transactionType: "ItemRcpt",
+      quantity: 5,
+      statusText: "Voided",
+      sourceLineKey: "stable-po"
+    }, {
+      sourceOrderId: 3,
+      transactionId: 91,
+      transactionRef: "IR91",
+      transactionType: "ItemRcpt",
+      quantity: 3,
+      raw: { sourceLineAliases: ["stable-po"], sourceOrderLineAliases: ["2"] }
+    }]
+  });
+  const live = await fetchLiveSource({ sourceOrderKind: "PO", sourceNetSuiteId: 3 });
+  assert.equal(live.lines[0].location, 1);
+  assert.equal(live.lines[0].completedQuantity, 3);
+  assert.equal(live.lines[0].remainingQuantity, 2);
+  assert.deepEqual(live.lines[0].linkedTransactions, [
+    { id: 91, ref: "IR91", type: "IR", quantity: 3 }
+  ]);
 });

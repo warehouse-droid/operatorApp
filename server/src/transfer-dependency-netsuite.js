@@ -21,6 +21,11 @@ export function transferDependencyMemoMarker(batchId, proposalId) {
   return `MBBS dependency batch ${batch} proposal ${proposal}`;
 }
 
+export function transferDependencySalesOrderMemo(salesOrderRef) {
+  const orderRef = String(salesOrderRef ?? "").trim();
+  return orderRef ? `for ${orderRef}` : "";
+}
+
 export function smartScmTransferOrderMemoMarker(proposalId) {
   const proposal = Number(proposalId);
   if (!Number.isInteger(proposal) || proposal <= 0) return "";
@@ -74,7 +79,12 @@ export function selectSmartScmMarkerTransferOrder(rows = [], {
   return { ...match, id };
 }
 
-export function buildTransferDependencyRestPayload({ proposal, batch, locations }) {
+export function buildTransferDependencyRestPayload({
+  proposal,
+  batch,
+  locations,
+  memoOverride = ""
+}) {
   const palletItemId = Number(proposal.palletItemId);
   const materialItems = (proposal.lines || [])
     .filter((line) => String(line.itemId) !== String(palletItemId)
@@ -88,10 +98,14 @@ export function buildTransferDependencyRestPayload({ proposal, batch, locations 
   const employeeId = String(config.transferDependency.employeeId || "").trim();
   const deliveryMethodId = String(config.transferDependency.deliveryMethodId || "").trim();
   const memoMarker = transferDependencyMemoMarker(batch.id, proposal.id);
+  const memo = String(memoOverride || "").trim()
+    || transferDependencySalesOrderMemo(batch.salesOrderRef)
+    || memoMarker
+    || `MBBS dependency batch ${batch.id}`;
   const payload = {
     location: { id: String(locations.source.netsuiteLocationId) },
     transferLocation: { id: String(locations.destination.netsuiteLocationId) },
-    memo: `${proposal.memo || `Inventory dependency for ${batch.salesOrderRef}`} | ${memoMarker || `MBBS dependency batch ${batch.id}`}`,
+    memo,
     item: {
       items: [
         ...materialItems,

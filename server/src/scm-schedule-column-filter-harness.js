@@ -1,13 +1,14 @@
 import assert from "node:assert/strict";
 import { readFile } from "node:fs/promises";
 
-const [client, css, html, repository, preferenceRepository, specialOrderMigration] = await Promise.all([
+const [client, css, html, repository, preferenceRepository, specialOrderMigration, server] = await Promise.all([
   readFile(new URL("../public/scm-schedule.js", import.meta.url), "utf8"),
   readFile(new URL("../public/dispatch.css", import.meta.url), "utf8"),
   readFile(new URL("../public/scm-schedule.html", import.meta.url), "utf8"),
   readFile(new URL("./dispatch-repository.js", import.meta.url), "utf8"),
   readFile(new URL("./scm-schedule-preference-repository.js", import.meta.url), "utf8"),
-  readFile(new URL("../migrations/084_scm_schedule_special_order_preference.sql", import.meta.url), "utf8")
+  readFile(new URL("../migrations/084_scm_schedule_special_order_preference.sql", import.meta.url), "utf8"),
+  readFile(new URL("./server.js", import.meta.url), "utf8")
 ]);
 
 function functionSource(source, name, nextName) {
@@ -30,19 +31,46 @@ const columnFilterRenderer = functionSource(
   "scmScheduleHeaderHtml"
 );
 includesAll(columnFilterRenderer, [
+  'column.key === "date"',
+  "scmScheduleQueuedDateFilterHtml",
   'column.key === "type"',
   'field: "kind"',
   'column.key === "method"',
   'field: "method"',
+  'column.key === "pickup"',
+  'field: "pickup"',
   'column.key === "dropoff"',
   'field: "dropoffPoint"',
   'column.key === "brand"',
   'field: "brand"',
+  'column.key === "content"',
+  'field: "contentSearch"',
+  'column.key === "remark"',
+  'field: "remarkSearch"',
+  'column.key === "order"',
+  'field: "orderSearch"',
+  'column.key === "weight"',
+  'fromField: "weightMin"',
+  'toField: "weightMax"',
+  'column.key === "packing"',
+  'field: "packingSearch"',
   'column.key === "status"',
   'field: "status"',
   'column.key === "eta"',
-  "scmScheduleDateFilterHtml"
+  "scmScheduleDateFilterHtml",
+  'column.key === "driver"',
+  'field: "driverSearch"',
+  'column.key === "sla"',
+  'fromField: "slaMin"',
+  'toField: "slaMax"'
 ], "Spreadsheet column-filter mapping");
+assert(columnFilterRenderer.includes('column.key === "type" && showTypeFilter'),
+  "Dispatch does not expose its Type column filter.");
+assert(columnFilterRenderer.includes('column.key === "method" && showScmWorkingControls'),
+  "Method is not limited to SCM Working.");
+assert(!columnFilterRenderer.includes('column.key === "select"')
+  && !columnFilterRenderer.includes('column.key === "action"'),
+"Utility checkbox and Save columns must remain non-filterable.");
 assert(
   columnFilterRenderer.includes("Sp.O")
     || (
@@ -121,8 +149,8 @@ assert.match(
 );
 assert.match(
   client,
-  /data-deferred-column-filter[\s\S]{0,260}updateScmScheduleDateFilterSummary[\s\S]{0,80}return;/,
-  "Changing an ETA date must update only the draft summary until Apply."
+  /data-deferred-column-filter[\s\S]{0,260}updateScmScheduleDeferredFilterSummary[\s\S]{0,80}return;/,
+  "Changing a deferred text, date, or number filter must update only the draft summary until Apply."
 );
 includesAll(client, [
   'data-action="apply-column-filters"',
@@ -141,22 +169,61 @@ includesAll(applyFilters, [
 includesAll(client, [
   'data-action="clear-column-filters"',
   'action === "clear-column-filters"',
-  'scmScheduleFilters.kind = ""',
-  'scmScheduleFilters.method = ""',
-  "scmScheduleFilters.status = []",
-  'scmScheduleFilters.dropoffPoint = ""',
-  "scmScheduleFilters.brand = []",
-  'scmScheduleFilters.from = ""',
-  'scmScheduleFilters.to = ""'
+  "clearScmScheduleColumnFilters()",
+  "function clearScmScheduleColumnFilters",
+  'queuedFrom: ""',
+  'pickup: ""',
+  'contentSearch: ""',
+  'remarkSearch: ""',
+  'orderSearch: ""',
+  'weightMin: ""',
+  'packingSearch: ""',
+  'driverSearch: ""',
+  'slaMin: ""'
 ], "Clear-column-filters behavior");
 
 includesAll(css, [
   ".scm-sheet-header.has-column-filter",
   ".scm-column-filter-select",
   ".scm-sheet-header .scm-multi-filter",
-  ".scm-column-date-filter",
+  ".scm-column-deferred-filter",
   ".scm-column-filter-menu"
 ], "Spreadsheet column-filter styling");
+
+includesAll(server, [
+  "queuedFrom: req.query.queuedFrom",
+  "queuedTo: req.query.queuedTo",
+  "pickup: req.query.pickup",
+  "contentSearch: req.query.contentSearch",
+  "remarkSearch: req.query.remarkSearch",
+  "orderSearch: req.query.orderSearch",
+  "weightMin: req.query.weightMin",
+  "weightMax: req.query.weightMax",
+  "packingSearch: req.query.packingSearch",
+  "driverSearch: req.query.driverSearch",
+  "slaMin: req.query.slaMin",
+  "slaMax: req.query.slaMax"
+], "Schedule route column-filter forwarding");
+includesAll(repository, [
+  'queuedFrom = ""',
+  'pickup = ""',
+  'contentSearch = ""',
+  'remarkSearch = ""',
+  'orderSearch = ""',
+  'weightMin = ""',
+  'packingSearch = ""',
+  'driverSearch = ""',
+  'slaMin = ""',
+  "$12::date IS NULL",
+  "$14 = ''",
+  "$15 = ''",
+  "$16 = ''",
+  "$17 = ''",
+  "$18::numeric IS NULL",
+  "$20 = ''",
+  "$21 = ''",
+  "$22::numeric IS NULL"
+], "Repository column-filter predicates");
 
 assert(client.includes("<span>Sp.O</span>"),
   "The Special Order checkbox label must expose a distinct Sp.O text element.");

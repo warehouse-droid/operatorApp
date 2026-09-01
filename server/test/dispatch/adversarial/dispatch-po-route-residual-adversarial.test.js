@@ -55,3 +55,37 @@ test("hostile allocation values cannot inflate, poison, or subtract another PO l
   assert.equal(projected.poRouteProjection.weight, 350);
   assert.deepEqual(projected.poRouteProjection.targetRefs, ["SO-A", "SO-WRONG-LINE"]);
 });
+
+test("legacy serialized and malformed allocation details cannot invent a fee route", () => {
+  const order = {
+    id: "PO-SERVICE-DETAILS",
+    type: "PO",
+    destinationYard: "3445",
+    items: [
+      { lineRowId: "material", sku: "MATERIAL", quantity: 1 },
+      { lineRowId: "fee", sku: "MBBS-Special Order", description: "Split Pallet Fee", quantity: 1 }
+    ]
+  };
+  const projected = projectPurchaseOrderRouteResidual(order, [
+    {
+      id: 10,
+      status: "active",
+      dispatch_target_ref: "SO-SERVICE",
+      po_line_id: "material",
+      allocated_sales_qty: 1,
+      details: JSON.stringify({
+        directServicePoLines: [{ poLineId: "fee", description: "Split Pallet Fee", quantity: 1 }]
+      })
+    },
+    { id: 11, status: "active", dispatch_target_ref: "SO-SERVICE", details: "not-json" },
+    { id: 12, status: "active", dispatch_target_ref: "SO-SERVICE", details: "[]" }
+  ]).poRouteProjection;
+
+  assert.equal(projected.hasResidual, false);
+  assert.deepEqual(projected.items, []);
+  assert.deepEqual(projected.directServiceLines, [{
+    poLineId: "fee",
+    description: "Split Pallet Fee",
+    quantity: 1
+  }]);
+});

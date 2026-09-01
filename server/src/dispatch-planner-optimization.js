@@ -61,6 +61,18 @@ function compactCardItem(item = {}) {
     .map((key) => [key, typeof item[key] === "string" ? text(item[key]).slice(0, 240) : item[key]]));
 }
 
+function compactTransitCo(value) {
+  if (!value || typeof value !== "object" || Array.isArray(value)) {return undefined;}
+  const id = text(value.id || value.coRef).slice(0, 240);
+  if (!id) {return undefined;}
+  const result = { id };
+  for (const key of ["fromYard", "toYard", "status", "sourceOrderId", "source", "createdAt", "updatedAt"]) {
+    const candidate = text(value[key]).slice(0, 240);
+    if (candidate) {result[key] = candidate;}
+  }
+  return result;
+}
+
 export function compactDispatchOrderCard(order = {}) {
   const fields = [
     "id", "orderId", "orderRef", "tranid", "refNumber", "type", "orderKind", "sourceTable",
@@ -71,6 +83,8 @@ export function compactDispatchOrderCard(order = {}) {
     "localDispatchStatus", "dispatchRef", "originalPoRef", "sourcePoRef", "sourcePoRefs",
     "correspondingPoRefs", "originalOrderId", "sourceOrderId",
     "relatedSoId", "childOrders", "groupAliases", "groupPlanId", "groupPlanDate", "planOwned",
+    "globalGroupDefinition", "globalGroupSourcePlanId", "globalGroupSourcePlanDate",
+    "globalOrderDefinition", "globalOrderDefinitionKind", "globalOrderSourcePlanId", "globalOrderSourcePlanDate",
     "isSplit", "isGrouped", "dependencyDirectPickup", "dependencyWaitingForTransfer",
     "dependencyAttention", "dependencyUncovered", "dependencyUncoveredQuantity",
     "historicalReconciliationComplete", "historicalPlanDate", "reconciliationStatus",
@@ -79,6 +93,8 @@ export function compactDispatchOrderCard(order = {}) {
   const card = Object.fromEntries(fields
     .filter((key) => order[key] !== undefined)
     .map((key) => [key, clone(order[key])]));
+  const transitCo = compactTransitCo(order.transitCo);
+  if (transitCo) {card.transitCo = transitCo;}
   card.id = identity(order);
   card.type = text(order.type).toUpperCase();
   card.items = (Array.isArray(order.items) ? order.items : [])

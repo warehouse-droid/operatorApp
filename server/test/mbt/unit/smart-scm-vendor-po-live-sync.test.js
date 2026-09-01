@@ -5,6 +5,8 @@ import test from "node:test";
 const publicRoot = new URL("../../../public/", import.meta.url);
 const smart = fs.readFileSync(new URL("scm-smart.js", publicRoot), "utf8");
 const server = fs.readFileSync(new URL("../../../src/server.js", import.meta.url), "utf8");
+const webhookQueue = fs.readFileSync(new URL("../../../src/netsuite-order-webhook-queue-repository.js", import.meta.url), "utf8");
+const webhookWorker = fs.readFileSync(new URL("../../../src/netsuite-order-webhook-worker.js", import.meta.url), "utf8");
 const historyService = fs.readFileSync(new URL("../../../src/scm-netsuite-po-history-service.js", import.meta.url), "utf8");
 const scheduled = fs.readFileSync(new URL("../../../netsuite-order-webhook-scheduled.js", import.meta.url), "utf8");
 const direct = fs.readFileSync(new URL("../../../netsuite-order-webhook-user-event-direct.js", import.meta.url), "utf8");
@@ -16,9 +18,13 @@ test("both supported NetSuite webhook senders include unit price and amount", ()
   }
 });
 
-test("the application forwards webhook financials and emits the Vendor Replies refresh event after commit", () => {
+test("the queued application webhook forwards financials and preserves the Vendor Replies refresh event after commit", () => {
   assert.match(server, /\.\.\.netSuiteOrderWebhookLineFinancials\(line\)/);
-  assert.match(server, /afterTransactionCommit\(\(\) => emitAppEvent\(poHistory\.event\.name/);
+  assert.match(webhookWorker, /processScmNetSuitePoHistoryWebhook\(job\.payload\)/);
+  assert.match(webhookWorker, /poHistoryEvent:\s*String\(poHistory\.event\?\.name \|\| ""\)/);
+  assert.match(webhookQueue, /poHistoryEvent:\s*text\(row\.result\?\.poHistoryEvent\)/);
+  assert.match(server, /notification\.poHistoryEvent === "scm\.smart\.updated"/);
+  assert.match(server, /emitAppEvent\("scm\.smart\.updated",\s*\{/);
   assert.match(historyService, /name:\s*"scm\.smart\.updated"/);
 });
 

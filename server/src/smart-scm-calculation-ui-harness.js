@@ -571,14 +571,14 @@ proposalContext.smartState.data.planningExclusions = {
 };
 vm.runInContext("smartPlanningExclusionState.open = true", proposalContext);
 const exclusionPlansHtml = proposalContext.smartPlans();
-assert.match(exclusionPlansHtml, /Paused items \(2\)/);
+assert.match(exclusionPlansHtml, /Coverage &amp; pauses \(1 paused · 1 Blanket\)/);
 assert.match(exclusionPlansHtml, /TH-COV60T-3045-BEI/);
 assert.match(exclusionPlansHtml, /Vendor out of stock/);
-assert.match(exclusionPlansHtml, /Automatic — Blanket balance/);
+assert.match(exclusionPlansHtml, /Automatic — Blanket coverage/);
 assert.match(exclusionPlansHtml, /BLANKET-COVERED-SKU/);
-assert.match(exclusionPlansHtml, /Blanket PO covered · 12 PLT remaining/);
+assert.match(exclusionPlansHtml, /Blanket coverage · 12 PLT available/);
 assert.match(exclusionPlansHtml, /Source PO-BLANKET-81/);
-assert.match(exclusionPlansHtml, /TO remains available/);
+assert.match(exclusionPlansHtml, /Uncovered demand remains eligible for PO\/TO planning/);
 assert.match(exclusionPlansHtml, /Manual pauses exclude an item only from new vendor PO planning/i);
 assert.match(exclusionPlansHtml, /Generated and manually added TO loads remain available/i);
 const exclusionUiSource = readPublic("scm-smart-exclusions.js");

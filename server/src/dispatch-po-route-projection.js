@@ -33,6 +33,29 @@ function activeAllocation(allocation = {}) {
   return !status || status === "active";
 }
 
+function allocationDetails(allocation = {}) {
+  const details = allocation.details;
+  if (details && typeof details === "object" && !Array.isArray(details)) {return details;}
+  if (typeof details !== "string") {return {};}
+  try {
+    const parsed = JSON.parse(details);
+    return parsed && typeof parsed === "object" && !Array.isArray(parsed) ? parsed : {};
+  } catch {
+    return {};
+  }
+}
+
+function directServiceLines(allocations = []) {
+  const byLine = new Map();
+  for (const allocation of allocations) {
+    for (const line of allocationDetails(allocation).directServicePoLines || []) {
+      const poLineId = text(line?.poLineId ?? line?.po_line_id ?? line?.id);
+      if (poLineId && !byLine.has(poLineId)) {byLine.set(poLineId, { ...line, poLineId });}
+    }
+  }
+  return [...byLine.values()];
+}
+
 function allocationMatchesItem(allocation = {}, item = {}) {
   const allocationLineId = allocationLineIdentity(allocation);
   const lineId = itemLineIdentity(item);
@@ -214,7 +237,12 @@ export function projectPurchaseOrderRouteResidual(order = {}, allocationRows = [
 } = {}) {
   const allocations = (Array.isArray(allocationRows) ? allocationRows : []).filter(activeAllocation);
   if (text(order.type).toUpperCase() !== "PO" || (!allocations.length && !force)) {return order;}
-  const items = (order.items || []).map((item) => residualItem(item, allocations)).filter(hasRouteQuantity);
+  const directLines = directServiceLines(allocations);
+  const directLineIds = new Set(directLines.map((line) => text(line.poLineId)).filter(Boolean));
+  const items = (order.items || [])
+    .filter((item) => !directLineIds.has(itemLineIdentity(item)))
+    .map((item) => residualItem(item, allocations))
+    .filter(hasRouteQuantity);
   const dropoffs = routeDropoffs(order, items);
   const targetRefs = [...new Set([
     ...allocations.map((allocation) => text(
@@ -240,6 +268,7 @@ export function projectPurchaseOrderRouteResidual(order = {}, allocationRows = [
       targetRefs,
       allocationIds: allocations.map((allocation) => Number(allocation.id)).filter(Number.isFinite),
       allocations: allocations.map(allocationEvidence),
+      directServiceLines: directLines,
       items,
       dropoffs,
       ...totals,

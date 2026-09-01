@@ -42,6 +42,10 @@ function smartPlanningExclusionCount() {
   return smartPausedPlanningItemIds().size;
 }
 
+function smartPlanningControlLabel() {
+  return `Coverage & pauses (${smartActivePlanningExclusions().length} paused · ${smartAutomaticBlanketPlanningPauses().length} Blanket)`;
+}
+
 function smartPlanningExclusionCandidateRows() {
   const exclusions = new Set(smartActivePlanningExclusions().map((entry) => Number(entry.itemId)));
   const blanketItems = new Set(smartAutomaticBlanketPlanningPauses().map((entry) => Number(entry.itemId)));
@@ -89,8 +93,8 @@ function smartBlanketPlanningPauseRows() {
     const refs = Array.isArray(entry.sourcePoRefs) ? entry.sourcePoRefs.filter(Boolean) : [];
     return `<div class="smart-planning-exclusion-row smart-planning-exclusion-row-automatic">
       <div class="smart-planning-exclusion-item"><strong>${smartEscape(entry.itemName || entry.itemId)}</strong><span>ID ${smartEscape(entry.itemId)}${entry.vendor ? ` · ${smartEscape(entry.vendor)}` : ""}</span></div>
-      <div><strong>Blanket PO covered · ${smartNumber(entry.availablePallets, 2)} PLT remaining</strong><span>${refs.length ? `Source ${smartEscape(refs.join(", "))}` : "Open Blanket source"}</span></div>
-      <div><span>Vendor PO planning paused</span><strong class="smart-planning-exclusion-to-note">TO remains available</strong></div>
+      <div><strong>Blanket coverage · ${smartNumber(entry.availablePallets, 2)} PLT available</strong><span>${refs.length ? `Source ${smartEscape(refs.join(", "))}` : "Open Blanket source"}</span></div>
+      <div><span>Applied before ordinary planning</span><strong class="smart-planning-exclusion-to-note">Uncovered demand remains eligible for PO/TO planning</strong></div>
       <button class="smart-button" data-smart-action="open-blanket-orders" type="button">View Blanket order</button>
     </div>`;
   }).join("");
@@ -98,9 +102,9 @@ function smartBlanketPlanningPauseRows() {
 
 function smartPlanningExclusionPanel() {
   if (!smartPlanningExclusionState.open) return "";
-  return `<section class="smart-planning-exclusions" aria-label="PO planning pauses">
+  return `<section class="smart-planning-exclusions" aria-label="Planning coverage and pauses">
     <div class="smart-planning-exclusion-head">
-      <div><h3>PO planning pauses</h3><p>Manual pauses exclude an item only from new vendor PO planning. Generated and manually added TO loads remain available. Blanket-covered items also pause new vendor POs while usable blanket quantity remains.</p></div>
+      <div><h3>Coverage &amp; pauses</h3><p>Blanket balances offset matching demand by quantity; uncovered demand remains eligible for PO/TO planning. Manual pauses exclude an item only from new vendor PO planning, while generated and manually added TO loads remain available.</p></div>
       <button class="smart-button" data-smart-action="toggle-planning-exclusions" type="button">Close</button>
     </div>
     ${smartCanWrite() ? `<div class="smart-planning-exclusion-form">
@@ -109,7 +113,7 @@ function smartPlanningExclusionPanel() {
       <label><span>Until (optional)</span><input id="smartPlanningExclusionExpiry" type="date" value="${smartEscape(smartPlanningExclusionState.expiresAt)}" /></label>
     </div>
     <div class="smart-planning-exclusion-candidates" data-smart-planning-exclusion-candidates>${smartPlanningExclusionCandidateRows()}</div>` : ""}
-    <div class="smart-planning-exclusion-group"><div class="smart-planning-exclusion-group-head"><strong>Automatic — Blanket balance</strong><span>${smartAutomaticBlanketPlanningPauses().length} item(s)</span></div><div class="smart-planning-exclusion-list">${smartBlanketPlanningPauseRows()}</div></div>
+    <div class="smart-planning-exclusion-group"><div class="smart-planning-exclusion-group-head"><strong>Automatic — Blanket coverage</strong><span>${smartAutomaticBlanketPlanningPauses().length} item(s)</span></div><div class="smart-planning-exclusion-list">${smartBlanketPlanningPauseRows()}</div></div>
     <div class="smart-planning-exclusion-group"><div class="smart-planning-exclusion-group-head"><strong>Manual temporary pauses</strong><span>${smartActivePlanningExclusions().length} item(s)</span></div><div class="smart-planning-exclusion-list">${smartManualPlanningExclusionRows()}</div></div>
   </section>`;
 }

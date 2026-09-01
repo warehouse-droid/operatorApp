@@ -6,6 +6,7 @@ import test, { after, before } from "node:test";
 import { recordDispatchPerformance, summarizeDispatchPerformance } from "../support/dispatch-performance-recorder.js";
 import { createDispatchV2Fixture, dispatchOrder, dispatchTrucks } from "../support/dispatch-v2-fixture.js";
 import { query } from "../../../src/db.js";
+import { listClosedNetSuiteOrders } from "../../../src/netsuite-closed-order-repository.js";
 
 let fixture;
 
@@ -124,6 +125,12 @@ test("DP-29: compact bootstrap removes a cancelled grouped CO while preserving L
       location: "DP29 Vendor Yard",
       items: [{ itemName: "DP29-GROUP-SKU", quantity: 8 }]
     }],
+    directPickupManifest: [{
+      transferOrderRef: "TOB-DP29",
+      salesOrderRef: groupRef,
+      location: "12441",
+      items: [{ itemName: "DP29-GROUP-SKU", quantity: 8 }]
+    }],
     orderDependencies: [{
       id: 29001,
       transferOrderRef: "TOB-DP29",
@@ -154,6 +161,8 @@ test("DP-29: compact bootstrap removes a cancelled grouped CO while preserving L
   assert.deepEqual(compact.pickupLocations, ["2967", "DP29 Vendor Yard"]);
   assert.equal(compact.sourceYard, "2967");
   assert.deepEqual(compact.poPickupManifest, group.poPickupManifest);
+  assert.deepEqual(compact.directPickupManifest, group.directPickupManifest,
+    "compact plan round-trips must retain Link TO allocation evidence");
   assert.deepEqual(compact.orderDependencies, group.orderDependencies);
   assert.equal(compact.dependencyDirectPickup, true);
   assert.equal(compact.childOrderDetails[0].transitCo, null);
@@ -231,6 +240,82 @@ test("DP-18: CO detail persistence acknowledgement is bounded and skips global o
     durationMs: result.durationMs,
     responseBytes: result.responseBytes
   }]);
+});
+
+test("indexed closed-family lookup preserves SO, PO, and TO split identities", async () => {
+  const soId = 9_916_000_101;
+  const poId = 9_916_000_201;
+  const toId = 9_916_000_301;
+  const soSplitId = -soId;
+  const poSplitId = -poId;
+  const toSplitId = -toId;
+  await query(
+    `INSERT INTO sales_orders (
+       netsuite_id, tranid, status, status_text, sales_order_type,
+       operator_status, local_yard_order_status, netsuite_active
+     ) VALUES
+       ($1, 'DP-CLOSED-SO', 'H', 'Sales Order : Closed', 'Delivery', 'open', 'Open', true),
+       ($2, 'DP-CLOSED-SO-S1', 'B', 'Sales Order : Pending Fulfillment', 'Delivery', 'open', 'Open', true)`,
+    [soId, soSplitId]
+  );
+  await query(
+    `INSERT INTO dispatch_scm_so_splits (
+       source_so_id, source_so_ref, split_so_id, split_so_ref, status
+     ) VALUES ($1, 'DP-CLOSED-SO', $2, 'DP-CLOSED-SO-S1', 'active')`,
+    [soId, soSplitId]
+  );
+  await query(
+    `INSERT INTO purchase_orders (
+       netsuite_id, tranid, dispatch_ref, status, status_text, netsuite_active
+     ) VALUES
+       ($1, 'DP-CLOSED-PO', NULL, 'B', 'Purchase Order : Pending Receipt', true),
+       ($2, 'DP-CLOSED-PO-S1', 'DP-CLOSED-PO-DISPATCH', 'H', 'Purchase Order : Closed', true)`,
+    [poId, poSplitId]
+  );
+  await query(
+    `INSERT INTO dispatch_scm_po_splits (
+       source_po_id, source_po_ref, split_po_id, split_po_ref, status
+     ) VALUES ($1, 'DP-CLOSED-PO', $2, 'DP-CLOSED-PO-S1', 'active')`,
+    [poId, poSplitId]
+  );
+  await query(
+    `INSERT INTO transfer_orders (
+       netsuite_id, tranid, status, status_text, netsuite_active
+     ) VALUES
+       ($1, 'DP-CLOSED-TO', 'H', 'Transfer Order : Closed', true),
+       ($2, 'DP-CLOSED-TO-S1', 'B', 'Transfer Order : Pending Fulfillment', true)`,
+    [toId, toSplitId]
+  );
+  await query(
+    `INSERT INTO dispatch_scm_to_splits (
+       source_to_id, source_to_ref, split_to_id, split_to_ref, status
+     ) VALUES ($1, 'DP-CLOSED-TO', $2, 'DP-CLOSED-TO-S1', 'active')`,
+    [toId, toSplitId]
+  );
+
+  const closed = await listClosedNetSuiteOrders([
+    "DP-CLOSED-SO-S1",
+    String(poSplitId),
+    "DP-CLOSED-PO-DISPATCH",
+    "DP-CLOSED-TO-S1"
+  ]);
+  const byRequestedRef = new Map(closed.map((entry) => [entry.requestedRef, entry]));
+  assert.deepEqual(
+    [byRequestedRef.get("DP-CLOSED-SO-S1")?.kind, byRequestedRef.get("DP-CLOSED-SO-S1")?.canonicalRef],
+    ["SO", "DP-CLOSED-SO"]
+  );
+  assert.deepEqual(
+    [byRequestedRef.get(String(poSplitId))?.kind, byRequestedRef.get(String(poSplitId))?.canonicalRef],
+    ["PO", "DP-CLOSED-PO"]
+  );
+  assert.deepEqual(
+    [byRequestedRef.get("DP-CLOSED-PO-DISPATCH")?.kind, byRequestedRef.get("DP-CLOSED-PO-DISPATCH")?.canonicalRef],
+    ["PO", "DP-CLOSED-PO"]
+  );
+  assert.deepEqual(
+    [byRequestedRef.get("DP-CLOSED-TO-S1")?.kind, byRequestedRef.get("DP-CLOSED-TO-S1")?.canonicalRef],
+    ["TO", "DP-CLOSED-TO"]
+  );
 });
 
 test("DP-13 and DP-16: checkpoint list is metadata-only and compact reads/commands record bounded timings", { timeout: 60_000 }, async () => {
@@ -348,4 +433,47 @@ test("DP-13 and DP-16: checkpoint list is metadata-only and compact reads/comman
     `P95 command/read time must remain below 1,000ms; got ${requestSummary.p95Ms}`
   );
   assert.ok(sequenceMs < 4_000, `continuous sequence must remain below 4,000ms; got ${sequenceMs}`);
+});
+
+test("date switch resolves 615 operational refs among 10,000 old orders within the one-second budget", { timeout: 60_000 }, async () => {
+  const baseId = 9_915_000_000;
+  await query(
+    `INSERT INTO sales_orders (
+       netsuite_id, tranid, trandate, customer, status, status_text,
+       sales_order_type, operator_status, local_yard_order_status, netsuite_active
+     )
+     SELECT $1::bigint + series,
+            'DP-DATE-SWITCH-' || lpad(series::text, 5, '0'),
+            '2039-01-15'::date, 'Date switch performance fixture', 'B',
+            'Sales Order : Pending Fulfillment', 'Delivery', 'open', 'Open', true
+       FROM generate_series(1, 10000) series
+     ON CONFLICT (netsuite_id) DO NOTHING`,
+    [baseId]
+  );
+  await query("ANALYZE sales_orders, purchase_orders, transfer_orders");
+
+  const refs = Array.from(
+    { length: 615 },
+    (_, index) => `DP-DATE-SWITCH-${String(index + 1).padStart(5, "0")}`
+  );
+  const seeded = await fixture.seedPlan({ date: "2039-01-15", refs });
+
+  const lookupStartedAt = performance.now();
+  const conflicts = await listClosedNetSuiteOrders(refs);
+  const lookupMs = performance.now() - lookupStartedAt;
+  assert.deepEqual(conflicts, []);
+  assert.ok(lookupMs < 500, `Closed-order resolution took ${lookupMs.toFixed(1)}ms`);
+
+  const bootstrap = await fixture.request(
+    `/api/dispatch/v2/bootstrap?planId=${seeded.id}&date=${seeded.plan_date}`
+  );
+  assert.equal(bootstrap.response.status, 200, JSON.stringify(bootstrap.payload));
+  assert.ok(
+    bootstrap.durationMs < 1_000,
+    `Date-plan bootstrap took ${bootstrap.durationMs.toFixed(1)}ms`
+  );
+  await recordDispatchPerformance([
+    { name: "closed_order_resolution_615_refs", durationMs: lookupMs, responseBytes: 0 },
+    { name: "date_plan_switch_bootstrap_615_refs", durationMs: bootstrap.durationMs, responseBytes: bootstrap.responseBytes }
+  ]);
 });

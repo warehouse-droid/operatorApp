@@ -17,6 +17,7 @@ import {
   unconfirmReceivingLine
 } from "./receiving-repository.js";
 import { getDriverDayJobs, listDriverHistory, startDriverJob, recordDriverJobPhotos } from "./driver-repository.js";
+import { driverCompanyDate } from "./driver-plan-date-policy.js";
 import { assertScmReconciliationOrderEditable } from "./scm-reconciliation-repository.js";
 import {
   createDispatchOperatorRequest,
@@ -252,10 +253,26 @@ try {
 
     assert.equal(await getDeliveryOrder(soId), null, "A Closed SO must be hidden from Operator Delivery.");
     assert.equal(await getDeliveryOrder(toId), null, "A Closed TO must be hidden from Operator Delivery.");
+    assert.ok(
+      await getDeliveryOrder(soId, { includeNetSuiteClosed: true }),
+      "The internal posting finalizer must retain access to an already-fulfilled SO record."
+    );
+    assert.ok(
+      await getDeliveryOrder(toId, { includeNetSuiteClosed: true }),
+      "The internal posting finalizer must retain access to an already-fulfilled TO record."
+    );
     assert.ok(await getDeliveryOrder(soId + 1), "An open SO must remain visible to Operator Delivery.");
     assert.ok(await getDeliveryOrder(toId + 1), "An open TO must remain visible to Operator Delivery.");
     assert.equal(await getReceivingOrder(poId), null, "A Closed PO must be hidden from Operator Receiving.");
     assert.equal(await getReceivingOrder(toId), null, "A Closed TO must be hidden from Operator Receiving.");
+    assert.ok(
+      await getReceivingOrder(poId, { includeNetSuiteClosed: true }),
+      "The internal posting finalizer must retain access to an already-received PO record."
+    );
+    assert.ok(
+      await getReceivingOrder(toId, { includeNetSuiteClosed: true }),
+      "The internal posting finalizer must retain access to an already-received TO record."
+    );
     assert.ok(await getReceivingOrder(poId + 1), "An open PO must remain visible to Operator Receiving.");
     assert.ok(await getReceivingOrder(toId + 1), "An open TO must remain visible to Operator Receiving.");
 
@@ -265,6 +282,7 @@ try {
     );
     const closedDriverJob = {
       jobId: "closed-order-policy-driver-job",
+      planDate: driverCompanyDate(),
       orderRefs: ["TST-TO-CLOSED-S1"],
       requiredPhotos: 0
     };

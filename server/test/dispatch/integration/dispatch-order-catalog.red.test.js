@@ -10,6 +10,7 @@ import {
   getDispatchOrderCatalogState,
   listDispatchOrderPool,
   markDispatchOrderCatalogReady,
+  recordDispatchOrderPoolShadowComparison,
   replaceDispatchOrderCatalog,
   upsertDispatchOrderCatalog
 } from "../../../src/dispatch-order-catalog-repository.js";
@@ -22,7 +23,7 @@ import {
 
 async function resetCatalog() {
   await query("DELETE FROM dispatch_plans WHERE note LIKE 'catalog test%'");
-  await query("TRUNCATE dispatch_order_catalog_refresh_outbox, dispatch_order_relation_edges, dispatch_order_catalog_entries, dispatch_order_catalog_state RESTART IDENTITY CASCADE");
+  await query("TRUNCATE dispatch_order_catalog_refresh_outbox, dispatch_order_relation_edges, dispatch_order_catalog_entries, dispatch_order_catalog_state, dispatch_planner_shadow_mismatches RESTART IDENTITY CASCADE");
   await query("INSERT INTO dispatch_order_catalog_state (singleton, status) VALUES (true, 'warming')");
 }
 
@@ -75,6 +76,40 @@ test("DPO-06 indexed pool defaults to unplanned and search returns planned route
   assert.equal(hydrated.items[0].sku, "STONE-A");
 });
 
+test("DPO-06b indexed pool retains completed transit CO evidence for the customer leg", async () => {
+  await resetCatalog();
+  await upsertDispatchOrderCatalog({
+    source: "dispatch-so-refresh",
+    orders: [{
+      id: "SOA07512",
+      type: "SO",
+      sourceYard: "2967",
+      pickupLocations: ["12441"],
+      transitCo: {
+        id: "CO-SOA07512",
+        fromYard: "2967",
+        toYard: "12441",
+        status: "completed",
+        source: "local-db",
+        raw: { giant: "x".repeat(50_000), credential: "must-not-leak" }
+      }
+    }]
+  });
+  await markDispatchOrderCatalogReady({ source: "dispatch-so-refresh" });
+
+  const pool = await listDispatchOrderPool({ type: "SO", search: "SOA07512" });
+  assert.equal(pool.orders.length, 1);
+  assert.deepEqual(pool.orders[0].transitCo, {
+    id: "CO-SOA07512",
+    fromYard: "2967",
+    toYard: "12441",
+    status: "completed",
+    source: "local-db"
+  });
+  assert.deepEqual(pool.orders[0].pickupLocations, ["12441"]);
+  assert.doesNotMatch(JSON.stringify(pool.orders[0]), /must-not-leak/u);
+});
+
 test("DPO-06 pool cursors are stable and replacement removes only the selected scope", async () => {
   await resetCatalog();
   await upsertDispatchOrderCatalog({
@@ -90,7 +125,7 @@ test("DPO-06 pool cursors are stable and replacement removes only the selected s
   const second = await listDispatchOrderPool({ type: "SO", limit: 3, cursor: first.nextCursor });
   const third = await listDispatchOrderPool({ type: "SO", limit: 3, cursor: second.nextCursor });
   assert.deepEqual([...first.orders, ...second.orders, ...third.orders].map((order) => order.id), [
-    "SO-PAGE-01", "SO-PAGE-02", "SO-PAGE-03", "SO-PAGE-04", "SO-PAGE-05", "SO-PAGE-06", "SO-PAGE-07"
+    "SO-PAGE-07", "SO-PAGE-06", "SO-PAGE-05", "SO-PAGE-04", "SO-PAGE-03", "SO-PAGE-02", "SO-PAGE-01"
   ]);
   await assert.rejects(
     listDispatchOrderPool({ cursor: "hostile-not-a-cursor" }),
@@ -119,11 +154,74 @@ test("DPO-06 catalog refresh outbox deduplicates work and claims it once", async
   assert.equal(state.pendingRefreshCount, 0);
 });
 
+test("DPO-19 a full catalog refresh coalesces the pending targeted backlog", async () => {
+  await resetCatalog();
+  await enqueueDispatchOrderCatalogRefresh({ orderRef: "SO-QUEUE-1", orderType: "SO", source: "webhook" });
+  await enqueueDispatchOrderCatalogRefresh({ orderRef: "TO-QUEUE-2", orderType: "TO", source: "webhook" });
+  const full = await enqueueDispatchOrderCatalogRefresh({ source: "startup" });
+
+  const claimed = await claimDispatchOrderCatalogRefreshes({ limit: 25 });
+  assert.deepEqual(claimed.map((refresh) => refresh.id), [full.id]);
+  assert.equal(claimed[0].orderRef, "");
+  const rows = await query(
+    `SELECT refresh_key, status
+       FROM dispatch_order_catalog_refresh_outbox
+      ORDER BY id`
+  );
+  assert.deepEqual(rows.rows, [
+    { refresh_key: "order:SO:so-queue-1", status: "complete" },
+    { refresh_key: "order:TO:to-queue-2", status: "complete" },
+    { refresh_key: "full:all", status: "running" }
+  ]);
+});
+
+test("DPO-06 shadow verification records matches, blocks mismatches, and resets on full refresh", async () => {
+  await resetCatalog();
+  await recordDispatchOrderPoolShadowComparison({
+    requestKey: "SO default",
+    legacy: [{ id: "SO-SHADOW-1" }, { id: "SO-SHADOW-2" }],
+    optimized: [{ id: "SO-SHADOW-2" }, { id: "SO-SHADOW-1" }]
+  });
+  await recordDispatchOrderPoolShadowComparison({
+    requestKey: "SO search",
+    legacy: [{ id: "SO-SHADOW-1" }],
+    optimized: [{ id: "SO-SHADOW-9" }]
+  });
+  const compared = await getDispatchOrderCatalogState();
+  assert.equal(compared.shadowMatchCount, 1);
+  assert.equal(compared.shadowMismatchCount, 1);
+  assert.ok(compared.lastShadowComparisonAt);
+
+  const mismatches = await query(
+    `SELECT details
+       FROM dispatch_planner_shadow_mismatches
+      WHERE comparison_kind = 'order_pool'
+        AND request_key = 'SO search'
+      ORDER BY id DESC
+      LIMIT 1`
+  );
+  assert.deepEqual(mismatches.rows[0].details, {
+    legacyOnly: ["SO-SHADOW-1"],
+    optimizedOnly: ["SO-SHADOW-9"],
+    legacyCount: 1,
+    optimizedCount: 1
+  });
+
+  await replaceDispatchOrderCatalog({
+    source: "shadow-reset",
+    orders: [{ id: "SO-SHADOW-1", type: "SO" }]
+  });
+  const refreshed = await getDispatchOrderCatalogState();
+  assert.equal(refreshed.shadowMatchCount, 0);
+  assert.equal(refreshed.shadowMismatchCount, 0);
+  assert.equal(refreshed.lastShadowComparisonAt, null);
+});
+
 test("DPO-07 assignment and relation projections retain interacting planning identities", async () => {
   await resetCatalog();
   const seeded = await query(
-    `INSERT INTO dispatch_plans (plan_date, status, note)
-     VALUES ('2326-08-21', 'draft', 'catalog test projections')
+    `INSERT INTO dispatch_plans (plan_date, status, note, revision)
+     VALUES ('2326-08-21', 'draft', 'catalog test projections', 9)
      RETURNING id`
   );
   const plan = {

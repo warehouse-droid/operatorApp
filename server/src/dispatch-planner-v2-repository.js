@@ -1,12 +1,17 @@
 import crypto from "node:crypto";
 
 import { query, withTransaction } from "./db.js";
-import { syncDispatchDeliveryGroupsFromPlan } from "./dispatch-delivery-group-repository.js";
+import { canonicalizeDispatchCoGroupIdentities } from "./dispatch-co-group-identity.js";
+import {
+  deactivateDispatchGlobalOrderDefinitions,
+  syncDispatchDeliveryGroupsFromPlan
+} from "./dispatch-delivery-group-repository.js";
 import {
   assertActiveDispatchCosForPlan,
   reconcileDispatchPlanLocalCos
 } from "./dispatch-co-lifecycle.js";
 import { DISPATCH_FLEET_PLANNING_LOCK } from "./dispatch-fleet-status.js";
+import { dispatchLoadAssignment } from "./dispatch-load-assignment.js";
 import {
   dispatchPlannedAssignmentMap,
   dispatchPlanV2Summary
@@ -102,7 +107,7 @@ function commandError(message, code, status = 409, details = {}) {
 
 function rowPlan(row = {}) {
   const summary = row.summary && typeof row.summary === "object" ? row.summary : {};
-  return {
+  return canonicalizeDispatchCoGroupIdentities({
     id: text(row.id || row.plan_id),
     planId: text(row.id || row.plan_id),
     planDate: planDate(row.plan_date),
@@ -118,7 +123,7 @@ function rowPlan(row = {}) {
           migratedAt: snapshotMarkerTimestamp(row)
         })
       : summary
-  };
+  });
 }
 
 function slimAssignedOrder(order = {}) {
@@ -135,10 +140,12 @@ function slimAssignedOrder(order = {}) {
     "originalOrderId", "sourceOrderId", "relatedSoId", "originalPoRef", "sourcePoRef",
     "sourcePoRefs", "correspondingPoRefs", "childOrders",
     "childOrderDetails", "groupAliases", "transitCo", "transitOriginalPickupLocations",
-    "transitOriginalSourceYard", "poPickupManifest", "poRouteProjection", "orderDependencies", "dependencyLabels",
+    "transitOriginalSourceYard", "directPickupManifest", "poPickupManifest", "poRouteProjection", "orderDependencies", "dependencyLabels",
     "dependencyDirectPickup", "dependencyWaitingForTransfer", "dependencyAttention",
     "dependencyUncovered", "dependencyUncoveredQuantity", "planOwned", "isSplit", "isGrouped",
     "groupPlanId", "groupPlanDate",
+    "globalGroupDefinition", "globalGroupSourcePlanId", "globalGroupSourcePlanDate",
+    "globalOrderDefinition", "globalOrderDefinitionKind", "globalOrderSourcePlanId", "globalOrderSourcePlanDate",
     "sourceTable", "netsuiteId", "dispatchRef", "dependency", "dependencies", "mbt",
     "historicalReconciliationComplete", "historicalPlanDate"
   ];
@@ -343,24 +350,49 @@ export async function getDispatchV2CommandReplay({ command = {} } = {}) {
   return { payload, replay: true };
 }
 
+function dispatchAssignmentEtaTime(stop = {}) {
+  const direct = text(stop.arriveTime || stop.plannedArrive);
+  if (direct) {return direct;}
+  const rawArrival = stop?.timing?.arrival;
+  if (rawArrival === null || rawArrival === undefined || rawArrival === "") {return "";}
+  const arrival = Number(rawArrival);
+  if (!Number.isFinite(arrival) || arrival < 0) {return "";}
+  const minute = Math.floor(arrival);
+  return `${String(Math.floor(minute / 60)).padStart(2, "0")}:${String(minute % 60).padStart(2, "0")}`;
+}
+
 function assignmentLocations(plan = {}) {
   const locations = new Map();
   for (const truck of plan.trucks || []) {
     for (const load of truck?.loads || []) {
+      const loadAssignment = dispatchLoadAssignment(truck, load);
       for (const stop of load?.stops || []) {
+        const stopType = text(stop.type).toLowerCase();
+        const deliveryPriority = ["drop", "dropoff", "delivery"].includes(stopType) ? 2 : 1;
         const refs = [...new Set([
           stop.orderId,
           stop.order_id,
           stop.orderRef,
           ...(Array.isArray(stop.orderRefs) ? stop.orderRefs : [])
         ].map(text).filter(Boolean))];
-        for (const ref of refs) {if (!locations.has(ref.toLowerCase())) {locations.set(ref.toLowerCase(), {
-          loadId: text(load.id),
-          stopId: text(stop.id),
-          truckId: text(truck.id),
-          truckPlate: text(truck.plate || truck.truckPlate),
-          loadName: text(load.name)
-        });}}
+        for (const ref of refs) {
+          const key = ref.toLowerCase();
+          const existing = locations.get(key);
+          if (existing && existing.deliveryPriority >= deliveryPriority) {continue;}
+          locations.set(key, {
+            orderRef: ref,
+            loadId: text(load.id),
+            stopId: text(stop.id),
+            truckId: text(truck.id),
+            truckPlate: loadAssignment.truckPlate,
+            loadName: text(load.name),
+            parkingSpot: loadAssignment.parkingSpot,
+            driverLogin: loadAssignment.driverLogin,
+            driverName: loadAssignment.driverName,
+            etaTime: dispatchAssignmentEtaTime(stop),
+            deliveryPriority
+          });
+        }
       }
     }
   }
@@ -391,6 +423,12 @@ function splitParentRef(order = {}, orderReference = "") {
   return /-S\d+$/iu.test(ref) ? ref.replace(/-S\d+$/iu, "") : "";
 }
 
+function dispatchAssignmentOrderKind(order = {}) {
+  if (text(order?.sourceTable).toLowerCase() === "scm_vrma_orders") {return "VRMA";}
+  const kind = text(order?.type || order?.orderKind).toUpperCase();
+  return ["PO", "TO", "VRMA"].includes(kind) ? kind : "";
+}
+
 export function dispatchPlanAssignmentRows(plan = {}) {
   const locations = assignmentLocations(plan);
   const orders = nestedOrderMap(plan);
@@ -403,6 +441,9 @@ export function dispatchPlanAssignmentRows(plan = {}) {
     if (!ref || seen.has(key)) {return;}
     seen.add(key);
     const location = locations.get(plannedRef.toLowerCase()) || locations.get(key) || {};
+    const order = orders.get(key) || orders.get(plannedRef.toLowerCase()) || {};
+    const orderKind = text(details?.dispatchOrderKind).toUpperCase()
+      || dispatchAssignmentOrderKind(order);
     rows.push({
       orderRef: ref,
       plannedOrderRef: plannedRef,
@@ -412,9 +453,14 @@ export function dispatchPlanAssignmentRows(plan = {}) {
       assignment: {
         ...details,
         plannedOrderRef: plannedRef,
+        dispatchOrderKind: orderKind,
+        dispatchEtaTime: text(details?.dispatchEtaTime || location.etaTime),
         dispatchTruckId: text(location.truckId),
         dispatchTruckPlate: text(details?.dispatchTruckPlate || location.truckPlate),
         dispatchLoadName: text(details?.dispatchLoadName || location.loadName),
+        dispatchParkingSpot: text(details?.dispatchParkingSpot || location.parkingSpot),
+        dispatchDriverLogin: text(details?.dispatchDriverLogin || location.driverLogin),
+        dispatchDriverName: text(details?.dispatchDriverName || location.driverName),
         dispatchLoadId: text(location.loadId),
         dispatchStopId: text(location.stopId)
       }
@@ -428,6 +474,23 @@ export function dispatchPlanAssignmentRows(plan = {}) {
       plannedOrderRef: plannedRef,
       assignmentKind: ref.toLowerCase() === plannedRef.toLowerCase() ? "direct" : "group_member",
       details
+    });
+  }
+  // Modern compact plans carry `orderRefs` on delivery/pickup stops, while
+  // legacy boards carried one `orderId` on a `drop` stop. Projection must
+  // cover both shapes so cross-date ownership never depends on snapshot JSON.
+  for (const location of locations.values()) {
+    add({
+      orderRef: location.orderRef,
+      plannedOrderRef: location.orderRef,
+      assignmentKind: "direct",
+      details: {
+        dispatchPlanned: true,
+        dispatchPlanId: plan.id ? String(plan.id) : "",
+        dispatchPlanDate: String(plan.planDate || "").slice(0, 10),
+        dispatchTruckPlate: location.truckPlate,
+        dispatchLoadName: location.loadName
+      }
     });
   }
   for (const row of [...rows]) {
@@ -490,8 +553,7 @@ export async function listDispatchPlanOrderAssignmentsProjection({
 export async function syncDispatchPlanOrderAssignments(plan = {}) {
   const rows = dispatchPlanAssignmentRows(plan);
   await query("DELETE FROM dispatch_plan_order_assignments WHERE plan_id = $1", [plan.id]);
-  if (!rows.length) {return;}
-  await query(
+  if (rows.length) {await query(
     `INSERT INTO dispatch_plan_order_assignments (
        plan_id, plan_date, order_ref, planned_order_ref, assignment_kind,
        load_id, stop_id, assignment, updated_at
@@ -519,6 +581,14 @@ export async function syncDispatchPlanOrderAssignments(plan = {}) {
       stop_id: row.stopId,
       assignment: row.assignment
     })))]
+  );}
+  await query(
+    `INSERT INTO dispatch_plan_projection_state (plan_id, source_revision, projected_at)
+     VALUES ($1, $2, now())
+     ON CONFLICT (plan_id) DO UPDATE
+       SET source_revision = EXCLUDED.source_revision,
+           projected_at = now()`,
+    [plan.id, Number(plan.revision || 0)]
   );
 }
 
@@ -544,31 +614,58 @@ export async function syncDispatchPlanRelationEdges(plan = {}) {
   );
 }
 
-export async function backfillDispatchPlanProjections() {
-  const active = await query(
-    `SELECT p.id, p.plan_date::text AS plan_date, p.status, p.note, p.revision,
-            p.created_at, p.updated_at, s.saved_at, s.orders, s.trucks, s.summary,
-            s.schema_version
-       FROM dispatch_plans p
-       JOIN dispatch_plan_snapshots s ON s.plan_id = p.id
-      WHERE p.status <> 'cancelled'
-      ORDER BY p.plan_date, p.id`
-  );
+export async function backfillDispatchPlanProjections({ batchSize = 25 } = {}) {
+  const safeBatchSize = Math.min(Math.max(Number(batchSize) || 25, 1), 100);
   let projected = 0;
-  for (const row of active.rows) {
-    const plan = rowPlan(row);
-    await withTransaction(async () => {
-      await syncDispatchPlanOrderAssignments(plan);
-      await syncDispatchPlanRelationEdges(plan);
-    });
-    projected += 1;
+  let lastPlanId = 0;
+  while (true) {
+    const active = await query(
+      `SELECT p.id, p.plan_date::text AS plan_date, p.status, p.note, p.revision,
+              p.created_at, p.updated_at, s.saved_at, s.orders, s.trucks, s.summary,
+              s.schema_version
+         FROM dispatch_plans p
+         JOIN dispatch_plan_snapshots s ON s.plan_id = p.id
+         LEFT JOIN dispatch_plan_projection_state projection ON projection.plan_id = p.id
+        WHERE p.status <> 'cancelled'
+          AND p.id > $1
+          AND (
+            projection.plan_id IS NULL
+            OR projection.source_revision <> COALESCE(p.revision, 0)
+          )
+        ORDER BY p.id
+        LIMIT $2`,
+      [lastPlanId, safeBatchSize]
+    );
+    if (!active.rowCount) {break;}
+    for (const row of active.rows) {
+      const plan = rowPlan(row);
+      await withTransaction(async () => {
+        await syncDispatchPlanOrderAssignments(plan);
+        await syncDispatchPlanRelationEdges(plan);
+      });
+      projected += 1;
+      lastPlanId = Number(row.id);
+    }
+    await new Promise((resolve) => setImmediate(resolve));
   }
+  const pending = await query(
+    `SELECT count(*)::int AS count
+       FROM dispatch_plans plan
+       LEFT JOIN dispatch_plan_projection_state projection ON projection.plan_id = plan.id
+      WHERE plan.status <> 'cancelled'
+        AND (
+          projection.plan_id IS NULL
+          OR projection.source_revision <> COALESCE(plan.revision, 0)
+        )`
+  );
+  const remaining = Number(pending.rows[0]?.count || 0);
   await query(
     `UPDATE dispatch_order_catalog_state
-        SET assignments_ready = true, updated_at = now()
-      WHERE singleton = true`
+        SET assignments_ready = $1, updated_at = now()
+      WHERE singleton = true`,
+    [remaining === 0]
   );
-  return { projected };
+  return { projected, remaining, ready: remaining === 0 };
 }
 
 async function otherDateAssignment(plan, orderReference) {
@@ -585,32 +682,42 @@ async function otherDateAssignment(plan, orderReference) {
     [plan.id, orderReference]
   );
   if (materialized.rows[0]) {return materialized.rows[0];}
-  const fallback = await query(
-    `SELECT p.id::text AS plan_id, p.plan_date::text AS plan_date
-       FROM dispatch_plans p
-       JOIN dispatch_plan_snapshots s ON s.plan_id = p.id
-      WHERE p.id <> $1
-        AND p.status <> 'cancelled'
-        AND EXISTS (
-          SELECT 1
-            FROM jsonb_array_elements(COALESCE(s.trucks, '[]'::jsonb)) truck(value)
-            CROSS JOIN LATERAL jsonb_array_elements(COALESCE(truck.value -> 'loads', '[]'::jsonb)) load(value)
-            CROSS JOIN LATERAL jsonb_array_elements(COALESCE(load.value -> 'stops', '[]'::jsonb)) stop(value)
-           WHERE lower(COALESCE(stop.value ->> 'orderId', stop.value ->> 'order_id', stop.value ->> 'orderRef', '')) = lower($2)
-              OR EXISTS (
-                SELECT 1
-                  FROM jsonb_array_elements_text(
-                    CASE WHEN jsonb_typeof(stop.value -> 'orderRefs') = 'array'
-                      THEN stop.value -> 'orderRefs' ELSE '[]'::jsonb END
-                  ) ref(value)
-                 WHERE lower(ref.value) = lower($2)
-              )
+  return null;
+}
+
+async function assertOtherPlanAssignmentProjectionsReady(plan) {
+  const pending = await query(
+    `SELECT other_plan.id::text AS plan_id,
+            other_plan.plan_date::text AS plan_date,
+            other_plan.revision::int AS revision,
+            projection.source_revision::int AS source_revision
+       FROM dispatch_plans other_plan
+       LEFT JOIN dispatch_plan_projection_state projection
+         ON projection.plan_id = other_plan.id
+      WHERE other_plan.id <> $1
+        AND other_plan.status <> 'cancelled'
+        AND (
+          projection.plan_id IS NULL
+          OR projection.source_revision <> COALESCE(other_plan.revision, 0)
         )
-      ORDER BY p.plan_date DESC
-      LIMIT 1`,
-    [plan.id, orderReference]
+      ORDER BY other_plan.plan_date DESC, other_plan.id DESC
+      LIMIT 10`,
+    [plan.id]
   );
-  return fallback.rows[0] || null;
+  if (!pending.rowCount) {return;}
+  throw commandError(
+    "Dispatch assignment index is still warming up. Retry after projection backfill completes.",
+    "DISPATCH_ASSIGNMENT_PROJECTION_NOT_READY",
+    409,
+    {
+      conflicts: pending.rows.map((row) => ({
+        planId: text(row.plan_id),
+        planDate: planDate(row.plan_date),
+        revision: Number(row.revision || 0),
+        projectedRevision: row.source_revision === null ? null : Number(row.source_revision)
+      }))
+    }
+  );
 }
 
 async function assertAssignmentDateAvailable(plan, command) {
@@ -631,6 +738,8 @@ async function assertAssignmentDateAvailable(plan, command) {
       .filter((ref) => ref && !previousRefs.has(ref.toLowerCase()));
   }
   const uniqueRefs = [...new Set(refs)];
+  if (!uniqueRefs.length) {return;}
+  await assertOtherPlanAssignmentProjectionsReady(plan);
   await assertNoDriverPwaCompletedDispatchRefs(uniqueRefs, "add these orders to Dispatch");
   await assertHistoricalInactiveSalesOrdersReconciled({
     planDate: plan.planDate,
@@ -754,6 +863,7 @@ export async function applyDispatchV2Command({ planId, command = {}, actorId = n
       command: { ...command, type: commandType },
       receiptStore: createDispatchCommandReceiptStore()
     });
+    result.plan = await reconcileDispatchPlanLocalCos(result.plan);
     result.plan.summary = dispatchPlanV2Summary(result.plan.summary || {}, {
       previousSummary: plan.summary || {},
       source: SNAPSHOT_SUMMARY_SAVE_SOURCE
@@ -845,6 +955,22 @@ export async function applyDispatchV2Command({ planId, command = {}, actorId = n
     // Operator reads this projection instead of the plan JSON. Keep it in the
     // command transaction so a refresh cannot resurrect a just-ungrouped order.
     await syncDispatchDeliveryGroupsFromPlan(result.plan);
+    const retainedRefs = new Set((result.plan.orders || [])
+      .map((order) => text(order?.id).toLowerCase())
+      .filter(Boolean));
+    const commandRetiredRefs = [
+      ...(Array.isArray(command.payload?.retiredGlobalOrderRefs)
+        ? command.payload.retiredGlobalOrderRefs
+        : []),
+      ...(commandType === "ungroup_orders" ? [command.payload?.groupRef] : []),
+      ...(commandType === "unsplit_order" && Array.isArray(result.patch?.unsplit?.removedPartRefs)
+        ? result.patch.unsplit.removedPartRefs
+        : [])
+    ];
+    await deactivateDispatchGlobalOrderDefinitions(commandRetiredRefs
+      .map(text)
+      .filter((ref) => ref && !retainedRefs.has(ref.toLowerCase()))
+      .slice(0, 200));
     const payload = {
       plan: publicPlan(result.plan),
       patch: result.patch,
@@ -1089,29 +1215,44 @@ export async function getDispatchV2Checkpoint({ planId, checkpointId } = {}) {
 }
 
 export async function pruneExpiredDispatchV2Checkpoints({ retentionDays = 7, batchSize = 500 } = {}) {
-  const days = Math.min(Math.max(Number(retentionDays) || 7, 1), 90);
+  // Kept for API compatibility; the bounded snapshot-count policy supersedes
+  // age-based deletion.
+  void retentionDays;
   const safeBatchSize = Math.min(Math.max(Number(batchSize) || 500, 1), 1000);
   const result = await query(
-    `WITH expired AS (
-       SELECT id
-         FROM dispatch_plan_snapshot_history
-        WHERE (
-          retention_until IS NOT NULL
-          AND retention_until < now()
-        ) OR (
-          retention_until IS NULL
-          AND checkpoint_kind NOT IN ('recovery', 'manual', 'lifecycle')
-          AND archive_reason <> 'save_recovery'
-          AND archived_at < now() - ($1::text || ' days')::interval
+    `WITH ranked AS MATERIALIZED (
+       SELECT history.id,
+              history.plan_date,
+              history.archived_at,
+              row_number() OVER (
+                PARTITION BY history.plan_id
+                ORDER BY history.archived_at DESC, history.id DESC
+              ) AS retained_rank
+         FROM dispatch_plan_snapshot_history history
+        WHERE NOT (
+          history.resolved_at IS NULL
+          AND (history.checkpoint_kind = 'recovery' OR history.archive_reason = 'save_recovery')
         )
-        ORDER BY archived_at, id
-        LIMIT $2
+     ), candidates AS MATERIALIZED (
+       SELECT ranked.id, ranked.archived_at
+         FROM ranked
+        WHERE (
+          ranked.plan_date < (now() AT TIME ZONE 'America/Toronto')::date
+          OR ranked.retained_rank > 4
+        )
+        ORDER BY ranked.archived_at, ranked.id
+        LIMIT $1
+     ), deleted AS (
+       DELETE FROM dispatch_plan_snapshot_history history
+        USING candidates
+        WHERE history.id = candidates.id
+        RETURNING history.id
      )
-     DELETE FROM dispatch_plan_snapshot_history history
-      USING expired
-      WHERE history.id = expired.id
-      RETURNING history.id`,
-    [days, safeBatchSize]
+     SELECT deleted.id
+       FROM deleted
+       JOIN candidates ON candidates.id = deleted.id
+      ORDER BY candidates.archived_at, deleted.id`,
+    [safeBatchSize]
   );
   return { deleted: result.rowCount, checkpointIds: result.rows.map((row) => text(row.id)) };
 }

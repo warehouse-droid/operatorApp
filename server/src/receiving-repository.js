@@ -421,7 +421,13 @@ export async function listReceivingOrders({ orderType, vendor = null, sourceLoca
   return result.rows;
 }
 
-export async function getReceivingOrder(orderId) {
+export async function getReceivingOrder(orderId, { includeNetSuiteClosed = false } = {}) {
+  const purchaseVisibilitySql = includeNetSuiteClosed
+    ? "true"
+    : `NOT ${netSuiteClosedOrderFamilySql("po", "PO")}`;
+  const transferVisibilitySql = includeNetSuiteClosed
+    ? "true"
+    : `NOT ${netSuiteClosedOrderFamilySql("t", "TO")}`;
   const order = await query(
     `WITH receiving_order_source AS (
        SELECT po.netsuite_id, 'purchase_order'::text AS order_type,
@@ -441,7 +447,7 @@ export async function getReceivingOrder(orderId) {
          LEFT JOIN scm_transport_schedule schedule
            ON schedule.order_kind = 'PO'
           AND lower(schedule.order_ref) = lower(COALESCE(NULLIF(po.dispatch_ref, ''), po.tranid))
-	       WHERE NOT ${netSuiteClosedOrderFamilySql("po", "PO")}
+	       WHERE ${purchaseVisibilitySql}
 	       UNION ALL
        SELECT netsuite_id, 'transfer_order'::text AS order_type,
               tranid,
@@ -457,7 +463,7 @@ export async function getReceivingOrder(orderId) {
               dispatch_window_end, dispatch_instructions
 	       FROM transfer_orders t
 	       WHERE t.to_location_id IS NOT NULL
-	         AND NOT ${netSuiteClosedOrderFamilySql("t", "TO")}
+	         AND ${transferVisibilitySql}
          AND NOT EXISTS (
            SELECT 1 FROM order_dependencies d
             WHERE d.transfer_order_id = t.netsuite_id
@@ -757,18 +763,20 @@ export async function unconfirmReceivingLine(orderId, lineRowId, operatorId) {
   return getReceivingOrder(orderId);
 }
 
-export async function getReceivableReceivingOrder(orderId) {
-  const order = await getReceivingOrder(orderId);
+export async function getReceivableReceivingOrder(orderId, { includeNetSuiteClosed = false } = {}) {
+  const order = await getReceivingOrder(orderId, { includeNetSuiteClosed });
   if (!order) throw new Error("Receiving order not found.");
   const receivableLines = (order.lines || []).filter((line) => {
-    if (remainingSalesQuantity(line) <= 0) return false;
     const physicalTotal = positiveQuantity(line.received_pallet_qty)
       + positiveQuantity(line.received_layer_qty)
       + positiveQuantity(line.received_section_qty)
       + positiveQuantity(line.received_piece_qty);
     const confirmedSalesQuantity = receivedSalesQuantity(line);
-    return line.netsuite_active
-      && !line.sync_exception
+    if (remainingSalesQuantity(line) <= 0
+        && !(includeNetSuiteClosed && (physicalTotal > 0 || confirmedSalesQuantity > 0))) {
+      return false;
+    }
+    return (includeNetSuiteClosed || (line.netsuite_active && !line.sync_exception))
       && ["InvtPart", "NonInvtPart"].includes(line.item_type || "")
       && (physicalTotal > 0 || confirmedSalesQuantity > 0);
   });
@@ -882,7 +890,7 @@ async function assertLocalCoReceivingSourceEditable(coRefOrId, action) {
 
 export async function listLocalCoSources({ destinationLocationId = null } = {}) {
   const params = [];
-  const clauses = ["co.status = 'planned'", openLocalCoSourceSql("co")];
+  const clauses = ["co.status IN ('planned', 'completed')", openLocalCoSourceSql("co")];
   if (destinationLocationId) {
     params.push(destinationLocationId);
     clauses.push(`co.to_location_id = $${params.length}`);
@@ -902,7 +910,7 @@ export async function listLocalCoSources({ destinationLocationId = null } = {}) 
 
 export async function listLocalCoReceivingOrders({ sourceLocationId = null, destinationLocationId = null, search = null, itemSearch = null } = {}) {
   const params = [];
-  const clauses = ["co.status = 'planned'", openLocalCoSourceSql("co")];
+  const clauses = ["co.status IN ('planned', 'completed')", openLocalCoSourceSql("co")];
   if (sourceLocationId) {
     params.push(sourceLocationId);
     clauses.push(`co.from_location_id = $${params.length}`);
@@ -958,7 +966,7 @@ export async function searchLocalCoItems({ sourceLocationId = null, destinationL
   if (term.length < 2) return [];
   const params = [`%${term}%`];
   const clauses = [
-    "co.status = 'planned'",
+    "co.status IN ('planned', 'completed')",
     openLocalCoSourceSql("co"),
     "(line.item_name ILIKE $1 OR line.item_description ILIKE $1)"
   ];
@@ -1030,7 +1038,7 @@ export async function confirmLocalCoReceivingLine(coRefOrId, lineRowId, values, 
        INNER JOIN co_orders co ON co.id = line.co_id
       WHERE line.id = $1
         AND (co.co_ref = $2 OR co.delivery_order_id::text = $2 OR co.id::text = $2)
-        AND co.status = 'planned'`,
+        AND co.status IN ('planned', 'completed')`,
     [lineRowId, String(coRefOrId)]
   );
   if (!line.rowCount) throw new Error("CO receiving line not found.");
@@ -1074,7 +1082,7 @@ export async function unconfirmLocalCoReceivingLine(coRefOrId, lineRowId, operat
        INNER JOIN co_orders co ON co.id = line.co_id
       WHERE line.id = $1
         AND (co.co_ref = $2 OR co.delivery_order_id::text = $2 OR co.id::text = $2)
-        AND co.status = 'planned'`,
+        AND co.status IN ('planned', 'completed')`,
     [lineRowId, String(coRefOrId)]
   );
   if (!line.rowCount) throw new Error("CO receiving line not found.");
@@ -1113,7 +1121,9 @@ export async function receiveLocalCoOrder(coRefOrId, operatorId, { photoDataUrls
   if (photos.length < 2) throw new Error("Two receiving photos are required.");
   const co = await getLocalCoReceivingOrder(coRefOrId);
   if (!co) throw new Error("Local CO not found.");
-  if (co.status !== "planned") throw new Error("This CO is not ready for receiving.");
+  if (!["planned", "completed"].includes(String(co.status || "").toLowerCase())) {
+    throw new Error("This CO is not ready for receiving.");
+  }
   const confirmedLines = (co.lines || []).filter((line) => {
     return positiveQuantity(line.received_pallet_qty)
       + positiveQuantity(line.received_layer_qty)
@@ -1453,11 +1463,20 @@ export async function receiveLocalCoOrder(coRefOrId, operatorId, { photoDataUrls
   };
 }
 
-export async function recordReceivingReceipt(orderId, operatorId, { photoDataUrls, payload, response, itemReceiptId, itemReceiptTranid }) {
-  await assertNoClosedNetSuiteOrders([orderId], "be received");
+export async function recordReceivingReceipt(orderId, operatorId, {
+  photoDataUrls,
+  payload,
+  response,
+  itemReceiptId,
+  itemReceiptTranid,
+  allowNetSuiteCompleted = false
+}) {
+  if (!allowNetSuiteCompleted) {
+    await assertNoClosedNetSuiteOrders([orderId], "be received");
+  }
   const photos = Array.isArray(photoDataUrls) ? photoDataUrls.filter(isPhotoReference) : [];
   if (photos.length < 2) throw new Error("Two receiving photos are required.");
-  const order = await getReceivingOrder(orderId);
+  const order = await getReceivingOrder(orderId, { includeNetSuiteClosed: allowNetSuiteCompleted });
   if (!order) throw new Error("Receiving order not found.");
   const receivedIds = (payload?.item?.items || [])
     .filter((item) => item.itemReceive !== false && positiveQuantity(item.quantity) > 0)

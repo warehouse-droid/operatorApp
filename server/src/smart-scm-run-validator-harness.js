@@ -12,12 +12,16 @@ function state({
   capacity = 25,
   minimumOrder = 1,
   availablePallets = 0,
-  urgent = true
+  urgent = true,
+  blanketCoveragePallets = 0,
+  residualRequiredPallets = requiredPallets
 } = {}) {
   return {
     key: `${itemId}:${locationId}`,
     policy: { item_id: itemId, item_name: `ITEM-${itemId}`, yard_code: yardCode, location_id: locationId },
     requiredPallets,
+    blanketCoveragePallets,
+    residualRequiredPallets,
     positionPallets,
     rop,
     preferred,
@@ -73,6 +77,35 @@ assert.equal(good.summary.coverageAboveRequiredCount, 0);
 assert.equal(good.summary.skuCoverageAboveRequiredCount, 0);
 assert.equal(good.summary.maximumFinalAbovePslPallets, 0,
   "Existing overstock without a new proposal must not inflate the proposal overshoot metric.");
+
+const blanketResidual = validateSmartScmPlanningRunSnapshot({
+  states: [state({
+    requiredPallets: 50,
+    preferred: 50,
+    capacity: 60,
+    blanketCoveragePallets: 1,
+    residualRequiredPallets: 49
+  })],
+  proposals: [proposal(101, "direct_vendor", [line(5001, "3445", 49)])]
+});
+assert.equal(blanketResidual.passed, true, "One Blanket PLT plus a 49-PLT proposal must conserve a 50-PLT requirement.");
+assert.equal(blanketResidual.summary.coverageBelowRequiredCount, 0);
+assert.equal(blanketResidual.summary.totalProposedPallets, 49);
+assert.equal(blanketResidual.summary.totalBlanketCoveragePallets, 1);
+assert.equal(blanketResidual.summary.totalCombinedCoveragePallets, 50);
+
+const blanketOvercovered = validateSmartScmPlanningRunSnapshot({
+  states: [state({
+    requiredPallets: 50,
+    preferred: 50,
+    capacity: 60,
+    blanketCoveragePallets: 1,
+    residualRequiredPallets: 49
+  })],
+  proposals: [proposal(102, "direct_vendor", [line(5001, "3445", 50)])]
+});
+assert.equal(blanketOvercovered.passed, false, "Blanket coverage must not be added on top of a full ordinary proposal.");
+assert.ok(blanketOvercovered.failures.some((failure) => failure.code === "coverage_exceeds_required"));
 
 const allocatedHubLine = validateSmartScmPlanningRunSnapshot({
   states: [

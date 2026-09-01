@@ -20,6 +20,8 @@ files=(
   src/driver-route-change-service.js
   src/driver-route-push.js
   src/order-dependency-repository.js
+  src/order-dependency-quantity.js
+  src/order-dependency-harness.js
   src/scm-dependency-command-service.js
   src/scm-dependency-management-policy.js
   src/scm-dependency-management-repository.js
@@ -28,6 +30,10 @@ files=(
   src/scm-dependency-search-repository.js
   src/server.js
   test/scm-dependency-management-spec.md
+  test/dispatch/integration/order-dependency-multi-to-extension.red.test.js
+  test/dispatch/integration/order-dependency-quantity-replay.red.test.js
+  test/dispatch/property/order-dependency-quantity.property.test.js
+  test/fixtures/order-dependency-quantity-replay.json
   test/support/run-scm-dependency-management-mutations.mjs
   tools/scm-dependency-management-gauntlet.sh
   tools/scm-dependency-management-source-state.sh

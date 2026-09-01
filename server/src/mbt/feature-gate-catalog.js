@@ -55,6 +55,17 @@ export const MBT_ADMIN_GATE_DEFINITIONS = Object.freeze([
     locked: false,
     lockReason: null
   }),
+  Object.freeze({
+    flagKey: "dispatch_optimized_order_pool",
+    label: "Dispatch optimized order pool",
+    description: "Serve the indexed, paged Dispatch order pool only after shadow verification and catalog/assignment readiness. Turning this off immediately retains the legacy read path.",
+    environmentProperty: "dispatchOrderPoolReady",
+    requiresDispatchOrderPoolReadiness: true,
+    deploymentGuarded: true,
+    independent: true,
+    locked: false,
+    lockReason: null
+  }),
   ...OPERATOR_NETSUITE_GATE_DEFINITIONS.map((definition) => Object.freeze({
     ...definition,
     environmentProperty: "netSuiteDirectAccessEnabled",
@@ -164,6 +175,10 @@ function environmentAllows(definition, environment) {
   if (definition.requiresNetSuiteDirectAccess === true) {
     return environment.netSuiteDirectAccessEnabled === true;
   }
+  if (definition.requiresDispatchOrderPoolReadiness === true) {
+    return environment.dispatchOrderPoolMode === "on"
+      && environment.dispatchOrderPoolReady === true;
+  }
   if (definition.independent === true) {
     return true;
   }
@@ -196,15 +211,58 @@ function optionalUpdatedBy(flag) {
   return String(flag.updatedBy);
 }
 
-/** @param {Record<string, unknown>} definition */
-function gateMetadata(definition) {
+/** @param {unknown} value @param {string} fallback */
+function metadataText(value, fallback = "") {
+  const normalized = String(value ?? "");
+  return normalized || fallback;
+}
+
+/** @param {unknown} value */
+function metadataCount(value) {
+  const parsed = Number(value);
+  return Number.isFinite(parsed) ? parsed : 0;
+}
+
+/** @param {Record<string, unknown>} definition @param {Record<string, unknown>} environment */
+function dispatchOrderPoolMetadata(definition, environment) {
+  if (definition.requiresDispatchOrderPoolReadiness !== true) {return null;}
+  return {
+    deploymentMode: metadataText(environment.dispatchOrderPoolMode, "off"),
+    status: metadataText(environment.dispatchOrderPoolStatus, "unavailable"),
+    ready: environment.dispatchOrderPoolReady === true,
+    activationReady: environment.dispatchOrderPoolActivationReady === true,
+    activationBlockReason: metadataText(
+      environment.dispatchOrderPoolActivationBlockReason,
+      "readiness_unavailable"
+    ),
+    catalogReady: environment.dispatchOrderPoolCatalogReady === true,
+    assignmentsReady: environment.dispatchOrderPoolAssignmentsReady === true,
+    catalogCount: metadataCount(environment.dispatchOrderPoolCatalogCount),
+    legacyCount: metadataCount(environment.dispatchOrderPoolLegacyCount),
+    pendingRefreshCount: metadataCount(environment.dispatchOrderPoolPendingRefreshCount),
+    shadowMatchCount: metadataCount(environment.dispatchOrderPoolShadowMatchCount),
+    shadowMismatchCount: metadataCount(environment.dispatchOrderPoolShadowMismatchCount),
+    requiredShadowMatchCount: metadataCount(environment.dispatchOrderPoolRequiredShadowMatchCount),
+    generation: metadataCount(environment.dispatchOrderPoolGeneration),
+    lastShadowComparisonAt: environment.dispatchOrderPoolLastShadowComparisonAt ?? null,
+    lastFullRefreshAt: environment.dispatchOrderPoolLastFullRefreshAt ?? null,
+    lastError: metadataText(environment.dispatchOrderPoolLastError)
+  };
+}
+
+/** @param {Record<string, unknown>} definition @param {Record<string, unknown>} environment */
+function gateMetadata(definition, environment) {
+  const dispatchOrderPool = dispatchOrderPoolMetadata(definition, environment);
   return {
     gateGroup: definition.gateGroup || "general",
     operatorFunction: definition.operatorFunction || null,
     transactionType: definition.transactionType || null,
     locationId: definition.locationId || null,
     yardCode: definition.yardCode || null,
-    requiresNetSuiteDirectAccess: definition.requiresNetSuiteDirectAccess === true
+    requiresNetSuiteDirectAccess: definition.requiresNetSuiteDirectAccess === true,
+    deploymentGuarded: definition.deploymentGuarded === true,
+    activationReady: dispatchOrderPool ? dispatchOrderPool.activationReady : null,
+    dispatchOrderPool
   };
 }
 
@@ -218,7 +276,7 @@ function materializedGate(definition, flag, environment, databaseRootConfigured)
     label: definition.label,
     description: definition.description,
     independent: definition.independent === true,
-    ...gateMetadata(definition),
+    ...gateMetadata(definition, environment),
     present,
     configured,
     environmentAllowed,

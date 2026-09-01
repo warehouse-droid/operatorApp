@@ -24,6 +24,7 @@ x-test-environment: &test-environment
   NETSUITE_M2M_SETTINGS_PATH: /app/data/netsuite-m2m-settings.json
   NETSUITE_M2M_MASTER_KEY_PATH: /app/data/.netsuite-m2m-master-key
   NETSUITE_DIRECT_ACCESS_ENABLED: "false"
+  NETSUITE_WEBHOOK_SECRET: mbt_test_webhook_stress_secret
   NETSUITE_MIRROR_ROLE: disabled
   NETSUITE_MIRROR_SHARED_SECRET: ""
   SMART_SCM_LIVE_EXECUTION_ENABLED: "false"
@@ -58,6 +59,7 @@ x-test-service: &test-service
   volumes:
     - ./server/test-artifacts:/app/test-artifacts
     - ./.github/workflows:/workspace/.github/workflows:ro
+    - ./docker-compose.yml:/workspace/docker-compose.yml:ro
     - ./docker-compose.mbt-test.yml:/workspace/docker-compose.mbt-test.yml:ro
   restart: "no"
 
@@ -149,6 +151,17 @@ services:
       interval: 2s
       timeout: 3s
       retries: 30
+
+  webhook-worker:
+    <<: *test-service
+    command: ["node", "src/netsuite-order-webhook-worker.js"]
+    environment:
+      <<: *test-environment
+      NETSUITE_ORDER_WEBHOOK_WORKER_CONCURRENCY: "1"
+      NETSUITE_ORDER_WEBHOOK_WORKER_POLL_MS: "250"
+    healthcheck:
+      disable: true
+    profiles: ["webhook-stress"]
 
   e2e:
     <<: *test-service

@@ -107,6 +107,7 @@ function rowToCustomOrder(row = {}, corrections = []) {
     id: row.transit_co_ref,
     fromYard: row.transit_co_from_yard || row.pickup_location || "",
     toYard: row.transit_co_to_yard || "",
+    status: row.transit_co_status || "",
     sourceOrderId: row.ref_number || "",
     source: "local-db"
   } : null;
@@ -226,10 +227,11 @@ export async function listDispatchCustomOrders({
     `SELECT custom_order.*,
             active_co.co_ref AS transit_co_ref,
             active_co.from_location AS transit_co_from_yard,
-            active_co.to_location AS transit_co_to_yard
+            active_co.to_location AS transit_co_to_yard,
+            active_co.status AS transit_co_status
        FROM dispatch_custom_orders custom_order
        LEFT JOIN LATERAL (
-         SELECT co.co_ref, co.from_location, co.to_location
+         SELECT co.co_ref, co.from_location, co.to_location, co.status
            FROM local_co_orders co
           WHERE co.source_order_ref = custom_order.ref_number
             AND co.status <> 'cancelled'
@@ -833,10 +835,11 @@ export async function canonicalizeDispatchCustomOrdersInPlan(plan = {}, {
     `SELECT custom_order.*,
             active_co.co_ref AS transit_co_ref,
             active_co.from_location AS transit_co_from_yard,
-            active_co.to_location AS transit_co_to_yard
+            active_co.to_location AS transit_co_to_yard,
+            active_co.status AS transit_co_status
        FROM dispatch_custom_orders custom_order
        LEFT JOIN LATERAL (
-         SELECT co.co_ref, co.from_location, co.to_location
+         SELECT co.co_ref, co.from_location, co.to_location, co.status
            FROM local_co_orders co
           WHERE co.source_order_ref = custom_order.ref_number
             AND co.status <> 'cancelled'
@@ -864,7 +867,15 @@ export async function canonicalizeDispatchCustomOrdersInPlan(plan = {}, {
   for (const [index, order] of nextOrders.entries()) {
     const refMatch = byRef.get(normalizedRef(order?.id));
     if (!isCustomDispatchOrder(order) && !refMatch) continue;
-    const stableId = customOrderStableId(order);
+    const submittedStableId = customOrderStableId(order);
+    // Older compact/recovery snapshots can retain the immutable Custom Order
+    // reference while losing its local ID. The reference is unique in the
+    // canonical table, so it is safe to restore that ID before validation.
+    // A submitted ID still wins here so the mismatch guards below can reject
+    // an attempted ref/ID substitution instead of silently repairing it.
+    const stableId = /^\d+$/.test(submittedStableId)
+      ? submittedStableId
+      : String(refMatch?.id || "");
     const aliases = [order?.id].map(String).filter(Boolean);
     const rawWork = customWorkSignature(plan, aliases);
     if (!/^\d+$/.test(stableId)) {

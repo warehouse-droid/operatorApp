@@ -11,7 +11,10 @@ import {
 } from "./dispatch-enrichment.js";
 import { resolveDispatchSalesTarget } from "./dispatch-order-target-repository.js";
 import { cancelDispatchCoGlobally } from "./dispatch-co-lifecycle.js";
-import { netSuiteClosedOrderFamilySql } from "./netsuite-closed-order-policy.js";
+import {
+  exactNetSuiteClosedSql,
+  netSuiteClosedOrderFamilySql
+} from "./netsuite-closed-order-policy.js";
 import { assertNoClosedNetSuiteOrders, listClosedNetSuiteOrders } from "./netsuite-closed-order-repository.js";
 import {
   dispatchLocationsShareYard,
@@ -29,6 +32,7 @@ import {
   normalizeScmScheduleRemarkOverride,
   resolveScmScheduleRemark
 } from "./scm-schedule-remark.js";
+import { createCoalescingWorkQueue } from "./coalescing-work-queue.js";
 
 function toNumber(value) {
   return Number(value || 0) || 0;
@@ -54,6 +58,17 @@ function exactBilledSalesOrderSql(alias) {
          '\\s+', ' ', 'g'
        ))
        IN ('BILLED', 'SALES ORDER:BILLED')
+  )`;
+}
+
+function netSuitePendingApprovalSql(alias) {
+  if (!/^[A-Za-z_][A-Za-z0-9_]*$/.test(String(alias || ""))) {
+    throw new TypeError("A safe NetSuite order SQL alias is required.");
+  }
+  return `(
+    UPPER(BTRIM(COALESCE(${alias}.status, ''))) = 'A'
+    OR COALESCE(${alias}.status_text, '') ~*
+      '^[[:space:]]*((sales|purchase|transfer)[[:space:]]+order[[:space:]]*:[[:space:]]*)?pending([[:space:]]+supervisor)?[[:space:]]+approval[[:space:]]*$'
   )`;
 }
 
@@ -241,6 +256,11 @@ function rowToDispatchOrder(row) {
   const totalLayers = toNumber(row.total_layer_qty);
   const fallbackQty = toNumber(row.total_quantity);
   const visibleRef = row.dispatch_type === "PO" && row.dispatch_ref ? row.dispatch_ref : row.tranid;
+  const localOrderDetails = row.local_order_details
+    && typeof row.local_order_details === "object"
+    && !Array.isArray(row.local_order_details)
+    ? row.local_order_details
+    : {};
   const allocationPickups = Array.isArray(row.allocation_pickup_locations)
     ? row.allocation_pickup_locations.filter(Boolean)
     : [];
@@ -268,8 +288,11 @@ function rowToDispatchOrder(row) {
     id: row.transit_co_ref,
     fromYard: row.transit_co_from_yard || row.pickup_location || "",
     toYard: row.transit_co_to_yard || "",
+    status: row.transit_co_status || "",
+    sourceOrderId: visibleRef,
     source: "local-db"
   } : null;
+  const effectiveSourceYard = transitCo?.toYard || row.pickup_location || "";
   const destinationYard = row.destination_location || "";
   const destinationAddress = row.default_drop_address || row.drop_address || row.dispatch_address || "";
   const dropoffs = row.dispatch_type === "PO"
@@ -291,9 +314,12 @@ function rowToDispatchOrder(row) {
     netsuiteId: row.netsuite_id,
     type: row.dispatch_type,
     sourceTable: row.source_table,
-    sourceOrderId: row.dispatch_type === "CO" && String(visibleRef || "").startsWith("CO-")
-      ? String(visibleRef).slice(3)
+    isBlanket: row.is_blanket_po === true,
+    sourceOrderId: row.dispatch_type === "CO"
+      ? localOrderDetails.sourceOrderId
+        || (String(visibleRef || "").startsWith("CO-") ? String(visibleRef).slice(3) : "")
       : "",
+    sourceOrderType: row.dispatch_type === "CO" ? localOrderDetails.sourceOrderType || "" : "",
     originalPoRef: row.dispatch_type === "PO" ? row.tranid : "",
     dispatchRef: row.dispatch_ref || "",
     sourcePoRef: sourcePoRefs[0] || "",
@@ -301,7 +327,7 @@ function rowToDispatchOrder(row) {
     correspondingPoRefs,
     customer: row.party || "",
     address,
-    sourceYard: row.pickup_location || "",
+    sourceYard: effectiveSourceYard,
     sourceAddress: row.pickup_address_override || row.source_address || "",
     defaultSourceAddress: row.source_address || "",
     pickupAddressOverride: row.pickup_address_override || "",
@@ -318,6 +344,7 @@ function rowToDispatchOrder(row) {
     parseSource: row.dispatch_parse_source || "",
     pickupLocations,
     transitOriginalPickupLocations: transitCo?.fromYard ? [transitCo.fromYard] : [],
+    transitOriginalSourceYard: transitCo?.fromYard || undefined,
     transitCo,
     destinationYard,
     dropoffs,
@@ -346,7 +373,15 @@ function rowToDispatchOrder(row) {
     dispatchTruckPlate: row.dispatch_truck_plate || "",
     dispatchLoadName: row.dispatch_load_name || "",
     dispatchParkingSpot: row.dispatch_parking_spot || "",
-    childOrders: Array.isArray(row.scm_child_orders) ? row.scm_child_orders.filter(Boolean) : [],
+    childOrders: Array.isArray(localOrderDetails.childOrderIds)
+      ? localOrderDetails.childOrderIds.filter(Boolean)
+      : Array.isArray(row.scm_child_orders) ? row.scm_child_orders.filter(Boolean) : [],
+    childOrderDetails: Array.isArray(localOrderDetails.childOrderDetails)
+      ? localOrderDetails.childOrderDetails.filter(Boolean)
+      : [],
+    groupAliases: Array.isArray(localOrderDetails.groupAliases)
+      ? localOrderDetails.groupAliases.filter(Boolean)
+      : [],
     scm: {
       method: row.scm_method || "MBT",
       status: row.scm_status || (
@@ -427,15 +462,21 @@ function yardAddressSql(field) {
 export async function listDispatchOrders({
   type = null,
   includeHiddenScm = false,
+  includeAllDiscoverableScmPurchaseOrders = false,
+  unboundedPerType = false,
   includeInactiveSalesOrderSearchCandidates = false,
   includeScmLinkedSearchRefs = false,
   search = "",
-  perTypeLimit = DEFAULT_DISPATCH_ORDERS_PER_TYPE
+  perTypeLimit = DEFAULT_DISPATCH_ORDERS_PER_TYPE,
+  exactOrderRefs = []
 } = {}) {
   const searchTerm = String(search || "").trim().slice(0, 120);
   const cleanPerTypeLimit = Math.min(Math.max(Number(perTypeLimit) || DEFAULT_DISPATCH_ORDERS_PER_TYPE, 1), MAX_DISPATCH_ORDERS_PER_TYPE);
   const normalizedType = String(type || "").trim().toUpperCase();
   const includeInactiveSalesOrders = Boolean(includeInactiveSalesOrderSearchCandidates && searchTerm);
+  const normalizedExactOrderRefs = [...new Set((Array.isArray(exactOrderRefs) ? exactOrderRefs : [])
+    .map((ref) => String(ref || "").trim().toUpperCase())
+    .filter(Boolean))].slice(0, 200);
   const params = [
     Boolean(includeHiddenScm),
     isNetSuiteSandboxEnvironment(),
@@ -443,11 +484,138 @@ export async function listDispatchOrders({
     cleanPerTypeLimit,
     normalizedType,
     includeInactiveSalesOrders,
-    Boolean(includeScmLinkedSearchRefs && searchTerm)
+    Boolean(includeScmLinkedSearchRefs && searchTerm),
+    normalizedExactOrderRefs,
+    Boolean(includeAllDiscoverableScmPurchaseOrders),
+    Boolean(unboundedPerType)
   ];
   const result = await query(
     `
-    WITH active_po_split_lookup AS (
+    WITH requested_exact_refs(requested_ref, numeric_id) AS (
+      SELECT normalized.requested_ref,
+             CASE
+               WHEN normalized.requested_ref ~ '^-?[0-9]{1,19}$'
+                AND normalized.requested_ref::numeric BETWEEN
+                      -9223372036854775808::numeric AND 9223372036854775807::numeric
+               THEN normalized.requested_ref::bigint
+               ELSE NULL
+             END AS numeric_id
+        FROM (
+          SELECT DISTINCT UPPER(BTRIM(value)) AS requested_ref
+            FROM unnest($8::text[]) input(value)
+           WHERE BTRIM(value) <> ''
+        ) normalized
+    ),
+    exact_so_seed_ids(order_id) AS (
+      SELECT candidate.netsuite_id
+        FROM requested_exact_refs requested
+        JOIN sales_orders candidate
+          ON UPPER(BTRIM(candidate.tranid)) = requested.requested_ref
+      UNION
+      SELECT candidate.netsuite_id
+        FROM requested_exact_refs requested
+        JOIN sales_orders candidate ON candidate.netsuite_id = requested.numeric_id
+       WHERE requested.numeric_id IS NOT NULL
+      UNION
+      SELECT family.source_so_id
+        FROM requested_exact_refs requested
+        JOIN dispatch_scm_so_splits family
+          ON UPPER(BTRIM(family.source_so_ref)) = requested.requested_ref
+          OR UPPER(BTRIM(family.split_so_ref)) = requested.requested_ref
+      UNION
+      SELECT family.split_so_id
+        FROM requested_exact_refs requested
+        JOIN dispatch_scm_so_splits family
+          ON UPPER(BTRIM(family.source_so_ref)) = requested.requested_ref
+          OR UPPER(BTRIM(family.split_so_ref)) = requested.requested_ref
+    ),
+    exact_so_source_ids(source_id) AS (
+      SELECT DISTINCT COALESCE(family.source_so_id, seed.order_id)
+        FROM exact_so_seed_ids seed
+        LEFT JOIN dispatch_scm_so_splits family ON family.split_so_id = seed.order_id
+    ),
+    exact_so_ids(order_id) AS (
+      SELECT source.source_id FROM exact_so_source_ids source
+      UNION
+      SELECT family.split_so_id
+        FROM exact_so_source_ids source
+        JOIN dispatch_scm_so_splits family ON family.source_so_id = source.source_id
+    ),
+    exact_po_seed_ids(order_id) AS (
+      SELECT candidate.netsuite_id
+        FROM requested_exact_refs requested
+        JOIN purchase_orders candidate
+          ON UPPER(BTRIM(candidate.tranid)) = requested.requested_ref
+          OR UPPER(BTRIM(candidate.dispatch_ref)) = requested.requested_ref
+      UNION
+      SELECT candidate.netsuite_id
+        FROM requested_exact_refs requested
+        JOIN purchase_orders candidate ON candidate.netsuite_id = requested.numeric_id
+       WHERE requested.numeric_id IS NOT NULL
+      UNION
+      SELECT family.source_po_id
+        FROM requested_exact_refs requested
+        JOIN dispatch_scm_po_splits family
+          ON UPPER(BTRIM(family.source_po_ref)) = requested.requested_ref
+          OR UPPER(BTRIM(family.split_po_ref)) = requested.requested_ref
+       WHERE family.source_po_id IS NOT NULL
+      UNION
+      SELECT family.split_po_id
+        FROM requested_exact_refs requested
+        JOIN dispatch_scm_po_splits family
+          ON UPPER(BTRIM(family.source_po_ref)) = requested.requested_ref
+          OR UPPER(BTRIM(family.split_po_ref)) = requested.requested_ref
+       WHERE family.split_po_id IS NOT NULL
+    ),
+    exact_po_source_ids(source_id) AS (
+      SELECT DISTINCT COALESCE(family.source_po_id, seed.order_id)
+        FROM exact_po_seed_ids seed
+        LEFT JOIN dispatch_scm_po_splits family ON family.split_po_id = seed.order_id
+    ),
+    exact_po_ids(order_id) AS (
+      SELECT source.source_id FROM exact_po_source_ids source
+      UNION
+      SELECT family.split_po_id
+        FROM exact_po_source_ids source
+        JOIN dispatch_scm_po_splits family ON family.source_po_id = source.source_id
+       WHERE family.split_po_id IS NOT NULL
+    ),
+    exact_to_seed_ids(order_id) AS (
+      SELECT candidate.netsuite_id
+        FROM requested_exact_refs requested
+        JOIN transfer_orders candidate
+          ON UPPER(BTRIM(candidate.tranid)) = requested.requested_ref
+      UNION
+      SELECT candidate.netsuite_id
+        FROM requested_exact_refs requested
+        JOIN transfer_orders candidate ON candidate.netsuite_id = requested.numeric_id
+       WHERE requested.numeric_id IS NOT NULL
+      UNION
+      SELECT family.source_to_id
+        FROM requested_exact_refs requested
+        JOIN dispatch_scm_to_splits family
+          ON UPPER(BTRIM(family.source_to_ref)) = requested.requested_ref
+          OR UPPER(BTRIM(family.split_to_ref)) = requested.requested_ref
+      UNION
+      SELECT family.split_to_id
+        FROM requested_exact_refs requested
+        JOIN dispatch_scm_to_splits family
+          ON UPPER(BTRIM(family.source_to_ref)) = requested.requested_ref
+          OR UPPER(BTRIM(family.split_to_ref)) = requested.requested_ref
+    ),
+    exact_to_source_ids(source_id) AS (
+      SELECT DISTINCT COALESCE(family.source_to_id, seed.order_id)
+        FROM exact_to_seed_ids seed
+        LEFT JOIN dispatch_scm_to_splits family ON family.split_to_id = seed.order_id
+    ),
+    exact_to_ids(order_id) AS (
+      SELECT source.source_id FROM exact_to_source_ids source
+      UNION
+      SELECT family.split_to_id
+        FROM exact_to_source_ids source
+        JOIN dispatch_scm_to_splits family ON family.source_to_id = source.source_id
+    ),
+    active_po_split_lookup AS (
       SELECT relation.po_id,
              jsonb_agg(DISTINCT relation.source_po_ref ORDER BY relation.source_po_ref) AS source_po_refs,
              jsonb_agg(DISTINCT relation.split_po_ref ORDER BY relation.split_po_ref) AS corresponding_po_refs
@@ -547,6 +715,10 @@ export async function listDispatchOrders({
         AND NOT ${billedSalesOrderFamilySql("sales_orders")}
         AND NOT ${netSuiteClosedOrderFamilySql("sales_orders", "SO")}
         AND (COALESCE(is_test_fixture, false) = false OR $2::boolean)
+        AND (
+          cardinality($8::text[]) = 0
+          OR netsuite_id IN (SELECT order_id FROM exact_so_ids)
+        )
       UNION ALL
       SELECT
         netsuite_id,
@@ -579,6 +751,10 @@ export async function listDispatchOrders({
       FROM transfer_orders
       WHERE from_location_id IS NOT NULL
         AND NOT ${netSuiteClosedOrderFamilySql("transfer_orders", "TO")}
+        AND (
+          cardinality($8::text[]) = 0
+          OR netsuite_id IN (SELECT order_id FROM exact_to_ids)
+        )
     ),
     delivery_line_source AS (
       SELECT
@@ -612,6 +788,8 @@ export async function listDispatchOrders({
         END AS netsuite_active
       FROM sales_order_lines l
       JOIN sales_orders o ON o.netsuite_id = l.sales_order_id
+      WHERE cardinality($8::text[]) = 0
+         OR l.sales_order_id IN (SELECT order_id FROM exact_so_ids)
       UNION ALL
       SELECT
         transfer_order_id AS order_id,
@@ -641,6 +819,10 @@ export async function listDispatchOrders({
         netsuite_active
       FROM transfer_order_lines
       WHERE line_stage = 'outbound'
+        AND (
+          cardinality($8::text[]) = 0
+          OR transfer_order_id IN (SELECT order_id FROM exact_to_ids)
+        )
     ),
     receiving_order_source AS (
       SELECT
@@ -667,11 +849,16 @@ export async function listDispatchOrders({
         NULL::text AS dispatch_load_name,
         NULL::text AS dispatch_parking_spot,
         status_text,
+        ${netSuitePendingApprovalSql("purchase_orders")} AS pending_approval,
         initial_scm_status,
         is_blanket_po,
         netsuite_active
       FROM purchase_orders
-      WHERE NOT ${netSuiteClosedOrderFamilySql("purchase_orders", "PO")}
+      WHERE ($9::boolean OR NOT ${netSuiteClosedOrderFamilySql("purchase_orders", "PO")})
+        AND (
+          cardinality($8::text[]) = 0
+          OR netsuite_id IN (SELECT order_id FROM exact_po_ids)
+        )
       UNION ALL
       SELECT
         netsuite_id,
@@ -697,12 +884,17 @@ export async function listDispatchOrders({
         dispatch_load_name,
         dispatch_parking_spot,
         status_text,
+        ${netSuitePendingApprovalSql("transfer_orders")} AS pending_approval,
         'Queued'::text AS initial_scm_status,
         false AS is_blanket_po,
         netsuite_active
       FROM transfer_orders
       WHERE to_location_id IS NOT NULL
         AND NOT ${netSuiteClosedOrderFamilySql("transfer_orders", "TO")}
+        AND (
+          cardinality($8::text[]) = 0
+          OR netsuite_id IN (SELECT order_id FROM exact_to_ids)
+        )
     ),
     receiving_line_source AS (
       SELECT
@@ -730,6 +922,8 @@ export async function listDispatchOrders({
         location,
         netsuite_active
       FROM purchase_order_lines
+      WHERE cardinality($8::text[]) = 0
+         OR purchase_order_id IN (SELECT order_id FROM exact_po_ids)
       UNION ALL
       SELECT
         transfer_order_id AS order_id,
@@ -757,6 +951,10 @@ export async function listDispatchOrders({
         netsuite_active
       FROM transfer_order_lines
       WHERE line_stage = 'receiving'
+        AND (
+          cardinality($8::text[]) = 0
+          OR transfer_order_id IN (SELECT order_id FROM exact_to_ids)
+        )
     ),
     so_alloc_pickups AS (
       SELECT a.sales_order_id,
@@ -801,6 +999,7 @@ export async function listDispatchOrders({
         co.co_ref AS transit_co_ref,
         co.from_location AS transit_co_from_yard,
         co.to_location AS transit_co_to_yard,
+        co.status AS transit_co_status,
         COALESCE(ap.pickup_locations, '[]'::jsonb) AS allocation_pickup_locations,
         o.operator_status,
         o.local_yard_order_status,
@@ -867,7 +1066,7 @@ export async function listDispatchOrders({
       LEFT JOIN delivery_line_source l ON l.order_id = o.netsuite_id AND l.netsuite_active = true
       LEFT JOIN so_alloc sa ON sa.sales_line_id = l.id
       LEFT JOIN LATERAL (
-        SELECT co_ref, from_location, to_location
+        SELECT co_ref, from_location, to_location, status
           FROM co_orders
          WHERE source_order_ref = o.tranid
            AND status <> 'cancelled'
@@ -906,7 +1105,7 @@ export async function listDispatchOrders({
                o.dispatch_parse_source, o.operator_status, o.local_yard_order_status,
                o.dispatch_planned, o.dispatch_plan_date, o.dispatch_truck_plate,
                o.dispatch_load_name, o.dispatch_parking_spot, o.fulfillment_status, o.status, o.status_text,
-               o.netsuite_active, co.co_ref, co.from_location, co.to_location, ap.pickup_locations
+               o.netsuite_active, co.co_ref, co.from_location, co.to_location, co.status, ap.pickup_locations
       HAVING o.dispatch_planned = true OR COUNT(l.id) > 0
     ),
     receiving AS (
@@ -945,6 +1144,7 @@ export async function listDispatchOrders({
         NULL::text AS transit_co_ref,
         NULL::text AS transit_co_from_yard,
         NULL::text AS transit_co_to_yard,
+        NULL::text AS transit_co_status,
         '[]'::jsonb AS allocation_pickup_locations,
         NULL::text AS operator_status,
         'Open'::text AS local_yard_order_status,
@@ -1057,14 +1257,20 @@ export async function listDispatchOrders({
           )
         )
         AND (
-          o.status_text ILIKE '%Pending Receipt%'
-          OR o.status_text ILIKE '%Partially Received%'
-          OR o.status_text ILIKE '%Received%'
-          -- NetSuite emits both "Pending Bill" and "Pending Billing". The
-          -- remaining-quantity filters below still remove genuinely completed
-          -- receipt lines while retaining locally corrected baselines.
-          OR o.status_text ILIKE '%Pending Bill%'
-          OR o.status_text ILIKE '%Billed%'
+          ($9::boolean AND o.order_type = 'purchase_order' AND NOT o.pending_approval)
+          OR (
+            (NOT $9::boolean OR o.order_type <> 'purchase_order')
+            AND (
+              o.status_text ILIKE '%Pending Receipt%'
+              OR o.status_text ILIKE '%Partially Received%'
+              OR o.status_text ILIKE '%Received%'
+              -- NetSuite emits both "Pending Bill" and "Pending Billing". The
+              -- remaining-quantity filters below still remove genuinely completed
+              -- receipt lines while retaining locally corrected baselines.
+              OR o.status_text ILIKE '%Pending Bill%'
+              OR o.status_text ILIKE '%Billed%'
+            )
+          )
         )
         AND NOT EXISTS (
           SELECT 1
@@ -1116,6 +1322,7 @@ export async function listDispatchOrders({
         NULL::text AS transit_co_ref,
         NULL::text AS transit_co_from_yard,
         NULL::text AS transit_co_to_yard,
+        NULL::text AS transit_co_status,
         '[]'::jsonb AS allocation_pickup_locations,
         NULL::text AS operator_status,
         COALESCE(co.status, 'planned') AS local_yard_order_status,
@@ -1165,7 +1372,13 @@ export async function listDispatchOrders({
         ) ORDER BY l.line_id NULLS LAST, l.id) FILTER (WHERE l.id IS NOT NULL) AS items
       FROM co_orders co
       LEFT JOIN co_order_lines l ON l.co_id = co.id
-      WHERE co.status IN ('pending_load', 'planned', 'received')
+      WHERE co.status IN ('pending_load', 'planned')
+        AND (
+          cardinality($8::text[]) = 0
+          OR UPPER(BTRIM(co.co_ref)) = ANY($8::text[])
+          OR UPPER(BTRIM(co.source_order_ref)) = ANY($8::text[])
+          OR co.delivery_order_id::text = ANY($8::text[])
+        )
       GROUP BY co.id
     ),
     local_vrma AS (
@@ -1195,6 +1408,7 @@ export async function listDispatchOrders({
         active_co.co_ref AS transit_co_ref,
         active_co.from_location AS transit_co_from_yard,
         active_co.to_location AS transit_co_to_yard,
+        active_co.status AS transit_co_status,
         '[]'::jsonb AS allocation_pickup_locations,
         NULL::text AS operator_status,
         'Open'::text AS local_yard_order_status,
@@ -1253,7 +1467,7 @@ export async function listDispatchOrders({
       FROM scm_vrma_orders v
       LEFT JOIN scm_transport_schedule scm ON scm.order_kind = 'VRMA' AND lower(scm.order_ref) = lower(v.vrma_ref)
       LEFT JOIN LATERAL (
-        SELECT co.co_ref, co.from_location, co.to_location
+        SELECT co.co_ref, co.from_location, co.to_location, co.status
           FROM local_co_orders co
          WHERE co.source_order_ref = v.vrma_ref
            AND co.status <> 'cancelled'
@@ -1273,6 +1487,12 @@ export async function listDispatchOrders({
       WHERE v.pickup_location IN ('3445', '2967', '12441', '150')
         AND vrma_yard.id IS NOT NULL
         AND (
+          cardinality($8::text[]) = 0
+          OR UPPER(BTRIM(v.vrma_ref)) = ANY($8::text[])
+          OR v.id::text = ANY($8::text[])
+          OR (-v.id)::text = ANY($8::text[])
+        )
+        AND (
           $1::boolean
           OR COALESCE(scm.method, v.method, 'MBT') = 'MBT'
         )
@@ -1283,7 +1503,7 @@ export async function listDispatchOrders({
           )
         )
       GROUP BY v.id, scm.id,
-               active_co.co_ref, active_co.from_location, active_co.to_location,
+               active_co.co_ref, active_co.from_location, active_co.to_location, active_co.status,
                vrma_yard.address, vrma_yard.window_start, vrma_yard.window_end, vrma_yard.instructions
     ),
     eligible_orders AS (
@@ -1305,8 +1525,10 @@ export async function listDispatchOrders({
         FROM eligible_orders
        WHERE ($5::text = '' OR dispatch_type = $5)
          AND (
-           $3::text = ''
+           cardinality($8::text[]) > 0
+           OR $3::text = ''
            OR tranid ILIKE '%' || $3 || '%'
+           OR netsuite_id::text = $3
            OR COALESCE(dispatch_ref, '') ILIKE '%' || $3 || '%'
            OR COALESCE(party, '') ILIKE '%' || $3 || '%'
            OR COALESCE(drop_address, '') ILIKE '%' || $3 || '%'
@@ -1370,7 +1592,17 @@ export async function listDispatchOrders({
               WHERE g.status = 'active'
                 AND orders.dispatch_type = 'PO'
                 AND lower(g.group_ref) = lower(COALESCE(NULLIF(orders.dispatch_ref, ''), orders.tranid))
-           ), '[]'::jsonb) AS scm_child_orders
+           ), '[]'::jsonb) AS scm_child_orders,
+           CASE
+             WHEN orders.source_table = 'local_co_orders' THEN COALESCE((
+               SELECT co.details
+                 FROM local_co_orders co
+                WHERE lower(co.co_ref) = lower(orders.tranid)
+                ORDER BY co.updated_at DESC, co.id DESC
+                LIMIT 1
+             ), '{}'::jsonb)
+             ELSE '{}'::jsonb
+           END AS local_order_details
     FROM ranked_orders orders
     LEFT JOIN active_po_split_lookup split_lookup
       ON orders.dispatch_type = 'PO'
@@ -1379,6 +1611,7 @@ export async function listDispatchOrders({
       ON orders.dispatch_type = 'PO'
      AND group_ref_lookup.group_ref_key = lower(COALESCE(NULLIF(orders.dispatch_ref, ''), orders.tranid))
     WHERE $3::text <> ''
+       OR $10::boolean
        OR orders.dispatch_type_rank <= $4
        OR orders.dispatch_planned = true
     ORDER BY CASE WHEN $2::boolean AND tranid LIKE 'TSTDEP-SO-%' THEN 0 ELSE 1 END,
@@ -1479,7 +1712,7 @@ export async function updateSalesOrderLocalMethod(tranid, { method = "", updated
   };
 }
 
-export async function refreshDispatchEnrichment({ force = false, delivery: includeDelivery = true, receiving: includeReceiving = true } = {}) {
+async function executeDispatchEnrichment({ force, delivery: includeDelivery, receiving: includeReceiving }) {
   let deliveryCount = 0;
   if (includeDelivery) {
     const delivery = await query(
@@ -1619,6 +1852,29 @@ export async function refreshDispatchEnrichment({ force = false, delivery: inclu
     }
   }
   return { delivery: deliveryCount, receiving: receivingCount };
+}
+
+const dispatchEnrichmentQueue = createCoalescingWorkQueue({
+  merge(current, incoming) {
+    return {
+      force: current.force || incoming.force,
+      delivery: current.delivery || incoming.delivery,
+      receiving: current.receiving || incoming.receiving
+    };
+  },
+  worker: executeDispatchEnrichment
+});
+
+export function refreshDispatchEnrichment({ force = false, delivery = true, receiving = true } = {}) {
+  return dispatchEnrichmentQueue.enqueue({
+    force: force === true,
+    delivery: delivery !== false,
+    receiving: receiving !== false
+  });
+}
+
+export function dispatchEnrichmentQueueStatus() {
+  return dispatchEnrichmentQueue.status();
 }
 
 export async function reparseMissingSalesOrderDispatch({ limit = 200, dryRun = false, scope = "missing" } = {}) {
@@ -2145,12 +2401,15 @@ export function scmPurchaseOrderMatchesListFilters(order = {}, {
 }
 
 export async function listScmPurchaseOrders({
-  search = "", poType = "", dropoff = "", vendor = "", pickupPoint = ""
+  search = "", poType = "", dropoff = "", vendor = "", pickupPoint = "",
+  includeAllDiscoverable = false, unbounded = false
 } = {}) {
   const needle = String(search || "").trim().toLowerCase();
   const listedOrders = await listDispatchOrders({
     type: "PO",
     includeHiddenScm: true,
+    includeAllDiscoverableScmPurchaseOrders: includeAllDiscoverable,
+    unboundedPerType: unbounded,
     includeScmLinkedSearchRefs: Boolean(needle),
     search: needle
   });
@@ -2276,7 +2535,7 @@ export async function listScmPurchaseOrders({
       vendor,
       pickupPoint
     }))
-    .filter((order) => (order.items || []).length || needle)
+    .filter((order) => includeAllDiscoverable || (order.items || []).length || needle)
     .sort(compareScmPurchaseOrders);
 }
 
@@ -2396,12 +2655,19 @@ async function listScmVendorYardOptionsForRefs(refs = [], executor = query) {
   if (!cleanRefs.length) return new Map();
   const runQuery = typeof executor === "function" ? executor : executor.query.bind(executor);
   const result = await runQuery(
-    `WITH requested(ref) AS (
-       SELECT unnest($1::text[])
+    `WITH requested AS MATERIALIZED (
+       SELECT ref,
+              upper(btrim(ref)) AS ref_key,
+              CASE
+                WHEN ref ~ '^[0-9]{1,19}$'
+                 AND ref::numeric <= 9223372036854775807::numeric
+                THEN ref::bigint
+                ELSE NULL
+              END AS numeric_id
+         FROM unnest($1::text[]) input(ref)
      ),
      matched_po AS (
-       SELECT DISTINCT
-              r.ref AS requested_ref,
+       SELECT r.ref AS requested_ref,
               po.netsuite_id,
               po.tranid,
               po.dispatch_ref,
@@ -2409,22 +2675,53 @@ async function listScmVendorYardOptionsForRefs(refs = [], executor = query) {
               po.vendor
          FROM requested r
          JOIN purchase_orders po
-           ON lower(po.tranid) = lower(r.ref)
-           OR lower(COALESCE(po.dispatch_ref, '')) = lower(r.ref)
-           OR po.netsuite_id::text = r.ref
+           ON upper(btrim(po.tranid)) = r.ref_key
         WHERE po.netsuite_active = true
+       UNION
+       SELECT r.ref, po.netsuite_id, po.tranid, po.dispatch_ref,
+              po.vendor_id::text, po.vendor
+         FROM requested r
+         JOIN purchase_orders po
+           ON upper(btrim(po.dispatch_ref)) = r.ref_key
+        WHERE po.netsuite_active = true
+       UNION
+       SELECT r.ref, po.netsuite_id, po.tranid, po.dispatch_ref,
+              po.vendor_id::text, po.vendor
+         FROM requested r
+         JOIN purchase_orders po ON po.netsuite_id = r.numeric_id
+        WHERE r.numeric_id IS NOT NULL
+          AND po.netsuite_active = true
+     ),
+     vendor_id_mapping AS MATERIALIZED (
+       SELECT DISTINCT ON (netsuite_vendor_id)
+              netsuite_vendor_id, local_vendor
+         FROM dispatch_vendor_mappings
+        WHERE active = true
+          AND COALESCE(netsuite_vendor_id, '') <> ''
+          AND COALESCE(local_vendor, '') <> ''
+        ORDER BY netsuite_vendor_id, last_seen_at DESC, id DESC
+     ),
+     vendor_name_mapping AS MATERIALIZED (
+       SELECT DISTINCT ON (lower(netsuite_vendor_name))
+              lower(netsuite_vendor_name) AS vendor_name_key, local_vendor
+         FROM dispatch_vendor_mappings
+        WHERE active = true
+          AND COALESCE(netsuite_vendor_name, '') <> ''
+          AND COALESCE(local_vendor, '') <> ''
+        ORDER BY lower(netsuite_vendor_name), last_seen_at DESC, id DESC
      ),
      mapped_po AS (
        SELECT p.*,
-              COALESCE(NULLIF(m.local_vendor, ''), '') AS local_vendor
+              COALESCE(
+                NULLIF(id_mapping.local_vendor, ''),
+                NULLIF(name_mapping.local_vendor, ''),
+                ''
+              ) AS local_vendor
          FROM matched_po p
-         LEFT JOIN dispatch_vendor_mappings m
-           ON m.active = true
-          AND COALESCE(m.local_vendor, '') <> ''
-          AND (
-            (COALESCE(p.vendor_id, '') <> '' AND m.netsuite_vendor_id::text = p.vendor_id)
-            OR lower(m.netsuite_vendor_name) = lower(p.vendor)
-          )
+         LEFT JOIN vendor_id_mapping id_mapping
+           ON id_mapping.netsuite_vendor_id = p.vendor_id
+         LEFT JOIN vendor_name_mapping name_mapping
+           ON name_mapping.vendor_name_key = lower(p.vendor)
      )
      SELECT DISTINCT ON (requested_ref, lower(y.yard))
             requested_ref,
@@ -2540,11 +2837,6 @@ async function attachScmScheduleRouteOptions(rows = [], executor = query) {
                  AND (schedule.dispatch_plan_id IS NOT NULL
                    OR lower(COALESCE(schedule.status, '')) IN ('planned', 'in transit', 'partially done', 'completed'))
              ) OR EXISTS (
-               SELECT 1 FROM dispatch_plan_snapshots snapshot
-               JOIN dispatch_plans plan ON plan.id = snapshot.plan_id
-               WHERE plan.status <> 'cancelled'
-                 AND snapshot.trucks::text LIKE ('%"' || replace(split.split_po_ref, '"', '\\"') || '"%')
-             ) OR EXISTS (
                SELECT 1 FROM purchase_order_lines child_line
                WHERE child_line.purchase_order_id = split.split_po_id
                  AND (COALESCE(child_line.received_pallet_qty, 0) > 0
@@ -2641,6 +2933,12 @@ function normalizeScmScheduleFilterValues(value, { lowercase = false } = {}) {
   const source = Array.isArray(value) ? value : String(value || "").split(",");
   const values = source.map((item) => String(item || "").trim()).filter(Boolean);
   return [...new Set(values.map((item) => lowercase ? item.toLowerCase() : item))];
+}
+
+function normalizeScmScheduleOptionalNumber(value) {
+  if (value === null || value === undefined || String(value).trim() === "") return null;
+  const number = Number(value);
+  return Number.isFinite(number) ? number : null;
 }
 
 function scmDisplayRef(row = {}) {
@@ -2830,6 +3128,18 @@ export async function listScmSchedule({
   brand = "",
   from = "",
   to = "",
+  queuedFrom = "",
+  queuedTo = "",
+  pickup = "",
+  contentSearch = "",
+  remarkSearch = "",
+  orderSearch = "",
+  weightMin = "",
+  weightMax = "",
+  packingSearch = "",
+  driverSearch = "",
+  slaMin = "",
+  slaMax = "",
   view = "",
   exactRef = "",
   audience = "scm"
@@ -2838,18 +3148,35 @@ export async function listScmSchedule({
   const rawKind = String(kind || "").trim().toUpperCase();
   const cleanKind = rawKind === "SP.O" ? "Sp.O" : rawKind;
   const cleanExactRef = String(exactRef || "").trim();
+  const statusFilters = normalizeScmScheduleFilterValues(status);
+  const cleanView = String(view || "").trim().toLowerCase();
+  const includeCompleted = cleanView === "completed"
+    || statusFilters.some((value) => value.toLowerCase() === "completed");
   const params = [
     globalSearch,
-    normalizeScmScheduleFilterValues(status),
+    statusFilters,
     String(method || "").trim(),
     cleanKind,
     String(yard || "").trim(),
     normalizeScmScheduleFilterValues(brand, { lowercase: true }),
     String(from || "").trim() || null,
     String(to || "").trim() || null,
-    String(view || "").trim().toLowerCase(),
+    cleanView,
     cleanExactRef,
-    String(audience || "").trim().toLowerCase() !== "operations"
+    String(audience || "").trim().toLowerCase() !== "operations",
+    String(queuedFrom || "").trim() || null,
+    String(queuedTo || "").trim() || null,
+    String(pickup || "").trim().toLowerCase(),
+    String(contentSearch || "").trim().toLowerCase(),
+    String(remarkSearch || "").trim().toLowerCase(),
+    String(orderSearch || "").trim().toLowerCase(),
+    normalizeScmScheduleOptionalNumber(weightMin),
+    normalizeScmScheduleOptionalNumber(weightMax),
+    String(packingSearch || "").trim().toLowerCase(),
+    String(driverSearch || "").trim().toLowerCase(),
+    normalizeScmScheduleOptionalNumber(slaMin),
+    normalizeScmScheduleOptionalNumber(slaMax),
+    includeCompleted
   ];
   const result = await query(
     `
@@ -2865,6 +3192,46 @@ export async function listScmSchedule({
           ON split_header.id = split_line.split_id
          AND split_header.status = 'active'
        GROUP BY split_line.source_line_id
+    ),
+    closed_po_source_ids AS MATERIALIZED (
+      SELECT po.netsuite_id AS source_id
+        FROM purchase_orders po
+       WHERE ${exactNetSuiteClosedSql("po")}
+      UNION
+      SELECT family.source_po_id
+        FROM dispatch_scm_po_splits family
+        JOIN purchase_orders closed_member
+          ON closed_member.netsuite_id = family.split_po_id
+       WHERE ${exactNetSuiteClosedSql("closed_member")}
+    ),
+    closed_po_family_ids AS MATERIALIZED (
+      SELECT source_id AS netsuite_id
+        FROM closed_po_source_ids
+      UNION
+      SELECT family.split_po_id
+        FROM dispatch_scm_po_splits family
+        JOIN closed_po_source_ids closed_family
+          ON closed_family.source_id = family.source_po_id
+    ),
+    closed_to_source_ids AS MATERIALIZED (
+      SELECT transfer_header.netsuite_id AS source_id
+        FROM transfer_orders transfer_header
+       WHERE ${exactNetSuiteClosedSql("transfer_header")}
+      UNION
+      SELECT family.source_to_id
+        FROM dispatch_scm_to_splits family
+        JOIN transfer_orders closed_member
+          ON closed_member.netsuite_id = family.split_to_id
+       WHERE ${exactNetSuiteClosedSql("closed_member")}
+    ),
+    closed_to_family_ids AS MATERIALIZED (
+      SELECT source_id AS netsuite_id
+        FROM closed_to_source_ids
+      UNION
+      SELECT family.split_to_id
+        FROM dispatch_scm_to_splits family
+        JOIN closed_to_source_ids closed_family
+          ON closed_family.source_id = family.source_to_id
     ),
     base_po AS (
       SELECT
@@ -2931,8 +3298,12 @@ export async function listScmSchedule({
        AND lower(active_group.group_ref) = lower(COALESCE(member_schedule.group_ref, ''))
       LEFT JOIN purchase_order_lines l ON l.purchase_order_id = po.netsuite_id AND l.netsuite_active = true
       LEFT JOIN active_po_split_alloc split_alloc ON split_alloc.source_line_id = l.id
-      WHERE (po.netsuite_active = true OR $9 = 'completed')
-        AND NOT ${netSuiteClosedOrderFamilySql("po", "PO")}
+      WHERE (po.netsuite_active = true OR $24::boolean)
+        AND NOT EXISTS (
+          SELECT 1
+            FROM closed_po_family_ids closed_family
+           WHERE closed_family.netsuite_id = po.netsuite_id
+        )
         AND (
           $10 = ''
           OR lower(po.tranid) = lower($10)
@@ -2943,6 +3314,28 @@ export async function listScmSchedule({
           OR lower(COALESCE(NULLIF(po.dispatch_ref, ''), po.tranid)) = lower(active_group.group_ref)
         )
       GROUP BY po.netsuite_id, active_split.source_po_ref, active_split.split_po_ref
+      HAVING $24::boolean
+          OR COUNT(l.id) = 0
+          OR COALESCE(SUM(
+            CASE
+              WHEN l.id IS NULL THEN 0
+              WHEN COALESCE(l.to_plt, 0) <> 0
+                OR COALESCE(l.to_lyr, 0) <> 0
+                OR COALESCE(l.to_sec, 0) <> 0
+                OR COALESCE(l.to_pcs, 0) <> 0
+              THEN
+                GREATEST(COALESCE(l.pallet_qty, 0) - COALESCE(l.received_pallet_qty, 0) - COALESCE(split_alloc.pallet_qty, 0), 0)
+                + GREATEST(COALESCE(l.layer_qty, 0) - COALESCE(l.received_layer_qty, 0) - COALESCE(split_alloc.layer_qty, 0), 0)
+                + GREATEST(COALESCE(l.section_qty, 0) - COALESCE(l.received_section_qty, 0) - COALESCE(split_alloc.section_qty, 0), 0)
+                + GREATEST(COALESCE(l.piece_qty, 0) - COALESCE(l.received_piece_qty, 0) - COALESCE(split_alloc.piece_qty, 0), 0)
+              ELSE GREATEST(
+                COALESCE(l.quantity, 0)
+                - COALESCE(l.netsuite_received_baseline_qty, l.netsuite_received_qty, 0)
+                - COALESCE(split_alloc.sales_qty, 0),
+                0
+              )
+            END
+          ), 0) > 0.000001
     ),
     unique_to_line_locations AS MATERIALIZED (
       SELECT line.transfer_order_id,
@@ -3036,8 +3429,12 @@ export async function listScmSchedule({
       LEFT JOIN unique_to_line_locations receiving_location
         ON receiving_location.transfer_order_id = t.netsuite_id
        AND receiving_location.line_stage = 'receiving'
-	      WHERE (t.netsuite_active = true OR $9 = 'completed')
-	        AND NOT ${netSuiteClosedOrderFamilySql("t", "TO")}
+	      WHERE (t.netsuite_active = true OR $24::boolean)
+	        AND NOT EXISTS (
+	          SELECT 1
+	            FROM closed_to_family_ids closed_family
+	           WHERE closed_family.netsuite_id = t.netsuite_id
+	        )
         AND COALESCE(t.to_location_id, receiving_location.location_id) IS NOT NULL
         AND ($10 = '' OR lower(t.tranid) = lower($10))
       GROUP BY t.netsuite_id,
@@ -3094,74 +3491,37 @@ export async function listScmSchedule({
       UNION ALL SELECT * FROM base_to
       UNION ALL SELECT * FROM base_vrma
     ),
-    plan_order_types AS MATERIALIZED (
-      SELECT snap.plan_id,
-             item.value->>'id' AS order_ref,
-             CASE
-               WHEN item.value->>'sourceTable' = 'scm_vrma_orders' THEN 'VRMA'
-               WHEN item.value->>'type' = 'TO' THEN 'TO'
-               ELSE 'PO'
-             END AS order_kind
-        FROM dispatch_plan_snapshots snap
-        CROSS JOIN LATERAL jsonb_array_elements(COALESCE(snap.orders, '[]'::jsonb)) item(value)
-       WHERE item.value->>'type' IN ('PO', 'TO')
-          OR item.value->>'sourceTable' = 'scm_vrma_orders'
-    ),
-    direct_planned AS (
-      SELECT DISTINCT ON (plan_order.order_kind, plan_order.order_ref)
-        plan_order.order_kind,
-        plan_order.order_ref,
-        p.plan_date AS eta_date,
-        stop_schedule.eta_time,
-        COALESCE(
-          NULLIF(load.value->>'driverName', ''),
-          NULLIF(load.value->>'driver_name', ''),
-          NULLIF(load.value->>'driverLogin', ''),
-          NULLIF(load.value->>'driver_login', ''),
-          NULLIF(truck.value->>'driverName', ''),
-          NULLIF(truck.value->>'driver', ''),
-          NULLIF(truck.value->>'driverLogin', ''),
-          ''
-        ) AS driver,
-        trim(concat_ws(' ',
-          COALESCE(
-            NULLIF(load.value->>'truckPlate', ''),
-            NULLIF(load.value->>'truck_plate', ''),
-            NULLIF(truck.value->>'plate', '')
-          ),
-          NULLIF(load.value->>'name', ''),
-          CASE
-            WHEN COALESCE(NULLIF(load.value->>'parkingSpot', ''), NULLIF(load.value->>'parking_spot', '')) IS NOT NULL
-              THEN 'Parking ' || COALESCE(NULLIF(load.value->>'parkingSpot', ''), NULLIF(load.value->>'parking_spot', ''))
-          END
-        )) AS notes
-      FROM dispatch_plans p
-      JOIN dispatch_plan_snapshots snap ON snap.plan_id = p.id
-      CROSS JOIN LATERAL jsonb_array_elements(COALESCE(snap.trucks, '[]'::jsonb)) truck(value)
-      CROSS JOIN LATERAL jsonb_array_elements(COALESCE(truck.value->'loads', '[]'::jsonb)) load(value)
-      CROSS JOIN LATERAL jsonb_array_elements(COALESCE(load.value->'stops', '[]'::jsonb)) stop(value)
-      CROSS JOIN LATERAL (
-        SELECT COALESCE(
-          NULLIF(stop.value->>'arriveTime', ''),
-          NULLIF(stop.value->>'plannedArrive', ''),
-          CASE
-            WHEN COALESCE(stop.value->'timing'->>'arrival', '') ~ '^[0-9]+([.][0-9]+)?$' THEN
-              lpad(floor((stop.value->'timing'->>'arrival')::numeric / 60)::integer::text, 2, '0')
-              || ':' ||
-              lpad(mod(floor((stop.value->'timing'->>'arrival')::numeric)::integer, 60)::text, 2, '0')
-          END,
-          ''
-        ) AS eta_time
-      ) stop_schedule
-      JOIN plan_order_types plan_order
-        ON plan_order.plan_id = snap.plan_id
-       AND lower(plan_order.order_ref) = lower(stop.value->>'orderId')
-      WHERE p.status <> 'cancelled'
-        AND stop.value->>'type' IN ('drop', 'dropoff')
-        AND COALESCE(stop.value->>'orderId', '') <> ''
-        AND COALESCE(load.value->>'returnOnly', 'false') <> 'true'
-      ORDER BY plan_order.order_kind, plan_order.order_ref, p.plan_date DESC,
-               stop_schedule.eta_time DESC
+    direct_planned AS MATERIALIZED (
+      SELECT DISTINCT ON (
+               upper(assignment.assignment->>'dispatchOrderKind'),
+               lower(assignment.order_ref)
+             )
+             upper(assignment.assignment->>'dispatchOrderKind') AS order_kind,
+             assignment.order_ref,
+             assignment.plan_date AS eta_date,
+             COALESCE(assignment.assignment->>'dispatchEtaTime', '') AS eta_time,
+             COALESCE(
+               NULLIF(assignment.assignment->>'dispatchDriverName', ''),
+               NULLIF(assignment.assignment->>'dispatchDriverLogin', ''),
+               ''
+             ) AS driver,
+             trim(concat_ws(' ',
+               NULLIF(assignment.assignment->>'dispatchTruckPlate', ''),
+               NULLIF(assignment.assignment->>'dispatchLoadName', ''),
+               CASE
+                 WHEN NULLIF(assignment.assignment->>'dispatchParkingSpot', '') IS NOT NULL
+                   THEN 'Parking ' || (assignment.assignment->>'dispatchParkingSpot')
+               END
+             )) AS notes
+        FROM dispatch_plan_order_assignments assignment
+        JOIN dispatch_plans p
+          ON p.id = assignment.plan_id
+         AND p.status <> 'cancelled'
+       WHERE upper(assignment.assignment->>'dispatchOrderKind') IN ('PO', 'TO', 'VRMA')
+       ORDER BY upper(assignment.assignment->>'dispatchOrderKind'),
+                lower(assignment.order_ref), assignment.plan_date DESC,
+                COALESCE(assignment.assignment->>'dispatchEtaTime', '') DESC,
+                assignment.updated_at DESC
     ),
     fully_linked_po AS MATERIALIZED (
       SELECT DISTINCT allocation.po_order_id,
@@ -3275,6 +3635,14 @@ export async function listScmSchedule({
            ) entry
           WHERE lower(entry.key) = lower(state.source_order_ref)
        )
+    ),
+    schedule_completion_status AS MATERIALIZED (
+      SELECT completion.completion_event_id,
+             completion.order_kind,
+             lower(btrim(completion.order_ref)) AS order_key,
+             completion.completion_evidence_type
+        FROM dispatch_order_completion_status completion
+       WHERE completion.dispatch_completion_status = 'completed'
     )
     SELECT
       COALESCE(s.id, 0) AS schedule_id,
@@ -3324,6 +3692,7 @@ export async function listScmSchedule({
       COALESCE(NULLIF(s.notes, ''), NULLIF(s.dispatch_assignment_note, ''), planned.notes, '') AS notes,
       effective_status.status AS calculated_status,
       dispatch_completion.completion_evidence_type AS dispatch_completion_evidence_type,
+      planned.order_ref IS NOT NULL AS dispatch_planned,
       COALESCE(s.reconciliation_blocked, false) AS reconciliation_blocked,
       s.updated_at,
       to_char(s.updated_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.US"Z"') AS concurrency_updated_at,
@@ -3339,10 +3708,9 @@ export async function listScmSchedule({
       ON reconciliation_projection.state_id = s.reconciliation_order_state_id
      AND reconciliation_projection.order_kind = b.order_kind
      AND lower(reconciliation_projection.order_ref) = lower(b.order_ref)
-    LEFT JOIN dispatch_order_completion_status dispatch_completion
+    LEFT JOIN schedule_completion_status dispatch_completion
       ON dispatch_completion.order_kind = b.order_kind
-     AND dispatch_completion.dispatch_completion_status = 'completed'
-     AND lower(btrim(dispatch_completion.order_ref)) = lower(btrim(b.order_ref))
+     AND dispatch_completion.order_key = lower(btrim(b.order_ref))
     CROSS JOIN LATERAL (
       SELECT CASE
         WHEN COALESCE(s.status, b.initial_scm_status, '') IN (
@@ -3359,6 +3727,23 @@ export async function listScmSchedule({
           THEN 'Completed'
         WHEN lower(COALESCE(operational_status.status, '')) IN ('complete', 'completed')
           THEN 'Completed'
+        WHEN b.order_kind = 'PO'
+          AND NULLIF(BTRIM(b.split_ref), '') IS NOT NULL
+          AND lower(BTRIM(COALESCE(operational_status.status, ''))) IN (
+            'queued', 'urgent', 'cancelled', 'canceled', 'hold',
+            'priority', 'surplus only', 'book appt'
+          )
+          THEN operational_status.status
+        WHEN b.order_kind = 'PO'
+          AND NULLIF(BTRIM(b.split_ref), '') IS NOT NULL
+          AND planned.order_ref IS NOT NULL
+          AND lower(BTRIM(COALESCE(operational_status.status, ''))) = 'planned'
+          AND lower(COALESCE(
+            NULLIF(reconciliation_projection.target_application_status, ''),
+            reconciliation_projection.family_application_status,
+            ''
+          )) NOT IN ('complete', 'completed', 'cancelled', 'canceled')
+          THEN operational_status.status
         WHEN COALESCE(s.reconciliation_blocked, false)
           OR reconciliation_projection.reconciliation_status = 'review'
           THEN 'Reconcile Review'
@@ -3414,6 +3799,10 @@ export async function listScmSchedule({
           )
         )
       )
+      AND (
+        $24::boolean
+        OR LOWER(BTRIM(effective_status.status)) NOT IN ('complete', 'completed')
+      )
       AND (cardinality($2::text[]) = 0 OR effective_status.status = ANY($2::text[]))
       AND ($3 = '' OR COALESCE(s.method, 'MBT') = $3)
       AND (
@@ -3429,6 +3818,61 @@ export async function listScmSchedule({
       AND (cardinality($6::text[]) = 0 OR lower(COALESCE(NULLIF(s.brand, ''), b.brand, '')) = ANY($6::text[]))
       AND ($7::date IS NULL OR COALESCE(s.eta_date, planned.eta_date, b.expected_delivery_date) >= $7::date)
       AND ($8::date IS NULL OR COALESCE(s.eta_date, planned.eta_date, b.expected_delivery_date) <= $8::date)
+      AND ($12::date IS NULL OR COALESCE(s.created_at, b.queued_at)::date >= $12::date)
+      AND ($13::date IS NULL OR COALESCE(s.created_at, b.queued_at)::date <= $13::date)
+      AND (
+        $14 = ''
+        OR lower(CASE WHEN b.order_kind = 'VRMA'
+          THEN COALESCE(b.pickup_point, '')
+          ELSE COALESCE(NULLIF(s.pickup_point, ''), b.pickup_point, '') END) LIKE '%' || $14 || '%'
+      )
+      AND ($15 = '' OR lower(COALESCE(NULLIF(s.content, ''), b.content, '')) LIKE '%' || $15 || '%')
+      AND (
+        $16 = ''
+        OR lower(COALESCE(
+          NULLIF(BTRIM(s.remark_override), ''),
+          CASE WHEN b.order_kind = 'TO' THEN NULLIF(BTRIM(b.source_memo), '') END,
+          ''
+        )) LIKE '%' || $16 || '%'
+      )
+      AND (
+        $17 = ''
+        OR lower(concat_ws(' ',
+          b.order_ref,
+          b.source_ref,
+          b.dispatch_ref,
+          COALESCE(NULLIF(s.display_ref, ''), b.order_ref),
+          s.group_ref
+        )) LIKE '%' || $17 || '%'
+      )
+      AND ($18::numeric IS NULL OR COALESCE(NULLIF(s.weight_lbs, 0), b.weight_lbs, 0) >= $18::numeric)
+      AND ($19::numeric IS NULL OR COALESCE(NULLIF(s.weight_lbs, 0), b.weight_lbs, 0) <= $19::numeric)
+      AND (
+        $20 = ''
+        OR lower(COALESCE(
+          NULLIF(s.packing_slip_ref, ''),
+          NULLIF(b.dispatch_ref, ''),
+          NULLIF(b.split_ref, ''),
+          ''
+        )) LIKE '%' || $20 || '%'
+      )
+      AND ($21 = '' OR lower(COALESCE(NULLIF(s.driver, ''), planned.driver, '')) LIKE '%' || $21 || '%')
+      AND (
+        $22::numeric IS NULL
+        OR (
+          COALESCE(s.eta_date, planned.eta_date, b.expected_delivery_date) IS NOT NULL
+          AND COALESCE(s.created_at, b.queued_at) IS NOT NULL
+          AND COALESCE(s.eta_date, planned.eta_date, b.expected_delivery_date) - COALESCE(s.created_at, b.queued_at)::date >= $22::numeric
+        )
+      )
+      AND (
+        $23::numeric IS NULL
+        OR (
+          COALESCE(s.eta_date, planned.eta_date, b.expected_delivery_date) IS NOT NULL
+          AND COALESCE(s.created_at, b.queued_at) IS NOT NULL
+          AND COALESCE(s.eta_date, planned.eta_date, b.expected_delivery_date) - COALESCE(s.created_at, b.queued_at)::date <= $23::numeric
+        )
+      )
       AND (
         $9 = ''
         OR $9 <> 'dispatch'
@@ -3492,7 +3936,7 @@ export async function listScmSchedule({
               (COALESCE(po.vendor_id::text, '') <> '' AND vendor_map.netsuite_vendor_id::text = po.vendor_id::text)
               OR lower(vendor_map.netsuite_vendor_name) = lower(po.vendor)
             )
-          WHERE po.netsuite_id::text = ANY($1::text[])`,
+              WHERE po.netsuite_id = ANY($1::bigint[])`,
         [poIds]
       ),
       createPurchaseOrderDispatchEnricher({ allowOllama: false })
@@ -3563,6 +4007,7 @@ export async function listScmSchedule({
       status: row.status || "Queued",
       calculatedStatus: row.calculated_status || row.status || "Queued",
       dispatchCompletionEvidenceType: row.dispatch_completion_evidence_type || "",
+      dispatchPlanned: row.dispatch_planned === true,
       reconciliationBlocked: row.reconciliation_blocked === true,
       queuedDate: dateOnly(row.queued_at),
       etaDate: dateOnly(row.eta_date),
@@ -3798,11 +4243,19 @@ async function updateScmScheduleEntryTransaction({
     });
   }
   if (kind === "PO" && has("packingSlipRef", "packing_slip_ref")) {
-    await updatePurchaseOrderDispatchRef({
+    const refUpdate = await updatePurchaseOrderDispatchRef({
       poRef: ref,
       newRef: next.packingSlipRef,
       updatedBy
     });
+    const committed = await query(
+      `SELECT *
+         FROM scm_transport_schedule
+        WHERE order_kind = 'PO' AND lower(order_ref) = lower($1)
+        LIMIT 1`,
+      [refUpdate.displayRef || ref]
+    );
+    return committed.rows[0] || result.rows[0];
   }
   return result.rows[0];
 }
@@ -5539,24 +5992,33 @@ export async function updatePurchaseOrderDispatchRef({
               dispatch_ref_updated_by = CASE WHEN COALESCE(dispatch_ref, '') IS DISTINCT FROM $2 THEN $3 ELSE dispatch_ref_updated_by END,
               synced_at = now(),
               status_updated_at = now()
-        WHERE netsuite_id = $1`,
+        WHERE netsuite_id = $1
+          AND COALESCE(dispatch_ref, '') IS DISTINCT FROM $2`,
       [po.netsuite_id, normalizedRef, updatedBy || null]
     );
-    await query(
+    const scheduleUpdate = await query(
       `UPDATE scm_transport_schedule s
           SET order_ref = $2,
               packing_slip_ref = NULLIF($3, ''),
               updated_by = $4,
-              updated_at = now()
+              updated_at = GREATEST(clock_timestamp(), s.updated_at + interval '1 microsecond')
         WHERE s.order_kind = 'PO'
           AND lower(s.order_ref) = lower($1)
+          AND (
+            s.order_ref IS DISTINCT FROM $2
+            OR s.packing_slip_ref IS DISTINCT FROM NULLIF($3, '')
+          )
           AND NOT EXISTS (
             SELECT 1
               FROM scm_transport_schedule duplicate
              WHERE duplicate.order_kind = 'PO'
                AND lower(duplicate.order_ref) = lower($2)
                AND duplicate.id <> s.id
-          )`,
+          )
+        RETURNING to_char(
+          updated_at AT TIME ZONE 'UTC',
+          'YYYY-MM-DD"T"HH24:MI:SS.US"Z"'
+        ) AS concurrency_updated_at`,
       [oldVisibleRef, newVisibleRef, normalizedRef, updatedBy || null]
     );
     const snapshotUpdate = oldVisibleRef !== newVisibleRef
@@ -5568,7 +6030,8 @@ export async function updatePurchaseOrderDispatchRef({
       oldDisplayRef: oldVisibleRef,
       dispatchRef: normalizedRef,
       displayRef: newVisibleRef,
-      updatedPlans: snapshotUpdate.planIds
+      updatedPlans: snapshotUpdate.planIds,
+      scheduleUpdatedAt: scheduleUpdate.rows[0]?.concurrency_updated_at || null
     };
   });
 }
@@ -6540,7 +7003,7 @@ export async function createScmPurchaseOrderSplit({
   newPoRef = "",
   pickupPoint = "",
   destinationLocationId = null,
-  status = "Queued",
+  status = "Hold",
   remarkOverride = "",
   lines = [],
   createdBy = "",
@@ -6554,6 +7017,9 @@ export async function createScmPurchaseOrderSplit({
   if (!splitRef) throw new Error("New PO ref number is required.");
   if (sourceRef.toLowerCase() === splitRef.toLowerCase()) throw new Error("New PO ref must be different from the blanket PO.");
   const splitInitialStatus = normalizeManualScmStatus(status);
+  const splitInitialMirrorStatus = ["Queued", "Hold"].includes(splitInitialStatus)
+    ? splitInitialStatus
+    : "Hold";
   const splitRemarkOverride = normalizeScmScheduleRemarkOverride(remarkOverride);
   const requestedLines = (Array.isArray(lines) ? lines : [])
     .map((line) => ({
@@ -6793,6 +7259,7 @@ export async function createScmPurchaseOrderSplit({
            netsuite_id, tranid, trandate, vendor_id, vendor, status, status_text, foreign_total,
            destination_location_id, destination_location, memo, dispatch_vendor_yard, dispatch_address,
            dispatch_window_start, dispatch_window_end, dispatch_instructions, receipt_status,
+           initial_scm_status,
            netsuite_active, synced_at, source_location_id, source_location, expected_delivery_date,
            dispatch_parse_source, dispatch_note_hash, dispatch_parsed_at, netsuite_missing_at,
            last_item_receipt_id, last_item_receipt_tranid, received_at, status_updated_at,
@@ -6804,6 +7271,7 @@ export async function createScmPurchaseOrderSplit({
             CONCAT(COALESCE(memo, ''), CASE WHEN COALESCE(memo, '') = '' THEN '' ELSE E'\n' END, 'SCM split from ', tranid),
             $7::text, $8::text,
            $9::text, $10::text, $11::text, receipt_status,
+           $13::text,
            true, now(), source_location_id, source_location, expected_delivery_date,
            $12::text, dispatch_note_hash, now(), null,
            null, null, null, now(),
@@ -6822,7 +7290,8 @@ export async function createScmPurchaseOrderSplit({
           splitPickupWindowStart,
           splitPickupWindowEnd,
           splitPickupInstructions,
-          splitPickupParseSource
+          splitPickupParseSource,
+          splitInitialMirrorStatus
         ]
       );
 
@@ -6851,24 +7320,26 @@ export async function createScmPurchaseOrderSplit({
     }
     const splitSchedule = await query(
       `INSERT INTO scm_transport_schedule (
-         order_kind, order_ref, pickup_point, brand, packing_slip_ref,
+         order_kind, order_ref, pickup_point, dropoff_point, brand, packing_slip_ref,
          status, remark_override, updated_by, created_by
        ) VALUES (
-         'PO', $1, NULLIF($2, ''), NULLIF($3, ''), $1,
-         $4, NULLIF($5, ''), $6, $6
+         'PO', $1, NULLIF($2, ''), NULLIF($3, ''), NULLIF($4, ''), $1,
+         $5, NULLIF($6, ''), $7, $7
        )
        ON CONFLICT (order_kind, order_ref) DO UPDATE SET
          pickup_point = COALESCE(EXCLUDED.pickup_point, scm_transport_schedule.pickup_point),
+         dropoff_point = COALESCE(NULLIF(scm_transport_schedule.dropoff_point, ''), EXCLUDED.dropoff_point),
          brand = COALESCE(scm_transport_schedule.brand, EXCLUDED.brand),
          packing_slip_ref = COALESCE(NULLIF(scm_transport_schedule.packing_slip_ref, ''), EXCLUDED.packing_slip_ref),
-         status = CASE WHEN $7::boolean THEN scm_transport_schedule.status ELSE EXCLUDED.status END,
-         remark_override = CASE WHEN $7::boolean THEN scm_transport_schedule.remark_override ELSE EXCLUDED.remark_override END,
+         status = CASE WHEN $8::boolean THEN scm_transport_schedule.status ELSE EXCLUDED.status END,
+         remark_override = CASE WHEN $8::boolean THEN scm_transport_schedule.remark_override ELSE EXCLUDED.remark_override END,
          updated_by = EXCLUDED.updated_by,
          updated_at = now()
        RETURNING status, remark_override`,
       [
         splitRef,
         splitPickupPoint,
+        splitDestinationLocation,
         selectedPickupYard?.vendor || "",
         splitInitialStatus,
         splitRemarkOverride || "",
@@ -7069,6 +7540,10 @@ function isMbbsSpecialLine(line = {}) {
   return Number(line.item_id ?? line.itemId) === MBBS_SPECIAL_ITEM_ID;
 }
 
+function isSelectableServiceFeeLine(line = {}) {
+  return isMbbsSpecialLine(line);
+}
+
 function isDispatchOperationalLine(line = {}) {
   if (isMbbsSpecialLine(line)) return true;
   const itemLabel = `${line.sku || ""} ${line.item_name || line.itemName || ""}`.trim();
@@ -7095,22 +7570,50 @@ function normalizedSpecialDescription(value, itemName = "") {
   while (parts.length && [itemLabel, "mbbs-special", "mbbs special"].filter(Boolean).includes(parts[0])) parts.shift();
   return normalize(parts.join(" "))
     .replace(/^mbbs[\s-]*special(?:\s+order)?\s*[:\-–—]?\s*/, "")
+    .replace(/\s*([:;,])\s*/g, "$1")
     .trim();
 }
 
-function normalizedSpecialUnit(value) {
+function normalizedLinkUnit(value) {
   return String(value || "").normalize("NFKC").trim().toUpperCase().replace(/\s+/g, " ");
 }
 
-function lineMatches(left, right) {
+function lineItemMatches(left, right) {
   if (left.item_id && right.item_id && String(left.item_id) === String(right.item_id)) return true;
   const leftSku = String(left.sku || left.item_name || "").trim().toLowerCase();
   const rightSku = String(right.sku || right.item_name || "").trim().toLowerCase();
   return Boolean(leftSku && rightSku && leftSku === rightSku);
 }
 
+function lineUnitMatches(left, right) {
+  return normalizedLinkUnit(left.unit) === normalizedLinkUnit(right.unit);
+}
+
+function lineMatches(left, right) {
+  return lineItemMatches(left, right) && lineUnitMatches(left, right);
+}
+
+function allocationDetails(row = {}) {
+  const details = row.details;
+  if (details && typeof details === "object" && !Array.isArray(details)) return details;
+  if (typeof details !== "string") return {};
+  try {
+    const parsed = JSON.parse(details);
+    return parsed && typeof parsed === "object" && !Array.isArray(parsed) ? parsed : {};
+  } catch {
+    return {};
+  }
+}
+
 function normalizeAllocationRow(row) {
   const salesQuantityOnly = isMbbsSpecialLine(row);
+  const details = allocationDetails(row);
+  const directServicePoLines = Array.isArray(details.directServicePoLines)
+    ? details.directServicePoLines
+    : [];
+  const serviceSalesLines = Array.isArray(details.serviceSalesLines)
+    ? details.serviceSalesLines
+    : [];
   return {
     id: row.id,
     salesOrderId: row.sales_order_id,
@@ -7136,7 +7639,10 @@ function normalizeAllocationRow(row) {
     createdAt: row.created_at,
     poVendor: row.po_vendor || "",
     poVendorYard: row.po_vendor_yard || "",
-    poAddress: row.po_address || ""
+    poAddress: row.po_address || "",
+    details,
+    directServicePoLines,
+    serviceSalesLines
   };
 }
 
@@ -7168,13 +7674,50 @@ function allocatedDispatchPhysicalQuantity(item = {}, field, explicitAllocated, 
   return Number(Math.min(totalPhysical, Math.max(explicit, totalPhysical * salesCoverage)).toFixed(6));
 }
 
+function selectedServiceSalesLines(allocations = []) {
+  const byTargetLine = new Map();
+  for (const allocation of allocations) {
+    for (const line of allocationDetails(allocation).serviceSalesLines || []) {
+      const targetLineKey = String(line?.targetLineKey || "").trim();
+      if (targetLineKey && !byTargetLine.has(targetLineKey)) {
+        byTargetLine.set(targetLineKey, { ...line, targetLineKey });
+      }
+    }
+  }
+  return [...byTargetLine.values()];
+}
+
+function selectedDirectServicePoLineIds(allocations = []) {
+  return new Set(allocations.flatMap((allocation) =>
+    (allocationDetails(allocation).directServicePoLines || [])
+      .map((line) => String(line?.poLineId || "").trim())
+      .filter(Boolean)
+  ));
+}
+
 function applyTargetPoAllocationsToOrder(order = {}, allocations = []) {
+  const serviceSalesLines = selectedServiceSalesLines(allocations);
+  const directServicePoLineIds = selectedDirectServicePoLineIds(allocations);
   const applyItems = (candidate) => {
     const sources = [candidate.id, candidate.originalOrderId];
     const childOrderDetails = (candidate.childOrderDetails || []).map(applyItems);
     const items = childOrderDetails.length
       ? childOrderDetails.flatMap((child) => child.items || [])
       : (candidate.items || []).map((item) => {
+          const serviceFee = serviceSalesLines.some((line) => allocationMatchesDispatchItem({
+            dispatch_target_line_key: line.targetLineKey
+          }, item, sources));
+          if (serviceFee) {
+            return {
+              ...item,
+              dispatchServiceFee: true,
+              poAllocatedPallets: positiveQuantity(item.pallets),
+              poAllocatedLayers: positiveQuantity(item.layers),
+              poAllocatedSections: positiveQuantity(item.sections),
+              poAllocatedPieces: positiveQuantity(item.pieces),
+              poAllocatedSalesQty: positiveQuantity(item.quantity ?? item.salesQty)
+            };
+          }
           const matches = allocations.filter((allocation) => allocationMatchesDispatchItem(allocation, item, sources));
           if (!matches.length) return item;
           const allocatedSalesQty = matches.reduce((sum, row) => sum + positiveQuantity(row.allocated_sales_qty), 0);
@@ -7212,6 +7755,7 @@ function applyTargetPoAllocationsToOrder(order = {}, allocations = []) {
   const enriched = applyItems(order);
   const manifestByLocation = new Map();
   for (const allocation of allocations) {
+    if (directServicePoLineIds.has(String(allocation.po_line_id || "").trim())) continue;
     const location = allocation.po_vendor_yard || allocation.po_vendor || "";
     if (!location) continue;
     const key = `${allocation.po_order_ref || ""}|${location}`;
@@ -7387,6 +7931,28 @@ export async function getSalesOrderPoAllocationOptions(orderRef, { planDate = ""
         AND (
           (array_length($1::bigint[], 1) IS NOT NULL AND l.item_id = ANY($1::bigint[]))
           OR (array_length($2::text[], 1) IS NOT NULL AND COALESCE(l.sku, l.item_name) = ANY($2::text[]))
+          OR (
+            l.item_id = 2055
+            AND EXISTS (
+              SELECT 1
+                FROM purchase_order_lines material_line
+               WHERE material_line.purchase_order_id = o.netsuite_id
+                 AND material_line.netsuite_active = true
+                 AND COALESCE(material_line.item_type, '') IN ('InvtPart', 'NonInvtPart')
+                 AND (
+                   (array_length($1::bigint[], 1) IS NOT NULL AND material_line.item_id = ANY($1::bigint[]))
+                   OR (array_length($2::text[], 1) IS NOT NULL AND COALESCE(material_line.sku, material_line.item_name) = ANY($2::text[]))
+                 )
+                 AND NOT EXISTS (
+                   SELECT 1
+                     FROM dispatch_scm_po_split_lines material_split_line
+                     JOIN dispatch_scm_po_splits material_split_header
+                       ON material_split_header.id = material_split_line.split_id
+                      AND material_split_header.status = 'active'
+                    WHERE material_split_line.source_line_id = material_line.id
+                 )
+            )
+          )
         )
       ORDER BY o.trandate DESC, o.tranid DESC, l.line_id NULLS LAST, l.id`,
     poParams
@@ -7417,7 +7983,6 @@ export async function getSalesOrderPoAllocationOptions(orderRef, { planDate = ""
       const normalizedDescription = normalizedSpecialDescription(line.item_description, line.item_name || line.sku);
       const lineCandidates = poLines.rows.filter((poLine) =>
         lineMatches(line, poLine)
-        && (!special || normalizedSpecialUnit(line.unit) === normalizedSpecialUnit(poLine.unit))
       ).map((poLine) => ({
         poLineId: poLine.id,
         poRef: poLine.po_ref,
@@ -7428,8 +7993,8 @@ export async function getSalesOrderPoAllocationOptions(orderRef, { planDate = ""
           poLine.po_original_ref
         ].map((value) => String(value || "").trim()).filter(Boolean))],
         descriptionMatch: Boolean(normalizedDescription) && normalizedDescription === normalizedSpecialDescription(poLine.item_description, poLine.item_name || poLine.sku),
-        unitMatch: normalizedSpecialUnit(line.unit) === normalizedSpecialUnit(poLine.unit),
-        exactMatch: !special || (Boolean(normalizedDescription) && normalizedDescription === normalizedSpecialDescription(poLine.item_description, poLine.item_name || poLine.sku) && normalizedSpecialUnit(line.unit) === normalizedSpecialUnit(poLine.unit))
+        unitMatch: lineUnitMatches(line, poLine),
+        exactMatch: !special || (Boolean(normalizedDescription) && normalizedDescription === normalizedSpecialDescription(poLine.item_description, poLine.item_name || poLine.sku) && lineUnitMatches(line, poLine))
       }));
       return {
       id: line.id,
@@ -7441,6 +8006,7 @@ export async function getSalesOrderPoAllocationOptions(orderRef, { planDate = ""
       itemName: line.item_name,
       description: line.item_description || "",
       isSpecial: special,
+      serviceFeeSelectable: special,
       independentSalesQty: !special && !hasConversion(line) && hasCustomQuantity(line),
       salesQuantityOnly: special,
       poCandidates: lineCandidates,
@@ -7489,6 +8055,8 @@ export async function getSalesOrderPoAllocationOptions(orderRef, { planDate = ""
       description: line.item_description || "",
       isSpecial: special,
       salesQuantityOnly: special,
+      serviceFeeSelectable: isSelectableServiceFeeLine(line),
+      directToCustomerEligible: isSelectableServiceFeeLine(line),
       statusText: line.po_status_text || "",
       required: {
         pallets: positiveQuantity(line.pallet_qty),
@@ -7548,7 +8116,14 @@ async function createSalesOrderPoAllocationWithExecutor(executor, {
     });
   }
 
-  const poParams = poLineId ? [poLineId] : [String(poRef || "").trim(), salesLine.item_id || null, salesLine.sku || salesLine.item_name || ""];
+  const poParams = poLineId
+    ? [poLineId]
+    : [
+        String(poRef || "").trim(),
+        salesLine.item_id || null,
+        salesLine.sku || salesLine.item_name || "",
+        salesLine.unit || ""
+      ];
   const poWhere = poLineId
     ? "l.id = $1"
     : `(lower(o.tranid) = lower($1)
@@ -7557,7 +8132,9 @@ async function createSalesOrderPoAllocationWithExecutor(executor, {
         AND (
           ($2::bigint IS NOT NULL AND l.item_id = $2::bigint)
           OR COALESCE(l.sku, l.item_name) = $3
-        )`;
+        )
+        AND UPPER(REGEXP_REPLACE(BTRIM(COALESCE(l.unit, '')), '\\s+', ' ', 'g'))
+          = UPPER(REGEXP_REPLACE(BTRIM($4), '\\s+', ' ', 'g'))`;
   const po = await executor.query(
     `WITH alloc AS (
        SELECT po_line_id,
@@ -7630,19 +8207,22 @@ async function createSalesOrderPoAllocationWithExecutor(executor, {
   if (requestedPoRef && !acceptedPoRefs.has(requestedPoRef)) {
     throw new Error("Selected PO line is not part of the entered purchase order.");
   }
-  if (!lineMatches(salesLine, poLine)) throw new Error("Selected PO line item does not match the SO line item.");
+  if (!lineItemMatches(salesLine, poLine)) {
+    throw Object.assign(new Error("Selected PO line item does not match the SO line item."), {
+      status: 400,
+      code: "DISPATCH_PO_LINK_ITEM_MISMATCH"
+    });
+  }
+  if (!lineUnitMatches(salesLine, poLine)) {
+    const salesUnit = normalizedLinkUnit(salesLine.unit) || "blank";
+    const purchaseUnit = normalizedLinkUnit(poLine.unit) || "blank";
+    throw Object.assign(
+      new Error(`${salesLine.sku || salesLine.item_name || "Item"}: SO UOM ${salesUnit} does not match PO ${poLine.po_order_ref} UOM ${purchaseUnit}.`),
+      { status: 400, code: "DISPATCH_PO_LINK_UOM_MISMATCH" }
+    );
+  }
 
   const specialSalesQuantityOnly = isMbbsSpecialLine(salesLine);
-  if (specialSalesQuantityOnly) {
-    const salesUnit = normalizedSpecialUnit(salesLine.unit);
-    const purchaseUnit = normalizedSpecialUnit(poLine.unit);
-    if (!salesUnit || salesUnit !== purchaseUnit) {
-      throw Object.assign(
-        new Error(`MBBS-Special sales UOM ${salesUnit || "blank"} does not match PO ${poLine.po_order_ref} purchase UOM ${purchaseUnit || "blank"}.`),
-        { status: 400, code: "DISPATCH_MBBS_SPECIAL_UOM_MISMATCH" }
-      );
-    }
-  }
 
   const submittedPallets = positiveQuantity(quantities.pallets);
   const submittedLayers = positiveQuantity(quantities.layers);
@@ -7746,8 +8326,20 @@ export async function createSalesOrderPoAllocation(options = {}) {
 }
 
 export async function createSalesOrderPoAllocations({
-  dispatchTargetRef = "", salesOrderRef, poRef = "", planDate = "", targetSignature = "", lines = [], createdBy = ""
+  dispatchTargetRef = "", salesOrderRef, poRef = "", planDate = "", targetSignature = "", lines = [],
+  directServicePoLineIds, serviceSalesLineKeys, createdBy = ""
 } = {}) {
+  const poServiceSelectionProvided = Array.isArray(directServicePoLineIds);
+  const salesServiceSelectionProvided = Array.isArray(serviceSalesLineKeys);
+  const serviceSelectionProvided = poServiceSelectionProvided || salesServiceSelectionProvided;
+  const serviceIds = poServiceSelectionProvided
+    ? [...new Set(directServicePoLineIds
+        .map(Number)
+        .filter((id) => Number.isSafeInteger(id) && id > 0))]
+    : [];
+  const serviceTargetLineKeys = salesServiceSelectionProvided
+    ? [...new Set(serviceSalesLineKeys.map((value) => String(value || "").trim()).filter(Boolean))]
+    : [];
   const cleaned = (Array.isArray(lines) ? lines : [])
     .map((line) => ({
       salesLineId: line.salesLineId,
@@ -7759,12 +8351,41 @@ export async function createSalesOrderPoAllocations({
       const q = line.quantities || {};
       return positiveQuantity(q.pallets) + positiveQuantity(q.layers) + positiveQuantity(q.sections) + positiveQuantity(q.pieces) + positiveQuantity(q.salesQty) > 0;
     });
-  if (!cleaned.length) throw new Error("At least one SO item quantity is required.");
+  if (poServiceSelectionProvided && cleaned.some((line) => serviceIds.includes(Number(line.poLineId)))) {
+    throw Object.assign(new Error("A PO line cannot be linked as material and marked as a service fee in the same request."), {
+      status: 400,
+      code: "DISPATCH_PO_SERVICE_LINE_CONFLICT"
+    });
+  }
+  if (salesServiceSelectionProvided && cleaned.some((line) => serviceTargetLineKeys.includes(String(line.targetLineKey || "")))) {
+    throw Object.assign(new Error("An SO line cannot be linked as material and marked as a service fee in the same request."), {
+      status: 400,
+      code: "DISPATCH_SO_SERVICE_LINE_CONFLICT"
+    });
+  }
+  if (!cleaned.length && !serviceSelectionProvided) throw new Error("At least one SO item quantity is required.");
   if (!String(poRef || "").trim()) throw new Error("Purchase order number is required.");
 
   return withTransaction(async () => {
     const executor = { query };
     const created = [];
+    let resolvedTarget = null;
+    if (!cleaned.length) {
+      resolvedTarget = await resolveDispatchSalesTarget({
+        dispatchTargetRef: dispatchTargetRef || salesOrderRef,
+        planDate
+      });
+      await assertNoClosedNetSuiteOrders(
+        [resolvedTarget.target.ref, ...(resolvedTarget.target.memberRefs || [])],
+        "change a Dispatch PO service route"
+      );
+      if (targetSignature && targetSignature !== resolvedTarget.signature) {
+        throw Object.assign(
+          new Error(`${resolvedTarget.target.ref} changed while the link window was open. Refresh before linking the PO.`),
+          { status: 409, code: "DISPATCH_TARGET_CHANGED" }
+        );
+      }
+    }
     for (const line of cleaned) {
       created.push(await createSalesOrderPoAllocationWithExecutor(executor, {
         dispatchTargetRef: dispatchTargetRef || salesOrderRef,
@@ -7778,6 +8399,194 @@ export async function createSalesOrderPoAllocations({
         quantities: line.quantities,
         createdBy
       }));
+    }
+    if (serviceSelectionProvided) {
+      const targetRef = created[0]?.dispatchTargetRef
+        || resolvedTarget?.target?.ref
+        || dispatchTargetRef
+        || salesOrderRef;
+      const requestedRef = String(poRef || "").trim().toLowerCase();
+      const existing = await query(
+        `SELECT allocation.*, po.vendor AS po_vendor,
+                po.dispatch_vendor_yard AS po_vendor_yard,
+                po.dispatch_address AS po_address,
+                po.tranid AS po_original_ref,
+                po.dispatch_ref AS po_dispatch_ref
+           FROM dispatch_so_po_allocations allocation
+           JOIN purchase_orders po ON po.netsuite_id = allocation.po_order_id
+          WHERE allocation.status = 'active'
+            AND lower(allocation.dispatch_target_ref) = lower($1)
+            AND (
+              lower(allocation.po_order_ref) = $2
+              OR lower(po.tranid) = $2
+              OR lower(COALESCE(NULLIF(po.dispatch_ref, ''), '')) = $2
+              OR po.netsuite_id::text = $2
+            )
+          ORDER BY allocation.id
+          FOR UPDATE OF allocation`,
+        [targetRef, requestedRef]
+      );
+      if (!existing.rows.length) {
+        throw Object.assign(new Error("Connect at least one material PO line before saving service-fee choices."), {
+          status: 400,
+          code: "DISPATCH_PO_SERVICE_ROUTE_REQUIRES_LINK"
+        });
+      }
+      const currentDetails = allocationDetails(existing.rows[0]);
+      let directServicePoLines = Array.isArray(currentDetails.directServicePoLines)
+        ? currentDetails.directServicePoLines
+        : [];
+      let serviceSalesLines = Array.isArray(currentDetails.serviceSalesLines)
+        ? currentDetails.serviceSalesLines
+        : [];
+      const poOrderId = existing.rows[0].po_order_id;
+
+      if (poServiceSelectionProvided) {
+        const selected = serviceIds.length
+          ? await query(
+            `SELECT l.*, o.netsuite_id AS po_order_id,
+                    COALESCE(NULLIF(o.dispatch_ref, ''), o.tranid) AS po_order_ref,
+                    o.tranid AS po_original_ref, o.dispatch_ref AS po_dispatch_ref
+               FROM purchase_order_lines l
+               JOIN purchase_orders o ON o.netsuite_id = l.purchase_order_id
+              WHERE l.id = ANY($1::bigint[])
+                AND l.netsuite_active = true
+                AND o.netsuite_active = true
+                AND (o.status_text ILIKE '%Pending Receipt%' OR o.status_text ILIKE '%Partially Received%')
+                AND NOT EXISTS (
+                  SELECT 1
+                    FROM dispatch_scm_po_split_lines split_line
+                    JOIN dispatch_scm_po_splits split_header
+                      ON split_header.id = split_line.split_id
+                     AND split_header.status = 'active'
+                   WHERE split_line.source_line_id = l.id
+                )
+              FOR SHARE OF l, o`,
+            [serviceIds]
+          )
+          : { rows: [] };
+        if (selected.rows.length !== serviceIds.length) {
+          throw Object.assign(new Error("One or more selected PO service-fee lines are no longer available."), {
+            status: 409,
+            code: "DISPATCH_PO_SERVICE_LINE_UNAVAILABLE"
+          });
+        }
+        for (const line of selected.rows) {
+          const aliases = [line.po_order_ref, line.po_original_ref, line.po_dispatch_ref, line.purchase_order_id]
+            .map((value) => String(value || "").trim().toLowerCase())
+            .filter(Boolean);
+          if (!aliases.includes(requestedRef)
+            || String(line.purchase_order_id) !== String(poOrderId)
+            || !isSelectableServiceFeeLine(line)) {
+            throw Object.assign(new Error("Only an explicitly selected MBBS-Special line from this PO can be marked as a service fee."), {
+              status: 400,
+              code: "DISPATCH_PO_SERVICE_LINE_INVALID"
+            });
+          }
+        }
+        const claimed = serviceIds.length ? await query(
+          `SELECT DISTINCT allocation.dispatch_target_ref, line.value->>'poLineId' AS po_line_id
+             FROM dispatch_so_po_allocations allocation
+             CROSS JOIN LATERAL jsonb_array_elements(
+               COALESCE(allocation.details->'directServicePoLines', '[]'::jsonb)
+             ) line(value)
+            WHERE allocation.status = 'active'
+              AND allocation.po_order_id = $1
+              AND line.value->>'poLineId' = ANY($2::text[])
+              AND lower(allocation.dispatch_target_ref) <> lower($3)`,
+          [poOrderId, serviceIds.map(String), targetRef]
+        ) : { rows: [] };
+        if (claimed.rows.length) {
+          throw Object.assign(new Error("A selected PO service-fee line already belongs to another customer order."), {
+            status: 409,
+            code: "DISPATCH_PO_SERVICE_LINE_ALREADY_LINKED"
+          });
+        }
+        directServicePoLines = selected.rows.map((line) => ({
+          poLineId: String(line.id),
+          itemId: line.item_id,
+          itemName: line.item_name || "",
+          sku: line.sku || line.item_name || "",
+          description: line.item_description || "",
+          unit: line.unit || "",
+          quantity: positiveQuantity(line.quantity)
+        }));
+      }
+
+      if (salesServiceSelectionProvided) {
+        if (serviceTargetLineKeys.length) {
+          resolvedTarget ||= await resolveDispatchSalesTarget({
+            dispatchTargetRef: dispatchTargetRef || salesOrderRef,
+            planDate
+          });
+          const targetLinesByKey = new Map(resolvedTarget.lines.map((line) => [line.targetLineKey, line]));
+          const selectedTargetLines = serviceTargetLineKeys.map((key) => targetLinesByKey.get(key));
+          if (selectedTargetLines.some((line) => !line)) {
+            throw Object.assign(new Error("One or more selected SO service-fee lines changed. Refresh Link PO and try again."), {
+              status: 409,
+              code: "DISPATCH_SO_SERVICE_LINE_UNAVAILABLE"
+            });
+          }
+          if (selectedTargetLines.some((line) => !isSelectableServiceFeeLine(targetLineAsAllocationRow(line)))) {
+            throw Object.assign(new Error("Only an explicitly selected MBBS-Special SO line can be marked as a service fee."), {
+              status: 400,
+              code: "DISPATCH_SO_SERVICE_LINE_INVALID"
+            });
+          }
+          serviceSalesLines = selectedTargetLines.map((line) => ({
+            targetLineKey: line.targetLineKey,
+            salesLineId: line.salesLineId,
+            sourceOrderRef: line.sourceOrderRef || "",
+            itemId: line.itemId,
+            itemName: line.itemName || "",
+            sku: line.sku || line.itemName || "",
+            description: line.description || "",
+            unit: line.unit || "",
+            quantity: positiveQuantity(line.quantity)
+          }));
+        } else {
+          serviceSalesLines = [];
+        }
+      }
+
+      await query(
+        `UPDATE dispatch_so_po_allocations
+            SET details = jsonb_set(
+                  jsonb_set(
+                    COALESCE(details, '{}'::jsonb),
+                    '{directServicePoLines}',
+                    $3::jsonb,
+                    true
+                  ),
+                  '{serviceSalesLines}',
+                  $4::jsonb,
+                  true
+                ),
+                updated_at = now()
+          WHERE status = 'active'
+            AND lower(dispatch_target_ref) = lower($1)
+            AND po_order_id = $2`,
+        [targetRef, poOrderId, JSON.stringify(directServicePoLines), JSON.stringify(serviceSalesLines)]
+      );
+      for (const allocation of created) {
+        allocation.details = {
+          ...(allocation.details || {}),
+          directServicePoLines,
+          serviceSalesLines
+        };
+        allocation.directServicePoLines = directServicePoLines;
+        allocation.serviceSalesLines = serviceSalesLines;
+      }
+      if (!created.length) {
+        return existing.rows.map((row) => normalizeAllocationRow({
+          ...row,
+          details: {
+            ...allocationDetails(row),
+            directServicePoLines,
+            serviceSalesLines
+          }
+        }));
+      }
     }
     return created;
   });
@@ -7866,7 +8675,15 @@ function localCoSourceItems(order = {}, fromYard = "") {
   return [...unique.values()];
 }
 
-export async function upsertLocalCoOrder({ sourceOrderRef, fromYard, toYard, order = {}, plan = {}, requestedBy = "" } = {}) {
+export async function upsertLocalCoOrder({
+  sourceOrderRef,
+  fromYard,
+  toYard,
+  order = {},
+  plan = {},
+  requestedBy = "",
+  reactivateCancelled = false
+} = {}) {
   const sourceRef = String(sourceOrderRef || order.id || "").trim();
   const fromText = locationTextFromId(fromYard || order.sourceYard || order.pickupLocations?.[0]);
   const toText = locationTextFromId(toYard || "12441");
@@ -7886,6 +8703,7 @@ export async function upsertLocalCoOrder({ sourceOrderRef, fromYard, toYard, ord
     sourceOrderType: order.sourceOrderType || order.type || "",
     childOrderIds: Array.isArray(order.childOrders) ? order.childOrders : [],
     childOrderDetails: Array.isArray(order.childOrderDetails) ? order.childOrderDetails : [],
+    groupAliases: Array.isArray(order.groupAliases) ? order.groupAliases : [],
     weight: order.weight || 0,
     salesQty: order.salesQty || 0
   };
@@ -7906,7 +8724,10 @@ export async function upsertLocalCoOrder({ sourceOrderRef, fromYard, toYard, ord
        from_location = EXCLUDED.from_location,
        to_location_id = EXCLUDED.to_location_id,
        to_location = EXCLUDED.to_location,
-       status = CASE WHEN local_co_orders.status = 'cancelled' THEN 'pending_load' ELSE local_co_orders.status END,
+       status = CASE
+         WHEN local_co_orders.status = 'cancelled' AND $14::boolean THEN 'pending_load'
+         ELSE local_co_orders.status
+       END,
        dispatch_plan_id = COALESCE(EXCLUDED.dispatch_plan_id, local_co_orders.dispatch_plan_id),
        dispatch_plan_date = COALESCE(EXCLUDED.dispatch_plan_date, local_co_orders.dispatch_plan_date),
        dispatch_truck_plate = CASE
@@ -7923,6 +8744,8 @@ export async function upsertLocalCoOrder({ sourceOrderRef, fromYard, toYard, ord
        END,
        details = EXCLUDED.details,
        updated_at = now()
+     WHERE local_co_orders.status NOT IN ('cancelled', 'completed')
+        OR (local_co_orders.status = 'cancelled' AND $14::boolean)
      RETURNING *`,
     [
       coRef,
@@ -7937,10 +8760,29 @@ export async function upsertLocalCoOrder({ sourceOrderRef, fromYard, toYard, ord
       hasDispatchAssignment ? plan.loadName || "" : "",
       hasDispatchAssignment ? plan.parkingSpot || "" : "",
       requestedBy || null,
-      JSON.stringify(details)
+      JSON.stringify(details),
+      reactivateCancelled === true
     ]
   );
   const co = inserted.rows[0];
+  if (!co) {
+    const existing = await query(
+      `SELECT status
+         FROM local_co_orders
+        WHERE co_ref = $1`,
+      [coRef]
+    );
+    if (String(existing.rows[0]?.status || "").toLowerCase() === "completed") {
+      throw Object.assign(
+        new Error(`${coRef} was completed in Driver PWA and cannot be changed or planned again.`),
+        { code: "DISPATCH_CO_COMPLETED", status: 409, coRef }
+      );
+    }
+    throw Object.assign(
+      new Error(`${coRef} was cancelled. Recreate it explicitly before assigning it to a Dispatch plan.`),
+      { code: "DISPATCH_CO_CANCELLED", status: 409, coRef }
+    );
+  }
   if (!co.delivery_order_id) {
     await query("UPDATE local_co_orders SET delivery_order_id = $2 WHERE id = $1", [co.id, -Number(co.id)]);
     co.delivery_order_id = -Number(co.id);

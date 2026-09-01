@@ -2080,6 +2080,7 @@ function planItemForPickup(item, context = {}) {
 }
 
 function planItemHasQuantity(item) {
+  if (item.dispatchServiceFee === true) return false;
   return numberValue(item.pallets ?? item.pallet_qty)
     || numberValue(item.layers ?? item.layer_qty)
     || numberValue(item.sections ?? item.section_qty)

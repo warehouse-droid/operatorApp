@@ -143,6 +143,7 @@ export function applyActiveTransitCoMetadata(order = {}, activeCos = []) {
           sourceOrderRef: text(record?.sourceOrderRef || record?.source_order_ref),
           fromYard: text(record?.fromYard || record?.from_yard || record?.from_location),
           toYard: text(record?.toYard || record?.to_yard || record?.to_location),
+          status: text(record?.status),
           createdAt: record?.createdAt || record?.created_at || null
         }
       ])
@@ -192,6 +193,7 @@ export function applyActiveTransitCoMetadata(order = {}, activeCos = []) {
       id: active.coRef,
       fromYard: active.fromYard,
       toYard: active.toYard,
+      ...(active.status ? { status: active.status } : {}),
       sourceOrderId: ref || active.sourceOrderRef
     };
     next.pickupLocations = [active.toYard];

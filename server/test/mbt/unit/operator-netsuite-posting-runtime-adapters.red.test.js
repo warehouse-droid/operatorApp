@@ -3,6 +3,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 
+import { findOperatorNetSuitePostingTransactionByExternalId } from "../../../src/netsuite.js";
 import { createOperatorNetSuitePostingAdapter } from "../../../src/operator-netsuite-posting-netsuite-adapter.js";
 import {
   configureOperatorNetSuitePostingCompletionEvents,
@@ -91,6 +92,65 @@ test("P6 the runtime adapter resolves an external ID into a complete readable re
     unreadable.findByExternalId(target),
     (error) => error?.code === "OPERATOR_NETSUITE_POSTING_RESULT_UNVERIFIED" && error?.ambiguous === true
   );
+});
+
+test("R2 external-ID recovery is scoped to the exact source transaction", async () => {
+  const target = sourceStep("SO");
+  const lookups = [];
+  const adapter = createOperatorNetSuitePostingAdapter({
+    findTransactionByExternalId: async (...args) => {
+      lookups.push(args);
+      return null;
+    },
+    transformSalesOrderToItemFulfillment: async () => ({}),
+    transformTransferOrderToItemFulfillment: async () => ({}),
+    transformPurchaseOrderToItemReceipt: async () => ({}),
+    transformTransferOrderToItemReceipt: async () => ({}),
+    fetchItemFulfillment: async () => null,
+    fetchItemReceipt: async () => null
+  });
+
+  assert.equal(await adapter.findByExternalId(target), null);
+  assert.deepEqual(lookups, [[target.externalId, target.transactionType, target.sourceNetSuiteId]],
+    "Recovery must provide the source order ID so NetSuite can use transaction links instead of its failing transaction.createdfrom/externalid query.");
+});
+
+test("R2 NetSuite recovery traverses source links, deduplicates lines, and reads the exact IF", async () => {
+  const externalId = "MBBS-OP-68c0dde1-9741-4a35-a8aa-dedbb23ba6a2-1";
+  const queries = [];
+  const reads = [];
+  const exact = {
+    id: "973910",
+    tranId: "IF150757",
+    externalId,
+    createdFrom: { id: "972607" },
+    item: { items: [] }
+  };
+  const found = await findOperatorNetSuitePostingTransactionByExternalId(externalId, "IF", 972607, {
+    queryAll: async (query) => {
+      queries.push(query);
+      return [
+        { id: "973910", tranid: "IF150757" },
+        { id: "973910", tranid: "IF150757" },
+        { id: "973000", tranid: "IF150700" }
+      ];
+    },
+    fetchItemFulfillment: async (id) => {
+      reads.push(id);
+      return id === 973910 ? exact : { id, externalId: "another-command" };
+    },
+    fetchItemReceipt: async () => { throw new Error("IF recovery must not read Item Receipts."); }
+  });
+
+  assert.match(queries[0], /NextTransactionLineLink/u);
+  assert.match(queries[0], /previousdoc = 972607/u);
+  assert.doesNotMatch(queries[0], /\.externalid/u);
+  assert.deepEqual(reads, [973910, 973000]);
+  assert.equal(found?.id, 973910);
+  assert.equal(found?.tranid, "IF150757");
+  assert.equal(found?.externalid, externalId);
+  assert.equal(found?.createdfrom, 972607);
+  assert.equal(found?.record, exact);
 });
 
 test("P1-P4 local finalization reuses existing flows and attaches command evidence", async () => {
@@ -198,5 +258,111 @@ test("P9 verified local finalization publishes the same operational refresh even
   assert.throws(
     () => configureOperatorNetSuitePostingCompletionEvents(null),
     /event emitter is required/u
+  );
+});
+
+test("R1 an authoritative already-received command finalizes the stable local receipt with zero transform steps", async () => {
+  const calls = [];
+  const finalizer = createOperatorNetSuitePostingFinalizer({
+    recordCustomerPickupLoad: async () => ({}),
+    recordDeliveryLoad: async () => ({}),
+    recordReceivingReceipt: async (...args) => {
+      calls.push(args);
+      return { receiptStatus: "received", itemReceiptId: args[2].itemReceiptId };
+    },
+    syncDirectDependencyOperatorProgress: async () => ({}),
+    syncOrderDependenciesForTransferOrder: async () => {},
+    attachLoadEvidence: async () => {},
+    publishCompletionEvents: async () => {}
+  });
+  const localPayload = {
+    item: { items: [{ orderLine: 4850690, quantity: 5, itemReceive: true, location: 1 }] }
+  };
+  const command = {
+    id: "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb",
+    requestId: "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb",
+    actorOperatorId: "operator-one",
+    photoRefs: ["r2://operator/a.jpg", "r2://operator/b.jpg"],
+    steps: [],
+    inputSnapshot: {
+      localOperation: { kind: "receiving_receipt", orderId: "968798", orderType: "purchase_order" },
+      localPayload,
+      lineReconciliation: {
+        schemaVersion: "operator-netsuite-line-reconciliation-v1",
+        lines: [{
+          sourceLineKey: "4850690",
+          requestedQuantity: 5,
+          postedQuantity: 0,
+          reconciledQuantity: 5,
+          linkedTransactions: [{ id: 991, ref: "IR991", type: "IR", quantity: 5 }]
+        }]
+      }
+    }
+  };
+
+  const result = await finalizer(command);
+  assert.equal(result.itemReceiptId, 991);
+  assert.equal(calls.length, 1);
+  assert.deepEqual(calls[0][2].payload, localPayload);
+  assert.equal(calls[0][2].itemReceiptId, 991);
+  assert.equal(calls[0][2].itemReceiptTranid, "IR991");
+  assert.equal(calls[0][2].allowNetSuiteCompleted, true);
+  assert.deepEqual(
+    calls[0][2].response.operatorNetSuitePosting.lineReconciliation,
+    command.inputSnapshot.lineReconciliation
+  );
+});
+
+test("E1 zero-step receiving rejects incomplete evidence and never invents one receipt from multiple IRs", async () => {
+  const calls = [];
+  const finalizer = createOperatorNetSuitePostingFinalizer({
+    recordCustomerPickupLoad: async () => ({}),
+    recordDeliveryLoad: async () => ({}),
+    recordReceivingReceipt: async (...args) => {
+      calls.push(args);
+      return { receiptStatus: "received", itemReceiptId: args[2].itemReceiptId };
+    },
+    syncDirectDependencyOperatorProgress: async () => ({}),
+    syncOrderDependenciesForTransferOrder: async () => {},
+    attachLoadEvidence: async () => {},
+    publishCompletionEvents: async () => {}
+  });
+  const base = {
+    id: "cccccccc-cccc-4ccc-8ccc-cccccccccccc",
+    requestId: "cccccccc-cccc-4ccc-8ccc-cccccccccccc",
+    actorOperatorId: "operator-one",
+    photoRefs: ["r2://operator/a.jpg", "r2://operator/b.jpg"],
+    steps: [],
+    inputSnapshot: {
+      localOperation: { kind: "receiving_receipt", orderId: "303", orderType: "purchase_order" },
+      localPayload: { item: { items: [{ orderLine: 10, quantity: 2, itemReceive: true }] } },
+      lineReconciliation: {
+        lines: [{
+          authoritative: true,
+          reconciledQuantity: 2,
+          linkedTransactions: [
+            { id: 91, ref: "IR91", type: "IR" },
+            { id: 92, ref: "IR92", type: "IR" }
+          ]
+        }]
+      }
+    }
+  };
+  const result = await finalizer(structuredClone(base));
+  assert.equal(result.itemReceiptId, null);
+  assert.equal(calls[0][2].itemReceiptTranid, null);
+
+  const incomplete = structuredClone(base);
+  incomplete.inputSnapshot.lineReconciliation.lines[0].authoritative = false;
+  await assert.rejects(
+    finalizer(incomplete),
+    (error) => error?.code === "OPERATOR_NETSUITE_POSTING_FINALIZER_UNSUPPORTED"
+  );
+
+  const missingPayload = structuredClone(base);
+  delete missingPayload.inputSnapshot.localPayload;
+  await assert.rejects(
+    finalizer(missingPayload),
+    (error) => error?.code === "OPERATOR_NETSUITE_POSTING_FINALIZER_UNSUPPORTED"
   );
 });

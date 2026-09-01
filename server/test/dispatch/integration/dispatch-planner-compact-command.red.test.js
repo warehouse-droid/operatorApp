@@ -179,6 +179,21 @@ test("DPO-09 a rejected compact command retains the complete candidate without c
       WHERE plan.id = $1`,
     [plan.id]
   )).rows[0];
+  const projectionBefore = {
+    assignments: structuredClone((await query(
+      `SELECT order_ref, planned_order_ref, assignment_kind, load_id, stop_id, assignment
+         FROM dispatch_plan_order_assignments
+        WHERE plan_id = $1
+        ORDER BY lower(order_ref)`,
+      [plan.id]
+    )).rows),
+    state: structuredClone((await query(
+      `SELECT source_revision::int AS source_revision
+         FROM dispatch_plan_projection_state
+        WHERE plan_id = $1`,
+      [plan.id]
+    )).rows)
+  };
   const firstTruck = { ...structuredClone(plan.trucks[0]), driverLogin: "duplicate-driver" };
   const duplicateTruck = {
     id: "DPO-DUPLICATE-TRUCK",
@@ -212,10 +227,23 @@ test("DPO-09 a rejected compact command retains the complete candidate without c
     (await query("SELECT count(*)::int AS count FROM dispatch_plan_commands WHERE command_id = $1", [commandId])).rows[0].count,
     0
   );
-  assert.equal(
-    (await query("SELECT count(*)::int AS count FROM dispatch_plan_order_assignments WHERE plan_id = $1", [plan.id])).rows[0].count,
-    0
-  );
+  const projectionAfter = {
+    assignments: structuredClone((await query(
+      `SELECT order_ref, planned_order_ref, assignment_kind, load_id, stop_id, assignment
+         FROM dispatch_plan_order_assignments
+        WHERE plan_id = $1
+        ORDER BY lower(order_ref)`,
+      [plan.id]
+    )).rows),
+    state: structuredClone((await query(
+      `SELECT source_revision::int AS source_revision
+         FROM dispatch_plan_projection_state
+        WHERE plan_id = $1`,
+      [plan.id]
+    )).rows)
+  };
+  assert.deepEqual(projectionAfter, projectionBefore,
+    "A rejected command must leave the existing assignment projection byte-for-byte unchanged.");
 
   const recovery = (await query(
     `SELECT orders, trucks, summary, archive_reason, checkpoint_kind,

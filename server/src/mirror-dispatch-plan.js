@@ -98,6 +98,19 @@ function coFinishMinute(occurrence = {}) {
 }
 
 async function findCoSequenceConflicts(plan = {}) {
+  const requiredCoRefs = [...new Set((plan.orders || [])
+    .map((order) => String(order?.transitCo?.id || "").trim())
+    .filter(Boolean))];
+  const terminalResult = requiredCoRefs.length
+    ? await query(
+        `SELECT LOWER(BTRIM(co_ref)) AS co_ref
+           FROM local_co_orders
+          WHERE LOWER(BTRIM(co_ref)) = ANY($1::text[])
+            AND LOWER(BTRIM(status)) IN ('completed', 'received')`,
+        [requiredCoRefs.map((ref) => ref.toLowerCase())]
+      )
+    : { rows: [] };
+  const terminalCoRefs = new Set(terminalResult.rows.map((row) => String(row.co_ref || "")));
   const result = await query(
     `SELECT p.id, p.plan_date::text AS plan_date, s.orders, s.trucks
        FROM dispatch_plans p
@@ -143,6 +156,7 @@ async function findCoSequenceConflicts(plan = {}) {
     if (!orderRef || !coRef || order?.type === "CO") continue;
     const occurrences = dropOccurrences(plan, orderRef);
     if (!occurrences.length) continue;
+    if (terminalCoRefs.has(coRef.trim().toLowerCase())) continue;
     const co = coOccurrences.get(coRef);
     if (!co) {
       conflicts.push({ orderRef, coRef, reason: `${orderRef} requires ${coRef} to be planned first.` });

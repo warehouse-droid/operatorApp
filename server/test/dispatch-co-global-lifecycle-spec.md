@@ -26,6 +26,8 @@ Assurance tier: 3. The change protects persisted Dispatch data across plan dates
 6. A cancelled plan incorrectly blocks legitimate cancellation forever.
 7. Recovery restores the wrong depot (`12441` instead of original `150`), alters snapshots/revisions, loses lines/details, or partially commits.
 8. A missing/malformed recovery prerequisite updates the wrong CO or silently does nothing.
+9. Driver PWA records a completed local CO drop, but the universal completion-kind mapper intentionally rejects `CO`/`CO_ORDER`; the physical evidence exists while the local CO stays `planned`, `pending_load`, or even `cancelled` and reappears in Dispatch.
+10. Treating a yard-transfer completion as customer delivery hides the source SO too early; treating it as no completion leaves the transfer card stale. The two lifecycles must remain separate.
 
 ## Acceptance scenarios
 
@@ -40,12 +42,18 @@ Assurance tier: 3. The change protects persisted Dispatch data across plan dates
 9. Given `--apply` and every expected predicate, recovery changes only that row to active `pending_load`, restores `2967 -> 150`, preserves its line rows and historical plan assignment, removes stale cancellation keys while recording recovery metadata, and writes one Dispatch audit event.
 10. Repeating recovery is idempotent and reports no second mutation/audit event.
 11. After deployment and recovery, today’s V2 bootstrap exposes `GOA-3464-3470-6922.transitCo.id = CO-GOA-3464-3470-6922`, `toYard = 150`; July 14 still owns the CO stop; a cancellation probe is rejected without changing the row.
+12. Given a complete Driver PWA drop whose `order_refs` contains a local CO, the local and canonical CO projections move to `completed`, retain the exact Driver job/stop/time evidence, and leave the Dispatch order pool immediately.
+13. The source SO remains globally plannable for its final customer-delivery leg, but its pickup yard is the completed CO destination. The CO remains available in destination-yard Receiving until receipt confirmation moves it to `received`.
+14. A later physical completion supersedes an earlier cancellation; a later cancellation supersedes delayed older offline evidence. Replays are idempotent, repeated upserts cannot reopen a completed CO, and neither completed nor received COs can return to Dispatch.
+15. Migration 191 backfills every eligible historical CO from the earliest terminal drop and is idempotent on a full schema upgrade replay.
 
 ## Must-not-change constraints
 
 - Plan boards remain date-scoped; only operational order/CO ownership is global.
 - Existing CO sequencing remains fail-closed: an earlier-date CO may satisfy a later source pickup only while the active relationship exists.
 - Received/loaded CO cancellation protection remains intact.
+- Driver-completed CO evidence remains non-billable and outside the universal SO/TO/PO/VRMA/CUSTOM completion ledger; only the dedicated local CO lifecycle is projected.
+- Driver transport completion (`completed`) and destination-yard inventory confirmation (`received`) remain distinct states.
 - No plan snapshot, plan revision, driver/operator evidence, CO line, V2 marker, dependency, PWA asset, cache version, feature flag, dependency version, or unrelated production row may be changed by recovery.
 - No automatic cancellation is inferred from checkbox absence, network delay, refresh ordering, or address override.
 - Test containers, networks, and task-specific images must be removed after verification.

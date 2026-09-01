@@ -4,6 +4,11 @@ import crypto from "node:crypto";
 import express from "express";
 
 import { config } from "../config.js";
+import { getDispatchOrderCatalogState } from "../dispatch-order-catalog-repository.js";
+import {
+  DISPATCH_OPTIMIZED_ORDER_POOL_FLAG_KEY,
+  evaluateDispatchOrderPoolPolicy
+} from "../dispatch-order-pool-policy.js";
 import { netSuiteReadOnlyGetTransport } from "../netsuite.js";
 import { MbtError, toErrorEnvelope } from "./errors.js";
 import { authorizeMbtPhase3Capability } from "./phase3-authorization.js";
@@ -622,18 +627,57 @@ export function createMbtRouter(dependencies = {}) {
   const router = express.Router();
 
   async function adminGateInventory() {
+    const [flags, dispatchOrderPoolState] = await Promise.all([
+      listMbtAdminFeatureFlags(),
+      getDispatchOrderCatalogState().catch(() => ({
+        status: "unavailable",
+        ready: false,
+        generation: 0,
+        catalogCount: 0,
+        legacyCount: 0,
+        assignmentsReady: false,
+        shadowMatchCount: 0,
+        shadowMismatchCount: 0,
+        pendingRefreshCount: 0,
+        lastShadowComparisonAt: null,
+        lastFullRefreshAt: null,
+        lastError: "Catalog readiness could not be read."
+      }))
+    ]);
+    const dispatchOrderPoolPolicy = evaluateDispatchOrderPoolPolicy({
+      deploymentMode: config.dispatch?.plannerOrderPoolMode || "off",
+      gate: { present: true, enabled: false },
+      catalogState: dispatchOrderPoolState
+    });
     return {
       schemaVersion: "mbt-admin-gates-v1",
       safetyProfile: "local_non_posting",
       environmentRootAllowed: config.mbt.enabled === true,
       netSuiteDirectAccessAllowed: config.netsuite.directAccessEnabled === true,
       gates: materializeMbtAdminGates({
-        flags: await listMbtAdminFeatureFlags(),
+        flags,
         environment: {
           enabled: config.mbt.enabled,
           ...config.mbtPhase3,
           netSuiteWritesEnabled: config.mbt.netSuiteWritesEnabled,
-          netSuiteDirectAccessEnabled: config.netsuite.directAccessEnabled
+          netSuiteDirectAccessEnabled: config.netsuite.directAccessEnabled,
+          dispatchOrderPoolMode: config.dispatch?.plannerOrderPoolMode || "off",
+          dispatchOrderPoolReady: dispatchOrderPoolPolicy.readModelReady,
+          dispatchOrderPoolActivationReady: dispatchOrderPoolPolicy.activationReady,
+          dispatchOrderPoolActivationBlockReason: dispatchOrderPoolPolicy.activationBlockReason,
+          dispatchOrderPoolStatus: dispatchOrderPoolState.status,
+          dispatchOrderPoolCatalogReady: dispatchOrderPoolState.ready === true,
+          dispatchOrderPoolAssignmentsReady: dispatchOrderPoolState.assignmentsReady === true,
+          dispatchOrderPoolCatalogCount: dispatchOrderPoolState.catalogCount,
+          dispatchOrderPoolLegacyCount: dispatchOrderPoolState.legacyCount,
+          dispatchOrderPoolPendingRefreshCount: dispatchOrderPoolState.pendingRefreshCount,
+          dispatchOrderPoolShadowMatchCount: dispatchOrderPoolPolicy.shadowMatchCount,
+          dispatchOrderPoolShadowMismatchCount: dispatchOrderPoolPolicy.shadowMismatchCount,
+          dispatchOrderPoolRequiredShadowMatchCount: dispatchOrderPoolPolicy.requiredShadowMatchCount,
+          dispatchOrderPoolLastShadowComparisonAt: dispatchOrderPoolState.lastShadowComparisonAt,
+          dispatchOrderPoolGeneration: dispatchOrderPoolState.generation,
+          dispatchOrderPoolLastFullRefreshAt: dispatchOrderPoolState.lastFullRefreshAt,
+          dispatchOrderPoolLastError: dispatchOrderPoolState.lastError
         }
       })
     };
@@ -723,13 +767,28 @@ export function createMbtRouter(dependencies = {}) {
   router.put("/config/gates/:flagKey", requireMbtAdmin, async (req, res, next) => {
     try {
       const body = requestObject(req.body);
+      const flagKey = requiredRequestText(
+        req.params.flagKey,
+        "MBT_FEATURE_FLAG_REQUIRED",
+        "A feature flag key is required."
+      );
+      if (flagKey === DISPATCH_OPTIMIZED_ORDER_POOL_FLAG_KEY && body.enabled === true) {
+        const inventory = await adminGateInventory();
+        const selected = inventory.gates.find((gate) => (
+          gate.flagKey === DISPATCH_OPTIMIZED_ORDER_POOL_FLAG_KEY
+        ));
+        if (selected?.activationReady !== true) {
+          throw new MbtError({
+            status: 409,
+            code: "DISPATCH_ORDER_POOL_NOT_READY",
+            message: "The optimized Dispatch order pool cannot be enabled until deployment mode is on, the read model is ready, pending refreshes are drained, and shadow comparisons match.",
+            details: { rollout: selected?.dispatchOrderPool || null }
+          });
+        }
+      }
       const result = await updateMbtFeatureFlagState({
         actor: commandActor(req),
-        flagKey: requiredRequestText(
-          req.params.flagKey,
-          "MBT_FEATURE_FLAG_REQUIRED",
-          "A feature flag key is required."
-        ),
+        flagKey,
         enabled: /** @type {boolean} */ (body.enabled),
         expectedRevision: /** @type {number} */ (body.expectedRevision),
         reason: requiredRequestText(

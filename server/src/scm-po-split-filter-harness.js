@@ -110,7 +110,7 @@ assert.match(client, /data-action="filter-po-type" data-value="po"/);
 assert.match(client, /data-action="filter-po-type" data-value="split"/);
 assert.match(client, /scmPoTypeFilter = scmPoTypeFilter === nextType \? "" : nextType/);
 assert.match(server, /poType: req\.query\.poType \|\| ""/);
-assert.match(page, /dispatch-scm\.js\?v=20260827-schedule-remarks-v1/);
+assert.match(page, /dispatch-scm\.js\?v=20260829-schedule-freshness-v1/);
 assert.match(repository, /FROM dispatch_scm_po_splits s[\s\S]*?WHERE s\.status = 'active'/);
 assert.match(repository, /const splitByRef = new Map\(splitRows\.rows\.map/);
 assert.match(repository, /isScmSplit: true/);

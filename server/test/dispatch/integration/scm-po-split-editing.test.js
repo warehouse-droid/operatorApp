@@ -386,6 +386,7 @@ test("PO Split derives Completed from exact canonical Driver completion without 
       const scheduleRows = await listScmSchedule({
         search: fixture.sourcePoRef,
         kind: "PO",
+        status: ["Planned", "Completed"],
         audience: "scm"
       });
       const rawCompletedSchedule = scheduleRows.find((row) => row.orderRef === fixture.splitPoRef);
@@ -412,6 +413,7 @@ test("PO Split derives Completed from exact canonical Driver completion without 
       const manuallyCompletedRows = await listScmSchedule({
         search: fixture.sourcePoRef,
         kind: "PO",
+        status: ["Completed"],
         audience: "scm"
       });
       const manuallyCompletedSibling = manuallyCompletedRows.find((row) => row.orderRef === siblingRef);
@@ -428,6 +430,7 @@ test("PO Split derives Completed from exact canonical Driver completion without 
       const blockedRows = await listScmSchedule({
         search: fixture.sourcePoRef,
         kind: "PO",
+        status: ["Completed"],
         audience: "scm"
       });
       const rawBlockedCompleted = blockedRows.find((row) => row.orderRef === fixture.splitPoRef);

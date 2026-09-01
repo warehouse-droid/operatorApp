@@ -61,6 +61,121 @@ test("a compact-plan stop can render before its full catalog order arrives", () 
   );
 });
 
+test("a grouped CO cannot impersonate one child's transit CO", () => {
+  const transitCoSourceRef = Function(
+    `"use strict"; return (${functionBody("transitCoSourceRef")});`
+  )();
+
+  assert.equal(
+    transitCoSourceRef({
+      id: "GOA-7510-7512",
+      type: "CO",
+      childOrders: ["CO-SOA07510", "CO-SOA07512"],
+      sourceOrderId: "SOA07510",
+      relatedSoId: "SOA07510"
+    }),
+    "",
+    "a grouped transit load must not rewrite SOA07510.transitCo.id to GOA-7510-7512"
+  );
+  assert.equal(
+    transitCoSourceRef({ id: "CO-SOA07512", type: "CO", sourceOrderId: "SOA07512" }),
+    "SOA07512",
+    "an ordinary transit CO must still reconcile its source SO"
+  );
+});
+
+test("both supported CO creation paths converge on one CO-GOA identity", () => {
+  const groupedDispatchOrderId = Function(
+    `"use strict"; return (${functionBody("groupedDispatchOrderId")});`
+  )();
+
+  const individualCoFirst = groupedDispatchOrderId([
+    { id: "CO-SOA07510", type: "CO" },
+    { id: "CO-SOA07512", type: "CO" }
+  ]);
+  const sourceGroupFirst = `CO-${groupedDispatchOrderId([
+    { id: "SOA07510", type: "SO" },
+    { id: "SOA07512", type: "SO" }
+  ])}`;
+
+  assert.equal(individualCoFirst, "CO-GOA-7510-7512");
+  assert.equal(sourceGroupFirst, "CO-GOA-7510-7512");
+  assert.equal(individualCoFirst, sourceGroupFirst);
+});
+
+test("CO selections reject mixed lifecycles but allow CO plus CO", () => {
+  const coGroupSelectionBlockReason = Function(
+    `"use strict"; return (${functionBody("coGroupSelectionBlockReason")});`
+  )();
+
+  assert.equal(coGroupSelectionBlockReason([
+    { id: "CO-SOA07510", type: "CO" },
+    { id: "CO-SOA07512", type: "CO" }
+  ]), "");
+  assert.match(coGroupSelectionBlockReason([
+    { id: "CO-SOA07510", type: "CO" },
+    { id: "SOA07512", type: "SO" }
+  ]), /CO orders can only be grouped with other CO orders/u);
+});
+
+test("grouping a CO-of-group preserves the CO identity instead of flattening its source orders", () => {
+  const canonicalDispatchOrderType = Function(
+    `"use strict"; return (${functionBody("canonicalDispatchOrderType")});`
+  )();
+  const isAggregateDispatchCoGroup = Function(
+    "canonicalDispatchOrderType",
+    `"use strict"; return (${functionBody("isAggregateDispatchCoGroup")});`
+  )(canonicalDispatchOrderType);
+  const flattenDispatchGroupMembers = Function(
+    "canonicalDispatchOrderType",
+    "isAggregateDispatchCoGroup",
+    `"use strict"; return (${functionBody("flattenDispatchGroupMembers")});`
+  )(canonicalDispatchOrderType, isAggregateDispatchCoGroup);
+
+  const coOfGroup = {
+    id: "CO-GSO-101-102",
+    type: "CO",
+    childOrders: ["SO-101", "SO-102"],
+    childOrderDetails: [
+      { id: "SO-101", type: "SO" },
+      { id: "SO-102", type: "SO" }
+    ]
+  };
+  const directCo = { id: "CO-SO-103", type: "CO" };
+  const grouped = flattenDispatchGroupMembers({
+    id: "CO-GSO-101-102-103",
+    type: "CO",
+    childOrders: [coOfGroup.id, directCo.id],
+    childOrderDetails: [coOfGroup, directCo]
+  });
+
+  assert.deepEqual(grouped.childOrders, [coOfGroup.id, directCo.id]);
+});
+
+test("a completed hidden CO satisfies the source-order drag prerequisite", () => {
+  const isTransitCoPlanned = Function(
+    "relatedTransitCo",
+    "allAssignedOrderIds",
+    `"use strict"; return (${functionBody("isTransitCoPlanned")});`
+  )(
+    () => null,
+    () => new Set()
+  );
+
+  assert.equal(isTransitCoPlanned({
+    id: "SOA07512",
+    transitCo: { id: "CO-SOA07512", status: "completed" }
+  }), true);
+  assert.equal(isTransitCoPlanned({
+    id: "SOA07512",
+    transitCo: { id: "CO-SOA07512", status: "pending_load" }
+  }), false);
+  assert.equal(isTransitCoPlanned({
+    id: "SOA07512",
+    transitCo: { id: "CO-SOA07512" }
+  }), false);
+});
+
 test("the Aug-14 assigned custom order survives a later feed that omits it", () => {
   const customOrder = {
     id: "3022118075",

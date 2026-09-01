@@ -12,6 +12,11 @@ import {
   getReceivableReceivingOrder
 } from "./receiving-repository.js";
 import {
+  fetchOperatorNetSuiteSourceItemLinesFromNetSuite,
+  fetchPoToLinkedTransactionsFromNetSuite,
+  fetchScmReconciliationOrdersFromNetSuite
+} from "./netsuite.js";
+import {
   normalizeOperatorNetSuiteLocationId,
   OPERATOR_NETSUITE_POSTING_FUNCTIONS
 } from "./operator-netsuite-posting-policy.js";
@@ -31,6 +36,212 @@ function positiveNumber(value) {
   return Number.isFinite(number) ? Math.max(0, number) : 0;
 }
 
+/** @param {unknown} value */
+function positiveInteger(value) {
+  const number = Number(value);
+  return Number.isSafeInteger(number) && number > 0 ? number : null;
+}
+
+/** @param {unknown[]} values */
+function lineAliases(values) {
+  return [...new Set(values
+    .flat()
+    .map((value) => String(value ?? "").trim())
+    .filter((value) => value && value !== "0" && value.toLowerCase() !== "null"))]
+    .sort((left, right) => left.localeCompare(right, undefined, { numeric: true }));
+}
+
+/** @param {Record<string, any>} item */
+function restSourceOrderLine(item) {
+  return positiveInteger(item?.orderLine ?? item?.orderline ?? item?.line);
+}
+
+/** @param {Record<string, any>} item */
+function restSourceItemId(item) {
+  return positiveInteger(item?.item?.id ?? item?.item?.value ?? item?.itemId ?? item?.item);
+}
+
+/** @param {Record<string, any>} line */
+function reconciliationOrderLineAliases(line) {
+  return lineAliases([line?.orderLineAliases || [], line?.orderLine]);
+}
+
+/** @param {Record<string, any>} line */
+function reconciliationSourceLineAliases(line) {
+  return lineAliases([line?.sourceLineAliases || [], line?.sourceLineKey]);
+}
+
+/** @param {Record<string, any>} line @param {Record<string, any>[]} sourceItems */
+function exactRestSourceLine(line, sourceItems) {
+  const aliases = new Set(reconciliationOrderLineAliases(line));
+  let candidates = sourceItems.filter((item) => {
+    const orderLine = restSourceOrderLine(item);
+    return orderLine && aliases.has(String(orderLine));
+  });
+  const itemId = positiveInteger(line?.itemId);
+  if (itemId) {
+    const hasRestItemIdentity = candidates.some((item) => restSourceItemId(item) !== null);
+    if (hasRestItemIdentity) {
+      candidates = candidates.filter((item) => restSourceItemId(item) === itemId);
+    }
+  }
+  const canonical = positiveInteger(line?.orderLine);
+  const direct = candidates.filter((item) => restSourceOrderLine(item) === canonical);
+  if (direct.length === 1) {return canonical;}
+  const onlyCandidate = candidates.length === 1 ? candidates[0] : null;
+  return onlyCandidate ? restSourceOrderLine(onlyCandidate) : null;
+}
+
+/** @param {unknown} value */
+function linkedTransactionType(value) {
+  const type = String(value || "").trim().toUpperCase();
+  if (["IF", "ITEMSHIP", "ITEMFULFILLMENT"].includes(type)) {return "IF";}
+  if (["IR", "ITEMRCPT", "ITEMRECEIPT"].includes(type)) {return "IR";}
+  return "";
+}
+
+/**
+ * @param {Record<string, any>} row
+ * @param {{id: number, expectedType: string, stableAliases: Set<string>, orderAliases: Set<string>}} identity
+ */
+// NetSuite may expose aliases in normalized fields or in retained raw evidence.
+// eslint-disable-next-line complexity
+function linkedRowMatchesLiveLine(row, { id, expectedType, stableAliases, orderAliases }) {
+  if (Number(row?.sourceOrderId) !== id || linkedTransactionType(row?.transactionType) !== expectedType) {return false;}
+  if (/VOID|CANCEL|REJECT/iu.test(String(row?.statusText || row?.status || ""))) {return false;}
+  const rowStableAliases = lineAliases([
+    row?.sourceLineKey,
+    row?.sourceLineAliases || [],
+    row?.raw?.sourceLineAliases || []
+  ]);
+  const rowOrderAliases = lineAliases([
+    row?.sourceOrderLine,
+    row?.sourceOrderLineAliases || [],
+    row?.raw?.sourceOrderLineAliases || []
+  ]);
+  return rowStableAliases.some((alias) => stableAliases.has(alias))
+    || rowOrderAliases.some((alias) => orderAliases.has(alias));
+}
+
+/**
+ * @param {Record<string, any>[]} linkedRows
+ * @param {{id: number, expectedType: string, stableAliases: Set<string>, orderAliases: Set<string>}} identity
+ */
+function liveLinkedTransactions(linkedRows, identity) {
+  return linkedRows.filter((row) => linkedRowMatchesLiveLine(row, identity))
+    .map((row) => ({
+      id: Number(row.transactionId),
+      ref: String(row.transactionRef || ""),
+      type: identity.expectedType,
+      quantity: positiveNumber(row.quantity)
+    })).filter((row) => Number.isSafeInteger(row.id) && row.id > 0 && row.quantity > 0)
+    .sort((left, right) => left.id - right.id || left.ref.localeCompare(right.ref));
+}
+
+/**
+ * Build the live, read-only source evidence used by the posting resolver. The
+ * REST source sublist supplies transform line numbers; SuiteQL supplies stable
+ * line keys, progress, and linked transaction evidence.
+ *
+ * @param {object} dependencies
+ * @param {Function} dependencies.fetchReconciliationOrders
+ * @param {Function} dependencies.fetchSourceItemLines
+ * @param {Function} dependencies.fetchLinkedTransactions
+ */
+export function createOperatorNetSuitePostingLiveSourceFetcher({
+  fetchReconciliationOrders,
+  fetchSourceItemLines,
+  fetchLinkedTransactions
+}) {
+  // This function joins three independently authoritative NetSuite read shapes
+  // and deliberately fails closed on any identity disagreement.
+  // eslint-disable-next-line complexity
+  return async function fetchOperatorNetSuitePostingLiveSource(
+    /** @type {{sourceOrderKind: unknown, sourceNetSuiteId: unknown}} */ { sourceOrderKind, sourceNetSuiteId }
+  ) {
+    const kind = String(sourceOrderKind || "").trim().toUpperCase();
+    const id = positiveInteger(sourceNetSuiteId);
+    if (!id || !["SO", "PO", "TO"].includes(kind)) {
+      throw resolutionError(
+        "OPERATOR_NETSUITE_POSTING_LINE_MAPPING_UNRESOLVED",
+        "A valid NetSuite source is required for authoritative line mapping."
+      );
+    }
+    const [orders, sourceItems, linkedRows] = await Promise.all([
+      fetchReconciliationOrders({ orderIds: [id], kind, includeOpen: false, targetOnly: true }),
+      fetchSourceItemLines(kind, id),
+      fetchLinkedTransactions([id])
+    ]);
+    const order = (orders || []).find((/** @type {Record<string, any>} */ candidate) => (
+      Number(candidate?.id) === id && String(candidate?.kind) === kind
+    ));
+    if (!order || !Array.isArray(order.lines) || !Array.isArray(sourceItems)) {
+      throw resolutionError(
+        "OPERATOR_NETSUITE_POSTING_LINE_MAPPING_UNRESOLVED",
+        `NetSuite did not return authoritative ${kind} source-line evidence for ${id}.`
+      );
+    }
+
+    const lines = order.lines.map((/** @type {Record<string, any>} */ line) => ({
+      ...line,
+      restOrderLine: line?.identityStatus === "exact" ? exactRestSourceLine(line, sourceItems) : null
+    }));
+    if (kind === "TO") {
+      for (const line of lines) {
+        if (line.stage !== "receiving") {continue;}
+        const outbound = lines.find((/** @type {Record<string, any>} */ candidate) => candidate.stage === "outbound"
+          && candidate.logicalLineIdentity
+          && candidate.logicalLineIdentity === line.logicalLineIdentity);
+        line.restOrderLine = outbound?.restOrderLine || null;
+        if (!outbound || outbound.identityStatus !== "exact") {
+          line.identityStatus = "ambiguous";
+          line.identityIssue = line.identityIssue || "The Transfer receipt line has no exact visible source-line anchor.";
+        }
+      }
+    }
+
+    for (const line of lines) {
+      if (!line.restOrderLine) {
+        line.identityStatus = "ambiguous";
+        line.identityIssue = line.identityIssue || "The SuiteQL source line did not map uniquely to the REST item sublist.";
+      }
+      const related = kind === "TO"
+        ? lines.filter((/** @type {Record<string, any>} */ candidate) => candidate.logicalLineIdentity === line.logicalLineIdentity)
+        : [line];
+      const stableAliases = new Set(lineAliases(related.map(reconciliationSourceLineAliases)));
+      const orderAliases = new Set(lineAliases(related.map(reconciliationOrderLineAliases)));
+      const expectedType = kind === "PO" || line.stage === "receiving" ? "IR" : "IF";
+      const linkedTransactions = liveLinkedTransactions(linkedRows || [], {
+        id,
+        expectedType,
+        stableAliases,
+        orderAliases
+      });
+      const orderedQuantity = positiveNumber(line.quantity);
+      const linkedQuantity = linkedTransactions.reduce((sum, transaction) => sum + transaction.quantity, 0);
+      const completedQuantity = Math.min(
+        orderedQuantity,
+        Math.max(positiveNumber(line.cumulativeProgressQuantity), linkedQuantity)
+      );
+      line.completedQuantity = Number(completedQuantity.toFixed(6));
+      line.remainingQuantity = Number(Math.max(orderedQuantity - completedQuantity, 0).toFixed(6));
+      line.linkedTransactions = linkedTransactions;
+      line.location = kind === "SO"
+        ? line.locationId ?? order.sourceLocationId ?? null
+        : kind === "PO"
+          ? line.locationId ?? order.destinationLocationId ?? null
+          : null;
+    }
+    return {
+      sourceOrderKind: kind,
+      sourceNetSuiteId: id,
+      sourceOrderRef: String(order.tranid || ""),
+      lines,
+      linkedTransactions: linkedRows || []
+    };
+  };
+}
+
 /** @param {Record<string, any>} line */
 function hasPackedQuantity(line) {
   return [
@@ -44,9 +255,8 @@ function hasPackedQuantity(line) {
 
 /** @param {Record<string, any>} line */
 function eligibleLine(line) {
-  return line?.netsuite_active === true
-    && !line?.sync_exception
-    && ["InvtPart", "NonInvtPart"].includes(String(line?.item_type || ""));
+  return ["InvtPart", "NonInvtPart"].includes(String(line?.item_type || ""))
+    && String(line?.line_id ?? "").trim() !== "";
 }
 
 /** @param {Record<string, any>} order */
@@ -88,7 +298,7 @@ function selectedPayload(order, functionKey) {
 }
 
 /** @param {Record<string, any>} order @param {string} functionKey @param {number} orderLine */
-function localLineIdForPayload(order, functionKey, orderLine) {
+function localLineForPayload(order, functionKey, orderLine) {
   const transferFulfillmentOffset = functionKey !== "receiving" && order.order_type === "transfer_order" ? 1 : 0;
   const localLineKey = orderLine - transferFulfillmentOffset;
   const line = (order.lines || []).find((/** @type {Record<string, any>} */ candidate) => Number(candidate.line_id) === localLineKey);
@@ -98,7 +308,7 @@ function localLineIdForPayload(order, functionKey, orderLine) {
       `NetSuite line ${orderLine} could not be mapped to ${order.tranid || order.netsuite_id}.`
     );
   }
-  return String(line.id ?? line.line_id);
+  return line;
 }
 
 /**
@@ -126,18 +336,37 @@ async function targetForOrder(order, functionKey, resolveRealSource) {
     );
   }
   const orderKey = localOrderKey(functionKey, order);
+  const authoritativeIdentityPresent = source.availableLines.some((/** @type {Record<string, any>} */ line) => (
+    line?.sourceLineKey || (Array.isArray(line?.sourceLineAliases) && line.sourceLineAliases.length)
+  ));
   return {
     sourceOrderKind: source.sourceOrderKind,
     sourceNetSuiteId: Number(source.sourceNetSuiteId),
     sourceOrderRef: String(source.sourceOrderRef || ""),
-    selectedLines: selectedItems.map((/** @type {Record<string, any>} */ item) => ({
-      orderLine: Number(item.orderLine),
-      quantity: Number(item.quantity),
-      location: item.location ?? null,
-      localOrderKey: orderKey,
-      localLineId: localLineIdForPayload(order, functionKey, Number(item.orderLine))
-    })),
-    availableLines: source.availableLines
+    selectedLines: selectedItems.map((/** @type {Record<string, any>} */ item) => {
+      const localLine = localLineForPayload(order, functionKey, Number(item.orderLine));
+      const sourceLineKey = String(localLine.line_id);
+      const candidates = source.availableLines.filter((/** @type {Record<string, any>} */ available) => {
+        if (!authoritativeIdentityPresent) {return Number(available.orderLine) === Number(item.orderLine);}
+        return lineAliases([available.sourceLineKey, available.sourceLineAliases || []]).includes(sourceLineKey);
+      });
+      if (candidates.length !== 1 || !positiveInteger(candidates[0].orderLine)) {
+        throw resolutionError(
+          "OPERATOR_NETSUITE_POSTING_LINE_MAPPING_UNRESOLVED",
+          `Local line ${sourceLineKey} did not map uniquely to the NetSuite REST source sublist.`
+        );
+      }
+      return {
+        orderLine: Number(candidates[0].orderLine),
+        quantity: Number(item.quantity),
+        location: item.location ?? null,
+        localOrderKey: orderKey,
+        localLineId: String(localLine.id ?? localLine.line_id),
+        ...(authoritativeIdentityPresent ? { sourceLineKey } : {})
+      };
+    }),
+    availableLines: source.availableLines,
+    localPayload: payload
   };
 }
 
@@ -275,7 +504,21 @@ export function createOperatorNetSuitePostingTargetResolver({
             : "No packed NetSuite lines are available to fulfill."
         );
       }
-      return { ...baseResolution, localOnly, targets };
+      const localPayload = functionKey === "receiving" && targets.length === 1
+        ? targets[0]?.localPayload || null
+        : null;
+      const allowNetSuiteCompleted = targets.some((/** @type {Record<string, any>} */ target) => target.selectedLines.some((/** @type {Record<string, any>} */ selected) => {
+        const available = target.availableLines.find((/** @type {Record<string, any>} */ line) => Number(line.orderLine) === Number(selected.orderLine));
+        return Number.isFinite(Number(available?.remainingQuantity))
+          && Number(available.remainingQuantity) + 0.000001 < Number(selected.quantity);
+      }));
+      return {
+        ...baseResolution,
+        localOnly,
+        localPayload,
+        allowNetSuiteCompleted,
+        targets: targets.map(({ localPayload: _localPayload, ...target }) => target)
+      };
     };
     if (deferTargets === true) {
       return {
@@ -293,9 +536,9 @@ export function createOperatorNetSuitePostingTargetResolver({
  * SQL selection is intentionally centralized so SO/PO/TO lineage and line
  * offsets cannot diverge across separate production adapters.
  *
- * @param {{query: Function}} dependencies
+ * @param {{query: Function, fetchLiveSource?: Function}} dependencies
  */
-export function createOperatorNetSuitePostingRealSourceResolver({ query: runQuery }) {
+export function createOperatorNetSuitePostingRealSourceResolver({ query: runQuery, fetchLiveSource }) {
   // eslint-disable-next-line complexity
   return async function resolveRealSourceFromDatabase(/** @type {Record<string, any>} */ order, /** @type {{functionKey: string}} */ { functionKey }) {
   const orderType = String(order?.order_type || "");
@@ -330,13 +573,11 @@ export function createOperatorNetSuitePostingRealSourceResolver({ query: runQuer
   let rows;
   if (sourceOrderKind === "SO") {
     rows = await runQuery(
-      `SELECT line.line_id AS order_line,
+      `SELECT line.line_id AS source_line_key,
               COALESCE(line.location_id, parent.outbound_location_id) AS location_id
          FROM sales_order_lines line
          JOIN sales_orders parent ON parent.netsuite_id = line.sales_order_id
         WHERE line.sales_order_id = $1
-          AND line.netsuite_active = true
-          AND line.sync_exception IS NULL
           AND line.item_type IN ('InvtPart', 'NonInvtPart')
           AND line.line_id IS NOT NULL
         ORDER BY line.line_id, line.id`,
@@ -344,13 +585,11 @@ export function createOperatorNetSuitePostingRealSourceResolver({ query: runQuer
     );
   } else if (sourceOrderKind === "PO") {
     rows = await runQuery(
-      `SELECT line.line_id AS order_line,
+      `SELECT line.line_id AS source_line_key,
               COALESCE(line.location_id, parent.destination_location_id) AS location_id
          FROM purchase_order_lines line
          JOIN purchase_orders parent ON parent.netsuite_id = line.purchase_order_id
         WHERE line.purchase_order_id = $1
-          AND line.netsuite_active = true
-          AND line.sync_exception IS NULL
           AND line.item_type IN ('InvtPart', 'NonInvtPart')
           AND line.line_id IS NOT NULL
         ORDER BY line.line_id, line.id`,
@@ -359,27 +598,81 @@ export function createOperatorNetSuitePostingRealSourceResolver({ query: runQuer
   } else {
     const lineStage = functionKey === "receiving" ? "receiving" : "outbound";
     rows = await runQuery(
-      `SELECT line.line_id AS order_line, NULL::bigint AS location_id
+      `SELECT line.line_id AS source_line_key, NULL::bigint AS location_id
          FROM transfer_order_lines line
         WHERE line.transfer_order_id = $1
           AND line.line_stage = $2
-          AND line.netsuite_active = true
-          AND line.sync_exception IS NULL
           AND line.item_type IN ('InvtPart', 'NonInvtPart')
           AND line.line_id IS NOT NULL
         ORDER BY line.line_id, line.id`,
       [sourceNetSuiteId, lineStage]
     );
   }
-  const transferFulfillmentOffset = sourceOrderKind === "TO" && functionKey !== "receiving" ? 1 : 0;
+  if (typeof fetchLiveSource !== "function") {
+    throw resolutionError(
+      "OPERATOR_NETSUITE_POSTING_LINE_MAPPING_UNRESOLVED",
+      "The authoritative NetSuite source-line reader is unavailable."
+    );
+  }
+  const live = await fetchLiveSource({ sourceOrderKind, sourceNetSuiteId, functionKey });
+  const expectedStage = functionKey === "receiving" ? "receiving" : "outbound";
+  const relevantLines = (live?.lines || []).filter((/** @type {Record<string, any>} */ line) => (
+    !line.stage || line.stage === expectedStage
+  ));
+  const unresolved = relevantLines.some((/** @type {Record<string, any>} */ line) => (
+    line.identityStatus !== "exact" || !positiveInteger(line.restOrderLine)
+  ));
+  const duplicateRestLines = new Set();
+  for (const line of relevantLines) {
+    const restLine = Number(line.restOrderLine);
+    if (duplicateRestLines.has(restLine)) {
+      throw resolutionError(
+        "OPERATOR_NETSUITE_POSTING_LINE_MAPPING_UNRESOLVED",
+        `NetSuite source ${sourceOrderRef || sourceNetSuiteId} returned duplicate REST line ${restLine}.`
+      );
+    }
+    duplicateRestLines.add(restLine);
+  }
+  if (!relevantLines.length || unresolved) {
+    throw resolutionError(
+      "OPERATOR_NETSUITE_POSTING_LINE_MAPPING_UNRESOLVED",
+      `NetSuite source ${sourceOrderRef || sourceNetSuiteId} has a missing or ambiguous transform-line identity.`
+    );
+  }
+  for (const row of rows.rows || []) {
+    const sourceLineKey = String(row.source_line_key || "").trim();
+    const candidates = relevantLines.filter((/** @type {Record<string, any>} */ line) => (
+      reconciliationSourceLineAliases(line).includes(sourceLineKey)
+    ));
+    if (!sourceLineKey || candidates.length !== 1) {
+      throw resolutionError(
+        "OPERATOR_NETSUITE_POSTING_LINE_MAPPING_UNRESOLVED",
+        `Local source line ${sourceLineKey || "(missing)"} did not map uniquely to NetSuite.`
+      );
+    }
+  }
   return {
     sourceOrderKind,
     sourceNetSuiteId,
     sourceOrderRef,
-    availableLines: rows.rows.map((/** @type {Record<string, any>} */ line) => ({
-      orderLine: Number(line.order_line) + transferFulfillmentOffset,
-      location: line.location_id === null ? null : Number(line.location_id)
-    }))
+    availableLines: relevantLines.map((/** @type {Record<string, any>} */ line) => {
+      const matchingLocal = (rows.rows || []).find((/** @type {Record<string, any>} */ row) => reconciliationSourceLineAliases(line)
+        .includes(String(row.source_line_key || "")));
+      return {
+        sourceLineKey: String(line.sourceLineKey || reconciliationSourceLineAliases(line)[0]),
+        sourceLineAliases: reconciliationSourceLineAliases(line),
+        orderLine: Number(line.restOrderLine),
+        location: line.location === null || line.location === undefined
+          ? matchingLocal?.location_id === null || matchingLocal?.location_id === undefined
+            ? null
+            : Number(matchingLocal.location_id)
+          : Number(line.location),
+        orderedQuantity: positiveNumber(line.quantity ?? line.orderedQuantity),
+        completedQuantity: positiveNumber(line.completedQuantity),
+        remainingQuantity: positiveNumber(line.remainingQuantity),
+        linkedTransactions: Array.isArray(line.linkedTransactions) ? line.linkedTransactions : []
+      };
+    }).sort((/** @type {Record<string, any>} */ left, /** @type {Record<string, any>} */ right) => left.orderLine - right.orderLine)
     };
   };
 }
@@ -397,14 +690,24 @@ export function createOperatorNetSuiteReceivingOrderReader({
   };
 }
 
-const resolveRealSourceFromDatabase = createOperatorNetSuitePostingRealSourceResolver({ query });
+const fetchLiveSourceFromNetSuite = createOperatorNetSuitePostingLiveSourceFetcher({
+  fetchReconciliationOrders: fetchScmReconciliationOrdersFromNetSuite,
+  fetchSourceItemLines: fetchOperatorNetSuiteSourceItemLinesFromNetSuite,
+  fetchLinkedTransactions: fetchPoToLinkedTransactionsFromNetSuite
+});
+const resolveRealSourceFromDatabase = createOperatorNetSuitePostingRealSourceResolver({
+  query,
+  fetchLiveSource: fetchLiveSourceFromNetSuite
+});
 const readReceivingOrder = createOperatorNetSuiteReceivingOrderReader({
   getLocalCoReceivingOrder,
-  getReceivableReceivingOrder
+  getReceivableReceivingOrder: (/** @type {unknown} */ orderId) => getReceivableReceivingOrder(orderId, {
+    includeNetSuiteClosed: true
+  })
 });
 
 export const resolveOperatorNetSuitePostingTargets = createOperatorNetSuitePostingTargetResolver({
-  getDeliveryOrder,
+  getDeliveryOrder: (/** @type {unknown} */ orderId) => getDeliveryOrder(orderId, { includeNetSuiteClosed: true }),
   getReceivableReceivingOrder: readReceivingOrder,
   resolveRealSource: resolveRealSourceFromDatabase
 });

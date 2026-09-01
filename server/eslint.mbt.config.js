@@ -33,6 +33,7 @@ export default [
       "src/netsuite-m2m-*.js",
       "src/netsuite-delayed-status-refresh-*.js",
       "src/pending-approval-reconciliation*.js",
+      "src/scm-reconcile-review-policy.js",
       "src/scm-po-split-adjustment.js",
       "src/scm-schedule-route-options.js",
       "src/smart-scm-phased-planning.js",

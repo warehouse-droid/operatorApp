@@ -9,6 +9,7 @@ import {
   createDispatchCustomOrder,
   dispatchOrderFromCustomOrder
 } from "../../../src/dispatch-custom-order-repository.js";
+import { backfillDispatchPlanProjections } from "../../../src/dispatch-planner-v2-repository.js";
 
 let fixture;
 
@@ -244,6 +245,11 @@ test("DP-05: remove → group → ungroup → replan is an exact, continuous com
   assert.equal(result.response.status, 200, JSON.stringify(result.payload));
   assert.equal(result.response.status, 200, JSON.stringify(result.payload));
   assert.deepEqual(result.payload.patch.ungroupedOrderRefs.sort(), ["DP-B", "DP-C"]);
+  assert.equal(
+    (await query("SELECT active FROM dispatch_global_order_groups WHERE group_ref = $1", [groupRef])).rows[0]?.active,
+    false,
+    "The explicit ungroup command must retire its global definition."
+  );
   current = result.payload;
 
   result = await command(current, seeded.id, lease, "dp05-replan-a", "assign_order", {
@@ -258,6 +264,52 @@ test("DP-05: remove → group → ungroup → replan is an exact, continuous com
   assert.deepEqual(finalBoard.plan.board.orderRefs.filter((ref) => ref === "DP-A"), ["DP-A"]);
   assert.deepEqual(finalBoard.plan.board.orderRefs.filter((ref) => ref === "DP-B"), ["DP-B"]);
   assert.deepEqual(finalBoard.plan.board.orderRefs.filter((ref) => ref === "DP-C"), ["DP-C"]);
+});
+
+test("DP-05: split → unsplit retires every global split definition", async () => {
+  const sourceRef = "DP-GLOBAL-SPLIT-SOURCE";
+  const splitRefs = [`${sourceRef}-S1`, `${sourceRef}-S2`];
+  const seeded = await fixture.seedPlan({ date: "2025-01-14", refs: [sourceRef] });
+  const lease = await fixture.acquireLease({
+    planDate: seeded.plan_date,
+    sessionId: "dispatch-v2-global-unsplit"
+  });
+  let current = await bootstrap(seeded.id, seeded.plan_date);
+
+  let result = await command(current, seeded.id, lease, "dp05-global-split", "split_order", {
+    sourceOrderRef: sourceRef,
+    parts: splitRefs.map((refNumber) => ({ refNumber }))
+  });
+  assert.equal(result.response.status, 200, JSON.stringify(result.payload));
+  assert.deepEqual(
+    (await query(
+      `SELECT split_ref
+         FROM dispatch_global_order_splits
+        WHERE split_ref = ANY($1::text[])
+          AND active = true
+        ORDER BY split_ref`,
+      [splitRefs]
+    )).rows.map((row) => row.split_ref),
+    splitRefs
+  );
+
+  current = result.payload;
+  result = await command(current, seeded.id, lease, "dp05-global-unsplit", "unsplit_order", {
+    sourceOrderRef: sourceRef,
+    truckId: "DP-V2-TEST",
+    loadId: "dp-v2-load-1"
+  });
+  assert.equal(result.response.status, 200, JSON.stringify(result.payload));
+  assert.deepEqual(
+    (await query(
+      `SELECT split_ref
+         FROM dispatch_global_order_splits
+        WHERE split_ref = ANY($1::text[])
+          AND active = true`,
+      [splitRefs]
+    )).rows,
+    []
+  );
 });
 
 test("DP-05: browser ungroup deactivates its durable delivery group before a hard refresh", async () => {
@@ -320,7 +372,8 @@ test("DP-05: browser ungroup deactivates its durable delivery group before a har
     trucks: ungroupedTrucks,
     summary: current.plan.summary,
     actionName: "ungroup_order",
-    refreshOrderPool: true
+    refreshOrderPool: true,
+    retiredGlobalOrderRefs: [groupRef]
   });
   assert.equal(result.response.status, 200, JSON.stringify(result.payload));
   assert.equal(
@@ -386,7 +439,8 @@ test("DP-05: a late cross-date order feed cannot resurrect GOB-116758-117328 aft
     trucks: ungroupedTrucks,
     summary: current.plan.summary,
     actionName: "ungroup_order",
-    refreshOrderPool: true
+    refreshOrderPool: true,
+    retiredGlobalOrderRefs: [groupRef]
   });
   assert.equal(result.response.status, 200, JSON.stringify(result.payload));
   current = result.payload;
@@ -422,7 +476,7 @@ test("DP-05: a late cross-date order feed cannot resurrect GOB-116758-117328 aft
   assert.equal(
     lateFeed.payload.some((order) => order.id === groupRef),
     false,
-    "The global order feed must not source a group from a snapshot that does not own it."
+    "The global order feed must honor the explicit ungroup tombstone."
   );
 
   result = await command(current, owner.id, ownerLease, "dp05-cross-date-unrelated-save", "replace_plan", {
@@ -473,6 +527,38 @@ test("DP-07: a previous-date order may be removed and re-added to its own plan, 
   });
   assert.equal(result.response.status, 409, JSON.stringify(result.payload));
   assert.equal(result.payload.code, "DISPATCH_ORDER_ALREADY_PLANNED");
+});
+
+test("DP-07: an incomplete assignment projection fails closed instead of treating an order as unplanned", async () => {
+  const owner = await fixture.seedPlan({ date: "2025-02-24", refs: ["DP-PROJECTION-WARMING"] });
+  const target = await fixture.seedPlan({ date: "2025-02-25", refs: ["DP-PROJECTION-TARGET"] });
+  await query("DELETE FROM dispatch_plan_order_assignments WHERE plan_id = $1", [owner.id]);
+  await query("DELETE FROM dispatch_plan_projection_state WHERE plan_id = $1", [owner.id]);
+
+  const lease = await fixture.acquireLease({
+    planDate: target.plan_date,
+    sessionId: "dispatch-v2-projection-warming"
+  });
+  const current = await bootstrap(target.id, target.plan_date);
+  const result = await command(
+    current,
+    target.id,
+    lease,
+    "dp07-projection-warming",
+    "assign_order",
+    {
+      orderRef: "DP-PROJECTION-WARMING",
+      truckId: "DP-V2-TEST",
+      loadId: "dp-v2-load-1"
+    }
+  );
+
+  assert.equal(result.response.status, 409, JSON.stringify(result.payload));
+  assert.equal(result.payload.code, "DISPATCH_ASSIGNMENT_PROJECTION_NOT_READY");
+  const unchanged = await bootstrap(target.id, target.plan_date);
+  assert.equal(unchanged.plan.board.orderRefs.includes("DP-PROJECTION-WARMING"), false);
+  const repaired = await backfillDispatchPlanProjections({ batchSize: 25 });
+  assert.equal(repaired.ready, true, "Projection backfill must clear the fail-closed warm-up fence.");
 });
 
 test("history search reveals reconciliation-complete PO/SO orders but never Driver PWA-completed orders", async () => {

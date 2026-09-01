@@ -5,6 +5,14 @@ import { calculateSmartScmOrderRequirement, calculateSmartScmPolicyLevels } from
 import { smartScmBuiltInRouteRule, smartScmIsGormleySource, smartScmRouteRuleKey, smartScmRouteRuleMap } from "./smart-scm-route-repository.js";
 import { listSmartScmActivePlanningExclusionItemIds } from "./smart-scm-planning-exclusion-repository.js";
 import {
+  smartScmAllocateBlanketCoverage,
+  smartScmBlanketCoverageSnapshot
+} from "./smart-scm-blanket-coverage.js";
+import {
+  listSmartScmBlanketPoolRows,
+  smartScmBlanketBalanceByItem
+} from "./smart-scm-blanket-pool-repository.js";
+import {
   smartScmApplyInboundOverlay,
   smartScmExpectedPoLineEligible,
   smartScmPlanningPhaseOneDrafts,
@@ -315,84 +323,9 @@ async function settingsRow() {
 }
 
 export async function smartScmAvailableBlanketBalanceByItem() {
-  const result = await query(
-    `WITH sales_alloc AS (
-       SELECT po_line_id,
-              SUM(allocated_pallet_qty) AS pallet_qty,
-              SUM(allocated_sales_qty) AS sales_qty
-         FROM dispatch_so_po_allocations
-        WHERE status = 'active'
-        GROUP BY po_line_id
-     ), split_alloc AS (
-       SELECT split_line.source_line_id,
-              SUM(split_line.pallet_qty) AS pallet_qty,
-              SUM(split_line.sales_qty) AS sales_qty
-         FROM dispatch_scm_po_split_lines split_line
-         JOIN dispatch_scm_po_splits split_header
-           ON split_header.id = split_line.split_id
-          AND split_header.status = 'active'
-        GROUP BY split_line.source_line_id
-     ), blanket_alloc AS (
-       SELECT source_line_id,
-              SUM(CASE WHEN status = 'reserved' THEN reserved_pallets ELSE held_pallets END) AS pallet_qty,
-              SUM(CASE WHEN status = 'reserved' THEN reserved_sales_qty ELSE held_sales_qty END) AS sales_qty
-         FROM scm_smart_blanket_allocations
-        WHERE status IN ('reserved', 'held')
-        GROUP BY source_line_id
-     ), net_lines AS (
-       SELECT line.item_id,
-              po.tranid AS source_po_ref,
-              line.to_plt,
-              line.pallet_qty,
-              GREATEST(
-                COALESCE(line.quantity, 0)
-                - COALESCE(line.netsuite_received_baseline_qty, line.netsuite_received_qty, 0)
-                - COALESCE(sales.sales_qty, 0)
-                - COALESCE(split.sales_qty, 0)
-                - COALESCE(blanket.sales_qty, 0),
-                0
-              ) AS available_sales_qty,
-              COALESCE(sales.pallet_qty, 0) + COALESCE(split.pallet_qty, 0) + COALESCE(blanket.pallet_qty, 0) AS allocated_pallets
-         FROM purchase_orders po
-         JOIN purchase_order_lines line
-           ON line.purchase_order_id = po.netsuite_id
-          AND line.netsuite_active = true
-         LEFT JOIN sales_alloc sales ON sales.po_line_id = line.id
-         LEFT JOIN split_alloc split ON split.source_line_id = line.id
-         LEFT JOIN blanket_alloc blanket ON blanket.source_line_id = line.id
-        WHERE po.netsuite_active = true
-          AND po.is_blanket_po = true
-          AND line.item_id IS NOT NULL
-          AND COALESCE(line.to_plt, 0) > 0
-          AND COALESCE(line.item_weight, 0) > 0
-          AND (po.status_text ILIKE '%Pending Receipt%' OR po.status_text ILIKE '%Partially Received%')
-          AND NOT EXISTS (
-            SELECT 1 FROM dispatch_scm_po_splits child_split
-             WHERE child_split.split_po_id = po.netsuite_id
-          )
-     ), item_balance AS (
-       SELECT item_id,
-              ARRAY_AGG(DISTINCT source_po_ref ORDER BY source_po_ref) AS source_po_refs,
-              SUM(available_sales_qty) AS available_sales_qty,
-              SUM(GREATEST(LEAST(
-                FLOOR((available_sales_qty / to_plt) + 0.000001),
-                CASE WHEN COALESCE(pallet_qty, 0) > 0
-                  THEN GREATEST(COALESCE(pallet_qty, 0) - allocated_pallets, 0)
-                  ELSE FLOOR((available_sales_qty / to_plt) + 0.000001)
-                END
-              ), 0)) AS available_pallets
-         FROM net_lines
-        GROUP BY item_id
-     )
-     SELECT item_id, source_po_refs, available_sales_qty, available_pallets
-       FROM item_balance
-      WHERE available_pallets > 0`
+  return smartScmBlanketBalanceByItem(
+    await listSmartScmBlanketPoolRows({ isBlanket: true, limit: 20000 })
   );
-  return new Map(result.rows.map((row) => [String(row.item_id), {
-    availableSalesQty: positive(row.available_sales_qty),
-    availablePallets: positive(row.available_pallets),
-    sourcePoRefs: Array.isArray(row.source_po_refs) ? row.source_po_refs.filter(Boolean) : []
-  }]));
 }
 
 export async function listSmartScmBlanketPlanningPauses({ search = "" } = {}) {
@@ -422,19 +355,24 @@ export async function listSmartScmBlanketPlanningPauses({ search = "" } = {}) {
       itemDescription: row.item_description || "",
       vendor: row.vendor || "",
       vendorCode: row.vendor_code || "",
-      reason: "Covered by remaining Blanket PO quantity",
+      reason: "Usable Blanket PO quantity is credited before ordinary planning",
       availablePallets: positive(balance.availablePallets),
       availableSalesQty: positive(balance.availableSalesQty),
       sourcePoRefs: Array.isArray(balance.sourcePoRefs) ? balance.sourcePoRefs : [],
       active: true,
       automatic: true,
-      pauseKind: "blanket_po"
+      pauseKind: "blanket_po",
+      planningEffect: "quantity_offset",
+      ordinaryPlanningActive: true
     };
   });
 }
 
-export async function loadSmartScmPlanningPolicies({ includeTemporarilyExcluded = false } = {}) {
-  const [result, blanketBalanceByItem] = await Promise.all([query(
+export async function loadSmartScmPlanningPolicies({
+  includeTemporarilyExcluded = false,
+  blanketBalanceByItem = null
+} = {}) {
+  const [result, resolvedBlanketBalanceByItem] = await Promise.all([query(
     `SELECT p.*,
             COALESCE(i.item_name, p.item_name) AS item_name,
             COALESCE(i.item_description, p.item_description) AS item_description,
@@ -487,14 +425,16 @@ export async function loadSmartScmPlanningPolicies({ includeTemporarilyExcluded 
         AND ($1::boolean OR active_exclusion.item_id IS NULL)
       ORDER BY p.item_id, y.location_id`,
     [includeTemporarilyExcluded]
-  ), smartScmAvailableBlanketBalanceByItem()]);
+  ), blanketBalanceByItem instanceof Map
+    ? Promise.resolve(blanketBalanceByItem)
+    : smartScmAvailableBlanketBalanceByItem()]);
   return result.rows.map((row) => {
-    const blanket = blanketBalanceByItem.get(String(row.item_id)) || {};
+    const blanket = resolvedBlanketBalanceByItem.get(String(row.item_id)) || {};
     return {
       ...row,
       blanket_available_sales_qty: positive(blanket.availableSalesQty),
       blanket_available_pallets: positive(blanket.availablePallets),
-      blanket_po_planning_excluded: positive(blanket.availablePallets) > EPSILON
+      blanket_coverage_available: positive(blanket.availablePallets) > EPSILON
     };
   });
 }
@@ -852,6 +792,15 @@ export function smartScmProposalLineForState(state, pallets, extraReason = {}) {
     urgencyScore: urgencyScore(state.urgencyScore, state.urgent),
     reason: {
       ...extraReason,
+      blanketCoveragePallets: round(positive(state.blanketCoveragePallets)),
+      residualRequiredPallets: round(
+        state.residualRequiredPallets === undefined
+          ? positive(state.requiredPallets)
+          : positive(state.residualRequiredPallets)
+      ),
+      blanketSourcePoRefs: Array.isArray(state.blanketSourcePoRefs)
+        ? state.blanketSourcePoRefs.filter(Boolean)
+        : [],
       quantityOnHand: state.onHandSales,
       quantityAvailable: state.availableSales,
       quantityOnOrder: state.onOrderSales,
@@ -1588,16 +1537,18 @@ export function smartScmBuildPlanningDrafts({ states, supplyMap, settings }) {
   const exceptions = [];
   for (const state of states.filter((entry) => entry.requiredPallets > 0)) {
     const manualPurchasePlanningExcluded = state.policy.temporarily_excluded === true;
-    const blanketPurchasePlanningExcluded = state.policy.blanket_po_planning_excluded === true;
-    const purchasePlanningExcluded = manualPurchasePlanningExcluded || blanketPurchasePlanningExcluded;
+    const purchasePlanningExcluded = manualPurchasePlanningExcluded;
+    const ordinaryPlanningNeed = state.residualRequiredPallets === undefined
+      ? positive(state.requiredPallets)
+      : positive(state.residualRequiredPallets);
     const supply = supplyMap.get(String(state.policy.item_id));
     const supplyStatus = supply?.status || "unknown";
     const vendorAvailable = positive(supply?.available_pallets);
     const directPallets = purchasePlanningExcluded || supplyStatus === "out_of_stock" || supplyStatus === "credit_hold"
       ? 0
       : supplyStatus === "partial"
-        ? Math.min(state.requiredPallets, vendorAvailable)
-        : state.requiredPallets;
+        ? Math.min(ordinaryPlanningNeed, vendorAvailable)
+        : ordinaryPlanningNeed;
     if (directPallets > 0) {
       const directLine = smartScmProposalLineForState(state, directPallets, {
         vendorSupplyStatus: supplyStatus,
@@ -1619,10 +1570,10 @@ export function smartScmBuildPlanningDrafts({ states, supplyMap, settings }) {
         keySuffix: index + 1
       }, settings)));
     }
-    let transferNeed = Math.max(0, state.requiredPallets - directPallets);
+    let transferNeed = Math.max(0, ordinaryPlanningNeed - directPallets);
     const provisional = false;
-    if (["out_of_stock", "credit_hold"].includes(supplyStatus)) transferNeed = state.requiredPallets;
-    if (purchasePlanningExcluded) transferNeed = state.requiredPallets;
+    if (["out_of_stock", "credit_hold"].includes(supplyStatus)) transferNeed = ordinaryPlanningNeed;
+    if (purchasePlanningExcluded) transferNeed = ordinaryPlanningNeed;
     if (transferNeed > EPSILON) {
       const internal = internalTransferDrafts({ state, requestedPallets: transferNeed, stateByKey, settings, provisional, keyPrefix: "initial" });
       drafts.push(...internal.drafts);
@@ -1661,12 +1612,7 @@ export function smartScmBuildPlanningDrafts({ states, supplyMap, settings }) {
         exceptions.push({
           itemId: Number(state.policy.item_id),
           yard: state.policy.yard_code,
-          reason: blanketPurchasePlanningExcluded
-            ? "Vendor PO planning is paused while this item has available Blanket-order balance; available internal transfers remain planned"
-            : "Vendor PO planning is temporarily paused; available internal transfers remain planned",
-          blanketAvailablePallets: blanketPurchasePlanningExcluded
-            ? round(positive(state.policy.blanket_available_pallets))
-            : 0,
+          reason: "Vendor PO planning is temporarily paused; available internal transfers remain planned",
           deferredVendorPallets: round(internal.remaining)
         });
       }
@@ -1730,7 +1676,7 @@ async function insertDrafts(runId, drafts = []) {
   }
 }
 
-function smartScmBuildTransferPhaseDrafts({ states = [], settings = {} } = {}) {
+export function smartScmBuildTransferPhaseDrafts({ states = [], settings = {} } = {}) {
   const drafts = [];
   const exceptions = [];
   const stateByKey = new Map(states.map((state) => [state.key, state]));
@@ -1740,7 +1686,9 @@ function smartScmBuildTransferPhaseDrafts({ states = [], settings = {} } = {}) {
     })) continue;
     const internal = internalTransferDrafts({
       state,
-      requestedPallets: state.requiredPallets,
+      requestedPallets: state.residualRequiredPallets === undefined
+        ? state.requiredPallets
+        : state.residualRequiredPallets,
       stateByKey,
       settings,
       provisional: false,
@@ -2162,7 +2110,12 @@ export async function loadSmartScmPlanningDemandStates({
 } = {}) {
   const selectedForecastRunId = forecastRunId || await latestSmartScmForecastRunId();
   const settings = settingsOverride || await settingsRow();
-  const policies = await loadSmartScmPlanningPolicies({ includeTemporarilyExcluded });
+  const blanketPoolRows = await listSmartScmBlanketPoolRows({ isBlanket: true, limit: 20000 });
+  const blanketBalanceByItem = smartScmBlanketBalanceByItem(blanketPoolRows);
+  const policies = await loadSmartScmPlanningPolicies({
+    includeTemporarilyExcluded,
+    blanketBalanceByItem
+  });
   const inventory = await inventoryState({
     excludeTransferOrderIds,
     applySplitOverlay: settings.inventory_planning_mode === "po_then_transfer"
@@ -2171,7 +2124,7 @@ export async function loadSmartScmPlanningDemandStates({
   const forecasts = await smartScmForecastMap(selectedForecastRunId);
   const routeRules = await smartScmRouteRuleMap();
   const minimumOrders = await smartScmMinimumOrderMap(policies, settings);
-  const states = classifySmartScmUrgency(policies.map((policy) => smartScmApplySkip12441Policy(
+  const classifiedStates = classifySmartScmUrgency(policies.map((policy) => smartScmApplySkip12441Policy(
     calculatePolicyState(
       policy,
       forecasts.get(`${policy.item_id}:${policy.location_id}`),
@@ -2181,11 +2134,18 @@ export async function loadSmartScmPlanningDemandStates({
     ),
     { enabled: Boolean(settings.skip_12441_enabled) }
   )));
+  const blanketCoverage = smartScmAllocateBlanketCoverage({
+    states: classifiedStates,
+    poolRows: blanketPoolRows
+  });
   return {
     forecastRunId: selectedForecastRunId,
     settings,
     policies,
-    states,
+    states: blanketCoverage.states,
+    blanketPoolRows,
+    blanketCoverage: blanketCoverage.coverage,
+    blanketAllocations: blanketCoverage.allocations,
     supplyMap,
     forecasts,
     routeRules,
@@ -2201,6 +2161,12 @@ export async function runSmartScmPlan({ triggerSource = "manual", operatorId = n
   });
   const selectedForecastRunId = planning.forecastRunId;
   const { settings, states, supplyMap, routeRules } = planning;
+  const {
+    blanketCoverage,
+    blanketCoveredLines,
+    blanketCoveredPallets,
+    residualRequiredPallets
+  } = smartScmBlanketCoverageSnapshot(states);
   const temporarilyExcludedItemIds = await listSmartScmActivePlanningExclusionItemIds();
   const planningMode = settings.inventory_planning_mode || "integrated";
   const planningPhase = planningMode === "po_then_transfer" ? "po_pending_approval" : "integrated";
@@ -2231,6 +2197,10 @@ export async function runSmartScmPlan({ triggerSource = "manual", operatorId = n
         held: drafts.filter((draft) => draft.status === "held").length,
         temporarilyExcludedItems: temporarilyExcludedItemIds.length,
         temporarilyExcludedItemIds,
+        blanketCoveredLines,
+        blanketCoveredPallets,
+        residualRequiredPallets,
+        blanketCoverage,
         exceptions,
         planningMode,
         planningPhase
@@ -2254,6 +2224,8 @@ export async function runSmartScmPlan({ triggerSource = "manual", operatorId = n
         proposalCount: drafts.length,
         temporarilyExcludedItems: temporarilyExcludedItemIds.length,
         temporarilyExcludedItemIds,
+        blanketCoveredPallets,
+        residualRequiredPallets,
         exceptions
       }
     });
@@ -2308,6 +2280,7 @@ export async function approveSmartScmPoPhase(runId, operatorId = null) {
           states: planning.states,
           settings: run.settings_snapshot
         });
+        const coverageSnapshot = smartScmBlanketCoverageSnapshot(planning.states);
         const drafts = consolidateCompatibleDrafts(
           calculated.drafts,
           run.settings_snapshot,
@@ -2341,7 +2314,12 @@ export async function approveSmartScmPoPhase(runId, operatorId = null) {
             safetyStockPallets: round(state.safety),
             reorderPointPallets: round(state.rop),
             preferredStockPallets: round(state.preferred),
-            requiredPallets: round(state.requiredPallets)
+            requiredPallets: round(state.requiredPallets),
+            blanketCoveragePallets: round(state.blanketCoveragePallets),
+            residualRequiredPallets: round(state.residualRequiredPallets),
+            blanketSourcePoRefs: Array.isArray(state.blanketSourcePoRefs)
+              ? state.blanketSourcePoRefs
+              : []
           })),
           exceptions: calculated.exceptions,
           frozen: true
@@ -2366,6 +2344,7 @@ export async function approveSmartScmPoPhase(runId, operatorId = null) {
               toProposals: Number(counts.rows[0]?.to_proposals || 0),
               urgent: Number(counts.rows[0]?.urgent || 0),
               held: Number(counts.rows[0]?.held || 0),
+              ...coverageSnapshot,
               phaseTwoProposals: drafts.length,
               phaseTwoExceptions: calculated.exceptions
             })

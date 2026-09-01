@@ -41,6 +41,71 @@ Tier: 3 — relationship quantities, Dispatch snapshots, Operator materializatio
 17. **Snapshot compatibility.** Old snapshots remain readable; restore uses current relationship ledgers and retains the existing recovery snapshot on validation failure.
 18. **No deployment.** Implementation and verification use disposable isolated containers only; production containers, data, and schema are not mutated.
 
+## 2026-08-27 quantity-routing amendment
+
+The user approved partial SO coverage by multiple Transfer Orders and clarified
+that direct pickup changes the SO route while yard replenishment does not. This
+amendment replaces the old reduced-TO behavior that put a dependency into
+attention solely because its TO quantity was below the linked allocation.
+
+19. **Partial TO contributions.** One or more TOs may each contribute less than
+    the SO's full item quantity. Each dependency is bounded by its own current TO
+    material quantity; the unallocated remainder stays at the SO's normal
+    outbound yard.
+20. **Reduced direct pickup.** If a direct-pick TO currently carries less than
+    its saved allocation, planning remains allowed. Its manifest and pickup stop
+    use only the bounded TO contribution, and the difference returns to the SO's
+    normal-yard residual.
+21. **Reduced yard replenishment.** If a replenishment TO currently carries less
+    than its saved allocation, it remains a timing prerequisite without adding
+    its source yard to the SO delivery route. Reduced quantity alone does not put
+    the dependency into attention.
+22. **Mixed-mode conservation.** With direct-pick and replenishment dependencies
+    on the same SO, only direct-pick locations affect the SO route. For each item,
+    normal-yard residual plus direct-pick contributions equals the SO quantity;
+    no contribution is negative or exceeds its TO quantity.
+23. **Real blockers survive.** Closed/inactive TOs, missing line identity,
+    execution progress, and dependency timing violations retain their existing
+    blocking behavior. Ancillary PALLET variance remains non-blocking.
+24. **Current-shape replay.** An anonymized fixture covering every current
+    SO-to-TO dependency shape is replayed through the quantity and route
+    projection, with deterministic results and no false reduced-quantity
+    attention.
+25. **Extreme mixed-source replay.** One SO may have four concurrent TO
+    dependencies plus one PO allocation. Direct TO and PO quantities add their
+    pickup locations, replenishment TOs remain prerequisites at the base yard,
+    and the base residual conserves the SO quantity after both direct sources.
+26. **Zero-contribution direct source.** If a direct TO still exists but its
+    current material contribution is zero, its source yard does not create a
+    pickup stop. Restoring a positive current quantity restores exactly one
+    pickup at that source without duplicating any other stop.
+27. **Ten-line ownership split.** For one ten-line SO, three distinct lines may
+    be direct pickups through TO0001, three different lines may wait for yard
+    replenishment through TO0002, and the remaining four lines may be direct PO
+    pickups. Every line has exactly one linked owner, all ten lines remain on the
+    customer drop, only TO0001 and the PO vendor add SO pickup locations, and no
+    line or pickup is duplicated or empty.
+28. **Seeded CO overlays.** Extreme replays apply deterministic seeded CO
+    overlays to a subset of direct and replenishment TOs. An active direct CO
+    changes only that direct pickup location, cancelling it restores the TO's
+    canonical source, and CO destinations on replenishment TOs never leak into
+    the SO customer route.
+
+### Amendment failure model
+
+| Failure | Required detector |
+| --- | --- |
+| A partial TO is compared with the full SO quantity | 10/20/50 multi-TO regression |
+| A reduced direct TO removes quantity from both its pickup and the base yard | Per-item conservation assertions |
+| A replenishment source yard leaks into the SO route | Mixed-mode route assertion |
+| Two direct TOs overdraw one SO line or one TO line | Boundary and property tests |
+| Four TOs plus one PO double-count linked cargo | Extreme mixed-source conservation replay |
+| A zero-quantity direct TO creates an empty route leg | Physical-visit replay after zeroing and restoring the TO |
+| A ten-line SO loses or duplicates lines across TO/PO modes | 3 direct TO + 3 replenishment TO + 4 direct PO line-ownership replay |
+| CO overlay randomness makes replay flaky or changes replenishment routing | Seeded CO matrix with active/cancel restore assertions |
+| A closed/inactive or started TO becomes silently plannable | Existing blocker and execution regression suites |
+| A live dependency shape behaves differently from the deterministic model | Sanitized all-shape replay fixture |
+
 ## Interfaces
 
 - SCM page: `/scm/dependency-management` (Admin/SCM/SCM Staff write; Dispatcher read-only).

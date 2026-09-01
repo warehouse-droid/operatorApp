@@ -311,6 +311,7 @@ test("inferred partial receipt cannot promote a planned child or regress a compl
       const projected = await listScmSchedule({
         search: completed.childRef,
         kind: "PO",
+        status: ["Completed"],
         audience: "scm"
       });
       const projectedCompleted = projected.find((row) => row.orderRef === completed.childRef);

@@ -72,6 +72,15 @@ function badge(label, state) {
   return element;
 }
 
+function dispatchOrderPoolRolloutText(rollout) {
+  if (!rollout) return "";
+  const projection = rollout.assignmentsReady ? "assignments ready" : "assignments warming";
+  const counts = `${Number(rollout.catalogCount || 0).toLocaleString("en-CA")} catalog / ${Number(rollout.legacyCount || 0).toLocaleString("en-CA")} legacy`;
+  const pending = `${Number(rollout.pendingRefreshCount || 0).toLocaleString("en-CA")} refreshes pending`;
+  const shadow = `${Number(rollout.shadowMatchCount || 0)}/${Number(rollout.requiredShadowMatchCount || 0)} shadow matches; ${Number(rollout.shadowMismatchCount || 0)} mismatches`;
+  return `Rollout check: deployment ${rollout.deploymentMode}; catalog ${rollout.status} (generation ${Number(rollout.generation || 0)}, ${counts}); ${projection}; ${pending}; ${shadow}.`;
+}
+
 function gateArticle(gate) {
   const article = document.createElement("article");
   article.className = "mbt-gate-card";
@@ -86,12 +95,26 @@ function gateArticle(gate) {
   const description = document.createElement("p");
   description.textContent = gate.description;
   copy.append(title, key, description);
+  if (gate.dispatchOrderPool) {
+    const rollout = document.createElement("p");
+    rollout.className = "mbt-gate-runtime-status";
+    rollout.textContent = dispatchOrderPoolRolloutText(gate.dispatchOrderPool);
+    copy.append(rollout);
+    if (gate.dispatchOrderPool.lastError) {
+      const rolloutError = document.createElement("p");
+      rolloutError.className = "danger";
+      rolloutError.textContent = `Catalog error: ${gate.dispatchOrderPool.lastError}`;
+      copy.append(rolloutError);
+    }
+  }
 
   const states = document.createElement("div");
   states.className = "mbt-gate-states";
   states.append(
     badge(gate.configured ? "Configured on" : "Configured off", gate.configured ? "on" : "off"),
-    gate.independent
+    gate.deploymentGuarded
+      ? badge(gate.environmentAllowed ? "Read path ready" : "Read path blocked", gate.environmentAllowed ? "open" : "closed")
+      : gate.independent
       ? badge("Admin controlled", "open")
       : badge(gate.environmentAllowed ? "Deployment open" : "Deployment closed", gate.environmentAllowed ? "open" : "closed"),
     badge(gate.effective ? "Effective" : "Inactive", gate.effective ? "effective" : "inactive")
@@ -112,8 +135,14 @@ function gateArticle(gate) {
     button.dataset.nextEnabled = String(!gate.configured);
     button.textContent = gate.configured ? "Turn off" : "Turn on";
     button.setAttribute("aria-label", `${gate.configured ? "Turn off" : "Turn on"} ${gate.label}`);
-    button.disabled = saving;
+    const rolloutBlocked = gate.deploymentGuarded && !gate.configured && !gate.activationReady;
+    button.disabled = saving || rolloutBlocked;
     action.append(button);
+    if (rolloutBlocked) {
+      const reason = document.createElement("p");
+      reason.textContent = "Turn on is locked until deployment mode is on, the indexed catalog and assignments are ready, pending refreshes are drained, and shadow comparisons match.";
+      action.append(reason);
+    }
   }
 
   article.append(copy, states, action);

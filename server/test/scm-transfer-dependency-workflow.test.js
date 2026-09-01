@@ -294,6 +294,11 @@ test("Auto Transfer creates without a status override and does not request a pri
     "NetSuite production rejects orderStatus B during the create POST");
   assert.equal(Object.keys(payload).some((key) => /print/i.test(key)), false,
     "the create request must not trigger or describe a print side effect");
+  assert.equal(transferDependencyNetSuite.transferDependencySalesOrderMemo(" SOA00001 "), "for SOA00001");
+  assert.equal(payload.memo, "for SO-AUTO-APPROVE",
+    "Auto Transfer must send only the concise Sales Order reference in the NetSuite memo");
+  assert.match(serverSource, /salesOrderRef:\s*batch\.salesOrderRef/,
+    "ambiguous-create recovery must search the new concise Sales Order memo");
 });
 
 test("Auto Transfer wires a separate approval PATCH after the status-free create POST", () => {

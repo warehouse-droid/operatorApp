@@ -20,6 +20,8 @@ import {
 import { updateSmartScmProposalLine } from "./smart-scm-proposal-editor.js";
 import { listSmartScmPlanningPauses } from "./smart-scm-repository.js";
 import { getSmartScmVendorWorkflowForProposal } from "./smart-scm-vendor-workflow-repository.js";
+import { smartScmAllocateBlanketCoverage } from "./smart-scm-blanket-coverage.js";
+import { listSmartScmBlanketPoolRows } from "./smart-scm-blanket-pool-repository.js";
 
 const migrationUrl = new URL("../migrations/097_smart_scm_blanket_orders.sql", import.meta.url);
 const migrationSource = await fs.readFile(migrationUrl, "utf8");
@@ -41,6 +43,11 @@ const sourcePoId = baseId + 1;
 const sourceLineId = baseId + 2;
 const candidatePoId = baseId + 3;
 const itemId = baseId + 4;
+const palletItemId = baseId + 5;
+const sourcePalletLineId = baseId + 6;
+const olderPalletLineId = baseId + 7;
+const salesOrderId = baseId + 8;
+const salesLineId = baseId + 9;
 const sourcePoRef = `BLANKET-WORKFLOW-${seed}`;
 const candidatePoRef = `BLANKET-CANDIDATE-${seed}`;
 const splitPoRef = `BLANKET-RELEASE-${seed}`;
@@ -127,11 +134,20 @@ try {
          quantity, unit, location_id, location, pallet_qty, layer_qty, section_qty,
          piece_qty, to_plt, to_lyr, to_sec, to_pcs, netsuite_received_qty,
          netsuite_received_baseline_qty, netsuite_active, synced_at, item_weight, raw
-       ) VALUES (
+       ) VALUES
+       (
+         $7,$2,5,$6,'PALLET','PALLET','Older official PALLET batch',50,'EACH',1,'3445',
+         0,0,0,0,0,0,0,0,0,0,true,now(),40,'{}'::jsonb
+       ),
+       (
          $1,$2,10,$3,$4,$4,'Exact source-line harness item',100,'EA',1,'3445',
          10,0,0,0,10,0,0,0,0,0,true,now(),100,'{}'::jsonb
+       ),
+       (
+         $5,$2,11,$6,'PALLET','PALLET','Official PALLET for Blanket releases',100,'EACH',1,'3445',
+         0,0,0,0,0,0,0,0,0,0,true,now(),40,'{}'::jsonb
        )`,
-      [sourceLineId, sourcePoId, itemId, `BLANKET-ITEM-${seed}`]
+      [sourceLineId, sourcePoId, itemId, `BLANKET-ITEM-${seed}`, sourcePalletLineId, palletItemId, olderPalletLineId]
     );
     await query(
       `INSERT INTO inventory_items (
@@ -180,6 +196,8 @@ try {
     assert.equal(automaticPauses[0].itemId, itemId);
     assert.equal(automaticPauses[0].availablePallets, 10);
     assert.deepEqual(automaticPauses[0].sourcePoRefs, [sourcePoRef]);
+    assert.equal(automaticPauses[0].planningEffect, "quantity_offset");
+    assert.equal(automaticPauses[0].ordinaryPlanningActive, true);
     const combinedPauses = await listSmartScmPlanningPauses({ search: `BLANKET-ITEM-${seed}`, limit: 20 });
     assert.equal(combinedPauses.blanketCount, 1);
     assert.equal(combinedPauses.combinedActiveCount, 1,
@@ -213,18 +231,21 @@ try {
         plant: `Blanket Vendor Yard ${seed}`
       }
     };
-    const planningDrafts = smartScmBuildPlanningDrafts({
+    const sharedPoolRows = await listSmartScmBlanketPoolRows({
+      isBlanket: true,
+      sourcePoId,
+      limit: 20
+    });
+    const allocatedCoverage = smartScmAllocateBlanketCoverage({
       states: [
         {
           ...stateBase,
           key: `${itemId}:1`,
-          requiredPallets: 2,
+          requiredPallets: 12,
           policy: {
             ...stateBase.policy,
             location_id: 1,
-            yard_code: "3445",
-            blanket_available_pallets: 10,
-            blanket_po_planning_excluded: true
+            yard_code: "3445"
           }
         },
         {
@@ -234,13 +255,75 @@ try {
           policy: { ...stateBase.policy, location_id: 28, yard_code: "2967" }
         }
       ],
-      supplyMap: new Map(),
+      poolRows: sharedPoolRows
+    });
+    const coveredDestination = allocatedCoverage.states.find((state) => state.policy.location_id === 1);
+    assert.equal(coveredDestination.blanketCoveragePallets, 10,
+      "The shared database pool must credit all ten compatible Blanket pallets.");
+    assert.equal(coveredDestination.residualRequiredPallets, 2,
+      "Demand beyond the shared Blanket pool must remain in ordinary planning.");
+    assert.deepEqual(coveredDestination.blanketSourcePoRefs, [sourcePoRef]);
+    const planningDrafts = smartScmBuildPlanningDrafts({
+      states: allocatedCoverage.states,
+      supplyMap: new Map([[String(itemId), { status: "out_of_stock", available_pallets: 0 }]]),
       settings: { truck_capacity_lbs: 78000, hold_load_ratio: 0.5, vendor_response_sla_hours: 24 }
     });
     assert.equal(planningDrafts.drafts.some((draft) => draft.proposalType === "PO"), false,
-      "Available Blanket balance must auto-pause ordinary PO proposals for the item.");
+      "An out-of-stock vendor must not create a PO for the uncovered residual.");
     assert.equal(planningDrafts.drafts.some((draft) => draft.proposalType === "TO"), true,
-      "Blanket auto-pause must still allow a safe internal TO for the item.");
+      "The uncovered two-pallet residual must follow the existing safe TO route.");
+    assert.equal(planningDrafts.drafts.flatMap((draft) => draft.lines)
+      .reduce((sum, line) => sum + Number(line.proposedPallets), 0), 2);
+
+    await query(
+      `UPDATE purchase_order_lines
+          SET netsuite_received_baseline_qty = 10
+        WHERE id = $1`,
+      [sourceLineId]
+    );
+    const afterReceipt = await smartScmAvailableBlanketBalanceByItem();
+    assert.equal(afterReceipt.get(String(itemId))?.availablePallets, 9,
+      "Received sales quantity must be removed before Blanket coverage is calculated.");
+    await query(
+      `UPDATE purchase_order_lines
+          SET netsuite_received_baseline_qty = 0
+        WHERE id = $1`,
+      [sourceLineId]
+    );
+
+    await query(
+      `INSERT INTO sales_orders (
+         netsuite_id, tranid, trandate, status, status_text, netsuite_active, synced_at
+       ) VALUES ($1,$2,current_date,'pendingFulfillment','Sales Order : Pending Fulfillment',true,now())`,
+      [salesOrderId, `BLANKET-SALES-${seed}`]
+    );
+    await query(
+      `INSERT INTO sales_order_lines (
+         id, sales_order_id, line_id, item_id, item_name, sku, quantity, unit,
+         pallet_qty, to_plt, netsuite_active, synced_at
+       ) VALUES ($1,$2,1,$3,$4,$4,10,'EA',1,10,true,now())`,
+      [salesLineId, salesOrderId, itemId, `BLANKET-ITEM-${seed}`]
+    );
+    const salesAllocation = await query(
+      `INSERT INTO dispatch_so_po_allocations (
+         sales_order_id, sales_order_ref, sales_line_id,
+         po_order_id, po_order_ref, po_line_id,
+         item_id, item_name, sku, allocated_pallet_qty, allocated_sales_qty,
+         status, created_by, dispatch_target_ref, dispatch_target_kind,
+         dispatch_target_line_key
+       ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$8,1,10,'active',$9,$2,'normal',$10)
+       RETURNING id`,
+      [salesOrderId, `BLANKET-SALES-${seed}`, salesLineId, sourcePoId, sourcePoRef,
+        sourceLineId, itemId, `BLANKET-ITEM-${seed}`, actor,
+        `BLANKET-SALES-${seed}::${salesLineId}`]
+    );
+    const afterSalesAllocation = await smartScmAvailableBlanketBalanceByItem();
+    assert.equal(afterSalesAllocation.get(String(itemId))?.availablePallets, 9,
+      "Active Sales allocation must be removed before Blanket coverage is calculated.");
+    await query(
+      `UPDATE dispatch_so_po_allocations SET status = 'cancelled' WHERE id = $1`,
+      [salesAllocation.rows[0].id]
+    );
 
     const run = await query(
       `INSERT INTO scm_smart_planning_runs (
@@ -603,8 +686,19 @@ try {
     const finalized = await finalizeSmartScmBlanketVendorWorkflow(proposalId, finalizePayload, actor);
     assert.equal(finalized.release.status, "partially_released");
     assert.equal(finalized.release.splitPoRef, splitPoRef);
-    assert.equal(finalized.split.lines.length, 2, "One local split must support multiple destination yards.");
-    assert.deepEqual(finalized.split.lines.map((line) => line.destinationLocationId).sort((a, b) => a - b), [1, 15]);
+    const finalizedMaterialLines = finalized.split.lines.filter((line) => String(line.itemName).toUpperCase() !== "PALLET");
+    const finalizedPalletLines = finalized.split.lines.filter((line) => String(line.itemName).toUpperCase() === "PALLET");
+    assert.equal(finalizedMaterialLines.length, 2, "One local split must support multiple destination yards.");
+    assert.deepEqual(finalizedMaterialLines.map((line) => line.destinationLocationId).sort((a, b) => a - b), [1, 15]);
+    assert.deepEqual(
+      finalizedPalletLines
+        .map((line) => [line.destinationLocationId, line.quantity])
+        .sort((left, right) => left[0] - right[0]),
+      [[1, 1], [15, 1]],
+      "Every confirmed Blanket destination must receive its derived official PALLET line."
+    );
+    assert(finalizedPalletLines.every((line) => line.sourceLineId === sourcePalletLineId),
+      "PALLET lineage must use the nearest following PALLET row from the selected material line batch.");
     assert(finalized.conservation.every((entry) => entry.conserved));
     assert(finalized.proposal.lines.every((line) => line.reason?.vendorReplyDraft?.decision === "hold"));
     assert(finalized.proposal.lines.every((line) => Number(line.reason?.vendorReplyDraft?.decisionPallets) === 1),
@@ -717,9 +811,24 @@ try {
       [sourcePoId, splitPoRef]
     );
     assert.equal(oneExtendedSplit.rowCount, 1);
-    assert.equal(oneExtendedSplit.rows[0].line_count, 2);
+    assert.equal(oneExtendedSplit.rows[0].line_count, 4);
     assert.equal(Number(oneExtendedSplit.rows[0].pallets), 3,
       "Later confirmed held quantity must extend the same local multi-yard split.");
+    const extendedPalletLines = await query(
+      `SELECT child.location_id, child.quantity
+         FROM dispatch_scm_po_splits split
+         JOIN purchase_order_lines child ON child.purchase_order_id = split.split_po_id
+        WHERE split.source_po_id = $1
+          AND split.split_po_ref = $2
+          AND UPPER(BTRIM(COALESCE(NULLIF(child.sku, ''), child.item_name, ''))) = 'PALLET'
+        ORDER BY child.location_id`,
+      [sourcePoId, splitPoRef]
+    );
+    assert.deepEqual(
+      extendedPalletLines.rows.map((line) => [Number(line.location_id), Number(line.quantity)]),
+      [[1, 2], [15, 1]],
+      "A later Blanket confirmation must extend the matching PALLET destination line without duplicating it."
+    );
 
     const releasedWorkspace = await listSmartScmBlanketWorkspace({ limit: 20 });
     const releasedSource = releasedWorkspace.blanketOrders.find((order) => order.orderRef === sourcePoRef);
