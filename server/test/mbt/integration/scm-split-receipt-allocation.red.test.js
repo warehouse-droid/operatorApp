@@ -53,6 +53,7 @@ async function seedFamily({
   receiptLocationId,
   materialReceiptQty = 1569,
   palletReceiptQty = 15,
+  splitMaterialQty = 1569,
   scheduleStatus = "Planned"
 }) {
   const parentId = 8_700_000_000 + seed + suffix;
@@ -84,7 +85,7 @@ async function seedFamily({
         0, 'EA', 1, '3445', true, $7::jsonb),
        ($1, $3, 920002, 'PALLET', 'PALLET', 15,
         0, 'EA', 1, '3445', true, $8::jsonb),
-       ($4, $5, 920001, 'Split material', 'SPLIT-MATERIAL', 1569,
+       ($4, $5, 920001, 'Split material', 'SPLIT-MATERIAL', $11,
         0, 'EA', 15, '12441', true, $9::jsonb),
        ($4, $6, 920002, 'PALLET', 'PALLET', 15,
         0, 'EA', 15, '12441', true, $10::jsonb)
@@ -109,7 +110,8 @@ async function seedFamily({
         identityStatus: "exact"
       }),
       JSON.stringify({ identityStatus: "exact" }),
-      JSON.stringify({ identityStatus: "exact" })
+      JSON.stringify({ identityStatus: "exact" }),
+      splitMaterialQty
     ]
   );
   const lineId = (purchaseOrderId, lineKey) => Number(lines.rows.find((row) =>
@@ -119,8 +121,8 @@ async function seedFamily({
   const split = await query(
     `INSERT INTO dispatch_scm_po_splits (
        source_po_id, source_po_ref, split_po_id, split_po_ref,
-       status, created_by
-     ) VALUES ($1, $2, $3, $4, 'active', $5)
+       status, created_by, created_at
+     ) VALUES ($1, $2, $3, $4, 'active', $5, TIMESTAMPTZ '2026-08-26 00:00:00+00')
      RETURNING id`,
     [parentId, parentRef, childId, childRef, actor]
   );
@@ -129,14 +131,15 @@ async function seedFamily({
        split_id, source_line_id, split_line_id, item_id, sku, item_name,
        sales_qty, requested_sales_qty, unit
      ) VALUES
-       ($1, $2, $3, 920001, 'SPLIT-MATERIAL', 'Split material', 1569, 1569, 'EA'),
+       ($1, $2, $3, 920001, 'SPLIT-MATERIAL', 'Split material', $6, $6, 'EA'),
        ($1, $4, $5, 920002, 'PALLET', 'PALLET', 15, 15, 'EA')`,
     [
       Number(split.rows[0].id),
       lineId(parentId, materialLineKey),
       lineId(childId, -materialLineKey),
       lineId(parentId, palletLineKey),
-      lineId(childId, -palletLineKey)
+      lineId(childId, -palletLineKey),
+      splitMaterialQty
     ]
   );
   await query(
@@ -185,11 +188,15 @@ async function seedFamily({
   return { parentId, childRef };
 }
 
-test("split receipt calculation uses child destination and rejects only genuine wrong-yard quantity", async () => {
+test("completed split receipt calculation uses child destination and rejects only genuine wrong-yard quantity", async () => {
   const rollback = await beginRollbackContext();
   try {
     await rollback.run(async () => {
-      const valid = await seedFamily({ suffix: 10, receiptLocationId: 15 });
+      const valid = await seedFamily({
+        suffix: 10,
+        receiptLocationId: 15,
+        scheduleStatus: "Completed"
+      });
       const validResult = await reconcileScmOrderFamily({
         kind: "PO",
         sourceOrderId: valid.parentId,
@@ -231,26 +238,82 @@ test("split receipt calculation uses child destination and rejects only genuine 
   }
 });
 
-test("inferred partial receipt cannot promote a planned child or regress a completed child", async () => {
+test("historical inferred receipt reopens an unfinished Partially Done child as Queued", async () => {
   const rollback = await beginRollbackContext();
   try {
     await rollback.run(async () => {
       const planned = await seedFamily({
         suffix: 30,
-        receiptLocationId: 15,
+        receiptLocationId: 1,
         materialReceiptQty: 500,
         palletReceiptQty: 0,
-        scheduleStatus: "Planned"
+        splitMaterialQty: 500,
+        scheduleStatus: "Partially Done"
       });
-      const plannedResult = await reconcileScmOrderFamily({
+      const firstResult = await reconcileScmOrderFamily({
         kind: "PO",
         sourceOrderId: planned.parentId,
         source: "manual"
       });
-      assert.equal(plannedResult.targets[planned.childRef].received, 500);
-      assert.deepEqual(plannedResult.targets[planned.childRef].allocationMethods, ["inferred"]);
-      assert.equal(plannedResult.targets[planned.childRef].evidencedReceived, 0);
-      assert.equal(plannedResult.targets[planned.childRef].applicationStatus, "Planned");
+      assert.equal(firstResult.reconciliationStatus, "ok");
+      assert.equal(firstResult.targets[planned.childRef].received, 0);
+      assert.deepEqual(firstResult.targets[planned.childRef].allocationMethods, []);
+      assert.equal(firstResult.targets[planned.childRef].evidencedReceived, 0);
+      assert.equal(firstResult.targets[planned.childRef].applicationStatus, "Queued");
+
+      const staleState = await query(
+        `SELECT id, quantity_summary
+           FROM scm_reconciliation_order_state
+          WHERE order_kind = 'PO' AND source_order_netsuite_id = $1`,
+        [planned.parentId]
+      );
+      const staleSummary = structuredClone(staleState.rows[0].quantity_summary);
+      staleSummary.targets[planned.childRef] = {
+        ...staleSummary.targets[planned.childRef],
+        applicationStatus: "Completed",
+        reconciliationStatus: "ok",
+        received: 515,
+        remaining: 0,
+        allocationMethods: ["inferred"],
+        exactAllocation: false,
+        evidencedReceived: 0
+      };
+      await query(
+        `UPDATE scm_reconciliation_order_state
+            SET application_status = 'Completed',
+                quantity_summary = $2::jsonb,
+                reconciled_at = now(),
+                updated_at = now()
+          WHERE id = $1`,
+        [staleState.rows[0].id, JSON.stringify(staleSummary)]
+      );
+
+      const corrected = await reconcileScmOrderFamily({
+        kind: "PO",
+        sourceOrderId: planned.parentId,
+        source: "manual"
+      });
+      assert.equal(corrected.reconciliationStatus, "ok");
+      assert.deepEqual(
+        {
+          ordered: corrected.targets[planned.childRef].ordered,
+          received: corrected.targets[planned.childRef].received,
+          remaining: corrected.targets[planned.childRef].remaining,
+          status: corrected.targets[planned.childRef].applicationStatus
+        },
+        { ordered: 515, received: 0, remaining: 515, status: "Queued" }
+      );
+
+      const projectedQueued = await listScmSchedule({
+        search: planned.childRef,
+        kind: "PO",
+        audience: "scm"
+      });
+      const queuedChild = projectedQueued.find((row) => row.orderRef === planned.childRef);
+      assert.equal(queuedChild?.status, "Partially Done",
+        "the raw operational observation remains available for audit");
+      assert.equal(queuedChild?.calculatedStatus, "Queued",
+        "the SCM-facing effective status must correct the stale inferred progress");
 
       const completed = await seedFamily({
         suffix: 40,
@@ -274,8 +337,8 @@ test("inferred partial receipt cannot promote a planned child or regress a compl
           WHERE order_kind = 'PO' AND source_order_netsuite_id = $1`,
         [completed.parentId]
       );
-      const staleSummary = structuredClone(completedState.rows[0].quantity_summary);
-      staleSummary.targets[completed.childRef].applicationStatus = "Partially Done";
+      const staleCompletedSummary = structuredClone(completedState.rows[0].quantity_summary);
+      staleCompletedSummary.targets[completed.childRef].applicationStatus = "Partially Done";
       await query(
         `UPDATE scm_reconciliation_order_state
             SET application_status = 'Partially Done',
@@ -283,7 +346,7 @@ test("inferred partial receipt cannot promote a planned child or regress a compl
                 reconciled_at = now(),
                 updated_at = now()
           WHERE id = $1`,
-        [completedState.rows[0].id, JSON.stringify(staleSummary)]
+        [completedState.rows[0].id, JSON.stringify(staleCompletedSummary)]
       );
       await query(
         `UPDATE scm_transport_schedule
@@ -300,7 +363,7 @@ test("inferred partial receipt cannot promote a planned child or regress a compl
         source: "manual"
       });
       assert.equal(replayedCompleted.targets[completed.childRef].applicationStatus, "Completed",
-        "an older saved local Completed status must survive a newer inferred reconciliation target");
+        "an authoritative local Completed status must survive inferred redistribution");
 
       await query(
         `UPDATE scm_transport_schedule
@@ -316,7 +379,7 @@ test("inferred partial receipt cannot promote a planned child or regress a compl
       });
       const projectedCompleted = projected.find((row) => row.orderRef === completed.childRef);
       assert.equal(projectedCompleted?.calculatedStatus, "Completed",
-        "local Completed must remain the displayed status while review stays metadata");
+        "authoritative Completed must remain displayed while review stays metadata");
     });
   } finally {
     await rollback.rollback();

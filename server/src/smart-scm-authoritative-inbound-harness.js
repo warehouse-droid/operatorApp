@@ -21,6 +21,7 @@ assert.deepEqual(
     authoritativeOnOrderSales: 1_000,
     blanketExcludedSales: 600,
     excludedTransferOrderSales: 100,
+    releasedSplitInboundSales: 0,
     reservedBlanketSales: 50,
     pendingTransferReservationSales: 20,
     // This deliberately looks like the old local-line input. It must have no
@@ -31,6 +32,7 @@ assert.deepEqual(
     authoritativeOnOrderSales: 1_000,
     blanketExcludedSales: 600,
     excludedTransferOrderSales: 100,
+    releasedSplitInboundSales: 0,
     reservedBlanketSales: 50,
     pendingTransferReservationSales: 20,
     effectiveOnOrderSales: 370
@@ -61,6 +63,7 @@ assert.deepEqual(
     authoritativeOnOrderSales: 1_000,
     blanketExcludedSales: 600,
     excludedTransferOrderSales: 0,
+    releasedSplitInboundSales: 0,
     reservedBlanketSales: 0,
     pendingTransferReservationSales: 0,
     effectiveOnOrderSales: 400,

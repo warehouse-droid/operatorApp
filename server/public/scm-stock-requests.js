@@ -252,10 +252,24 @@ function scmStockTransferList(request) {
   return `<div class="stock-request-tabs">${request.transfers.map((transfer) => `<button data-scm-stock-action="select-transfer" data-transfer-id="${Number(transfer.id)}" aria-selected="${Number(scmStockSelectedTransfer()?.id) === Number(transfer.id)}" type="button">${scmStockEscape(transfer.transferRef)} · ${scmStockEscape(transfer.sourceName)} → ${scmStockEscape(transfer.destinationName)}</button>`).join("")}</div>`;
 }
 
-function scmStockTransferLine(line) {
+function scmStockCanRestructureTransfer(transfer) {
+  return transfer.status === "pending_local"
+    && transfer.confirmationStatus === "idle"
+    && !transfer.confirmationRequestId
+    && !transfer.netsuiteTransferOrderId
+    && !transfer.netsuiteTransferOrderRef
+    && !transfer.printJobId
+    && !transfer.printGeneration;
+}
+
+function scmStockTransferLine(line, { canEditQuantities, canEditStructure } = {}) {
   return `<article class="stock-request-line" data-scm-stock-transfer-line-id="${Number(line.id)}">
     <header><div><strong>${scmStockEscape(line.itemName)}</strong><div class="stock-request-muted">${scmStockEscape(line.itemDescription || "")}</div></div><strong>${scmStockNumber(line.salesQty)} ${scmStockEscape(line.salesUom)}</strong></header>
-    <div class="stock-request-line-fields">${scmStockQuantityInputs(line, "transfer", line.disabled === true)}</div>
+    <div class="stock-request-line-fields">
+      <label><span>Outbound location</span><select data-scm-stock-transfer-source ${canEditStructure ? "" : "disabled"}>${scmStockSourceOptions(line)}</select></label>
+      ${scmStockQuantityInputs(line, "transfer", !canEditQuantities)}
+    </div>
+    ${canEditStructure ? `<label class="stock-request-line-removal"><input data-scm-stock-remove-transfer-line type="checkbox" /> <span>Remove from this TO <small>Returns this line to the Request queue.</small></span></label>` : ""}
   </article>`;
 }
 
@@ -266,6 +280,7 @@ function scmStockPendingToDetail() {
   const transfer = scmStockSelectedTransfer();
   scmStockState.selectedTransferId = transfer.id;
   const canEdit = !["partially_fulfilled", "pending_receipt", "received", "cancelled", "closed"].includes(transfer.status);
+  const canEditStructure = scmStockCanRestructureTransfer(transfer);
   const canConfirm = ["pending_local", "attention"].includes(transfer.status);
   const hasPrinted = Boolean(transfer.printJobId || transfer.printGeneration);
   const canRejectPending = transfer.status === "pending_local"
@@ -294,12 +309,15 @@ function scmStockPendingToDetail() {
     ${transfer.printInvalidatedAt ? `<div class="stock-request-notice">The prior ticket was invalidated by a quantity change. Save/sync, then use Re-print.</div>` : ""}
     ${request.remarks ? `<div class="stock-request-notice"><strong>Sales remark:</strong> ${scmStockEscape(request.remarks)}</div>` : ""}
     ${scmStockBackorderNotice(transfer.lines, { transfer })}
-    <section class="stock-request-section"><h3>TO material quantities</h3><div class="stock-request-lines">${transfer.lines.map((line) => scmStockTransferLine({ ...line, disabled: !canEdit })).join("")}</div></section>
+    <section class="stock-request-section"><h3>TO material lines</h3>
+      ${canEditStructure ? `<div class="stock-request-notice">Change a line's outbound location to move it into a separate local Pending TO for that route. Remove a line to return it to the Request queue. These route changes are available before Confirm TO + Print.</div>` : ""}
+      <div class="stock-request-lines">${transfer.lines.map((line) => scmStockTransferLine(line, { canEditQuantities: canEdit, canEditStructure })).join("")}</div>
+    </section>
     <div class="stock-request-line-fields">
       <label><span>Official PALLET item quantity${transfer.palletQuantityRequiresManual ? " · required manual final value" : ""}</span><input data-scm-stock-pallet type="number" min="0" step="any" value="${scmStockEscape(transfer.palletQuantity)}" ${canEdit ? "" : "disabled"} /></label>
     </div>
     <div class="stock-request-actions">
-      <button data-scm-stock-action="save-transfer" type="button" ${canEdit ? "" : "disabled"}>Save TO quantities</button>
+      <button data-scm-stock-action="save-transfer" type="button" ${canEdit ? "" : "disabled"}>Save TO changes</button>
       <button class="primary" data-scm-stock-action="confirm-print" type="button" ${canConfirm ? "" : "disabled"}>Confirm TO + Print</button>
       ${hasPrinted || transfer.netsuiteTransferOrderId ? `<button data-scm-stock-action="reprint" type="button" ${transfer.netsuiteTransferOrderId ? "" : "disabled"}>Re-print</button>` : ""}
       ${scmStockState.queue === "pending_to" ? `<button class="danger" data-scm-stock-action="reject-pending-to" title="${canRejectPending ? "Reject this local Pending TO" : "Only available before Confirm TO + Print"}" type="button" ${canRejectPending ? "" : "disabled"}>Reject Pending TO</button>` : ""}
@@ -512,7 +530,12 @@ function scmStockTransferPayload() {
   const transfer = scmStockSelectedTransfer();
   const lines = [...scmStockRequestApp.querySelectorAll("[data-scm-stock-transfer-line-id]")].map((container) => {
     const line = transfer.lines.find((candidate) => Number(candidate.id) === Number(container.dataset.scmStockTransferLineId));
-    return { requestLineId: line.id, ...scmStockQuantityPayload(container, line) };
+    return {
+      requestLineId: line.id,
+      sourceLocationId: Number(container.querySelector("[data-scm-stock-transfer-source]")?.value || transfer.sourceLocationId),
+      remove: container.querySelector("[data-scm-stock-remove-transfer-line]")?.checked === true,
+      ...scmStockQuantityPayload(container, line)
+    };
   });
   return {
     expectedRevision: transfer.revision,
@@ -534,6 +557,15 @@ scmStockRequestApp.addEventListener("input", (event) => {
 });
 
 scmStockRequestApp.addEventListener("change", (event) => {
+  if (event.target.matches("[data-scm-stock-remove-transfer-line]")) {
+    const container = event.target.closest("[data-scm-stock-transfer-line-id]");
+    const removed = event.target.checked;
+    container?.querySelectorAll("[data-scm-stock-transfer-source], [data-scm-stock-quantity]").forEach((field) => {
+      field.disabled = removed;
+    });
+    container?.classList.toggle("stock-request-line-removed", removed);
+    return;
+  }
   if (event.target.matches("[data-scm-stock-filter]")) {
     scmStockState[event.target.dataset.scmStockFilter] = event.target.value;
     scmStockLoad({ preserveSelection: false }).catch((error) => {
@@ -618,12 +650,29 @@ scmStockRequestApp.addEventListener("click", async (event) => {
     }
     if (action === "save-transfer") {
       const transfer = scmStockSelectedTransfer();
+      const payload = scmStockTransferPayload();
+      const hasStructureChanges = payload.lines.some((line) => line.remove
+        || Number(line.sourceLocationId) !== Number(transfer.sourceLocationId));
       const result = await scmStockApi(`/api/scm/stock-transfers/${transfer.id}`, {
         method: "PATCH",
-        body: JSON.stringify(scmStockTransferPayload())
+        body: JSON.stringify(payload)
       });
       scmStockState.detail = await scmStockApi(`/api/scm/stock-requests/${result.transfer.requestId}`);
-      scmStockState.notice = "TO quantities saved. Any quantity above current availability is retained as backorder.";
+      const activeTransfers = scmStockState.detail.transfers.filter((candidate) =>
+        !["received", "cancelled", "closed"].includes(candidate.status)
+      );
+      scmStockState.notice = hasStructureChanges
+        ? "TO changes saved. Changed outbound locations were separated into the correct local Pending TOs; removed lines returned to Request. Review each TO's PALLET quantity before confirmation."
+        : "TO quantities saved. Any quantity above current availability is retained as backorder.";
+      if (!activeTransfers.length) {
+        scmStockState.queue = "request";
+        scmStockState.selectedTransferId = null;
+        localStorage.setItem("mbbs.scm.stockRequests.queue", "request");
+        return scmStockLoad({ preserveSelection: true });
+      }
+      if (!activeTransfers.some((candidate) => Number(candidate.id) === Number(scmStockState.selectedTransferId))) {
+        scmStockState.selectedTransferId = activeTransfers[0].id;
+      }
       return renderScmStockRequests();
     }
     if (action === "confirm-print") {

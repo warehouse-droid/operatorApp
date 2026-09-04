@@ -3,11 +3,16 @@ import { readFile } from "node:fs/promises";
 import {
   canViewRestrictedScmOrders,
   filterRestrictedScmOrders,
+  isCompletedScmOrder,
+  isDispatchExplicitSearchVisibleScmOrder,
   isRestrictedScmOrder
 } from "./scm-order-visibility.js";
 import { changedPlacedDispatchScmAssignmentRefs } from "./dispatch-scm-placement.js";
 
-const serverSource = await readFile(new URL("./server.js", import.meta.url), "utf8");
+const [serverSource, dispatchUiSource] = await Promise.all([
+  readFile(new URL("./server.js", import.meta.url), "utf8"),
+  readFile(new URL("../public/dispatch.js", import.meta.url), "utf8")
+]);
 
 function sourceSection(source, startMarker, endMarker, label) {
   const start = source.indexOf(startMarker);
@@ -43,8 +48,8 @@ function assertLateVisibilityGate(section, label, {
     if (historicalFilterAt > enrichmentAt) {
       assert.match(
         serverSource,
-        /function filterDispatchPlanningVisibleOrders\(orders = \[\]\) \{[\s\S]*?historicalReconciliationComplete === true \|\| !isRestrictedScmOrder\(order\)/,
-        `${label} historical visibility must allow only explicitly reconciled history rows through the restricted-order gate.`
+        /function filterDispatchPlanningVisibleOrders\([\s\S]*?historicalReconciliationComplete === true[\s\S]*?isDispatchExplicitSearchVisibleScmOrder\(order\)[\s\S]*?!isRestrictedScmOrder\(order\)/,
+        `${label} must preserve historical access and narrowly allow completed explicit-search results.`
       );
     } else {
       assert.match(
@@ -140,6 +145,20 @@ for (const row of normalRows) {
     `${row.id} must remain visible to non-SCM roles.`
   );
 }
+
+assert.equal(isCompletedScmOrder({ type: "PO", scm: { status: "Completed" } }), true);
+assert.equal(isCompletedScmOrder({ type: "TO", reconciliationApplicationStatus: "Complete" }), true);
+assert.equal(isCompletedScmOrder({ type: "PO", scm: { status: "Queued" }, initialScmStatus: "Completed" }), false,
+  "A current Queued status must override an old completed intake status.");
+assert.equal(isDispatchExplicitSearchVisibleScmOrder({ type: "PO", scm: { status: "Completed" } }), true);
+assert.equal(isDispatchExplicitSearchVisibleScmOrder({ type: "TO", scm: { status: "Complete" } }), true);
+assert.equal(isDispatchExplicitSearchVisibleScmOrder({ type: "PO", scm: { status: "Hold" } }), false);
+assert.equal(isDispatchExplicitSearchVisibleScmOrder({ type: "TO", scm: { status: "Cancelled" } }), false);
+assert.equal(
+  isDispatchExplicitSearchVisibleScmOrder({ type: "PO", isBlanketPo: true, scm: { status: "Completed" } }),
+  false,
+  "Completed Blanket POs must remain hidden from Dispatch search."
+);
 
 const mixedRows = [...normalRows, ...restrictedRows];
 assert.deepEqual(
@@ -290,6 +309,19 @@ assert(
   !dispatchResponse.includes("req.query.includeRestricted")
     && !dispatchResponse.includes("req.query.includeHiddenScm"),
   "Dispatch restricted-order visibility must not be enabled by a request query parameter."
+);
+assert(
+  dispatchResponse.includes("revealCompletedScmSearch")
+    && dispatchResponse.includes("dispatchPlanningRestricted")
+    && dispatchResponse.includes("dispatchPlanningRestrictionReason"),
+  "Explicit Dispatch searches must return completed PO/TO records as clearly marked search-only rows."
+);
+assert(
+  dispatchUiSource.includes("isDispatchPlanningRestricted")
+    && dispatchUiSource.includes('data-planning-restricted="${planningRestricted ? "true" : "false"}"')
+    && dispatchUiSource.includes("Completed · search only")
+    && dispatchUiSource.includes('type === "drop" && isDispatchPlanningRestricted(order)'),
+  "Completed Dispatch search results must be visibly read-only and blocked from load placement."
 );
 assert(
   !staffScheduleResponse.includes("req.query.includeRestricted"),

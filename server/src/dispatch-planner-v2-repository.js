@@ -4,6 +4,7 @@ import { query, withTransaction } from "./db.js";
 import { canonicalizeDispatchCoGroupIdentities } from "./dispatch-co-group-identity.js";
 import {
   deactivateDispatchGlobalOrderDefinitions,
+  reconcileDispatchPlanGlobalOrderDefinitions,
   syncDispatchDeliveryGroupsFromPlan
 } from "./dispatch-delivery-group-repository.js";
 import {
@@ -12,6 +13,7 @@ import {
 } from "./dispatch-co-lifecycle.js";
 import { DISPATCH_FLEET_PLANNING_LOCK } from "./dispatch-fleet-status.js";
 import { dispatchLoadAssignment } from "./dispatch-load-assignment.js";
+import { materializeDispatchPickupVisits } from "./dispatch-pickup-visits.js";
 import {
   dispatchPlannedAssignmentMap,
   dispatchPlanV2Summary
@@ -178,8 +180,17 @@ function publicPlan(plan = {}) {
   };
 }
 
-async function reconcileCancelledLocalCos(plan) {
-  return reconcileDispatchPlanLocalCos(plan);
+async function reconcileCancelledLocalCos(plan, options = {}) {
+  return reconcileDispatchPlanLocalCos(await reconcileDispatchPlanGlobalOrderDefinitions(plan, options));
+}
+
+async function syncDispatchPlanLoadProjection(plan = {}) {
+  // The load projection depends on Driver route materialization, whose module
+  // already participates in the Dispatch repository graph. Resolve it only at
+  // operation time so V2 commands can keep both assignment projections in the
+  // same transaction without introducing an ESM initialization cycle.
+  const { syncDispatchPlanLoadAssignments } = await import("./dispatch-load-assignment-repository.js");
+  return syncDispatchPlanLoadAssignments(plan, { allowBin: true });
 }
 
 async function selectPlan({ planId = "", date = "", lock = false } = {}) {
@@ -529,6 +540,22 @@ export async function listDispatchPlanOrderAssignmentsProjection({
       WHERE plan.status <> 'cancelled'
         AND (NULLIF($1, '') IS NULL OR assignment.plan_id <> NULLIF($1, '')::bigint)
         AND ($2 = '' OR assignment.plan_date <> $2::date)
+        AND NOT EXISTS (
+          SELECT 1
+            FROM dispatch_global_order_groups retired_group
+           WHERE retired_group.active = false
+             AND lower(retired_group.group_ref) IN (
+               lower(assignment.order_ref), lower(assignment.planned_order_ref)
+             )
+        )
+        AND NOT EXISTS (
+          SELECT 1
+            FROM dispatch_global_order_splits retired_split
+           WHERE retired_split.active = false
+             AND lower(retired_split.split_ref) IN (
+               lower(assignment.order_ref), lower(assignment.planned_order_ref)
+             )
+        )
         AND (
           cardinality($3::text[]) = 0
           OR lower(assignment.order_ref) = ANY($3::text[])
@@ -550,10 +577,32 @@ export async function listDispatchPlanOrderAssignmentsProjection({
   }));
 }
 
-export async function syncDispatchPlanOrderAssignments(plan = {}) {
+async function refreshDispatchAssignmentProjectionReadiness(runQuery = query) {
+  const result = await runQuery(
+    `UPDATE dispatch_order_catalog_state state
+        SET assignments_ready = NOT EXISTS (
+              SELECT 1
+                FROM dispatch_plans plan
+                LEFT JOIN dispatch_plan_projection_state projection
+                  ON projection.plan_id = plan.id
+               WHERE plan.status <> 'cancelled'
+                 AND (
+                   projection.plan_id IS NULL
+                   OR projection.source_revision <> COALESCE(plan.revision, 0)
+                 )
+            ),
+            updated_at = now()
+      WHERE state.singleton = true
+      RETURNING assignments_ready`
+  );
+  return result.rows[0]?.assignments_ready === true;
+}
+
+export async function syncDispatchPlanOrderAssignments(plan = {}, { execute = query } = {}) {
+  const runQuery = typeof execute === "function" ? execute : query;
   const rows = dispatchPlanAssignmentRows(plan);
-  await query("DELETE FROM dispatch_plan_order_assignments WHERE plan_id = $1", [plan.id]);
-  if (rows.length) {await query(
+  await runQuery("DELETE FROM dispatch_plan_order_assignments WHERE plan_id = $1", [plan.id]);
+  if (rows.length) {await runQuery(
     `INSERT INTO dispatch_plan_order_assignments (
        plan_id, plan_date, order_ref, planned_order_ref, assignment_kind,
        load_id, stop_id, assignment, updated_at
@@ -582,7 +631,7 @@ export async function syncDispatchPlanOrderAssignments(plan = {}) {
       assignment: row.assignment
     })))]
   );}
-  await query(
+  await runQuery(
     `INSERT INTO dispatch_plan_projection_state (plan_id, source_revision, projected_at)
      VALUES ($1, $2, now())
      ON CONFLICT (plan_id) DO UPDATE
@@ -590,13 +639,15 @@ export async function syncDispatchPlanOrderAssignments(plan = {}) {
            projected_at = now()`,
     [plan.id, Number(plan.revision || 0)]
   );
+  await refreshDispatchAssignmentProjectionReadiness(runQuery);
 }
 
-export async function syncDispatchPlanRelationEdges(plan = {}) {
+export async function syncDispatchPlanRelationEdges(plan = {}, { execute = query } = {}) {
+  const runQuery = typeof execute === "function" ? execute : query;
   const edges = extractDispatchOrderRelationEdges(plan);
-  await query("DELETE FROM dispatch_order_relation_edges WHERE plan_id = $1", [plan.id]);
+  await runQuery("DELETE FROM dispatch_order_relation_edges WHERE plan_id = $1", [plan.id]);
   if (!edges.length) {return;}
-  await query(
+  await runQuery(
     `INSERT INTO dispatch_order_relation_edges (
        plan_id, relation_type, owner_ref, member_ref, metadata, source_revision, updated_at
      )
@@ -616,56 +667,54 @@ export async function syncDispatchPlanRelationEdges(plan = {}) {
 
 export async function backfillDispatchPlanProjections({ batchSize = 25 } = {}) {
   const safeBatchSize = Math.min(Math.max(Number(batchSize) || 25, 1), 100);
-  let projected = 0;
-  let lastPlanId = 0;
-  while (true) {
-    const active = await query(
-      `SELECT p.id, p.plan_date::text AS plan_date, p.status, p.note, p.revision,
-              p.created_at, p.updated_at, s.saved_at, s.orders, s.trucks, s.summary,
-              s.schema_version
-         FROM dispatch_plans p
-         JOIN dispatch_plan_snapshots s ON s.plan_id = p.id
-         LEFT JOIN dispatch_plan_projection_state projection ON projection.plan_id = p.id
-        WHERE p.status <> 'cancelled'
-          AND p.id > $1
-          AND (
-            projection.plan_id IS NULL
-            OR projection.source_revision <> COALESCE(p.revision, 0)
-          )
-        ORDER BY p.id
-        LIMIT $2`,
-      [lastPlanId, safeBatchSize]
-    );
-    if (!active.rowCount) {break;}
-    for (const row of active.rows) {
-      const plan = rowPlan(row);
-      await withTransaction(async () => {
+  return withTransaction(async () => {
+    await query("SELECT pg_advisory_xact_lock(hashtext($1))", [DISPATCH_FLEET_PLANNING_LOCK]);
+    let projected = 0;
+    let lastPlanId = 0;
+    while (true) {
+      const active = await query(
+        `SELECT p.id, p.plan_date::text AS plan_date, p.status, p.note, p.revision,
+                p.created_at, p.updated_at, s.saved_at, s.orders, s.trucks, s.summary,
+                s.schema_version
+           FROM dispatch_plans p
+           JOIN dispatch_plan_snapshots s ON s.plan_id = p.id
+           LEFT JOIN dispatch_plan_projection_state projection ON projection.plan_id = p.id
+          WHERE p.status <> 'cancelled'
+            AND p.id > $1
+            AND (
+              projection.plan_id IS NULL
+              OR projection.source_revision <> COALESCE(p.revision, 0)
+            )
+          ORDER BY p.id
+          LIMIT $2
+          FOR UPDATE OF p, s`,
+        [lastPlanId, safeBatchSize]
+      );
+      if (!active.rowCount) {break;}
+      for (const row of active.rows) {
+        const plan = await reconcileCancelledLocalCos(rowPlan(row));
+        await syncDispatchPlanLoadProjection(plan);
         await syncDispatchPlanOrderAssignments(plan);
         await syncDispatchPlanRelationEdges(plan);
-      });
-      projected += 1;
-      lastPlanId = Number(row.id);
+        projected += 1;
+        lastPlanId = Number(row.id);
+      }
+      await new Promise((resolve) => setImmediate(resolve));
     }
-    await new Promise((resolve) => setImmediate(resolve));
-  }
-  const pending = await query(
-    `SELECT count(*)::int AS count
-       FROM dispatch_plans plan
-       LEFT JOIN dispatch_plan_projection_state projection ON projection.plan_id = plan.id
-      WHERE plan.status <> 'cancelled'
-        AND (
-          projection.plan_id IS NULL
-          OR projection.source_revision <> COALESCE(plan.revision, 0)
-        )`
-  );
-  const remaining = Number(pending.rows[0]?.count || 0);
-  await query(
-    `UPDATE dispatch_order_catalog_state
-        SET assignments_ready = $1, updated_at = now()
-      WHERE singleton = true`,
-    [remaining === 0]
-  );
-  return { projected, remaining, ready: remaining === 0 };
+    const pending = await query(
+      `SELECT count(*)::int AS count
+         FROM dispatch_plans plan
+         LEFT JOIN dispatch_plan_projection_state projection ON projection.plan_id = plan.id
+        WHERE plan.status <> 'cancelled'
+          AND (
+            projection.plan_id IS NULL
+            OR projection.source_revision <> COALESCE(plan.revision, 0)
+          )`
+    );
+    const remaining = Number(pending.rows[0]?.count || 0);
+    const ready = await refreshDispatchAssignmentProjectionReadiness();
+    return { projected, remaining, ready };
+  });
 }
 
 async function otherDateAssignment(plan, orderReference) {
@@ -676,6 +725,22 @@ async function otherDateAssignment(plan, orderReference) {
        JOIN dispatch_plans p ON p.id = assignment.plan_id
       WHERE assignment.plan_id <> $1
         AND p.status <> 'cancelled'
+        AND NOT EXISTS (
+          SELECT 1
+            FROM dispatch_global_order_groups retired_group
+           WHERE retired_group.active = false
+             AND lower(retired_group.group_ref) IN (
+               lower(assignment.order_ref), lower(assignment.planned_order_ref)
+             )
+        )
+        AND NOT EXISTS (
+          SELECT 1
+            FROM dispatch_global_order_splits retired_split
+           WHERE retired_split.active = false
+             AND lower(retired_split.split_ref) IN (
+               lower(assignment.order_ref), lower(assignment.planned_order_ref)
+             )
+        )
         AND lower(assignment.order_ref) = lower($2)
       ORDER BY assignment.plan_date DESC
       LIMIT 1`,
@@ -686,7 +751,7 @@ async function otherDateAssignment(plan, orderReference) {
 }
 
 async function assertOtherPlanAssignmentProjectionsReady(plan) {
-  const pending = await query(
+  const pendingAssignments = () => query(
     `SELECT other_plan.id::text AS plan_id,
             other_plan.plan_date::text AS plan_date,
             other_plan.revision::int AS revision,
@@ -704,6 +769,15 @@ async function assertOtherPlanAssignmentProjectionsReady(plan) {
       LIMIT 10`,
     [plan.id]
   );
+  let pending = await pendingAssignments();
+  if (!pending.rowCount) {return;}
+  try {
+    await backfillDispatchPlanProjections({ batchSize: 25 });
+  } catch {
+    // The command remains fail-closed below. A later maintenance tick can
+    // retry the same idempotent repair without risking a duplicate assignment.
+  }
+  pending = await pendingAssignments();
   if (!pending.rowCount) {return;}
   throw commandError(
     "Dispatch assignment index is still warming up. Retry after projection backfill completes.",
@@ -782,7 +856,7 @@ function commandOrderRefs(command = {}, plan = {}) {
 
 async function activityForPlan(planId) {
   const result = await query(
-    `SELECT status, load_id, stop_id, stop_type, order_refs
+    `SELECT status, load_id, stop_id, stop_type, order_refs, job_details
        FROM driver_job_records
       WHERE plan_id = $1
         AND status IN ('in_progress', 'complete')
@@ -843,7 +917,8 @@ export async function applyDispatchV2Command({ planId, command = {}, actorId = n
     throw commandError("commandId, commandType, and baseRevision are required.", "DISPATCH_COMMAND_INVALID", 400);
   }
   const hash = requestHash({ ...command, commandType });
-  return withTransaction(async () => {
+  let deferredAssignmentError = null;
+  const transactionResult = await withTransaction(async () => {
     await query("SELECT pg_advisory_xact_lock(hashtext($1))", [DISPATCH_FLEET_PLANNING_LOCK]);
     const plan = await selectPlan({ planId, lock: true });
     if (!plan) {throw commandError("Dispatch plan not found.", "DISPATCH_PLAN_NOT_FOUND", 404);}
@@ -857,13 +932,47 @@ export async function applyDispatchV2Command({ planId, command = {}, actorId = n
       };
     }
     await assertNoClosedNetSuiteOrders(commandOrderRefs({ ...command, commandType }, plan), "be changed in Dispatch");
-    await assertAssignmentDateAvailable(plan, { ...command, commandType });
+    try {
+      await assertAssignmentDateAvailable(plan, { ...command, commandType });
+    } catch (error) {
+      if ([
+        "DISPATCH_ASSIGNMENT_PROJECTION_NOT_READY",
+        "DISPATCH_ORDER_ALREADY_PLANNED"
+      ].includes(error?.code)) {
+        deferredAssignmentError = error;
+        return null;
+      }
+      throw error;
+    }
     const result = applyDispatchPlanCommand({
       plan,
       command: { ...command, type: commandType },
       receiptStore: createDispatchCommandReceiptStore()
     });
-    result.plan = await reconcileDispatchPlanLocalCos(result.plan);
+    const commandReactivatedRefs = [
+      ...(Array.isArray(command.payload?.reactivatedGlobalOrderRefs)
+        ? command.payload.reactivatedGlobalOrderRefs
+        : []),
+      ...(commandType === "group_orders"
+        ? [command.payload?.groupRef, result.patch?.group?.ref]
+        : []),
+      ...(commandType === "split_order"
+        ? (result.patch?.split?.parts || []).map((part) => part?.refNumber || part?.id)
+        : [])
+    ].map(text).filter(Boolean);
+    result.plan = await reconcileCancelledLocalCos(result.plan, {
+      reactivatedGlobalOrderRefs: commandReactivatedRefs,
+      rejectRetiredGlobalOrderRefs: true
+    });
+    const pickupVisits = materializeDispatchPickupVisits(result.plan, {
+      previousPlan: plan,
+      allowLegacyPassthrough: true
+    });
+    if (pickupVisits.conflicts.length) {
+      const first = pickupVisits.conflicts[0];
+      throw commandError(first.message, first.code, 409, { conflicts: pickupVisits.conflicts });
+    }
+    result.plan = pickupVisits.plan;
     result.plan.summary = dispatchPlanV2Summary(result.plan.summary || {}, {
       previousSummary: plan.summary || {},
       source: SNAPSHOT_SUMMARY_SAVE_SOURCE
@@ -949,12 +1058,19 @@ export async function applyDispatchV2Command({ planId, command = {}, actorId = n
         counts.stopCount
       ]
     );
+    // A V2 command may add, remove, move, or reassign a load. Keep the Driver
+    // execution/status projection atomic with the snapshot and order index.
+    // Load first so the order projection's readiness refresh observes both.
+    await syncDispatchPlanLoadProjection(result.plan);
     await syncDispatchPlanOrderAssignments(result.plan);
     await syncDispatchPlanRelationEdges(result.plan);
     if (command.compactReceipt === true) {await recordDispatchCommandCheckpointState(plan, result.plan);}
     // Operator reads this projection instead of the plan JSON. Keep it in the
     // command transaction so a refresh cannot resurrect a just-ungrouped order.
-    await syncDispatchDeliveryGroupsFromPlan(result.plan);
+    await syncDispatchDeliveryGroupsFromPlan(result.plan, {
+      reactivatedGlobalOrderRefs: commandReactivatedRefs,
+      rejectRetiredGlobalOrderRefs: true
+    });
     const retainedRefs = new Set((result.plan.orders || [])
       .map((order) => text(order?.id).toLowerCase())
       .filter(Boolean));
@@ -1015,6 +1131,8 @@ export async function applyDispatchV2Command({ planId, command = {}, actorId = n
     );
     return { payload, replay: false };
   });
+  if (deferredAssignmentError) {throw deferredAssignmentError;}
+  return transactionResult;
 }
 
 function checkpointResult(row = {}) {

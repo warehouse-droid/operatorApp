@@ -497,6 +497,10 @@ export function sanitizeDriverOfflineJob(job = {}) {
     "orderTypes",
     "dependencyPickupManifests",
     "requiredPhotos",
+    "retainedPhotoReferences",
+    "retainedPhotoCount",
+    "remainingRequiredPhotos",
+    "maxPhotos",
     "plannedStartMinute",
     "plannedFinishMinute",
     "sequence",
@@ -551,6 +555,23 @@ export function sanitizeDriverOfflineJob(job = {}) {
     sanitized.deliveryInstructions = sanitizeDeliveryInstructions(job.deliveryInstructions);
   }
   sanitized.requiredPhotos = Math.max(0, Math.min(100, Number(sanitized.requiredPhotos) || 0));
+  sanitized.retainedPhotoReferences = Array.isArray(sanitized.retainedPhotoReferences)
+    ? [...new Set(sanitized.retainedPhotoReferences
+        .slice(0, 20)
+        .map((value) => optionalText(value, { maxLength: 4096 }))
+        .filter((value) => value.startsWith("r2://")))]
+    : [];
+  sanitized.retainedPhotoCount = sanitized.retainedPhotoReferences.length;
+  sanitized.remainingRequiredPhotos = Math.max(
+    0,
+    Math.min(
+      sanitized.requiredPhotos,
+      Number.isFinite(Number(sanitized.remainingRequiredPhotos))
+        ? Math.floor(Number(sanitized.remainingRequiredPhotos))
+        : sanitized.requiredPhotos - sanitized.retainedPhotoCount
+    )
+  );
+  sanitized.maxPhotos = Math.max(0, Math.min(20, Number(sanitized.maxPhotos) || 20));
   if (job.mbt !== undefined && job.mbt !== null) sanitized.mbt = sanitizeMbtDriverJob(job.mbt);
   return sanitized;
 }
@@ -1357,7 +1378,7 @@ export async function persistDriverOfflineManifest({
           login,
           item.fingerprint,
           item.predecessorFingerprint,
-          item.snapshot.requiredPhotos,
+          item.snapshot.remainingRequiredPhotos ?? item.snapshot.requiredPhotos,
           JSON.stringify(item.snapshot)
         ]
       );

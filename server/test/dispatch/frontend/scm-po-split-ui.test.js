@@ -77,6 +77,23 @@ test("split PO details do not render an Update action", () => {
   assert.match(html, /data-action="save-scm-schedule"/,
     "removing Update must not remove schedule persistence");
 
+  const lockedHtml = vm.runInContext(`
+    scmSplitEditor = null;
+    renderScmScheduleMiniPanel({
+      id: "3022124135",
+      type: "PO",
+      isScmSplit: true,
+      scmSplitLocked: true,
+      destinationLocationId: 15,
+      vendorYardOptions: [{ yard: "PERMACON Bolton", vendor: "PERMACON" }],
+      scm: { pickupPoint: "PERMACON Bolton", status: "Queued", method: "MBT" }
+    });
+  `, context);
+  assert.match(lockedHtml, /data-action="unsplit-order"[^>]+disabled/,
+    "an operational split must retain the Unsplit action in a disabled state");
+  assert.match(lockedHtml, /data-action="save-scm-remark"/,
+    "an operational split must retain its safe remark-only action");
+
   const sourceHtml = vm.runInContext(`
     scmDestinationLocationId = "15";
     scmPickupPoint = "PERMACON Bolton";
@@ -104,8 +121,8 @@ test("split PO details do not render an Update action", () => {
 });
 
 test("the PO-split page requests the fixed client with a new cache key", () => {
-  assert.match(page, /dispatch-scm\.js\?v=20260831-live-schedule-v1/);
-  assert.match(page, /dispatch\.css\?v=20260831-live-schedule-v1/);
+  assert.match(page, /dispatch-scm\.js\?v=20260903-po-line-sequence-v1/);
+  assert.match(page, /dispatch\.css\?v=20260903-po-line-sequence-v1/);
 });
 
 test("the PO Split schedule panel uses a responsive two-row layout", () => {
@@ -628,6 +645,165 @@ test("split Schedule Save changes the physical split destination before saving t
     "the second save must use the schedule revision created by the destination transaction");
   assert.equal(vm.runInContext("scmOrders[0].destinationYard", context), "12441",
     "the saved physical destination must immediately become the local NetSuite baseline");
+});
+
+test("split Schedule Save persists a changed pickup before saving the shared schedule", async () => {
+  const status = {
+    dataset: { scmField: "status" },
+    type: "select-one",
+    value: "Queued"
+  };
+  const controls = new Map([["[data-scm-field]", [status]]]);
+  const context = clientContext(controls);
+  vm.runInContext(`
+    scmOrders = [{
+      id: "3022143273",
+      originalPoRef: "3022143273",
+      type: "PO",
+      isScmSplit: true,
+      scmSplitRevision: 3,
+      destinationLocationId: 28,
+      vendorYardOptions: [
+        { yard: "PERMACON Bolton", vendor: "PERMACON" },
+        { yard: "PERMACON Milton", vendor: "PERMACON" }
+      ],
+      items: [],
+      scm: {
+        status: "Queued",
+        method: "MBT",
+        pickupPoint: "PERMACON Bolton",
+        updatedAt: "2026-09-02T21:20:00.123456Z"
+      }
+    }];
+    selectedScmOrderId = "3022143273";
+    scmPickupPoint = "PERMACON Milton";
+    renderScm = () => {};
+    loadScmOrders = async () => {};
+    globalThis.__requests = [];
+    scmApi = async (path, options) => {
+      globalThis.__requests.push({ path, options });
+      if (path.endsWith("/pickup")) {
+        return { updated: {
+          pickupPoint: "PERMACON Milton",
+          revision: 4,
+          scheduleUpdatedAt: "2026-09-02T21:21:00.654321Z"
+        }, orders: [] };
+      }
+      return { row: {
+        orderKind: "PO",
+        orderRef: "3022143273",
+        status: "Queued",
+        method: "MBT",
+        pickupPoint: "PERMACON Milton",
+        updatedAt: "2026-09-02T21:21:01.000001Z"
+      } };
+    };
+  `, context);
+
+  await vm.runInContext("saveScmScheduleForSelected()", context);
+  const requests = context.__requests;
+  assert.deepEqual(Array.from(requests, (request) => String(request.path)), [
+    "/api/dispatch/scm/purchase-order-splits/3022143273/pickup",
+    "/api/scm/schedule/3022143273?includeSchedule=false"
+  ]);
+  const pickupPatch = JSON.parse(requests[0].options.body);
+  assert.equal(pickupPatch.pickupPoint, "PERMACON Milton");
+  assert.equal(pickupPatch.expectedRevision, 3);
+  const schedulePatch = JSON.parse(requests[1].options.body);
+  assert.equal(schedulePatch.expectedSplitRevision, 4);
+  assert.equal(schedulePatch.expectedUpdatedAt, "2026-09-02T21:21:00.654321Z",
+    "the schedule save must use the concurrency revision created by the pickup transaction");
+  assert.equal(vm.runInContext("scmOrders[0].scm.pickupPoint", context), "PERMACON Milton");
+});
+
+test("split Schedule Save does not mutate an unchanged pickup", async () => {
+  const status = {
+    dataset: { scmField: "status" },
+    type: "select-one",
+    value: "Priority"
+  };
+  const controls = new Map([["[data-scm-field]", [status]]]);
+  const context = clientContext(controls);
+  vm.runInContext(`
+    scmOrders = [{
+      id: "UNCHANGED-PICKUP-SPLIT",
+      type: "PO",
+      isScmSplit: true,
+      scmSplitRevision: 9,
+      vendorYardOptions: [
+        { yard: "PERMACON Bolton", vendor: "PERMACON" },
+        { yard: "PERMACON Milton", vendor: "PERMACON" }
+      ],
+      items: [],
+      scm: {
+        status: "Queued",
+        pickupPoint: "PERMACON Bolton",
+        updatedAt: "2026-09-03T02:00:00.123456Z"
+      }
+    }];
+    selectedScmOrderId = "UNCHANGED-PICKUP-SPLIT";
+    scmPickupPoint = "PERMACON Bolton";
+    renderScm = () => {};
+    globalThis.__paths = [];
+    scmApi = async (path) => {
+      globalThis.__paths.push(path);
+      return { row: {
+        orderKind: "PO",
+        orderRef: "UNCHANGED-PICKUP-SPLIT",
+        status: "Priority",
+        pickupPoint: "PERMACON Bolton",
+        updatedAt: "2026-09-03T02:00:01.123456Z"
+      } };
+    };
+  `, context);
+
+  await vm.runInContext("saveScmScheduleForSelected()", context);
+  assert.deepEqual(Array.from(context.__paths, String), [
+    "/api/scm/schedule/UNCHANGED-PICKUP-SPLIT?includeSchedule=false"
+  ]);
+});
+
+test("a rejected split pickup stops the schedule save and retains the selected yard", async () => {
+  const status = {
+    dataset: { scmField: "status" },
+    type: "select-one",
+    value: "Queued"
+  };
+  const controls = new Map([["[data-scm-field]", [status]]]);
+  const context = clientContext(controls);
+  vm.runInContext(`
+    scmOrders = [{
+      id: "STALE-PICKUP-SPLIT",
+      type: "PO",
+      isScmSplit: true,
+      scmSplitRevision: 4,
+      vendorYardOptions: [
+        { yard: "PERMACON Bolton", vendor: "PERMACON" },
+        { yard: "PERMACON Milton", vendor: "PERMACON" }
+      ],
+      items: [],
+      scm: {
+        status: "Queued",
+        pickupPoint: "PERMACON Bolton",
+        updatedAt: "2026-09-03T02:10:00.123456Z"
+      }
+    }];
+    selectedScmOrderId = "STALE-PICKUP-SPLIT";
+    scmPickupPoint = "PERMACON Milton";
+    renderScm = () => {};
+    globalThis.__paths = [];
+    scmApi = async (path) => {
+      globalThis.__paths.push(path);
+      throw new Error("This split PO changed after it was opened");
+    };
+  `, context);
+
+  await vm.runInContext("saveScmScheduleForSelected()", context);
+  assert.deepEqual(Array.from(context.__paths, String), [
+    "/api/dispatch/scm/purchase-order-splits/STALE-PICKUP-SPLIT/pickup"
+  ]);
+  assert.equal(vm.runInContext("scmPickupPoint", context), "PERMACON Milton");
+  assert.match(vm.runInContext("scmNotice", context), /Save schedule failed: This split PO changed/);
 });
 
 test("successful Schedule Save applies its authoritative row without a stale catalog reload", async () => {

@@ -1,4 +1,5 @@
 import readline from "node:readline";
+import { createReadStream } from "node:fs";
 
 import { beginRollbackContext, closeDb, query } from "./db.js";
 import { startDriverJob } from "./driver-repository.js";
@@ -18,7 +19,8 @@ function integer(value, fallback = 0) {
 
 async function readCorpus() {
   const entries = [];
-  const lines = readline.createInterface({ input: process.stdin, crlfDelay: Infinity });
+  const input = process.argv[2] ? createReadStream(process.argv[2], "utf8") : process.stdin;
+  const lines = readline.createInterface({ input, crlfDelay: Infinity });
   for await (const sourceLine of lines) {
     const line = sourceLine.trim();
     if (!line) continue;

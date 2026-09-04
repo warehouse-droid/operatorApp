@@ -238,6 +238,32 @@
   gap: 8px;
 }
 
+.stock-request-line-removed {
+  border-color: #d7a7a7;
+  background: #fff7f7;
+}
+
+.stock-request-line-removal {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  color: #8c2f2f;
+  font-size: 12px;
+  font-weight: 900;
+}
+
+.stock-request-line-removal input {
+  width: 18px;
+  height: 18px;
+  margin: 0;
+}
+
+.stock-request-line-removal small {
+  display: block;
+  color: #6f7e85;
+  font-weight: 700;
+}
+
 .stock-request-line-fields {
   display: grid;
   grid-template-columns: repeat(auto-fit, minmax(105px, 1fr));

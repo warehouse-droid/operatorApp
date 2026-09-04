@@ -38,28 +38,18 @@ function truthyFlag(value) {
   return ["true", "1", "yes"].includes(String(value || "").trim().toLowerCase());
 }
 
-export function canViewRestrictedScmOrders(operator = null) {
-  const roles = [
-    ...(Array.isArray(operator?.roles) ? operator.roles : []),
-    operator?.role
-  ]
-    .map(normalizedVisibilityValue)
-    .filter(Boolean);
-  return roles.some((role) => RESTRICTED_SCM_VIEW_ROLES.has(role));
-}
-
-export function isRestrictedScmOrder(row = {}) {
-  if ([
+function isBlanketScmOrder(row = {}) {
+  return [
     row.isBlanket,
     row.is_blanket,
     row.isBlanketPo,
     row.is_blanket_po,
     row.raw?.isBlanket,
     row.raw?.is_blanket_po
-  ].some(truthyFlag)) {
-    return true;
-  }
+  ].some(truthyFlag);
+}
 
+function effectiveScmStatus(row = {}) {
   const currentStatuses = [
     row.reconciliationApplicationStatus,
     row.reconciliation_application_status,
@@ -81,8 +71,33 @@ export function isRestrictedScmOrder(row = {}) {
   ]
     .map((status) => String(status || "").trim().toLowerCase())
     .filter(Boolean);
-  const effectiveStatus = currentStatuses[0] || initialStatuses[0] || rowStatus;
-  return RESTRICTED_SCM_STATUSES.has(effectiveStatus);
+  return currentStatuses[0] || initialStatuses[0] || rowStatus;
+}
+
+export function canViewRestrictedScmOrders(operator = null) {
+  const roles = [
+    ...(Array.isArray(operator?.roles) ? operator.roles : []),
+    operator?.role
+  ]
+    .map(normalizedVisibilityValue)
+    .filter(Boolean);
+  return roles.some((role) => RESTRICTED_SCM_VIEW_ROLES.has(role));
+}
+
+export function isRestrictedScmOrder(row = {}) {
+  return isBlanketScmOrder(row) || RESTRICTED_SCM_STATUSES.has(effectiveScmStatus(row));
+}
+
+export function isCompletedScmOrder(row = {}) {
+  return ["complete", "completed"].includes(effectiveScmStatus(row));
+}
+
+export function isDispatchExplicitSearchVisibleScmOrder(row = {}) {
+  if (!isRestrictedScmOrder(row)) return true;
+  const type = String(row.type || row.orderKind || row.order_kind || "").trim().toUpperCase();
+  return ["PO", "TO"].includes(type)
+    && !isBlanketScmOrder(row)
+    && isCompletedScmOrder(row);
 }
 
 export function filterRestrictedScmOrders(rows = [], { includeRestricted = false } = {}) {

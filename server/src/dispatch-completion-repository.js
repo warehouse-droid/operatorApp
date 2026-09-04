@@ -5,6 +5,23 @@ import { assertNoClosedNetSuiteOrders } from "./netsuite-closed-order-repository
 
 const ORDER_KINDS = new Set(["SO", "TO", "PO", "VRMA", "CUSTOM"]);
 
+/**
+ * @typedef {object} DispatchOrderCompletionStatus
+ * @property {string} completionEventId
+ * @property {string} orderKind
+ * @property {string} orderRef
+ * @property {string} dispatchCompletionStatus
+ * @property {string} dispatchCompletedAt
+ * @property {string} completionEvidenceType
+ * @property {string} completionEvidenceId
+ * @property {string | null} planId
+ * @property {string | null} planDate
+ * @property {string | null} loadId
+ * @property {string} actorType
+ * @property {string} actorId
+ * @property {string} reason
+ */
+
 /** @param {number} status @param {string} code @param {string} message */
 function failure(status, code, message) {
   return Object.assign(new Error(message), { status, code });
@@ -83,7 +100,7 @@ function completionActor(value) {
   return { operatorId, roles };
 }
 
-/** @param {Record<string, any>} row */
+/** @param {Record<string, any>} row @returns {DispatchOrderCompletionStatus} */
 function publicCompletion(row) {
   return {
     completionEventId: text(row.completion_event_id),
@@ -107,6 +124,7 @@ function publicCompletion(row) {
  * interpreting any source-specific operational status.
  *
  * @param {Array<{orderKind: unknown, orderRef: unknown}>} requests
+ * @returns {Promise<DispatchOrderCompletionStatus[]>}
  */
 export async function listDispatchOrderCompletionStatuses(requests) {
   const unique = new Map();
@@ -150,8 +168,62 @@ export async function listDispatchOrderCompletionStatuses(requests) {
   return result.rows.map(publicCompletion);
 }
 
+/** @param {Record<string, any>} order */
+function projectedOrderKind(order = {}) {
+  if (text(order.sourceTable) === "scm_vrma_orders") return "VRMA";
+  try {
+    return normalizedKind(order.type || order.orderKind);
+  } catch {
+    return "";
+  }
+}
+
+/** @param {Record<string, any>} order */
+function projectedOrderReference(order = {}) {
+  return text(order.id || order.orderId || order.orderRef || order.tranid || order.refNumber);
+}
+
+/**
+ * Overlay the immutable completion projection at read time. Source operational
+ * fields remain retained, while an SCM status shown by Dispatch receives the
+ * terminal projection so an earlier pickup/transit phase cannot look current.
+ *
+ * @param {Array<Record<string, any>>} orders
+ */
+export async function overlayDispatchOrderCompletionStatuses(orders = []) {
+  const sourceOrders = Array.isArray(orders) ? orders : [];
+  if (!sourceOrders.length) return [];
+  const completions = await listDispatchOrderCompletionStatuses(sourceOrders.map((order) => ({
+    orderKind: projectedOrderKind(order),
+    orderRef: projectedOrderReference(order)
+  })));
+  const byKey = new Map(completions.map((completion) => [
+    `${completion.orderKind}|${text(completion.orderRef).toUpperCase()}`,
+    completion
+  ]));
+  return sourceOrders.map((order) => {
+    const kind = projectedOrderKind(order);
+    const reference = projectedOrderReference(order);
+    const completion = byKey.get(`${kind}|${reference.toUpperCase()}`);
+    if (!completion) return order;
+    const scm = order.scm && typeof order.scm === "object" && !Array.isArray(order.scm)
+      ? { ...order.scm, status: "Completed" }
+      : null;
+    return {
+      ...order,
+      ...(scm ? { scm } : {}),
+      dispatchCompletionStatus: completion.dispatchCompletionStatus,
+      dispatchCompletedAt: completion.dispatchCompletedAt,
+      completionEvidenceType: completion.completionEvidenceType,
+      completionEvidenceId: completion.completionEvidenceId,
+      completionEventId: completion.completionEventId
+    };
+  });
+}
+
 /** @param {string} kind @param {string} reference */
 async function assertOrderExists(kind, reference) {
+  /** @type {Record<string, string>} */
   const statements = {
     SO: `SELECT netsuite_id::text AS id, tranid AS retained_ref, false AS cancelled
            FROM sales_orders

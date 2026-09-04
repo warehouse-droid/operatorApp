@@ -86,3 +86,43 @@ Required fresh evidence before handoff:
 5. Mutation checks for critical ordering, time, photo, and immutability predicates.
 6. Typecheck, lint/syntax, targeted coverage thresholds, full application regressions, and the existing 320-case Driver offline stress matrix.
 7. One persisted gauntlet command with source-state capture, isolated Docker execution, teardown of test containers/images, and a final evidence report.
+
+## Approved completion-photo expansion — 2026-09-02
+
+The following scenarios extend this specification and supersede only the earlier statements that the Driver PWA bundle and reopened photo set remain unchanged.
+
+### Dispatch drag-and-drop and completed-visit discovery
+
+1. Historical completion and completed-stop supplemental upload both accept multi-image drag-and-drop through the same compression, hashing, preview, ordering, removal, upload, retry, and accessibility path as their file inputs.
+2. Dispatch → Driver PWA → Driver stops defaults to one plan date and completed visits. It provides status, driver, stop type, photo state, completion source, and text filters; filtering and stable cursor pagination happen on the server.
+3. Logical records declared in `physicalVisitJobIds` render as one visit. Legacy records without that declaration remain singleton visits; cross-driver, cross-date, missing-member, or mixed-lifecycle declarations are surfaced as conflicts and are never partially changed.
+4. A selected completed visit displays all canonical photo thumbnails and provenance. Dispatch may stage additional photos only while the visit is complete and below 20 unique photos.
+5. Supplemental submission requires a nonblank reason. Committed evidence is append-only and cannot be replaced or deleted.
+
+### Supplemental evidence semantics
+
+1. Each new JPEG is at most 2 MB after compression and is bound by request UUID, photo UUID, ordinal, SHA-256, actor, record type, and the `dispatch-stop-evidence` R2 namespace. Completion read-back verifies every object before database mutation.
+2. A successful request appends the ordered, deduplicated references to every logical record in the physical visit and writes one immutable addition event plus Dispatch audit in the same transaction.
+3. The physical visit has a hard limit of 20 unique canonical photos, including completion, supplemental, carried, and later Driver photos.
+4. Exact request replay returns the stored result. Reuse for another visit/actor, stale state, append-versus-append, append-versus-reopen, and append-versus-Driver completion must never lose evidence or partially update members.
+5. Photo-only changes must not change lifecycle timestamps, completion attribution, planning, dependencies, billing, fulfillment, actual arrivals, custom-order effects, NetSuite state, or canonical order-completion event counts.
+6. Supplemental references remain discoverable by the photo archive even after later lifecycle changes.
+
+### Reopened-photo carry-forward
+
+1. Reopening a physical visit atomically resets lifecycle state for every member but preserves the union of their existing photos in original order.
+2. The refreshed Driver route and immutable offline manifest expose read-only retained photo references, retained count, remaining required count, and the 20-photo limit.
+3. Driver PWA shows retained thumbnails in the completion panel and prefetches them for the saved offline route. A retained photo cannot be removed.
+4. Retained photos count toward the configured requirement. When the retained count meets the requirement, online and offline Driver completion may submit zero new photos; otherwise only the shortfall is required.
+5. New Driver photos append after retained photos, are deduplicated, and produce the same canonical array for every physical member without exceeding 20.
+
+### Freshness and compatibility
+
+1. Supplemental commit emits a no-store Driver-photo event. Other Dispatch computers refresh the matching date automatically; a screen with staged files keeps its draft and revalidates against the new physical-visit state hash.
+2. Existing Driver-stop correction endpoints and legacy list callers remain compatible. New grouped-visit APIs are dispatcher/admin only.
+3. Old Driver manifests interpret absent retained-photo fields as empty. Reopening supersedes old manifests before the Driver can act.
+4. MBBS Driver history, Dispatch, Control, previews, archives, and exports read the same canonical evidence. This expansion does not upload attachments to NetSuite.
+
+### Expansion failure model and required evidence
+
+The gauntlet adds RED-first unit, property, migration, HTTP, repository, concurrency, wiring, and Playwright scenarios for: both drop zones; every filter/source classification; deterministic pagination; hostile upload descriptors; 19-plus-2 overflow; consolidated visits; request replay/conflict; two Dispatch computers; append/reopen/online/offline races; transaction rollback; immutable addition ledger; archive discovery; cross-view photo parity; carried-photo online/offline completion; inaccessible retained thumbnails; and unchanged completion/billing/NetSuite effects.

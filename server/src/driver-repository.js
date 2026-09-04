@@ -33,6 +33,11 @@ import {
   purchaseOrderRouteItems,
   purchaseOrderRouteProjection
 } from "./dispatch-po-route-projection.js";
+import {
+  DRIVER_COMPLETED_VISIT_MAX_PHOTOS,
+  retainedDriverPhotoRequirement,
+  uniqueDriverPhotoReferences
+} from "./driver-completed-photo-evidence.js";
 
 const YARD_ADDRESSES = {
   "3445": "3445 Kennedy Road, Toronto, ON",
@@ -489,9 +494,14 @@ async function locationAddress(value) {
   return result.rows[0]?.address || text;
 }
 
-function dropStopsForPickup(plan, load, location) {
+function dropStopsForPickup(plan, load, pickup) {
+  const location = String(pickup?.location || pickup?.yard || "");
+  const explicitRefs = Array.isArray(pickup?.orderRefs)
+    ? new Set(pickup.orderRefs.map((ref) => String(ref || "").trim().toLowerCase()).filter(Boolean))
+    : null;
   return (load.stops || []).filter((stop) => {
     if (stop.type !== "drop" || !stop.orderId) return false;
+    if (explicitRefs) return explicitRefs.has(String(stop.orderId).trim().toLowerCase());
     const order = orderByRef(plan, stop.orderId);
     return requiredPickupLocations(order).some((candidate) => dispatchLocationsShareYard(candidate, location));
   });
@@ -774,8 +784,10 @@ function buildInterStopTravelJob(plan, truck, load, previousStop, stop, truckInd
     address: toAddress,
     fromLocation: from,
     fromAddress,
+    fromStopId: previousStop.id || "",
     toLocation: to,
     toAddress,
+    toStopId: stop.id || "",
     windowStart: "",
     windowEnd: "",
     instructions: "Travel to the next required stop.",
@@ -871,7 +883,7 @@ function buildTruckSwitchJob(plan, previousAssignment, nextAssignment, sequenceI
 
 function buildJob(plan, truck, load, stop, truckIndex, loadIndex, stopIndex, physicalVisit = null) {
   const isPickup = stop.type === "pick";
-  const relatedStops = isPickup ? dropStopsForPickup(plan, load, stop.location) : [stop];
+  const relatedStops = isPickup ? dropStopsForPickup(plan, load, stop) : [stop];
   const stopOrderRefs = [...new Set(relatedStops.map((item) => String(item.orderId || "")).filter(Boolean))];
   const dependencyPickupManifests = isPickup
     ? relatedStops.flatMap((relatedStop) => {
@@ -1003,7 +1015,7 @@ async function jobStatusMap(jobIds) {
   if (!jobIds.length) return new Map();
   const result = await query(
     `SELECT DISTINCT ON (job_id)
-            job_id, status, started_at, completed_at
+            job_id, status, started_at, completed_at, photo_data_urls
        FROM driver_job_records
       WHERE job_id = ANY($1::text[])
       ORDER BY job_id, completed_at DESC NULLS LAST, started_at DESC NULLS LAST, created_at DESC`,
@@ -2234,6 +2246,20 @@ async function materializeDriverJob(plan, job, status = null, { deferDeliveryIns
     startedAt: status?.started_at || null,
     completedAt: status?.completed_at || null
   };
+  if (["pickup", "dropoff"].includes(String(materialized.stopType || "").toLowerCase())) {
+    const retainedPhotoReferences = String(status?.status || "").toLowerCase() === "complete"
+      ? []
+      : uniqueDriverPhotoReferences(status?.photo_data_urls);
+    const retained = retainedDriverPhotoRequirement({
+      configuredRequiredPhotos: materialized.requiredPhotos,
+      retainedPhotos: retainedPhotoReferences,
+      minimumRequiredPhotos: materialized?.mbt?.schemaVersion ? 0 : 2
+    });
+    materialized.retainedPhotoReferences = retainedPhotoReferences;
+    materialized.retainedPhotoCount = retained.retainedPhotoCount;
+    materialized.remainingRequiredPhotos = retained.remainingRequiredPhotos;
+    materialized.maxPhotos = retained.maxPhotos;
+  }
   if (materialized.stopType === "travel") {
     materialized.address = await locationAddress(materialized.toLocation || materialized.address);
     materialized.fromAddress = await locationAddress(materialized.fromLocation || materialized.fromAddress);
@@ -2350,12 +2376,20 @@ export async function getDriverDayJobs(driverLogin, {
   }
   const jobs = planJobsForDriver(plan, login, { allowBin });
   const statuses = await jobStatusMap(jobs.map((job) => job.jobId));
-  const materializedJobs = await decorateReattemptReadiness(await Promise.all(jobs.map(async (job) => materializeDriverJob(
-    plan,
-    await enrichMbtDriverJob(job, { allowBin, clientVersion, minimumClientVersion }),
-    statuses.get(job.jobId),
-    { deferDeliveryInstructions: true }
-  ))));
+  // This route can be materialized inside a reopen transaction. Querying jobs
+  // sequentially keeps a transaction-bound pg client from receiving overlapping
+  // reads while preserving the confirmed-plan order.
+  const pendingMaterializedJobs = [];
+  for (const job of jobs) {
+    const enrichedJob = await enrichMbtDriverJob(job, { allowBin, clientVersion, minimumClientVersion });
+    pendingMaterializedJobs.push(await materializeDriverJob(
+      plan,
+      enrichedJob,
+      statuses.get(job.jobId),
+      { deferDeliveryInstructions: true }
+    ));
+  }
+  const materializedJobs = await decorateReattemptReadiness(pendingMaterializedJobs);
   const instructionByOrderId = await getDeliveryInstructionsForDriverOrderIds(
     materializedJobs
       .flatMap(materializedDriverSalesOrders)
@@ -2443,6 +2477,8 @@ function driverJobRecordDetails(job = {}, { driverRemark, completionContext = nu
     location: job.location || "",
     pickupLocation: job.pickupLocation || "",
     address: job.address || "",
+    fromStopId: job.fromStopId || "",
+    toStopId: job.toStopId || "",
     dropLocation: job.dropLocation || "",
     dropAddress: job.dropAddress || "",
     destinationLocationId: job.destinationLocationId ?? null,
@@ -2756,13 +2792,48 @@ export async function recordDriverJobPhotos(driverLogin, jobIdValue, {
   completionContext = null
 } = {}) {
   await assertNoClosedNetSuiteOrders(job?.orderRefs || [], "be completed by Driver");
-  const photos = Array.isArray(photoDataUrls) ? photoDataUrls.filter(isPhotoReference) : [];
+  const submittedPhotos = Array.isArray(photoDataUrls) ? photoDataUrls.filter(isPhotoReference) : [];
+  const existing = (await query(
+    `SELECT status, photo_data_urls
+       FROM driver_job_records
+      WHERE job_id = $1
+      LIMIT 1`,
+    [jobIdValue]
+  )).rows[0];
+  const isPhysicalVisit = ["pickup", "dropoff", "pick", "drop"]
+    .includes(String(job?.stopType || "").toLowerCase());
+  const retainedPhotos = isPhysicalVisit && String(existing?.status || "").toLowerCase() !== "complete"
+    ? uniqueDriverPhotoReferences(existing?.photo_data_urls)
+    : [];
   const requiredPhotos = job?.mbt?.schemaVersion
     ? Math.max(0, Number(job.requiredPhotos || 0))
     : job && Number(job.requiredPhotos) === 0
       ? 0
       : Math.max(2, Number(job?.requiredPhotos || 2));
-  if (photos.length < requiredPhotos) throw new Error(`${requiredPhotos} photo${requiredPhotos > 1 ? "s are" : " is"} required.`);
+  const remainingRequiredPhotos = isPhysicalVisit
+    ? retainedDriverPhotoRequirement({
+        configuredRequiredPhotos: requiredPhotos,
+        retainedPhotos,
+        minimumRequiredPhotos: job?.mbt?.schemaVersion ? 0 : 2
+      }).remainingRequiredPhotos
+    : requiredPhotos;
+  if (submittedPhotos.length < remainingRequiredPhotos) {
+    throw new Error(`${remainingRequiredPhotos} photo${remainingRequiredPhotos > 1 ? "s are" : " is"} required.`);
+  }
+  const photos = isPhysicalVisit
+    ? submittedPhotos.reduce((references, reference) => {
+        if (!reference.startsWith("r2://") || !references.includes(reference)) {
+          references.push(reference);
+        }
+        return references;
+      }, [...retainedPhotos])
+    : submittedPhotos;
+  if (isPhysicalVisit && photos.length > DRIVER_COMPLETED_VISIT_MAX_PHOTOS) {
+    throw Object.assign(new Error(`A physical visit can contain at most ${DRIVER_COMPLETED_VISIT_MAX_PHOTOS} photos.`), {
+      status: 409,
+      code: "DRIVER_COMPLETED_PHOTO_LIMIT"
+    });
+  }
   const result = await query(
     `INSERT INTO driver_job_records (
        job_id, plan_id, plan_date, driver_login, truck_id, truck_plate, load_id, load_name,

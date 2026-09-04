@@ -37,7 +37,7 @@ echo "[historical-assist] syntax, types, lint, and changed-module coverage"
 "${compose[@]}" --profile tools run --rm test npm run lint:driver-pwa-historical-assist
 "${compose[@]}" --profile tools run --rm test npm run coverage:driver-pwa-historical-assist
 
-echo "[historical-assist] eight critical mutations"
+echo "[historical-assist] historical and completed-stop critical mutations"
 "${compose[@]}" --profile tools run --rm \
   -e MBT_MUTATION_EPHEMERAL=1 \
   mutation npm run mutate:driver-pwa-historical-assist
@@ -58,7 +58,8 @@ echo "[historical-assist] browser UI and unchanged 320-case Driver offline campa
 "${compose[@]}" --profile runtime up -d --wait app
 "${compose[@]}" --profile runtime --profile e2e run --rm e2e \
   npx playwright test --config test/playwright.config.mjs \
-  test/mbt/e2e/driver-pwa-historical-assist.spec.js
+  test/mbt/e2e/driver-pwa-historical-assist.spec.js \
+  test/mbt/e2e/driver-completed-stop-photo-evidence.spec.js
 "${compose[@]}" --profile runtime --profile e2e run --rm e2e npm run test:driver-offline-stress:full
 
 echo "[historical-assist] complete; isolated containers, volumes, and local images will now be removed"

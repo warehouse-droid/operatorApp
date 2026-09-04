@@ -50,6 +50,8 @@ export function effectiveScmPurchaseOrderCatalogStatus(order = {}, evidence = {}
     reconciliationReconciledAt: evidence.reconciled_at,
     reconciliationApplicationStatus: evidence.reconciliation_application_status,
     blockingReview: evidence.reconciliation_blocked === true,
-    preserveOperationalStatus
+    preserveOperationalStatus,
+    preferReconciliationStatus: order.isScmSplit === true
+      && !preserveOperationalStatus
   });
 }

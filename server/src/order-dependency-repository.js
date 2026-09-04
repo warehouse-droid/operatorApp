@@ -4791,17 +4791,15 @@ async function priorPlannedTransferRefs(transferRefs = [], plan = {}) {
   const planDate = String(plan.planDate || "").slice(0, 10);
   if (!refs.length || !planDate) return new Set();
   const result = await query(
-    `SELECT DISTINCT stop ->> 'orderId' AS order_ref
-       FROM dispatch_plans p
-       JOIN dispatch_plan_snapshots snapshot ON snapshot.plan_id = p.id
-       CROSS JOIN LATERAL jsonb_array_elements(COALESCE(snapshot.trucks, '[]'::jsonb)) truck
-       CROSS JOIN LATERAL jsonb_array_elements(COALESCE(truck -> 'loads', '[]'::jsonb)) load
-       CROSS JOIN LATERAL jsonb_array_elements(COALESCE(load -> 'stops', '[]'::jsonb)) stop
+    `SELECT DISTINCT requested.order_ref
+       FROM unnest($3::text[]) requested(order_ref)
+       JOIN dispatch_plan_order_assignments assignment
+         ON lower(assignment.order_ref) = lower(requested.order_ref)
+         OR lower(assignment.planned_order_ref) = lower(requested.order_ref)
+       JOIN dispatch_plans p ON p.id = assignment.plan_id
       WHERE p.status <> 'cancelled'
         AND p.id <> $1
-        AND p.plan_date < $2::date
-        AND stop ->> 'type' = 'drop'
-        AND stop ->> 'orderId' = ANY($3::text[])`,
+        AND p.plan_date < $2::date`,
     [Number(plan.id) || 0, planDate, refs]
   );
   return new Set(result.rows.map((row) => text(row.order_ref)).filter(Boolean));
@@ -4847,9 +4845,17 @@ export async function validateDispatchPlanDependencies(plan = {}) {
         const order = (plan.orders || []).find((entry) => dispatchOrderRefs(entry).includes(String(stop.orderId || "")));
         return order ? dispatchOrderRefs(order).includes(plannedSalesRef) : String(stop.orderId || "") === plannedSalesRef;
       });
-      const pickupIndex = (assignedLoad?.stops || []).findIndex((stop) =>
-        stop.type === "pick" && dispatchLocationsShareYard(stop.location, dependency.sourceLocation)
-      );
+      const pickupIndex = (assignedLoad?.stops || []).findIndex((stop) => {
+        if (stop.type !== "pick" || !dispatchLocationsShareYard(stop.location, dependency.sourceLocation)) return false;
+        if (!Array.isArray(stop.orderRefs)) return true;
+        return stop.orderRefs.some((ref) => {
+          if (String(ref || "") === plannedSalesRef) return true;
+          const allocatedOrder = (plan.orders || []).find((entry) =>
+            dispatchOrderRefs(entry).includes(String(ref || ""))
+          );
+          return allocatedOrder ? dispatchOrderRefs(allocatedOrder).includes(plannedSalesRef) : false;
+        });
+      });
       if (pickupIndex < 0 || dropIndex < 0 || pickupIndex > dropIndex) {
         conflicts.push(`${plannedSalesRef} requires direct pickup ${dependency.transferOrderRef} at ${dependency.sourceLocation} before the customer drop.`);
       }

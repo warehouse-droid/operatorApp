@@ -232,6 +232,17 @@ test("DP-05: remove → group → ungroup → replan is an exact, continuous com
   assert.equal(result.response.status, 200, JSON.stringify(result.payload));
   assert.equal(result.payload.plan.revision, current.plan.revision + 1);
   assert.deepEqual(result.payload.patch.removedOrderRefs, ["DP-A"]);
+  assert.deepEqual(
+    (await query(
+      `SELECT load_id
+         FROM dispatch_plan_load_assignments
+        WHERE plan_id = $1
+        ORDER BY load_id`,
+      [seeded.id]
+    )).rows,
+    [{ load_id: "dp-v2-load-1" }],
+    "the incremental command must materialize its Driver load projection in the same transaction"
+  );
   current = result.payload;
 
   result = await command(current, seeded.id, lease, "dp05-group-b-c", "group_orders", { orderRefs: ["DP-B", "DP-C"] });
@@ -345,7 +356,11 @@ test("DP-05: browser ungroup deactivates its durable delivery group before a har
     orders: [groupedOrder],
     trucks: groupedTrucks,
     summary: current.plan.summary,
-    actionName: "group_order"
+    actionName: "group_order",
+    // The preceding lifecycle deliberately retired this exact deterministic
+    // ref. Reusing it here is a new, explicit grouping action—not stale feed
+    // ingress—so opt in to the guarded reactivation path.
+    reactivatedGlobalOrderRefs: [groupRef]
   });
   assert.equal(result.response.status, 200, JSON.stringify(result.payload));
   const projectedGroup = await query(
@@ -426,7 +441,8 @@ test("DP-05: a late cross-date order feed cannot resurrect GOB-116758-117328 aft
     orders: [groupedOrder],
     trucks: groupedTrucks,
     summary: current.plan.summary,
-    actionName: "group_order"
+    actionName: "group_order",
+    reactivatedGlobalOrderRefs: [groupRef]
   });
   assert.equal(result.response.status, 200, JSON.stringify(result.payload));
   current = result.payload;
@@ -529,7 +545,7 @@ test("DP-07: a previous-date order may be removed and re-added to its own plan, 
   assert.equal(result.payload.code, "DISPATCH_ORDER_ALREADY_PLANNED");
 });
 
-test("DP-07: an incomplete assignment projection fails closed instead of treating an order as unplanned", async () => {
+test("DP-07: an incomplete assignment projection repairs before proving a cross-date conflict", async () => {
   const owner = await fixture.seedPlan({ date: "2025-02-24", refs: ["DP-PROJECTION-WARMING"] });
   const target = await fixture.seedPlan({ date: "2025-02-25", refs: ["DP-PROJECTION-TARGET"] });
   await query("DELETE FROM dispatch_plan_order_assignments WHERE plan_id = $1", [owner.id]);
@@ -554,11 +570,57 @@ test("DP-07: an incomplete assignment projection fails closed instead of treatin
   );
 
   assert.equal(result.response.status, 409, JSON.stringify(result.payload));
-  assert.equal(result.payload.code, "DISPATCH_ASSIGNMENT_PROJECTION_NOT_READY");
+  assert.equal(result.payload.code, "DISPATCH_ORDER_ALREADY_PLANNED");
   const unchanged = await bootstrap(target.id, target.plan_date);
   assert.equal(unchanged.plan.board.orderRefs.includes("DP-PROJECTION-WARMING"), false);
-  const repaired = await backfillDispatchPlanProjections({ batchSize: 25 });
-  assert.equal(repaired.ready, true, "Projection backfill must clear the fail-closed warm-up fence.");
+  assert.deepEqual(
+    (await query(
+      `SELECT plan.revision::int AS revision,
+              projection.source_revision::int AS source_revision
+         FROM dispatch_plans plan
+         JOIN dispatch_plan_projection_state projection ON projection.plan_id = plan.id
+        WHERE plan.id = $1`,
+      [owner.id]
+    )).rows[0],
+    { revision: 0, source_revision: 0 },
+    "the command must restore the projection before using it as duplicate-order evidence"
+  );
+});
+
+test("DP-07: an assignment command stays fail-closed when projection repair cannot establish parity", async () => {
+  const owner = await fixture.seedPlan({ date: "2025-02-26", refs: ["DP-PROJECTION-UNREPAIRABLE"] });
+  const target = await fixture.seedPlan({ date: "2025-02-27", refs: ["DP-PROJECTION-SAFE-TARGET"] });
+  await query("DELETE FROM dispatch_plan_order_assignments WHERE plan_id = $1", [owner.id]);
+  await query("DELETE FROM dispatch_plan_projection_state WHERE plan_id = $1", [owner.id]);
+  await query("DELETE FROM dispatch_plan_snapshots WHERE plan_id = $1", [owner.id]);
+
+  try {
+    const lease = await fixture.acquireLease({
+      planDate: target.plan_date,
+      sessionId: "dispatch-v2-projection-unrepairable"
+    });
+    const current = await bootstrap(target.id, target.plan_date);
+    const result = await command(
+      current,
+      target.id,
+      lease,
+      "dp07-projection-unrepairable",
+      "assign_order",
+      {
+        orderRef: "DP-PROJECTION-UNREPAIRABLE",
+        truckId: "DP-V2-TEST",
+        loadId: "dp-v2-load-1"
+      }
+    );
+
+    assert.equal(result.response.status, 409, JSON.stringify(result.payload));
+    assert.equal(result.payload.code, "DISPATCH_ASSIGNMENT_PROJECTION_NOT_READY");
+    const unchanged = await bootstrap(target.id, target.plan_date);
+    assert.equal(unchanged.plan.board.orderRefs.includes("DP-PROJECTION-UNREPAIRABLE"), false);
+  } finally {
+    await query("DELETE FROM dispatch_plans WHERE id = $1", [owner.id]);
+    await backfillDispatchPlanProjections({ batchSize: 25 });
+  }
 });
 
 test("history search reveals reconciliation-complete PO/SO orders but never Driver PWA-completed orders", async () => {

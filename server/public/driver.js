@@ -40,6 +40,9 @@ const instructionMediaOnlineFallbackIds = new Set();
 const instructionMediaRetryNonces = new Map();
 let instructionMediaPreparationKey = "";
 let instructionMediaPreparationGeneration = 0;
+const retainedPhotoObjectUrls = new Map();
+let retainedPhotoPreparationKey = "";
+let retainedPhotoPreparationGeneration = 0;
 let instructionTranslationPromise = null;
 let instructionTranslationPromiseKey = "";
 const instructionTranslationCache = new Map();
@@ -1720,7 +1723,7 @@ function remainingRequiredPhotosAfterCandidate({ isDvir = false, index = 0 } = {
     + (!isDvir && !photos[index] ? 1 : 0);
   let remaining = (offlineManifest?.jobs || []).reduce((total, job) => {
     if (jobIsComplete(job)) return total;
-    const required = Math.max(0, Math.floor(Number(job?.requiredPhotos || 0)));
+    const required = Math.max(0, Math.floor(Number(job?.remainingRequiredPhotos ?? job?.requiredPhotos ?? 0)));
     if (!required) return total;
     if (String(job?.jobId || "") !== currentJobId) return total + required;
     return total + Math.max(0, required - Math.min(required, capturedJobPhotos));
@@ -2129,7 +2132,8 @@ function updateCountdownButtons(job) {
   if (!job || currentJob?.jobId !== job.jobId) return;
   const waitSeconds = completeWaitSeconds(job);
   app.querySelectorAll("[data-job-confirm]").forEach((button) => {
-    const photosReady = button.dataset.photoRequired !== "true" || photos.filter(Boolean).length >= Number(job.requiredPhotos || 0);
+    const photosReady = button.dataset.photoRequired !== "true"
+      || photos.filter(Boolean).length >= Number(job.remainingRequiredPhotos ?? job.requiredPhotos ?? 0);
     const binEvidenceReady = !isDriverBinJob(job) || driverBinEvidenceReady(job);
     const gpsReady = button.dataset.gpsGate === "complete"
       ? canCompleteCurrentJob(job)
@@ -2662,6 +2666,9 @@ function clearDriverSessionMemory() {
   instructionMediaPreparationGeneration += 1;
   instructionMediaPreparationKey = "";
   instructionMediaOnlineFallbackIds.clear();
+  retainedPhotoPreparationGeneration += 1;
+  retainedPhotoPreparationKey = "";
+  releaseRetainedPhotoObjectUrls();
   instructionTranslationPromise = null;
   instructionTranslationPromiseKey = "";
   instructionTranslationCache.clear();
@@ -3075,6 +3082,143 @@ function driverDeliveryInstructionMediaUrl(media) {
   const retryNonce = instructionMediaRetryNonces.get(mediaId);
   const query = `token=${encodeURIComponent(authToken || "")}${retryNonce ? `&retry=${encodeURIComponent(retryNonce)}` : ""}`;
   return `${base}${base.includes("?") ? "&" : "?"}${query}`;
+}
+
+function retainedPhotoReferencesForJob(job) {
+  return (Array.isArray(job?.retainedPhotoReferences) ? job.retainedPhotoReferences : [])
+    .map((reference) => String(reference || "").trim())
+    .filter((reference) => reference.startsWith("r2://"))
+    .slice(0, 20);
+}
+
+function retainedPhotoMediaId(job, index) {
+  return `retained-photo:${String(job?.jobId || "")}:${index + 1}`.toLowerCase();
+}
+
+function releaseRetainedPhotoObjectUrls(retainedMediaIds = new Set()) {
+  for (const [mediaId, cached] of retainedPhotoObjectUrls) {
+    if (retainedMediaIds.has(mediaId)) continue;
+    if (cached?.url) URL.revokeObjectURL(cached.url);
+    retainedPhotoObjectUrls.delete(mediaId);
+  }
+}
+
+function rememberRetainedPhotoObjectUrl({ mediaId, reference, blob }) {
+  if (!mediaId || !(blob instanceof Blob) || !blob.size) return "";
+  const previous = retainedPhotoObjectUrls.get(mediaId);
+  if (previous?.url) URL.revokeObjectURL(previous.url);
+  const url = URL.createObjectURL(blob);
+  retainedPhotoObjectUrls.set(mediaId, { url, reference });
+  return url;
+}
+
+function retainedPhotoContentPath(job, index) {
+  return `/api/driver/jobs/${encodeURIComponent(String(job?.jobId || ""))}/retained-photos/${index + 1}`;
+}
+
+function driverRetainedPhotoUrl(job, index) {
+  const reference = retainedPhotoReferencesForJob(job)[index] || "";
+  const mediaId = retainedPhotoMediaId(job, index);
+  const cached = retainedPhotoObjectUrls.get(mediaId);
+  if (cached?.url && cached.reference === reference) return cached.url;
+  if (!navigator.onLine || !authToken || !reference) return "";
+  return `${retainedPhotoContentPath(job, index)}?token=${encodeURIComponent(authToken)}`;
+}
+
+function driverRetainedPhotoPreview(job, index) {
+  const url = driverRetainedPhotoUrl(job, index);
+  return url
+    ? `<img src="${escapeHtml(url)}" alt="Retained photo ${index + 1}" />`
+    : `<span>Retained photo ${index + 1} is saved and will display after its offline preview is available.</span>`;
+}
+
+function patchDriverRetainedPhoto(job, index) {
+  const mediaId = retainedPhotoMediaId(job, index);
+  const node = app.querySelector(`[data-retained-photo-id="${CSS.escape(mediaId)}"] [data-retained-photo-preview]`);
+  if (node) node.innerHTML = driverRetainedPhotoPreview(job, index);
+}
+
+async function fetchRetainedPhoto(job, index) {
+  const controller = new AbortController();
+  const timeout = window.setTimeout(() => controller.abort(), DELIVERY_INSTRUCTION_IMAGE_TIMEOUT_MS);
+  try {
+    const response = await fetch(retainedPhotoContentPath(job, index), {
+      method: "GET",
+      cache: "no-store",
+      credentials: "same-origin", // secret-scan: allow -- Fetch credential mode, not a credential value.
+      signal: controller.signal,
+      headers: {
+        Authorization: `Bearer ${authToken}`,
+        [DRIVER_PWA_VERSION_HEADER]: DRIVER_PWA_CLIENT_VERSION
+      }
+    });
+    if (!response.ok) throw new Error(`Retained completion photo request failed (${response.status}).`);
+    const mimeType = String(response.headers.get("content-type") || "").split(";")[0].trim().toLowerCase();
+    if (!mimeType.startsWith("image/")) throw new Error("The retained completion photo response is not an image.");
+    const blob = await response.blob();
+    if (!blob.size || blob.size > 25 * 1024 * 1024) {
+      throw new Error("The retained completion photo response has an invalid size.");
+    }
+    return blob.type === mimeType ? blob : new Blob([blob], { type: mimeType });
+  } catch (error) {
+    if (controller.signal.aborted) throw new Error("Retained completion photo request timed out.");
+    throw error;
+  } finally {
+    window.clearTimeout(timeout);
+  }
+}
+
+async function prepareRetainedCompletionPhotos(job, { force = false } = {}) {
+  const references = retainedPhotoReferencesForJob(job);
+  const mediaIds = new Set(references.map((_reference, index) => retainedPhotoMediaId(job, index)));
+  releaseRetainedPhotoObjectUrls(mediaIds);
+  const partitionKey = String(offlinePartition?.partitionKey || "");
+  if (!references.length || !partitionKey || !offlineStorageAvailable || !window.DriverOfflineDB) {
+    retainedPhotoPreparationKey = "";
+    return;
+  }
+  const preparationKey = JSON.stringify({
+    partitionKey,
+    jobId: job?.jobId || "",
+    references,
+    online: navigator.onLine
+  });
+  if (!force && preparationKey === retainedPhotoPreparationKey) return;
+  retainedPhotoPreparationKey = preparationKey;
+  const generation = ++retainedPhotoPreparationGeneration;
+  for (let index = 0; index < references.length; index += 1) {
+    if (generation !== retainedPhotoPreparationGeneration || partitionKey !== offlinePartition?.partitionKey) return;
+    const reference = references[index];
+    const mediaId = retainedPhotoMediaId(job, index);
+    const cached = await window.DriverOfflineDB.getCachedInstructionMedia(partitionKey, mediaId).catch(() => null);
+    if (cached?.blob instanceof Blob && cached.blob.size && cached.objectReference === reference) {
+      rememberRetainedPhotoObjectUrl({ mediaId, reference, blob: cached.blob });
+      if (String(currentJob?.jobId || "") === String(job?.jobId || "")) patchDriverRetainedPhoto(job, index);
+      continue;
+    }
+    if (!navigator.onLine || !authToken) continue;
+    try {
+      const blob = await fetchRetainedPhoto(job, index);
+      if (generation !== retainedPhotoPreparationGeneration || partitionKey !== offlinePartition?.partitionKey) return;
+      const stored = await window.DriverOfflineDB.cacheInstructionMedia(partitionKey, {
+        mediaId,
+        id: mediaId,
+        jobId: job?.jobId || "",
+        mediaKind: "image",
+        mimeType: blob.type || "image/jpeg",
+        fileName: `Retained completion photo ${index + 1}`,
+        byteSize: blob.size,
+        priority: 2,
+        objectReference: reference,
+        blob
+      }).catch(() => null);
+      const visibleBlob = stored?.blob instanceof Blob ? stored.blob : blob;
+      rememberRetainedPhotoObjectUrl({ mediaId, reference, blob: visibleBlob });
+      if (String(currentJob?.jobId || "") === String(job?.jobId || "")) patchDriverRetainedPhoto(job, index);
+    } catch {
+      // The authenticated online URL remains available. A later route refresh retries offline prefetch.
+    }
+  }
 }
 
 function currentDeliveryInstructionMedia(mediaId) {
@@ -3496,7 +3640,11 @@ function renderPhotoSlots(job) {
       </section>
     `;
   }
-  const minimumPhotos = Math.max(2, Number(job.requiredPhotos || 0));
+  const requiredPhotos = Math.max(2, Number(job.requiredPhotos || 0));
+  const retainedPhotoReferences = Array.isArray(job.retainedPhotoReferences)
+    ? job.retainedPhotoReferences.slice(0, 20)
+    : [];
+  const minimumPhotos = Math.max(0, Number(job.remainingRequiredPhotos ?? requiredPhotos));
   while (photos.length < minimumPhotos) photos.push("");
   const completionBlockers = [];
   if (!locationCheckApproved()) {
@@ -3514,15 +3662,35 @@ function renderPhotoSlots(job) {
     ));
   }
   return `
-    <div class="photo-modal" role="dialog" aria-modal="true" aria-label="${tf("driver.photosRequired", "At least {count} photos required", { count: minimumPhotos })}">
+    <div class="photo-modal" role="dialog" aria-modal="true" aria-label="${tf("driver.photosRequired", "At least {count} photos required", { count: requiredPhotos })}">
       <section class="photo-panel">
         ${renderDriverActionProtectionNotice("driverPhotoProtectionNotice")}
         <div class="photo-head">
-          <h3>${tf("driver.photosRequired", "At least {count} photos required", { count: minimumPhotos })}</h3>
+          <h3>${tf("driver.photosRequired", "At least {count} photos required", { count: requiredPhotos })}</h3>
           ${renderCameraSwitchButton()}
           <button class="icon-button" data-action="close-photo" aria-label="${t("driver.closePhoto", "Close photo")}" title="${t("driver.closePhoto", "Close photo")}" type="button">X</button>
         </div>
         ${renderLocationCheck(job)}
+        ${retainedPhotoReferences.length ? `
+          <section class="driver-retained-photos" aria-label="${t("driver.retainedFromPreviousCompletion", "Retained from previous completion")}">
+            <div class="driver-retained-photo-heading">
+              <strong>${t("driver.retainedFromPreviousCompletion", "Retained from previous completion")}</strong>
+              <span>${tf(
+                "driver.retainedRequiredPhotosAlreadySaved",
+                "{count} / {required} required photos already saved",
+                { count: retainedPhotoReferences.length, required: requiredPhotos }
+              )}</span>
+            </div>
+            <div class="photo-grid driver-retained-photo-grid">
+              ${retainedPhotoReferences.map((_reference, index) => `
+                <div class="photo-slot driver-retained-photo-slot" data-retained-photo-id="${escapeHtml(retainedPhotoMediaId(job, index))}">
+                  <div class="photo-preview" data-retained-photo-preview>${driverRetainedPhotoPreview(job, index)}</div>
+                  <small>${t("driver.savedEvidenceReadOnly", "Saved evidence · read only")}</small>
+                </div>
+              `).join("")}
+            </div>
+          </section>
+        ` : ""}
         <div class="photo-grid">
           ${photos.map((photo, index) => `
             <div class="photo-slot">
@@ -3645,6 +3813,7 @@ function renderJob() {
     </section>
     ${activeRest ? renderRestModal() : ""}
   `);
+  void prepareRetainedCompletionPhotos(job);
   if (job.stopType === "dropoff") void prepareCurrentDeliveryInstructionLanguage();
 }
 
@@ -4635,7 +4804,8 @@ async function queueDriverEvent(eventType, {
   const manifestRequiredPhotoCount = eventType === "dvir_captured"
     ? 4
     : eventType === "job_completed"
-      ? Number(manifestJob?.requiredPhotos ?? job?.requiredPhotos ?? 0)
+      ? Number(manifestJob?.remainingRequiredPhotos ?? job?.remainingRequiredPhotos
+        ?? manifestJob?.requiredPhotos ?? job?.requiredPhotos ?? 0)
       : 0;
   const requiredPhotoCount = Number.isFinite(manifestRequiredPhotoCount)
     ? Math.max(0, Math.floor(manifestRequiredPhotoCount))
@@ -4676,7 +4846,7 @@ async function queueDriverEvent(eventType, {
       initialStatus: deferSync ? "foreground_pending" : "pending",
       requiredPhotoCount,
       enforcePhotoCompletionLimit: eventType === "dvir_captured"
-        || (eventType === "job_completed" && Number(job?.requiredPhotos || 0) > 0),
+        || (eventType === "job_completed" && Number(job?.remainingRequiredPhotos ?? job?.requiredPhotos ?? 0) > 0),
       details: {
         ...details,
         ...(["job_started", "job_completed"].includes(eventType)
@@ -5615,7 +5785,8 @@ app.addEventListener("click", async (event) => {
     return renderJob();
   }
   if (action === "remove-job-photo") {
-    if (photos.length > Math.max(2, Number(currentJob?.requiredPhotos || 0))) {
+    if (photos.length > Math.max(0, Number(currentJob?.remainingRequiredPhotos
+      ?? (Number(currentJob?.requiredPhotos || 0) > 0 ? Math.max(2, Number(currentJob.requiredPhotos)) : 0)))) {
       const removed = photos.pop();
       if (removed?.photoId) await window.DriverOfflineDB.deleteDraftPhoto(removed.photoId).catch(() => {});
       window.DriverOfflinePhotos?.revokePhoto(removed);
@@ -6723,7 +6894,7 @@ if ("serviceWorker" in navigator) {
     window.setTimeout(requestDriverWorkerVersion, 0);
     window.setTimeout(publishDriverOfflineMode, 0);
   });
-  navigator.serviceWorker.register("/driver-service-worker.js?v=20260819-driver-route-readiness-v1", {
+  navigator.serviceWorker.register("/driver-service-worker.js?v=20260903-retained-photo-i18n-v1", {
     scope: "/driver",
     updateViaCache: "none"
   })

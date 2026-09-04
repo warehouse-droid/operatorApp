@@ -5,17 +5,23 @@ import test, { after } from "node:test";
 import { beginRollbackContext, closeDb, query } from "../../../src/db.js";
 import {
   deactivateDispatchGlobalOrderDefinitions,
+  reconcileDispatchPlanGlobalOrderDefinitions,
+  reconcileDispatchGlobalOrderSources,
   reconcileDispatchGlobalOrderTransitCos,
   removeDispatchGlobalGroupedMember,
   syncDispatchDeliveryGroupsFromPlan,
   syncDispatchGlobalOrderTransitCo
 } from "../../../src/dispatch-delivery-group-repository.js";
+import { canonicalizeDispatchCoGroupIdentities } from "../../../src/dispatch-co-group-identity.js";
 import {
   getDispatchOrderCatalogOrder,
   listDispatchOrderPool,
   upsertDispatchOrderCatalog
 } from "../../../src/dispatch-order-catalog-repository.js";
-import { syncDispatchPlanOrderAssignments } from "../../../src/dispatch-planner-v2-repository.js";
+import {
+  getDispatchV2Bootstrap,
+  syncDispatchPlanOrderAssignments
+} from "../../../src/dispatch-planner-v2-repository.js";
 
 after(closeDb);
 
@@ -44,6 +50,10 @@ function baseOrder(id, type, sourceYard = "2967") {
     salesQty: 10,
     eligible: true
   };
+}
+
+function clone(value) {
+  return JSON.parse(JSON.stringify(value));
 }
 
 test("SO, PO, TO, and CO splits are global definitions while their date assignment remains independent", async () => {
@@ -276,7 +286,10 @@ test("CO metadata follows a global split across dates and restores globally on c
         [co.co_ref, co.source_order_ref, co.from_location, co.to_location, co.status]
       );
       const repaired = await reconcileDispatchGlobalOrderTransitCos();
-      assert.deepEqual(repaired.orderRefs, [split.id]);
+      assert.ok(
+        repaired.orderRefs.includes(split.id),
+        "the global reconciliation result may also include independently changing orders"
+      );
 
       const redirected = await getDispatchOrderCatalogOrder(split.id);
       assert.equal(redirected.sourceYard, "12441");
@@ -505,6 +518,303 @@ test("grouped CO and CO-of-group are global without hiding the source-order life
         [sourceGroupCo.id, individualCos[1].id].sort(),
         "cancelling one unassigned CO must update its global grouped-CO definition immediately"
       );
+    });
+  } finally {
+    await rollback.rollback();
+  }
+});
+
+test("a source refresh cannot turn one aliased grouped-CO member back into an SO", async () => {
+  const rollback = await beginRollbackContext();
+  try {
+    await rollback.run(async () => {
+      const suffix = crypto.randomUUID().slice(0, 8).toUpperCase();
+      const planRow = await query(
+        `INSERT INTO dispatch_plans (plan_date, status, note, revision)
+         VALUES ('2098-09-02', 'draft', $1, 1) RETURNING id`,
+        [`aliased grouped CO source refresh ${suffix}`]
+      );
+      const memberRefs = [1, 2, 3].map((index) => `SO-ALIASED-CO-${suffix}-${index}`);
+      const coMembers = memberRefs.map((id, index) => ({
+        ...baseOrder(id, "CO"),
+        customer: `Aliased CO member ${index + 1}`,
+        sourceTable: "local_co_orders",
+        destinationYard: "12441"
+      }));
+      const group = {
+        ...coMembers[0],
+        id: `CO-GOA-ALIASED-${suffix}`,
+        childOrders: memberRefs,
+        childOrderDetails: coMembers,
+        groupPlanId: String(planRow.rows[0].id),
+        groupPlanDate: "2098-09-02"
+      };
+      await syncDispatchDeliveryGroupsFromPlan({
+        id: String(planRow.rows[0].id),
+        planDate: "2098-09-02",
+        revision: 1,
+        orders: [group],
+        trucks: []
+      });
+
+      const refreshed = await reconcileDispatchGlobalOrderSources({
+        orders: [{
+          ...baseOrder(memberRefs[2], "SO", "3445"),
+          sourceTable: "sales_orders",
+          customer: "Fresh NetSuite SO must not replace the CO wrapper"
+        }]
+      });
+      assert.deepEqual(refreshed.groups, [group.id]);
+      const stored = await query(
+        "SELECT full_order FROM dispatch_global_order_groups WHERE group_ref = $1",
+        [group.id]
+      );
+      const persisted = stored.rows[0].full_order;
+      assert.deepEqual(
+        persisted.childOrderDetails.map((child) => ({ id: child.id, type: child.type })),
+        coMembers.map((child) => ({ id: child.id, type: "CO" })),
+        "the source SO refresh must not create a mixed CO/non-CO definition"
+      );
+      assert.equal(
+        persisted.childOrderDetails[2].customer,
+        coMembers[2].customer,
+        "the local CO wrapper remains the operational authority for its member"
+      );
+      assert.doesNotThrow(() => canonicalizeDispatchCoGroupIdentities({
+        orders: [persisted],
+        trucks: []
+      }));
+    });
+  } finally {
+    await rollback.rollback();
+  }
+});
+
+test("retired consolidation and generic derived definitions cannot be revived by a stale sync", async () => {
+  const rollback = await beginRollbackContext();
+  try {
+    await rollback.run(async () => {
+      const suffix = crypto.randomUUID().slice(0, 8).toUpperCase();
+      const planDate = "2098-09-03";
+      const planRow = await query(
+        `INSERT INTO dispatch_plans (plan_date, status, note, revision)
+         VALUES ($1::date, 'draft', $2, 1) RETURNING id`,
+        [planDate, `retired non-split definitions ${suffix}`]
+      );
+      const planId = String(planRow.rows[0].id);
+      const consolidation = {
+        ...baseOrder(`TO-DRAFT-${suffix}`, "TO", "3445"),
+        sourceOrderId: `SO-CONSOLIDATION-SOURCE-${suffix}`,
+        globalOrderDefinitionKind: "consolidation",
+        planOwned: true
+      };
+      const derived = {
+        ...baseOrder(`CUSTOM-DERIVED-${suffix}`, "CUSTOM", "12441"),
+        sourceOrderId: `SO-DERIVED-SOURCE-${suffix}`,
+        globalOrderDefinitionKind: "derived",
+        planOwned: true
+      };
+      const stalePlan = {
+        id: planId,
+        planDate,
+        revision: 1,
+        orders: [consolidation, derived],
+        trucks: []
+      };
+
+      await syncDispatchDeliveryGroupsFromPlan(stalePlan);
+      await deactivateDispatchGlobalOrderDefinitions([consolidation.id, derived.id]);
+
+      await syncDispatchDeliveryGroupsFromPlan({ ...stalePlan, revision: 2 });
+      const afterTolerantSync = await query(
+        `SELECT split_ref, definition_kind, active
+           FROM dispatch_global_order_splits
+          WHERE lower(split_ref) = ANY($1::text[])
+          ORDER BY definition_kind`,
+        [[consolidation.id, derived.id].map((ref) => ref.toLowerCase())]
+      );
+      assert.deepEqual(
+        afterTolerantSync.rows.map((row) => ({ kind: row.definition_kind, active: row.active })),
+        [
+          { kind: "consolidation", active: false },
+          { kind: "derived", active: false }
+        ],
+        "background synchronization must skip every retired global-derived kind"
+      );
+
+      await assert.rejects(
+        syncDispatchDeliveryGroupsFromPlan({ ...stalePlan, revision: 3 }, {
+          rejectRetiredGlobalOrderRefs: true
+        }),
+        (error) => error?.code === "DISPATCH_DERIVED_ORDER_RETIRED"
+          && [consolidation.id, derived.id].every((ref) => error.retiredOrderRefs?.includes(ref))
+          && new Set(error.conflicts?.map((conflict) => conflict.definitionKind)).size === 2,
+        "an operator write must reject stale consolidation and generic-derived snapshots"
+      );
+    });
+  } finally {
+    await rollback.rollback();
+  }
+});
+
+test("mixed-case explicit reactivation reuses canonical group and split row identities", async () => {
+  const rollback = await beginRollbackContext();
+  try {
+    await rollback.run(async () => {
+      const suffix = crypto.randomUUID().slice(0, 8).toUpperCase();
+      const planDate = "2098-09-03";
+      const planRow = await query(
+        `INSERT INTO dispatch_plans (plan_date, status, note, revision)
+         VALUES ($1::date, 'draft', $2, 1) RETURNING id`,
+        [planDate, `mixed-case derived reactivation ${suffix}`]
+      );
+      const planId = String(planRow.rows[0].id);
+      const members = [1, 2].map((index) => baseOrder(`SO-CASE-${suffix}-${index}`, "SO"));
+      const canonicalGroup = {
+        ...members[0],
+        id: `GO-CASE-${suffix}`,
+        customer: "2 case-sensitive orders grouped",
+        childOrders: members.map((member) => member.id),
+        childOrderDetails: clone(members),
+        groupPlanId: planId,
+        groupPlanDate: planDate,
+        planOwned: true
+      };
+      const splitParent = baseOrder(`TO-CASE-${suffix}`, "TO", "3445");
+      const canonicalSplit = {
+        ...splitParent,
+        id: `${splitParent.id}-S1`,
+        originalOrderId: splitParent.id,
+        salesQty: 4,
+        items: [{ ...splitParent.items[0], quantity: 4 }],
+        planOwned: true
+      };
+      const canonicalPlan = {
+        id: planId,
+        planDate,
+        revision: 1,
+        orders: [canonicalGroup, canonicalSplit],
+        trucks: []
+      };
+      await syncDispatchDeliveryGroupsFromPlan(canonicalPlan);
+      await deactivateDispatchGlobalOrderDefinitions([canonicalGroup.id, canonicalSplit.id]);
+
+      const lowerGroup = { ...clone(canonicalGroup), id: canonicalGroup.id.toLowerCase() };
+      const lowerSplit = { ...clone(canonicalSplit), id: canonicalSplit.id.toLowerCase() };
+      await syncDispatchDeliveryGroupsFromPlan({
+        ...canonicalPlan,
+        revision: 2,
+        orders: [lowerGroup, lowerSplit]
+      }, {
+        reactivatedGlobalOrderRefs: [lowerGroup.id, lowerSplit.id],
+        rejectRetiredGlobalOrderRefs: true
+      });
+
+      const groupRows = await query(
+        `SELECT group_ref, full_order->>'id' AS full_order_id, active
+           FROM dispatch_global_order_groups
+          WHERE lower(group_ref) = lower($1)`,
+        [canonicalGroup.id]
+      );
+      assert.equal(groupRows.rowCount, 1);
+      assert.deepEqual(groupRows.rows[0], {
+        group_ref: canonicalGroup.id,
+        full_order_id: canonicalGroup.id,
+        active: true
+      });
+      const splitRows = await query(
+        `SELECT split_ref, full_order->>'id' AS full_order_id, active
+           FROM dispatch_global_order_splits
+          WHERE lower(split_ref) = lower($1)`,
+        [canonicalSplit.id]
+      );
+      assert.equal(splitRows.rowCount, 1);
+      assert.deepEqual(splitRows.rows[0], {
+        split_ref: canonicalSplit.id,
+        full_order_id: canonicalSplit.id,
+        active: true
+      });
+    });
+  } finally {
+    await rollback.rollback();
+  }
+});
+
+test("an active pruned group overlays a consistent child list without rewriting its saved snapshot", async () => {
+  const rollback = await beginRollbackContext();
+  try {
+    await rollback.run(async () => {
+      const suffix = crypto.randomUUID().slice(0, 8).toUpperCase();
+      const planDate = "2098-09-03";
+      const planRow = await query(
+        `INSERT INTO dispatch_plans (plan_date, status, note, revision)
+         VALUES ($1::date, 'draft', $2, 1) RETURNING id`,
+        [planDate, `pruned group live read ${suffix}`]
+      );
+      const planId = String(planRow.rows[0].id);
+      const members = [1, 2, 3].map((index) => ({
+        ...baseOrder(`SO-PRUNE-${suffix}-${index}`, "SO", index === 1 ? "3445" : "2967"),
+        customer: `Prune member ${index}`
+      }));
+      const group = {
+        ...members[0],
+        id: `GO-PRUNE-${suffix}`,
+        customer: "3 orders grouped",
+        childOrders: members.map((member) => member.id),
+        childOrderDetails: clone(members),
+        groupPlanId: planId,
+        groupPlanDate: planDate,
+        planOwned: true
+      };
+      const trucks = assignedTruck(group.id);
+      await query(
+        `INSERT INTO dispatch_plan_snapshots (plan_id, orders, trucks, summary, saved_at)
+         VALUES ($1, $2::jsonb, $3::jsonb, '{}'::jsonb, now())`,
+        [planId, JSON.stringify([group]), JSON.stringify(trucks)]
+      );
+      await syncDispatchDeliveryGroupsFromPlan({
+        id: planId,
+        planDate,
+        revision: 1,
+        orders: [group],
+        trucks
+      });
+
+      const removedRef = members[1].id;
+      const retainedRefs = [members[0].id, members[2].id];
+      const pruned = await removeDispatchGlobalGroupedMember(removedRef);
+      assert.deepEqual(pruned.updated, [group.id]);
+
+      const bootstrap = await getDispatchV2Bootstrap({ planId, date: planDate });
+      const liveGroup = bootstrap.plan.assignedOrderSnapshots.find((order) => order.id === group.id);
+      assert.deepEqual(liveGroup?.childOrders, retainedRefs);
+      assert.deepEqual(
+        liveGroup?.childOrderDetails.map((child) => child.id),
+        retainedRefs,
+        "childOrders and childOrderDetails must describe the same canonical members"
+      );
+      assert.equal(liveGroup?.customer, "2 orders grouped");
+
+      const stored = await query(
+        `SELECT orders
+           FROM dispatch_plan_snapshots
+          WHERE plan_id = $1`,
+        [planId]
+      );
+      assert.deepEqual(
+        stored.rows[0].orders[0].childOrders,
+        members.map((member) => member.id),
+        "the live overlay must not mutate the immutable persisted snapshot"
+      );
+
+      const direct = await reconcileDispatchPlanGlobalOrderDefinitions({
+        id: planId,
+        planDate,
+        revision: 1,
+        orders: [clone(group)],
+        trucks: clone(trucks)
+      });
+      assert.deepEqual(direct.orders[0].childOrders, retainedRefs);
     });
   } finally {
     await rollback.rollback();

@@ -489,14 +489,19 @@ function dispatchRequiredPickupLocations(plan = {}, order = {}) {
   );
 }
 
-function dispatchPickupFootprintForLocation(plan = {}, load = {}, location = "") {
+function dispatchPickupFootprintForVisit(plan = {}, load = {}, pickup = {}) {
+  const location = pickup.location || pickup.yard || "";
   const pickupLocation = dispatchLocationKey(location);
+  const explicitRefs = Array.isArray(pickup.orderRefs)
+    ? new Set(pickup.orderRefs.map((ref) => text(ref).toLowerCase()).filter(Boolean))
+    : null;
   const countedOrders = new Set();
   let total = 0;
   for (const stop of load.stops || []) {
     if (!["drop", "dropoff"].includes(text(stop.type).toLowerCase())) continue;
     const orderId = text(stop.orderId);
     if (!orderId || countedOrders.has(orderId)) continue;
+    if (explicitRefs && !explicitRefs.has(orderId.toLowerCase())) continue;
     const order = dispatchOrderByRef(plan, orderId);
     if (!order) continue;
     if (!dispatchRequiredPickupLocations(plan, order)
@@ -609,7 +614,7 @@ export function dispatchPhysicalStopVisits(plan = {}, parentTruck = {}, load = {
       addressKey,
       pallets: stopType === "drop"
         ? dispatchDropFootprintPallets(order, stop)
-        : dispatchPickupFootprintForLocation(plan, load, stop.location || stop.yard),
+        : dispatchPickupFootprintForVisit(plan, load, stop),
       customStopMinutes: dispatchCustomOrderStopMinutes(stop, order),
       override: dispatchStopOverrideState(stop)
     };

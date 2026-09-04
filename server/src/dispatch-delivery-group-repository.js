@@ -11,6 +11,25 @@ import {
 
 const GLOBAL_GROUP_ORDER_TYPES = new Set(["SO", "PO", "TO", "CO"]);
 const GLOBAL_DERIVED_ORDER_TYPES = new Set(["SO", "PO", "TO", "CO", "CUSTOM"]);
+const NETSUITE_DISPATCH_SOURCE_TABLES = new Set(["sales_orders", "purchase_orders", "transfer_orders"]);
+const SPLIT_LIVE_SOURCE_FIELDS = Object.freeze([
+  "sourceTable", "netsuiteId", "dispatchRef", "customer", "customerName",
+  "address", "pickupAddress", "pickupAddressOverride", "sourceAddress",
+  "defaultSourceAddress", "pickupLocation", "pickupLocations", "sourceYard",
+  "destinationYard", "destinationAddress", "defaultDestinationAddress",
+  "deliveryAddressOverride", "destinationLocationId", "expectedDeliveryDate",
+  "windowStart", "windowEnd", "instructions", "notes", "vendorYard",
+  "parseSource", "netsuiteStatus", "netsuiteStatusText", "fulfillmentStatus",
+  "netsuiteActive", "operatorStatus", "localYardOrderStatus", "raw", "scm"
+]);
+const PLAN_LIVE_DEFINITION_FIELDS = Object.freeze([
+  ...SPLIT_LIVE_SOURCE_FIELDS,
+  "customer", "customerName", "childOrders", "groupAliases", "isGrouped", "isSplit",
+  "items", "pallets", "layers", "sections", "pieces", "salesQty",
+  "salesQuantities", "packed", "weight", "totalWeightLbs", "unloadMinutes",
+  "travelMinutes", "stopMinutes", "childOrderDetails", "transitCo",
+  "transitOriginalPickupLocations", "transitOriginalSourceYard"
+]);
 
 function dateOnly(value) {
   if (!value) return null;
@@ -21,6 +40,70 @@ function dateOnly(value) {
 
 function text(value) {
   return String(value ?? "").trim();
+}
+
+function orderIdentity(order = {}) {
+  return text(order.id || order.orderId || order.orderRef || order.tranid || order.refNumber);
+}
+
+function cloneOrder(order = {}) {
+  return JSON.parse(JSON.stringify(order));
+}
+
+function cloneValue(value) {
+  return value === undefined ? undefined : JSON.parse(JSON.stringify(value));
+}
+
+function locationKey(value) {
+  return text(value).split(/\s*:\s*/u, 1)[0].toLowerCase();
+}
+
+function uniqueLocations(values = []) {
+  const seen = new Set();
+  return values.map(text).filter((value) => {
+    const key = locationKey(value);
+    if (!key || seen.has(key)) return false;
+    seen.add(key);
+    return true;
+  });
+}
+
+function isNetSuiteDispatchSourceOrder(order = {}) {
+  return NETSUITE_DISPATCH_SOURCE_TABLES.has(text(order.sourceTable || order.raw?.source_table).toLowerCase());
+}
+
+export function netSuiteDispatchSourceSnapshot(order = {}) {
+  const snapshot = cloneOrder(order);
+  const raw = snapshot.raw && typeof snapshot.raw === "object" && !Array.isArray(snapshot.raw)
+    ? snapshot.raw
+    : {};
+  const rawPickups = uniqueLocations([
+    raw.pickup_location,
+    raw.outbound_location,
+    raw.source_location,
+    ...(Array.isArray(raw.allocation_pickup_locations) ? raw.allocation_pickup_locations : [])
+  ]);
+  const fallbackPickups = uniqueLocations([
+    ...(Array.isArray(snapshot.transitOriginalPickupLocations)
+      ? snapshot.transitOriginalPickupLocations
+      : []),
+    snapshot.transitOriginalSourceYard,
+    snapshot.transitCo?.fromYard,
+    ...(Array.isArray(snapshot.pickupLocations)
+      ? snapshot.pickupLocations.filter((location) => (
+        locationKey(location) !== locationKey(snapshot.transitCo?.toYard)
+      ))
+      : [])
+  ]);
+  const pickupLocations = rawPickups.length ? rawPickups : fallbackPickups;
+  snapshot.pickupLocations = pickupLocations;
+  snapshot.sourceYard = pickupLocations[0] || snapshot.transitOriginalSourceYard
+    || snapshot.transitCo?.fromYard || snapshot.sourceYard || "";
+  snapshot.notes = text(snapshot.notes).replace(/^Transit via [^.]+\.?\s*/iu, "").trim();
+  snapshot.transitCo = null;
+  delete snapshot.transitOriginalPickupLocations;
+  delete snapshot.transitOriginalSourceYard;
+  return snapshot;
 }
 
 function canonicalGroupedOrderType(order = {}) {
@@ -333,11 +416,17 @@ async function syncDispatchGlobalOrderGroupsFromPlan(plan = {}) {
         hides_member: member.hidesMember
       })))]
     );
+    await query(
+      `DELETE FROM dispatch_order_catalog_entries
+        WHERE lower(order_ref) = ANY($1::text[])`,
+      [groupRefs.map((ref) => ref.toLowerCase())]
+    );
   }
   if (groups.length || deactivated.rowCount) {
     await query(
       `UPDATE dispatch_order_catalog_state
           SET generation = generation + 1,
+              catalog_count = (SELECT count(*)::int FROM dispatch_order_catalog_entries),
               updated_at = now()
         WHERE singleton = true`
     );
@@ -571,11 +660,17 @@ async function syncDispatchGlobalOrderSplitsFromPlan(plan = {}) {
         source_revision: split.sourceRevision
       })))]
     );
+    await query(
+      `DELETE FROM dispatch_order_catalog_entries
+        WHERE lower(order_ref) = ANY($1::text[])`,
+      [splitRefs.map((ref) => ref.toLowerCase())]
+    );
   }
   if (splits.length || deactivated.rowCount) {
     await query(
       `UPDATE dispatch_order_catalog_state
           SET generation = generation + 1,
+              catalog_count = (SELECT count(*)::int FROM dispatch_order_catalog_entries),
               updated_at = now()
         WHERE singleton = true`
     );
@@ -592,6 +687,29 @@ function transitCoRecord(co = {}, sourceOrderRef = "") {
     status: text(co.status),
     createdAt: co.created_at || co.createdAt || null
   };
+}
+
+async function dispatchTransitCoState() {
+  const localCos = await query(
+    `SELECT co_ref, source_order_ref, from_location, to_location,
+            status, created_at, updated_at
+       FROM local_co_orders
+      ORDER BY updated_at, id`
+  );
+  const activeBySource = new Map();
+  const cancelledByRef = new Map();
+  const allByRef = new Map();
+  for (const row of localCos.rows) {
+    const record = transitCoRecord(row, row.source_order_ref);
+    if (!record.coRef) continue;
+    allByRef.set(record.coRef.toLowerCase(), record);
+    if (text(row.status).toLowerCase() === "cancelled") {
+      cancelledByRef.set(record.coRef.toLowerCase(), record);
+    } else if (record.sourceOrderRef && record.fromYard && record.toYard) {
+      activeBySource.set(record.sourceOrderRef.toLowerCase(), record);
+    }
+  }
+  return { activeBySource, cancelledByRef, allByRef };
 }
 
 async function updateGlobalDefinitionTransitCo({
@@ -724,22 +842,7 @@ async function reconcileGlobalDefinitionTableTransitCos({
 
 export async function reconcileDispatchGlobalOrderTransitCos() {
   return withTransaction(async () => {
-    const localCos = await query(
-      `SELECT co_ref, source_order_ref, from_location, to_location,
-              status, created_at, updated_at
-         FROM local_co_orders
-        ORDER BY updated_at, id`
-    );
-    const activeBySource = new Map();
-    const cancelledByRef = new Map();
-    for (const row of localCos.rows) {
-      const record = transitCoRecord(row, row.source_order_ref);
-      if (text(row.status).toLowerCase() === "cancelled") {
-        cancelledByRef.set(record.coRef.toLowerCase(), record);
-      } else if (record.sourceOrderRef && record.coRef && record.fromYard && record.toYard) {
-        activeBySource.set(record.sourceOrderRef.toLowerCase(), record);
-      }
-    }
+    const { activeBySource, cancelledByRef } = await dispatchTransitCoState();
     const groups = await reconcileGlobalDefinitionTableTransitCos({
       tableName: "dispatch_global_order_groups",
       refColumn: "group_ref",
@@ -774,6 +877,12 @@ function aggregateGlobalGroup(order = {}, childOrderDetails = [], { preserveTran
     .flatMap((child) => child.pickupLocations || [])
     .map(text)
     .filter(Boolean))];
+  const existingSourceYard = text(order.sourceYard);
+  const sourceYard = pickupLocations.length === 1
+    ? pickupLocations[0]
+    : pickupLocations.some((location) => locationKey(location) === locationKey(existingSourceYard))
+      ? existingSourceYard
+      : pickupLocations[0] || existingSourceYard;
   return {
     ...order,
     childOrders: childOrderDetails.map((child) => text(child?.id)).filter(Boolean),
@@ -788,13 +897,341 @@ function aggregateGlobalGroup(order = {}, childOrderDetails = [], { preserveTran
     unloadMinutes: sum("unloadMinutes"),
     travelMinutes: Math.max(0, ...childOrderDetails.map((child) => Number(child?.travelMinutes || 0))),
     pickupLocations,
-    sourceYard: pickupLocations.length === 1 ? pickupLocations[0] : order.sourceYard,
+    sourceYard,
     customer: `${childOrderDetails.length} orders grouped`,
     sourceOrderId: "",
     relatedSoId: "",
     relatedToId: "",
     relatedCustomOrderId: "",
     transitCo: preserveTransitCo ? order.transitCo : null
+  };
+}
+
+function stripTransitOverlays(order = {}, allByRef = new Map()) {
+  const overlays = new Map(allByRef);
+  const visit = (candidate = {}) => {
+    const coRef = text(candidate.transitCo?.id);
+    if (coRef && !overlays.has(coRef.toLowerCase())) {
+      overlays.set(coRef.toLowerCase(), {
+        coRef,
+        fromYard: text(candidate.transitCo?.fromYard || candidate.transitOriginalSourceYard),
+        toYard: text(candidate.transitCo?.toYard)
+      });
+    }
+    for (const child of Array.isArray(candidate.childOrderDetails) ? candidate.childOrderDetails : []) visit(child);
+  };
+  visit(order);
+  return clearCancelledTransitCoMetadata(order, overlays);
+}
+
+function splitWithFreshSource(split = {}, source = {}, { activeBySource, allByRef } = {}) {
+  const next = cloneOrder(stripTransitOverlays(split, allByRef));
+  for (const field of SPLIT_LIVE_SOURCE_FIELDS) {
+    if (Object.prototype.hasOwnProperty.call(source, field)) next[field] = cloneValue(source[field]);
+  }
+  next.id = orderIdentity(split);
+  next.type = canonicalDerivedOrderType(split) || split.type;
+  next.originalOrderId = splitParentRef(split);
+  next.globalOrderDefinition = true;
+  next.globalOrderDefinitionKind = text(split.globalOrderDefinitionKind || "split");
+  return applyActiveTransitCoMetadata(next, activeBySource);
+}
+
+function groupWithFreshSources(group = {}, freshByRef = new Map(), { activeBySource, allByRef } = {}) {
+  const base = stripTransitOverlays(group, allByRef);
+  const refreshNested = (candidate = {}) => {
+    const ref = orderIdentity(candidate).toLowerCase();
+    const direct = freshByRef.get(ref);
+    const candidateType = canonicalGroupedOrderType(candidate);
+    const directType = canonicalGroupedOrderType(direct);
+    // A grouped CO may retain the source SO/TO ref as its member identity.
+    // NetSuite source refreshes may update the source lifecycle, but they must
+    // not replace the local CO wrapper or turn one member into a mixed type.
+    if (direct && !(candidateType === "CO" && directType !== "CO")) {
+      return cloneOrder(direct);
+    }
+    const children = Array.isArray(candidate.childOrderDetails) ? candidate.childOrderDetails : [];
+    if (!children.length) return candidate;
+    return { ...candidate, childOrderDetails: children.map(refreshNested) };
+  };
+  const childRefs = (Array.isArray(base.childOrders) ? base.childOrders : [])
+    .map(text)
+    .filter(Boolean);
+  const detailByRef = new Map((Array.isArray(base.childOrderDetails) ? base.childOrderDetails : [])
+    .map((child) => [orderIdentity(child).toLowerCase(), child])
+    .filter(([ref]) => ref));
+  const childOrderDetails = childRefs.map((ref) => {
+    const existing = detailByRef.get(ref.toLowerCase());
+    if (existing) return refreshNested(existing);
+    return freshByRef.get(ref.toLowerCase()) || null;
+  }).filter(Boolean).map(cloneOrder);
+  let next = childOrderDetails.length === childRefs.length
+    ? aggregateGlobalGroup(base, childOrderDetails)
+    : {
+        ...base,
+        childOrderDetails: (Array.isArray(base.childOrderDetails) ? base.childOrderDetails : []).map(refreshNested)
+      };
+  const firstChild = childOrderDetails[0];
+  if (firstChild) {
+    for (const field of [
+      "netsuiteStatus", "netsuiteStatusText", "fulfillmentStatus",
+      "netsuiteActive", "operatorStatus", "localYardOrderStatus"
+    ]) {
+      if (Object.prototype.hasOwnProperty.call(firstChild, field)) next[field] = cloneValue(firstChild[field]);
+    }
+  }
+  next.globalGroupDefinition = true;
+  return applyActiveTransitCoMetadata(next, activeBySource);
+}
+
+export async function reconcileDispatchGlobalOrderSources({ orders = [] } = {}) {
+  const sourceByRef = new Map((Array.isArray(orders) ? orders : [])
+    .filter(isNetSuiteDispatchSourceOrder)
+    .map((order) => [orderIdentity(order).toLowerCase(), netSuiteDispatchSourceSnapshot(order)])
+    .filter(([ref]) => ref));
+  if (!sourceByRef.size) return { updated: 0, groups: [], splits: [] };
+  return withTransaction(async () => {
+    const sourceRefs = [...sourceByRef.keys()].sort();
+    for (const sourceRef of sourceRefs) {
+      await query(
+        "SELECT pg_advisory_xact_lock(hashtextextended($1, 0))",
+        [`dispatch-global-source-refresh:${sourceRef}`]
+      );
+    }
+    const transitState = await dispatchTransitCoState();
+    const freshByRef = new Map(sourceByRef);
+    const updatedSplits = [];
+    const splitRows = await query(
+      `SELECT split_ref, parent_order_ref, full_order, eligible
+         FROM dispatch_global_order_splits
+        WHERE active = true
+          AND lower(parent_order_ref) = ANY($1::text[])
+        ORDER BY lower(split_ref)
+        FOR UPDATE`,
+      [sourceRefs]
+    );
+    for (const row of splitRows.rows) {
+      const source = sourceByRef.get(text(row.parent_order_ref).toLowerCase());
+      if (!source) continue;
+      const next = splitWithFreshSource(row.full_order || {}, source, transitState);
+      const eligible = source.eligible !== false && source.netsuiteActive !== false;
+      freshByRef.set(text(row.split_ref).toLowerCase(), next);
+      if (JSON.stringify(next) === JSON.stringify(row.full_order || {}) && eligible === row.eligible) continue;
+      await query(
+        `UPDATE dispatch_global_order_splits
+            SET full_order = $2::jsonb,
+                card = $3::jsonb,
+                search_text = $4,
+                eligible = $5,
+                updated_at = now()
+          WHERE split_ref = $1`,
+        [
+          row.split_ref,
+          JSON.stringify(next),
+          JSON.stringify(compactDispatchOrderCard(next)),
+          dispatchOrderSearchText(next),
+          eligible
+        ]
+      );
+      updatedSplits.push(text(row.split_ref));
+    }
+
+    const updatedGroups = [];
+    const refreshRefs = [...freshByRef.keys()];
+    const groupRows = await query(
+      `SELECT global_group.group_ref, global_group.full_order,
+              global_group.eligible
+         FROM dispatch_global_order_groups global_group
+        WHERE global_group.active = true
+          AND EXISTS (
+            SELECT 1
+              FROM dispatch_global_order_group_members member
+             WHERE member.group_ref = global_group.group_ref
+               AND lower(member.member_order_ref) = ANY($1::text[])
+          )
+        ORDER BY lower(global_group.group_ref)
+        FOR UPDATE OF global_group`,
+      [refreshRefs]
+    );
+    for (const row of groupRows.rows) {
+      const next = groupWithFreshSources(row.full_order || {}, freshByRef, transitState);
+      const childDetails = Array.isArray(next.childOrderDetails) ? next.childOrderDetails : [];
+      const eligible = childDetails.every((child) => child?.eligible !== false && child?.netsuiteActive !== false);
+      freshByRef.set(text(row.group_ref).toLowerCase(), next);
+      if (JSON.stringify(next) === JSON.stringify(row.full_order || {}) && eligible === row.eligible) continue;
+      await query(
+        `UPDATE dispatch_global_order_groups
+            SET full_order = $2::jsonb,
+                card = $3::jsonb,
+                search_text = $4,
+                eligible = $5,
+                updated_at = now()
+          WHERE group_ref = $1`,
+        [
+          row.group_ref,
+          JSON.stringify(next),
+          JSON.stringify(compactDispatchOrderCard(next)),
+          dispatchOrderSearchText(next),
+          eligible
+        ]
+      );
+      updatedGroups.push(text(row.group_ref));
+    }
+
+    const updatedRefs = [...new Set([...updatedSplits, ...updatedGroups])];
+    if (updatedRefs.length) {
+      await query(
+        `DELETE FROM dispatch_order_catalog_entries
+          WHERE lower(order_ref) = ANY($1::text[])`,
+        [updatedRefs.map((ref) => ref.toLowerCase())]
+      );
+      await query(
+        `UPDATE dispatch_order_catalog_state
+            SET generation = generation + 1,
+                catalog_count = (SELECT count(*)::int FROM dispatch_order_catalog_entries),
+                updated_at = now()
+          WHERE singleton = true`
+      );
+    }
+    return {
+      updated: updatedRefs.length,
+      groups: updatedGroups,
+      splits: updatedSplits
+    };
+  });
+}
+
+function withoutRetiredGlobalOrderRefs(plan = {}, retiredRefs = new Set()) {
+  if (!retiredRefs.size) return plan;
+  const keepRef = (value) => !retiredRefs.has(text(value).toLowerCase());
+  return {
+    ...plan,
+    orders: (Array.isArray(plan.orders) ? plan.orders : [])
+      .filter((order) => keepRef(orderIdentity(order))),
+    trucks: (Array.isArray(plan.trucks) ? plan.trucks : []).map((truck) => ({
+      ...truck,
+      loads: (Array.isArray(truck?.loads) ? truck.loads : []).map((load) => ({
+        ...load,
+        stops: (Array.isArray(load?.stops) ? load.stops : [])
+          .filter((stop) => keepRef(stop?.orderId || stop?.orderRef))
+      }))
+    }))
+  };
+}
+
+function withCanonicalGlobalOrderRefs(plan = {}, canonicalByRef = new Map()) {
+  if (!canonicalByRef.size) return plan;
+  const canonicalRef = (value) => canonicalByRef.get(text(value).toLowerCase()) || text(value);
+  return {
+    ...plan,
+    orders: (Array.isArray(plan.orders) ? plan.orders : []).map((order) => {
+      const currentRef = orderIdentity(order);
+      const nextRef = canonicalRef(currentRef);
+      return currentRef && nextRef !== currentRef ? { ...order, id: nextRef } : order;
+    }),
+    trucks: (Array.isArray(plan.trucks) ? plan.trucks : []).map((truck) => ({
+      ...truck,
+      loads: (Array.isArray(truck?.loads) ? truck.loads : []).map((load) => ({
+        ...load,
+        stops: (Array.isArray(load?.stops) ? load.stops : []).map((stop) => {
+          const currentRef = text(stop?.orderId || stop?.orderRef);
+          const nextRef = canonicalRef(currentRef);
+          if (!currentRef || nextRef === currentRef) return stop;
+          return Object.prototype.hasOwnProperty.call(stop || {}, "orderId")
+            ? { ...stop, orderId: nextRef }
+            : { ...stop, orderRef: nextRef };
+        })
+      }))
+    }))
+  };
+}
+
+export async function reconcileDispatchPlanGlobalOrderDefinitions(plan, {
+  reactivatedGlobalOrderRefs = [],
+  rejectRetiredGlobalOrderRefs = false
+} = {}) {
+  if (!plan) return null;
+  const refs = [...new Set([
+    ...(Array.isArray(plan.orders) ? plan.orders : [])
+      .map((order) => orderIdentity(order).toLowerCase()),
+    ...(Array.isArray(plan.trucks) ? plan.trucks : [])
+      .flatMap((truck) => Array.isArray(truck?.loads) ? truck.loads : [])
+      .flatMap((load) => Array.isArray(load?.stops) ? load.stops : [])
+      .map((stop) => text(stop?.orderId || stop?.orderRef).toLowerCase())
+  ].filter(Boolean))];
+  if (!refs.length) return plan;
+  const definitions = await query(
+    `SELECT definition.order_ref, definition.full_order, definition.active,
+            definition.definition_kind
+       FROM (
+         SELECT group_ref AS order_ref, full_order, active, 'group'::text AS definition_kind
+           FROM dispatch_global_order_groups
+          WHERE lower(group_ref) = ANY($1::text[])
+         UNION ALL
+         SELECT split_ref AS order_ref, full_order, active, definition_kind
+           FROM dispatch_global_order_splits
+          WHERE lower(split_ref) = ANY($1::text[])
+       ) definition`,
+    [refs]
+  );
+  if (!definitions.rowCount) return plan;
+  const byRef = new Map();
+  const canonicalByRef = new Map();
+  const retiredRefs = new Set();
+  for (const row of definitions.rows) {
+    const ref = text(row.order_ref).toLowerCase();
+    if (!ref) continue;
+    canonicalByRef.set(ref, text(row.order_ref));
+    if (row.active === true) byRef.set(ref, row.full_order || {});
+    else retiredRefs.add(ref);
+  }
+  for (const ref of byRef.keys()) retiredRefs.delete(ref);
+  const allowedReactivations = new Set((Array.isArray(reactivatedGlobalOrderRefs)
+    ? reactivatedGlobalOrderRefs
+    : [])
+    .map((ref) => text(ref).toLowerCase())
+    .filter(Boolean));
+  const blockedRetiredRefs = new Set([...retiredRefs]
+    .filter((ref) => !allowedReactivations.has(ref)));
+  if (rejectRetiredGlobalOrderRefs && blockedRetiredRefs.size) {
+    const conflicts = definitions.rows
+      .filter((row) => row.active !== true && blockedRetiredRefs.has(text(row.order_ref).toLowerCase()))
+      .map((row) => ({
+        orderRef: text(row.order_ref),
+        definitionKind: text(row.definition_kind)
+      }));
+    const refs = [...new Set(conflicts.map((conflict) => conflict.orderRef).filter(Boolean))];
+    throw Object.assign(
+      new Error(`Reload this Dispatch plan before saving. Retired derived order(s) cannot be restored by a stale snapshot: ${refs.join(", ")}.`),
+      {
+        status: 409,
+        code: "DISPATCH_DERIVED_ORDER_RETIRED",
+        retiredOrderRefs: refs,
+        conflicts
+      }
+    );
+  }
+  const visiblePlan = withCanonicalGlobalOrderRefs(
+    withoutRetiredGlobalOrderRefs(plan, blockedRetiredRefs),
+    canonicalByRef
+  );
+  return {
+    ...visiblePlan,
+    orders: (visiblePlan.orders || []).map((order) => {
+      const current = byRef.get(orderIdentity(order).toLowerCase());
+      if (!current) return order;
+      const reconciled = cloneOrder(order);
+      for (const field of PLAN_LIVE_DEFINITION_FIELDS) {
+        if (Object.prototype.hasOwnProperty.call(current, field)) {
+          reconciled[field] = cloneValue(current[field]);
+        } else if ([
+          "transitCo", "transitOriginalPickupLocations", "transitOriginalSourceYard"
+        ].includes(field)) {
+          delete reconciled[field];
+        }
+      }
+      return reconciled;
+    })
   };
 }
 
@@ -898,36 +1335,71 @@ export async function deactivateDispatchGlobalOrderDefinitions(orderRefs = []) {
     .map((ref) => text(ref).toLowerCase())
     .filter(Boolean))];
   if (!refs.length) return { groups: [], splits: [] };
-  const groups = await query(
-    `UPDATE dispatch_global_order_groups
-        SET active = false,
-            updated_at = now()
-      WHERE active = true
-        AND lower(group_ref) = ANY($1::text[])
-      RETURNING group_ref`,
-    [refs]
-  );
-  const splits = await query(
-    `UPDATE dispatch_global_order_splits
-        SET active = false,
-            updated_at = now()
-      WHERE active = true
-        AND lower(split_ref) = ANY($1::text[])
-      RETURNING split_ref`,
-    [refs]
-  );
-  if (groups.rowCount || splits.rowCount) {
-    await query(
-      `UPDATE dispatch_order_catalog_state
-          SET generation = generation + 1,
+  return withTransaction(async () => {
+    await lockDispatchGlobalOrderDefinitionRefs(refs);
+    const groups = await query(
+      `UPDATE dispatch_global_order_groups
+          SET active = false,
               updated_at = now()
-        WHERE singleton = true`
+        WHERE active = true
+          AND lower(group_ref) = ANY($1::text[])
+        RETURNING group_ref`,
+      [refs]
     );
-  }
-  return {
-    groups: groups.rows.map((row) => text(row.group_ref)),
-    splits: splits.rows.map((row) => text(row.split_ref))
-  };
+    const splits = await query(
+      `UPDATE dispatch_global_order_splits
+          SET active = false,
+              updated_at = now()
+        WHERE active = true
+          AND lower(split_ref) = ANY($1::text[])
+        RETURNING split_ref`,
+      [refs]
+    );
+    const catalog = await query(
+      `DELETE FROM dispatch_order_catalog_entries catalog
+        WHERE lower(catalog.order_ref) = ANY($1::text[])
+          AND (
+            EXISTS (
+              SELECT 1
+                FROM dispatch_global_order_groups global_group
+               WHERE lower(global_group.group_ref) = lower(catalog.order_ref)
+            )
+            OR EXISTS (
+              SELECT 1
+                FROM dispatch_global_order_splits global_split
+               WHERE lower(global_split.split_ref) = lower(catalog.order_ref)
+            )
+          )
+        RETURNING catalog.order_ref`,
+      [refs]
+    );
+    const assignments = await query(
+      `DELETE FROM dispatch_plan_order_assignments assignment
+        WHERE lower(assignment.order_ref) = ANY($1::text[])
+           OR lower(assignment.planned_order_ref) = ANY($1::text[])
+        RETURNING assignment.plan_id`,
+      [refs]
+    );
+    const relations = await query(
+      `DELETE FROM dispatch_order_relation_edges relation
+        WHERE lower(relation.owner_ref) = ANY($1::text[])
+        RETURNING relation.plan_id`,
+      [refs]
+    );
+    if (groups.rowCount || splits.rowCount || catalog.rowCount || assignments.rowCount || relations.rowCount) {
+      await query(
+        `UPDATE dispatch_order_catalog_state
+            SET generation = generation + 1,
+                catalog_count = (SELECT count(*)::int FROM dispatch_order_catalog_entries),
+                updated_at = now()
+          WHERE singleton = true`
+      );
+    }
+    return {
+      groups: groups.rows.map((row) => text(row.group_ref)),
+      splits: splits.rows.map((row) => text(row.split_ref))
+    };
+  });
 }
 
 function projectGroups(plan = {}) {
@@ -955,12 +1427,81 @@ function projectGroups(plan = {}) {
   return groups;
 }
 
-export async function syncDispatchDeliveryGroupsFromPlan(plan = {}) {
+async function lockDispatchGlobalOrderDefinitionRefs(orderRefs = []) {
+  const refs = [...new Set((Array.isArray(orderRefs) ? orderRefs : [])
+    .map((ref) => text(ref).toLowerCase())
+    .filter(Boolean))].sort();
+  for (const ref of refs) {
+    await query(
+      "SELECT pg_advisory_xact_lock(hashtextextended($1, 0))",
+      [`dispatch-global-order-definition:${ref}`]
+    );
+  }
+}
+
+async function syncDispatchDeliveryGroupsFromPlanInTransaction(plan = {}, {
+  reactivatedGlobalOrderRefs = [],
+  rejectRetiredGlobalOrderRefs = false
+} = {}) {
   const planId = Number(plan.id);
   if (!Number.isInteger(planId)) return { groups: 0, members: 0 };
-  const globalGroups = await syncDispatchGlobalOrderGroupsFromPlan(plan);
-  const globalSplits = await syncDispatchGlobalOrderSplitsFromPlan(plan);
-  const groups = projectGroups(plan);
+  const allowedReactivations = new Set((Array.isArray(reactivatedGlobalOrderRefs)
+    ? reactivatedGlobalOrderRefs
+    : [])
+    .map((ref) => text(ref).toLowerCase())
+    .filter(Boolean));
+  const structuralRefs = [...new Set((Array.isArray(plan.orders) ? plan.orders : [])
+    .filter((order) => isGroupedDispatchOrder(order) || isGlobalDerivedOrder(order))
+    .map((order) => orderIdentity(order).toLowerCase())
+    .filter(Boolean))];
+  await lockDispatchGlobalOrderDefinitionRefs(structuralRefs);
+  let definitions = { rows: [], rowCount: 0 };
+  if (structuralRefs.length) {
+    definitions = await query(
+      `SELECT group_ref AS order_ref, 'group'::text AS definition_kind, active
+         FROM dispatch_global_order_groups
+        WHERE lower(group_ref) = ANY($1::text[])
+       UNION ALL
+       SELECT split_ref AS order_ref, definition_kind, active
+         FROM dispatch_global_order_splits
+        WHERE lower(split_ref) = ANY($1::text[])
+       ORDER BY order_ref`,
+      [structuralRefs]
+    );
+    const blocked = definitions.rows.filter((row) => (
+      row.active !== true
+      && !allowedReactivations.has(text(row.order_ref).toLowerCase())
+    ));
+    if (rejectRetiredGlobalOrderRefs && blocked.length) {
+      const refs = blocked.map((row) => text(row.order_ref)).filter(Boolean);
+      throw Object.assign(
+        new Error(`Reload this Dispatch plan before saving. Retired derived order(s) cannot be restored by a stale snapshot: ${refs.join(", ")}.`),
+        {
+          status: 409,
+          code: "DISPATCH_DERIVED_ORDER_RETIRED",
+          retiredOrderRefs: refs,
+          conflicts: blocked.map((row) => ({
+            orderRef: text(row.order_ref),
+            definitionKind: text(row.definition_kind)
+          }))
+        }
+      );
+    }
+  }
+  const retiredRefs = new Set(definitions.rows
+    .filter((row) => row.active !== true && !allowedReactivations.has(text(row.order_ref).toLowerCase()))
+    .map((row) => text(row.order_ref).toLowerCase())
+    .filter(Boolean));
+  const canonicalByRef = new Map(definitions.rows
+    .map((row) => [text(row.order_ref).toLowerCase(), text(row.order_ref)])
+    .filter(([key, value]) => key && value));
+  const effectivePlan = withCanonicalGlobalOrderRefs(
+    withoutRetiredGlobalOrderRefs(plan, retiredRefs),
+    canonicalByRef
+  );
+  const globalGroups = await syncDispatchGlobalOrderGroupsFromPlan(effectivePlan);
+  const globalSplits = await syncDispatchGlobalOrderSplitsFromPlan(effectivePlan);
+  const groups = projectGroups(effectivePlan);
 
   await query(
     `UPDATE dispatch_delivery_groups
@@ -1014,6 +1555,10 @@ export async function syncDispatchDeliveryGroupsFromPlan(plan = {}) {
     [JSON.stringify(members)]
   );
   return { groups: groups.length, members: members.length, globalGroups, globalSplits };
+}
+
+export async function syncDispatchDeliveryGroupsFromPlan(plan = {}, options = {}) {
+  return withTransaction(() => syncDispatchDeliveryGroupsFromPlanInTransaction(plan, options));
 }
 
 function mapGroup(row) {

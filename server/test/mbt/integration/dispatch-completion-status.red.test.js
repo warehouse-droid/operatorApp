@@ -5,7 +5,15 @@ import crypto from "node:crypto";
 import test, { after } from "node:test";
 
 import { beginRollbackContext, closeDb, query } from "../../../src/db.js";
-import { manuallyCompleteDispatchOrder } from "../../../src/dispatch-completion-repository.js";
+import {
+  manuallyCompleteDispatchOrder,
+  overlayDispatchOrderCompletionStatuses
+} from "../../../src/dispatch-completion-repository.js";
+import {
+  getDispatchOrderCatalogOrder,
+  listDispatchOrderPool,
+  upsertDispatchOrderCatalog
+} from "../../../src/dispatch-order-catalog-repository.js";
 import {
   createMbbsBillingCasesFromCandidates,
   listMbbsBillingCandidates,
@@ -323,6 +331,34 @@ test("U3: a TOB00870-shaped direct dependency is completed and billed even witho
     assert.equal(directCandidate.dropCount, 1);
     assert.equal(directCandidate.chargeable, true);
     assert.match(directCandidate.relationship.summary, /additional drop/iu);
+
+    const staleOperationalOrder = {
+      id: transferOrderRef,
+      type: "TO",
+      customer: "Direct dependency customer",
+      status: "In Transit",
+      scm: { status: "In Transit", source: "direct-pickup" }
+    };
+    const [projectedOrder] = await overlayDispatchOrderCompletionStatuses([staleOperationalOrder]);
+    assert.equal(projectedOrder.status, "In Transit",
+      "canonical completion must not rewrite retained operational evidence");
+    assert.equal(projectedOrder.scm.status, "Completed",
+      "the Dispatch projection must give terminal delivery precedence over pickup transit");
+    assert.equal(projectedOrder.dispatchCompletionStatus, "completed");
+    assert.equal(projectedOrder.completionEvidenceType, "direct_dependency");
+
+    await upsertDispatchOrderCatalog({
+      orders: [staleOperationalOrder],
+      source: "direct-completion-projection-red"
+    });
+    const pooled = await listDispatchOrderPool({ type: "TO", search: transferOrderRef, limit: 20 });
+    assert.equal(pooled.orders[0]?.dispatchCompletionStatus, "completed",
+      "the global indexed pool must overlay completion recorded after its source status");
+    const hydrated = await getDispatchOrderCatalogOrder(transferOrderRef);
+    assert.equal(hydrated?.status, "In Transit");
+    assert.equal(hydrated?.scm?.status, "Completed",
+      "targeted hydration must not resurrect a stale In Transit state");
+    assert.equal(hydrated?.completionEvidenceType, "direct_dependency");
   });
 });
 

@@ -279,6 +279,21 @@ test("SCM can reverse a returned decision and reject only an unconfirmed local p
   assert.match(source, /\/api\/scm\/stock-transfers\/\$\{[^}]+\}\/reject/);
 });
 
+test("SCM can remove accepted local TO lines and change their outbound location before confirmation", () => {
+  const source = readPublic("scm-stock-requests.js");
+  const css = readPublic("stock-requests.css");
+
+  assert.match(source, /data-scm-stock-transfer-source/);
+  assert.match(source, /data-scm-stock-remove-transfer-line/);
+  assert.match(source, /Remove from this TO/);
+  assert.match(source, /Returns this line to the Request queue/);
+  assert.match(source, /separate local Pending TO/);
+  assert.match(source, /sourceLocationId:\s*Number\(/);
+  assert.match(source, /remove:\s*container\.querySelector/);
+  assert.match(source, /scmStockCanRestructureTransfer/);
+  assert.match(css, /\.stock-request-line-removed/);
+});
+
 test("live list rendering restores search focus and ignores stale responses", () => {
   for (const name of ["sales-stock-requests.js", "scm-stock-requests.js"]) {
     const source = readPublic(name);

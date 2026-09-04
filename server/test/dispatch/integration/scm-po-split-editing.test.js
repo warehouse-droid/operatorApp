@@ -9,9 +9,13 @@ import {
   listScmPurchaseOrders,
   listScmSchedule,
   updateScmScheduleEntry,
-  updateScmPurchaseOrderSplitLines
+  updateScmPurchaseOrderSplitLines,
+  updateScmPurchaseOrderSplitPickupYard
 } from "../../../src/dispatch-repository.js";
-import { enrichScmScheduleWithReconciliation } from "../../../src/scm-reconciliation-repository.js";
+import {
+  enrichScmScheduleWithReconciliation,
+  reconcileScmOrderFamily
+} from "../../../src/scm-reconciliation-repository.js";
 import {
   approveSmartScmPoPhase,
   getSmartScmPlanningRun,
@@ -182,6 +186,101 @@ test("split creation stores initial manual status and remark atomically", async 
   }
 });
 
+test("split pickup update returns its schedule revision and persists every route projection atomically", async () => {
+  // This fixture intentionally remains in the disposable isolated test database:
+  // its split change event is append-only and must never be deleted for cleanup.
+  const fixture = await seedSplitFixture("pickup-projection");
+  const localVendor = `Split Pickup Vendor ${fixture.baseId}`;
+  const nextPickup = `Split Pickup Milton ${fixture.baseId}`;
+  const nextAddress = `${fixture.baseId} Main Street, Milton, ON`;
+  await query(
+    `INSERT INTO dispatch_local_vendors (name, active, updated_by)
+       VALUES ($1, true, 'split-pickup-projection-test')`,
+    [localVendor]
+  );
+  await query(
+    `INSERT INTO dispatch_vendor_yards (
+         vendor, yard, day_label, window_start, window_end,
+         instructions, address, active
+       ) VALUES ($1, $2, 'Mon-Fri', '08:00', '17:00',
+         'Use Milton gate', $3, true)`,
+    [localVendor, nextPickup, nextAddress]
+  );
+  await query(
+    `INSERT INTO dispatch_vendor_mappings (
+         netsuite_vendor_id, netsuite_vendor_name, local_vendor, active,
+         last_po_ref, last_seen_at, updated_by
+       ) VALUES ($1, $2, $3, true, $4, now(), 'split-pickup-projection-test')`,
+    [String(fixture.vendorId), `Split Edit Vendor ${fixture.baseId}`,
+      localVendor, fixture.sourcePoRef]
+  );
+
+  const beforeSchedule = await query(
+    `SELECT updated_at
+         FROM scm_transport_schedule
+        WHERE order_kind = 'PO' AND lower(order_ref) = lower($1)`,
+    [fixture.splitPoRef]
+  );
+  const updated = await updateScmPurchaseOrderSplitPickupYard({
+    splitPoRef: fixture.splitPoRef,
+    pickupPoint: nextPickup,
+    updatedBy: "split-pickup-projection-test",
+    expectedRevision: 1
+  });
+  assert.equal(updated.revision, 2);
+  assert.equal(updated.pickupPoint, nextPickup);
+  assert.ok(updated.scheduleUpdatedAt,
+    "the caller needs the exact schedule revision written by the pickup transaction");
+  assert.ok(new Date(updated.scheduleUpdatedAt) > new Date(beforeSchedule.rows[0].updated_at));
+
+  const stored = await query(
+    `SELECT po.dispatch_vendor_yard, po.dispatch_address,
+              schedule.pickup_point, schedule.updated_at,
+              split.details->>'pickupPoint' AS split_pickup,
+              event.event_type,
+              event.expected_revision::int AS expected_revision,
+              event.applied_revision::int AS applied_revision
+         FROM dispatch_scm_po_splits split
+         JOIN purchase_orders po ON po.netsuite_id = split.split_po_id
+         JOIN scm_transport_schedule schedule
+           ON schedule.order_kind = 'PO'
+          AND lower(schedule.order_ref) = lower(split.split_po_ref)
+         JOIN dispatch_scm_po_split_change_events event
+           ON event.split_id = split.id
+          AND event.applied_revision = 2
+        WHERE split.id = $1`,
+    [fixture.splitId]
+  );
+  assert.deepEqual(stored.rows, [{
+    dispatch_vendor_yard: nextPickup,
+    dispatch_address: nextAddress,
+    pickup_point: nextPickup,
+    updated_at: new Date(updated.scheduleUpdatedAt),
+    split_pickup: nextPickup,
+    event_type: "pickup_changed",
+    expected_revision: 1,
+    applied_revision: 2
+  }]);
+
+  await assert.rejects(
+    updateScmPurchaseOrderSplitPickupYard({
+      splitPoRef: fixture.splitPoRef,
+      pickupPoint: nextPickup,
+      updatedBy: "stale-split-pickup-projection-test",
+      expectedRevision: 1
+    }),
+    (error) => error?.code === "SCM_PO_SPLIT_STALE"
+  );
+  const eventCount = await query(
+    `SELECT COUNT(*)::int AS count
+         FROM dispatch_scm_po_split_change_events
+        WHERE split_id = $1 AND event_type = 'pickup_changed'`,
+    [fixture.splitId]
+  );
+  assert.equal(eventCount.rows[0].count, 1,
+    "a stale retry must not append another pickup event");
+});
+
 function desiredLine(sourceLineId, pallets) {
   return { sourceLineId, pallets, layers: 0, sections: 0, pieces: 0, salesQty: 0 };
 }
@@ -289,18 +388,133 @@ test("an unplanned split returns reduced quantity, accepts another source item, 
           WHERE order_kind = 'PO' AND lower(order_ref) = lower($1)`,
         [fixture.splitPoRef]
       );
+      const staleStatusOnly = await getScmPurchaseOrderSplitSourceLines(fixture.splitPoRef);
+      assert.equal(staleStatusOnly.split.locked, false,
+        "raw schedule text without a real plan must not demand an impossible unplan");
+      assert.equal(staleStatusOnly.split.conflicts.planned, false);
+      const updatedWithoutPlan = await updateScmPurchaseOrderSplitLines({
+        splitPoRef: fixture.splitPoRef,
+        expectedRevision: 2,
+        updatedBy: "stale-planned-status-editor",
+        lines: [desiredLine(fixture.firstLineId, 4), desiredLine(fixture.secondLineId, 2)]
+      });
+      assert.equal(updatedWithoutPlan.revision, 3);
+
+      const cancelledPlan = await query(
+        `INSERT INTO dispatch_plans (plan_date, status, note, revision)
+         VALUES ('2399-12-28', 'cancelled', 'Cancelled split lock fixture', 1)
+         RETURNING id`
+      );
+      await query(
+        `UPDATE scm_transport_schedule
+            SET dispatch_plan_id = $2
+          WHERE order_kind = 'PO' AND lower(order_ref) = lower($1)`,
+        [fixture.splitPoRef, cancelledPlan.rows[0].id]
+      );
+      const cancelledPlanPointer = await getScmPurchaseOrderSplitSourceLines(
+        fixture.splitPoRef
+      );
+      assert.equal(cancelledPlanPointer.split.locked, false,
+        "a cancelled plan pointer must not demand an impossible unplan");
+      assert.equal(cancelledPlanPointer.split.conflicts.planned, false);
+
+      const plan = await query(
+        `INSERT INTO dispatch_plans (plan_date, status, note, revision)
+         VALUES ('2399-12-29', 'draft', 'Authoritative split lock fixture', 1)
+         RETURNING id`
+      );
+      await query(
+        `INSERT INTO dispatch_plan_order_assignments (
+           plan_id, plan_date, order_ref, planned_order_ref, assignment_kind,
+           load_id, stop_id, assignment
+         ) VALUES (
+           $1, '2399-12-29', $2, $2, 'direct',
+           'AUTHORITATIVE-SPLIT-LOCK-LOAD', 'AUTHORITATIVE-SPLIT-LOCK-STOP',
+           '{"dispatchPlanned":true,"dispatchOrderKind":"PO"}'::jsonb
+         )`,
+        [plan.rows[0].id, fixture.splitPoRef]
+      );
       const locked = await getScmPurchaseOrderSplitSourceLines(fixture.splitPoRef);
       assert.equal(locked.split.locked, true);
       assert.equal(locked.split.conflicts.planned, true);
       await assert.rejects(
         () => updateScmPurchaseOrderSplitLines({
           splitPoRef: fixture.splitPoRef,
-          expectedRevision: 2,
+          expectedRevision: 3,
           updatedBy: "planned-editor",
-          lines: [desiredLine(fixture.firstLineId, 4), desiredLine(fixture.secondLineId, 2)]
+          lines: [desiredLine(fixture.firstLineId, 5), desiredLine(fixture.secondLineId, 2)]
         }),
         (error) => error?.code === "SCM_PO_SPLIT_OPERATIONAL" && error?.conflicts?.planned === true
       );
+    });
+  } finally {
+    await rollback.rollback();
+  }
+});
+
+test("stale Partially Done text cannot resurrect status or an unplan-first lock after a remark save", async () => {
+  const rollback = await beginRollbackContext();
+  try {
+    await rollback.run(async () => {
+      const fixture = await seedSplitFixture("stale-partial-remark");
+      await query(
+        `UPDATE scm_transport_schedule
+            SET status = 'Partially Done',
+                updated_by = 'legacy-inferred-progress',
+                updated_at = now() - interval '2 minutes'
+          WHERE order_kind = 'PO' AND lower(order_ref) = lower($1)`,
+        [fixture.splitPoRef]
+      );
+      const reconciled = await reconcileScmOrderFamily({
+        kind: "PO",
+        sourceOrderId: fixture.sourcePoId,
+        source: "manual"
+      });
+      assert.equal(reconciled.targets[fixture.splitPoRef]?.applicationStatus, "Queued");
+      assert.equal(reconciled.targets[fixture.splitPoRef]?.received, 0);
+      assert.equal(
+        reconciled.targets[fixture.splitPoRef]?.hasActiveDispatchAssignment,
+        false
+      );
+
+      const [beforeRemark] = await listScmSchedule({
+        kind: "PO",
+        exactRef: fixture.splitPoRef,
+        audience: "scm"
+      });
+      await updateScmScheduleEntry({
+        orderKind: "PO",
+        orderRef: fixture.splitPoRef,
+        patch: { remarkOverride: "Remark-only concurrency update" },
+        updatedBy: "remark-only-editor",
+        expectedUpdatedAt: beforeRemark.updatedAt
+      });
+
+      const [baseRow] = await listScmSchedule({
+        kind: "PO",
+        exactRef: fixture.splitPoRef,
+        audience: "scm"
+      });
+      const [displayed] = await enrichScmScheduleWithReconciliation([baseRow]);
+      assert.equal(baseRow.status, "Partially Done", "raw audit text remains available");
+      assert.equal(baseRow.calculatedStatus, "Queued",
+        "a remark timestamp must not become status authority");
+      assert.equal(baseRow.scmSplitLocked, false,
+        "PO/TO Schedule must not turn historical status text into an edit lock");
+      assert.equal(displayed.calculatedStatus, "Queued");
+
+      const catalog = await listScmPurchaseOrders({ search: fixture.splitPoRef });
+      const child = catalog.find((order) => order.id === fixture.splitPoRef);
+      assert.equal(child?.scmSplitLocked, false);
+      const editor = await getScmPurchaseOrderSplitSourceLines(fixture.splitPoRef);
+      assert.equal(editor.split.locked, false);
+      assert.deepEqual(editor.split.conflicts, {
+        planned: false,
+        receivingActivity: false,
+        driverActivity: false,
+        activePoLink: false,
+        activeGroup: false
+      });
     });
   } finally {
     await rollback.rollback();
@@ -447,6 +661,17 @@ test("PO Split derives Completed from exact canonical Driver completion without 
       assert.equal(blockedManual?.calculatedStatus || blockedManual?.status, "Completed");
       assert.equal(blockedManual?.reconciliationStatus, "review",
         "The review remains visible as metadata without downgrading local completion.");
+
+      const staleProjection = await enrichScmScheduleWithReconciliation(blockedRows.map((row) => ({
+        ...row,
+        calculatedStatus: "Reconcile Review"
+      })));
+      const staleDriverCompletion = staleProjection.find((row) => row.orderRef === fixture.splitPoRef);
+      const staleManualCompletion = staleProjection.find((row) => row.orderRef === siblingRef);
+      assert.equal(staleDriverCompletion?.calculatedStatus, "Completed",
+        "Driver completion evidence must repair a stale reconciliation projection.");
+      assert.equal(staleManualCompletion?.calculatedStatus, "Completed",
+        "Manual completion evidence must repair a stale reconciliation projection.");
     });
   } finally {
     await rollback.rollback();

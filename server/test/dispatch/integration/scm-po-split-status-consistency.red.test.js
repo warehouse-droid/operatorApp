@@ -69,6 +69,142 @@ test("delayed purchase_order status events route a stable PO ref back to the PO 
   );
 });
 
+test("indexed PO status keeps a source and sibling isolated from one completed child", async () => {
+  await inRollback(async () => {
+    const nonce = `${Date.now()}${Math.floor(Math.random() * 1_000_000)}`;
+    const sourceRef = `PO-STATUS-COMPLETION-SOURCE-${nonce}`;
+    const completedRef = `PO-STATUS-COMPLETION-CHILD-${nonce}`;
+    const siblingRef = `PO-STATUS-COMPLETION-SIBLING-${nonce}`;
+    const updatedAt = "2026-09-03T01:00:00.000Z";
+    await replaceScmPurchaseOrderCatalog({
+      orders: [
+        {
+          ...catalogOrder(sourceRef, "Queued", updatedAt),
+          correspondingPoRefs: [completedRef, siblingRef]
+        },
+        {
+          ...catalogOrder(completedRef, "Planned", updatedAt),
+          isScmSplit: true,
+          originalPoRef: completedRef,
+          sourcePoRef: sourceRef
+        },
+        {
+          ...catalogOrder(siblingRef, "Queued", updatedAt),
+          isScmSplit: true,
+          originalPoRef: siblingRef,
+          sourcePoRef: sourceRef
+        }
+      ],
+      source: "exact-completion-isolation-red"
+    });
+    await query(
+      `INSERT INTO scm_transport_schedule (
+         order_kind, order_ref, method, status, updated_by, created_at, updated_at
+       ) VALUES
+         ('PO', $1, 'MBT', 'Queued', 'exact-completion-isolation-red', $4, $4),
+         ('PO', $2, 'MBT', 'Planned', 'exact-completion-isolation-red', $4, $4),
+         ('PO', $3, 'MBT', 'Queued', 'exact-completion-isolation-red', $4, $4)`,
+      [sourceRef, completedRef, siblingRef, updatedAt]
+    );
+    await query(
+      `SELECT dispatch_record_order_completion(
+         'PO', $1, now(), 'driver_job', $2, NULL, current_date, NULL,
+         'driver', 'exact-completion-driver', '', '{}'::jsonb
+       )`,
+      [completedRef, `exact-completion:${completedRef}`]
+    );
+
+    const listed = await listScmPurchaseOrderCatalog({ search: sourceRef });
+    const sourceList = listed.orders.find((order) => order.id === sourceRef);
+    const completedList = listed.orders.find((order) => order.id === completedRef);
+    const siblingList = listed.orders.find((order) => order.id === siblingRef);
+    const sourceDetail = await getScmPurchaseOrderCatalogOrder(sourceRef);
+    const completedDetail = await getScmPurchaseOrderCatalogOrder(completedRef);
+    const siblingDetail = await getScmPurchaseOrderCatalogOrder(siblingRef);
+
+    for (const [surface, order] of [
+      ["source list", sourceList],
+      ["source detail", sourceDetail]
+    ]) {
+      assert.equal(order?.scm?.status, "Queued", `${surface} must retain exact source status`);
+      assert.notEqual(order?.dispatchCompleted, true, `${surface} must not borrow child completion`);
+    }
+    for (const [surface, order] of [
+      ["completed list", completedList],
+      ["completed detail", completedDetail]
+    ]) {
+      assert.equal(order?.scm?.status, "Completed", `${surface} retains exact completion`);
+      assert.equal(order?.dispatchCompleted, true);
+    }
+    for (const [surface, order] of [
+      ["sibling list", siblingList],
+      ["sibling detail", siblingDetail]
+    ]) {
+      assert.equal(order?.scm?.status, "Queued", `${surface} retains its exact status`);
+      assert.notEqual(order?.dispatchCompleted, true, `${surface} must not borrow sibling completion`);
+    }
+    const repeatedSource = await getScmPurchaseOrderCatalogOrder(sourceRef);
+    assert.deepEqual(
+      {
+        status: repeatedSource?.scm?.status,
+        dispatchCompleted: repeatedSource?.dispatchCompleted === true
+      },
+      { status: "Queued", dispatchCompleted: false },
+      "repeated exact reads must remain idempotent"
+    );
+  });
+});
+
+test("indexed PO status keeps an unfinished split isolated from a completed parent", async () => {
+  await inRollback(async () => {
+    const nonce = `${Date.now()}${Math.floor(Math.random() * 1_000_000)}`;
+    const sourceRef = `PO-STATUS-COMPLETED-PARENT-${nonce}`;
+    const childRef = `PO-STATUS-QUEUED-CHILD-${nonce}`;
+    const updatedAt = "2026-09-03T01:30:00.000Z";
+    await replaceScmPurchaseOrderCatalog({
+      orders: [
+        {
+          ...catalogOrder(sourceRef, "Queued", updatedAt),
+          correspondingPoRefs: [childRef]
+        },
+        {
+          ...catalogOrder(childRef, "Queued", updatedAt),
+          isScmSplit: true,
+          originalPoRef: childRef,
+          sourcePoRef: sourceRef
+        }
+      ],
+      source: "completed-parent-isolation-red"
+    });
+    await query(
+      `INSERT INTO scm_transport_schedule (
+         order_kind, order_ref, method, status, updated_by, created_at, updated_at
+       ) VALUES
+         ('PO', $1, 'MBT', 'Queued', 'completed-parent-isolation-red', $3, $3),
+         ('PO', $2, 'MBT', 'Queued', 'completed-parent-isolation-red', $3, $3)`,
+      [sourceRef, childRef, updatedAt]
+    );
+    await query(
+      `SELECT dispatch_record_order_completion(
+         'PO', $1, now(), 'manual_dispatch', $2, NULL, current_date, NULL,
+         'operator', 'completed-parent-isolation', 'Exact parent completion.', '{}'::jsonb
+       )`,
+      [sourceRef, `completed-parent:${sourceRef}`]
+    );
+
+    const listed = await listScmPurchaseOrderCatalog({ search: sourceRef });
+    const parent = listed.orders.find((order) => order.id === sourceRef);
+    const child = listed.orders.find((order) => order.id === childRef);
+    const childDetail = await getScmPurchaseOrderCatalogOrder(childRef);
+    assert.equal(parent?.scm?.status, "Completed");
+    assert.equal(parent?.dispatchCompleted, true);
+    for (const [surface, order] of [["child list", child], ["child detail", childDetail]]) {
+      assert.equal(order?.scm?.status, "Queued", `${surface} must retain exact child status`);
+      assert.notEqual(order?.dispatchCompleted, true, `${surface} must not borrow parent completion`);
+    }
+  });
+});
+
 async function insertPurchaseOrder({
   id,
   ref,
@@ -568,6 +704,172 @@ test("manual split exact Queued status does not inherit its linked parent's Part
     assert.equal(listed.orders[0]?.isScmSplit, true);
     assert.equal(listed.orders[0]?.scm?.status, schedule?.calculatedStatus);
     assert.equal(detail?.scm?.status, schedule?.calculatedStatus);
+  });
+});
+
+test("manual split exact Queued status stays local when only its linked parent is reconciled", async () => {
+  await inRollback(async () => {
+    const nonce = `${Date.now()}${Math.floor(Math.random() * 1_000_000)}`;
+    const sourceRef = `PO-MANUAL-SPLIT-PARENT-ONLY-${nonce}`;
+    const childRef = `SN-MANUAL-SPLIT-LOCAL-QUEUED-${nonce}`;
+    const sourceId = Number(`96${nonce.slice(-10)}`);
+    await insertPurchaseOrder({ id: sourceId, ref: sourceRef, initialStatus: "Hold" });
+    const sourceLine = await query(
+      "SELECT id FROM purchase_order_lines WHERE purchase_order_id = $1",
+      [sourceId]
+    );
+    await createScmPurchaseOrderSplit({
+      sourcePoRef: sourceRef,
+      newPoRef: childRef,
+      destinationLocationId: 15,
+      status: "Queued",
+      lines: [{ lineRowId: sourceLine.rows[0].id, pallets: 1 }],
+      createdBy: "status-consistency-red"
+    });
+    await replaceScmPurchaseOrderCatalog({
+      orders: [{
+        ...catalogOrder(childRef),
+        isScmSplit: true,
+        originalPoRef: childRef,
+        dispatchRef: childRef,
+        sourcePoRef: sourceRef
+      }],
+      source: "status-consistency-red"
+    });
+    const reconciliation = await query(
+      `INSERT INTO scm_reconciliation_order_state (
+         order_kind, source_order_netsuite_id, source_order_ref,
+         application_status, reconciliation_status, reconciliation_source,
+         ordered_qty, remaining_qty, quantity_summary, reconciled_at
+       ) VALUES (
+         'PO', $1, $2, 'Partially Done', 'ok', 'manual',
+         10, 5, $3::jsonb, '2026-08-31T20:58:49.455323Z'
+       ) RETURNING id`,
+      [
+        sourceId,
+        sourceRef,
+        JSON.stringify({
+          targets: {
+            [sourceRef]: { applicationStatus: "Partially Done" }
+          }
+        })
+      ]
+    );
+    await query(
+      `INSERT INTO scm_transport_schedule (
+         order_kind, order_ref, method, pickup_point, dropoff_point,
+         status, reconciliation_order_state_id, updated_by, created_at, updated_at
+       ) VALUES (
+         'PO', $1, 'MBT', 'PO status consistency yard', '3445',
+         'Planned', $2, 'status-consistency-red',
+         '2026-08-31T20:54:31.000000Z', '2026-08-31T20:54:32.000000Z'
+       )`,
+      [sourceRef, reconciliation.rows[0].id]
+    );
+
+    const listed = await listScmPurchaseOrderCatalog({ search: sourceRef });
+    const detail = await getScmPurchaseOrderCatalogOrder(childRef);
+    const [schedule] = await listScmSchedule({ kind: "PO", exactRef: childRef });
+
+    assert.equal(schedule?.calculatedStatus, "Queued");
+    assert.equal(listed.orders[0]?.scm?.status, schedule?.calculatedStatus);
+    assert.equal(detail?.scm?.status, schedule?.calculatedStatus);
+  });
+});
+
+test("indexed manual split drops a stale Partially Done snapshot and impossible unplan lock", async () => {
+  await inRollback(async () => {
+    const nonce = `${Date.now()}${Math.floor(Math.random() * 1_000_000)}`;
+    const sourceRef = `PO-INDEXED-SPLIT-SOURCE-${nonce}`;
+    const childRef = `SN-INDEXED-SPLIT-STALE-${nonce}`;
+    const sourceId = Number(`95${nonce.slice(-10)}`);
+    await insertPurchaseOrder({
+      id: sourceId,
+      ref: sourceRef,
+      initialStatus: "Hold"
+    });
+    const sourceLine = await query(
+      "SELECT id FROM purchase_order_lines WHERE purchase_order_id = $1",
+      [sourceId]
+    );
+    await createScmPurchaseOrderSplit({
+      sourcePoRef: sourceRef,
+      newPoRef: childRef,
+      destinationLocationId: 15,
+      status: "Queued",
+      lines: [{ lineRowId: sourceLine.rows[0].id, pallets: 1 }],
+      createdBy: "status-consistency-stale-split"
+    });
+    await replaceScmPurchaseOrderCatalog({
+      orders: [{
+        ...catalogOrder(childRef, "Partially Done", "2026-09-01T22:14:02.750784Z"),
+        isScmSplit: true,
+        originalPoRef: childRef,
+        dispatchRef: childRef,
+        sourcePoRef: sourceRef,
+        scmSplitLocked: true
+      }],
+      source: "status-consistency-stale-split"
+    });
+    const reconciliation = await query(
+      `INSERT INTO scm_reconciliation_order_state (
+         order_kind, source_order_netsuite_id, source_order_ref,
+         application_status, reconciliation_status, reconciliation_source,
+         ordered_qty, received_qty, remaining_qty, quantity_summary, reconciled_at
+       ) VALUES (
+         'PO', $1, $2, 'Partially Done', 'ok', 'manual',
+         10, 5, 5, $3::jsonb, '2026-09-01T22:03:10.000000Z'
+       ) RETURNING id`,
+      [
+        sourceId,
+        sourceRef,
+        JSON.stringify({
+          targets: {
+            [sourceRef]: { applicationStatus: "Partially Done" },
+            [childRef]: {
+              targetKind: "po_split",
+              applicationStatus: "Queued",
+              received: 0,
+              remaining: 10,
+              hasActiveDispatchAssignment: false
+            }
+          }
+        })
+      ]
+    );
+    await query(
+      `UPDATE scm_transport_schedule
+          SET status = 'Partially Done',
+              remark_override = 'Remark-only update retained historical status',
+              reconciliation_order_state_id = $2,
+              updated_by = 'remark-only-editor',
+              updated_at = '2026-09-01T22:14:02.750784Z'
+        WHERE order_kind = 'PO' AND lower(order_ref) = lower($1)`,
+      [childRef, reconciliation.rows[0].id]
+    );
+
+    const listed = await listScmPurchaseOrderCatalog({ search: childRef });
+    const detail = await getScmPurchaseOrderCatalogOrder(childRef);
+    const [schedule] = await listScmSchedule({ kind: "PO", exactRef: childRef });
+
+    assert.deepEqual({
+      schedule: {
+        status: schedule?.calculatedStatus,
+        locked: schedule?.scmSplitLocked
+      },
+      list: {
+        status: listed.orders[0]?.scm?.status,
+        locked: listed.orders[0]?.scmSplitLocked
+      },
+      detail: {
+        status: detail?.scm?.status,
+        locked: detail?.scmSplitLocked
+      }
+    }, {
+      schedule: { status: "Queued", locked: false },
+      list: { status: "Queued", locked: false },
+      detail: { status: "Queued", locked: false }
+    });
   });
 });
 

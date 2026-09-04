@@ -78,12 +78,22 @@ receipts, completed reconciliation rows, fulfilled SO fallback rows, completed
 VRMA rows, and completed Custom Orders. Rerunning the migration/backfill adds no
 duplicates and does not change the source operational statuses.
 
+### U9 — terminal delivery wins over retained pickup transit
+
+Given a direct TO or fully linked PO whose pickup phase recorded `In Transit`,
+when its linked Sales Order customer drop creates canonical completion, every
+legacy and indexed/global Dispatch read projects `Completed`. The retained
+operational status remains unchanged for audit, and neither a later catalog
+refresh nor targeted hydration can expose `In Transit` as the effective state.
+
 ## Invariants
 
 - Pickup or start cannot be promoted to completion.
 - A manual completion never fabricates Driver evidence.
 - Operational NetSuite, SCM, dependency, and Custom Order statuses remain
   intact; the universal status is a Dispatch projection.
+- A canonical terminal completion always outranks an earlier pickup or transit
+  state in Dispatch presentation.
 - Completion time is stored as `timestamptz` and billing date/month filters use
   the existing America/Toronto boundary rules.
 - No new runtime dependency is introduced.

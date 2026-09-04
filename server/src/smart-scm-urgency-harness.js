@@ -32,6 +32,7 @@ const zeroAvailableShortage = calculatePolicyState({
   }]]),
   blanketExcludedMap: new Map(),
   excludedTransferOrderMap: new Map(),
+  releasedSplitInboundMap: new Map(),
   reservedBlanketMap: new Map(),
   outboundReservationMap: new Map(),
   inboundReservationMap: new Map()

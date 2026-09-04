@@ -3764,6 +3764,14 @@ button[data-action="enter-edit-mode"]:disabled:hover {
   font-size: 13px;
 }
 
+.scm-line-main .scm-line-sequence,
+.scm-split-source-results .scm-line-sequence {
+  color: var(--muted);
+  font-size: 12px;
+  font-weight: 800;
+  letter-spacing: 0.02em;
+}
+
 .scm-line-main .scm-line-yard {
   display: inline-flex;
   width: fit-content;
@@ -10292,4 +10300,21 @@ button[data-action="enter-edit-mode"]:disabled:hover {
   border-left: 4px solid #0f766e;
   background: #ecfdf5;
   color: #134e4a;
+}
+
+.pickup-visit-split {
+  justify-self: start;
+  margin-top: 0.3rem;
+  padding: 0.28rem 0.55rem;
+  border: 1px solid #2563eb;
+  border-radius: 0.45rem;
+  background: #eff6ff;
+  color: #1d4ed8;
+  font-size: 0.75rem;
+  font-weight: 700;
+}
+
+.pickup-visit-order-list {
+  display: grid;
+  gap: 0.5rem;
 }

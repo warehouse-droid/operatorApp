@@ -73,13 +73,27 @@ assert.deepEqual(
   "A NetSuite child location and its parent must produce one physical pickup."
 );
 
-const pickupStopSource = sourceSlice("function opaqueDispatchStopId", "function isScmGroupedPoOrder");
+const pickupAllocationSource = sourceSlice("function pickupStopOrderRefs", "function isMbbsSpecialLinkLine");
+const pickupStopSource = `${pickupAllocationSource}\n${sourceSlice("function opaqueDispatchStopId", "function isScmGroupedPoOrder")}`;
 const makeEnsurePickupStops = Function(
   "requiredPickupLocations",
   "normalizedPickupLocation",
+  "stopOrder",
+  "orderById",
+  "stopHasDriverActivity",
+  "loadDriverActivityRecords",
+  "executionStatusFromRecord",
   '"use strict"; ' + pickupStopSource + "; return ensurePickupStops;"
 );
-const ensurePickupStops = makeEnsurePickupStops(requiredPickupLocations, locationHelpers.normalizedPickupLocation);
+const ensurePickupStops = makeEnsurePickupStops(
+  requiredPickupLocations,
+  locationHelpers.normalizedPickupLocation,
+  (stop) => stop?.order || null,
+  () => null,
+  () => false,
+  () => [],
+  () => "pending"
+);
 const load = { id: "LOAD-1", stops: [] };
 assert.equal(ensurePickupStops(load, externalPickupOrder, 0), 1);
 assert.equal(load.stops.length, 1);

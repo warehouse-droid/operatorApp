@@ -198,6 +198,8 @@ test("the Aug-14 assigned custom order survives a later feed that omits it", () 
     "reapplyActiveOrderEvidence",
     "reconcilePickupStopRepresentatives",
     "invalidateRoutesChangedByOrderFeed",
+    "isAuthoritativelyRetiredOrderRef",
+    "clearTransitCoFromOrderSnapshot",
     `"use strict";
       let orders = [initialOrder];
       let orderCatalog = [];
@@ -205,6 +207,7 @@ test("the Aug-14 assigned custom order survives a later feed that omits it", () 
       let appliedPlanStructure = { planId: "234", planDate: "2026-08-14", orderIds: new Set([initialOrder.id]) };
       let selectedOrderId = initialOrder.id;
       let selectedOrderIds = new Set([initialOrder.id]);
+      ${functionBody("withoutAuthoritativelyRetiredOrders")}
       ${functionBody("applyDispatchOrderFeed")}
       return {
         applyDispatchOrderFeed,
@@ -223,7 +226,9 @@ test("the Aug-14 assigned custom order survives a later feed that omits it", () 
     () => {},
     (orders) => orders,
     () => {},
-    () => {}
+    () => {},
+    () => false,
+    (order) => order
   );
 
   harness.applyDispatchOrderFeed([]);

@@ -217,6 +217,7 @@ function mapTransfer(row = {}) {
     printStatus: row.print_status || null,
     printInvalidatedAt: row.print_invalidated_at || null,
     confirmedAt: row.confirmed_at || null,
+    createdBy: row.created_by || null,
     dispatchPlanned: row.dispatch_planned === true,
     dispatchPlanDate: row.dispatch_plan_date || null,
     dispatchTruckPlate: row.dispatch_truck_plate || null,
@@ -683,6 +684,10 @@ export async function listSalesStockRequests({
     clauses.push(`NOT EXISTS (
       SELECT 1 FROM sales_stock_transfers bucket_transfer
        WHERE bucket_transfer.request_id = request.id
+         AND (
+           bucket_transfer.status <> 'cancelled'
+           OR bucket_transfer.netsuite_transfer_order_id IS NOT NULL
+         )
     )`);
     clauses.push(`EXISTS (
       SELECT 1 FROM sales_stock_request_lines bucket_line
@@ -1658,80 +1663,291 @@ async function currentTransferReservationTotals(transferId) {
   return new Map(result.rows.map((row) => [`${row.item_id}:${row.source_location_id}`, numeric(row.reserved)]));
 }
 
+function isPristineLocalStockTransfer(transfer) {
+  return transfer.status === "pending_local"
+    && transfer.confirmationStatus === "idle"
+    && !transfer.confirmationRequestId
+    && !transfer.netsuiteTransferOrderId
+    && !transfer.netsuiteTransferOrderRef
+    && !transfer.printJobId
+    && transfer.printGeneration === 0;
+}
+
+function normalizeStockTransferRevisionLines(transfer, input = {}) {
+  const inputs = Array.isArray(input.lines) ? input.lines : [];
+  if (inputs.length !== transfer.lines.length) {
+    throw stockRequestError("A TO revision must include every material line currently on this pending TO.");
+  }
+  const byRequestLineId = new Map(transfer.lines.map((line) => [line.id, line]));
+  const seen = new Set();
+  const normalized = inputs.map((lineInput) => {
+    const requestLineId = requiredId(lineInput.requestLineId ?? lineInput.id, "request line");
+    const current = byRequestLineId.get(requestLineId);
+    if (!current) throw stockRequestError("A pending TO material line was not found.", 404);
+    if (seen.has(requestLineId)) throw stockRequestError("Each pending TO material line may appear only once.");
+    seen.add(requestLineId);
+    const targetSourceLocationId = sourceLocation(
+      lineInput.sourceLocationId ?? current.sourceLocationId,
+      transfer.destinationLocationId
+    );
+    if (lineInput.remove === true) {
+      return { ...current, remove: true, targetSourceLocationId };
+    }
+    const quantity = normalizeStockRequestQuantity(lineInput, {
+      stockUnit: current.salesUom,
+      toPlt: current.toPlt,
+      toLyr: current.toLyr,
+      toSec: current.toSec,
+      toPcs: current.toPcs
+    });
+    return { ...current, ...quantity, remove: false, targetSourceLocationId };
+  });
+  return normalized;
+}
+
+function normalizeStockTransferPalletInput(input = {}) {
+  const provided = Object.hasOwn(input, "palletQuantity");
+  const value = provided ? Number(input.palletQuantity) : null;
+  if (provided && (!Number.isFinite(value) || value < 0 || value > 1_000_000_000)) {
+    throw stockRequestError("PALLET item quantity must be a finite non-negative number.");
+  }
+  return { provided, value };
+}
+
+function stockTransferPalletSnapshot(lines, palletInput = { provided: false, value: null }) {
+  const calculated = stockRequestPalletQuantity(lines);
+  return {
+    quantity: palletInput.provided ? palletInput.value : calculated.automaticQuantity,
+    requiresManual: calculated.requiresManualQuantity,
+    manuallyAdjusted: palletInput.provided
+  };
+}
+
+async function persistStockTransferMaterialLine(transfer, line) {
+  const sourceName = YARD_BY_LOCATION_ID.get(line.targetSourceLocationId).yardCode;
+  await query(
+    `UPDATE sales_stock_request_lines
+        SET source_location_id = $2, source_name = $3,
+            sales_qty = $4, sales_uom = $5, quantity_mode = $6,
+            pallet_qty = $7, layer_qty = $8, section_qty = $9, piece_qty = $10,
+            updated_at = now()
+      WHERE id = $1`,
+    [
+      line.id, line.targetSourceLocationId, sourceName,
+      line.salesQty, line.salesUom, line.mode,
+      line.pallets, line.layers, line.sections, line.pieces
+    ]
+  );
+  await query(
+    `UPDATE sales_stock_transfer_lines
+        SET sales_qty = $2, sales_uom = $3, quantity_mode = $4,
+            pallet_qty = $5, layer_qty = $6, section_qty = $7, piece_qty = $8,
+            updated_at = now()
+      WHERE transfer_id = $9 AND request_line_id = $1`,
+    [
+      line.id, line.salesQty, line.salesUom, line.mode,
+      line.pallets, line.layers, line.sections, line.pieces, transfer.id
+    ]
+  );
+  await query(
+    `UPDATE sales_stock_transfer_reservations reservation
+        SET source_location_id = $2, reserved_sales_quantity = $3, updated_at = now()
+       FROM sales_stock_transfer_lines transfer_line
+      WHERE transfer_line.id = reservation.transfer_line_id
+        AND transfer_line.transfer_id = $4
+        AND transfer_line.request_line_id = $1
+        AND reservation.status = 'active'`,
+    [line.id, line.targetSourceLocationId, line.salesQty, transfer.id]
+  );
+}
+
+async function returnStockTransferLineToRequest(transfer, line, operatorId) {
+  await query(
+    `UPDATE sales_stock_request_lines
+        SET status = 'submitted', decision_reason = NULL,
+            decided_by = $2, decided_at = now(), updated_at = now()
+      WHERE id = $1 AND status = 'converted'`,
+    [line.id, operatorId || null]
+  );
+  const removed = await query(
+    `DELETE FROM sales_stock_transfer_lines
+      WHERE transfer_id = $1 AND request_line_id = $2
+      RETURNING id`,
+    [transfer.id, line.id]
+  );
+  if (!removed.rowCount) {
+    throw stockRequestError("A pending TO material line was not found.", 404);
+  }
+}
+
+async function updatePrimaryLocalStockTransfer(transfer, group, pallet, revisionRequestId) {
+  if (!group) {
+    await query(
+      `UPDATE sales_stock_transfers
+          SET status = 'cancelled', pallet_quantity = 0,
+              pallet_quantity_requires_manual = false,
+              pallet_quantity_manually_adjusted = false,
+              revision = revision + 1, revision_request_id = $2,
+              revision_error = NULL, confirmation_error = NULL, updated_at = now()
+        WHERE id = $1`,
+      [transfer.id, revisionRequestId]
+    );
+    return;
+  }
+  const sourceName = YARD_BY_LOCATION_ID.get(group.sourceLocationId).yardCode;
+  await query(
+    `UPDATE sales_stock_transfers
+        SET source_location_id = $2, source_name = $3,
+            pallet_quantity = $4,
+            pallet_quantity_requires_manual = $5,
+            pallet_quantity_manually_adjusted = $6,
+            revision = revision + 1, revision_request_id = $7,
+            revision_error = NULL, confirmation_error = NULL, updated_at = now()
+      WHERE id = $1`,
+    [
+      transfer.id, group.sourceLocationId, sourceName,
+      pallet.quantity, pallet.requiresManual, pallet.manuallyAdjusted,
+      revisionRequestId
+    ]
+  );
+}
+
+async function createRepartitionedLocalStockTransfer(transfer, group, operatorId) {
+  const pallet = stockTransferPalletSnapshot(group.lines);
+  const sourceName = YARD_BY_LOCATION_ID.get(group.sourceLocationId).yardCode;
+  const createdBy = String(operatorId || transfer.createdBy || "").trim();
+  if (!createdBy) throw stockRequestError("An SCM operator is required to split a local Pending TO.", 403);
+  const result = await query(
+    `INSERT INTO sales_stock_transfers (
+       request_id, source_location_id, source_name,
+       destination_location_id, destination_name,
+       pallet_item_id, pallet_item_name, pallet_quantity,
+       pallet_quantity_requires_manual, pallet_quantity_manually_adjusted, created_by
+     ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,false,$10)
+     RETURNING *`,
+    [
+      transfer.requestId, group.sourceLocationId, sourceName,
+      transfer.destinationLocationId, transfer.destinationName,
+      transfer.palletItemId, transfer.palletItemName, pallet.quantity,
+      pallet.requiresManual, createdBy
+    ]
+  );
+  const created = mapTransfer(result.rows[0]);
+  const lineIds = group.lines.map((line) => line.id);
+  const moved = await query(
+    `UPDATE sales_stock_transfer_lines
+        SET transfer_id = $1, updated_at = now()
+      WHERE transfer_id = $2 AND request_line_id = ANY($3::bigint[])
+      RETURNING request_line_id`,
+    [created.id, transfer.id, lineIds]
+  );
+  if (moved.rowCount !== lineIds.length) {
+    throw stockRequestError("Not every selected line could be moved to the new local Pending TO.", 409);
+  }
+  return { ...created, lineIds };
+}
+
+async function reviseLocalStockTransferStructure({
+  transfer,
+  normalized,
+  palletInput,
+  revisionRequestId,
+  operatorId,
+  availability
+}) {
+  await lockRequest(transfer.requestId);
+  const removed = normalized.filter((line) => line.remove);
+  const kept = normalized.filter((line) => !line.remove);
+  for (const line of kept) await persistStockTransferMaterialLine(transfer, line);
+  for (const line of removed) await returnStockTransferLineToRequest(transfer, line, operatorId);
+  const groups = groupStockRequestLinesForTransfer(kept.map((line) => ({
+    ...line,
+    sourceLocationId: line.targetSourceLocationId,
+    destinationLocationId: transfer.destinationLocationId
+  })));
+  const primary = groups.find((group) => group.sourceLocationId === transfer.sourceLocationId) || groups[0] || null;
+  const primaryPalletInput = groups.length === 1 && removed.length === 0
+    ? palletInput
+    : { provided: false, value: null };
+  const primaryPallet = stockTransferPalletSnapshot(primary?.lines || [], primaryPalletInput);
+  await updatePrimaryLocalStockTransfer(transfer, primary, primaryPallet, revisionRequestId);
+  const createdTransfers = [];
+  for (const group of groups) {
+    if (group === primary) continue;
+    createdTransfers.push(await createRepartitionedLocalStockTransfer(transfer, group, operatorId));
+  }
+  await query("UPDATE sales_stock_requests SET revision = revision + 1, updated_at = now() WHERE id = $1", [transfer.requestId]);
+  await updateStoredRequestStatus(transfer.requestId);
+  const sourceChanges = kept.filter((line) => line.targetSourceLocationId !== transfer.sourceLocationId).map((line) => ({
+    lineId: line.id,
+    previousSourceLocationId: transfer.sourceLocationId,
+    sourceLocationId: line.targetSourceLocationId
+  }));
+  await recordEvent({
+    requestId: transfer.requestId,
+    transferId: transfer.id,
+    eventType: "transfer_lines_revised",
+    actorId: operatorId,
+    details: {
+      revisionRequestId,
+      previousRevision: transfer.revision,
+      removedLineIds: removed.map((line) => line.id),
+      sourceChanges,
+      createdTransfers: createdTransfers.map((created) => ({
+        transferId: created.id,
+        transferRef: created.transferRef,
+        sourceLocationId: created.sourceLocationId,
+        lineIds: created.lineIds
+      })),
+      availability,
+      backorderSalesQty: availability.reduce((sum, entry) => sum + entry.backorderSalesQty, 0)
+    }
+  });
+  return getStockTransfer(transfer.id);
+}
+
 export async function reviseStockTransferQuantities(transferId, input = {}, { operatorId = null } = {}) {
   return withTransaction(async () => {
     const transfer = await getStockTransfer(transferId, { forUpdate: true });
     const expected = requiredRevision(input.expectedRevision);
-    if (transfer.revision !== expected) {
-      throw stockRequestError("This pending Transfer Order changed after the screen loaded. Reload and try again.", 409, "STOCK_TRANSFER_REVISION_CONFLICT");
-    }
     const revisionRequestId = String(input.requestId || "").trim();
     if (!revisionRequestId || revisionRequestId.length > 200) throw stockRequestError("A stable requestId is required for a TO quantity revision.");
     if (transfer.revisionRequestId && transfer.revisionRequestId === revisionRequestId) return transfer;
-    const inputs = Array.isArray(input.lines) ? input.lines : [];
-    if (inputs.length !== transfer.lines.length) {
-      throw stockRequestError("A quantity revision must include every material line on this pending TO.");
+    if (transfer.revision !== expected) {
+      throw stockRequestError("This pending Transfer Order changed after the screen loaded. Reload and try again.", 409, "STOCK_TRANSFER_REVISION_CONFLICT");
     }
-    const byRequestLineId = new Map(transfer.lines.map((line) => [line.id, line]));
-    const normalized = inputs.map((lineInput) => {
-      const current = byRequestLineId.get(requiredId(lineInput.requestLineId ?? lineInput.id, "request line"));
-      if (!current) throw stockRequestError("A pending TO material line was not found.", 404);
-      const quantity = normalizeStockRequestQuantity(lineInput, {
-        stockUnit: current.salesUom,
-        toPlt: current.toPlt,
-        toLyr: current.toLyr,
-        toSec: current.toSec,
-        toPcs: current.toPcs
-      });
-      return { ...current, ...quantity };
-    });
-    const pairs = normalized.map((line) => ({
+    const normalized = normalizeStockTransferRevisionLines(transfer, input);
+    const structural = normalized.some((line) => line.remove
+      || line.targetSourceLocationId !== transfer.sourceLocationId);
+    if (structural && !isPristineLocalStockTransfer(transfer)) {
+      throw stockRequestError(
+        "Lines can be removed or assigned to another outbound location only before Confirm TO + Print.",
+        409,
+        "STOCK_TRANSFER_STRUCTURE_LOCKED"
+      );
+    }
+    const kept = normalized.filter((line) => !line.remove);
+    const pairs = kept.map((line) => ({
       item_id: line.itemId,
-      source_location_id: transfer.sourceLocationId,
+      source_location_id: line.targetSourceLocationId,
       sales_qty: line.salesQty
     }));
-    const availability = await conversionAvailabilitySnapshot(pairs, {
+    const availability = pairs.length ? await conversionAvailabilitySnapshot(pairs, {
       ownReservations: await currentTransferReservationTotals(transfer.id)
-    });
-    for (const line of normalized) {
-      await query(
-        `UPDATE sales_stock_request_lines
-            SET sales_qty = $2, sales_uom = $3, quantity_mode = $4,
-                pallet_qty = $5, layer_qty = $6, section_qty = $7, piece_qty = $8,
-                updated_at = now()
-          WHERE id = $1`,
-        [line.id, line.salesQty, line.salesUom, line.mode, line.pallets, line.layers, line.sections, line.pieces]
-      );
-      await query(
-        `UPDATE sales_stock_transfer_lines
-            SET sales_qty = $2, sales_uom = $3, quantity_mode = $4,
-                pallet_qty = $5, layer_qty = $6, section_qty = $7, piece_qty = $8,
-                updated_at = now()
-          WHERE transfer_id = $9 AND request_line_id = $1`,
-        [line.id, line.salesQty, line.salesUom, line.mode, line.pallets, line.layers, line.sections, line.pieces, transfer.id]
-      );
-      await query(
-        `UPDATE sales_stock_transfer_reservations reservation
-            SET reserved_sales_quantity = $2, updated_at = now()
-           FROM sales_stock_transfer_lines transfer_line
-          WHERE transfer_line.id = reservation.transfer_line_id
-            AND transfer_line.transfer_id = $3
-            AND transfer_line.request_line_id = $1
-            AND reservation.status = 'active'`,
-        [line.id, line.salesQty, transfer.id]
-      );
+    }) : [];
+    const palletInput = normalizeStockTransferPalletInput(input);
+    if (structural) {
+      return reviseLocalStockTransferStructure({
+        transfer,
+        normalized,
+        palletInput,
+        revisionRequestId,
+        operatorId,
+        availability
+      });
     }
-    const pallet = stockRequestPalletQuantity(normalized.map((line) => ({
-      itemId: line.itemId,
-      salesQty: line.salesQty,
-      toPlt: line.toPlt
-    })));
-    const hasPalletInput = Object.hasOwn(input, "palletQuantity");
-    const requestedPallet = hasPalletInput ? Number(input.palletQuantity) : null;
-    if (hasPalletInput && (!Number.isFinite(requestedPallet) || requestedPallet < 0 || requestedPallet > 1_000_000_000)) {
-      throw stockRequestError("PALLET item quantity must be a finite non-negative number.");
-    }
-    const palletQuantity = hasPalletInput ? requestedPallet : pallet.automaticQuantity;
+    for (const line of normalized) await persistStockTransferMaterialLine(transfer, line);
+    const pallet = stockTransferPalletSnapshot(normalized, palletInput);
     await query(
       `UPDATE sales_stock_transfers
           SET pallet_quantity = $2,
@@ -1743,7 +1959,7 @@ export async function reviseStockTransferQuantities(transferId, input = {}, { op
               confirmation_error = CASE WHEN netsuite_transfer_order_id IS NULL THEN confirmation_error ELSE 'Quantity changed; NetSuite sync and re-print are required.' END,
               updated_at = now()
         WHERE id = $1`,
-      [transfer.id, palletQuantity, pallet.requiresManualQuantity, hasPalletInput, revisionRequestId]
+      [transfer.id, pallet.quantity, pallet.requiresManual, palletInput.provided, revisionRequestId]
     );
     await query("UPDATE sales_stock_requests SET revision = revision + 1, updated_at = now() WHERE id = $1", [transfer.requestId]);
     await recordEvent({
@@ -1754,7 +1970,7 @@ export async function reviseStockTransferQuantities(transferId, input = {}, { op
       details: {
         revisionRequestId,
         previousRevision: expected,
-        palletQuantity,
+        palletQuantity: pallet.quantity,
         availability,
         backorderSalesQty: availability.reduce((sum, entry) => sum + entry.backorderSalesQty, 0)
       }

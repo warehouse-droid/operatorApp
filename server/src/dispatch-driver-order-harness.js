@@ -231,6 +231,7 @@ vm.runInContext(`
   };
   const trucks = [truck];
   let hasTransferAssignment = true;
+  let projectedAssignments = new Map();
   function driverOrientedPlanningEnabled() { return true; }
   function loadDriverKey(parentTruck, load) {
     return String(load?.driverLogin || parentTruck?.driverLogin || "").trim().toLowerCase();
@@ -251,6 +252,9 @@ vm.runInContext(`
     return hasTransferAssignment && String(orderId || "") === transferOrder.id
       ? { truck, load: transferLoad }
       : {};
+  }
+  function dispatchPlannedAssignment(orderId) {
+    return projectedAssignments.get(String(orderId || "")) || null;
   }
   function replenishmentTransferCompletionInLoad() { return null; }
   function comparePlanDate(a, b) {
@@ -273,11 +277,13 @@ vm.runInContext(`
   const blocked = replenishmentPlacementBlockMessage(groupedSales, truck, salesLoad);
   hasTransferAssignment = false;
   transferLoad.driverSequence = 3;
-  groupedSales.orderDependencies[0].transferDispatchPlanned = true;
-  groupedSales.orderDependencies[0].transferDispatchPlanDate = "2026-07-21";
+  projectedAssignments = new Map([[transferOrder.id, {
+    orderRef: transferOrder.id,
+    dispatchPlanId: "prior-plan",
+    dispatchPlanDate: "2026-07-21"
+  }]]);
   const historicalAllowed = replenishmentPlacementBlockMessage(groupedSales, truck, salesLoad);
-  delete groupedSales.orderDependencies[0].transferDispatchPlanned;
-  delete groupedSales.orderDependencies[0].transferDispatchPlanDate;
+  projectedAssignments.clear();
   const missingPlanBlocked = replenishmentPlacementBlockMessage(groupedSales, truck, salesLoad);
   globalThis.result = { allowed, blocked, historicalAllowed, missingPlanBlocked };
 `, replenishmentPrecedenceContext);
@@ -805,6 +811,12 @@ vm.runInContext(`
   function normalizeReplenishmentTransferInsertIndex(_order, _load, insertIndex) { return insertIndex; }
   function normalizeReplenishmentDependentInsertIndex(_order, _load, insertIndex) { return insertIndex; }
   function replenishmentPlacementBlockMessage() { return ""; }
+  function lateOrderRoutePlacement(load, _order, requestedIndex) {
+    const index = Number.isInteger(requestedIndex)
+      ? Math.max(0, Math.min(requestedIndex, load.stops.length))
+      : load.stops.length;
+    return { pickupInsertIndex: index, dropInsertIndex: index, boundary: -1 };
+  }
   function summarizeLoad(load) { return { id: load.id, stops: load.stops.length }; }
   function hasUsableDispatchAddress() { return true; }
   function transitBlockMessage() { return ""; }
@@ -1056,7 +1068,7 @@ assert.equal((initDispatchSource.match(/loadDriverJobStatuses\(/g) || []).length
 assert(repository.includes("displayOrder: numberValue(row.display_order, 0)"), "Setup API does not expose persisted display order.");
 assert(repository.includes("cleanDriver(driver, index)"), "Driver request order is not explicitly persisted as display_order.");
 assert(setupHtml.includes("20260818-actual-stop-arrival-v1"), "Dispatch Setup browser asset version was not bumped.");
-assert(plannerHtml.includes('/dispatch.js?v=20260830-po-link-co-reconcile-v1'), "Dispatch planner browser asset version was not bumped.");
+assert(plannerHtml.includes('/dispatch.js?v=20260903-repeat-pickup-visits-v1'), "Dispatch planner browser asset version was not bumped.");
 
 const activityPositionSource = sourceRange(
   plannerUi,
@@ -1064,9 +1076,9 @@ const activityPositionSource = sourceRange(
   "function stopActivityLockNotice"
 );
 const physicalActivityPositionChanged = Function(
-  "stopHasDriverActivity",
+  "dispatchEditableRouteBoundary",
   `"use strict"; ${activityPositionSource}; return physicalActivityPositionChanged;`
-)((_load, stop) => stop?.id === "ACTIVE");
+)((load) => (load?.stops || []).findIndex((stop) => stop?.id === "ACTIVE"));
 const activityLoad = { stops: [{ id: "EARLY-A" }, { id: "EARLY-B" }, { id: "ACTIVE" }, { id: "FUTURE-A" }, { id: "FUTURE-B" }] };
 assert.equal(physicalActivityPositionChanged(activityLoad, [{ id: "EARLY-B" }, { id: "EARLY-A" }, { id: "ACTIVE" }, { id: "FUTURE-A" }, { id: "FUTURE-B" }]), true,
   "Equal-count edits before a started stop must not rewrite the executed prefix.");
@@ -1087,13 +1099,13 @@ const optimizeLoad = {
 };
 const optimizeSelectedRoute = Function(
   "selectedLoad",
-  "stopHasDriverActivity",
+  "dispatchEditableRouteBoundary",
   "stopOrder",
   "minutes",
   `"use strict"; ${optimizeSource}; return optimizeSelectedRoute;`
 )(
   () => ({ load: optimizeLoad }),
-  (_load, stop) => stop?.id === "ACTIVE",
+  (load) => (load?.stops || []).findIndex((stop) => stop?.id === "ACTIVE"),
   (stop) => stop,
   (value) => Number(String(value).split(":")[0]) * 60 + Number(String(value).split(":")[1])
 );

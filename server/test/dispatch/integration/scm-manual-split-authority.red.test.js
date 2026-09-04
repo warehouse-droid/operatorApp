@@ -233,10 +233,12 @@ test("scheduled reconciliation preserves a held manual child despite partial rec
     const reconciled = await reconcileScmOrderFamily({
       kind: "PO",
       sourceOrderId: fixture.sourcePoId,
-      source: "manual"
+      source: "manual",
+      explicitReviewReason: "Fixture parent review must not replace the held child status."
     });
     assert.equal(reconciled.reconciliationStatus, "review");
-    assert.equal(reconciled.targets[fixture.firstSplitRef]?.received, 5);
+    assert.equal(reconciled.targets[fixture.firstSplitRef]?.received, 0,
+      "an unfinished held child must not inherit family receipt quantity");
     assert.equal(reconciled.targets[fixture.firstSplitRef]?.applicationStatus, "Hold");
     assert.equal(reconciled.targets[fixture.firstSplitRef]?.reconciliationStatus, "ok");
     const schedule = await query(
@@ -434,6 +436,8 @@ test("accepted unchanged reconciliation conflict remains resolved until evidence
     const accepted = await query(
       `SELECT review.status, review.resolution_action,
               review.details->>'conflictFingerprint' AS conflict_fingerprint,
+              review.details->>'conflictAcceptanceFingerprint'
+                AS conflict_acceptance_fingerprint,
               state.reconciliation_status,
               schedule.status AS schedule_status,
               schedule.reconciliation_blocked
@@ -448,9 +452,47 @@ test("accepted unchanged reconciliation conflict remains resolved until evidence
     assert.equal(accepted.rows[0]?.status, "resolved");
     assert.equal(accepted.rows[0]?.resolution_action, "accept");
     assert.match(accepted.rows[0]?.conflict_fingerprint || "", /^[a-f0-9]{64}$/);
+    assert.match(
+      accepted.rows[0]?.conflict_acceptance_fingerprint || "",
+      /^[a-f0-9]{64}$/
+    );
     assert.notEqual(accepted.rows[0]?.reconciliation_status, "review");
     assert.equal(accepted.rows[0]?.schedule_status, "Hold");
     assert.equal(accepted.rows[0]?.reconciliation_blocked, false);
+
+    await query(
+      `UPDATE purchase_order_lines
+          SET quantity = quantity + 10,
+              synced_at = now()
+        WHERE id = $1`,
+      [fixture.lineId]
+    );
+    const unrelatedUpdate = await reconcileScmOrderFamily({
+      kind: "PO",
+      sourceOrderId: fixture.sourcePoId,
+      source: "system",
+      explicitReviewReason: reason
+    });
+    assert.notEqual(unrelatedUpdate.reconciliationStatus, "review",
+      "a valid PO quantity update must not revive an unchanged accepted conflict");
+    assert.notEqual(unrelatedUpdate.applicationStatus, "Reconcile Review");
+
+    await query(
+      `UPDATE purchase_order_lines
+          SET quantity = quantity + 15,
+              synced_at = now()
+        WHERE id = $1`,
+      [fixture.lineId]
+    );
+    const laterUnrelatedUpdate = await reconcileScmOrderFamily({
+      kind: "PO",
+      sourceOrderId: fixture.sourcePoId,
+      source: "system",
+      explicitReviewReason: reason
+    });
+    assert.notEqual(laterUnrelatedUpdate.reconciliationStatus, "review",
+      "repeated valid PO quantity updates must keep the same accepted conflict resolved");
+    assert.notEqual(laterUnrelatedUpdate.applicationStatus, "Reconcile Review");
 
     const changed = await reconcileScmOrderFamily({
       kind: "PO",
@@ -469,7 +511,7 @@ test("accepted unchanged reconciliation conflict remains resolved until evidence
   });
 });
 
-test("accepting a review preserves a split planning status saved after the review snapshot", async () => {
+test("accepting a review rejects newer Planned text without an active assignment", async () => {
   await inRollback(async () => {
     const fixture = await seedSource("post-review-plan");
     await createSplit(fixture, { status: "Hold", destinationLocationId: 15 });
@@ -528,7 +570,7 @@ test("accepting a review preserves a split planning status saved after the revie
       kind: "PO",
       orderRef: fixture.sourcePoRef,
       resolution: "accept_current",
-      note: "Accept without overwriting newer dispatch planning.",
+      note: "Accept without treating stale Planned text as a dispatch assignment.",
       actor: "manual-split-authority-test",
       actorRole: "admin"
     });
@@ -545,9 +587,9 @@ test("accepting a review preserves a split planning status saved after the revie
       [fixture.firstSplitRef, fixture.firstSplitRef]
     );
     assert.deepEqual(persisted.rows, [{
-      status: "Planned",
-      updated_by: "dispatch-v2:post-review-plan-test",
-      target_application_status: "Planned"
+      status: "Queued",
+      updated_by: "manual-split-authority-test",
+      target_application_status: "Queued"
     }]);
   });
 });
@@ -698,6 +740,36 @@ test("manual split display status ignores family reconciliation derivation but p
       completion_event_id: 99
     }),
     "Completed"
+  );
+
+  const stalePartialEvidence = {
+    scheduleStatus: "Partially Done",
+    scheduleId: 42,
+    scheduleUpdatedAt: "2026-09-01T22:14:02.750784Z",
+    reconciliationStatus: "ok",
+    reconciliationReconciledAt: "2026-09-01T22:03:10.000Z",
+    reconciliationApplicationStatus: "Queued",
+    preferReconciliationStatus: true
+  };
+  assert.equal(
+    scmScheduleEffectiveReconciliationStatus(stalePartialEvidence),
+    "Queued",
+    "a newer non-authoritative split status must not outrank corrected evidence"
+  );
+  assert.equal(
+    effectiveScmPurchaseOrderCatalogStatus(
+      { isScmSplit: true, dispatchPlanned: false, scm: { status: "Partially Done" } },
+      {
+        schedule_id: 42,
+        schedule_status: "Partially Done",
+        schedule_updated_at: "2026-09-01T22:14:02.750784Z",
+        reconciliation_status: "ok",
+        reconciled_at: "2026-09-01T22:03:10.000Z",
+        reconciliation_application_status: "Queued",
+        reconciliation_blocked: false
+      }
+    ),
+    "Queued"
   );
 });
 

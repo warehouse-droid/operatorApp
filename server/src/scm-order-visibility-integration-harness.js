@@ -1,6 +1,8 @@
 import assert from "node:assert/strict";
 import { createOperator } from "./auth-repository.js";
 import { closeDb, query } from "./db.js";
+import { listDispatchOrders } from "./dispatch-repository.js";
+import { enrichScmScheduleWithReconciliation } from "./scm-reconciliation-repository.js";
 
 const { app } = await import("./server.js");
 
@@ -88,6 +90,14 @@ const restrictedRefs = new Set(
     ) || ["Hold", "Completed", "Cancelled"].includes(fixture.scheduleStatus))
     .map((fixture) => fixture.ref)
 );
+const completedSearchRefs = new Set(
+  allFixtures
+    .filter((fixture) => fixture.status === "Completed" || fixture.reconciliationStatus === "Completed")
+    .map((fixture) => fixture.ref)
+);
+const nonSearchableRestrictedRefs = new Set(
+  [...restrictedRefs].filter((ref) => !completedSearchRefs.has(ref))
+);
 const normalRefs = new Set(
   allFixtures.filter((fixture) => !restrictedRefs.has(fixture.ref)).map((fixture) => fixture.ref)
 );
@@ -135,6 +145,27 @@ function assertHasNormalControls(payload, label) {
   const returned = new Set(fixtureRefs(payload));
   for (const ref of normalRefs) {
     assert(returned.has(ref), `${label} did not return eligible control row ${ref}.`);
+  }
+}
+
+function assertDispatchExplicitSearchResults(payload, label) {
+  const rows = fixtureRows(payload);
+  const returned = new Set(rows.map((row) => String(row.orderRef ?? row.id)));
+  const leaked = [...nonSearchableRestrictedRefs].filter((ref) => returned.has(ref));
+  assert.deepEqual(leaked, [], `${label} leaked non-searchable restricted rows: ${leaked.join(", ")}`);
+  assertHasNormalControls(payload, label);
+  for (const ref of completedSearchRefs) {
+    const row = rows.find((candidate) => String(candidate.orderRef ?? candidate.id) === ref);
+    assert(
+      row,
+      `${label} did not return completed PO/TO ${ref}; returned ${[...returned].join(", ")}.`
+    );
+    assert.equal(row.dispatchPlanningRestricted, true, `${label} must mark ${ref} search-only.`);
+    assert.match(
+      String(row.dispatchPlanningRestrictionReason || ""),
+      /completed/i,
+      `${label} must explain why ${ref} cannot be planned.`
+    );
   }
 }
 
@@ -374,6 +405,35 @@ try {
   for (const [index, fixture] of transferFixtures.entries()) {
     await insertTransferFixture(fixture, index);
   }
+  const hiddenSearchRows = await listDispatchOrders({
+    search: prefix,
+    includeHiddenScm: true,
+    includeScmLinkedSearchRefs: true
+  });
+  const hiddenCompletedTo = hiddenSearchRows.find((row) => (
+    row.id === `${prefix}-TO-COMPLETED`
+    && ["complete", "completed"].includes(String(row.scm?.status || "").trim().toLowerCase())
+  ));
+  assert(
+    hiddenCompletedTo,
+    `The repository hidden-search feed did not return its completed TO schedule row; returned ${hiddenSearchRows.map((row) => `${row.id}=${row.scm?.status || ""}`).join(", ")}.`
+  );
+  const [reconciledCompletedTo] = await enrichScmScheduleWithReconciliation([{
+    orderKind: hiddenCompletedTo.type,
+    orderRef: hiddenCompletedTo.id,
+    sourceRef: hiddenCompletedTo.originalOrderId || hiddenCompletedTo.id,
+    sourceId: hiddenCompletedTo.netsuiteId,
+    status: hiddenCompletedTo.scm?.status || "Queued",
+    scheduleId: hiddenCompletedTo.scm?.scheduleId || null,
+    updatedAt: hiddenCompletedTo.scm?.updatedAt || null
+  }], { includeDetails: false, view: "dispatch" });
+  const reconciledCompletedToStatus = reconciledCompletedTo?.calculatedStatus
+    || reconciledCompletedTo?.reconciliationApplicationStatus
+    || reconciledCompletedTo?.status;
+  assert(
+    ["Complete", "Completed"].includes(reconciledCompletedToStatus),
+    `Completed TO reconciliation changed status unexpectedly: ${JSON.stringify(reconciledCompletedTo)}.`
+  );
   const staleHoldRef = `${prefix}-PO-STALE-RECON-HOLD`;
   const staleReconciliationHoldRef = `${prefix}-PO-MANUAL-QUEUED-STALE-HOLD`;
   const staleReconciliationCompletedRef = `${prefix}-PO-MANUAL-QUEUED-COMPLETED`;
@@ -481,13 +541,23 @@ try {
   ]) {
     const dispatch = await requestJson(
       baseUrl,
-      `/api/dispatch/orders?search=${encodeURIComponent(prefix)}&includeHiddenScm=true`,
+      `/api/dispatch/orders?search=${encodeURIComponent(prefix)}`,
       { token }
     );
     assert.equal(dispatch.response.status, 200, `${role} dispatch order request should succeed.`);
-    assertNoRestricted(dispatch.payload, `${role} dispatch response`);
-    assertHasNormalControls(dispatch.payload, `${role} dispatch response`);
+    assertDispatchExplicitSearchResults(dispatch.payload, `${role} dispatch response`);
   }
+
+  const versionedDispatch = await requestJson(
+    baseUrl,
+    `/api/dispatch/v2/order-pool?search=${encodeURIComponent(prefix)}&limit=200`,
+    { token: tokens.dispatcher }
+  );
+  assert.equal(versionedDispatch.response.status, 200, "Versioned Dispatch search should succeed.");
+  assertDispatchExplicitSearchResults(
+    versionedDispatch.payload?.orders,
+    "Versioned Dispatcher search response"
+  );
 
   await assertRestrictedScheduleHidden(baseUrl, tokens.dispatcher, "Dispatcher");
   const dispatcherNormal = await requestJson(

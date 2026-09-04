@@ -66,7 +66,7 @@ test("SPSE-A3: split identity is normalized but unrelated targets remain byte-fo
   }), {});
 });
 
-test("SPSE-A4: terminal lifecycle and terminal application decisions remain authoritative", () => {
+test("SPSE-A4: terminal lifecycle and authoritative terminal decisions remain authoritative", () => {
   for (const lifecycle of [{ closed: true }, { cancelled: true }]) {
     const review = derived("Reconcile Review", "lifecycle conflict", lifecycle);
     assert.strictEqual(applySplitTargetEvidencePrecedence({
@@ -84,20 +84,35 @@ test("SPSE-A4: terminal lifecycle and terminal application decisions remain auth
     }), lifecyclePartial);
   }
 
-  for (const applicationStatus of ["Completed", "Cancelled"]) {
-    const terminal = derived(applicationStatus);
-    assert.strictEqual(applySplitTargetEvidencePrecedence({
-      targetKind: "po_split",
-      previousStatus: "Queued",
-      derivedState: terminal
-    }), terminal);
-  }
+  const cancelled = derived("Cancelled");
+  assert.strictEqual(applySplitTargetEvidencePrecedence({
+    targetKind: "po_split",
+    previousStatus: "Queued",
+    derivedState: cancelled
+  }), cancelled);
+
+  const completed = derived("Completed");
+  assert.strictEqual(applySplitTargetEvidencePrecedence({
+    targetKind: "po_split",
+    previousStatus: "Completed",
+    hasAuthoritativeCompletion: true,
+    derivedState: completed
+  }), completed);
+
+  assert.equal(applySplitTargetEvidencePrecedence({
+    targetKind: "po_split",
+    previousStatus: "Completed",
+    hasAuthoritativeCompletion: false,
+    hasActivePlan: false,
+    derivedState: completed
+  }).applicationStatus, "Queued");
 });
 
 test("SPSE-A5: legacy completion spelling is monotonic and a reasonless review remains visible", () => {
   assert.equal(applySplitTargetEvidencePrecedence({
     targetKind: "po_split",
     previousStatus: " complete ",
+    hasAuthoritativeCompletion: true,
     derivedState: derived("Queued")
   }).applicationStatus, "Completed");
 

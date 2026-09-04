@@ -1845,6 +1845,14 @@ function reconciliationLineSort(left, right) {
   );
 }
 
+export function scmCumulativeProgressObserved(row = {}) {
+  const raw = row.progress_raw
+    ?? row.progress_
+    ?? row.cumulative_progress_raw
+    ?? row.cumulative_progress_;
+  return raw !== null && raw !== undefined && raw !== "";
+}
+
 function collapseTransferMirrorRows(rows, {
   identityStatus,
   identityIssue = "",
@@ -2123,7 +2131,7 @@ async function fetchScmReconciliationOrdersBatch(options = {}) {
       BUILTIN.DF(i.itemtype) AS item_type_text,
       tl.quantity AS signed_quantity,
       ABS(NVL(tl.quantity, 0)) AS ordered_quantity,
-      tl.quantityshiprecv AS cumulative_progress_raw,
+      tl.quantityshiprecv AS progress_raw,
       ABS(NVL(tl.quantityshiprecv, 0)) AS cumulative_progress_quantity,
       tl.quantitycommitted AS netsuite_committed_qty,
       tl.quantitybackordered AS netsuite_backordered_qty,
@@ -2197,9 +2205,7 @@ async function fetchScmReconciliationOrdersBatch(options = {}) {
       signedQuantity,
       quantity: toNumber(row.ordered_quantity),
       cumulativeProgressQuantity: toNumber(row.cumulative_progress_quantity),
-      cumulativeProgressObserved: row.cumulative_progress_raw !== null
-        && row.cumulative_progress_raw !== undefined
-        && row.cumulative_progress_raw !== "",
+      cumulativeProgressObserved: scmCumulativeProgressObserved(row),
       netsuiteCommittedQty: row.netsuite_committed_qty === null
         || row.netsuite_committed_qty === undefined
         || row.netsuite_committed_qty === ""
@@ -2789,6 +2795,8 @@ export async function fetchPurchaseOrderDetailsFromNetSuite(orderId, locationId 
   const result = await suiteql(`
     SELECT
       tl.uniquekey AS line_id,
+      tl.id AS order_line,
+      tl.linesequencenumber AS line_sequence_number,
       tl.item AS item_id,
       BUILTIN.DF(tl.item) AS item_name,
       i.itemtype AS item_type,
@@ -2815,7 +2823,7 @@ export async function fetchPurchaseOrderDetailsFromNetSuite(orderId, locationId 
       AND tl.mainline = 'F'
       AND (tl.taxline = 'F' OR tl.taxline IS NULL)
       ${locationFilter}
-    ORDER BY tl.uniquekey
+    ORDER BY tl.linesequencenumber, tl.id, tl.uniquekey
   `);
   return (result.items || []).map(normalizeOpenDeliveryLine);
 }

@@ -13,6 +13,30 @@ const TESTS = Object.freeze([
 
 const MUTANTS = Object.freeze([
   {
+    name: "evidence-protected split allocation is bypassed",
+    target: "src/scm-split-receipt-allocation.js",
+    from: "  if (usesEvidenceProtectedAllocation(normalizedTargets)) {",
+    to: "  if (false) {"
+  },
+  {
+    name: "unfinished split children accept inferred receipts",
+    target: "src/scm-split-receipt-allocation.js",
+    from: "            && target.allowInferredReceipt !== false\n            && target.operationallyCompleted !== true\n            && targetExistedForReceipt(target, entry.receiptDate)",
+    to: "            && target.operationallyCompleted !== true\n            && targetExistedForReceipt(target, entry.receiptDate)"
+  },
+  {
+    name: "operationally completed children are excluded from historical IR",
+    target: "src/scm-split-receipt-allocation.js",
+    from: "    const completedForReceipt = (target) => (\n      target.operationallyCompleted === true",
+    to: "    const completedForReceipt = (target) => (\n      target.operationallyCompleted !== true"
+  },
+  {
+    name: "source residual cannot conserve a historical cross-yard remainder",
+    target: "src/scm-split-receipt-allocation.js",
+    from: "        (target) => target.isParent === true\n          && target.allowInferredReceipt !== false",
+    to: "        (target) => target.isParent !== true\n          && target.allowInferredReceipt !== false"
+  },
+  {
     name: "known receipt locations use the legacy cross-yard allocator",
     target: "src/scm-split-receipt-allocation.js",
     from: "  if (!quantitiesByLocation.size) {",
@@ -27,8 +51,8 @@ const MUTANTS = Object.freeze([
   {
     name: "known-location budget is discarded",
     target: "src/scm-split-receipt-allocation.js",
-    from: "      Math.max(knownQuantityBudget, 0)",
-    to: "      0"
+    from: "    const bucketQty = roundReconciliationQuantity(Math.min(\n      observedQuantity,\n      Math.max(knownQuantityBudget, 0)\n    ));",
+    to: "    const bucketQty = roundReconciliationQuantity(Math.min(\n      observedQuantity,\n      0\n    ));"
   },
   {
     name: "receipt rows above authoritative total are accepted",
@@ -53,12 +77,6 @@ const MUTANTS = Object.freeze([
     target: "src/scm-reconciliation-repository.js",
     from: "    const receivedAllocation = order.kind === \"PO\"",
     to: "    const receivedAllocation = order.kind === \"PO_DISABLED\""
-  },
-  {
-    name: "split target destination is forced to the parent yard",
-    target: "src/scm-reconciliation-repository.js",
-    from: "              COALESCE(child_line.location_id, child.destination_location_id) AS target_destination_location_id,",
-    to: "              1 AS target_destination_location_id,"
   }
 ]);
 

@@ -16,12 +16,13 @@ async function addPoSplit(parentRef, childRef, { status = "active" } = {}) {
   );
 }
 
-async function completeDriverRef(orderRef, suffix) {
+async function completeDriverRef(orderRef, suffix, { stopType = "dropoff", status = "complete" } = {}) {
   await query(
     `INSERT INTO driver_job_records (
        job_id, driver_login, stop_type, order_refs, status, started_at, completed_at
-     ) VALUES ($1, 'split-test-driver', 'dropoff', $2::jsonb, 'complete', now(), now())`,
-    [`driver-completion-split-${suffix}`, JSON.stringify([orderRef])]
+     ) VALUES ($1, 'split-test-driver', $2, $3::jsonb, $4, now(),
+               CASE WHEN $4 IN ('complete', 'completed') THEN now() ELSE NULL END)`,
+    [`driver-completion-split-${suffix}`, stopType, JSON.stringify([orderRef]), status]
   );
 }
 
@@ -129,5 +130,28 @@ test("an exact Driver-completed reference remains blocked without any relation r
       () => assertNoDriverPwaCompletedDispatchRefs([orderRef], "add these orders to Dispatch"),
       (error) => error?.code === "DISPATCH_ORDER_DRIVER_COMPLETED"
     );
+  }, { rollback: true });
+});
+
+test("a completed transfer pickup does not mark its sales-order refs delivered", async () => {
+  await withTransaction(async () => {
+    const first = "SOB119023";
+    const second = "SOB118968";
+    await completeDriverRef(first, "co-pickup-first", { stopType: "pickup" });
+    await completeDriverRef(second, "co-pickup-second", { stopType: "pickup" });
+    await completeDriverRef(first, "co-drop-in-progress", {
+      stopType: "dropoff",
+      status: "in_progress"
+    });
+
+    const completed = await listDriverPwaCompletedDispatchRefs({
+      candidateRefs: [first, second]
+    });
+    assert.equal(completed.has(first.toLowerCase()), false);
+    assert.equal(completed.has(second.toLowerCase()), false);
+    await assert.doesNotReject(() => assertNoDriverPwaCompletedDispatchRefs(
+      [first, second],
+      "add these orders to Dispatch"
+    ));
   }, { rollback: true });
 });

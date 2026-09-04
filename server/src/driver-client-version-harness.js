@@ -160,8 +160,8 @@ assert.match(driverSource, /navigator\.serviceWorker\.addEventListener\("control
 assert.match(driverSource, /updateViaCache: "none"/);
 assert.match(driverSource, /String\(savedJob\.fingerprint\) !== currentFingerprint/);
 assert.match(offlineSyncSource, /\[DRIVER_PWA_VERSION_HEADER\]: DRIVER_PWA_CLIENT_VERSION/);
-assert.match(workerSource, /DRIVER_CACHE_NAME = `\$\{DRIVER_CACHE_PREFIX\}v38`/);
-assert.match(workerSource, /DRIVER_REFRESH_CACHE_NAME = `\$\{DRIVER_CACHE_PREFIX\}refresh-v38`/);
+assert.match(workerSource, /DRIVER_CACHE_NAME = `\$\{DRIVER_CACHE_PREFIX\}v40`/);
+assert.match(workerSource, /DRIVER_REFRESH_CACHE_NAME = `\$\{DRIVER_CACHE_PREFIX\}refresh-v40`/);
 assert.match(workerSource, /DRIVER_VERSION_REQUEST/);
 assert.match(workerSource, /type: "DRIVER_VERSION", version: DRIVER_PWA_CLIENT_VERSION/);
 for (const asset of [
@@ -177,17 +177,17 @@ for (const asset of [
   "driver.js"
 ]) {
   assert.ok(
-    workerSource.includes(`/${asset}?v=20260819-driver-route-readiness-v1`),
+    workerSource.includes(`/${asset}?v=20260903-retained-photo-i18n-v1`),
     `${asset} must use the current atomic token in the worker shell.`
   );
   assert.ok(
-    driverHtml.includes(`/${asset}?v=20260819-driver-route-readiness-v1`),
+    driverHtml.includes(`/${asset}?v=20260903-retained-photo-i18n-v1`),
     `${asset} must use the current atomic token in the Driver page.`
   );
 }
 assert.match(
   driverSource,
-  /serviceWorker\.register\("\/driver-service-worker\.js\?v=20260819-driver-route-readiness-v1"/
+  /serviceWorker\.register\("\/driver-service-worker\.js\?v=20260903-retained-photo-i18n-v1"/
 );
 assert.match(driverCss, /\.driver-pwa-update-screen[\s\S]*\.driver-pwa-update-card/);
 

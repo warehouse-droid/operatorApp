@@ -1,5 +1,6 @@
 import crypto from "node:crypto";
 import { applyDispatchPlanDelta } from "./dispatch-planner-optimization.js";
+import { dispatchExecutedStopFingerprint } from "./dispatch-pickup-visits.js";
 
 const PLAN_OWNED_TYPES = new Set(["CO", "CUSTOM", "GROUP", "SPLIT"]);
 const PHYSICAL_STOP_TYPES = new Set([
@@ -149,6 +150,10 @@ export function applyActiveTransitCoMetadata(order = {}, activeCos = []) {
       ])
       .filter(([sourceRef, record]) => sourceRef && record.coRef && record.fromYard && record.toYard));
   const locationKey = (value) => text(value).split(/\s*:\s*/u, 1)[0].toLowerCase();
+  const relationshipPickupLocations = (candidate = {}) => [
+    ...(Array.isArray(candidate.poPickupManifest) ? candidate.poPickupManifest : []),
+    ...(Array.isArray(candidate.directPickupManifest) ? candidate.directPickupManifest : [])
+  ].map((entry) => text(entry?.location)).filter(Boolean);
   const reconcile = (candidate = {}, inherited = null) => {
     const ref = orderRef(candidate);
     const active = activeBySource.get(ref.toLowerCase()) || inherited;
@@ -165,14 +170,28 @@ export function applyActiveTransitCoMetadata(order = {}, activeCos = []) {
     if (!active) {return next;}
 
     const destination = locationKey(active.toYard);
+    const relationshipPickups = relationshipPickupLocations(candidate);
+    const relationshipPickupKeys = new Set(relationshipPickups.map(locationKey).filter(Boolean));
     const originalPickups = [
       ...(Array.isArray(candidate.transitOriginalPickupLocations)
         ? candidate.transitOriginalPickupLocations
         : []),
       ...(Array.isArray(candidate.pickupLocations)
-        ? candidate.pickupLocations.filter((location) => locationKey(location) !== destination)
+        ? candidate.pickupLocations.filter((location) => (
+            (
+              !candidate.transitOriginalPickupLocations?.length
+              || locationKey(location) !== destination
+            )
+            && !relationshipPickupKeys.has(locationKey(location))
+          ))
         : []),
-      ...(!candidate.transitOriginalPickupLocations?.length && active.fromYard ? [active.fromYard] : [])
+      ...(
+        !candidate.transitOriginalPickupLocations?.length
+        && !candidate.pickupLocations?.length
+        && active.fromYard
+          ? [active.fromYard]
+          : []
+      )
     ];
     const seen = new Set();
     next.transitOriginalPickupLocations = originalPickups.filter((location) => {
@@ -196,7 +215,13 @@ export function applyActiveTransitCoMetadata(order = {}, activeCos = []) {
       ...(active.status ? { status: active.status } : {}),
       sourceOrderId: ref || active.sourceOrderRef
     };
-    next.pickupLocations = [active.toYard];
+    const activePickupKeys = new Set();
+    next.pickupLocations = [active.toYard, ...relationshipPickups].filter((location) => {
+      const key = locationKey(location);
+      if (!key || activePickupKeys.has(key)) {return false;}
+      activePickupKeys.add(key);
+      return true;
+    });
     next.sourceYard = active.toYard;
     return next;
   };
@@ -675,6 +700,16 @@ function stopIdentity(stop = {}) {
   return text(stop.id || stop.stopId) || `${text(stop.type)}:${stopRefs(stop).join("|")}`;
 }
 
+function activityJobDetails(record = {}) {
+  const value = record.jobDetails || record.job_details || {};
+  if (value && typeof value === "object") {return value;}
+  try {
+    return JSON.parse(text(value) || "{}");
+  } catch {
+    return {};
+  }
+}
+
 export function evaluateExecutedPrefixPolicy({ previousPlan = {}, nextPlan = {}, activity = [] } = {}) {
   const previousLoads = planLoads(previousPlan);
   const nextLoads = planLoads(nextPlan);
@@ -683,16 +718,28 @@ export function evaluateExecutedPrefixPolicy({ previousPlan = {}, nextPlan = {},
   for (const record of activity || []) {
     if (!["in_progress", "complete"].includes(text(record.status).toLowerCase())) {continue;}
     const type = text(record.stopType || record.stop_type).toLowerCase();
-    if (type && !PHYSICAL_STOP_TYPES.has(type)) {continue;}
+    if (type && type !== "travel" && !PHYSICAL_STOP_TYPES.has(type)) {continue;}
     const loadId = text(record.loadId || record.load_id);
     const previous = previousLoads.get(loadId);
     if (!previous) {continue;}
     const physical = (previous.load.stops || []).filter(physicalStop);
-    let index = physical.findIndex((stop) => stopIdentity(stop) === text(record.stopId || record.stop_id));
-    if (index < 0 && record.orderRef) {
-      index = physical.findIndex((stop) => stopRefs(stop).includes(text(record.orderRef)));
+    let index = -1;
+    if (type === "travel") {
+      const details = activityJobDetails(record);
+      const targetStopId = text(details.toStopId || details.to_stop_id);
+      index = physical.findIndex((stop) => stopIdentity(stop) === targetStopId);
+      if (index < 0) {
+        const travelStopId = text(record.stopId || record.stop_id);
+        index = physical.findIndex((stop) => travelStopId.endsWith(`-${stopIdentity(stop)}`));
+      }
+      if (index < 0) {continue;}
+    } else {
+      index = physical.findIndex((stop) => stopIdentity(stop) === text(record.stopId || record.stop_id));
+      if (index < 0 && record.orderRef) {
+        index = physical.findIndex((stop) => stopRefs(stop).includes(text(record.orderRef)));
+      }
+      if (index < 0) {index = physical.length - 1;}
     }
-    if (index < 0) {index = physical.length - 1;}
     protectedByLoad.set(loadId, Math.max(protectedByLoad.get(loadId) ?? -1, index));
   }
   for (const [loadId, throughIndex] of protectedByLoad) {
@@ -703,7 +750,11 @@ export function evaluateExecutedPrefixPolicy({ previousPlan = {}, nextPlan = {},
     const assignmentChanged = !next
       || driverIdentity(previous.truck, previous.load) !== driverIdentity(next.truck, next.load)
       || truckIdentity(previous.truck, previous.load) !== truckIdentity(next.truck, next.load);
-    const prefixChanged = stableJson(beforePrefix.map(stopIdentity)) !== stableJson(afterPrefix.map(stopIdentity));
+    const prefixChanged = stableJson(beforePrefix.map((stop) =>
+      dispatchExecutedStopFingerprint(previousPlan, previous.load, stop)
+    )) !== stableJson(afterPrefix.map((stop) =>
+      dispatchExecutedStopFingerprint(nextPlan, next?.load || {}, stop, { previousPlan })
+    ));
     if (assignmentChanged || prefixChanged) {
       conflicts.push({
         code: "DISPATCH_ACTIVE_LOAD_LOCKED",

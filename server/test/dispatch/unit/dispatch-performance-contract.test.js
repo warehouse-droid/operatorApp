@@ -260,6 +260,70 @@ test("DP-30 an active global CO rehydrates grouped source and children without m
   assert.deepEqual(repeated, hydrated);
 });
 
+test("DP-31 an active CO preserves current PO and direct vendor pickups after its destination yard", () => {
+  const grouped = order("GOB-118968-119023", {
+    childOrders: ["SOB118968", "SOB119023"],
+    childOrderDetails: [
+      order("SOB118968", { pickupLocations: ["3445"] }),
+      order("SOB119023", { pickupLocations: ["3445"] })
+    ],
+    sourceYard: "3445",
+    pickupLocations: ["3445", "TECHO BLOC Vaughan", "Direct Vendor Yard"],
+    poPickupManifest: [{
+      poOrderRef: "LOINC-030542",
+      location: "TECHO BLOC Vaughan",
+      address: "720 Arrow Rd. North York, ON M9M 2M1"
+    }],
+    directPickupManifest: [{
+      dependencyId: 930541,
+      location: "TECHO BLOC Vaughan"
+    }, {
+      dependencyId: 930542,
+      location: "Direct Vendor Yard"
+    }]
+  });
+  const active = [{
+    coRef: "CO-GOB-118968-119023",
+    sourceOrderRef: grouped.id,
+    fromYard: "3445",
+    toYard: "12441",
+    status: "pending_load"
+  }];
+
+  const hydrated = applyActiveTransitCoMetadata(grouped, active);
+  const repeated = applyActiveTransitCoMetadata(hydrated, active);
+
+  assert.deepEqual(
+    hydrated.pickupLocations,
+    ["12441", "TECHO BLOC Vaughan", "Direct Vendor Yard"]
+  );
+  assert.deepEqual(hydrated.poPickupManifest, grouped.poPickupManifest);
+  assert.deepEqual(hydrated.directPickupManifest, grouped.directPickupManifest);
+  assert.deepEqual(hydrated.transitOriginalPickupLocations, ["3445"]);
+  assert.equal(hydrated.sourceYard, "12441");
+  assert.deepEqual(repeated, hydrated, "read-time CO reconciliation must be idempotent");
+});
+
+test("DP-32 an active CO retains its source-yard rollback evidence when the current order has no pickups", () => {
+  const source = order("SOA-EMPTY-PICKUPS", {
+    sourceYard: "3445",
+    pickupLocations: []
+  });
+  const active = [{
+    coRef: "CO-SOA-EMPTY-PICKUPS",
+    sourceOrderRef: source.id,
+    fromYard: "3445",
+    toYard: "12441",
+    status: "pending_load"
+  }];
+
+  const hydrated = applyActiveTransitCoMetadata(source, active);
+
+  assert.deepEqual(hydrated.pickupLocations, ["12441"]);
+  assert.deepEqual(hydrated.transitOriginalPickupLocations, ["3445"]);
+  assert.equal(hydrated.transitOriginalSourceYard, "3445");
+});
+
 test("DP-06 exact command retries return the stored acknowledgement without a second revision or side effect", () => {
   const initial = planWithOrders(
     [order("A"), order("B"), order("C")],

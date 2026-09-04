@@ -8,22 +8,39 @@ files=(
   eslint.mbt.config.js
   package.json
   migrations/174_driver_pwa_historical_assist.sql
+  migrations/194_driver_completed_stop_photo_evidence.sql
   public/app-sidebar.js
   public/dispatch-offline-review.css
   public/dispatch-offline-review.html
   public/dispatch-offline-review.js
+  public/driver.css
+  public/driver.html
+  public/driver-service-worker.js
+  public/driver.js
+  src/driver-completed-photo-evidence.js
+  src/driver-completed-photo-repository.js
   src/driver-historical-assist-policy.js
   src/driver-historical-assist-evidence.js
   src/driver-historical-assist-repository.js
   src/driver-repository.js
+  src/driver-offline-repository.js
+  src/driver-pwa-repository.js
+  src/photo-archive-repository.js
   src/server.js
   test/driver-pwa-historical-assist-spec.md
   test/mbt/adversarial/driver-pwa-historical-assist-adversarial.test.js
+  test/mbt/adversarial/driver-completed-photo-evidence.adversarial.test.js
   test/mbt/concurrency/driver-pwa-historical-assist-concurrency.test.js
   test/mbt/e2e/driver-pwa-historical-assist.spec.js
+  test/mbt/e2e/driver-completed-stop-photo-evidence.spec.js
+  test/mbt/integration/driver-completed-photo-evidence-repository.test.js
+  test/mbt/integration/driver-retained-completion-photos.test.js
   test/mbt/integration/driver-pwa-historical-assist-migration.test.js
   test/mbt/property/driver-pwa-historical-assist.property.test.js
+  test/mbt/property/driver-completed-photo-evidence.property.test.js
   test/mbt/unit/driver-pwa-historical-assist-policy.red.test.js
+  test/mbt/unit/driver-completed-photo-evidence.red.test.js
+  test/mbt/unit/driver-pwa-recovery-assets.test.js
   test/mbt/unit/driver-pwa-historical-assist-wiring.contract.test.js
   test/support/run-driver-pwa-historical-assist-mutations.mjs
   tools/driver-pwa-historical-assist-gauntlet.sh
@@ -40,6 +57,10 @@ done
 
 if grep -Eiq '(^|[[:space:]])(DROP[[:space:]]+TABLE|TRUNCATE)[[:space:]]' migrations/174_driver_pwa_historical_assist.sql; then
   echo "Historical completion migration must remain additive." >&2
+  exit 65
+fi
+if grep -Eiq '(^|[[:space:]])(DROP[[:space:]]+TABLE|TRUNCATE)[[:space:]]' migrations/194_driver_completed_stop_photo_evidence.sql; then
+  echo "Completed-stop photo migration must remain additive." >&2
   exit 65
 fi
 if grep -Eiq 'indexedDB|DriverOfflineDB' public/dispatch-offline-review.js; then

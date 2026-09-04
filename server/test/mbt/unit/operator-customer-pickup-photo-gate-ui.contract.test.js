@@ -91,6 +91,6 @@ test("S7: Operator cache revision ships the live-policy client once; later toggl
     source("public/service-worker.js")
   ]);
   assert.match(html, /operator\.js\?v=20260825-fulfillment-layout-v1/u);
-  assert.match(serviceWorker, /mbbs-yard-operator-v142-fulfillment-layout-v1/u);
+  assert.match(serviceWorker, /mbbs-yard-operator-v143-linked-quantity-i18n-v1/u);
   assert.match(serviceWorker, /operator\.js\?v=20260825-fulfillment-layout-v1/u);
 });

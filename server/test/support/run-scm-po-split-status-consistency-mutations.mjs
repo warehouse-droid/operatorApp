@@ -12,6 +12,10 @@ const TESTS = Object.freeze([
 const LINKED_STATUS_TESTS = Object.freeze([
   "test/dispatch/integration/scm-po-split-status-consistency.red.test.js"
 ]);
+const PICKUP_TESTS = Object.freeze([
+  "--test-name-pattern=split pickup update returns",
+  "test/dispatch/integration/scm-po-split-editing.test.js"
+]);
 
 const MUTANTS = Object.freeze([
   {
@@ -78,16 +82,50 @@ const MUTANTS = Object.freeze([
 
 const target = "src/scm-purchase-order-catalog-status.js";
 const linkedStatusTarget = "src/scm-purchase-order-catalog-repository.js";
+const pickupTarget = "src/dispatch-repository.js";
 const LINKED_STATUS_MUTANTS = Object.freeze([
   {
+    name: "family and search links regain status and completion authority",
+    from: "  const refsByOrder = orders.map((order) => statusEvidenceRefs(order));",
+    to: "  const refsByOrder = orders.map((order) => linkedRefs(order));"
+  },
+  {
     name: "a linked current status can no longer replace a queued display alias",
-    from: "    const linkedCurrentEvidence = initialStatus.toLowerCase() === \"queued\"",
+    from: "    const linkedCurrentEvidence = !exactSplitStatusEvidence && initialStatus.toLowerCase() === \"queued\"",
     to: "    const linkedCurrentEvidence = false && initialStatus.toLowerCase() === \"queued\""
   },
   {
     name: "a linked initial Hold can downgrade an exact Planned schedule",
-    from: "    const linkedCurrentEvidence = initialStatus.toLowerCase() === \"queued\"",
+    from: "    const linkedCurrentEvidence = !exactSplitStatusEvidence && initialStatus.toLowerCase() === \"queued\"",
     to: "    const linkedCurrentEvidence = [\"queued\", \"planned\"].includes(initialStatus.toLowerCase())"
+  },
+  {
+    name: "a split identity regains its completed parent as status evidence",
+    from: "    split ? \"\" : order.sourcePoRef",
+    to: "    order.sourcePoRef"
+  },
+  {
+    name: "the indexed catalog keeps its stale split lock snapshot",
+    from: `      scmSplitLocked: order.isScmSplit === true && liveSplitLock !== undefined
+        ? liveSplitLock
+        : order.scmSplitLocked === true,`,
+    to: "      scmSplitLocked: order.scmSplitLocked === true,"
+  },
+  {
+    name: "indexed PO Split treats raw Partially Done text as an active plan",
+    from: `                 JOIN dispatch_plans plan
+                   ON plan.id = schedule.dispatch_plan_id
+                  AND plan.status <> 'cancelled'
+                WHERE schedule.order_kind = 'PO'
+                  AND lower(schedule.order_ref) = lower(split.split_po_ref)`,
+    to: `                 LEFT JOIN dispatch_plans plan
+                   ON plan.id = schedule.dispatch_plan_id
+                WHERE schedule.order_kind = 'PO'
+                  AND lower(schedule.order_ref) = lower(split.split_po_ref)
+                  AND (
+                    plan.status <> 'cancelled'
+                    OR lower(COALESCE(schedule.status, '')) = 'partially done'
+                  )`
   },
   {
     name: "linked aliases no longer read the current source PO initial status",
@@ -126,8 +164,19 @@ const LINKED_STATUS_MUTANTS = Object.freeze([
   },
   {
     name: "PO Split borrows editable schedule state from a linked PO identity",
-    from: "    const exactScheduleEvidence = evidenceByRef.get(text(orderRef(order)).toLowerCase()) || {};",
+    from: "    const exactScheduleEvidence = evidenceByRef.get(exactRef) || {};",
     to: "    const exactScheduleEvidence = evidenceByRef.get(text(refsByOrder[index].at(-1)).toLowerCase()) || {};"
+  }
+]);
+const PICKUP_MUTANTS = Object.freeze([
+  {
+    name: "split pickup mutation omits its authoritative schedule revision",
+    from: `      pickupAddress: selected.address || "",
+      scheduleUpdatedAt: scheduleUpdate.rows[0]?.concurrency_updated_at || scheduleUpdate.rows[0]?.updated_at || null,
+      revision: change.revision`,
+    to: `      pickupAddress: selected.address || "",
+      scheduleUpdatedAt: null,
+      revision: change.revision`
   }
 ]);
 
@@ -173,15 +222,20 @@ const original = await readFile(path.resolve(target), "utf8");
 const originalHash = hash(original);
 const linkedStatusOriginal = await readFile(path.resolve(linkedStatusTarget), "utf8");
 const linkedStatusOriginalHash = hash(linkedStatusOriginal);
+const pickupOriginal = await readFile(path.resolve(pickupTarget), "utf8");
+const pickupOriginalHash = hash(pickupOriginal);
 if (runTests("baseline") !== 0) {
   throw new Error("Focused mutation tests do not start green.");
 }
 if (runTests("linked status baseline", LINKED_STATUS_TESTS) !== 0) {
   throw new Error("Linked-status mutation tests do not start green.");
 }
+if (runTests("split pickup baseline", PICKUP_TESTS) !== 0) {
+  throw new Error("Split-pickup mutation tests do not start green.");
+}
 
 let killed = 0;
-const mutationCount = MUTANTS.length + LINKED_STATUS_MUTANTS.length;
+const mutationCount = MUTANTS.length + LINKED_STATUS_MUTANTS.length + PICKUP_MUTANTS.length;
 try {
   for (const mutant of MUTANTS) {
     if (occurrenceCount(original, mutant.from) !== 1) {
@@ -211,14 +265,34 @@ try {
     console.log(`KILLED ${killed}/${mutationCount}: ${mutant.name}`);
     await writeFile(path.resolve(linkedStatusTarget), linkedStatusOriginal, "utf8");
   }
+  for (const mutant of PICKUP_MUTANTS) {
+    if (occurrenceCount(pickupOriginal, mutant.from) !== 1) {
+      throw new Error(`${mutant.name}: expected exactly one mutation target occurrence.`);
+    }
+    await writeFile(
+      path.resolve(pickupTarget),
+      pickupOriginal.replace(mutant.from, mutant.to),
+      "utf8"
+    );
+    if (runTests(mutant.name, PICKUP_TESTS) === 0) {
+      throw new Error(`${mutant.name}: survived the focused regression suite.`);
+    }
+    killed += 1;
+    console.log(`KILLED ${killed}/${mutationCount}: ${mutant.name}`);
+    await writeFile(path.resolve(pickupTarget), pickupOriginal, "utf8");
+  }
 } finally {
   await writeFile(path.resolve(target), original, "utf8");
   await writeFile(path.resolve(linkedStatusTarget), linkedStatusOriginal, "utf8");
+  await writeFile(path.resolve(pickupTarget), pickupOriginal, "utf8");
   if (hash(await readFile(path.resolve(target), "utf8")) !== originalHash) {
     throw new Error(`Mutation source restoration failed for ${target}.`);
   }
   if (hash(await readFile(path.resolve(linkedStatusTarget), "utf8")) !== linkedStatusOriginalHash) {
     throw new Error(`Mutation source restoration failed for ${linkedStatusTarget}.`);
+  }
+  if (hash(await readFile(path.resolve(pickupTarget), "utf8")) !== pickupOriginalHash) {
+    throw new Error(`Mutation source restoration failed for ${pickupTarget}.`);
   }
 }
 
@@ -227,5 +301,8 @@ if (runTests("post-mutation restored source") !== 0) {
 }
 if (runTests("post-mutation linked status restored source", LINKED_STATUS_TESTS) !== 0) {
   throw new Error("Linked-status tests failed after mutation source restoration.");
+}
+if (runTests("post-mutation split pickup restored source", PICKUP_TESTS) !== 0) {
+  throw new Error("Split-pickup tests failed after mutation source restoration.");
 }
 console.log(`PO Split status mutation score: ${killed}/${mutationCount} killed (100%); sources restored.`);

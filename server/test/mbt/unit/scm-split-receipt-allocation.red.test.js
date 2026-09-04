@@ -105,6 +105,48 @@ test("unknown-location receipt quantity falls back to remaining capacity", () =>
   assert.equal(result.conflict, false);
 });
 
+test("later exact child evidence can consume the unlocated balance without reopening review", () => {
+  const result = allocateSplitReceiptsByDestination({
+    totalReceivedQty: 2937.48,
+    receiptRows: [
+      { quantity: 629.46, actualLocationId: 15 },
+      { quantity: 629.46, actualLocationId: 1 }
+    ],
+    targets: [
+      {
+        targetOrderRef: "SN1397704",
+        requestedQty: 629.46,
+        destinationLocationId: 15,
+        createdAt: "2026-08-10T00:00:00.000Z"
+      },
+      {
+        targetOrderRef: "SN1397965",
+        requestedQty: 629.46,
+        destinationLocationId: 1,
+        createdAt: "2026-08-11T00:00:00.000Z"
+      },
+      {
+        targetOrderRef: "SN1399496",
+        requestedQty: 1678.56,
+        exactReceivedQty: 1678.56,
+        destinationLocationId: 1,
+        actualDispatchAt: "2026-09-01T14:34:34.625Z",
+        createdAt: "2026-08-31T00:00:00.000Z"
+      }
+    ]
+  });
+
+  assert.deepEqual(byRef(result), {
+    SN1397704: 629.46,
+    SN1397965: 629.46,
+    SN1399496: 1678.56
+  });
+  assert.equal(result.overflowQty, 0);
+  assert.equal(result.unallocatedExactQty, 0);
+  assert.equal(result.conflict, false,
+    "the exact completion is covered by the parent total after its unlocated balance is applied");
+});
+
 test("merges repeated and mixed evidence conservatively on the same target", () => {
   const repeated = allocateSplitReceiptsByDestination({
     totalReceivedQty: 10,
@@ -228,4 +270,152 @@ test("empty receipt rows preserve the legacy aggregate allocator", () => {
   assert.deepEqual(byRef(result), { FIRST: 3, SECOND: 2 });
   assert.equal(result.locationAware, false);
   assert.equal(result.conflict, false);
+});
+
+test("POB03535 completed children consume historical IR globally before unfinished 3022143273", () => {
+  const result = allocateSplitReceiptsByDestination({
+    totalReceivedQty: 13_807.2,
+    receiptRows: [
+      { transactionRef: "IR13777", transactionDate: "2026-08-05", quantity: 2301.2, actualLocationId: 15 },
+      { transactionRef: "IR14031", transactionDate: "2026-08-17", quantity: 1359.8, actualLocationId: 15 },
+      { transactionRef: "IR14124", transactionDate: "2026-08-21", quantity: 2301.2, actualLocationId: 15 },
+      { transactionRef: "IR14218", transactionDate: "2026-08-24", quantity: 2301.2, actualLocationId: 15 },
+      { transactionRef: "IR13395", transactionDate: "2026-07-14", quantity: 2301.2, actualLocationId: 28 },
+      { transactionRef: "IR13622", transactionDate: "2026-07-28", quantity: 2301.2, actualLocationId: 28 },
+      { transactionRef: "IR14088", transactionDate: "2026-08-20", quantity: 941.4, actualLocationId: 28 }
+    ],
+    targets: [
+      { targetOrderRef: "3022021494", requestedQty: 2301.2, destinationLocationId: 28, createdAt: "2026-07-09", operationallyCompleted: true, allowInferredReceipt: true },
+      { targetOrderRef: "3022069120", requestedQty: 2301.2, destinationLocationId: 28, createdAt: "2026-07-27", operationallyCompleted: true, allowInferredReceipt: true },
+      { targetOrderRef: "3022069127", requestedQty: 2301.2, destinationLocationId: 28, createdAt: "2026-07-27", operationallyCompleted: true, allowInferredReceipt: true },
+      { targetOrderRef: "3022124135", requestedQty: 1359.8, destinationLocationId: 15, createdAt: "2026-08-13", operationallyCompleted: true, allowInferredReceipt: true },
+      { targetOrderRef: "3022134768", requestedQty: 2301.2, destinationLocationId: 15, createdAt: "2026-08-18", operationallyCompleted: true, allowInferredReceipt: true },
+      { targetOrderRef: "3022134771", requestedQty: 2301.2, destinationLocationId: 15, createdAt: "2026-08-18", operationallyCompleted: true, allowInferredReceipt: true },
+      { targetOrderRef: "3022138841", requestedQty: 941.4, destinationLocationId: 28, createdAt: "2026-08-19", operationallyCompleted: true, allowInferredReceipt: true },
+      { targetOrderRef: "3022143273", requestedQty: 2301.2, destinationLocationId: 15, createdAt: "2026-08-20", operationallyCompleted: false, allowInferredReceipt: false }
+    ]
+  });
+
+  const allocations = byRef(result);
+  assert.equal(allocations["3022143273"], 0);
+  assert.equal(allocations["3022069120"], 2301.2);
+  assert.equal(allocations["3022138841"], 941.4);
+  assert.equal(
+    Number(result.allocations.reduce(
+      (sum, allocation) => sum + allocation.allocatedQty,
+      0
+    ).toFixed(6)),
+    13_807.2
+  );
+  assert.equal(result.conflict, false);
+  assert.equal(result.overflowQty, 0);
+  assert.deepEqual(result.unexplainedLocations, []);
+});
+
+test("POB03535 pallet IR leaves source residual and never fills unfinished 3022143273", () => {
+  const result = allocateSplitReceiptsByDestination({
+    totalReceivedQty: 873,
+    receiptRows: [
+      { transactionRef: "IR-3445", transactionDate: "2026-07-20", quantity: 17, actualLocationId: 1 },
+      { transactionRef: "IR-12441-OLD", transactionDate: "2026-08-01", quantity: 205, actualLocationId: 15 },
+      { transactionRef: "IR13777", transactionDate: "2026-08-05", quantity: 22, actualLocationId: 15 },
+      { transactionRef: "IR-12441-LATER", transactionDate: "2026-08-24", quantity: 146, actualLocationId: 15 },
+      { transactionRef: "IR-2967", transactionDate: "2026-08-24", quantity: 483, actualLocationId: 28 }
+    ],
+    targets: [
+      { targetOrderRef: "COMPLETED-3445", requestedQty: 17, destinationLocationId: 1, createdAt: "2026-07-01", operationallyCompleted: true, allowInferredReceipt: true },
+      { targetOrderRef: "COMPLETED-12441-OLD", requestedQty: 205, destinationLocationId: 15, createdAt: "2026-07-01", operationallyCompleted: true, allowInferredReceipt: true },
+      { targetOrderRef: "COMPLETED-12441-LATER", requestedQty: 146, destinationLocationId: 15, createdAt: "2026-08-06", operationallyCompleted: true, allowInferredReceipt: true },
+      { targetOrderRef: "COMPLETED-2967", requestedQty: 473, destinationLocationId: 28, createdAt: "2026-07-01", operationallyCompleted: true, allowInferredReceipt: true },
+      { targetOrderRef: "3022143273", requestedQty: 22, destinationLocationId: 15, createdAt: "2026-08-20", operationallyCompleted: false, allowInferredReceipt: false },
+      { targetOrderRef: "POB03535", requestedQty: 1000, destinationLocationId: 28, isParent: true, allowInferredReceipt: true }
+    ]
+  });
+
+  assert.deepEqual(byRef(result), {
+    "COMPLETED-3445": 17,
+    "COMPLETED-12441-OLD": 205,
+    "COMPLETED-12441-LATER": 146,
+    "COMPLETED-2967": 473,
+    "3022143273": 0,
+    POB03535: 32
+  });
+  assert.equal(result.conflict, false);
+  assert.equal(result.overflowQty, 0);
+});
+
+test("exact child evidence still allocates to an unfinished split", () => {
+  const result = allocateSplitReceiptsByDestination({
+    totalReceivedQty: 5,
+    receiptRows: [{ transactionDate: "2026-08-01", quantity: 5, actualLocationId: 15 }],
+    targets: [{
+      targetOrderRef: "EXACT-UNFINISHED",
+      requestedQty: 5,
+      exactReceivedQty: 5,
+      destinationLocationId: 15,
+      createdAt: "2026-08-20",
+      operationallyCompleted: false,
+      allowInferredReceipt: false
+    }]
+  });
+
+  assert.deepEqual(byRef(result), { "EXACT-UNFINISHED": 5 });
+  assert.equal(result.allocations[0].allocationMethod, "exact");
+  assert.equal(result.conflict, false);
+});
+
+test("inferred receipt can fill an eligible non-completed target only after it exists", () => {
+  const beforeCreation = allocateSplitReceiptsByDestination({
+    totalReceivedQty: 5,
+    receiptRows: [{ transactionDate: "2026-08-01", quantity: 5, actualLocationId: 15 }],
+    targets: [{
+      targetOrderRef: "CREATED-LATER",
+      requestedQty: 5,
+      destinationLocationId: 15,
+      createdAt: "2026-08-02",
+      operationallyCompleted: false,
+      allowInferredReceipt: true
+    }]
+  });
+  assert.deepEqual(byRef(beforeCreation), { "CREATED-LATER": 0 });
+  assert.equal(beforeCreation.conflict, true,
+    "a known-yard receipt from before target creation must remain unexplained");
+
+  const afterCreation = allocateSplitReceiptsByDestination({
+    totalReceivedQty: 5,
+    receiptRows: [{ transactionDate: "2026-08-02", quantity: 5, actualLocationId: 15 }],
+    targets: [{
+      targetOrderRef: "CREATED-EARLIER",
+      requestedQty: 5,
+      destinationLocationId: 15,
+      createdAt: "2026-08-01",
+      operationallyCompleted: false,
+      allowInferredReceipt: true
+    }]
+  });
+  assert.deepEqual(byRef(afterCreation), { "CREATED-EARLIER": 5 });
+  assert.equal(afterCreation.conflict, false);
+});
+
+test("protected allocation reports repeated unexplained rows deterministically", () => {
+  const result = allocateSplitReceiptsByDestination({
+    totalReceivedQty: 5,
+    receiptRows: [
+      { transactionRef: "IR-B", transactionDate: "not-a-date", quantity: 3, actualLocationId: 15 },
+      { transactionRef: "IR-A", transactionDate: "not-a-date", quantity: 4, actualLocationId: 15 }
+    ],
+    targets: [{
+      targetOrderRef: "UNFINISHED",
+      requestedQty: 10,
+      destinationLocationId: 15,
+      createdAt: "2026-08-01",
+      operationallyCompleted: false,
+      allowInferredReceipt: false
+    }]
+  });
+
+  assert.deepEqual(byRef(result), { UNFINISHED: 0 });
+  assert.equal(result.conflict, true);
+  assert.equal(result.overflowQty, 7);
+  assert.deepEqual(result.unexplainedLocations, [{ locationId: 15, quantity: 7 }]);
 });

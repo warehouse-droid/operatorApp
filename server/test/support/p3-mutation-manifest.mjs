@@ -45,6 +45,11 @@ export const P3_DEDICATED_MUTATION_RUNNERS = Object.freeze([
     ])
   }),
   Object.freeze({
+    runner: "run-dispatch-co-authoritative-route-mutations.mjs",
+    adminUrlEnvironment: null,
+    sourcePaths: Object.freeze(["public/dispatch.js"])
+  }),
+  Object.freeze({
     runner: "run-dispatch-co-group-identity-mutations.mjs",
     adminUrlEnvironment: null,
     sourcePaths: Object.freeze([
@@ -70,6 +75,20 @@ export const P3_DEDICATED_MUTATION_RUNNERS = Object.freeze([
     ])
   }),
   Object.freeze({
+    runner: "run-dispatch-co-snapshot-route-mutations.mjs",
+    adminUrlEnvironment: null,
+    sourcePaths: Object.freeze(["src/dispatch-co-lifecycle.js"])
+  }),
+  Object.freeze({
+    runner: "run-dispatch-derived-order-freshness-mutations.mjs",
+    adminUrlEnvironment: null,
+    sourcePaths: Object.freeze([
+      "src/dispatch-delivery-group-repository.js",
+      "src/dispatch-order-catalog-repository.js",
+      "src/dispatch-planner-performance.js"
+    ])
+  }),
+  Object.freeze({
     runner: "run-dispatch-driver-completion-mutations.mjs",
     adminUrlEnvironment: null,
     sourcePaths: Object.freeze(["src/dispatch-history-mode.js"])
@@ -86,6 +105,7 @@ export const P3_DEDICATED_MUTATION_RUNNERS = Object.freeze([
       "migrations/159_dispatch_order_completion_status.sql",
       "public/dispatch.js",
       "src/dispatch-completion-repository.js",
+      "src/dispatch-order-catalog-repository.js",
       "src/mbt/mbbs-billing-candidate-service.js",
       "src/server.js"
     ])
@@ -94,6 +114,11 @@ export const P3_DEDICATED_MUTATION_RUNNERS = Object.freeze([
     runner: "run-dispatch-performance-mutations.mjs",
     adminUrlEnvironment: null,
     sourcePaths: Object.freeze(["src/dispatch-planner-performance.js"])
+  }),
+  Object.freeze({
+    runner: "run-dispatch-plan-authoritative-projection-mutations.mjs",
+    adminUrlEnvironment: null,
+    sourcePaths: Object.freeze(["src/dispatch-plan-order-projection.js"])
   }),
   Object.freeze({
     runner: "run-dispatch-planner-optimization-mutations.mjs",
@@ -112,6 +137,18 @@ export const P3_DEDICATED_MUTATION_RUNNERS = Object.freeze([
     ])
   }),
   Object.freeze({
+    runner: "run-dispatch-po-ref-projection-mutations.mjs",
+    adminUrlEnvironment: null,
+    sourcePaths: Object.freeze([
+      "migrations/193_dispatch_assignment_projection_invariant.sql",
+      "src/dispatch-order-catalog-repository.js",
+      "src/dispatch-plan-repository.js",
+      "src/dispatch-planner-v2-repository.js",
+      "src/dispatch-repository.js",
+      "src/server.js"
+    ])
+  }),
+  Object.freeze({
     runner: "run-dispatch-po-route-residual-mutations.mjs",
     adminUrlEnvironment: null,
     sourcePaths: Object.freeze([
@@ -119,6 +156,15 @@ export const P3_DEDICATED_MUTATION_RUNNERS = Object.freeze([
       "src/dispatch-po-route-projection.js",
       "src/driver-repository.js",
       "src/scm-dependency-plan-reconciler.js"
+    ])
+  }),
+  Object.freeze({
+    runner: "run-dispatch-repeat-pickup-mutations.mjs",
+    adminUrlEnvironment: null,
+    sourcePaths: Object.freeze([
+      "public/dispatch.js",
+      "src/dispatch-pickup-visits.js",
+      "src/driver-repository.js"
     ])
   }),
   Object.freeze({
@@ -392,9 +438,28 @@ export const P3_DEDICATED_MUTATION_RUNNERS = Object.freeze([
     ])
   }),
   Object.freeze({
+    runner: "run-scm-netsuite-address-pickup-mutations.mjs",
+    adminUrlEnvironment: null,
+    sourcePaths: Object.freeze([
+      "public/scm-schedule.js",
+      "src/dispatch-repository.js",
+      "src/scm-po-pickup-save-policy.js"
+    ])
+  }),
+  Object.freeze({
     runner: "run-scm-po-group-rollup-recovery-mutations.mjs",
     adminUrlEnvironment: null,
     sourcePaths: Object.freeze(["src/scm-reconciliation-group-schedule.js"])
+  }),
+  Object.freeze({
+    runner: "run-scm-po-line-sequence-and-pallet-conservation-mutations.mjs",
+    adminUrlEnvironment: null,
+    sourcePaths: Object.freeze([
+      "public/dispatch-scm.js",
+      "src/dispatch-repository.js",
+      "src/netsuite.js",
+      "src/scm-reconciliation-repository.js"
+    ])
   }),
   Object.freeze({
     runner: "run-scm-po-split-live-schedule-mutations.mjs",

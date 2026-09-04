@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import test, { after } from "node:test";
 
 import { beginRollbackContext, closeDb, query } from "../../../src/db.js";
+import { overlayDispatchOrderCompletionStatuses } from "../../../src/dispatch-completion-repository.js";
 import {
   createSalesOrderPoAllocation,
   createSalesOrderPoAllocations,
@@ -723,6 +724,38 @@ test("Dispatch Planning source-PO search returns the split ref and relationship 
       const source = orders.find((order) => order.id === fixture.purchaseOrderRef);
       assert.ok(source, "the remaining source PO stays visible alongside its refs");
       assert.ok(source.correspondingPoRefs.includes(fixture.splitRef));
+
+      await query(
+        `UPDATE scm_transport_schedule
+            SET status = 'Completed', updated_at = now()
+          WHERE order_kind = 'PO' AND lower(order_ref) = lower($1)`,
+        [fixture.splitRef]
+      );
+      const completed = await listDispatchOrders({
+        type: "PO",
+        search: fixture.purchaseOrderRef,
+        includeScmLinkedSearchRefs: true
+      });
+      assert.equal(completed.some((order) => order.id === fixture.splitRef), false,
+        "source-ref discovery must not reopen a terminal split");
+
+      await query(
+        `UPDATE scm_transport_schedule
+            SET status = 'Hold', updated_at = now()
+          WHERE order_kind = 'PO' AND lower(order_ref) = lower($1)`,
+        [fixture.splitRef]
+      );
+      await query(
+        "UPDATE dispatch_scm_po_splits SET status = 'cancelled' WHERE lower(split_po_ref) = lower($1)",
+        [fixture.splitRef]
+      );
+      const cancelled = await listDispatchOrders({
+        type: "PO",
+        search: fixture.purchaseOrderRef,
+        includeScmLinkedSearchRefs: true
+      });
+      assert.equal(cancelled.some((order) => order.id === fixture.splitRef), false,
+        "source-ref discovery must not reopen a cancelled split");
     });
   } finally {
     await rollback.rollback();
@@ -867,6 +900,19 @@ test("a fully linked PO inherits planned and completed lifecycle from its Driver
       })).find((row) => row.orderRef === currentPoRef);
       assert.equal(completed?.calculatedStatus, "Completed");
       assert.equal(completed?.dispatchCompletionEvidenceType, "driver_job");
+
+      const [projected] = await overlayDispatchOrderCompletionStatuses([{
+        id: currentPoRef,
+        type: "PO",
+        status: "In Transit",
+        scm: { status: "In Transit", source: "linked-sales-order" }
+      }]);
+      assert.equal(projected.status, "In Transit",
+        "the fully linked PO's operational history remains retained");
+      assert.equal(projected.scm.status, "Completed",
+        "the linked Sales Order drop must stay terminal in the Dispatch projection");
+      assert.equal(projected.dispatchCompletionStatus, "completed");
+      assert.equal(projected.completionEvidenceType, "driver_job");
     });
   } finally {
     await rollback.rollback();

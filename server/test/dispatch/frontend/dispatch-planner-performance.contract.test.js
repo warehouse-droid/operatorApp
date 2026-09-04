@@ -62,6 +62,61 @@ test("DP-03: targeted server operational fields win without overwriting local pl
   assert.match(dispatchSource, /function\s+preserveActiveOrderEvidence\(/u);
 });
 
+test("DP-03b: an authoritative CO route replaces a stale planner route while sparse feeds preserve it", () => {
+  const preservePlanning = Function(
+    `"use strict"; return (${functionBody("preserveDispatchPlanningFields")});`
+  )();
+  const stalePlannerOrder = {
+    id: "GOA-7894-7895",
+    childOrders: ["SOA07894", "SOA07895"],
+    transitCo: {
+      id: "CO-GOA-7894-7895",
+      fromYard: "2967",
+      toYard: "3445"
+    },
+    transitOriginalPickupLocations: ["2967"],
+    transitOriginalSourceYard: "2967"
+  };
+  const authoritative = preservePlanning(stalePlannerOrder, {
+    id: "GOA-7894-7895",
+    sourceYard: "12441",
+    pickupLocations: ["12441"],
+    transitCo: {
+      id: "CO-GOA-7894-7895",
+      status: "pending_load",
+      fromYard: "2967",
+      toYard: "12441",
+      sourceOrderId: "GOA-7894-7895"
+    },
+    transitOriginalPickupLocations: ["2967"],
+    transitOriginalSourceYard: "2967"
+  });
+
+  assert.equal(authoritative.transitCo.toYard, "12441");
+  assert.equal(authoritative.sourceYard, "12441");
+  assert.deepEqual(authoritative.pickupLocations, ["12441"]);
+  assert.deepEqual(authoritative.childOrders, ["SOA07894", "SOA07895"]);
+
+  const sparse = preservePlanning(stalePlannerOrder, {
+    id: "GOA-7894-7895",
+    customer: "refreshed without CO fields"
+  });
+  assert.deepEqual(sparse.transitCo, stalePlannerOrder.transitCo);
+  assert.deepEqual(
+    sparse.transitOriginalPickupLocations,
+    stalePlannerOrder.transitOriginalPickupLocations
+  );
+  assert.equal(sparse.transitOriginalSourceYard, "2967");
+
+  const cancelled = preservePlanning(stalePlannerOrder, {
+    id: "GOA-7894-7895",
+    transitCo: null
+  });
+  assert.equal(cancelled.transitCo, null);
+  assert.equal(cancelled.transitOriginalPickupLocations, undefined);
+  assert.equal(cancelled.transitOriginalSourceYard, undefined);
+});
+
 test("DP-04: the browser consumes a compact assigned-plan snapshot, never an unassigned order pool embedded in it", () => {
   assert.match(dispatchSource, /\/api\/dispatch\/v2\/bootstrap/u);
   assert.match(dispatchSource, /function\s+applyCompactDispatchPlanSnapshot\(/u);
@@ -496,7 +551,7 @@ test("DP-26 frontend: planner undo and redo are persisted even after resetting t
 
 test("DP-28 frontend: CO cancellation is server-first and clears every stale required-CO marker", () => {
   const clearSnapshot = functionBody("clearTransitCoFromOrderSnapshot");
-  const clearTransitCo = Function(`"use strict"; return (${clearSnapshot});`)();
+  const clearTransitCo = Function(`"use strict"; ${functionBody("dispatchOrderRefKey")}; return (${clearSnapshot});`)();
   const relationshipCases = [
     { label: "CO only", po: false, to: false },
     { label: "Link PO + CO", po: true, to: false },
@@ -600,6 +655,142 @@ test("DP-28 frontend: CO cancellation is server-first and clears every stale req
   );
   assert.equal(authoritativeCancellation.transitCo, null);
   assert.equal(authoritativeCancellation.transitOriginalPickupLocations, undefined);
+});
+
+test("DP-33 frontend: active CO projection retains every current relationship pickup", () => {
+  const relationshipPickupLocations = Function(
+    "uniqueDispatchLocationLabels",
+    `"use strict"; return (${functionBody("dispatchRelationshipPickupLocations")});`
+  )((values) => {
+    const seen = new Set();
+    return values.filter((value) => {
+      const key = String(value || "").trim().split(/\s*:\s*/u, 1)[0].toLowerCase();
+      if (!key || seen.has(key)) {return false;}
+      seen.add(key);
+      return true;
+    });
+  });
+  const activePickupLocations = Function(
+    "uniqueDispatchLocationLabels",
+    "dispatchRelationshipPickupLocations",
+    `"use strict"; return (${functionBody("activeTransitPickupLocations")});`
+  )((values) => {
+    const seen = new Set();
+    return values.filter((value) => {
+      const key = String(value || "").trim().split(/\s*:\s*/u, 1)[0].toLowerCase();
+      if (!key || seen.has(key)) {return false;}
+      seen.add(key);
+      return true;
+    });
+  }, relationshipPickupLocations);
+
+  const incident = {
+    id: "GOB-118968-119023",
+    pickupLocations: ["12441", "TECHO BLOC Vaughan"],
+    transitOriginalPickupLocations: ["3445"],
+    transitCo: {
+      id: "CO-GOB-118968-119023",
+      fromYard: "3445",
+      toYard: "12441"
+    },
+    poPickupManifest: [{
+      poOrderRef: "LOINC-030542",
+      location: "TECHO BLOC Vaughan",
+      items: [{ quantity: 81.38 }]
+    }],
+    directPickupManifest: [
+      { transferOrderRef: "TO-DIRECT", location: "Direct Vendor", items: [{ quantity: 1 }] },
+      { transferOrderRef: "TO-DUP", location: "techo bloc vaughan : dock 2", items: [{ quantity: 1 }] }
+    ]
+  };
+
+  assert.deepEqual(
+    relationshipPickupLocations(incident),
+    ["TECHO BLOC Vaughan", "Direct Vendor"]
+  );
+  assert.deepEqual(
+    activePickupLocations(incident, incident.pickupLocations),
+    ["12441", "TECHO BLOC Vaughan", "Direct Vendor"]
+  );
+  assert.deepEqual(
+    activePickupLocations(
+      { ...incident, pickupLocations: ["3445", "TECHO BLOC Vaughan"] },
+      ["3445", "TECHO BLOC Vaughan"]
+    ),
+    ["12441", "TECHO BLOC Vaughan", "Direct Vendor"],
+    "The pre-CO source yard is rollback evidence, not an active pickup."
+  );
+  assert.deepEqual(
+    activePickupLocations({ pickupLocations: ["2967"] }, ["2967"]),
+    ["2967"],
+    "Orders without an active CO retain their native pickup route."
+  );
+  assert.deepEqual(
+    activePickupLocations(incident, activePickupLocations(incident, incident.pickupLocations)),
+    ["12441", "TECHO BLOC Vaughan", "Direct Vendor"],
+    "Browser projection must be idempotent."
+  );
+
+  const normalize = functionBody("normalizeOrder");
+  assert.match(normalize, /activeTransitPickupLocations\(order,\s*basePickupLocations\)/u);
+  assert.doesNotMatch(normalize, /order\.transitCo\?\.toYard\s*\?\s*\[order\.transitCo\.toYard\]/u);
+
+  const applyTransitSource = functionBody("applyTransitPickupToOrder");
+  assert.match(applyTransitSource, /dispatchRelationshipPickupLocations\(order\)/u);
+  assert.match(applyTransitSource, /activeTransitPickupLocations\(order/u);
+  assert.match(applyTransitSource, /relationshipPickupKeys/u);
+  assert.doesNotMatch(applyTransitSource, /order\.pickupLocations\s*=\s*\[toYard\]/u);
+  const applyTransit = Function(
+    "dispatchRelationshipPickupLocations",
+    "normalizedPickupLocation",
+    "sameDispatchLocation",
+    "uniqueDispatchLocationLabels",
+    "activeTransitPickupLocations",
+    "normalizeOrder",
+    `"use strict"; return (${applyTransitSource});`
+  )(
+    relationshipPickupLocations,
+    (value) => String(value || "").trim().split(/\s*:\s*/u, 1)[0].toLowerCase(),
+    (left, right) => String(left || "").trim().toLowerCase() === String(right || "").trim().toLowerCase(),
+    (values) => {
+      const seen = new Set();
+      return values.filter((value) => {
+        const key = String(value || "").trim().split(/\s*:\s*/u, 1)[0].toLowerCase();
+        if (!key || seen.has(key)) {return false;}
+        seen.add(key);
+        return true;
+      });
+    },
+    activePickupLocations,
+    (value) => ({ ...value })
+  );
+  const applied = applyTransit({
+    ...incident,
+    transitCo: undefined,
+    transitOriginalPickupLocations: undefined,
+    pickupLocations: ["3445", "12441", "TECHO BLOC Vaughan", "Direct Vendor"]
+  }, {
+    coId: "CO-GOB-118968-119023",
+    fromYard: "3445",
+    toYard: "12441",
+    createdAt: "2026-09-03T00:00:00.000Z"
+  });
+  assert.deepEqual(applied.transitOriginalPickupLocations, ["3445"]);
+  assert.deepEqual(applied.pickupLocations, ["12441", "TECHO BLOC Vaughan", "Direct Vendor"]);
+
+  for (let index = 0; index < 500; index += 1) {
+    const po = `PO Vendor ${index % 17}`;
+    const direct = `Direct Vendor ${index % 13}`;
+    const candidate = {
+      transitCo: { toYard: index % 2 ? "12441" : "2967" },
+      poPickupManifest: [{ location: po }, { location: `${po} : duplicate` }],
+      directPickupManifest: [{ location: direct }, { location: po.toLowerCase() }]
+    };
+    const projected = activePickupLocations(candidate, ["3445", po]);
+    assert.deepEqual(projected, [candidate.transitCo.toYard, po, direct]);
+    assert.deepEqual(activePickupLocations(candidate, projected), projected);
+    assert.equal(projected.includes("3445"), false);
+  }
 });
 
 test("DP-15: successful popup persistence never replaces the dispatch planner root", () => {

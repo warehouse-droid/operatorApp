@@ -1864,7 +1864,9 @@ function scmScheduleTableRowHtml(row, { pickupOptions = [], dropoffOptions = OWN
           </label>` : ""}
         </div>
         <div class="scm-sheet-cell">${rowEditable ? selectHtml({ rowId, field: "method", value: row.method, options: SCM_METHODS }) : readOnlyCell(row.method)}</div>
-        <div class="scm-sheet-cell">${rowEditable ? selectHtml({ rowId, field: "pickupPoint", value: row.pickupPoint, options: rowPickupOptions }) : readOnlyCell(row.pickupPoint)}</div>
+        <div class="scm-sheet-cell">${rowEditable && rowPickupOptions.length
+          ? selectHtml({ rowId, field: "pickupPoint", value: row.pickupPoint, options: rowPickupOptions })
+          : readOnlyCell(row.pickupPoint)}</div>
         <div class="scm-sheet-cell scm-dropoff-cell${dropoffFormatting.className}"${dropoffFormatting.style}>${rowEditable
           ? row.orderKind === "PO"
             ? poDestinationOverrideSelectHtml({ rowId, row, options: rowDropoffOptions })
@@ -2084,7 +2086,11 @@ function collectRowPatch(rowId) {
     expectedSplitRevision: row?.isScmSplit ? row?.scmSplitRevision : undefined
   };
   scmScheduleApp.querySelectorAll(`[data-row="${CSS.escape(rowId)}"][data-field]`).forEach((field) => {
-    patch[field.dataset.field] = field.type === "checkbox" ? field.checked : field.value;
+    const value = field.type === "checkbox" ? field.checked : field.value;
+    const unchangedPoPickup = row?.orderKind === "PO"
+      && field.dataset.field === "pickupPoint"
+      && String(value || "").trim().toLowerCase() === String(row.pickupPoint || "").trim().toLowerCase();
+    if (!unchangedPoPickup) patch[field.dataset.field] = value;
   });
   return patch;
 }

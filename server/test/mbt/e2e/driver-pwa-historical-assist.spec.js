@@ -1,6 +1,6 @@
 import { expect, test } from "./mbt-e2e-test.js";
 
-/* global localStorage, window */
+/* global atob, DataTransfer, DragEvent, File, localStorage, Uint8Array, window */
 
 test.use({ serviceWorkers: "block" });
 
@@ -188,15 +188,14 @@ test("dispatcher retains compressed photos across failure and completes only the
   await expect(page.locator(".historical-assist-visit").nth(1).locator("form")).toHaveCount(0);
 
   const photo = await page.screenshot({ type: "jpeg", quality: 60 });
-  await page.locator("input[data-action='historical-assist-photos']").setInputFiles([{
-    name: "historical-one.jpg",
-    mimeType: "image/jpeg",
-    buffer: photo
-  }, {
-    name: "historical-two.jpg",
-    mimeType: "image/jpeg",
-    buffer: photo
-  }]);
+  await page.locator("[data-photo-drop-zone='historical-assist']").evaluate((zone, base64) => {
+    const bytes = Uint8Array.from(atob(base64), (character) => character.charCodeAt(0));
+    const transfer = new DataTransfer();
+    transfer.items.add(new File([bytes], "historical-one.jpg", { type: "image/jpeg" }));
+    transfer.items.add(new File([bytes], "historical-two.jpg", { type: "image/jpeg" }));
+    zone.dispatchEvent(new DragEvent("dragover", { bubbles: true, dataTransfer: transfer }));
+    zone.dispatchEvent(new DragEvent("drop", { bubbles: true, dataTransfer: transfer }));
+  }, photo.toString("base64"));
   await expect(page.locator(".historical-assist-section-head")).toContainText("2/20 prepared");
 
   await page.locator("input[name='arrivalTime']").fill("10:00:00");

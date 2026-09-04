@@ -33,6 +33,25 @@ test("server resolves the runtime gate for config, pool, hydration, and snapshot
   assert.match(server, /dispatchOrderPoolRuntimePolicy\(\)\)\.effective/u);
 });
 
+test("explicit order-pool searches bypass the bounded optimized catalog", () => {
+  const routeStart = server.indexOf('app.get("/api/dispatch/v2/order-pool"');
+  assert.notEqual(routeStart, -1, "Expected the versioned Dispatch order-pool route.");
+  const route = server.slice(routeStart, routeStart + 2_500);
+  const searchFallback = route.indexOf("if (search)");
+  const optimizedRead = route.indexOf("if (policy.effective)");
+
+  assert.notEqual(searchFallback, -1, "Explicit searches must use the authoritative DB-backed pool.");
+  assert.notEqual(optimizedRead, -1, "Expected the optimized catalog read path.");
+  assert.ok(
+    searchFallback < optimizedRead,
+    "The explicit-search fallback must run before the bounded optimized catalog read."
+  );
+  assert.match(
+    route.slice(searchFallback, optimizedRead),
+    /legacyDispatchOrderPool\(\{\s*type,\s*search\s*\}\)/u
+  );
+});
+
 test("shadow verification compares the same bounded page on both read paths", () => {
   const routeStart = server.indexOf('app.get("/api/dispatch/v2/order-pool"');
   assert.notEqual(routeStart, -1, "Expected the versioned Dispatch order-pool route.");

@@ -6,15 +6,31 @@ cd "${server_root}"
 
 fixed_files=(
   package.json
+  src/dispatch-repository.js
+  src/scm-purchase-order-catalog-repository.js
+  src/scm-purchase-order-catalog-status.js
   src/scm-reconciliation-repository.js
   src/scm-reconciliation.js
   src/scm-split-receipt-allocation.js
+  src/scm-split-status-evidence-precedence.js
   test/scm-split-po-receipt-allocation-spec.md
   test/scm-split-po-receipt-allocation-evidence.md
+  test/scm-split-po-status-evidence-precedence-spec.md
+  test/scm-split-po-status-evidence-precedence-evidence.md
+  test/mbt/adversarial/scm-split-po-status-evidence-precedence.adversarial.test.js
   test/mbt/integration/scm-split-receipt-allocation.red.test.js
   test/mbt/property/scm-split-receipt-allocation.property.test.js
+  test/mbt/property/scm-split-po-status-evidence-precedence.property.test.js
   test/mbt/unit/scm-split-receipt-allocation.red.test.js
+  test/mbt/unit/scm-split-po-status-evidence-precedence.red.test.js
+  test/dispatch/integration/scm-manual-split-authority.red.test.js
+  test/dispatch/integration/scm-po-split-editing.test.js
+  test/dispatch/integration/scm-po-split-status-consistency.red.test.js
+  test/dispatch/integration/scm-pob03658-split-driver-lifecycle.red.test.js
+  test/support/run-scm-manual-split-authority-mutations.mjs
+  test/support/run-scm-po-split-status-consistency-mutations.mjs
   test/support/run-scm-split-receipt-allocation-mutations.mjs
+  test/support/run-scm-split-status-evidence-precedence-mutations.mjs
   tools/scm-split-receipt-allocation-gauntlet.sh
   tools/scm-split-receipt-allocation-source-state.sh
 )

@@ -67,6 +67,18 @@ function linkedRefs(order = {}) {
   ].map(text).filter(Boolean))];
 }
 
+function statusEvidenceRefs(order = {}) {
+  const split = orderKind(order) === "split";
+  return [...new Set([
+    orderRef(order),
+    order.originalPoRef,
+    order.dispatchRef,
+    order.tranid,
+    order.refNumber,
+    split ? "" : order.sourcePoRef
+  ].map(text).filter(Boolean))];
+}
+
 function aggregateQuantities(items = []) {
   const totals = { pallets: 0, layers: 0, sections: 0, pieces: 0, salesQty: 0 };
   for (const item of items || []) {
@@ -455,13 +467,76 @@ async function currentScmPurchaseOrderStatusEvidence(orderRefs = []) {
   return new Map(result.rows.map((row) => [row.order_key, row]));
 }
 
-async function applyCurrentScmPurchaseOrderStatuses(orders = []) {
-  const refsByOrder = orders.map((order) => linkedRefs(order));
-  const evidenceByRef = await currentScmPurchaseOrderStatusEvidence(
-    refsByOrder.flat()
+async function currentScmPurchaseOrderSplitLocks(orders = []) {
+  const refs = [...new Set((orders || [])
+    .filter((order) => order.isScmSplit === true)
+    .map((order) => text(orderRef(order)).toLowerCase())
+    .filter(Boolean))];
+  if (!refs.length) return new Map();
+  const result = await query(
+    `SELECT lower(split.split_po_ref) AS split_ref,
+            (EXISTS (
+               SELECT 1
+                 FROM dispatch_plan_order_assignments assignment
+                 JOIN dispatch_plans plan ON plan.id = assignment.plan_id
+                WHERE plan.status <> 'cancelled'
+                  AND (lower(assignment.order_ref) = lower(split.split_po_ref)
+                    OR lower(NULLIF(assignment.planned_order_ref, '')) = lower(split.split_po_ref))
+             ) OR EXISTS (
+               SELECT 1
+                 FROM scm_transport_schedule schedule
+                 JOIN dispatch_plans plan
+                   ON plan.id = schedule.dispatch_plan_id
+                  AND plan.status <> 'cancelled'
+                WHERE schedule.order_kind = 'PO'
+                  AND lower(schedule.order_ref) = lower(split.split_po_ref)
+             ) OR EXISTS (
+               SELECT 1
+                 FROM purchase_order_lines child_line
+                WHERE child_line.purchase_order_id = split.split_po_id
+                  AND (COALESCE(child_line.received_pallet_qty, 0) > 0
+                    OR COALESCE(child_line.received_layer_qty, 0) > 0
+                    OR COALESCE(child_line.received_section_qty, 0) > 0
+                    OR COALESCE(child_line.received_piece_qty, 0) > 0
+                    OR COALESCE(child_line.netsuite_received_qty, 0) > 0
+                    OR child_line.confirmed_at IS NOT NULL)
+             ) OR EXISTS (
+               SELECT 1
+                 FROM driver_job_records job
+                WHERE job.status IN ('in_progress', 'complete')
+                  AND job.order_refs ? split.split_po_ref
+             ) OR EXISTS (
+               SELECT 1
+                 FROM dispatch_so_po_allocations allocation
+                WHERE allocation.po_order_id = split.split_po_id
+                  AND allocation.status = 'active'
+             ) OR EXISTS (
+               SELECT 1
+                 FROM scm_schedule_group_members member
+                 JOIN scm_schedule_groups group_header ON group_header.id = member.group_id
+                WHERE group_header.status = 'active'
+                  AND lower(member.order_ref) = lower(split.split_po_ref)
+             )) AS locked
+       FROM dispatch_scm_po_splits split
+      WHERE split.status = 'active'
+        AND lower(split.split_po_ref) = ANY($1::text[])`,
+    [refs]
   );
+  return new Map(result.rows.map((row) => [row.split_ref, row.locked === true]));
+}
+
+async function applyCurrentScmPurchaseOrderStatuses(orders = []) {
+  // linkedRefs also contains children, siblings, groups, and search aliases.
+  // Those are useful for discovery but are not the same order identity and
+  // therefore cannot supply mutable status or completion evidence.
+  const refsByOrder = orders.map((order) => statusEvidenceRefs(order));
+  const [evidenceByRef, splitLocksByRef] = await Promise.all([
+    currentScmPurchaseOrderStatusEvidence(refsByOrder.flat()),
+    currentScmPurchaseOrderSplitLocks(orders)
+  ]);
   return orders.map((order, index) => {
-    const exactScheduleEvidence = evidenceByRef.get(text(orderRef(order)).toLowerCase()) || {};
+    const exactRef = text(orderRef(order)).toLowerCase();
+    const exactScheduleEvidence = evidenceByRef.get(exactRef) || {};
     const candidates = refsByOrder[index]
       .map((ref) => evidenceByRef.get(text(ref).toLowerCase()))
       .filter(Boolean);
@@ -478,7 +553,13 @@ async function applyCurrentScmPurchaseOrderStatuses(orders = []) {
         hasActivePlan: order.dispatchPlanned === true,
         derivedStatus: exactScheduleEvidence.reconciliation_application_status
       });
-    const linkedCurrentEvidence = !exactManualSplitStatus && initialStatus.toLowerCase() === "queued"
+    const exactSplitStatusEvidence = order.isScmSplit === true
+      && Boolean(exactScheduleEvidence.schedule_id)
+      && (
+        exactManualSplitStatus
+        || Boolean(exactScheduleEvidence.reconciliation_state_id)
+      );
+    const linkedCurrentEvidence = !exactSplitStatusEvidence && initialStatus.toLowerCase() === "queued"
       ? candidates.find((candidate) => (
         !["queued", "planned"].includes(
           effectiveScmPurchaseOrderCatalogStatus(order, candidate).toLowerCase()
@@ -487,7 +568,7 @@ async function applyCurrentScmPurchaseOrderStatuses(orders = []) {
       : null;
     const completion = candidates.find((candidate) => candidate.completion_event_id);
     const evidence = {
-      ...(exactManualSplitStatus ? exactScheduleEvidence : linkedCurrentEvidence || initialEvidence),
+      ...(exactSplitStatusEvidence ? exactScheduleEvidence : linkedCurrentEvidence || initialEvidence),
       ...(completion ? {
         completion_event_id: completion.completion_event_id,
         completion_evidence_type: completion.completion_evidence_type
@@ -495,8 +576,12 @@ async function applyCurrentScmPurchaseOrderStatuses(orders = []) {
     };
     const status = effectiveScmPurchaseOrderCatalogStatus(order, evidence);
     const hasExactSchedule = Boolean(exactScheduleEvidence.schedule_id);
+    const liveSplitLock = splitLocksByRef.get(exactRef);
     return {
       ...order,
+      scmSplitLocked: order.isScmSplit === true && liveSplitLock !== undefined
+        ? liveSplitLock
+        : order.scmSplitLocked === true,
       dispatchCompleted: Boolean(evidence.completion_event_id) || order.dispatchCompleted === true,
       dispatchCompletionEvidenceType: text(evidence.completion_evidence_type)
         || text(order.dispatchCompletionEvidenceType),

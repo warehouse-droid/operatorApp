@@ -86,6 +86,52 @@ function scmNumber(value) {
   return Number.isFinite(number) ? Math.max(number, 0) : 0;
 }
 
+function scmNetSuiteLineSequence(line = {}) {
+  const value = Number(
+    line.netSuiteLineSequence
+    ?? line.netsuiteLineSequence
+    ?? line.lineSequenceNumber
+    ?? line.line_sequence_number
+  );
+  return Number.isFinite(value) && value > 0 ? value : null;
+}
+
+function scmLineIdentity(line = {}) {
+  return String(
+    line.lineId
+    ?? line.line_id
+    ?? line.sourceLineId
+    ?? line.lineRowId
+    ?? ""
+  ).trim();
+}
+
+function scmOrderedLines(lines = []) {
+  return (Array.isArray(lines) ? lines : [])
+    .map((line, index) => ({ line, index }))
+    .sort((left, right) => {
+      const leftSequence = scmNetSuiteLineSequence(left.line);
+      const rightSequence = scmNetSuiteLineSequence(right.line);
+      if (leftSequence !== null || rightSequence !== null) {
+        if (leftSequence === null) return 1;
+        if (rightSequence === null) return -1;
+        if (leftSequence !== rightSequence) return leftSequence - rightSequence;
+      }
+      const identityDifference = scmLineIdentity(left.line).localeCompare(
+        scmLineIdentity(right.line),
+        undefined,
+        { numeric: true, sensitivity: "base" }
+      );
+      return identityDifference || left.index - right.index;
+    })
+    .map(({ line }) => line);
+}
+
+function scmNetSuiteLineLabel(line = {}) {
+  const sequence = scmNetSuiteLineSequence(line);
+  return sequence === null ? "" : `NetSuite line ${sequence.toLocaleString("en-CA")}`;
+}
+
 function scmWeightLabel(value) {
   return `${scmNumber(value).toLocaleString("en-CA", { maximumFractionDigits: 0 })} lb`;
 }
@@ -422,7 +468,7 @@ function scmLineMatchesSearch(item = {}) {
 }
 
 function scmFilteredItems(order = scmSelectedOrder()) {
-  return (order?.items || []).filter(scmLineMatchesSearch);
+  return scmOrderedLines(order?.items || []).filter(scmLineMatchesSearch);
 }
 
 function scmInputForLine(lineRowId) {
@@ -603,6 +649,30 @@ function applyAuthoritativeScmDestination(payload = {}, orderRef = "", fallback 
   if (String(scmOrderDetail?.id || "").trim().toLowerCase() === ref) scmOrderDetail = apply(scmOrderDetail);
 }
 
+function applyAuthoritativeScmPickup(payload = {}, orderRef = "", fallback = "") {
+  mergeAuthoritativeScmOrders(payload.orders || []);
+  const ref = String(orderRef || "").trim().toLowerCase();
+  const pickupPoint = String(payload.updated?.pickupPoint || fallback || "").trim();
+  const scheduleUpdatedAt = payload.updated?.scheduleUpdatedAt || null;
+  const splitRevision = Number(payload.updated?.revision || 0);
+  if (!ref || !pickupPoint) return;
+  const apply = (order) => {
+    if (String(order?.id || "").trim().toLowerCase() !== ref) return order;
+    return {
+      ...order,
+      scmSplitRevision: splitRevision || order.scmSplitRevision,
+      scm: {
+        ...(order.scm || {}),
+        pickupPoint,
+        updatedAt: scheduleUpdatedAt || order.scm?.updatedAt || null
+      }
+    };
+  };
+  scmOrders = scmOrders.map(apply);
+  if (String(scmOrderDetail?.id || "").trim().toLowerCase() === ref) scmOrderDetail = apply(scmOrderDetail);
+  scmPickupPoint = pickupPoint;
+}
+
 async function refreshScmOrder(orderRef, targetedOrders = [], { removeRefs = [] } = {}) {
   const cleanRef = String(orderRef || "").trim();
   const removed = new Set(removeRefs.map((ref) => String(ref || "").trim().toLowerCase()).filter(Boolean));
@@ -698,13 +768,14 @@ function renderScmSplitLineEditor(order = {}) {
   }
   const locked = scmSplitEditor.split?.locked === true || order.scmSplitLocked === true;
   const needle = scmLineSearch.trim().toLowerCase();
-  const activeLines = (scmSplitEditor.lines || []).filter((line) => {
+  const orderedLines = scmOrderedLines(scmSplitEditor.lines || []);
+  const activeLines = orderedLines.filter((line) => {
     const input = scmSplitInputForLine(line);
     if (!line.inSplit && !scmSplitInputHasQuantity(input)) return false;
     return !needle || [line.sku, line.itemName, line.description, line.unit].join(" ").toLowerCase().includes(needle);
   });
   const sourceNeedle = scmSplitSourceSearch.trim().toLowerCase();
-  const addCandidates = (scmSplitEditor.lines || []).filter((line) => {
+  const addCandidates = orderedLines.filter((line) => {
     const input = scmSplitInputForLine(line);
     if (!line.canAdd || line.inSplit || scmSplitInputHasQuantity(input)) return false;
     return !sourceNeedle || [line.sku, line.itemName, line.description, line.unit].join(" ").toLowerCase().includes(sourceNeedle);
@@ -714,7 +785,7 @@ function renderScmSplitLineEditor(order = {}) {
     const units = scmSplitEditorUnits(line);
     const weight = scmSplitEditorSalesQuantity(line, input) * scmNumber(line.itemWeight);
     return `<article class="scm-line-card scm-split-edit-line" data-split-source-line="${escapeHtml(line.sourceLineId)}">
-      <div class="scm-line-main"><div><strong>${escapeHtml(line.sku || line.itemName || "Item")}</strong><span>${escapeHtml(line.description || "")}</span></div>
+      <div class="scm-line-main"><div>${scmNetSuiteLineLabel(line) ? `<span class="scm-line-sequence">${escapeHtml(scmNetSuiteLineLabel(line))}</span>` : ""}<strong>${escapeHtml(line.sku || line.itemName || "Item")}</strong><span>${escapeHtml(line.description || "")}</span></div>
         <div class="scm-line-totals"><span>Maximum on this split: ${escapeHtml(units.map((unit) => `${scmNumber(line.maximum?.[unit.key]).toLocaleString()} ${unit.label}`).join(" / "))}</span><span>${escapeHtml(scmWeightLabel(weight))}</span></div></div>
       <div class="scm-line-inputs">
         ${units.map((unit) => `<label><span>${escapeHtml(unit.label)}</span><input data-action="split-line-qty" data-source-line="${escapeHtml(line.sourceLineId)}" data-field="${escapeHtml(unit.key)}" type="number" min="0" max="${escapeHtml(scmNumber(line.maximum?.[unit.key]))}" step="1" value="${escapeHtml(scmNumber(input[unit.key]))}" ${locked ? "disabled" : ""} /></label>`).join("")}
@@ -725,7 +796,7 @@ function renderScmSplitLineEditor(order = {}) {
   return `${locked ? `<div class="route-notice">This split is planned, linked, grouped, received, or already used by Driver. Unplan/unlink it before changing any split detail.</div>` : ""}
     <section class="scm-split-source-picker">
       <label><span>Add item from ${escapeHtml(scmSplitEditor.split?.sourcePoRef || "source PO")}</span><input data-action="split-source-search" type="search" value="${escapeHtml(scmSplitSourceSearch)}" placeholder="SKU, item name, or description" autocomplete="off" ${locked ? "disabled" : ""} /></label>
-      ${sourceNeedle ? `<div class="scm-split-source-results">${addCandidates.map((line) => `<button data-action="add-split-source-line" data-source-line="${escapeHtml(line.sourceLineId)}" type="button" ${locked ? "disabled" : ""}><strong>${escapeHtml(line.sku || line.itemName)}</strong><span>${escapeHtml(scmSplitEditorUnits(line).map((unit) => `${scmNumber(line.maximum?.[unit.key]).toLocaleString()} ${unit.label} available`).join(" / "))}</span></button>`).join("") || `<span>No remaining source item matches.</span>`}</div>` : ""}
+      ${sourceNeedle ? `<div class="scm-split-source-results">${addCandidates.map((line) => `<button data-action="add-split-source-line" data-source-line="${escapeHtml(line.sourceLineId)}" type="button" ${locked ? "disabled" : ""}>${scmNetSuiteLineLabel(line) ? `<span class="scm-line-sequence">${escapeHtml(scmNetSuiteLineLabel(line))}</span>` : ""}<strong>${escapeHtml(line.sku || line.itemName)}</strong><span>${escapeHtml(scmSplitEditorUnits(line).map((unit) => `${scmNumber(line.maximum?.[unit.key]).toLocaleString()} ${unit.label} available`).join(" / "))}</span></button>`).join("") || `<span>No remaining source item matches.</span>`}</div>` : ""}
     </section>
     ${lineCards || `<div class="empty-state">No split item matches this search.</div>`}
     <div class="scm-submit-row"><button class="primary-action" data-action="save-split-lines" type="button" ${locked || scmLoading ? "disabled" : ""}>${scmLoading ? "Saving..." : "Save split quantities"}</button></div>`;
@@ -756,6 +827,7 @@ function renderSelectedOrder() {
       <article class="scm-line-card">
         <div class="scm-line-main">
           <div>
+            ${scmNetSuiteLineLabel(item) ? `<span class="scm-line-sequence">${escapeHtml(scmNetSuiteLineLabel(item))}</span>` : ""}
             <strong>${escapeHtml(item.sku || item.itemName || "Item")}</strong>
             <span>${escapeHtml(item.description || "")}</span>
             <span class="scm-line-yard">
@@ -1304,7 +1376,12 @@ function applyAuthoritativeScmScheduleRow(row = null, orderRef = "") {
 async function saveScmScheduleForSelected() {
   const order = scmSelectedOrder();
   if (!order || scmLoading) return;
+  const isSplit = scmOrderIsSplit(order);
   const previousDestinationOverride = String(order.scm?.dropoffPoint || "").trim();
+  const previousPickupPoint = scmDefaultPickupPoint(order);
+  const requestedPickupPoint = scmVendorYardOptions(order).length
+    ? String(scmPickupPoint || previousPickupPoint || "").trim()
+    : previousPickupPoint;
   const patch = collectScmSchedulePatch(order);
   order.scm ||= {};
   for (const [key, value] of Object.entries(patch)) {
@@ -1315,9 +1392,10 @@ async function saveScmScheduleForSelected() {
   renderScm();
   scmApp.querySelectorAll("[data-scm-field]").forEach((field) => { field.disabled = true; });
   let splitDestinationUpdated = false;
+  let splitPickupUpdated = false;
   try {
     const requestedDestination = String(patch.dropoffPoint || "").trim();
-    if (scmOrderIsSplit(order)
+    if (isSplit
       && requestedDestination
       && requestedDestination.toLowerCase() !== previousDestinationOverride.toLowerCase()) {
       const destination = SCM_DESTINATION_YARDS.find((yard) => yard.text === requestedDestination);
@@ -1336,6 +1414,22 @@ async function saveScmScheduleForSelected() {
       patch.expectedUpdatedAt = destinationPayload.updated?.scheduleUpdatedAt || patch.expectedUpdatedAt;
       patch.expectedSplitRevision = destinationPayload.updated?.revision || patch.expectedSplitRevision;
     }
+    if (isSplit
+      && requestedPickupPoint
+      && requestedPickupPoint.toLowerCase() !== String(previousPickupPoint || "").trim().toLowerCase()) {
+      const pickupPayload = await scmApi(`/api/dispatch/scm/purchase-order-splits/${encodeURIComponent(order.id)}/pickup`, scmTargetedMutationOptions({
+        method: "PUT",
+        body: JSON.stringify({
+          pickupPoint: requestedPickupPoint,
+          expectedRevision: patch.expectedSplitRevision,
+          audit: { sessionId: sessionStorage.getItem("mbbs.dispatch.sessionId") || "" }
+        })
+      }));
+      applyAuthoritativeScmPickup(pickupPayload, order.id, requestedPickupPoint);
+      splitPickupUpdated = true;
+      patch.expectedUpdatedAt = pickupPayload.updated?.scheduleUpdatedAt || patch.expectedUpdatedAt;
+      patch.expectedSplitRevision = pickupPayload.updated?.revision || patch.expectedSplitRevision;
+    }
     const payload = await scmApi(`/api/scm/schedule/${encodeURIComponent(order.id)}?includeSchedule=false`, {
       method: "PUT",
       body: JSON.stringify({
@@ -1346,8 +1440,12 @@ async function saveScmScheduleForSelected() {
     scmNotice = `Saved SCM schedule for ${order.id}.`;
     if (!applyAuthoritativeScmScheduleRow(payload.row, order.id)) await loadScmOrders();
   } catch (error) {
-    scmNotice = splitDestinationUpdated
-      ? `Destination updated, but the remaining schedule save failed: ${error.message}`
+    const routeUpdates = [
+      splitDestinationUpdated ? "Destination" : "",
+      splitPickupUpdated ? "Pickup" : ""
+    ].filter(Boolean).join(" and ");
+    scmNotice = routeUpdates
+      ? `${routeUpdates} updated, but the remaining schedule save failed: ${error.message}`
       : `Save schedule failed: ${error.message}`;
   } finally {
     scmLoading = false;

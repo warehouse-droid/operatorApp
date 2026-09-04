@@ -53,6 +53,56 @@ function isCoRef(value) {
   return text(value).toUpperCase().startsWith("CO-");
 }
 
+const DISPATCH_CO_YARD_METADATA = new Map([
+  ["3445", { locationId: 1, address: "3445 Kennedy Road, Toronto, ON" }],
+  ["2967", { locationId: 28, address: "2967 Kennedy Road, Toronto, ON" }],
+  ["12441", { locationId: 15, address: "12441 Woodbine Avenue, Whitchurch-Stouffville, ON" }],
+  ["150", { locationId: 26, address: "150 Clark Blvd, Brampton, ON L6T 4Y8, Canada" }]
+]);
+
+function coYardMetadata(value) {
+  return DISPATCH_CO_YARD_METADATA.get(text(value).split(/\s*:\s*/u, 1)[0]) || null;
+}
+
+export function applyActiveLocalCoOrderRoute(order = {}, activeCo = null) {
+  const ref = orderRef(order);
+  const coRef = text(activeCo?.coRef || activeCo?.co_ref);
+  const sourceOrderRef = text(activeCo?.sourceOrderRef || activeCo?.source_order_ref);
+  const fromYard = text(activeCo?.fromYard || activeCo?.from_yard || activeCo?.from_location);
+  const toYard = text(activeCo?.toYard || activeCo?.to_yard || activeCo?.to_location);
+  if (!isCoRef(ref) || !coRef || ref.toLowerCase() !== coRef.toLowerCase() || !fromYard || !toYard) {
+    return order;
+  }
+  const fromMetadata = coYardMetadata(fromYard);
+  const toMetadata = coYardMetadata(toYard);
+  const fromLocationId = Number(activeCo?.fromLocationId || activeCo?.from_location_id || fromMetadata?.locationId) || null;
+  const toLocationId = Number(activeCo?.toLocationId || activeCo?.to_location_id || toMetadata?.locationId) || null;
+  const sourceAddress = fromMetadata?.address || fromYard;
+  const destinationAddress = toMetadata?.address || toYard;
+  const status = text(activeCo?.status);
+  return {
+    ...order,
+    sourceYard: fromYard,
+    pickupLocations: [fromYard],
+    sourceAddress,
+    defaultSourceAddress: sourceAddress,
+    ...(fromLocationId ? { sourceLocationId: fromLocationId } : {}),
+    destinationYard: toYard,
+    ...(toLocationId ? { destinationLocationId: toLocationId } : {}),
+    address: destinationAddress,
+    destinationAddress,
+    defaultDestinationAddress: destinationAddress,
+    sourceOrderId: sourceOrderRef || order.sourceOrderId || "",
+    ...(status ? {
+      status,
+      statusText: status,
+      netsuiteStatus: status,
+      netsuiteStatusText: status,
+      localYardOrderStatus: status
+    } : {})
+  };
+}
+
 function isAggregateCoGroup(order = {}) {
   if (text(order.type).toUpperCase() !== "CO") return false;
   return (Array.isArray(order.childOrders) ? order.childOrders : []).some(isCoRef)
@@ -261,9 +311,11 @@ export async function reconcileDispatchPlanLocalCos(plan) {
   plan = canonicalizeDispatchCoGroupIdentities(plan);
   const sourceRefs = new Set();
   const coRefs = new Set();
+  const directCoOrderRefs = new Set();
   const transitFallbackByRef = new Map();
   const collect = (order = {}) => {
     const ref = orderRef(order);
+    if (isCoRef(ref)) directCoOrderRefs.add(ref);
     if (ref && !(isCoRef(ref) && isAggregateCoGroup(order))) {
       (isCoRef(ref) ? coRefs : sourceRefs).add(ref);
     }
@@ -286,29 +338,36 @@ export async function reconcileDispatchPlanLocalCos(plan) {
   for (const order of Array.isArray(plan.orders) ? plan.orders : []) {
     collect(order);
   }
-  if (!sourceRefs.size && !coRefs.size) return plan;
+  if (!sourceRefs.size && !coRefs.size && !directCoOrderRefs.size) return plan;
+  const queriedCoRefs = [...new Set([...coRefs, ...directCoOrderRefs])];
   const result = await query(
-    `SELECT co_ref, source_order_ref, from_location, to_location, status, created_at, updated_at
+    `SELECT co_ref, source_order_ref,
+            from_location_id, from_location, to_location_id, to_location,
+            status, created_at, updated_at
        FROM local_co_orders
       WHERE LOWER(source_order_ref) = ANY($1::text[])
          OR LOWER(co_ref) = ANY($2::text[])
       ORDER BY updated_at DESC, id DESC`,
-    [[...sourceRefs].map((ref) => ref.toLowerCase()), [...coRefs].map((ref) => ref.toLowerCase())]
+    [[...sourceRefs].map((ref) => ref.toLowerCase()), queriedCoRefs.map((ref) => ref.toLowerCase())]
   );
   const cancelledByRef = new Map();
+  const cancelledLocalCoRefs = new Set();
   const activeByRef = new Map();
   const activeBySource = new Map();
   for (const row of result.rows) {
     const record = {
       coRef: text(row.co_ref),
       sourceOrderRef: text(row.source_order_ref),
+      fromLocationId: Number(row.from_location_id) || null,
       fromYard: text(row.from_location),
+      toLocationId: Number(row.to_location_id) || null,
       toYard: text(row.to_location),
       status: text(row.status),
       createdAt: row.created_at || null
     };
     if (String(row.status || "").toLowerCase() === "cancelled") {
       cancelledByRef.set(record.coRef.toLowerCase(), record);
+      cancelledLocalCoRefs.add(record.coRef.toLowerCase());
     } else {
       activeByRef.set(record.coRef.toLowerCase(), record);
       if (!activeBySource.has(record.sourceOrderRef.toLowerCase())) {
@@ -325,7 +384,7 @@ export async function reconcileDispatchPlanLocalCos(plan) {
     }
   }
 
-  const removedOrderRefs = new Set([...invalidCoRefs].filter(isCoRef));
+  const removedOrderRefs = new Set([...invalidCoRefs, ...cancelledLocalCoRefs].filter(isCoRef));
   const aggregateGroup = (order, childOrderDetails) => {
     const sum = (field) => childOrderDetails.reduce((total, child) => total + Number(child?.[field] || 0), 0);
     return {
@@ -352,9 +411,17 @@ export async function reconcileDispatchPlanLocalCos(plan) {
   };
   const reconcileOrder = (order) => {
     const ref = orderRef(order);
-    if (isCoRef(ref) && !isAggregateCoGroup(order) && invalidCoRefs.has(ref.toLowerCase())) return null;
-    let next = applyActiveTransitCoMetadata(
+    if (isCoRef(ref) && (
+      cancelledLocalCoRefs.has(ref.toLowerCase())
+      || (!isAggregateCoGroup(order) && invalidCoRefs.has(ref.toLowerCase()))
+    )) return null;
+    const activeCo = isCoRef(ref) ? activeByRef.get(ref.toLowerCase()) : null;
+    let next = applyActiveLocalCoOrderRoute(
       clearCancelledTransitCoMetadata(order, cancelledByRef),
+      activeCo
+    );
+    next = applyActiveTransitCoMetadata(
+      next,
       activeBySource
     );
     const originalChildren = Array.isArray(next.childOrderDetails) ? next.childOrderDetails : [];

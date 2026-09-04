@@ -8,7 +8,13 @@ import path from "node:path";
 const UI_TEST = "test/dispatch/frontend/scm-manual-split-authority-ui.red.test.js";
 const INTEGRATION_TEST = "test/dispatch/integration/scm-manual-split-authority.red.test.js";
 const CATALOG_TEST = "test/dispatch/integration/scm-po-split-status-consistency.red.test.js";
-const ALL_TESTS = Object.freeze([UI_TEST, INTEGRATION_TEST, CATALOG_TEST]);
+const SPLIT_EDIT_TEST = "test/dispatch/integration/scm-po-split-editing.test.js";
+const ALL_TESTS = Object.freeze([
+  UI_TEST,
+  INTEGRATION_TEST,
+  CATALOG_TEST,
+  SPLIT_EDIT_TEST
+]);
 
 /** @type {ReadonlyArray<{
  * name: string,
@@ -118,9 +124,91 @@ const MUTANTS = Object.freeze([
   {
     name: "the PO catalog drops manual split status authority",
     target: "src/scm-purchase-order-catalog-status.js",
-    from: "    preserveOperationalStatus\n  });",
-    to: "    preserveOperationalStatus: false\n  });",
+    from: `    preserveOperationalStatus,
+    preferReconciliationStatus: order.isScmSplit === true
+      && !preserveOperationalStatus`,
+    to: `    preserveOperationalStatus: false,
+    preferReconciliationStatus: order.isScmSplit === true
+      && !preserveOperationalStatus`,
     tests: [INTEGRATION_TEST]
+  },
+  {
+    name: "a newer remark timestamp restores stale split lifecycle text",
+    target: "src/scm-reconciliation-repository.js",
+    from: "    && !(preferReconciliationStatus && currentReconciliationApplicationStatus)",
+    to: "    && true",
+    tests: [INTEGRATION_TEST, SPLIT_EDIT_TEST]
+  },
+  {
+    name: "PO catalog treats stale raw schedule text as a dispatch plan",
+    target: "src/dispatch-repository.js",
+    from: `              OR EXISTS (
+                SELECT 1 FROM scm_transport_schedule schedule
+                JOIN dispatch_plans schedule_plan
+                  ON schedule_plan.id = schedule.dispatch_plan_id
+                 AND schedule_plan.status <> 'cancelled'
+                WHERE schedule.order_kind = 'PO'
+                  AND lower(schedule.order_ref) = lower(s.split_po_ref)
+              )`,
+    to: `              OR EXISTS (
+                SELECT 1 FROM scm_transport_schedule schedule
+                WHERE schedule.order_kind = 'PO'
+                  AND lower(schedule.order_ref) = lower(s.split_po_ref)
+                  AND lower(COALESCE(schedule.status, '')) IN (
+                    'planned', 'in transit', 'partially done', 'completed'
+                  )
+              )`,
+    tests: [SPLIT_EDIT_TEST]
+  },
+  {
+    name: "PO/TO Schedule treats stale raw schedule text as a split lock",
+    target: "src/dispatch-repository.js",
+    from: "      scmSplitLocked: splitState?.locked === true",
+    to: `      scmSplitLocked: splitState?.locked === true
+        || (Boolean(splitState) && ["Planned", "In Transit", "Partially Done", "Completed"].includes(row.status))`,
+    tests: [SPLIT_EDIT_TEST]
+  },
+  {
+    name: "PO/TO Schedule lets a remark timestamp revive stale split lifecycle text",
+    target: "src/dispatch-repository.js",
+    from: `        WHEN b.order_kind = 'PO'
+          AND NULLIF(BTRIM(b.split_ref), '') IS NOT NULL
+          AND NULLIF(BTRIM(COALESCE(`,
+    to: `        WHEN false
+          AND NULLIF(BTRIM(b.split_ref), '') IS NOT NULL
+          AND NULLIF(BTRIM(COALESCE(`,
+    tests: [SPLIT_EDIT_TEST]
+  },
+  {
+    name: "the split editor treats stale raw schedule text as a dispatch plan",
+    target: "src/dispatch-repository.js",
+    from: `       EXISTS (
+         SELECT 1
+           FROM scm_transport_schedule schedule
+           JOIN dispatch_plans schedule_plan
+             ON schedule_plan.id = schedule.dispatch_plan_id
+            AND schedule_plan.status <> 'cancelled'
+          WHERE schedule.order_kind = 'PO'
+            AND lower(schedule.order_ref) = lower($1)
+       ) AS schedule_plan,`,
+    to: `       EXISTS (
+         SELECT 1
+           FROM scm_transport_schedule schedule
+          WHERE schedule.order_kind = 'PO'
+            AND lower(schedule.order_ref) = lower($1)
+            AND lower(COALESCE(schedule.status, '')) IN (
+              'planned', 'in transit', 'partially done', 'completed'
+            )
+       ) AS schedule_plan,`,
+    tests: [SPLIT_EDIT_TEST]
+  },
+  {
+    name: "cancelled schedule plans still lock split editing",
+    target: "src/dispatch-repository.js",
+    from: "AND schedule_plan.status <> 'cancelled'",
+    to: "AND true",
+    occurrences: 3,
+    tests: [SPLIT_EDIT_TEST]
   },
   {
     name: "PO Split borrows a reconciled parent status over an exact manual child status",
@@ -188,23 +276,28 @@ const MUTANTS = Object.freeze([
   {
     name: "accept-current rewrites a split revision saved after the review snapshot",
     target: "src/scm-reconciliation-repository.js",
-    from: `        const preserveNewerSplitRevision = source.kind === "PO"
-          && target.targetKind === "po_split"
+    from: `        const preserveNewerSplitRevision = scheduleHasOperationalAuthority
           && Number(acceptedSchedule.id) > 0
           && stateReconciledAt !== null
           && scheduleUpdatedAt !== null
           && scheduleUpdatedAt > stateReconciledAt;`,
-    to: "        const preserveNewerSplitRevision = false;",
+    to: `        const preserveNewerSplitRevision = true
+          && Number(acceptedSchedule.id) > 0
+          && stateReconciledAt !== null
+          && scheduleUpdatedAt !== null
+          && scheduleUpdatedAt > stateReconciledAt;`,
     tests: [INTEGRATION_TEST]
   },
   {
     name: "accept-current ignores an exact active split assignment",
     target: "src/scm-reconciliation-repository.js",
-    from: `            || scmManualSplitHasOperationalStatusAuthority(preservedOperationalStatus, {
-              hasActivePlan: target.hasActiveDispatchAssignment === true,
-              derivedStatus: derived.applicationStatus
-            })`,
-    to: "            || false",
+    from: `        const scheduleHasOperationalAuthority = source.kind === "PO"
+          && target.targetKind === "po_split"
+          && scmManualSplitHasOperationalStatusAuthority(preservedOperationalStatus, {
+            hasActivePlan: target.hasActiveDispatchAssignment === true,
+            derivedStatus: derived.applicationStatus
+          });`,
+    to: "        const scheduleHasOperationalAuthority = false;",
     tests: [INTEGRATION_TEST]
   },
   {
@@ -291,14 +384,17 @@ const MUTANTS = Object.freeze([
   }
 ]);
 
+/** @param {string} value */
 function hash(value) {
   return createHash("sha256").update(value).digest("hex");
 }
 
+/** @param {string} source @param {string} needle */
 function occurrenceCount(source, needle) {
   return source.split(needle).length - 1;
 }
 
+/** @param {string} label @param {ReadonlyArray<string>} [tests] */
 function runTests(label, tests = ALL_TESTS) {
   process.stdout.write(`\n[manual split authority mutation] ${label}\n`);
   const result = spawnSync(process.execPath, [

@@ -390,6 +390,144 @@ test("pending TO revisions atomically replace reservations, reject stale screens
   );
 });
 
+test("SCM repartitions accepted local TO lines by outbound yard and returns removed lines to Request", async () => {
+  const request = await createSalesStockRequest({
+    destinationLocationId: 26,
+    lines: [
+      conversionLine({ sourceLocationId: 1, pallets: 0, pieces: 2 }),
+      { itemId: itemIds.loose, sourceLocationId: 1, salesQty: 3 },
+      conversionLine({ sourceLocationId: 1, pallets: 0, pieces: 4 })
+    ]
+  }, { operatorId: actor, authorizedDestinationLocationIds: [26] });
+  const converted = await convertSalesStockRequestLines(request.id, {
+    expectedRevision: request.revision,
+    lineIds: request.lines.map((line) => line.id)
+  }, { operatorId: actor });
+  const transfer = converted.transfers[0];
+  assert.equal(transfer.sourceName, "3445");
+  assert.equal(transfer.destinationName, "150");
+
+  const revisionRequestId = `structure-${seed}-${transfer.id}`;
+  const revised = await reviseStockTransferQuantities(transfer.id, {
+    expectedRevision: transfer.revision,
+    requestId: revisionRequestId,
+    palletQuantity: 99,
+    lines: [
+      { requestLineId: request.lines[0].id, sourceLocationId: 15, pallets: 0, pieces: 2 },
+      { requestLineId: request.lines[1].id, sourceLocationId: 1, salesQty: 3 },
+      { requestLineId: request.lines[2].id, sourceLocationId: 1, remove: true }
+    ]
+  }, { operatorId: actor });
+  assert.equal(revised.sourceLocationId, 1);
+  assert.equal(revised.lines.length, 1);
+  assert.equal(revised.lines[0].id, request.lines[1].id);
+  assert.equal(revised.palletQuantity, 0, "a structural split must recalculate the route-specific PALLET quantity");
+  assert.equal(revised.palletQuantityRequiresManual, true);
+
+  const detail = await getScmStockRequest(request.id);
+  const activeTransfers = detail.transfers.filter((candidate) => candidate.status === "pending_local");
+  assert.equal(activeTransfers.length, 2);
+  const originalRoute = activeTransfers.find((candidate) => candidate.sourceLocationId === 1);
+  const changedRoute = activeTransfers.find((candidate) => candidate.sourceLocationId === 15);
+  assert.deepEqual(originalRoute.lines.map((line) => line.id), [request.lines[1].id]);
+  assert.deepEqual(changedRoute.lines.map((line) => line.id), [request.lines[0].id]);
+  assert.equal(changedRoute.sourceName, "12441");
+  assert.equal(changedRoute.destinationName, "150");
+  assert.equal(changedRoute.palletQuantity, 1);
+  const removedLine = detail.lines.find((line) => line.id === request.lines[2].id);
+  assert.equal(removedLine.status, "submitted");
+  assert.equal(removedLine.transferId, null);
+
+  const reservations = await query(
+    `SELECT transfer_line.request_line_id, reservation.source_location_id,
+            reservation.reserved_sales_quantity
+       FROM sales_stock_transfer_reservations reservation
+       JOIN sales_stock_transfer_lines transfer_line ON transfer_line.id = reservation.transfer_line_id
+       JOIN sales_stock_request_lines request_line ON request_line.id = transfer_line.request_line_id
+      WHERE request_line.request_id = $1 AND reservation.status = 'active'
+      ORDER BY transfer_line.request_line_id`,
+    [request.id]
+  );
+  assert.deepEqual(reservations.rows.map((row) => ({
+    requestLineId: Number(row.request_line_id),
+    sourceLocationId: Number(row.source_location_id),
+    quantity: Number(row.reserved_sales_quantity)
+  })), [
+    { requestLineId: request.lines[0].id, sourceLocationId: 15, quantity: 2 },
+    { requestLineId: request.lines[1].id, sourceLocationId: 1, quantity: 3 }
+  ]);
+  assert((await listScmStockRequests({ queue: "request", search: request.requestRef }))
+    .some((candidate) => candidate.id === request.id));
+  assert((await listScmStockRequests({ queue: "pending_to", search: request.requestRef }))
+    .some((candidate) => candidate.id === request.id));
+  const event = detail.events.find((candidate) => candidate.eventType === "transfer_lines_revised");
+  assert.deepEqual(event.details.removedLineIds, [request.lines[2].id]);
+  assert.deepEqual(event.details.sourceChanges, [{
+    lineId: request.lines[0].id,
+    previousSourceLocationId: 1,
+    sourceLocationId: 15
+  }]);
+  assert.equal(event.details.createdTransfers.length, 1);
+
+  const retry = await reviseStockTransferQuantities(transfer.id, {
+    expectedRevision: transfer.revision,
+    requestId: revisionRequestId,
+    lines: []
+  }, { operatorId: actor });
+  assert.equal(retry.revision, revised.revision);
+
+  const remoteId = baseId + 70 + changedRoute.id;
+  await query(
+    `UPDATE sales_stock_transfers
+        SET netsuite_transfer_order_id = $2,
+            netsuite_transfer_order_ref = $3,
+            status = 'pending_fulfillment', confirmation_status = 'complete'
+      WHERE id = $1`,
+    [changedRoute.id, remoteId, `TO${remoteId}`]
+  );
+  await assert.rejects(
+    () => reviseStockTransferQuantities(changedRoute.id, {
+      expectedRevision: changedRoute.revision,
+      requestId: `${revisionRequestId}-locked`,
+      palletQuantity: changedRoute.palletQuantity,
+      lines: [{
+        requestLineId: request.lines[0].id,
+        sourceLocationId: 28,
+        pallets: 0,
+        pieces: 2
+      }]
+    }, { operatorId: actor }),
+    (error) => error?.status === 409 && error?.code === "STOCK_TRANSFER_STRUCTURE_LOCKED"
+  );
+  assert.equal((await getStockTransfer(changedRoute.id)).sourceLocationId, 15);
+});
+
+test("removing every line cancels only the local TO and returns the stock request to Pending", async () => {
+  const local = await createConvertedTransfer(conversionLine({ sourceLocationId: 15, pallets: 0, pieces: 3 }));
+  const revised = await reviseStockTransferQuantities(local.transfer.id, {
+    expectedRevision: local.transfer.revision,
+    requestId: `remove-all-${seed}-${local.transfer.id}`,
+    palletQuantity: 0,
+    lines: [{ requestLineId: local.transfer.lines[0].id, remove: true }]
+  }, { operatorId: actor });
+  assert.equal(revised.status, "cancelled");
+  assert.deepEqual(revised.lines, []);
+
+  const detail = await getSalesStockRequest(local.request.id, { authorizedDestinationLocationIds: [1] });
+  assert.equal(detail.lines[0].status, "submitted");
+  assert.equal(detail.lines[0].transferId, null);
+  assert.equal(detail.bucket, "pending");
+  assert((await listSalesStockRequests({
+    authorizedDestinationLocationIds: [1],
+    bucket: "pending",
+    search: local.request.requestRef
+  })).some((candidate) => candidate.id === local.request.id));
+  assert((await listScmStockRequests({ queue: "request", search: local.request.requestRef }))
+    .some((candidate) => candidate.id === local.request.id));
+  assert(!(await listScmStockRequests({ queue: "pending_to", search: local.request.requestRef }))
+    .some((candidate) => candidate.id === local.request.id));
+});
+
 test("quantity revision invalidates a prior ticket snapshot without changing the real TO identity", async () => {
   const { transfer } = await createConvertedTransfer(conversionLine({ pallets: 1 }));
   const remoteId = baseId + 80;

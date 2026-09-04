@@ -10,6 +10,7 @@ import {
   createSalesStockRequest,
   decideSalesStockRequestLines,
   getSalesStockRequest,
+  getStockTransfer,
   listScmStockRequests,
   resubmitSalesStockRequest,
   reviseStockTransferQuantities,
@@ -293,4 +294,86 @@ test("TO revisions require every line, allow an explicit backorder, and reject m
     }, { operatorId: actor }),
     /PALLET item quantity/i
   );
+});
+
+test("TO structural revisions fail atomically when a database guard refuses a line removal or move", async () => {
+  const removableRequest = await create([line({ sourceLocationId: 15, pieces: 2 })]);
+  const removableTransfer = await convert(removableRequest);
+  const removableLineId = removableTransfer.lines[0].id;
+  const deleteFunction = `stock_request_skip_delete_${seed}`;
+  const deleteTrigger = `stock_request_skip_delete_trigger_${seed}`;
+  await query(
+    `CREATE FUNCTION ${deleteFunction}() RETURNS trigger LANGUAGE plpgsql AS $$
+       BEGIN
+         IF OLD.request_line_id = ${removableLineId} THEN RETURN NULL; END IF;
+         RETURN OLD;
+       END;
+     $$`
+  );
+  await query(
+    `CREATE TRIGGER ${deleteTrigger}
+       BEFORE DELETE ON sales_stock_transfer_lines
+       FOR EACH ROW EXECUTE FUNCTION ${deleteFunction}()`
+  );
+  try {
+    await assert.rejects(
+      () => reviseStockTransferQuantities(removableTransfer.id, {
+        expectedRevision: removableTransfer.revision,
+        requestId: `guarded-delete-${seed}-${removableTransfer.id}`,
+        palletQuantity: 0,
+        lines: [{ requestLineId: removableLineId, remove: true }]
+      }, { operatorId: actor }),
+      /material line was not found/i
+    );
+  } finally {
+    await query(`DROP TRIGGER ${deleteTrigger} ON sales_stock_transfer_lines`);
+    await query(`DROP FUNCTION ${deleteFunction}()`);
+  }
+  const afterDeleteGuard = await getStockTransfer(removableTransfer.id);
+  assert.equal(afterDeleteGuard.status, "pending_local");
+  assert.deepEqual(afterDeleteGuard.lines.map((candidate) => candidate.id), [removableLineId]);
+
+  const movableRequest = await create([line({ pieces: 2 }), line({ pieces: 3 })]);
+  const movableTransfer = await convert(movableRequest);
+  const movedLineId = movableTransfer.lines[0].id;
+  const moveFunction = `stock_request_skip_move_${seed}`;
+  const moveTrigger = `stock_request_skip_move_trigger_${seed}`;
+  await query(
+    `CREATE FUNCTION ${moveFunction}() RETURNS trigger LANGUAGE plpgsql AS $$
+       BEGIN
+         IF NEW.request_line_id = ${movedLineId} AND NEW.transfer_id <> OLD.transfer_id THEN RETURN NULL; END IF;
+         RETURN NEW;
+       END;
+     $$`
+  );
+  await query(
+    `CREATE TRIGGER ${moveTrigger}
+       BEFORE UPDATE OF transfer_id ON sales_stock_transfer_lines
+       FOR EACH ROW EXECUTE FUNCTION ${moveFunction}()`
+  );
+  try {
+    await assert.rejects(
+      () => reviseStockTransferQuantities(movableTransfer.id, {
+        expectedRevision: movableTransfer.revision,
+        requestId: `guarded-move-${seed}-${movableTransfer.id}`,
+        palletQuantity: 1,
+        lines: [
+          { requestLineId: movedLineId, sourceLocationId: 15, pallets: 0, pieces: 2 },
+          { requestLineId: movableTransfer.lines[1].id, sourceLocationId: 28, pallets: 0, pieces: 3 }
+        ]
+      }, { operatorId: actor }),
+      /not every selected line could be moved/i
+    );
+  } finally {
+    await query(`DROP TRIGGER ${moveTrigger} ON sales_stock_transfer_lines`);
+    await query(`DROP FUNCTION ${moveFunction}()`);
+  }
+  const afterMoveGuard = await getStockTransfer(movableTransfer.id);
+  assert.equal(afterMoveGuard.revision, movableTransfer.revision);
+  assert.deepEqual(afterMoveGuard.lines.map((candidate) => candidate.sourceLocationId), [28, 28]);
+  const transferCount = await query(
+    "SELECT COUNT(*)::int AS count FROM sales_stock_transfers WHERE request_id = $1",
+    [movableRequest.id]
+  );
+  assert.equal(transferCount.rows[0].count, 1);
 });

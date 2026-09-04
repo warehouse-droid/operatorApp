@@ -136,7 +136,10 @@ export const REQUIRED_MBT_P3_MIGRATIONS = Object.freeze([
   "189_direct_dependency_shared_driver_receipt.sql",
   "190_dispatch_global_order_groups.sql",
   "191_driver_completed_co_lifecycle.sql",
-  "192_dispatch_global_derived_orders.sql"
+  "192_dispatch_global_derived_orders.sql",
+  "193_dispatch_assignment_projection_invariant.sql",
+  "194_driver_completed_stop_photo_evidence.sql",
+  "195_dispatch_load_assignment_projection_invariant.sql"
 ]);
 
 export const REQUIRED_MBT_P3_FLAGS = Object.freeze([

@@ -5,7 +5,14 @@ import { readFile } from "node:fs/promises";
 import path from "node:path";
 
 /**
- * @typedef {{ file: string, label: string, needle: string, occurrence?: number }} CoverageProbe
+ * @typedef {{
+ *   file: string,
+ *   label: string,
+ *   needle: string,
+ *   occurrence?: number,
+ *   scopeStart?: string,
+ *   scopeEnd?: string
+ * }} CoverageProbe
  * @typedef {{
  *   path?: string,
  *   statementMap: Record<string, { start: { line: number }, end: { line: number } }>,
@@ -66,9 +73,10 @@ const probes = Object.freeze([
   },
   {
     file: "src/server.js",
-    label: "the PUT route passes the required revision to the repository",
+    label: "the main PUT route passes the required revision to the repository",
     needle: "expectedUpdatedAt: requiredScmScheduleRevision(req.body || {})",
-    occurrence: 2
+    scopeStart: 'app.put("/api/scm/schedule/:id",',
+    scopeEnd: 'app.post("/api/scm/schedule-groups"'
   }
 ]);
 
@@ -105,11 +113,18 @@ function coverageFor(file) {
 /** @param {CoverageProbe} probe */
 async function lineFor(probe) {
   const source = await sourceFor(probe.file);
-  let offset = -1;
+  const scopeStart = probe.scopeStart ? source.indexOf(probe.scopeStart) : 0;
+  assert.notEqual(scopeStart, -1, `${probe.label}: source scope start was not found.`);
+  const scopeEnd = probe.scopeEnd ? source.indexOf(probe.scopeEnd, scopeStart + 1) : source.length;
+  assert.notEqual(scopeEnd, -1, `${probe.label}: source scope end was not found.`);
+  assert.ok(scopeEnd > scopeStart, `${probe.label}: source scope is not ordered.`);
+  const scopedSource = source.slice(scopeStart, scopeEnd);
+  let scopedOffset = -1;
   for (let index = 0; index < (probe.occurrence || 1); index += 1) {
-    offset = source.indexOf(probe.needle, offset + 1);
-    assert.notEqual(offset, -1, `${probe.label}: source marker was not found.`);
+    scopedOffset = scopedSource.indexOf(probe.needle, scopedOffset + 1);
+    assert.notEqual(scopedOffset, -1, `${probe.label}: source marker was not found.`);
   }
+  const offset = scopeStart + scopedOffset;
   return source.slice(0, offset).split("\n").length;
 }
 

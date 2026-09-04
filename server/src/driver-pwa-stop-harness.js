@@ -277,14 +277,17 @@ assert.match(reopenSource, /const before = recordEvidenceSnapshot\(row\)/);
 assert.match(reopenSource, /status = 'pending'/);
 assert.match(reopenSource, /started_at = NULL/);
 assert.match(reopenSource, /completed_at = NULL/);
-assert.match(reopenSource, /photo_data_urls = '\[\]'::jsonb/);
+assert.doesNotMatch(reopenSource, /photo_data_urls = '\[\]'::jsonb/);
+assert.match(reopenSource, /const retainedPhotoReferences = uniqueDriverPhotoReferences\(/);
+assert.match(reopenSource, /photo_data_urls = \$2::jsonb/);
+assert.match(reopenSource, /JSON\.stringify\(retainedPhotoReferences\)/);
 assert.match(reopenSource, /source_offline_event_id = NULL/);
-assert.match(reopenSource, /const after = recordEvidenceSnapshot\(updated\.rows\[0\]\)/);
+assert.match(reopenSource, /const after = recordEvidenceSnapshot\(afterRow\)/);
 assert.match(reopenSource, /insertCorrection\(\{[\s\S]*?before,[\s\S]*?after,/);
 assert.match(reopenSource, /supersedeDriverOfflineManifests\(\{/);
 assert.match(
   reopenSource,
-  /UPDATE driver_offline_events[\s\S]*status = 'evidence_only'[\s\S]*server_applied_at = COALESCE\(server_applied_at, now\(\)\)[\s\S]*original_job_id = \$3/,
+  /UPDATE driver_offline_events[\s\S]*status = 'evidence_only'[\s\S]*server_applied_at = COALESCE\(server_applied_at, now\(\)\)[\s\S]*original_job_id = ANY\(\$3::text\[\]\)/,
   "Restart must close already-received target events as retained evidence instead of replaying them."
 );
 assert.match(

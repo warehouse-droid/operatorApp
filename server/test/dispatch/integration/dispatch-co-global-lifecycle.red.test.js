@@ -214,6 +214,7 @@ test("today bootstrap rehydrates an active CO owned by a different date onto its
     id: coRef,
     fromYard: "2967",
     toYard: "150",
+    status: "pending_load",
     sourceOrderId: sourceRef
   });
   assert.deepEqual(hydrated.transitOriginalPickupLocations, ["2967"]);
@@ -494,6 +495,7 @@ test("a mixed CO group drops only its cancelled child and still protects its act
   const cancelledRef = `CO-${cancelledSource}`;
   const activeRef = `CO-${activeSource}`;
   const groupRef = `GOA-GLOBAL-${suffix}-CO-GROUP`;
+  const canonicalGroupRef = `CO-${groupRef}`;
   const truckPlate = `CO-GROUP-${suffix}`;
   await seedLocalCo({ coRef: cancelledRef, sourceRef: cancelledSource, status: "cancelled" });
   await seedLocalCo({ coRef: activeRef, sourceRef: activeSource });
@@ -545,7 +547,8 @@ test("a mixed CO group drops only its cancelled child and still protects its act
   )).rows[0];
   assert.doesNotMatch(JSON.stringify(saved), new RegExp(cancelledRef));
   assert.match(JSON.stringify(saved), new RegExp(activeRef));
-  const group = saved.orders.find((order) => order.id === groupRef);
+  const group = saved.orders.find((order) => order.id === canonicalGroupRef);
+  assert.ok(group, "the surviving CO group must use its canonical CO-prefixed identity");
   assert.deepEqual(group?.childOrders, [activeRef]);
   assert.equal(group?.pallets, 2);
   assert.equal(group?.weight, 200);

@@ -982,6 +982,41 @@ body.driver-pwa-update-active {
   gap: 8px;
 }
 
+.driver-retained-photos {
+  border: 1px solid #8fc9bd;
+  border-radius: 9px;
+  background: #e8f6f3;
+  padding: 9px;
+  display: grid;
+  gap: 8px;
+}
+
+.driver-retained-photo-heading {
+  display: grid;
+  gap: 2px;
+}
+
+.driver-retained-photo-heading span,
+.driver-retained-photo-slot small {
+  color: #365c55;
+  font-size: 12px;
+  font-weight: 800;
+}
+
+.driver-retained-photo-grid {
+  grid-template-columns: repeat(auto-fit, minmax(135px, 1fr));
+}
+
+.driver-retained-photo-slot {
+  grid-template-columns: minmax(0, 1fr);
+  align-content: start;
+}
+
+.driver-retained-photo-slot .photo-preview {
+  border-style: solid;
+  border-color: #8fc9bd;
+}
+
 .photo-list-actions {
   display: flex;
   flex-wrap: wrap;

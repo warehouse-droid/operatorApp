@@ -20,6 +20,12 @@ function pseudonym(namespace, value) {
   return `${namespace}_${crypto.createHash("sha256").update(`${salt}\0${namespace}\0${String(value ?? "")}`).digest("hex").slice(0, 16)}`;
 }
 
+function digestKey(namespace, value) {
+  return crypto.createHash("sha256")
+    .update(`${salt}\0${namespace}\0${String(value ?? "")}`)
+    .digest("hex").slice(0, 32);
+}
+
 function iso(value, fallback = from) {
   const parsed = new Date(value || fallback);
   return Number.isNaN(parsed.getTime()) ? fallback : parsed.toISOString();
@@ -36,6 +42,53 @@ function actionCount(rows, key = "action") {
     counts[value] = (counts[value] || 0) + 1;
   }
   return Object.fromEntries(Object.entries(counts).sort(([left], [right]) => left.localeCompare(right)));
+}
+
+function driverJobDetails(row = {}) {
+  return row.job_details && typeof row.job_details === "object" ? row.job_details : {};
+}
+
+function sanitizedDriverTravelDetails(row = {}) {
+  const details = driverJobDetails(row);
+  return {
+    ...(details.fromStopId || details.from_stop_id ? {
+      fromStopId: pseudonym("STOP", details.fromStopId || details.from_stop_id)
+    } : {}),
+    ...(details.toStopId || details.to_stop_id ? {
+      toStopId: pseudonym("STOP", details.toStopId || details.to_stop_id)
+    } : {})
+  };
+}
+
+function capturedDriverActivity(row = {}) {
+  return {
+    planId: pseudonym("PLAN", row.plan_id),
+    planDate: String(row.plan_date || "").slice(0, 10),
+    loadId: pseudonym("LOAD", row.load_id),
+    stopId: pseudonym("STOP", row.stop_id),
+    stopType: String(row.stop_type || "").toLowerCase(),
+    status: String(row.status || "").toLowerCase(),
+    orderRefs: (Array.isArray(row.order_refs) ? row.order_refs : [])
+      .map((ref) => pseudonym("ORDER", ref)),
+    jobDetails: sanitizedDriverTravelDetails(row)
+  };
+}
+
+function capturedDriverCorpusEntry(row = {}) {
+  const details = driverJobDetails(row);
+  const visitIdentity = Array.isArray(details.physicalVisitJobIds) && details.physicalVisitJobIds.length
+    ? [...details.physicalVisitJobIds].map(String).sort().join("|")
+    : String(row.job_id || row.id);
+  return {
+    sourceKey: digestKey("DRIVER_JOB", row.job_id || row.id),
+    visitKey: digestKey("DRIVER_VISIT", visitIdentity),
+    driverKey: digestKey("DRIVER", row.driver_login),
+    planDate: String(row.plan_date).slice(0, 10),
+    stopType: String(row.stop_type).toLowerCase(),
+    originalStatus: String(row.status || "").toLowerCase(),
+    orderRefCount: Array.isArray(row.order_refs) ? row.order_refs.length : 0,
+    requiredPhotos: Math.max(0, Number(details.requiredPhotos || 0))
+  };
 }
 
 const client = await pool.connect();
@@ -55,11 +108,19 @@ try {
   const snapshots = await client.query(
       `SELECT history.id, history.plan_id, history.plan_date::text, history.revision,
               history.archive_reason, history.archived_at,
+              history.orders, history.trucks, history.summary,
               plan.status
          FROM dispatch_plan_snapshot_history history
          JOIN dispatch_plans plan ON plan.id = history.plan_id
         WHERE history.archived_at >= $1::timestamptz AND history.archived_at < $2::timestamptz
         ORDER BY history.archived_at, history.id`, params);
+  const currentSnapshots = await client.query(
+      `SELECT snapshot.plan_id, plan.plan_date::text, plan.revision, plan.status,
+              snapshot.orders, snapshot.trucks, snapshot.summary, snapshot.saved_at
+         FROM dispatch_plan_snapshots snapshot
+         JOIN dispatch_plans plan ON plan.id = snapshot.plan_id
+        WHERE snapshot.saved_at >= $1::timestamptz AND snapshot.saved_at < $2::timestamptz
+        ORDER BY snapshot.saved_at, snapshot.plan_id`, params);
   const audits = await client.query(
       `SELECT id, action, source, plan_id, created_at,
               before_state IS NOT NULL AS has_before,
@@ -91,7 +152,9 @@ try {
         WHERE server_received_at >= $1::timestamptz AND server_received_at < $2::timestamptz
         ORDER BY server_received_at, id`, params);
   const driverJobs = await client.query(
-      `SELECT id, status, stop_type, device_occurred_at,
+      `SELECT id, job_id, plan_id, plan_date::text, driver_login,
+              load_id, stop_id, status, stop_type, order_refs, job_details,
+              device_occurred_at,
               COALESCE(server_applied_at, completed_at, started_at, created_at) AS event_at,
               source_offline_event_id IS NOT NULL AS offline_source
          FROM driver_job_records
@@ -119,6 +182,15 @@ try {
 
   const events = [];
   for (const row of snapshots.rows) {
+    const rawPlan = {
+      id: row.plan_id,
+      planDate: row.plan_date,
+      status: row.status,
+      revision: row.revision,
+      orders: row.orders || [],
+      trucks: row.trucks || [],
+      summary: row.summary || {}
+    };
     events.push({
       stream: "dispatch",
       id: eventId("dispatch", "snapshot_history", row.id),
@@ -127,7 +199,27 @@ try {
       action: row.archive_reason,
       before: { archived: true },
       after: { revision: Number(row.revision || 0) },
-      candidateOnly: row.archive_reason === "save_recovery"
+      candidateOnly: row.archive_reason === "save_recovery",
+      planState: sanitizeDispatchReplayPlan(rawPlan, { salt })
+    });
+  }
+  for (const row of currentSnapshots.rows) {
+    events.push({
+      stream: "dispatch",
+      id: eventId("dispatch", "current_snapshot", row.plan_id),
+      serverAt: iso(row.saved_at),
+      sourceSequence: Number(row.plan_id),
+      action: "current_snapshot",
+      after: { revision: Number(row.revision || 0) },
+      planState: sanitizeDispatchReplayPlan({
+        id: row.plan_id,
+        planDate: row.plan_date,
+        status: row.status,
+        revision: row.revision,
+        orders: row.orders || [],
+        trucks: row.trucks || [],
+        summary: row.summary || {}
+      }, { salt })
     });
   }
   for (const row of commands.rows) {
@@ -214,6 +306,17 @@ try {
     });
   }
   for (const row of driverJobs.rows) {
+    const jobDetails = row.job_details && typeof row.job_details === "object" ? row.job_details : {};
+    const sanitizedOrderRefs = (Array.isArray(row.order_refs) ? row.order_refs : [])
+      .map((ref) => pseudonym("ORDER", ref));
+    const sanitizedJobDetails = {
+      ...(jobDetails.fromStopId || jobDetails.from_stop_id ? {
+        fromStopId: pseudonym("STOP", jobDetails.fromStopId || jobDetails.from_stop_id)
+      } : {}),
+      ...(jobDetails.toStopId || jobDetails.to_stop_id ? {
+        toStopId: pseudonym("STOP", jobDetails.toStopId || jobDetails.to_stop_id)
+      } : {})
+    };
     events.push({
       stream: "driver",
       id: eventId("driver", "job", row.id),
@@ -222,7 +325,16 @@ try {
       sourceSequence: Number(row.id),
       action: `driver_job_${row.status}`,
       before: { materialized: false },
-      after: { status: row.status, stopType: row.stop_type, offlineSource: row.offline_source === true }
+      after: {
+        status: row.status,
+        stopType: row.stop_type,
+        offlineSource: row.offline_source === true,
+        planId: pseudonym("PLAN", row.plan_id),
+        loadId: pseudonym("LOAD", row.load_id),
+        stopId: pseudonym("STOP", row.stop_id),
+        orderRefCount: sanitizedOrderRefs.length,
+        jobDetails: sanitizedJobDetails
+      }
     });
   }
   for (const row of completions.rows) {
@@ -253,6 +365,7 @@ try {
   const sourceCounts = {
     dispatch_plan_commands: commands.rowCount,
     dispatch_plan_snapshot_history: snapshots.rowCount,
+    dispatch_plan_snapshots: currentSnapshots.rowCount,
     dispatch_audit_log: audits.rowCount,
     scm_netsuite_po_history_changes: scmChanges.rowCount,
     scm_reconciliation_audit_events: scmEvents.rowCount,
@@ -275,6 +388,20 @@ try {
     });
   }
 
+  const driverActivity = driverJobs.rows.map(capturedDriverActivity);
+  const supportedDriverRows = driverJobs.rows.filter((row) =>
+    ["pickup", "dropoff", "travel"].includes(String(row.stop_type || "").toLowerCase())
+    && row.plan_date
+  );
+  const driverCorpus = supportedDriverRows.map(capturedDriverCorpusEntry);
+  const visitSizes = new Map();
+  for (const entry of driverCorpus) {
+    visitSizes.set(entry.visitKey, Number(visitSizes.get(entry.visitKey) || 0) + 1);
+  }
+  for (const entry of driverCorpus) {
+    entry.declaredVisitSize = visitSizes.get(entry.visitKey);
+  }
+
   capture = {
     schemaVersion: 1,
     capturedAt: new Date().toISOString(),
@@ -294,6 +421,8 @@ try {
       netsuiteDerived: actionCount(scmEvents.rows),
       driverOffline: actionCount(offlineEvents.rows, "event_type")
     },
+    driverActivity,
+    driverCorpus,
     events
   };
   await client.query("COMMIT");

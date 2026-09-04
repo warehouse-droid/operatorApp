@@ -494,6 +494,7 @@ function mappedOrderLine(line) {
         ? line.sourceLineAliases.map(text).filter(Boolean)
         : [lineKey],
       orderLine: line.orderLine,
+      lineSequenceNumber: line.lineSequenceNumber,
       orderLineAliases: Array.isArray(line.orderLineAliases)
         ? line.orderLineAliases.map(text).filter(Boolean)
         : [text(line.orderLine)].filter(Boolean),

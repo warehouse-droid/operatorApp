@@ -20,13 +20,13 @@ const MUTANTS = Object.freeze([
   {
     name: "PO Schedule ignores canonical Driver completion",
     target: "src/dispatch-repository.js",
-    from: "     AND dispatch_completion.dispatch_completion_status = 'completed'",
-    to: "     AND dispatch_completion.dispatch_completion_status = 'disabled-by-mutant'"
+    from: "       WHERE completion.dispatch_completion_status = 'completed'",
+    to: "       WHERE completion.dispatch_completion_status = 'disabled-by-mutant'"
   },
   {
     name: "PO Schedule completion contaminates sibling split references",
     target: "src/dispatch-repository.js",
-    from: "     AND lower(btrim(dispatch_completion.order_ref)) = lower(btrim(b.order_ref))",
+    from: "     AND dispatch_completion.order_key = lower(btrim(b.order_ref))",
     to: "     AND true"
   },
   {
@@ -36,16 +36,16 @@ const MUTANTS = Object.freeze([
     to: "        WHEN false\n          THEN 'Completed'"
   },
   {
-    name: "PO Schedule lets a reconciliation review override Driver completion",
+    name: "PO Schedule lets a reconciliation review override universal completion",
     target: "src/dispatch-repository.js",
-    from: "        WHEN dispatch_completion.completion_evidence_type = 'driver_job'\n          THEN 'Completed'",
-    to: "        WHEN false\n          THEN 'Completed'"
+    from: "        WHEN dispatch_completion.completion_event_id IS NOT NULL\n          THEN 'Completed'",
+    to: "        WHEN dispatch_completion.completion_event_id IS NOT NULL\n          AND NOT (COALESCE(s.reconciliation_blocked, false)\n            OR reconciliation_projection.reconciliation_status = 'review')\n          THEN 'Completed'"
   },
   {
-    name: "reconciliation enrichment lets review override Driver completion",
+    name: "reconciliation enrichment lets review override universal completion",
     target: "src/scm-reconciliation-repository.js",
-    from: "    const driverCompleted = text(row.dispatchCompletionEvidenceType).toLowerCase() === \"driver_job\";",
-    to: "    const driverCompleted = false;"
+    from: "    const locallyCompleted = Boolean(text(row.dispatchCompletionEvidenceType));",
+    to: "    const locallyCompleted = false;"
   },
   {
     name: "active split ref no longer fills a blank packing slip",
@@ -56,14 +56,14 @@ const MUTANTS = Object.freeze([
   {
     name: "stale revisions bypass the atomic upsert predicate",
     target: "src/dispatch-repository.js",
-    from: "     WHERE NOT $20::boolean\n        OR (",
-    to: "     WHERE $20::boolean IS NOT NULL\n        OR ("
+    from: "     WHERE NOT $21::boolean\n        OR (",
+    to: "     WHERE $21::boolean IS NOT NULL\n        OR ("
   },
   {
     name: "successful saves keep the old revision token",
     target: "src/dispatch-repository.js",
-    from: "       notes = EXCLUDED.notes,\n       updated_by = EXCLUDED.updated_by,\n       updated_at = GREATEST(clock_timestamp(), scm_transport_schedule.updated_at + interval '1 microsecond')",
-    to: "       notes = EXCLUDED.notes,\n       updated_by = EXCLUDED.updated_by,\n       updated_at = scm_transport_schedule.updated_at"
+    from: "       notes = EXCLUDED.notes,\n       remark_override = EXCLUDED.remark_override,\n       updated_by = EXCLUDED.updated_by,\n       updated_at = GREATEST(clock_timestamp(), scm_transport_schedule.updated_at + interval '1 microsecond')",
+    to: "       notes = EXCLUDED.notes,\n       remark_override = EXCLUDED.remark_override,\n       updated_by = EXCLUDED.updated_by,\n       updated_at = scm_transport_schedule.updated_at"
   },
   {
     name: "split identity overrides a genuinely entered packing slip",
@@ -74,7 +74,7 @@ const MUTANTS = Object.freeze([
   {
     name: "HTTP mutations stop requiring a loaded schedule revision",
     target: "src/server.js",
-    occurrences: 3,
+    occurrences: 4,
     from: "expectedUpdatedAt: requiredScmScheduleRevision(req.body || {})",
     to: "expectedUpdatedAt: undefined"
   },
@@ -93,12 +93,14 @@ const MUTANTS = Object.freeze([
   {
     name: "PO TO Schedule submits an absence token instead of its loaded revision",
     target: "public/scm-schedule.js",
+    occurrences: 2,
     from: "    expectedUpdatedAt: row?.updatedAt || null",
     to: "    expectedUpdatedAt: null"
   },
   {
     name: "PO TO Schedule leaves row editors active during save",
     target: "public/scm-schedule.js",
+    occurrences: 2,
     from: "    setScmScheduleRowControlsDisabled(rowId, true);",
     to: "    setScmScheduleRowControlsDisabled(rowId, false);"
   }

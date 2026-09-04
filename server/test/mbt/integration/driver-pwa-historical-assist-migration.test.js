@@ -148,3 +148,81 @@ test("S19: ordinary Driver attribution stays unchanged and trigger writes roll b
   assert.equal((await query(`SELECT 1 FROM driver_job_records WHERE job_id = $1`, [rollbackJobId])).rowCount, 0);
   assert.equal((await query(`SELECT 1 FROM dispatch_order_completion_events WHERE completion_evidence_id = $1`, [rollbackJobId])).rowCount, 0);
 });
+
+test("S34: supplemental photo ledger is immutable and photo-only changes do not duplicate completion", async () => {
+  const suffix = crypto.randomUUID().slice(0, 8);
+  const jobId = `photo-addition-drop-${suffix}`;
+  const orderRef = `SO-PHOTO-ADDITION-${suffix}`;
+  const oldPhoto = `r2://driver/driver-dropoff-photo/${suffix}/old.jpg`;
+  const newPhoto = `r2://dispatch-stop-evidence/driver-dropoff-photo/${suffix}/new.jpg`;
+  const record = await query(
+    `INSERT INTO driver_job_records (
+       job_id, plan_date, driver_login, stop_id, stop_type,
+       order_refs, photo_data_urls, status, started_at, completed_at, job_details
+     ) VALUES (
+       $1, '2026-08-19', 'photo-ledger-driver', 'drop-photo-ledger', 'dropoff',
+       $2::jsonb, $3::jsonb, 'complete',
+       '2026-08-19T15:00:00Z', '2026-08-19T15:05:00Z', $4::jsonb
+     ) RETURNING id`,
+    [
+      jobId,
+      JSON.stringify([orderRef]),
+      JSON.stringify([oldPhoto]),
+      JSON.stringify({ schemaVersion: 1, requiredPhotos: 2, physicalVisitJobIds: [jobId], orderTypes: ["SO"] })
+    ]
+  );
+  const eventId = crypto.randomUUID();
+  const requestId = crypto.randomUUID();
+  await query(
+    `INSERT INTO driver_job_photo_addition_events (
+       addition_event_id, request_id, actor_operator_id, actor_name,
+       driver_login, plan_date, primary_driver_job_record_id,
+       primary_job_id, physical_visit_record_ids, physical_visit_job_ids,
+       stop_type, photo_references, photo_descriptors, reason,
+       before_photo_count, after_photo_count, expected_state_hash, result
+     ) VALUES (
+       $1::uuid, $2::uuid, 'dispatch-photo-actor', 'Dispatch Photo Actor',
+       'photo-ledger-driver', '2026-08-19', $3,
+       $4, $5::jsonb, $6::jsonb,
+       'dropoff', $7::jsonb, $8::jsonb, 'Customer supplied additional delivery evidence.',
+       1, 2, $9, $10::jsonb
+     )`,
+    [
+      eventId,
+      requestId,
+      record.rows[0].id,
+      jobId,
+      JSON.stringify([Number(record.rows[0].id)]),
+      JSON.stringify([jobId]),
+      JSON.stringify([newPhoto]),
+      JSON.stringify([{ objectReference: newPhoto, ordinal: 1 }]),
+      "a".repeat(64),
+      JSON.stringify({ photoAdditionEventId: eventId, photoCount: 2 })
+    ]
+  );
+  const completionCountBefore = Number((await query(
+    `SELECT count(*)::int AS count
+       FROM dispatch_order_completion_events
+      WHERE completion_evidence_type = 'driver_job' AND completion_evidence_id = $1`,
+    [jobId]
+  )).rows[0].count);
+  await query(
+    `UPDATE driver_job_records SET photo_data_urls = $2::jsonb WHERE id = $1`,
+    [record.rows[0].id, JSON.stringify([oldPhoto, newPhoto])]
+  );
+  const completionCountAfter = Number((await query(
+    `SELECT count(*)::int AS count
+       FROM dispatch_order_completion_events
+      WHERE completion_evidence_type = 'driver_job' AND completion_evidence_id = $1`,
+    [jobId]
+  )).rows[0].count);
+  assert.equal(completionCountAfter, completionCountBefore);
+  await assert.rejects(
+    query(`UPDATE driver_job_photo_addition_events SET actor_name = 'Changed' WHERE request_id = $1::uuid`, [requestId]),
+    /immutable|append-only|cannot be modified|mutation/iu
+  );
+  await assert.rejects(
+    query(`DELETE FROM driver_job_photo_addition_events WHERE request_id = $1::uuid`, [requestId]),
+    /immutable|append-only|cannot be modified|mutation/iu
+  );
+});

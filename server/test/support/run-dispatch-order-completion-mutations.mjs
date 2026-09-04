@@ -50,6 +50,7 @@ const MUTANTS = Object.freeze([
   {
     name: "a missing route is priced as a zero-distance automatic route",
     target: "src/mbt/mbbs-billing-candidate-service.js",
+    occurrences: 2,
     from: "  if (stops.length < 2\n      || stops.some((stop) => !text(stop.addressText))\n      || !stops.some((stop) => text(stop.stopType).toLowerCase() === \"dropoff\")) {",
     to: "  if (false) {"
   },
@@ -70,6 +71,30 @@ const MUTANTS = Object.freeze([
     target: "src/server.js",
     from: "  return enrichDispatchOrdersWithCompletionStatus(searchedOrders);",
     to: "  return searchedOrders;"
+  },
+  {
+    name: "a completed direct pickup keeps its stale SCM transit presentation",
+    target: "src/dispatch-completion-repository.js",
+    from: "      ? { ...order.scm, status: \"Completed\" }",
+    to: "      ? { ...order.scm, status: order.scm.status }"
+  },
+  {
+    name: "the indexed global pool skips the read-time completion overlay",
+    target: "src/dispatch-order-catalog-repository.js",
+    from: "    overlayDispatchOrderCompletionStatuses(\n      page.map((row) => ({ ...row.card, ...assignmentFields(row) }))\n    ),",
+    to: "    Promise.resolve(page.map((row) => ({ ...row.card, ...assignmentFields(row) }))),"
+  },
+  {
+    name: "targeted catalog hydration resurrects a stale transit status",
+    target: "src/dispatch-order-catalog-repository.js",
+    from: "  return (await overlayDispatchOrderCompletionStatuses([order]))[0] || null;",
+    to: "  return order;"
+  },
+  {
+    name: "Dispatch renders a stale SCM chip beside canonical completion",
+    target: "public/dispatch.js",
+    from: "${!dispatchCompleted && order.scm?.status && order.scm.status !== \"Queued\"",
+    to: "${true && order.scm?.status && order.scm.status !== \"Queued\""
   },
   {
     name: "Dispatch keeps manual completion enabled after completion",

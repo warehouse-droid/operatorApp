@@ -1,6 +1,12 @@
 import crypto from "node:crypto";
 import { pool, query, withTransaction } from "./db.js";
 import { dispatchLoadAssignment } from "./dispatch-load-assignment.js";
+import { DISPATCH_FLEET_PLANNING_LOCK } from "./dispatch-fleet-status.js";
+import {
+  syncDispatchPlanOrderAssignments,
+  syncDispatchPlanRelationEdges
+} from "./dispatch-planner-v2-repository.js";
+import { digestDispatchPlan } from "./dispatch-planner-performance.js";
 import { isNetSuiteSandboxEnvironment } from "./config.js";
 import {
   createPurchaseOrderDispatchEnricher,
@@ -27,6 +33,10 @@ import {
   adjustBlanketSplitAllocation,
   assertSplitQuantityAvailable
 } from "./scm-po-split-adjustment.js";
+import {
+  isUnchangedScmPoPickup,
+  scmPoPickupNeedsNetSuiteAddressLookup
+} from "./scm-po-pickup-save-policy.js";
 import {
   isRemarkOnlyScmSchedulePatch,
   normalizeScmScheduleRemarkOverride,
@@ -896,39 +906,67 @@ export async function listDispatchOrders({
           OR netsuite_id IN (SELECT order_id FROM exact_to_ids)
         )
     ),
+    po_split_child_line_sequence AS (
+      SELECT DISTINCT ON (ledger.split_line_id)
+             ledger.split_line_id,
+             COALESCE(
+               NULLIF(source.raw->>'lineSequenceNumber', ''),
+               NULLIF(source.raw->>'line_sequence_number', ''),
+               NULLIF(source.raw->>'netSuiteLineSequence', '')
+             ) AS netsuite_line_sequence
+        FROM dispatch_scm_po_split_lines ledger
+        JOIN dispatch_scm_po_splits header
+          ON header.id = ledger.split_id
+         AND header.status = 'active'
+        JOIN purchase_order_lines source ON source.id = ledger.source_line_id
+       ORDER BY ledger.split_line_id, header.updated_at DESC, header.id DESC
+    ),
     receiving_line_source AS (
       SELECT
-        purchase_order_id AS order_id,
-        id,
-        line_id,
-        item_id,
-        item_name,
-        sku,
-        item_description,
-        quantity,
-        unit,
-        item_weight,
-        pallet_qty,
-        layer_qty,
-        section_qty,
-        piece_qty,
-        netsuite_received_qty,
-        netsuite_received_baseline_qty,
-        to_plt,
-        to_lyr,
-        to_sec,
-        to_pcs,
-        location_id,
-        location,
-        netsuite_active
-      FROM purchase_order_lines
+        po_line.purchase_order_id AS order_id,
+        po_line.id,
+        po_line.line_id,
+        COALESCE(
+          NULLIF(po_line.raw->>'lineSequenceNumber', ''),
+          NULLIF(po_line.raw->>'line_sequence_number', ''),
+          NULLIF(po_line.raw->>'netSuiteLineSequence', ''),
+          child_sequence.netsuite_line_sequence
+        ) AS netsuite_line_sequence,
+        po_line.item_id,
+        po_line.item_name,
+        po_line.sku,
+        po_line.item_description,
+        po_line.quantity,
+        po_line.unit,
+        po_line.item_weight,
+        po_line.pallet_qty,
+        po_line.layer_qty,
+        po_line.section_qty,
+        po_line.piece_qty,
+        po_line.netsuite_received_qty,
+        po_line.netsuite_received_baseline_qty,
+        po_line.to_plt,
+        po_line.to_lyr,
+        po_line.to_sec,
+        po_line.to_pcs,
+        po_line.location_id,
+        po_line.location,
+        po_line.netsuite_active
+      FROM purchase_order_lines po_line
+      LEFT JOIN po_split_child_line_sequence child_sequence
+        ON child_sequence.split_line_id = po_line.id
       WHERE cardinality($8::text[]) = 0
-         OR purchase_order_id IN (SELECT order_id FROM exact_po_ids)
+         OR po_line.purchase_order_id IN (SELECT order_id FROM exact_po_ids)
       UNION ALL
       SELECT
         transfer_order_id AS order_id,
         id,
         line_id,
+        COALESCE(
+          NULLIF(raw->>'lineSequenceNumber', ''),
+          NULLIF(raw->>'line_sequence_number', ''),
+          NULLIF(raw->>'netSuiteLineSequence', '')
+        ) AS netsuite_line_sequence,
         item_id,
         item_name,
         sku,
@@ -1187,6 +1225,7 @@ export async function listDispatchOrders({
         jsonb_agg(jsonb_build_object(
           'lineRowId', l.id,
           'lineId', l.line_id,
+          'netSuiteLineSequence', l.netsuite_line_sequence,
           'itemId', l.item_id,
           'destinationLocationId', COALESCE(
             ${scmScheduleDestinationLocationIdSql("scm.dropoff_point")},
@@ -1225,7 +1264,15 @@ export async function listDispatchOrders({
           'toLyr', l.to_lyr,
           'toSec', l.to_sec,
           'toPcs', l.to_pcs
-        ) ORDER BY l.line_id NULLS LAST, l.id) FILTER (WHERE l.id IS NOT NULL) AS items
+        ) ORDER BY
+          CASE
+            WHEN l.netsuite_line_sequence ~ '^[0-9]+([.][0-9]+)?$'
+              AND l.netsuite_line_sequence::numeric > 0
+            THEN l.netsuite_line_sequence::numeric
+            ELSE NULL
+          END NULLS LAST,
+          l.line_id NULLS LAST,
+          l.id) FILTER (WHERE l.id IS NOT NULL) AS items
       FROM receiving_order_source o
       LEFT JOIN scm_transport_schedule scm
         ON scm.order_kind = CASE WHEN o.order_type = 'transfer_order' THEN 'TO' ELSE 'PO' END
@@ -1254,6 +1301,21 @@ export async function listDispatchOrders({
           $1::boolean
           OR LOWER(BTRIM(COALESCE(scm.status, o.initial_scm_status, 'Hold'))) NOT IN (
             'hold', 'complete', 'completed', 'cancelled', 'canceled'
+          )
+          OR (
+            $7::boolean
+            AND o.order_type = 'purchase_order'
+            AND LOWER(BTRIM(COALESCE(scm.status, o.initial_scm_status, 'Hold'))) = 'hold'
+            AND EXISTS (
+              SELECT 1
+                FROM dispatch_scm_po_splits searchable_split
+               WHERE searchable_split.status = 'active'
+                 AND searchable_split.split_po_id = o.netsuite_id
+                 AND (
+                   searchable_split.source_po_ref ILIKE '%' || $3 || '%'
+                   OR searchable_split.split_po_ref ILIKE '%' || $3 || '%'
+                 )
+            )
           )
         )
         AND (
@@ -2097,6 +2159,46 @@ function positiveQuantity(value) {
   return Math.max(Number(value || 0) || 0, 0);
 }
 
+function purchaseOrderNetSuiteLineSequence(row = {}) {
+  const raw = row?.raw && typeof row.raw === "object" && !Array.isArray(row.raw)
+    ? row.raw
+    : {};
+  const value = Number(
+    row.netSuiteLineSequence
+    ?? row.netsuiteLineSequence
+    ?? row.lineSequenceNumber
+    ?? row.line_sequence_number
+    ?? raw.lineSequenceNumber
+    ?? raw.line_sequence_number
+    ?? raw.netSuiteLineSequence
+  );
+  return Number.isFinite(value) && value > 0 ? value : null;
+}
+
+function purchaseOrderNetSuiteOrderLine(row = {}) {
+  const raw = row?.raw && typeof row.raw === "object" && !Array.isArray(row.raw)
+    ? row.raw
+    : {};
+  const value = raw.orderLine ?? raw.order_line ?? raw.order_line_number;
+  const normalized = String(value ?? "").trim();
+  return normalized || null;
+}
+
+function comparePurchaseOrderNetSuiteLines(left = {}, right = {}) {
+  const leftSequence = purchaseOrderNetSuiteLineSequence(left);
+  const rightSequence = purchaseOrderNetSuiteLineSequence(right);
+  if (leftSequence !== null || rightSequence !== null) {
+    if (leftSequence === null) return 1;
+    if (rightSequence === null) return -1;
+    if (leftSequence !== rightSequence) return leftSequence - rightSequence;
+  }
+  return String(left.line_id ?? left.sourceLineId ?? left.id ?? "").localeCompare(
+    String(right.line_id ?? right.sourceLineId ?? right.id ?? ""),
+    undefined,
+    { numeric: true, sensitivity: "base" }
+  );
+}
+
 function hasConversion(row) {
   return positiveQuantity(row.to_plt) > 0
     || positiveQuantity(row.to_lyr) > 0
@@ -2331,13 +2433,19 @@ async function updateDispatchSnapshotsForRef(executor, { oldRef = "", newRef = "
   const ref = String(oldRef || "").trim();
   if (!ref) return { planIds: [] };
   const runQuery = typeof executor === "function" ? executor : executor.query.bind(executor);
+  await runQuery("SELECT pg_advisory_xact_lock(hashtext($1))", [DISPATCH_FLEET_PLANNING_LOCK]);
   const snapshots = await runQuery(
-    `SELECT plan_id, orders, trucks
-       FROM dispatch_plan_snapshots
-      WHERE orders::text LIKE $1 OR trucks::text LIKE $1`,
+    `SELECT snapshot.plan_id, plan.plan_date::text AS plan_date,
+            plan.status, plan.note, plan.revision,
+            snapshot.orders, snapshot.trucks, snapshot.summary
+       FROM dispatch_plan_snapshots snapshot
+       JOIN dispatch_plans plan ON plan.id = snapshot.plan_id
+      WHERE snapshot.orders::text LIKE $1 OR snapshot.trucks::text LIKE $1
+      ORDER BY snapshot.plan_id
+      FOR UPDATE OF plan, snapshot`,
     [`%"${ref.replaceAll('"', '\\"')}"%`]
   );
-  const changedPlanIds = [];
+  const changedPlans = [];
   for (const row of snapshots.rows) {
     const next = remove
       ? removeRefFromPlanArrays({ orders: row.orders || [], trucks: row.trucks || [] }, ref)
@@ -2345,26 +2453,44 @@ async function updateDispatchSnapshotsForRef(executor, { oldRef = "", newRef = "
           orders: replaceRefDeep(row.orders || [], ref, String(newRef || "").trim()),
           trucks: replaceRefDeep(row.trucks || [], ref, String(newRef || "").trim())
         };
+    const nextPlan = {
+      id: String(row.plan_id),
+      planDate: String(row.plan_date || "").slice(0, 10),
+      status: row.status || "draft",
+      note: row.note || "",
+      revision: Number(row.revision || 0) + 1,
+      orders: next.orders,
+      trucks: next.trucks,
+      summary: row.summary || {}
+    };
     await runQuery(
       `UPDATE dispatch_plan_snapshots
           SET orders = $2::jsonb,
               trucks = $3::jsonb,
+              plan_digest = $4,
               saved_at = now()
         WHERE plan_id = $1`,
-      [row.plan_id, JSON.stringify(next.orders), JSON.stringify(next.trucks)]
+      [row.plan_id, JSON.stringify(next.orders), JSON.stringify(next.trucks), digestDispatchPlan(nextPlan)]
     );
-    changedPlanIds.push(row.plan_id);
+    changedPlans.push(nextPlan);
   }
-  if (changedPlanIds.length) {
-    await runQuery(
+  if (changedPlans.length) {
+    const revisions = await runQuery(
       `UPDATE dispatch_plans
           SET revision = COALESCE(revision, 0) + 1,
               updated_at = now()
         WHERE id = ANY($1::bigint[])`,
-      [changedPlanIds]
+      [changedPlans.map((plan) => plan.id)]
     );
+    if (revisions.rowCount !== changedPlans.length) {
+      throw new Error("A Dispatch plan disappeared during the PO reference rewrite.");
+    }
+    for (const plan of changedPlans) {
+      await syncDispatchPlanOrderAssignments(plan, { execute: runQuery });
+      await syncDispatchPlanRelationEdges(plan, { execute: runQuery });
+    }
   }
-  return { planIds: changedPlanIds };
+  return { planIds: changedPlans.map((plan) => plan.id) };
 }
 
 export function scmPurchaseOrderListKind(order = {}) {
@@ -2428,10 +2554,11 @@ export async function listScmPurchaseOrders({
               )
               OR EXISTS (
                 SELECT 1 FROM scm_transport_schedule schedule
+                JOIN dispatch_plans schedule_plan
+                  ON schedule_plan.id = schedule.dispatch_plan_id
+                 AND schedule_plan.status <> 'cancelled'
                 WHERE schedule.order_kind = 'PO'
                   AND lower(schedule.order_ref) = lower(s.split_po_ref)
-                  AND (schedule.dispatch_plan_id IS NOT NULL
-                    OR lower(COALESCE(schedule.status, '')) IN ('planned', 'in transit', 'partially done', 'completed'))
               )
               OR EXISTS (
                 SELECT 1 FROM purchase_order_lines child_line
@@ -2832,10 +2959,11 @@ async function attachScmScheduleRouteOptions(rows = [], executor = query) {
                    OR lower(NULLIF(assignment.planned_order_ref, '')) = lower(split.split_po_ref))
              ) OR EXISTS (
                SELECT 1 FROM scm_transport_schedule schedule
+               JOIN dispatch_plans schedule_plan
+                 ON schedule_plan.id = schedule.dispatch_plan_id
+                AND schedule_plan.status <> 'cancelled'
                WHERE schedule.order_kind = 'PO'
                  AND lower(schedule.order_ref) = lower(split.split_po_ref)
-                 AND (schedule.dispatch_plan_id IS NOT NULL
-                   OR lower(COALESCE(schedule.status, '')) IN ('planned', 'in transit', 'partially done', 'completed'))
              ) OR EXISTS (
                SELECT 1 FROM purchase_order_lines child_line
                WHERE child_line.purchase_order_id = split.split_po_id
@@ -2870,8 +2998,74 @@ async function attachScmScheduleRouteOptions(rows = [], executor = query) {
       isScmSplit: Boolean(splitState),
       scmSplitRevision: splitState ? Number(splitState.revision || 1) : null,
       scmSplitLocked: splitState?.locked === true
-        || (Boolean(splitState) && ["Planned", "In Transit", "Partially Done", "Completed"].includes(row.status))
     };
+  });
+}
+
+async function isUnchangedScmPurchaseOrderPickup({
+  ref = "",
+  requestedPickup = "",
+  currentPickup = "",
+  groupRef = ""
+} = {}) {
+  const unchanged = isUnchangedScmPoPickup({ requestedPickup, currentPickup, groupRef });
+  if (unchanged || !scmPoPickupNeedsNetSuiteAddressLookup({ requestedPickup, currentPickup, groupRef })) {
+    return unchanged;
+  }
+
+  const result = await query(
+    `WITH matched_po AS MATERIALIZED (
+       SELECT po.netsuite_id,
+              po.vendor_id::text AS vendor_id,
+              po.vendor,
+              CASE
+                WHEN lower(COALESCE(po.tranid, '')) = lower($1) THEN 0
+                WHEN lower(COALESCE(po.dispatch_ref, '')) = lower($1) THEN 1
+                ELSE 2
+              END AS ref_rank
+         FROM purchase_orders po
+        WHERE po.netsuite_active = true
+          AND (
+            lower(COALESCE(po.tranid, '')) = lower($1)
+            OR lower(COALESCE(po.dispatch_ref, '')) = lower($1)
+            OR po.netsuite_id::text = $1
+          )
+        ORDER BY ref_rank, po.netsuite_id DESC
+        LIMIT 1
+     ),
+     canonical_mapping AS (
+       SELECT po.vendor,
+              COALESCE(
+                (SELECT NULLIF(mapping.local_vendor, '')
+                   FROM dispatch_vendor_mappings mapping
+                  WHERE mapping.active = true
+                    AND COALESCE(mapping.netsuite_vendor_id, '') <> ''
+                    AND COALESCE(mapping.local_vendor, '') <> ''
+                    AND mapping.netsuite_vendor_id = po.vendor_id
+                  ORDER BY mapping.last_seen_at DESC, mapping.id DESC
+                  LIMIT 1),
+                (SELECT NULLIF(mapping.local_vendor, '')
+                   FROM dispatch_vendor_mappings mapping
+                  WHERE mapping.active = true
+                    AND COALESCE(mapping.netsuite_vendor_name, '') <> ''
+                    AND COALESCE(mapping.local_vendor, '') <> ''
+                    AND lower(mapping.netsuite_vendor_name) = lower(po.vendor)
+                  ORDER BY mapping.last_seen_at DESC, mapping.id DESC
+                  LIMIT 1),
+                ''
+              ) AS local_vendor
+         FROM matched_po po
+     )
+     SELECT vendor
+       FROM canonical_mapping
+      WHERE local_vendor = $2`,
+    [String(ref || "").trim(), useNetSuiteAddressMappingValue()]
+  );
+  return isUnchangedScmPoPickup({
+    requestedPickup,
+    currentPickup,
+    groupRef,
+    netSuiteAddressVendor: result.rows[0]?.vendor
   });
 }
 
@@ -3761,6 +3955,32 @@ export async function listScmSchedule({
         )) IN ('complete', 'completed') THEN 'Completed'
         WHEN reconciliation_projection.reconciliation_status = 'pending'
           THEN operational_status.status
+        WHEN b.order_kind = 'PO'
+          AND NULLIF(BTRIM(b.split_ref), '') IS NOT NULL
+          AND NULLIF(BTRIM(COALESCE(
+            NULLIF(
+              CASE
+                WHEN reconciliation_projection.target_application_status = 'Reconcile Review'
+                  THEN reconciliation_projection.family_application_status
+                ELSE reconciliation_projection.target_application_status
+              END,
+              ''
+            ),
+            reconciliation_projection.family_application_status,
+            ''
+          )), '') IS NOT NULL
+          THEN COALESCE(
+            NULLIF(
+              CASE
+                WHEN reconciliation_projection.target_application_status = 'Reconcile Review'
+                  THEN reconciliation_projection.family_application_status
+                ELSE reconciliation_projection.target_application_status
+              END,
+              ''
+            ),
+            NULLIF(reconciliation_projection.family_application_status, ''),
+            operational_status.status
+          )
         WHEN s.id IS NOT NULL
           AND s.updated_at IS NOT NULL
           AND (
@@ -4111,12 +4331,22 @@ async function updateScmScheduleEntryTransaction({
     const selected = (route?.pickupOptions || []).find((yard) =>
       String(yard || "").trim().toLowerCase() === next.pickupPoint.toLowerCase());
     if (!selected) {
-      throw Object.assign(new Error(`Pickup yard ${next.pickupPoint} is not available for this PO vendor${route?.groupRef ? " group" : ""}.`), {
-        status: 400,
-        code: "SCM_PO_PICKUP_YARD_INVALID"
+      const unchanged = await isUnchangedScmPurchaseOrderPickup({
+        ref,
+        requestedPickup: next.pickupPoint,
+        currentPickup: current.pickup_point,
+        groupRef: route?.groupRef
       });
+      if (!unchanged) {
+        throw Object.assign(new Error(`Pickup yard ${next.pickupPoint} is not available for this PO vendor${route?.groupRef ? " group" : ""}.`), {
+          status: 400,
+          code: "SCM_PO_PICKUP_YARD_INVALID"
+        });
+      }
+      next.pickupPoint = String(current.pickup_point || "").trim();
+    } else {
+      next.pickupPoint = selected;
     }
-    next.pickupPoint = selected;
   }
   if (kind === "PO" && next.dropoffPoint) {
     const destinationLocationId = normalizeScmDestinationLocationId(next.dropoffPoint);
@@ -5707,10 +5937,11 @@ async function scmPurchaseOrderSplitOperationalConflicts(executor, split = {}) {
        EXISTS (
          SELECT 1
            FROM scm_transport_schedule schedule
+           JOIN dispatch_plans schedule_plan
+             ON schedule_plan.id = schedule.dispatch_plan_id
+            AND schedule_plan.status <> 'cancelled'
           WHERE schedule.order_kind = 'PO'
             AND lower(schedule.order_ref) = lower($1)
-            AND (schedule.dispatch_plan_id IS NOT NULL
-              OR lower(COALESCE(schedule.status, '')) IN ('planned', 'in transit', 'partially done', 'completed'))
        ) AS schedule_plan,
        EXISTS (
          SELECT 1
@@ -6257,7 +6488,7 @@ export async function updateScmPurchaseOrderSplitPickupYard({
         vendorYardInstructions(selected)
       ]
     );
-    await client.query(
+    const scheduleUpdate = await client.query(
       `INSERT INTO scm_transport_schedule (
          order_kind, order_ref, pickup_point, brand, updated_by, created_by
        ) VALUES ('PO', $1, $2, NULLIF($3, ''), $4, $4)
@@ -6265,7 +6496,9 @@ export async function updateScmPurchaseOrderSplitPickupYard({
          pickup_point = EXCLUDED.pickup_point,
          brand = COALESCE(scm_transport_schedule.brand, EXCLUDED.brand),
          updated_by = EXCLUDED.updated_by,
-         updated_at = now()`,
+         updated_at = GREATEST(clock_timestamp(), scm_transport_schedule.updated_at + interval '1 microsecond')
+       RETURNING updated_at,
+                 to_char(updated_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.US"Z"') AS concurrency_updated_at`,
       [split.split_po_ref, selected.yard || "", selected.vendor || "", updatedBy || null]
     );
     await client.query(
@@ -6302,6 +6535,7 @@ export async function updateScmPurchaseOrderSplitPickupYard({
       oldPickupPoint: previousPickup,
       pickupPoint: selected.yard || "",
       pickupAddress: selected.address || "",
+      scheduleUpdatedAt: scheduleUpdate.rows[0]?.concurrency_updated_at || scheduleUpdate.rows[0]?.updated_at || null,
       revision: change.revision
     };
   } catch (error) {
@@ -6482,7 +6716,7 @@ export async function getScmPurchaseOrderSplitSourceLines(splitPoRef = "") {
        LEFT JOIN blanket_unavailable ON blanket_unavailable.source_line_id = source.id
       WHERE source.purchase_order_id = $2
         AND (source.netsuite_active = true OR ledger.id IS NOT NULL)
-      ORDER BY lower(COALESCE(source.sku, source.item_name, '')), source.line_id NULLS LAST, source.id`,
+      ORDER BY source.line_id NULLS LAST, source.id`,
     [split.id, split.source_po_id]
   );
   const lines = lineResult.rows.map((row) => {
@@ -6501,6 +6735,8 @@ export async function getScmPurchaseOrderSplitSourceLines(splitPoRef = "") {
     ]));
     return {
       sourceLineId: Number(row.id),
+      lineId: row.line_id === null ? null : Number(row.line_id),
+      netSuiteLineSequence: purchaseOrderNetSuiteLineSequence(row),
       childLineId: row.split_line_id === null ? null : Number(row.split_line_id),
       ledgerId: row.ledger_id === null ? null : Number(row.ledger_id),
       itemId: Number(row.item_id || 0) || null,
@@ -6519,7 +6755,7 @@ export async function getScmPurchaseOrderSplitSourceLines(splitPoRef = "") {
       inSplit: active,
       canAdd: !active && hasRequestedSplitQuantity(maximum)
     };
-  });
+  }).sort(comparePurchaseOrderNetSuiteLines);
   return {
     split: {
       id: Number(split.id),
@@ -6913,6 +7149,12 @@ export async function updateScmPurchaseOrderSplitLines({
               sourcePoRef: split.source_po_ref,
               sourcePoId: split.source_po_id,
               sourceLineId: sourceLine.id,
+              ...(purchaseOrderNetSuiteOrderLine(sourceLine)
+                ? { orderLine: purchaseOrderNetSuiteOrderLine(sourceLine) }
+                : {}),
+              ...(purchaseOrderNetSuiteLineSequence(sourceLine) !== null
+                ? { lineSequenceNumber: purchaseOrderNetSuiteLineSequence(sourceLine) }
+                : {}),
               destinationLocationId: split.destination_location_id,
               manualAdjustment: true
             })]
@@ -7465,6 +7707,12 @@ export async function createScmPurchaseOrderSplit({
             sourcePoId: source.netsuite_id,
             sourceLineId: sourceLine.id,
             sourceLineKey: sourceLine.line_id,
+            ...(purchaseOrderNetSuiteOrderLine(sourceLine)
+              ? { orderLine: purchaseOrderNetSuiteOrderLine(sourceLine) }
+              : {}),
+            ...(purchaseOrderNetSuiteLineSequence(sourceLine) !== null
+              ? { lineSequenceNumber: purchaseOrderNetSuiteLineSequence(sourceLine) }
+              : {}),
             destinationLocationId: selection.destinationLocationId,
             destinationLocation: selection.destinationLocation,
             selected: qtys

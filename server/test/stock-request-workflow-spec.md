@@ -152,6 +152,24 @@ Feature: Sales requests regular stock from another authorized yard
     And an explicit re-print is required
     But partially fulfilled, pending-receipt, received, closed, or cancelled TOs cannot be revised
 
+  Scenario: SCM corrects the outbound route of an accepted local TO line
+    Given Sales requested multiple lines from 3445 to 150
+    And SCM converted them into a pristine local Pending TO
+    When SCM changes one line's outbound location to 12441
+    Then that line moves atomically into a separate 12441 to 150 local Pending TO
+    And the unchanged lines remain on the 3445 to 150 local Pending TO
+    And every reservation follows its line's corrected outbound location
+    And each route's official PALLET quantity is recalculated
+    But route changes are blocked after Confirm TO + Print creates or links a NetSuite TO
+
+  Scenario: SCM removes a line from an accepted local TO
+    Given SCM converted a stock-request line into a pristine local Pending TO
+    When SCM removes that line from the TO
+    Then its TO reservation is released atomically
+    And the line returns to the SCM Request queue instead of deleting Sales demand
+    And an empty local TO becomes Cancelled
+    And Sales sees the request under Pending when no accepted line remains
+
   Scenario: Webhooks reconcile linked stock transfers without regressing state
     Given a real TO is linked to a stock request
     When a newer NetSuite webhook reports fulfillment, receipt, cancellation, or quantities

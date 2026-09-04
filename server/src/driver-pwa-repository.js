@@ -4,6 +4,11 @@ import { writeDispatchAudit } from "./dispatch-audit-repository.js";
 import { DISPATCH_FLEET_PLANNING_LOCK } from "./dispatch-fleet-status.js";
 import { getDriverDayJobs } from "./driver-repository.js";
 import { supersedeDriverOfflineManifests } from "./driver-offline-repository.js";
+import {
+  DRIVER_COMPLETED_VISIT_MAX_PHOTOS,
+  retainedDriverPhotoRequirement,
+  uniqueDriverPhotoReferences
+} from "./driver-completed-photo-evidence.js";
 
 const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 const SHA256_PATTERN = /^[0-9a-f]{64}$/i;
@@ -220,16 +225,17 @@ function mappedStop(row, currentJob = null, validation = null, correction = null
 }
 
 async function driverDayBlockers(driverLogin, planDate) {
-  const [offline, rest, truckSwitch, foreground] = await Promise.all([
-    query(
+  // Reopen calls this inside a transaction-bound pg client. Keep the reads
+  // sequential so the same client never receives overlapping queries.
+  const offline = await query(
       `SELECT event_id, original_job_id, status
          FROM driver_offline_events
         WHERE lower(driver_login) = lower($1)
           AND plan_date = $2::date
           AND status = ANY($3::text[])`,
       [driverLogin, planDate, NONTERMINAL_OFFLINE_STATUSES]
-    ),
-    query(
+    );
+  const rest = await query(
       `SELECT COUNT(*)::int AS count
          FROM driver_rest_records
         WHERE lower(driver_login) = lower($1)
@@ -237,24 +243,23 @@ async function driverDayBlockers(driverLogin, planDate) {
           AND status = 'active'
           AND ended_at IS NULL`,
       [driverLogin, planDate]
-    ),
-    query(
+    );
+  const truckSwitch = await query(
       `SELECT COUNT(*)::int AS count
          FROM driver_truck_switch_records
         WHERE lower(driver_login) = lower($1)
           AND plan_date = $2::date
           AND status = 'attention'`,
       [driverLogin, planDate]
-    ),
-    query(
+    );
+  const foreground = await query(
       `SELECT COUNT(*)::int AS count
          FROM driver_foreground_action_receipts
         WHERE lower(driver_login) = lower($1)
           AND event_context->>'planDate' = $2
           AND status = 'executing'`,
       [driverLogin, planDate]
-    )
-  ]);
+    );
   return {
     nonterminalOfflineCount: offline.rows.length,
     nonterminalOfflineEvents: offline.rows.map((row) => ({
@@ -269,10 +274,8 @@ async function driverDayBlockers(driverLogin, planDate) {
 }
 
 async function currentDriverDayContext(driverLogin, planDate) {
-  const [route, blockers] = await Promise.all([
-    getDriverDayJobs(driverLogin, { date: planDate }),
-    driverDayBlockers(driverLogin, planDate)
-  ]);
+  const route = await getDriverDayJobs(driverLogin, { date: planDate });
+  const blockers = await driverDayBlockers(driverLogin, planDate);
   return { route, blockers };
 }
 
@@ -475,43 +478,128 @@ export async function reopenDriverPwaStop({
     const { route, blockers } = await currentDriverDayContext(row.driver_login, planDateValue(row.plan_date));
     const routeIndex = (route.jobs || []).findIndex((job) => String(job.jobId) === String(row.job_id));
     const currentJob = routeIndex >= 0 ? route.jobs[routeIndex] : null;
+    const physicalVisitJobIds = [...new Set((
+      Array.isArray(currentJob?.physicalVisitJobIds) && currentJob.physicalVisitJobIds.length
+        ? currentJob.physicalVisitJobIds
+        : Array.isArray(row.job_details?.physicalVisitJobIds) && row.job_details.physicalVisitJobIds.length
+          ? row.job_details.physicalVisitJobIds
+          : [row.job_id]
+    ).map(String).filter(Boolean))];
+    if (!physicalVisitJobIds.includes(String(row.job_id))) {
+      throw pwaError(
+        "This physical visit has an invalid member declaration. Refresh or repair it before reopening.",
+        409,
+        "DRIVER_PWA_PHYSICAL_VISIT_INVALID"
+      );
+    }
+    const routeJobById = new Map((route.jobs || []).map((job) => [String(job.jobId), job]));
+    const physicalVisitJobs = physicalVisitJobIds.map((jobId) => routeJobById.get(jobId)).filter(Boolean);
+    if (physicalVisitJobs.length !== physicalVisitJobIds.length) {
+      throw pwaError(
+        "This physical visit is no longer fully assigned to the Driver's confirmed route.",
+        409,
+        "DRIVER_PWA_STOP_NO_LONGER_ASSIGNED"
+      );
+    }
+    const lockedVisit = await query(
+      `SELECT *
+         FROM driver_job_records
+        WHERE job_id = ANY($1::text[])
+        ORDER BY job_id
+        FOR UPDATE`,
+      [physicalVisitJobIds]
+    );
+    if (lockedVisit.rowCount !== physicalVisitJobIds.length) {
+      throw pwaError(
+        "This physical visit does not have a complete set of Driver records.",
+        409,
+        "DRIVER_PWA_PHYSICAL_VISIT_INVALID"
+      );
+    }
+    const memberRowsByJobId = new Map(lockedVisit.rows.map((member) => [String(member.job_id), member]));
+    const memberRows = physicalVisitJobIds.map((jobId) => memberRowsByJobId.get(jobId));
+    const invalidMember = memberRows.find((member) =>
+      !member
+      || String(member.driver_login).toLowerCase() !== String(row.driver_login).toLowerCase()
+      || planDateValue(member.plan_date) !== planDateValue(row.plan_date)
+      || !RESTARTABLE_STOP_STATUSES.has(String(member.status || "").toLowerCase())
+    );
+    if (invalidMember) {
+      throw pwaError(
+        "Every member of the physical visit must be in progress or complete before it can be reopened together.",
+        409,
+        "DRIVER_PWA_PHYSICAL_VISIT_INVALID"
+      );
+    }
+    const physicalIndexes = physicalVisitJobIds
+      .map((jobId) => (route.jobs || []).findIndex((job) => String(job.jobId) === jobId))
+      .filter((index) => index >= 0);
+    const lastPhysicalIndex = Math.max(...physicalIndexes);
     const validation = validateDriverPwaStopReopen({
       record: recordEvidenceSnapshot(row),
       routeIndex,
-      laterJobs: routeIndex >= 0 ? route.jobs.slice(routeIndex + 1) : [],
+      laterJobs: routeIndex >= 0 ? route.jobs.slice(lastPhysicalIndex + 1) : [],
       targetNonterminalOfflineCount: blockers.nonterminalOfflineEvents.filter(
-        (event) => String(event.originalJobId) === String(row.job_id)
+        (event) => physicalVisitJobIds.includes(String(event.originalJobId))
       ).length,
       ...blockers
     });
     if (!validation.allowed) throw pwaError(validation.reason, 409, validation.code);
 
     const correctionId = crypto.randomUUID();
-    const wasInProgress = String(row.status || "").toLowerCase() === "in_progress";
+    const wasInProgress = memberRows.some((member) => String(member.status || "").toLowerCase() === "in_progress");
     const before = recordEvidenceSnapshot(row);
-    const replacementDetails = {
-      ...(currentJob || {}),
-      reopenedByCorrectionId: correctionId,
-      reopenedAt: new Date().toISOString()
-    };
-    const updated = await query(
-      `UPDATE driver_job_records
-          SET status = 'pending',
-              started_at = NULL,
-              completed_at = NULL,
-              photo_data_urls = '[]'::jsonb,
-              job_details = $2::jsonb,
-              source_offline_event_id = NULL,
-              device_occurred_at = NULL,
-              server_received_at = NULL,
-              server_applied_at = NULL,
-              location_status = NULL,
-              location_details = '{}'::jsonb
-        WHERE id = $1
-        RETURNING *`,
-      [id, JSON.stringify(replacementDetails)]
+    const beforeVisit = memberRows.map(recordEvidenceSnapshot);
+    const retainedPhotoReferences = uniqueDriverPhotoReferences(
+      memberRows.flatMap((member) => member.photo_data_urls || [])
     );
-    const after = recordEvidenceSnapshot(updated.rows[0]);
+    if (retainedPhotoReferences.length > DRIVER_COMPLETED_VISIT_MAX_PHOTOS) {
+      throw pwaError(
+        `This physical visit has more than ${DRIVER_COMPLETED_VISIT_MAX_PHOTOS} canonical photos and cannot be reopened safely.`,
+        409,
+        "DRIVER_COMPLETED_PHOTO_LIMIT"
+      );
+    }
+    const reopenedAt = new Date().toISOString();
+    const updatedRows = [];
+    for (const member of memberRows) {
+      const routeJob = routeJobById.get(String(member.job_id)) || {};
+      const requirement = retainedDriverPhotoRequirement({
+        configuredRequiredPhotos: routeJob.requiredPhotos,
+        retainedPhotos: retainedPhotoReferences,
+        minimumRequiredPhotos: routeJob?.mbt?.schemaVersion ? 0 : 2
+      });
+      const replacementDetails = {
+        ...routeJob,
+        retainedPhotoReferences,
+        retainedPhotoCount: requirement.retainedPhotoCount,
+        remainingRequiredPhotos: requirement.remainingRequiredPhotos,
+        maxPhotos: requirement.maxPhotos,
+        reopenedByCorrectionId: correctionId,
+        reopenedAt
+      };
+      const updated = await query(
+        `UPDATE driver_job_records
+            SET status = 'pending',
+                started_at = NULL,
+                completed_at = NULL,
+                photo_data_urls = $2::jsonb,
+                job_details = $3::jsonb,
+                source_offline_event_id = NULL,
+                device_occurred_at = NULL,
+                server_received_at = NULL,
+                server_applied_at = NULL,
+                location_status = NULL,
+                location_details = '{}'::jsonb
+          WHERE id = $1
+          RETURNING *`,
+        [member.id, JSON.stringify(retainedPhotoReferences), JSON.stringify(replacementDetails)]
+      );
+      updatedRows.push(updated.rows[0]);
+    }
+    const afterRow = updatedRows.find((member) => Number(member.id) === id);
+    const after = recordEvidenceSnapshot(afterRow);
+    const afterVisit = updatedRows.map(recordEvidenceSnapshot);
     await refreshLoadExecution(route, row);
     await supersedeDriverOfflineManifests({
       driverLogin: row.driver_login,
@@ -527,13 +615,13 @@ export async function reopenDriverPwaStop({
               updated_at = now()
         WHERE lower(driver_login) = lower($1)
           AND plan_date = $2::date
-          AND original_job_id = $3
+          AND original_job_id = ANY($3::text[])
           AND status = ANY($5::text[])
         RETURNING event_id`,
       [
         row.driver_login,
         planDateValue(row.plan_date),
-        row.job_id,
+        physicalVisitJobIds,
         JSON.stringify({
           supersededByDriverPwaCorrectionId: correctionId,
           disposition: "evidence_only",
@@ -546,7 +634,9 @@ export async function reopenDriverPwaStop({
       correctionId,
       action: "reopen",
       recordId: id,
+      recordIds: memberRows.map((member) => Number(member.id)),
       jobId: row.job_id,
+      physicalVisitJobIds,
       driverLogin: row.driver_login,
       planDate: planDateValue(row.plan_date),
       status: "pending",
@@ -580,13 +670,16 @@ export async function reopenDriverPwaStop({
       planDate: planDateValue(row.plan_date),
       operatorName: actor,
       source: "driver_pwa",
-      before,
-      after,
+      before: { physicalVisit: beforeVisit },
+      after: { physicalVisit: afterVisit },
       details: {
         correctionId,
         idempotencyId: idem,
         auditNote: note,
         previousStatus: row.status,
+        physicalVisitRecordIds: memberRows.map((member) => Number(member.id)),
+        physicalVisitJobIds,
+        retainedPhotoCount: retainedPhotoReferences.length,
         suppressedOfflineRecordCount: suppressed.rowCount
       }
     });

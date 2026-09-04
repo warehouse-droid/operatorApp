@@ -4,6 +4,7 @@ import test, { after, before } from "node:test";
 
 import { createOperator } from "../../../src/auth-repository.js";
 import { closeDb, query } from "../../../src/db.js";
+import { getSalesPortalSettings, updateSalesPortalSettings } from "../../../src/sales-settings-repository.js";
 import { app } from "../../../src/server.js";
 
 const RUN_ID = crypto.randomUUID().replaceAll("-", "");
@@ -17,6 +18,7 @@ const USERS = Object.freeze({
 let server;
 let baseUrl;
 let originalGate;
+let originalPublicSalesEnabled;
 const tokens = new Map();
 
 async function request(path, { token, method = "GET", body } = {}) {
@@ -38,6 +40,8 @@ async function login(username) {
 }
 
 before(async () => {
+  originalPublicSalesEnabled = (await getSalesPortalSettings({ fresh: true })).enabled;
+  await updateSalesPortalSettings({ enabled: false }, null);
   originalGate = (await query(
     "SELECT enabled, revision FROM mbt_feature_flags WHERE flag_key = 'special_stock_request_workflow'"
   )).rows[0];
@@ -85,6 +89,9 @@ after(async () => {
   }
   if (server) {
     await new Promise((resolve) => server.close(resolve));
+  }
+  if (typeof originalPublicSalesEnabled === "boolean") {
+    await updateSalesPortalSettings({ enabled: originalPublicSalesEnabled }, null);
   }
   await closeDb();
 });

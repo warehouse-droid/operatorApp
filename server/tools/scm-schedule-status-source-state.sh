@@ -11,6 +11,7 @@ files=(
   public/scm-schedule.html
   public/scm-schedule.js
   src/dispatch-repository.js
+  src/scm-po-pickup-save-policy.js
   src/operator-camera-schedule-harness.js
   src/scm-po-split-filter-harness.js
   src/scm-reconciliation-ui-harness.js
@@ -19,16 +20,22 @@ files=(
   src/scm-status-precedence-mutation-harness.js
   src/scm-weight-schedule-harness.js
   src/server.js
+  test/scm-netsuite-address-pickup-evidence.md
+  test/scm-netsuite-address-pickup-spec.md
   test/dispatch/frontend/scm-po-split-ui.test.js
   test/dispatch/frontend/scm-schedule-status-save.test.js
+  test/dispatch/integration/scm-po-netsuite-address-pickup.red.test.js
+  test/dispatch/property/scm-po-pickup-save-policy.property.test.js
   test/mbt/integration/scm-po-split-ref-reuse.test.js
   test/mbt/infrastructure/p3-gauntlet-contract.test.js
   test/mbt/integration/scm-schedule-status-concurrency.test.js
   test/mbt/integration/scm-schedule-status-http.test.js
+  test/support/check-scm-netsuite-address-pickup-coverage.mjs
   test/support/check-scm-po-split-ui-coverage.mjs
   test/support/check-scm-schedule-status-coverage.mjs
   test/support/p3-mutation-manifest.mjs
   test/support/run-scm-po-split-ui-mutations.mjs
+  test/support/run-scm-netsuite-address-pickup-mutations.mjs
   test/support/run-scm-schedule-status-mutations.mjs
   tools/scm-po-split-ui-gauntlet.sh
   tools/scm-schedule-status-gauntlet.sh

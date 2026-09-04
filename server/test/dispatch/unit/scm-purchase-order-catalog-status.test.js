@@ -77,6 +77,33 @@ test("manual operational statuses survive a dispatch assignment", () => {
     "Planned"
   );
 });
+
+test("manual split authority is evaluated with its exact plan and reconciliation state", () => {
+  assert.equal(
+    effectiveScmPurchaseOrderCatalogStatus(
+      { isScmSplit: true, dispatchPlanned: false, scm: { status: "Queued" } },
+      evidence({
+        schedule_status: "Hold",
+        reconciliation_status: "ok",
+        reconciliation_application_status: "Completed"
+      })
+    ),
+    "Hold",
+    "an operator-controlled exact split status remains authoritative"
+  );
+  assert.equal(
+    effectiveScmPurchaseOrderCatalogStatus(
+      { isScmSplit: true, dispatchPlanned: true, scm: { status: "Queued" } },
+      evidence({
+        schedule_status: "Planned",
+        reconciliation_status: "ok",
+        reconciliation_application_status: "Queued"
+      })
+    ),
+    "Planned",
+    "an exact active assignment may preserve Planned"
+  );
+});
 test("Driver completion evidence is monotonic over every other status source", () => {
   assert.equal(
     effectiveScmPurchaseOrderCatalogStatus(

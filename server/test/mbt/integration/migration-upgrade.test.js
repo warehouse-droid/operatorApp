@@ -419,9 +419,12 @@ test("F06/F16: schema-101 upgrade preserves representative legacy records and is
     assert.match(firstRunner.stdout, /Applied 190_dispatch_global_order_groups\.sql/);
     assert.match(firstRunner.stdout, /Applied 191_driver_completed_co_lifecycle\.sql/);
     assert.match(firstRunner.stdout, /Applied 192_dispatch_global_derived_orders\.sql/);
+    assert.match(firstRunner.stdout, /Applied 193_dispatch_assignment_projection_invariant\.sql/);
+    assert.match(firstRunner.stdout, /Applied 194_driver_completed_stop_photo_evidence\.sql/);
+    assert.match(firstRunner.stdout, /Applied 195_dispatch_load_assignment_projection_invariant\.sql/);
 
     const after = await captureLegacyState(client, ids);
-    assert.deepEqual(after, before, "Migrations 102-192 must not rewrite representative schema-101 field values.");
+    assert.deepEqual(after, before, "Migrations 102-195 must not rewrite representative schema-101 field values.");
 
     const repairedCos = await client.query(
       `SELECT local.co_ref, local.status, canonical.status AS canonical_status,
@@ -719,10 +722,10 @@ test("F06/F16: schema-101 upgrade preserves representative legacy records and is
       immutable_trigger: true
     }]);
 
-    assert.equal(receiptsBeforeNoOp.rowCount, 192);
+    assert.equal(receiptsBeforeNoOp.rowCount, 195);
     assert.equal(
       receiptsBeforeNoOp.rows.at(-1)?.filename,
-      "192_dispatch_global_derived_orders.sql"
+      "195_dispatch_load_assignment_projection_invariant.sql"
     );
     assert.deepEqual(
       receiptsBeforeNoOp.rows

@@ -43,11 +43,12 @@ test("SPSE-U1: SN1397956 inferred-only partial progress remains Planned", () => 
     "inferred quantities remain visible even though they cannot drive status");
 });
 
-test("SPSE-U2: 3022069120 cannot regress from Completed when inferred allocation moves", () => {
+test("SPSE-U2: authoritative local completion cannot regress when inferred allocation moves", () => {
   const actual = applySplitTargetEvidencePrecedence({
     targetKind: "po_split",
     previousStatus: "Completed",
     hasActivePlan: false,
+    hasAuthoritativeCompletion: true,
     evidencedReceivedQty: 0,
     evidencedFulfilledQty: 0,
     derivedState: state("Reconcile Review", {
@@ -75,16 +76,21 @@ test("SPSE-U3: exact or pinned progress above reconciliation tolerance may produ
   }
 });
 
-test("SPSE-U4: fully allocated inferred child retains Completed", () => {
+test("SPSE-U4: fully allocated inferred-only child without an assignment reopens Queued", () => {
   const derived = state("Completed");
   const actual = applySplitTargetEvidencePrecedence({
     targetKind: "po_split",
-    previousStatus: "Planned",
-    hasActivePlan: true,
+    previousStatus: "Completed",
+    hasActivePlan: false,
+    hasAuthoritativeCompletion: false,
     evidencedReceivedQty: 0,
     derivedState: derived
   });
-  assert.deepEqual(actual, derived);
+  assert.equal(actual.applicationStatus, "Queued");
+  assert.equal(actual.reconciliationStatus, "ok");
+  assert.equal(actual.reason, "");
+  assert.deepEqual(actual.quantities, derived.quantities,
+    "the inferred quantity remains diagnostic but cannot complete the child");
 });
 
 test("SPSE-U5: source residual and genuine lifecycle review behavior are unchanged", () => {
@@ -140,4 +146,36 @@ test("SPSE-U7: a saved local Completed status wins while nonterminal review rema
     reconciliationApplicationStatus: "Partially Done",
     blockingReview: true
   }), "Reconcile Review");
+});
+
+test("SPSE-U8: corrected 3022143273 completion loss becomes Queued, not review", () => {
+  const actual = applySplitTargetEvidencePrecedence({
+    targetKind: "po_split",
+    previousStatus: "Completed",
+    hasActivePlan: false,
+    hasAuthoritativeCompletion: false,
+    evidencedReceivedQty: 0,
+    evidencedFulfilledQty: 0,
+    derivedState: state("Reconcile Review", {
+      reconciliationStatus: "review",
+      reason: "A previously completed order lost destination receipt evidence."
+    })
+  });
+
+  assert.equal(actual.applicationStatus, "Queued");
+  assert.equal(actual.reconciliationStatus, "ok");
+  assert.equal(actual.reason, "");
+});
+
+test("SPSE-U9: an actual assignment permits Planned but not inferred completion", () => {
+  const actual = applySplitTargetEvidencePrecedence({
+    targetKind: "po_split",
+    previousStatus: "Partially Done",
+    hasActivePlan: true,
+    hasAuthoritativeCompletion: false,
+    evidencedReceivedQty: 0,
+    derivedState: state("Completed")
+  });
+
+  assert.equal(actual.applicationStatus, "Planned");
 });

@@ -338,7 +338,12 @@ test("DLR-05: the save path serializes the corrected positional fields", () => {
     ["fixed", "13:00"]
   ]);
   assert.equal(savedLoads[0].switchYard, "3445");
-  assert.match(functionBody("planPayload"), /trucks:\s*trucksWithTimingMetadata\(\)/u);
+  const payloadBody = functionBody("planPayload");
+  assert.match(
+    payloadBody,
+    /const payloadTrucks\s*=\s*withoutAuthoritativelyRetiredStops\(trucksWithTimingMetadata\(\)\)/u
+  );
+  assert.match(payloadBody, /trucks:\s*payloadTrucks/u);
   assert.match(functionBody("assignLoadFields"), /load\.switchYard\s*=\s*loadSwitchYard/u);
   assert.match(functionBody("trucksWithTimingMetadata"), /\.\.\.assignment[\s\S]*startMode/u);
 });

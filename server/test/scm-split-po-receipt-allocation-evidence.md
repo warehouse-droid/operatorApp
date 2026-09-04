@@ -59,3 +59,42 @@ The same read-only capacity audit found one genuine unresolved quantity in `POB0
 - Gauntlet exit code: 0.
 
 The gauntlet's project auto-teardown completed. All additional diagnostic test projects, networks, and the two disposable test image tags were then explicitly removed. The three production containers remained healthy. No deployment was performed.
+
+## 2026-09-01 POB03535 false-completion addendum
+
+Production showed that unfinished child `3022143273` had no exact receipt,
+Driver completion, or active dispatch assignment, but historical family IR had
+been inferred onto it as `2323.2 / 2323.2`. That inference incorrectly made the
+child `Completed`. The corrected allocator now gives historical inferred IR to
+operationally completed children first, conserves the valid remainder on the
+source parent, and never assigns inferred IR to an unfinished child that lacks
+completion authority. Exact later child evidence remains eligible.
+
+Final isolated verification after all 193 migrations:
+
+- Full allocation/status/repository/reconciliation/group/UI/authoritative-status
+  gate passed with exit code 0.
+- Allocation coverage: 100% statements, functions, and lines; 90.72% branches
+  (90% required).
+- Status-precedence coverage: 100% statements, functions, and lines; 97.29%
+  branches.
+- Mutation scores: allocation 11/11 killed; status precedence 10/10 killed.
+- Strict lint, TypeScript, changed-line secret scans, and source-integrity check
+  passed.
+- The production-shaped POB03658 lifecycle test passed through new split,
+  repeated parent quantity increases, assignment, Driver completion, exact
+  child receipt, whole-family completion, and idempotent replay without review.
+
+Production application:
+
+- Backup: `docker/backups/mbbs-before-split-po-queued-20260901T215547Z.dump`
+  (`c944e727168840b5c68cfb4cade58fa18ff43aad13ec2e495e2bc62c3aeac04c`).
+- Release image: `mbbs-operator-app:split-po-queued-20260901T215140Z`
+  (`sha256:c9bcec6f5a5f6a4c340fcee5ac659884b80f13d4ee3f8fc4c0da31b7c98d05fb`).
+- App/worker cutover: 2.20 seconds; database start time was unchanged; health
+  passed with zero restarts.
+- Driver HTML, JavaScript, and service-worker hashes were unchanged.
+- Two separate live POB03535 recalculation transactions returned identical
+  results: family received `84041.48`; source residual received `3499.2`;
+  `3022143273` ordered `2323.2`, received `0`, remaining `2323.2`, effective
+  status `Queued`, reconciliation `ok`, and zero open reviews.

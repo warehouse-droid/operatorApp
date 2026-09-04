@@ -1216,6 +1216,23 @@
   background: white;
 }
 
+.driver-photo-drop-zone {
+  border-style: dashed;
+  border-width: 2px;
+  transition: border-color 120ms ease, background-color 120ms ease, box-shadow 120ms ease;
+}
+
+.driver-photo-drop-zone:focus-visible {
+  outline: 3px solid rgba(0, 128, 109, 0.2);
+  outline-offset: 2px;
+}
+
+.driver-photo-drop-zone.drag-active {
+  border-color: var(--accent);
+  background: #e8f6f3;
+  box-shadow: 0 0 0 4px rgba(0, 128, 109, 0.12);
+}
+
 .historical-assist-section-head > div {
   display: grid;
   gap: 2px;
@@ -1297,6 +1314,163 @@
   color: white;
 }
 
+.driver-pwa-stop-toolbar {
+  flex-wrap: wrap;
+}
+
+.driver-pwa-stop-subtabs {
+  display: flex;
+  align-items: center;
+  gap: 5px;
+  flex-wrap: wrap;
+}
+
+.driver-pwa-completed-surface {
+  min-width: 0;
+  min-height: 0;
+  display: grid;
+  grid-template-rows: auto minmax(0, 1fr);
+  gap: 10px;
+  overflow: hidden;
+}
+
+.driver-pwa-completed-filters {
+  min-width: 0;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: var(--paper);
+  padding: 8px;
+  display: grid;
+  grid-template-columns: repeat(5, minmax(120px, 1fr)) minmax(210px, 1.7fr) auto;
+  align-items: end;
+  gap: 7px;
+}
+
+.driver-pwa-completed-filters label {
+  min-width: 0;
+  display: grid;
+  gap: 4px;
+  color: #34454e;
+  font-size: 10px;
+  font-weight: 900;
+}
+
+.driver-pwa-completed-filters select,
+.driver-pwa-completed-filters input {
+  width: 100%;
+  min-width: 0;
+  min-height: 34px;
+}
+
+.driver-pwa-completed-filter-actions {
+  display: flex;
+  gap: 5px;
+}
+
+.driver-pwa-completed-filter-actions button {
+  min-height: 34px;
+  padding: 0 9px;
+  white-space: nowrap;
+}
+
+.driver-pwa-completed-section-head h3,
+.driver-pwa-completed-section-head p,
+.driver-pwa-completed-append-blocked p {
+  margin: 0;
+}
+
+.driver-pwa-completed-section-head p,
+.driver-pwa-completed-append-blocked p {
+  margin-top: 3px;
+  color: var(--ink-soft);
+  font-size: 11px;
+  font-weight: 800;
+  line-height: 1.4;
+}
+
+.driver-pwa-completed-photo-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(190px, 1fr));
+  gap: 8px;
+}
+
+.driver-pwa-completed-photo-card {
+  min-width: 0;
+  border: 1px solid var(--line);
+  border-radius: 7px;
+  background: #f8fbfc;
+  padding: 8px;
+  display: grid;
+  gap: 7px;
+}
+
+.driver-pwa-completed-photo-card > div {
+  display: flex;
+  justify-content: space-between;
+  align-items: baseline;
+  gap: 6px;
+}
+
+.driver-pwa-completed-photo-card > div span,
+.driver-pwa-completed-photo-card dl {
+  color: var(--ink-soft);
+  font-size: 10px;
+  font-weight: 800;
+}
+
+.driver-pwa-completed-photo-card dl {
+  margin: 0;
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr);
+  gap: 3px 6px;
+}
+
+.driver-pwa-completed-photo-card dt,
+.driver-pwa-completed-photo-card dd {
+  min-width: 0;
+  margin: 0;
+  overflow-wrap: anywhere;
+}
+
+.driver-pwa-completed-photo-card dt {
+  color: #34454e;
+}
+
+.driver-pwa-completed-photo-card button {
+  min-height: 30px;
+  color: var(--accent);
+  font-size: 11px;
+  font-weight: 900;
+}
+
+.driver-pwa-completed-append {
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  padding: 10px;
+}
+
+.driver-pwa-completed-stale {
+  border: 1px solid #e0ae60;
+  border-radius: 7px;
+  background: #fff7e7;
+  color: #704000;
+  padding: 9px;
+  display: grid;
+  gap: 5px;
+  font-size: 12px;
+  font-weight: 800;
+  line-height: 1.4;
+}
+
+.driver-pwa-completed-stale button {
+  width: fit-content;
+  min-height: 32px;
+  border-color: #c2872d;
+  background: white;
+  color: #704000;
+  font-weight: 900;
+}
+
 @media (max-width: 1250px) {
   .offline-review-summary-grid {
     grid-template-columns: repeat(2, minmax(120px, 1fr));
@@ -1312,6 +1486,14 @@
 
   .historical-assist-time-grid {
     grid-template-columns: repeat(2, minmax(130px, 1fr));
+  }
+
+  .driver-pwa-completed-filters {
+    grid-template-columns: repeat(3, minmax(120px, 1fr));
+  }
+
+  .driver-pwa-completed-search {
+    grid-column: span 2;
   }
 }
 
@@ -1398,5 +1580,24 @@
 
   .historical-assist-time-grid {
     grid-template-columns: 1fr;
+  }
+
+  .driver-pwa-stop-subtabs,
+  .driver-pwa-stop-subtabs button,
+  .driver-pwa-completed-filter-actions,
+  .driver-pwa-completed-filter-actions button {
+    width: 100%;
+  }
+
+  .driver-pwa-completed-filters {
+    grid-template-columns: 1fr;
+  }
+
+  .driver-pwa-completed-search {
+    grid-column: auto;
+  }
+
+  .driver-pwa-completed-surface {
+    overflow: visible;
   }
 }

@@ -3,6 +3,7 @@ import crypto from "node:crypto";
 import test, { after, before } from "node:test";
 
 import { closeDb, query } from "../../../src/db.js";
+import { overlayDispatchOrderCompletionStatuses } from "../../../src/dispatch-completion-repository.js";
 import { replaceDispatchFleetSetup } from "../../../src/dispatch-setup-repository.js";
 import {
   DRIVER_PWA_CURRENT_VERSION,
@@ -41,6 +42,7 @@ let token;
 let planDate;
 let manifest;
 let pickupJob;
+let dropJob;
 
 async function request(path, { method = "GET", body, offlineGrant = "" } = {}) {
   const response = await fetch(`${baseUrl}${path}`, {
@@ -250,6 +252,10 @@ async function downloadRoute() {
   assert.equal(manifest.jobs[0].jobId, pickupJob.jobId, "TOB00870 must be the exact next route job.");
   assert.equal(pickupJob.jobId, `${PLAN_ID}:${TRUCK_ID}:${LOAD_ID}:${PICKUP_STOP_ID}`);
   assert.deepEqual(pickupJob.orderRefs, [TRANSFER_ORDER_REF]);
+  dropJob = manifest.jobs.find((job) =>
+    job.stopType === "dropoff" && (job.orderRefs || []).includes(SALES_ORDER_REF)
+  );
+  assert.ok(dropJob, "The isolated manifest did not contain the linked Sales Order customer drop.");
 }
 
 async function assertStartDidNotForgeOperatorProgress() {
@@ -308,9 +314,9 @@ async function assertCompletionAdvancedOnlyDriverDependency() {
   });
 }
 
-function offlineCompletionEvidence() {
+function offlineCompletionEvidence(label = "pickup") {
   return [0, 1].map((ordinal) => {
-    const bytes = Buffer.from(`TOB00870-isolated-evidence-${ordinal}`);
+    const bytes = Buffer.from(`TOB00870-isolated-${label}-evidence-${ordinal}`);
     return {
       photoId: crypto.randomUUID(),
       ordinal,
@@ -341,9 +347,9 @@ async function completeOnline() {
   assert.equal(completed.response.status, 200, JSON.stringify(completed.payload));
 }
 
-async function completeOffline() {
+async function completeOffline(job = pickupJob, clientSequence = 2, label = "pickup", includePhotos = true) {
   const completionEventId = crypto.randomUUID();
-  const photos = offlineCompletionEvidence();
+  const photos = includePhotos ? offlineCompletionEvidence(label) : [];
   const registered = await request("/api/driver/offline-sync", {
     method: "POST",
     offlineGrant: manifest.offlineSyncGrant,
@@ -355,11 +361,11 @@ async function completeOffline() {
         eventId: completionEventId,
         manifestId: manifest.manifestId,
         deviceId: DEVICE_ID,
-        clientSequence: 2,
+        clientSequence,
         eventType: "job_completed",
-        jobId: pickupJob.jobId,
-        jobFingerprint: pickupJob.fingerprint,
-        predecessorFingerprint: pickupJob.predecessorFingerprint,
+        jobId: job.jobId,
+        jobFingerprint: job.fingerprint,
+        predecessorFingerprint: job.predecessorFingerprint,
         occurredAt: new Date().toISOString(),
         locationStatus: "not_checked_offline",
         locationDetails: { warningCode: "", overrideReason: "" },
@@ -370,7 +376,11 @@ async function completeOffline() {
     }
   });
   assert.equal(registered.response.status, 200, JSON.stringify(registered.payload));
-  assert.equal(registered.payload.events?.[0]?.status, "waiting_photos", JSON.stringify(registered.payload));
+  assert.equal(
+    registered.payload.events?.[0]?.status,
+    photos.length ? "waiting_photos" : "applied",
+    JSON.stringify(registered.payload)
+  );
 
   const receipts = photos.map((photo) => ({
     photoId: photo.photoId,
@@ -392,18 +402,20 @@ async function completeOffline() {
       receipt: { provider: "isolated-readback-proof" }
     });
   }
-  const drained = await request("/api/driver/offline-sync", {
-    method: "POST",
-    offlineGrant: manifest.offlineSyncGrant,
-    body: {
-      manifestId: manifest.manifestId,
-      deviceId: DEVICE_ID,
-      offlineSyncGrant: manifest.offlineSyncGrant,
-      events: [],
-      photoReceipts: []
-    }
-  });
-  assert.equal(drained.response.status, 200, JSON.stringify(drained.payload));
+  if (receipts.length) {
+    const drained = await request("/api/driver/offline-sync", {
+      method: "POST",
+      offlineGrant: manifest.offlineSyncGrant,
+      body: {
+        manifestId: manifest.manifestId,
+        deviceId: DEVICE_ID,
+        offlineSyncGrant: manifest.offlineSyncGrant,
+        events: [],
+        photoReceipts: []
+      }
+    });
+    assert.equal(drained.response.status, 200, JSON.stringify(drained.payload));
+  }
   const completionEvent = await getDriverOfflineEvent(completionEventId);
   assert.equal(completionEvent?.status, "applied", JSON.stringify(completionEvent));
 }
@@ -545,4 +557,166 @@ test(`TOB00870 direct pickup starts in ${MODE} mode without operator loading`, a
   });
   assert.equal(replayed[0]?.alreadyCompleted, true);
   await assertCompletionAdvancedOnlyDriverDependency();
+});
+
+test(`TOB00870 customer drop in ${MODE} mode makes completion terminal over pickup transit`, async () => {
+  let refreshedRoute = await request(`/api/driver/day-plan?date=${planDate}&forceRefresh=1`);
+  assert.equal(refreshedRoute.response.status, 200, JSON.stringify(refreshedRoute.payload));
+  const travelJob = refreshedRoute.payload.jobs.find((job) =>
+    job.stopType === "travel" && job.status !== "complete"
+  );
+  assert.ok(travelJob, "The refreshed route did not retain travel to the customer drop.");
+  if (MODE === "online") {
+    const startedTravel = await request(`/api/driver/jobs/${encodeURIComponent(travelJob.jobId)}/start`, {
+      method: "POST",
+      body: {
+        eventId: crypto.randomUUID(),
+        manifestId: manifest.manifestId,
+        clientSequence: 3,
+        jobFingerprint: travelJob.fingerprint,
+        predecessorFingerprint: travelJob.predecessorFingerprint,
+        truckPlate: travelJob.truckPlate,
+        deviceOccurredAt: new Date().toISOString()
+      }
+    });
+    assert.equal(startedTravel.response.status, 200, JSON.stringify(startedTravel.payload));
+    await query(
+      "UPDATE driver_job_records SET started_at = now() - interval '11 seconds' WHERE job_id = $1",
+      [travelJob.jobId]
+    );
+    const completedTravel = await request(`/api/driver/jobs/${encodeURIComponent(travelJob.jobId)}/photos`, {
+      method: "POST",
+      body: { photoDataUrls: [], locationOverride: true, autoStartNext: false }
+    });
+    assert.equal(completedTravel.response.status, 200, JSON.stringify(completedTravel.payload));
+  } else {
+    const startedTravel = await request("/api/driver/offline-sync", {
+      method: "POST",
+      offlineGrant: manifest.offlineSyncGrant,
+      body: {
+        manifestId: manifest.manifestId,
+        deviceId: DEVICE_ID,
+        offlineSyncGrant: manifest.offlineSyncGrant,
+        events: [{
+          eventId: crypto.randomUUID(),
+          manifestId: manifest.manifestId,
+          deviceId: DEVICE_ID,
+          clientSequence: 3,
+          eventType: "job_started",
+          jobId: travelJob.jobId,
+          jobFingerprint: travelJob.fingerprint,
+          predecessorFingerprint: travelJob.predecessorFingerprint,
+          occurredAt: new Date().toISOString(),
+          locationStatus: "not_required",
+          locationDetails: { warningCode: "", overrideReason: "" },
+          details: {},
+          photos: []
+        }],
+        photoReceipts: []
+      }
+    });
+    assert.equal(startedTravel.response.status, 200, JSON.stringify(startedTravel.payload));
+    assert.equal(startedTravel.payload.events?.[0]?.status, "applied", JSON.stringify(startedTravel.payload));
+    await completeOffline(travelJob, 4, "travel", false);
+  }
+
+  refreshedRoute = await request(`/api/driver/day-plan?date=${planDate}&forceRefresh=1`);
+  assert.equal(refreshedRoute.response.status, 200, JSON.stringify(refreshedRoute.payload));
+  dropJob = refreshedRoute.payload.jobs.find((job) =>
+    job.stopType === "dropoff" && (job.orderRefs || []).includes(SALES_ORDER_REF)
+  );
+  assert.ok(dropJob, "The refreshed route did not retain the linked Sales Order customer drop.");
+  const eventId = crypto.randomUUID();
+  const occurredAt = new Date().toISOString();
+  if (MODE === "online") {
+    const started = await request(`/api/driver/jobs/${encodeURIComponent(dropJob.jobId)}/start`, {
+      method: "POST",
+      body: {
+        eventId,
+        manifestId: manifest.manifestId,
+        clientSequence: 5,
+        jobFingerprint: dropJob.fingerprint,
+        predecessorFingerprint: dropJob.predecessorFingerprint,
+        truckPlate: dropJob.truckPlate,
+        deviceOccurredAt: occurredAt
+      }
+    });
+    assert.equal(started.response.status, 200, JSON.stringify(started.payload));
+    await query(
+      "UPDATE driver_job_records SET started_at = now() - interval '11 seconds' WHERE job_id = $1",
+      [dropJob.jobId]
+    );
+    const completed = await request(`/api/driver/jobs/${encodeURIComponent(dropJob.jobId)}/photos`, {
+      method: "POST",
+      body: {
+        photoDataUrls: [
+          "data:image/jpeg;base64,/9j/2Q==",
+          "data:image/jpeg;base64,/9j/2Q=="
+        ],
+        locationOverride: true,
+        autoStartNext: false
+      }
+    });
+    assert.equal(completed.response.status, 200, JSON.stringify(completed.payload));
+  } else {
+    const started = await request("/api/driver/offline-sync", {
+      method: "POST",
+      offlineGrant: manifest.offlineSyncGrant,
+      body: {
+        manifestId: manifest.manifestId,
+        deviceId: DEVICE_ID,
+        offlineSyncGrant: manifest.offlineSyncGrant,
+        events: [{
+          eventId,
+          manifestId: manifest.manifestId,
+          deviceId: DEVICE_ID,
+          clientSequence: 5,
+          eventType: "job_started",
+          jobId: dropJob.jobId,
+          jobFingerprint: dropJob.fingerprint,
+          predecessorFingerprint: dropJob.predecessorFingerprint,
+          occurredAt,
+          locationStatus: "not_required",
+          locationDetails: { warningCode: "", overrideReason: "" },
+          details: {},
+          photos: []
+        }],
+        photoReceipts: []
+      }
+    });
+    assert.equal(started.response.status, 200, JSON.stringify(started.payload));
+    assert.equal(started.payload.events?.[0]?.status, "applied", JSON.stringify(started.payload));
+    await completeOffline(dropJob, 6, "drop");
+  }
+
+  const dependency = await query(
+    `SELECT status, direct_receipt_job_id
+       FROM order_dependencies
+      WHERE transfer_order_ref = $1`,
+    [TRANSFER_ORDER_REF]
+  );
+  assert.deepEqual(dependency.rows[0], {
+    status: "received_local",
+    direct_receipt_job_id: dropJob.jobId
+  });
+  const completion = await query(
+    `SELECT dispatch_completion_status, completion_evidence_type, completion_evidence_id
+       FROM dispatch_order_completion_status
+      WHERE order_kind = 'TO' AND lower(order_ref) = lower($1)`,
+    [TRANSFER_ORDER_REF]
+  );
+  assert.deepEqual(completion.rows[0], {
+    dispatch_completion_status: "completed",
+    completion_evidence_type: "direct_dependency",
+    completion_evidence_id: dropJob.jobId
+  });
+  const [projected] = await overlayDispatchOrderCompletionStatuses([{
+    id: TRANSFER_ORDER_REF,
+    type: "TO",
+    status: "In Transit",
+    scm: { status: "In Transit" }
+  }]);
+  assert.equal(projected.status, "In Transit");
+  assert.equal(projected.scm.status, "Completed");
+  assert.equal(projected.dispatchCompletionStatus, "completed");
 });

@@ -84,11 +84,12 @@ run_test npm run migrate
 echo "[scm-schedule-status] browser executable specification"
 run_test node --test --test-concurrency=1 \
   test/dispatch/frontend/scm-po-split-ui.test.js \
-  test/dispatch/frontend/scm-schedule-status-save.test.js
+  test/dispatch/frontend/scm-schedule-status-save.test.js \
+  test/dispatch/property/scm-po-pickup-save-policy.property.test.js
 
 echo "[scm-schedule-status] isolated repository, HTTP, and existing split lifecycle regressions"
 run_test node --input-type=module -e \
-  "import { runNodeTestFilesIsolated } from './test/support/test-database-isolation.mjs'; process.exitCode = await runNodeTestFilesIsolated(['test/mbt/integration/scm-schedule-status-concurrency.test.js','test/mbt/integration/scm-schedule-status-http.test.js','test/mbt/integration/scm-po-split-ref-reuse.test.js'], { label: 'SCM schedule-status gauntlet' });"
+  "import { runNodeTestFilesIsolated } from './test/support/test-database-isolation.mjs'; process.exitCode = await runNodeTestFilesIsolated(['test/mbt/integration/scm-schedule-status-concurrency.test.js','test/mbt/integration/scm-schedule-status-http.test.js','test/mbt/integration/scm-po-split-ref-reuse.test.js','test/dispatch/integration/scm-po-netsuite-address-pickup.red.test.js'], { label: 'SCM schedule-status gauntlet' });"
 
 echo "[scm-schedule-status] related schedule, visibility, and reference contracts"
 run_test npm run test:scm-schedule-row-refresh
@@ -109,22 +110,32 @@ run_test npm run test:mbt
 
 echo "[scm-schedule-status] syntax, types, and lint"
 run_test node --check src/dispatch-repository.js
+run_test node --check src/scm-po-pickup-save-policy.js
 run_test node --check src/server.js
 run_test node --check public/dispatch-scm.js
 run_test node --check public/scm-schedule.js
 run_test node --check test/mbt/integration/scm-schedule-status-concurrency.test.js
 run_test node --check test/mbt/integration/scm-schedule-status-http.test.js
+run_test node --check test/dispatch/integration/scm-po-netsuite-address-pickup.red.test.js
+run_test node --check test/dispatch/property/scm-po-pickup-save-policy.property.test.js
+run_test node --check test/support/check-scm-netsuite-address-pickup-coverage.mjs
 run_test node --check test/support/check-scm-schedule-status-coverage.mjs
+run_test node --check test/support/run-scm-netsuite-address-pickup-mutations.mjs
 run_test node --check test/support/run-scm-schedule-status-mutations.mjs
 run_test npm run syntax:legacy
 run_test npm run typecheck:mbt
 run_test npx eslint --config eslint.mbt.config.js --max-warnings=0 \
+  src/scm-po-pickup-save-policy.js \
   test/dispatch/frontend/scm-po-split-ui.test.js \
   test/dispatch/frontend/scm-schedule-status-save.test.js \
+  test/dispatch/integration/scm-po-netsuite-address-pickup.red.test.js \
+  test/dispatch/property/scm-po-pickup-save-policy.property.test.js \
   test/mbt/integration/scm-schedule-status-concurrency.test.js \
   test/mbt/integration/scm-schedule-status-http.test.js \
   test/mbt/infrastructure/p3-gauntlet-contract.test.js \
+  test/support/check-scm-netsuite-address-pickup-coverage.mjs \
   test/support/check-scm-schedule-status-coverage.mjs \
+  test/support/run-scm-netsuite-address-pickup-mutations.mjs \
   test/support/run-scm-schedule-status-mutations.mjs
 
 echo "[scm-schedule-status] PO Split UI changed-line and mutation gauntlet"
@@ -140,12 +151,15 @@ docker run --rm --network "${test_network}" \
   "${test_image}" \
   npx c8 --all=false --check-coverage=false \
     --include=src/dispatch-repository.js \
+    --include=src/scm-po-pickup-save-policy.js \
     --include=src/server.js \
     --temp-directory=/tmp/scm-schedule-status-c8 \
     --report-dir=/coverage \
     --reporter=text \
     --reporter=json \
     node --test --test-concurrency=1 \
+      test/dispatch/integration/scm-po-netsuite-address-pickup.red.test.js \
+      test/dispatch/property/scm-po-pickup-save-policy.property.test.js \
       test/mbt/integration/scm-schedule-status-concurrency.test.js \
       test/mbt/integration/scm-schedule-status-http.test.js
 docker run --rm --network "${test_network}" \
@@ -154,6 +168,12 @@ docker run --rm --network "${test_network}" \
   -v "${coverage_volume}:/coverage:ro" \
   "${test_image}" \
   node test/support/check-scm-schedule-status-coverage.mjs /coverage/coverage-final.json
+docker run --rm --network "${test_network}" \
+  "${docker_environment[@]}" \
+  "${docker_mounts[@]}" \
+  -v "${coverage_volume}:/coverage:ro" \
+  "${test_image}" \
+  node test/support/check-scm-netsuite-address-pickup-coverage.mjs /coverage/coverage-final.json
 
 echo "[scm-schedule-status] critical mutation set"
 docker run --rm --network "${test_network}" \
@@ -161,6 +181,11 @@ docker run --rm --network "${test_network}" \
   "${docker_mounts[@]}" \
   -e MBT_MUTATION_EPHEMERAL=1 \
   "${test_image}" npm run mutate:scm-schedule-status
+docker run --rm --network "${test_network}" \
+  "${docker_environment[@]}" \
+  "${docker_mounts[@]}" \
+  -e MBT_MUTATION_EPHEMERAL=1 \
+  "${test_image}" node test/support/run-scm-netsuite-address-pickup-mutations.mjs
 
 echo "[scm-schedule-status] dependency graph and secret boundaries"
 run_test npm ls --omit=dev --all
@@ -171,15 +196,22 @@ run_test node test/support/scan-diff-secrets.mjs \
   public/scm-schedule.html \
   public/scm-schedule.js \
   src/dispatch-repository.js \
+  src/scm-po-pickup-save-policy.js \
   src/scm-schedule-row-refresh-harness.js \
   src/scm-status-precedence-mutation-harness.js \
   src/server.js \
+  test/scm-netsuite-address-pickup-evidence.md \
+  test/scm-netsuite-address-pickup-spec.md \
   test/dispatch/frontend/scm-po-split-ui.test.js \
   test/dispatch/frontend/scm-schedule-status-save.test.js \
+  test/dispatch/integration/scm-po-netsuite-address-pickup.red.test.js \
+  test/dispatch/property/scm-po-pickup-save-policy.property.test.js \
   test/mbt/integration/scm-schedule-status-concurrency.test.js \
   test/mbt/integration/scm-schedule-status-http.test.js \
+  test/support/check-scm-netsuite-address-pickup-coverage.mjs \
   test/support/check-scm-schedule-status-coverage.mjs \
   test/support/p3-mutation-manifest.mjs \
+  test/support/run-scm-netsuite-address-pickup-mutations.mjs \
   test/support/run-scm-schedule-status-mutations.mjs \
   tools/scm-schedule-status-gauntlet.sh \
   tools/scm-schedule-status-source-state.sh

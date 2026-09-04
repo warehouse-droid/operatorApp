@@ -257,7 +257,7 @@ const durationHelpers = Function(
   "dropLocationForStop",
   "truckStopMinutes",
   "stopServiceType",
-  "pickupFootprintForLocation",
+  "pickupFootprintForStop",
   "loadContainingStop",
   "truckOwnYardFixedMinutes",
   "truckVendorFixedMinutes",

@@ -179,8 +179,8 @@ const MUTANTS = Object.freeze([
     target: "src/stock-request-repository.js",
     tests: [INTEGRATION],
     database: true,
-    from: "AND (\n           bucket_transfer.status <> 'cancelled'\n           OR bucket_transfer.netsuite_transfer_order_id IS NOT NULL\n         )",
-    to: "AND TRUE"
+    from: "} else if (requestedBucket === \"accepted\") {\n    clauses.push(`EXISTS (\n      SELECT 1 FROM sales_stock_transfers bucket_transfer\n       WHERE bucket_transfer.request_id = request.id\n         AND (\n           bucket_transfer.status <> 'cancelled'\n           OR bucket_transfer.netsuite_transfer_order_id IS NOT NULL\n         )",
+    to: "} else if (requestedBucket === \"accepted\") {\n    clauses.push(`EXISTS (\n      SELECT 1 FROM sales_stock_transfers bucket_transfer\n       WHERE bucket_transfer.request_id = request.id\n         AND TRUE"
   },
   {
     name: "completed confirmation retries print twice",

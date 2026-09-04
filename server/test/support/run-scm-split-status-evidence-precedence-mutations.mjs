@@ -28,6 +28,11 @@ const MUTANTS = Object.freeze([
     to: 'const previousCompleted = ["never-completed"].includes('
   },
   {
+    name: "inferred previous completion is treated as authoritative",
+    from: "    previousCompleted\n    && hasAuthoritativeCompletion === true\n    && (",
+    to: "    previousCompleted\n    && ("
+  },
+  {
     name: "every review is hidden as an inferred completion loss",
     from: "&& String(derivedState.reason || \"\").trim() === LOST_COMPLETION_EVIDENCE_REASON;",
     to: "&& true;"
@@ -36,6 +41,11 @@ const MUTANTS = Object.freeze([
     name: "Partially Done is allowed to regress from Completed",
     from: '["Queued", "Partially Done", "In Transit"].includes(applicationStatus)',
     to: '["Queued", "In Transit"].includes(applicationStatus)'
+  },
+  {
+    name: "inferred full allocation remains Completed",
+    from: '["Completed", "Partially Done", "In Transit"].includes(applicationStatus)',
+    to: '["Partially Done", "In Transit"].includes(applicationStatus)'
   },
   {
     name: "zero exact evidence is treated as progress",

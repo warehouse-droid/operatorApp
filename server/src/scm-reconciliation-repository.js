@@ -95,7 +95,8 @@ export function scmScheduleEffectiveReconciliationStatus({
   reconciliationReconciledAt = null,
   reconciliationApplicationStatus = "",
   blockingReview = false,
-  preserveOperationalStatus = false
+  preserveOperationalStatus = false,
+  preferReconciliationStatus = false
 } = {}) {
   const currentScheduleStatus = text(scheduleStatus) || "Queued";
   const currentReconciliationStatus = text(reconciliationStatus).toLowerCase();
@@ -115,7 +116,10 @@ export function scmScheduleEffectiveReconciliationStatus({
   const scheduleIsNewer = Number(scheduleId) > 0
     && scheduleUpdatedTimestamp !== null
     && (reconciliationTimestamp === null || scheduleUpdatedTimestamp > reconciliationTimestamp);
-  if (scheduleIsNewer) return currentScheduleStatus;
+  if (
+    scheduleIsNewer
+    && !(preferReconciliationStatus && currentReconciliationApplicationStatus)
+  ) return currentScheduleStatus;
   return currentReconciliationApplicationStatus || currentScheduleStatus;
 }
 
@@ -2217,9 +2221,18 @@ async function loadSplitLineTargets(order, sourceLine) {
               child_line.to_plt, child_line.to_lyr, child_line.to_sec, child_line.to_pcs,
               COALESCE(child_line.location_id, child.destination_location_id) AS target_destination_location_id,
               COALESCE(NULLIF(child_line.location, ''), child.destination_location) AS target_destination_location,
+              completion_job.job_details->>'destinationLocationId'
+                AS completed_destination_location_id,
+              COALESCE(
+                NULLIF(completion_job.job_details->>'dropLocation', ''),
+                NULLIF(completion_job.job_details->>'location', '')
+              ) AS completed_destination_location,
               schedule.eta_date,
               schedule.status AS schedule_status,
               schedule.updated_at AS schedule_updated_at,
+              completion.completion_event_id,
+              completion.completion_evidence_type,
+              completion.dispatch_completed_at,
               EXISTS (
                 SELECT 1
                   FROM dispatch_plan_order_assignments assignment
@@ -2238,6 +2251,15 @@ async function loadSplitLineTargets(order, sourceLine) {
          LEFT JOIN scm_transport_schedule schedule
            ON schedule.order_kind = 'PO'
           AND lower(schedule.order_ref) = lower(split_header.split_po_ref)
+         LEFT JOIN dispatch_order_completion_status completion
+           ON completion.order_kind = 'PO'
+          AND lower(completion.order_ref) = lower(split_header.split_po_ref)
+          AND completion.dispatch_completion_status = 'completed'
+         LEFT JOIN driver_job_records completion_job
+           ON completion_job.job_id = completion.completion_evidence_id
+          AND completion.completion_evidence_type = 'driver_job'
+          AND lower(completion_job.status) = 'complete'
+          AND lower(completion_job.stop_type) = 'dropoff'
         WHERE split_line.source_line_id = $1
         ORDER BY schedule.updated_at,
                  schedule.eta_date,
@@ -2258,12 +2280,22 @@ async function loadSplitLineTargets(order, sourceLine) {
         salesQuantityFromPack(row, "received_")
       ),
       exactFulfilledQty: 0,
-      destinationLocationId: positiveId(row.target_destination_location_id),
-      destinationLocation: row.target_destination_location || "",
+      // A completed Driver drop-off is the durable execution destination. It
+      // supersedes stale split metadata while NetSuite receipt locations still
+      // remain an independent, fail-closed check in the allocator.
+      destinationLocationId: positiveId(row.completed_destination_location_id)
+        || positiveId(row.target_destination_location_id),
+      destinationLocation: positiveId(row.completed_destination_location_id)
+        ? row.completed_destination_location || row.target_destination_location || ""
+        : row.target_destination_location || "",
       actualDispatchAt: ["Planned", "Partially Done", "In Transit", "Completed"].includes(row.schedule_status)
         ? row.schedule_updated_at
         : null,
       plannedEta: row.eta_date,
+      operationallyCompleted: Boolean(row.completion_event_id)
+        || ["complete", "completed"].includes(text(row.schedule_status).toLowerCase()),
+      allowInferredReceipt: Boolean(row.completion_event_id)
+        || ["complete", "completed"].includes(text(row.schedule_status).toLowerCase()),
       hasActiveDispatchAssignment: row.has_active_dispatch_assignment === true,
       createdAt: row.created_at
     }));
@@ -2934,6 +2966,7 @@ function addTargetProgress(targets, allocation, progressKind, lineIdentity = "")
       hidden: false,
       hasActivePlan: Boolean(allocation.actualDispatchAt || allocation.plannedEta),
       hasActiveDispatchAssignment: allocation.hasActiveDispatchAssignment === true,
+      operationallyCompleted: allocation.operationallyCompleted === true,
       allocationMethods: new Set(),
       lineIdentities: new Set()
     });
@@ -2941,6 +2974,9 @@ function addTargetProgress(targets, allocation, progressKind, lineIdentity = "")
   const target = targets.get(ref);
   if (allocation.hasActiveDispatchAssignment === true) {
     target.hasActiveDispatchAssignment = true;
+  }
+  if (allocation.operationallyCompleted === true) {
+    target.operationallyCompleted = true;
   }
   const identity = text(lineIdentity) || String(allocation.targetLocalLineId || allocation.ledgerLineId || "");
   if (!target.lineIdentities.has(identity)) {
@@ -2994,6 +3030,27 @@ function stableReconciliationJson(value) {
       ? []
       : [[key, stableReconciliationJson(value[key])]]
   )));
+}
+
+function reconciliationConflictAcceptanceFingerprint({
+  reason = "",
+  details = {}
+} = {}) {
+  const cleanDetails = details && typeof details === "object"
+    ? structuredClone(details)
+    : {};
+  delete cleanDetails.conflictFingerprint;
+  delete cleanDetails.conflictAcceptanceFingerprint;
+  const reasonStatements = [...new Set(text(reason)
+    .split(/(?<=\.)\s+/u)
+    .map(text)
+    .filter(Boolean))]
+    .sort((left, right) => left.localeCompare(right));
+  const payload = stableReconciliationJson({
+    reasonStatements,
+    details: cleanDetails
+  });
+  return crypto.createHash("sha256").update(JSON.stringify(payload)).digest("hex");
 }
 
 function reconciliationConflictFingerprint({
@@ -3104,19 +3161,31 @@ function persistedReconciliationConflictFingerprint(state = {}, review = {}) {
   });
 }
 
-async function acceptedReconciliationConflictMatches({ order, fingerprint }) {
-  if (!fingerprint) return false;
+async function acceptedReconciliationConflictMatches({
+  order,
+  fingerprint,
+  acceptanceFingerprint
+}) {
+  if (!fingerprint || !acceptanceFingerprint) return false;
   const result = await query(
-    `SELECT 1
+    `SELECT reason, details
        FROM scm_reconciliation_review_cases
       WHERE case_key = $1
         AND status = 'resolved'
         AND resolution_action = 'accept'
-        AND details->>'conflictFingerprint' = $2
       LIMIT 1`,
-    [`${order.kind}:${order.id}:reconciliation_conflict`, fingerprint]
+    [`${order.kind}:${order.id}:reconciliation_conflict`]
   );
-  return Boolean(result.rows[0]);
+  const accepted = result.rows[0];
+  if (!accepted) return false;
+  if (text(accepted.details?.conflictFingerprint) === fingerprint) return true;
+  const acceptedAcceptanceFingerprint = text(
+    accepted.details?.conflictAcceptanceFingerprint
+  ) || reconciliationConflictAcceptanceFingerprint({
+    reason: accepted.reason,
+    details: accepted.details
+  });
+  return acceptedAcceptanceFingerprint === acceptanceFingerprint;
 }
 
 async function upsertBlockingReview({
@@ -3991,6 +4060,8 @@ export async function reconcileScmOrderFamily({
         destinationLocationId: positiveId(line.locationId || order.destinationLocationId),
         destinationLocation: line.location || order.destinationLocation || "",
         isParent: true,
+        operationallyCompleted: false,
+        allowInferredReceipt: true,
         createdAt: "9999-12-31T23:59:59.999Z"
       }
     ];
@@ -4204,9 +4275,22 @@ export async function reconcileScmOrderFamily({
       lines: lineSummary
     })
     : "";
-  if (conflictFingerprint) reviewDetails.conflictFingerprint = conflictFingerprint;
+  const conflictAcceptanceFingerprint = reconciliationReason
+    ? reconciliationConflictAcceptanceFingerprint({
+      reason: reconciliationReason,
+      details: reviewDetails
+    })
+    : "";
+  if (conflictFingerprint) {
+    reviewDetails.conflictFingerprint = conflictFingerprint;
+    reviewDetails.conflictAcceptanceFingerprint = conflictAcceptanceFingerprint;
+  }
   const acceptedCurrentEvidence = reconciliationReason
-    ? await acceptedReconciliationConflictMatches({ order, fingerprint: conflictFingerprint })
+    ? await acceptedReconciliationConflictMatches({
+      order,
+      fingerprint: conflictFingerprint,
+      acceptanceFingerprint: conflictAcceptanceFingerprint
+    })
     : false;
   const activeReconciliationReason = acceptedCurrentEvidence ? "" : reconciliationReason;
 
@@ -4256,7 +4340,9 @@ export async function reconcileScmOrderFamily({
     const derived = applySplitTargetEvidencePrecedence({
       targetKind: target.targetKind,
       previousStatus: targetPreviousStatus,
-      hasActivePlan: target.hasActivePlan,
+      hasActivePlan: target.hasActiveDispatchAssignment === true,
+      hasAuthoritativeCompletion: previousScheduleCompleted
+        || target.operationallyCompleted === true,
       evidencedFulfilledQty: target.evidencedFulfilled,
       evidencedReceivedQty: target.evidencedReceived,
       derivedState: calculated
@@ -6503,7 +6589,10 @@ export async function enrichScmScheduleWithReconciliation(rows = [], {
           reconciliationReconciledAt: state.reconciled_at,
           reconciliationApplicationStatus: currentTargetStatus || state.application_status,
           blockingReview: isReview,
-          preserveOperationalStatus: preserveManualSplitOperationalStatus
+          preserveOperationalStatus: preserveManualSplitOperationalStatus,
+          preferReconciliationStatus: kind === "PO"
+            && row.isScmSplit === true
+            && !preserveManualSplitOperationalStatus
         });
     }
     const displayedReason = isReview
@@ -6634,6 +6723,7 @@ function poSplitCandidatePreview(ledger, candidate) {
   const requestedQty = reconciliationQuantity(
     ledger.requested_sales_qty ?? ledger.sales_qty
   );
+  const currentQty = reconciliationQuantity(ledger.sales_qty);
   const orderedQty = reconciliationQuantity(candidate.quantity);
   const linkedSalesQty = reconciliationQuantity(candidate.linked_sales_qty);
   const existingSplitQty = reconciliationQuantity(
@@ -6645,7 +6735,7 @@ function poSplitCandidatePreview(ledger, candidate) {
   );
   const exactReceivedQty = poLineReceivedQuantity(candidate);
   const maximumBaselineQty = roundReconciliationQuantity(Math.max(
-    orderedQty - linkedSalesQty - existingSplitQty - requestedQty,
+    orderedQty - linkedSalesQty - existingSplitQty - currentQty,
     0
   ));
   const recommendedBaselineQty = roundReconciliationQuantity(Math.min(
@@ -6656,13 +6746,13 @@ function poSplitCandidatePreview(ledger, candidate) {
     baselineQty - recommendedBaselineQty,
     0
   ));
-  const requestedPackFields = [
-    ["requested_pallet_qty", "to_plt"],
-    ["requested_layer_qty", "to_lyr"],
-    ["requested_section_qty", "to_sec"],
-    ["requested_piece_qty", "to_pcs"]
+  const currentPackFields = [
+    ["pallet_qty", "to_plt"],
+    ["layer_qty", "to_lyr"],
+    ["section_qty", "to_sec"],
+    ["piece_qty", "to_pcs"]
   ];
-  const compatiblePack = requestedPackFields.every(([quantityField, conversionField]) => {
+  const compatiblePack = currentPackFields.every(([quantityField, conversionField]) => {
     if (reconciliationQuantity(ledger[quantityField]) <= EPSILON) return true;
     return Math.abs(
       reconciliationQuantity(ledger[`old_${conversionField}`])
@@ -6671,7 +6761,7 @@ function poSplitCandidatePreview(ledger, candidate) {
   });
   const canFit = (
     orderedQty + EPSILON
-      >= linkedSalesQty + existingSplitQty + requestedQty
+      >= linkedSalesQty + existingSplitQty + currentQty
   );
   const evidenceSufficient = (
     baselineReductionQty <= EPSILON
@@ -6683,6 +6773,8 @@ function poSplitCandidatePreview(ledger, candidate) {
     itemName: candidate.item_name || "",
     sku: candidate.sku || "",
     unit: candidate.unit || "",
+    requestedQty,
+    currentQty,
     orderedQty,
     receivedQty: exactReceivedQty,
     baselineQty,
@@ -6800,6 +6892,7 @@ export async function listScmPoSplitLineAdjustmentOptions({
       requestedQty: reconciliationQuantity(
         ledger.requested_sales_qty ?? ledger.sales_qty
       ),
+      currentQty: reconciliationQuantity(ledger.sales_qty),
       currentSource: {
         localLineId: Number(ledger.source_line_id),
         lineKey: ledger.old_line_key === null ? "" : String(ledger.old_line_key),
@@ -7042,7 +7135,11 @@ export async function reassignScmPoSplitLineSource({
       previousSourceLineId: String(ledger.source_line_id),
       previousLineKey: before.sourceLineKey,
       sourceLineId: String(candidate.id),
-      lineKey: String(candidate.line_id)
+      lineKey: String(candidate.line_id),
+      requestedQty: reconciliationQuantity(
+        ledger.requested_sales_qty ?? ledger.sales_qty
+      ),
+      currentQty: reconciliationQuantity(ledger.sales_qty)
     };
     await query(
       `UPDATE dispatch_scm_po_split_lines
@@ -7050,12 +7147,7 @@ export async function reassignScmPoSplitLineSource({
               item_id = $3,
               sku = NULLIF($4, ''),
               item_name = NULLIF($5, ''),
-              unit = NULLIF($6, ''),
-              pallet_qty = requested_pallet_qty,
-              layer_qty = requested_layer_qty,
-              section_qty = requested_section_qty,
-              piece_qty = requested_piece_qty,
-              sales_qty = requested_sales_qty
+              unit = NULLIF($6, '')
         WHERE id = $1`,
       [
         ledgerId,
@@ -7083,17 +7175,24 @@ export async function reassignScmPoSplitLineSource({
               section_qty = $14,
               piece_qty = $15,
               netsuite_active = true,
-              raw = jsonb_set(
+              raw = (
                 jsonb_set(
-                  COALESCE(raw, '{}'::jsonb),
-                  '{sourceLineId}',
-                  to_jsonb($16::text),
+                  jsonb_set(
+                    COALESCE(raw, '{}'::jsonb),
+                    '{sourceLineId}',
+                    to_jsonb($16::text),
+                    true
+                  ),
+                  '{manualSourceLineAdjustment}',
+                  $17::jsonb,
                   true
-                ),
-                '{manualSourceLineAdjustment}',
-                $17::jsonb,
-                true
-              ),
+                )
+                - 'lineSequenceNumber'
+                - 'line_sequence_number'
+                - 'netSuiteLineSequence'
+                - 'orderLine'
+                - 'order_line'
+              ) || $18::jsonb,
               synced_at = now()
         WHERE id = $1`,
       [
@@ -7107,13 +7206,35 @@ export async function reassignScmPoSplitLineSource({
         reconciliationQuantity(candidate.to_lyr),
         reconciliationQuantity(candidate.to_sec),
         reconciliationQuantity(candidate.to_pcs),
-        reconciliationQuantity(ledger.requested_sales_qty ?? ledger.sales_qty),
-        reconciliationQuantity(ledger.requested_pallet_qty),
-        reconciliationQuantity(ledger.requested_layer_qty),
-        reconciliationQuantity(ledger.requested_section_qty),
-        reconciliationQuantity(ledger.requested_piece_qty),
+        reconciliationQuantity(ledger.sales_qty),
+        reconciliationQuantity(ledger.pallet_qty),
+        reconciliationQuantity(ledger.layer_qty),
+        reconciliationQuantity(ledger.section_qty),
+        reconciliationQuantity(ledger.piece_qty),
         String(candidate.id),
-        JSON.stringify(childAdjustment)
+        JSON.stringify(childAdjustment),
+        JSON.stringify((() => {
+          const raw = candidate.raw && typeof candidate.raw === "object"
+            && !Array.isArray(candidate.raw)
+            ? candidate.raw
+            : {};
+          const lineSequenceNumber = Number(
+            raw.lineSequenceNumber
+              ?? raw.line_sequence_number
+              ?? raw.netSuiteLineSequence
+          );
+          const orderLine = text(
+            raw.orderLine
+              ?? raw.order_line
+              ?? raw.order_line_number
+          );
+          return {
+            ...(Number.isFinite(lineSequenceNumber) && lineSequenceNumber > 0
+              ? { lineSequenceNumber }
+              : {}),
+            ...(orderLine ? { orderLine } : {})
+          };
+        })())
       ]
     );
     if (preview.requiresBaselineReduction) {
@@ -7205,6 +7326,7 @@ export async function reassignScmPoSplitLineSource({
         requestedQty: reconciliationQuantity(
           ledger.requested_sales_qty ?? ledger.sales_qty
         ),
+        currentQty: reconciliationQuantity(ledger.sales_qty),
         before,
         after,
         capacity: preview,
@@ -7299,14 +7421,26 @@ export async function resolveScmReconciliationReview({
       throw Object.assign(new Error("Enter at least one split allocation."), { status: 400 });
     }
     let acceptedConflictFingerprint = "";
+    let acceptedConflictAcceptanceFingerprint = "";
     if (action === "accept" && review.review_code === "reconciliation_conflict") {
       acceptedConflictFingerprint = text(review.details?.conflictFingerprint)
         || persistedReconciliationConflictFingerprint(state, review);
+      acceptedConflictAcceptanceFingerprint = text(
+        review.details?.conflictAcceptanceFingerprint
+      ) || reconciliationConflictAcceptanceFingerprint({
+        reason: review.reason,
+        details: review.details
+      });
       const acceptedDetails = {
         ...(review.details && typeof review.details === "object" ? review.details : {}),
-        conflictFingerprint: acceptedConflictFingerprint
+        conflictFingerprint: acceptedConflictFingerprint,
+        conflictAcceptanceFingerprint: acceptedConflictAcceptanceFingerprint
       };
-      if (text(review.details?.conflictFingerprint) !== acceptedConflictFingerprint) {
+      if (
+        text(review.details?.conflictFingerprint) !== acceptedConflictFingerprint
+        || text(review.details?.conflictAcceptanceFingerprint)
+          !== acceptedConflictAcceptanceFingerprint
+      ) {
         await query(
           `UPDATE scm_reconciliation_review_cases
               SET details = $2::jsonb,
@@ -7330,7 +7464,10 @@ export async function resolveScmReconciliationReview({
         resolution: cleanResolution,
         note: cleanNote,
         allocations: requested,
-        ...(acceptedConflictFingerprint ? { conflictFingerprint: acceptedConflictFingerprint } : {})
+        ...(acceptedConflictFingerprint ? { conflictFingerprint: acceptedConflictFingerprint } : {}),
+        ...(acceptedConflictAcceptanceFingerprint
+          ? { conflictAcceptanceFingerprint: acceptedConflictAcceptanceFingerprint }
+          : {})
       },
       actor: cleanActor
     });
@@ -7349,7 +7486,10 @@ export async function resolveScmReconciliationReview({
           orderKind: source.kind,
           orderRef,
           allocations: requested,
-          ...(acceptedConflictFingerprint ? { conflictFingerprint: acceptedConflictFingerprint } : {})
+          ...(acceptedConflictFingerprint ? { conflictFingerprint: acceptedConflictFingerprint } : {}),
+          ...(acceptedConflictAcceptanceFingerprint
+            ? { conflictAcceptanceFingerprint: acceptedConflictAcceptanceFingerprint }
+            : {})
         }),
         audit.event.id
       ]
@@ -7538,21 +7678,20 @@ export async function resolveScmReconciliationReview({
         const preservedOperationalStatus = text(acceptedSchedule.status) || "Hold";
         const stateReconciledAt = timestampValue(state.reconciled_at);
         const scheduleUpdatedAt = timestampValue(acceptedSchedule.updated_at);
-        const preserveNewerSplitRevision = source.kind === "PO"
+        const scheduleHasOperationalAuthority = source.kind === "PO"
           && target.targetKind === "po_split"
+          && scmManualSplitHasOperationalStatusAuthority(preservedOperationalStatus, {
+            hasActivePlan: target.hasActiveDispatchAssignment === true,
+            derivedStatus: derived.applicationStatus
+          });
+        const preserveNewerSplitRevision = scheduleHasOperationalAuthority
           && Number(acceptedSchedule.id) > 0
           && stateReconciledAt !== null
           && scheduleUpdatedAt !== null
           && scheduleUpdatedAt > stateReconciledAt;
         const preserveSplitOperationalStatus = source.kind === "PO"
           && target.targetKind === "po_split"
-          && (
-            preserveNewerSplitRevision
-            || scmManualSplitHasOperationalStatusAuthority(preservedOperationalStatus, {
-              hasActivePlan: target.hasActiveDispatchAssignment === true,
-              derivedStatus: derived.applicationStatus
-            })
-          );
+          && scheduleHasOperationalAuthority;
         target.applicationStatus = preserveSplitOperationalStatus
           ? preservedOperationalStatus
           : target.hidden === true

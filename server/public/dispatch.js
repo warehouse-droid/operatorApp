@@ -503,6 +503,7 @@ const dispatchOrderHydrationPromises = new Map();
 let modalType = "";
 let modalOrderId = "";
 let modalLoadId = "";
+let modalStopId = "";
 let deliveryInstructionEditorState = {
   orderId: "",
   targetOrderId: "",
@@ -601,9 +602,13 @@ let pendingOperatorAlertRefs = new Set();
 let nextSaveNeedsOrderPoolRefresh = false;
 let pendingTargetedOrderRefreshRefs = new Set();
 let pendingGlobalOrderRetireRefs = new Set();
+let pendingGlobalOrderReactivateRefs = new Set();
+let authoritativeRetiredOrderRefs = new Set();
+let pendingRemoteStructuralLifecycleByRef = new Map();
 let nextPlanSaveMode = "";
 let pendingPlanMutationAction = "dispatch_plan_autosaved";
 let plannedAssignmentRefs = new Set();
+let plannedAssignmentsByRef = new Map();
 const HISTORY_LIMIT = 20;
 const HISTORY_MEMORY_LIMIT_BYTES = 32 * 1024 * 1024;
 const DISPATCH_PLAN_KEY = DISPATCH_PLAN_CACHE_KEY;
@@ -668,6 +673,7 @@ function ensureDispatchPlanEditor() {
 const DISPATCH_VIEW_MUTATION_ACTIONS = new Set([
   "undo-plan", "redo-plan", "confirm-plan", "reopen-plan",
   "confirm-group", "ungroup-order", "confirm-split", "unsplit-order", "request-unpack-for-split",
+  "open-pickup-visit-split",
   "open-consolidate-modal", "confirm-consolidate", "open-po-link-modal", "open-to-link-modal", "confirm-po-link",
   "open-co-modal", "confirm-co", "open-po-yard-modal", "confirm-po-yard", "cancel-po-link",
   "link-order-dependency", "update-dependency-mode", "unlink-dependency", "cancel-transit-co",
@@ -2213,27 +2219,63 @@ function uniqueDispatchLocationLabels(values = []) {
   });
 }
 
+function dispatchRelationshipPickupLocations(order = {}) {
+  return uniqueDispatchLocationLabels([
+    ...(Array.isArray(order.poPickupManifest) ? order.poPickupManifest : []),
+    ...(Array.isArray(order.directPickupManifest) ? order.directPickupManifest : [])
+  ].map((entry) => entry?.location).filter(Boolean));
+}
+
+function activeTransitPickupLocations(order = {}, basePickupLocations = []) {
+  const relationshipPickupLocations = dispatchRelationshipPickupLocations(order);
+  return uniqueDispatchLocationLabels(
+    order.transitCo?.toYard
+      ? [order.transitCo.toYard, ...relationshipPickupLocations]
+      : [...basePickupLocations, ...relationshipPickupLocations]
+  );
+}
+
 function orderRequiresPickupLocation(order = {}, pickupLocation = "") {
   const target = normalizedPickupLocation(pickupLocation);
   if (!target) return false;
   return requiredPickupLocations(order).some((location) => normalizedPickupLocation(location) === target);
 }
 
-function pickupOrdersForStop(load, stop) {
+function pickupStopOrderRefs(load, stop) {
   if (!load || !stop || stop.type !== "pick") return [];
-  const ordersForLocation = [];
+  if (Array.isArray(stop.orderRefs)) {
+    return [...new Set(stop.orderRefs.map((ref) => String(ref || "").trim()).filter(Boolean))];
+  }
+  const refs = [];
   const seen = new Set();
   for (const candidate of load.stops || []) {
     if (candidate.type !== "drop") continue;
     const order = stopOrder(candidate);
-    if (!order || seen.has(order.id)) continue;
-    if (!orderRequiresPickupLocation(order, stop.location)) continue;
-    seen.add(order.id);
-    ordersForLocation.push(order);
+    const ref = String(order?.id || candidate.orderId || "").trim();
+    if (!order || !ref || seen.has(ref) || !orderRequiresPickupLocation(order, stop.location)) continue;
+    seen.add(ref);
+    refs.push(ref);
   }
-  const directOrder = stopOrder(stop);
-  if (directOrder && !seen.has(directOrder.id)) ordersForLocation.unshift(directOrder);
-  return ordersForLocation;
+  return refs;
+}
+
+function pickupStopIncludesOrder(load, stop, orderId) {
+  const wanted = String(orderId || "").trim().toLowerCase();
+  return Boolean(wanted && pickupStopOrderRefs(load, stop)
+    .some((ref) => String(ref).trim().toLowerCase() === wanted));
+}
+
+function pickupOrdersForStop(load, stop) {
+  if (!load || !stop || stop.type !== "pick") return [];
+  const loadOrders = new Map();
+  for (const candidate of load.stops || []) {
+    if (candidate.type !== "drop") continue;
+    const order = stopOrder(candidate);
+    if (order?.id) loadOrders.set(String(order.id).toLowerCase(), order);
+  }
+  return pickupStopOrderRefs(load, stop)
+    .map((ref) => loadOrders.get(String(ref).toLowerCase()) || orderById(ref))
+    .filter(Boolean);
 }
 
 function isMbbsSpecialLinkLine(line = {}) {
@@ -2728,6 +2770,17 @@ function scmReconciliationBlockText(order = {}) {
     order.reconciliationReason
       || order.scm?.reconciliationReason
       || "Resolve this grouped order in NetSuite Reconcile Review before changing its plan."
+  ).trim();
+}
+
+function isDispatchPlanningRestricted(order = {}) {
+  return order.dispatchPlanningRestricted === true;
+}
+
+function dispatchPlanningRestrictionText(order = {}) {
+  return String(
+    order.dispatchPlanningRestrictionReason
+      || `${order.id || "This order"} is available for search only and cannot be added to a Dispatch plan.`
   ).trim();
 }
 
@@ -3326,9 +3379,7 @@ function normalizeOrder(order) {
       : type === "SO"
         ? ["3445"]
         : [];
-  const pickupLocations = uniqueDispatchLocationLabels(
-    order.transitCo?.toYard ? [order.transitCo.toYard] : basePickupLocations
-  );
+  const pickupLocations = activeTransitPickupLocations(order, basePickupLocations);
   const effectiveSourceYard = order.transitCo?.toYard
     || order.sourceYard
     || pickupLocations[0]
@@ -3615,17 +3666,12 @@ function replenishmentPlacementBlockMessage(order, targetTruck, targetLoad, inse
     }
     const assignment = orderAssignment(dependency.transferOrderRef);
     if (!assignment.load) {
-      const transferPlanned = Boolean(
-        transferOrder?.dispatchPlanned
-        || dependency.transferDispatchPlanned
-        || dependency.plannedPlanId
-      );
-      const transferDate = String(
-        transferOrder?.dispatchPlanDate
-        || dependency.transferDispatchPlanDate
-        || dependency.plannedDate
-        || ""
-      ).slice(0, 10);
+      // Dependency cards and NetSuite-derived flags can lag a Dispatch save.
+      // The global assignment projection is the planning authority; Driver
+      // completion remains a separate execution concern.
+      const projectedAssignment = dispatchPlannedAssignment(dependency.transferOrderRef);
+      const transferPlanned = Boolean(projectedAssignment);
+      const transferDate = String(projectedAssignment?.dispatchPlanDate || "").slice(0, 10);
       if (transferPlanned && transferDate && comparePlanDate(transferDate, currentPlanDate) < 0) continue;
       return `${order.id} requires ${dependency.transferOrderRef} to be planned before this delivery.`;
     }
@@ -3973,10 +4019,221 @@ function invalidateRoutesChangedByOrderFeed(beforeSignatures = new Map()) {
   }
 }
 
+function dispatchOrderRefKey(ref) {
+  return String(ref || "").trim().toUpperCase();
+}
+
+function isAuthoritativelyRetiredOrderRef(ref) {
+  return authoritativeRetiredOrderRefs.has(dispatchOrderRefKey(ref));
+}
+
+function setAuthoritativeOrderRetirement(ref, retired = true) {
+  const key = dispatchOrderRefKey(ref);
+  if (!key) return;
+  if (retired) authoritativeRetiredOrderRefs.add(key);
+  else authoritativeRetiredOrderRefs.delete(key);
+}
+
+function deleteDispatchOrderRefFromSet(refs, ref) {
+  const key = dispatchOrderRefKey(ref);
+  if (!key) return false;
+  let deleted = false;
+  for (const candidate of refs) {
+    if (dispatchOrderRefKey(candidate) !== key) continue;
+    refs.delete(candidate);
+    deleted = true;
+  }
+  return deleted;
+}
+
+function queueGlobalOrderRetirement(ref) {
+  const clean = String(ref || "").trim();
+  const key = dispatchOrderRefKey(clean);
+  if (!key) return;
+  deleteDispatchOrderRefFromSet(pendingGlobalOrderReactivateRefs, clean);
+  deleteDispatchOrderRefFromSet(pendingGlobalOrderRetireRefs, clean);
+  pendingGlobalOrderRetireRefs.add(clean);
+  setAuthoritativeOrderRetirement(clean, true);
+  plannedAssignmentRefs = new Set([...plannedAssignmentRefs]
+    .filter((candidate) => dispatchOrderRefKey(candidate) !== key));
+  plannedAssignmentsByRef.delete(key);
+}
+
+function queueGlobalOrderReactivation(ref) {
+  const clean = String(ref || "").trim();
+  if (!dispatchOrderRefKey(clean)) return;
+  deleteDispatchOrderRefFromSet(pendingGlobalOrderRetireRefs, clean);
+  deleteDispatchOrderRefFromSet(pendingGlobalOrderReactivateRefs, clean);
+  pendingGlobalOrderReactivateRefs.add(clean);
+  setAuthoritativeOrderRetirement(clean, false);
+}
+
+function resetPendingGlobalOrderLifecycle() {
+  pendingGlobalOrderRetireRefs = new Set();
+  pendingGlobalOrderReactivateRefs = new Set();
+  authoritativeRetiredOrderRefs = new Set();
+  pendingRemoteStructuralLifecycleByRef = new Map();
+}
+
+function withoutAuthoritativelyRetiredOrders(orderList = []) {
+  return (Array.isArray(orderList) ? orderList : []).flatMap((order) => {
+    if (!order || isAuthoritativelyRetiredOrderRef(order.id)) return [];
+    const transitCoId = order.transitCo?.id;
+    const next = transitCoId && isAuthoritativelyRetiredOrderRef(transitCoId)
+      ? clearTransitCoFromOrderSnapshot(order, transitCoId)
+      : order;
+    return [normalizeOrder(next)];
+  });
+}
+
+function withoutAuthoritativelyRetiredStops(truckList = []) {
+  return (Array.isArray(truckList) ? truckList : []).map((truck) => ({
+    ...truck,
+    loads: (Array.isArray(truck?.loads) ? truck.loads : []).map((load) => ({
+      ...load,
+      stops: (Array.isArray(load?.stops) ? load.stops : [])
+        .filter((stop) => !isAuthoritativelyRetiredOrderRef(stop?.orderId))
+    }))
+  }));
+}
+
+function isRetirableDispatchStructure(order = {}) {
+  const orderType = canonicalDispatchOrderType(order.type, order.id);
+  if (!["SO", "TO"].includes(orderType)) return false;
+  return Boolean(
+    (Array.isArray(order.childOrders) && order.childOrders.length)
+    || splitParentOrderId(order)
+    || ["consolidation", "derived"].includes(String(order.globalOrderDefinitionKind || "").trim().toLowerCase())
+  );
+}
+
+function reconcileGlobalOrderLifecycleTransition(beforeOrders = [], afterOrders = []) {
+  const structuralRefs = (list) => new Map((Array.isArray(list) ? list : [])
+    .filter(isRetirableDispatchStructure)
+    .map((order) => [dispatchOrderRefKey(order?.id), String(order?.id || "").trim()])
+    .filter(([key, ref]) => key && ref));
+  const before = structuralRefs(beforeOrders);
+  const after = structuralRefs(afterOrders);
+  for (const [key, ref] of before) {
+    if (!after.has(key)) queueGlobalOrderRetirement(ref);
+  }
+  for (const [key, ref] of after) {
+    if (!before.has(key)) queueGlobalOrderReactivation(ref);
+  }
+}
+
+function queueRemoteStructuralRetirement(payload = {}) {
+  const planId = String(payload.planId || currentPlan?.id || "").trim();
+  if (!planId || planId !== String(currentPlan?.id || "").trim()) return;
+  const revision = Math.max(0, Number(payload.revision || 0));
+  for (const ref of Array.isArray(payload.retiredGlobalOrderRefs) ? payload.retiredGlobalOrderRefs : []) {
+    const key = dispatchOrderRefKey(ref);
+    if (key) pendingRemoteStructuralLifecycleByRef.set(key, { planId, revision, retired: true });
+  }
+  for (const ref of Array.isArray(payload.reactivatedGlobalOrderRefs) ? payload.reactivatedGlobalOrderRefs : []) {
+    const key = dispatchOrderRefKey(ref);
+    if (key) pendingRemoteStructuralLifecycleByRef.set(key, { planId, revision, retired: false });
+  }
+}
+
+function applyPendingRemoteStructuralRetirements(saved = {}) {
+  const planId = String(saved.id || saved.planId || "").trim();
+  const savedOrders = Array.isArray(saved.orders) ? saved.orders : [];
+  const savedOrderKeys = new Set(savedOrders.map((order) => dispatchOrderRefKey(order?.id)).filter(Boolean));
+  for (const ref of assignedOrderIdsForTrucks(saved.trucks || [])) {
+    const key = dispatchOrderRefKey(ref);
+    if (key) savedOrderKeys.add(key);
+  }
+  const savedRevision = Math.max(0, Number(saved.revision || 0));
+  if (!planId) return;
+  for (const [key, lifecycle] of pendingRemoteStructuralLifecycleByRef) {
+    if (lifecycle.planId !== planId) continue;
+    if (lifecycle.revision && savedRevision < lifecycle.revision) continue;
+    if (!lifecycle.retired && !savedOrderKeys.has(key)) continue;
+    setAuthoritativeOrderRetirement(key, lifecycle.retired);
+    if (lifecycle.retired) {
+      plannedAssignmentRefs = new Set([...plannedAssignmentRefs]
+        .filter((ref) => dispatchOrderRefKey(ref) !== key));
+      plannedAssignmentsByRef.delete(key);
+    }
+    pendingRemoteStructuralLifecycleByRef.delete(key);
+  }
+}
+
+function applyCancelledCoLiveEvent({ coRef = "", sourceOrderRef = "" } = {}) {
+  const coKey = dispatchOrderRefKey(coRef);
+  const sourceKey = dispatchOrderRefKey(sourceOrderRef);
+  if (!coKey) return;
+  setAuthoritativeOrderRetirement(coKey, true);
+  const clearList = (list = []) => (list || [])
+    .filter((order) => dispatchOrderRefKey(order?.id) !== coKey)
+    .map((order) => {
+      const ownsCo = dispatchOrderRefKey(order?.transitCo?.id) === coKey;
+      const isSource = sourceKey && dispatchOrderRefKey(order?.id) === sourceKey;
+      return ownsCo || isSource
+        ? normalizeOrder(clearTransitCoFromOrderSnapshot(order, coRef))
+        : order;
+    });
+  const routeSignaturesBefore = captureOperationalLoadSignatures();
+  orders = clearList(orders);
+  orderCatalog = clearList(orderCatalog);
+  removeStopsForOrders([coRef]);
+  plannedAssignmentRefs = new Set([...plannedAssignmentRefs]
+    .filter((ref) => dispatchOrderRefKey(ref) !== coKey));
+  plannedAssignmentsByRef.delete(coKey);
+  for (const [ref, evidence] of assignedOrderEvidenceById) {
+    if (dispatchOrderRefKey(ref) === coKey) {
+      assignedOrderEvidenceById.delete(ref);
+      continue;
+    }
+    const ownsCo = dispatchOrderRefKey(evidence?.transitCo?.id) === coKey;
+    const isSource = sourceKey && dispatchOrderRefKey(ref) === sourceKey;
+    if (ownsCo || isSource) {
+      assignedOrderEvidenceById.set(ref, normalizeOrder(clearTransitCoFromOrderSnapshot(evidence, coRef)));
+    }
+  }
+  invalidateRoutesChangedByOrderFeed(routeSignaturesBefore);
+  if (activeOrderType === "CO" && !orders.some((order) => order.type === "CO")) activeOrderType = "SO";
+  const selectedCoWasRetired = dispatchOrderRefKey(selectedOrderId) === coKey;
+  if (selectedCoWasRetired) selectedOrderId = sourceOrderRef || orders[0]?.id || "";
+  selectedOrderIds = new Set([...selectedOrderIds]
+    .filter((ref) => dispatchOrderRefKey(ref) !== coKey));
+  if (selectedCoWasRetired && selectedOrderId) selectedOrderIds.add(selectedOrderId);
+  if (!selectedOrderIds.size && selectedOrderId) selectedOrderIds.add(selectedOrderId);
+  resetUndoHistory();
+}
+
+function applyRetiredStructuralLiveEvent(orderRefs = []) {
+  const refs = [...new Set((Array.isArray(orderRefs) ? orderRefs : [])
+    .map((ref) => String(ref || "").trim())
+    .filter(Boolean))];
+  if (!refs.length) return;
+  const keys = new Set(refs.map(dispatchOrderRefKey));
+  const routeSignaturesBefore = captureOperationalLoadSignatures();
+  refs.forEach((ref) => setAuthoritativeOrderRetirement(ref, true));
+  orders = withoutAuthoritativelyRetiredOrders(orders);
+  orderCatalog = withoutAuthoritativelyRetiredOrders(orderCatalog);
+  trucks = withoutAuthoritativelyRetiredStops(trucks);
+  plannedAssignmentRefs = new Set([...plannedAssignmentRefs]
+    .filter((ref) => !keys.has(dispatchOrderRefKey(ref))));
+  for (const key of keys) plannedAssignmentsByRef.delete(key);
+  for (const ref of [...assignedOrderEvidenceById.keys()]) {
+    if (keys.has(dispatchOrderRefKey(ref))) assignedOrderEvidenceById.delete(ref);
+  }
+  invalidateRoutesChangedByOrderFeed(routeSignaturesBefore);
+  selectedOrderIds = new Set([...selectedOrderIds]
+    .filter((ref) => !keys.has(dispatchOrderRefKey(ref))));
+  if (keys.has(dispatchOrderRefKey(selectedOrderId))) {
+    selectedOrderId = orders[0]?.id || "";
+  }
+  if (!selectedOrderIds.size && selectedOrderId) selectedOrderIds.add(selectedOrderId);
+  resetUndoHistory();
+}
+
 function applyDispatchOrderFeed(feed) {
   const routeSignaturesBefore = captureOperationalLoadSignatures();
   const activityEvidence = activePhysicalOrderEvidence();
-  const normalizedFeed = Array.isArray(feed) ? feed.map(normalizeOrder).filter((order) => order.id) : [];
+  const normalizedFeed = withoutAuthoritativelyRetiredOrders(feed);
   const nextOrders = filterDispatchOrderFeedForAppliedPlan(normalizedFeed, currentPlan, appliedPlanStructure);
   orderCatalog = nextOrders;
   const byId = new Map(orders.map((order) => [order.id, order]));
@@ -3984,9 +4241,12 @@ function applyDispatchOrderFeed(feed) {
     .filter(([, order]) => orderMatchesActivityRefs(order, activityEvidence.all))
     .map(([, order]) => [String(order.id || "").trim().toLowerCase(), order]));
   const localOrders = orders.filter((order) =>
-    isOrderAssignedInCurrentPlan(order.id)
-    || shouldPreserveDuringFeedRefresh(order)
-    || orderMatchesActivityRefs(order, activityEvidence.all)
+    !isAuthoritativelyRetiredOrderRef(order.id)
+    && (
+      isOrderAssignedInCurrentPlan(order.id)
+      || shouldPreserveDuringFeedRefresh(order)
+      || orderMatchesActivityRefs(order, activityEvidence.all)
+    )
   );
   const nextIds = new Set(orderCatalog.map((order) => order.id));
   orders = [
@@ -4006,8 +4266,7 @@ function applyDispatchOrderFeed(feed) {
 }
 
 function preserveDispatchPlanningFields(existing = {}, fresh = {}) {
-  const authoritativeTransitCoClear = Object.prototype.hasOwnProperty.call(fresh, "transitCo")
-    && !fresh.transitCo;
+  const authoritativeTransitCoState = Object.prototype.hasOwnProperty.call(fresh, "transitCo");
   const planningKeys = [
     "assigned",
     "localDispatchStatus",
@@ -4018,6 +4277,7 @@ function preserveDispatchPlanningFields(existing = {}, fresh = {}) {
     "originalPallets",
     "transitCo",
     "transitOriginalPickupLocations",
+    "transitOriginalSourceYard",
     "groupAliases",
     "groupPlanId",
     "groupPlanDate",
@@ -4026,7 +4286,7 @@ function preserveDispatchPlanningFields(existing = {}, fresh = {}) {
     "isGrouped"
   ];
   const planning = Object.fromEntries(planningKeys
-    .filter((key) => !(authoritativeTransitCoClear && [
+    .filter((key) => !(authoritativeTransitCoState && [
       "transitCo",
       "transitOriginalPickupLocations",
       "transitOriginalSourceYard"
@@ -4042,7 +4302,7 @@ function mergeFreshDispatchOperationalOrder(existing = {}, candidate = {}, activ
 }
 
 function mergeDispatchOrderSearchFeed(feed) {
-  const normalizedFeed = Array.isArray(feed) ? feed.map(normalizeOrder).filter((order) => order.id) : [];
+  const normalizedFeed = withoutAuthoritativelyRetiredOrders(feed);
   const candidates = filterDispatchOrderFeedForAppliedPlan(normalizedFeed, currentPlan, appliedPlanStructure);
   if (!candidates.length) return;
   const routeSignaturesBefore = captureOperationalLoadSignatures();
@@ -4169,11 +4429,19 @@ function scheduleDispatchOrderSearch() {
 }
 
 function applyPlannedAssignments(assignments = []) {
+  assignments = (Array.isArray(assignments) ? assignments : []).filter((assignment) =>
+    !isAuthoritativelyRetiredOrderRef(assignment?.orderRef)
+    && !isAuthoritativelyRetiredOrderRef(assignment?.plannedOrderRef)
+    && !isAuthoritativelyRetiredOrderRef(assignment?.plannedOrderSnapshot?.id)
+  );
   plannedAssignmentRefs = new Set((assignments || []).map((assignment) => String(assignment.orderRef || "")).filter(Boolean));
+  plannedAssignmentsByRef = new Map((assignments || [])
+    .map((assignment) => [String(assignment.orderRef || "").trim().toUpperCase(), assignment])
+    .filter(([orderRef]) => orderRef));
   const byOrderRef = new Map((assignments || []).map((assignment) => [String(assignment.orderRef || ""), assignment]));
-  const plannedDerivedSnapshots = (assignments || [])
+  const plannedDerivedSnapshots = withoutAuthoritativelyRetiredOrders((assignments || [])
     .map((assignment) => assignment?.plannedOrderSnapshot)
-    .filter((order) => order?.id && (order?.childOrders?.length || order?.originalOrderId));
+    .filter((order) => order?.id && (order?.childOrders?.length || order?.originalOrderId)));
   const applyToOrder = (order) => {
     const assignment = byOrderRef.get(String(order.id || ""));
     return normalizeOrder({
@@ -4206,10 +4474,14 @@ function applyPlannedAssignments(assignments = []) {
     }
     return [...byId.values()];
   };
-  orders = orders.map(applyToOrder);
-  orderCatalog = orderCatalog.map(applyToOrder);
+  orders = withoutAuthoritativelyRetiredOrders(orders.map(applyToOrder));
+  orderCatalog = withoutAuthoritativelyRetiredOrders(orderCatalog.map(applyToOrder));
   orders = addPlannedDerivedSnapshots(orders);
   orderCatalog = addPlannedDerivedSnapshots(orderCatalog);
+}
+
+function dispatchPlannedAssignment(orderRef) {
+  return plannedAssignmentsByRef.get(String(orderRef || "").trim().toUpperCase()) || null;
 }
 
 async function refreshPlannedAssignments() {
@@ -5266,11 +5538,8 @@ function loadHasPhysicalStopActivity(load) {
 
 function physicalActivityPositionChanged(load, nextStops = []) {
   const currentStops = load?.stops || [];
-  const activityIndexes = currentStops
-    .map((stop, index) => stopHasDriverActivity(load, stop) ? index : -1)
-    .filter((index) => index >= 0);
-  if (!activityIndexes.length) return false;
-  const boundary = Math.max(...activityIndexes);
+  const boundary = dispatchEditableRouteBoundary(load);
+  if (boundary < 0) return false;
   const stopIds = (stops) => stops.slice(0, boundary + 1).map((stop) => String(stop?.id || ""));
   return JSON.stringify(stopIds(currentStops)) !== JSON.stringify(stopIds(nextStops));
 }
@@ -5326,15 +5595,29 @@ function loadGoogleMaps() {
 
 function planPayload(savedAt = new Date()) {
   normalizePlanBeforeSave();
-  const assignedIds = assignedOrderIdsForTrucks(trucks);
+  const payloadTrucks = withoutAuthoritativelyRetiredStops(trucksWithTimingMetadata());
+  const payloadOrders = withoutAuthoritativelyRetiredOrders(orders);
+  const assignedIds = assignedOrderIdsForTrucks(payloadTrucks);
   const hiddenOrderIds = new Set([
-    ...groupedChildOrderIds(),
-    ...splitParentOrderIds()
+    ...groupedChildOrderIds(payloadOrders),
+    ...splitParentOrderIds(payloadOrders)
   ]);
   const payloadPlanId = currentPlan?.id || null;
   const payloadPlanDate = currentPlan?.planDate || currentPlanDate;
-  const visibleOrderRefs = new Set(orders.map((order) => String(order?.id || "")).filter(Boolean));
+  const transmittedOrders = payloadOrders
+    .filter((order) => !hiddenOrderIds.has(order.id))
+    .filter((order) => assignedIds.has(order.id) || isDispatchPlanOwnedOrder(order))
+    .map((order) => ({
+      ...order,
+      localDispatchStatus: assignedIds.has(order.id) ? "planned" : "open"
+    }));
+  const visibleOrderRefs = new Set(transmittedOrders
+    .map((order) => dispatchOrderRefKey(order?.id))
+    .filter(Boolean));
+  const pickupVisitSchemaVersion = payloadTrucks.some((truck) => (truck.loads || [])
+    .some((load) => Number(load.pickupVisitSchemaVersion || 0) >= 1)) ? 1 : 0;
   return {
+    pickupVisitSchemaVersion,
     planId: payloadPlanId,
     planDate: payloadPlanDate,
     editLeaseToken: planEditLeaseToken,
@@ -5343,22 +5626,19 @@ function planPayload(savedAt = new Date()) {
     savedAt: savedAt.toISOString(),
     mutationAction: pendingPlanMutationAction,
     retiredGlobalOrderRefs: [...pendingGlobalOrderRetireRefs]
-      .filter((ref) => !visibleOrderRefs.has(ref)),
+      .filter((ref) => !visibleOrderRefs.has(dispatchOrderRefKey(ref))),
+    reactivatedGlobalOrderRefs: [...pendingGlobalOrderReactivateRefs]
+      .filter((ref) => visibleOrderRefs.has(dispatchOrderRefKey(ref))),
     refreshOrderPool: Boolean(nextSaveNeedsOrderPoolRefresh),
     summary: planSummary(),
-    orders: orders
-      .filter((order) => !hiddenOrderIds.has(order.id))
-      .filter((order) => assignedIds.has(order.id) || isDispatchPlanOwnedOrder(order))
-      .map((order) => ({
-        ...order,
-        localDispatchStatus: assignedIds.has(order.id) ? "planned" : "open"
-      })),
-    trucks: trucksWithTimingMetadata()
+    orders: transmittedOrders,
+    trucks: payloadTrucks
   };
 }
 
 function dispatchPlanWireState(plan = {}) {
   return {
+    pickupVisitSchemaVersion: Number(plan.pickupVisitSchemaVersion || 0),
     id: plan.id || plan.planId || currentPlan?.id || null,
     planDate: plan.planDate || currentPlanDate,
     status: plan.status || currentPlan?.status || "draft",
@@ -5413,6 +5693,7 @@ function dispatchSemanticCommandType(actionName = "") {
   if (action.includes("ungroup")) return "ungroup_orders";
   if (action.includes("group")) return "group_orders";
   if (action.includes("unsplit")) return "unsplit_order";
+  if (action.includes("split_pickup_visit")) return "split_pickup_visit";
   if (action.includes("split")) return "split_order";
   if (action.includes("co_cancel")) return "cancel_co";
   if (action.includes("co_")) return "upsert_co";
@@ -5621,7 +5902,8 @@ function payloadRequiresSave(payload = {}, nextHash = stablePlanHashPayload(payl
   const requiresFollowup = payload.refreshOrderPool
     || payload.saveMode
     || pendingOperatorAlertRefs.size
-    || (payload.retiredGlobalOrderRefs || []).length;
+    || (payload.retiredGlobalOrderRefs || []).length
+    || (payload.reactivatedGlobalOrderRefs || []).length;
   return forceSave || requiresFollowup || nextHash !== lastSavedPlanHash;
 }
 
@@ -5789,9 +6071,19 @@ function transitCoSourceRef(coOrder) {
 
 function applyTransitPickupToOrder(order, { coId, fromYard, toYard, createdAt } = {}) {
   if (!order || !fromYard || !toYard) return order;
-  const originalPickupLocations = order.transitOriginalPickupLocations?.length
+  const relationshipPickupLocations = dispatchRelationshipPickupLocations(order);
+  const relationshipPickupKeys = new Set(
+    relationshipPickupLocations.map(normalizedPickupLocation).filter(Boolean)
+  );
+  const originalPickupCandidates = order.transitOriginalPickupLocations?.length
     ? order.transitOriginalPickupLocations
     : (order.pickupLocations || []).filter((location) => !sameDispatchLocation(location, toYard));
+  const originalPickupLocations = uniqueDispatchLocationLabels(
+    originalPickupCandidates.filter((location) => (
+      !sameDispatchLocation(location, toYard)
+      && !relationshipPickupKeys.has(normalizedPickupLocation(location))
+    ))
+  );
   order.transitOriginalPickupLocations = originalPickupLocations.length ? originalPickupLocations : [fromYard];
   if (order.transitOriginalSourceYard === undefined) order.transitOriginalSourceYard = order.sourceYard || fromYard;
   order.transitCo = {
@@ -5802,7 +6094,7 @@ function applyTransitPickupToOrder(order, { coId, fromYard, toYard, createdAt } 
     sourceOrderId: order.id,
     createdAt: createdAt || order.transitCo?.createdAt || new Date().toISOString()
   };
-  order.pickupLocations = [toYard];
+  order.pickupLocations = activeTransitPickupLocations(order, order.pickupLocations || []);
   order.sourceYard = toYard;
   order.childOrderDetails = (order.childOrderDetails || []).map((child) => {
     const next = normalizeOrder({ ...child });
@@ -5969,6 +6261,21 @@ function splitOrderPlanningBlock(splits = []) {
 
 function applySavedPlan(saved) {
   if (!Array.isArray(saved?.orders) || !Array.isArray(saved?.trucks)) return false;
+  const incomingPlanId = String(saved.id || saved.planId || "").trim();
+  if (
+    appliedPlanStructure.planId
+    && incomingPlanId
+    && appliedPlanStructure.planId !== incomingPlanId
+  ) {
+    resetPendingGlobalOrderLifecycle();
+  }
+  applyPendingRemoteStructuralRetirements(saved);
+  saved = {
+    ...saved,
+    orders: withoutAuthoritativelyRetiredOrders(saved.orders),
+    trucks: withoutAuthoritativelyRetiredStops(saved.trucks)
+  };
+  orderCatalog = withoutAuthoritativelyRetiredOrders(orderCatalog);
   const savedAssignedIds = assignedOrderIdsForTrucks(saved.trucks);
   const savedOrders = saved.orders.filter((order) =>
     savedAssignedIds.has(order.id) || !savedGroupStructureConflictsWithPlan(order, saved)
@@ -6032,6 +6339,7 @@ function applySavedPlan(saved) {
     ...splitParentOrderIds([...savedById.values()])
   ]);
   for (const order of orderCatalog) {
+    if (isAuthoritativelyRetiredOrderRef(order.id)) continue;
     if (hiddenOrderIds.has(order.id)) continue;
     if (catalogStructureConflictsWithSavedPlan(order, restorableSavedPlan)) continue;
     if (!savedById.has(order.id)) savedById.set(order.id, normalizeOrder(order));
@@ -6137,6 +6445,7 @@ function dispatchIncrementalSaveRequest(targetPlanId, payload, options) {
         planDelta: buildDispatchPlanWireDelta(lastAcknowledgedPlanState, payload),
         actionName: payload.mutationAction || "dispatch_plan_autosaved",
         retiredGlobalOrderRefs: payload.retiredGlobalOrderRefs || [],
+        reactivatedGlobalOrderRefs: payload.reactivatedGlobalOrderRefs || [],
         operatorAlertRefs,
         refreshOrderPool: Boolean(payload.refreshOrderPool)
       }
@@ -6147,6 +6456,7 @@ function dispatchIncrementalSaveRequest(targetPlanId, payload, options) {
         summary: payload.summary || {},
         actionName: payload.mutationAction || "dispatch_plan_autosaved",
         retiredGlobalOrderRefs: payload.retiredGlobalOrderRefs || [],
+        reactivatedGlobalOrderRefs: payload.reactivatedGlobalOrderRefs || [],
         operatorAlertRefs,
         refreshOrderPool: Boolean(payload.refreshOrderPool)
       };
@@ -6188,6 +6498,7 @@ async function savePlanToServer(payload, { retryOnStale = true, forceSave = fals
     const refreshOrderPool = Boolean(payload.refreshOrderPool);
     const targetedOrderRefs = [...pendingTargetedOrderRefreshRefs];
     const retiredGlobalOrderRefs = [...(payload.retiredGlobalOrderRefs || [])];
+    const reactivatedGlobalOrderRefs = [...(payload.reactivatedGlobalOrderRefs || [])];
     const saveMode = payload.saveMode || "";
     const incrementalSave = shouldUseDispatchIncrementalSave(payload, { forceSave });
     autosaveDebug("savePlanToServer:start", {
@@ -6345,7 +6656,8 @@ async function savePlanToServer(payload, { retryOnStale = true, forceSave = fals
           nextSaveNeedsOrderPoolRefresh = false;
           targetedOrderRefs.forEach((ref) => pendingTargetedOrderRefreshRefs.delete(ref));
         }
-        retiredGlobalOrderRefs.forEach((ref) => pendingGlobalOrderRetireRefs.delete(ref));
+        retiredGlobalOrderRefs.forEach((ref) => deleteDispatchOrderRefFromSet(pendingGlobalOrderRetireRefs, ref));
+        reactivatedGlobalOrderRefs.forEach((ref) => deleteDispatchOrderRefFromSet(pendingGlobalOrderReactivateRefs, ref));
         if (saveMode === "truck_sequence") nextPlanSaveMode = "";
         clearLocalPlanDirty(payload.savedAt, saveGeneration);
         loadDispatchForecast({ renderAfter: true }).catch(() => null);
@@ -6381,7 +6693,8 @@ async function savePlanToServer(payload, { retryOnStale = true, forceSave = fals
         nextSaveNeedsOrderPoolRefresh = false;
         targetedOrderRefs.forEach((ref) => pendingTargetedOrderRefreshRefs.delete(ref));
       }
-      retiredGlobalOrderRefs.forEach((ref) => pendingGlobalOrderRetireRefs.delete(ref));
+      retiredGlobalOrderRefs.forEach((ref) => deleteDispatchOrderRefFromSet(pendingGlobalOrderRetireRefs, ref));
+      reactivatedGlobalOrderRefs.forEach((ref) => deleteDispatchOrderRefFromSet(pendingGlobalOrderReactivateRefs, ref));
       if (saveMode === "truck_sequence") nextPlanSaveMode = "";
       if (payload.mutationAction === pendingPlanMutationAction) pendingPlanMutationAction = "dispatch_plan_autosaved";
       clearLocalPlanDirty(payload.savedAt, saveGeneration);
@@ -6556,8 +6869,9 @@ function resetUndoHistory() {
 
 function applyHistorySnapshot(snapshot) {
   if (!snapshot) return;
-  orders = (snapshot.orders || []).map(normalizeOrder);
-  trucks = snapshot.trucks || [];
+  reconcileGlobalOrderLifecycleTransition(orders, snapshot.orders || []);
+  orders = withoutAuthoritativelyRetiredOrders(snapshot.orders || []);
+  trucks = withoutAuthoritativelyRetiredStops(snapshot.trucks || []);
   ensureDriverLaneOrder(snapshot.driverLaneOrder || defaultDriverLaneOrder());
   selectedOrderId = orders.find((order) => order.id === snapshot.selectedOrderId)?.id || orders[0]?.id || "";
   selectedOrderIds = new Set((snapshot.selectedOrderIds || []).filter((id) => orders.some((order) => order.id === id)));
@@ -6937,6 +7251,7 @@ async function createPlanForDate(planDate = currentPlanDate) {
 function resetPlanningBoard() {
   assignedOrderEvidenceById = new Map();
   appliedPlanStructure = { planId: "", planDate: "", orderIds: new Set() };
+  resetPendingGlobalOrderLifecycle();
   orders = orderCatalog.map((order) => normalizeOrder(order));
   trucks = fleet.map((vehicle, index) => makeTruckFromFleet(vehicle, index));
   if (driverOrientedPlanningEnabled()) {
@@ -7251,6 +7566,7 @@ function connectEvents() {
         savedAt: payload.savedAt || "",
         refreshOrderPool: payload.refreshOrderPool === true
       });
+      queueRemoteStructuralRetirement(payload);
       // Some legacy server events omit sourceSessionId. Verify that the server
       // revision is actually newer before warning about a remote editor.
       if (saveInFlight || saveQueued || confirmInFlight) return;
@@ -7280,6 +7596,32 @@ function connectEvents() {
       return;
     }
 
+    if (event.type === "dispatch.co.updated") {
+      if (payload.cancelled === true) {
+        applyCancelledCoLiveEvent({
+          coRef: payload.coRef,
+          sourceOrderRef: payload.sourceOrderRef
+        });
+        routeNotice = `${payload.coRef || "CO"} was cancelled. Its source order pickup was restored.`;
+        renderDispatchNoticePatch();
+        renderDispatchOrderPoolPatch();
+      } else {
+        setAuthoritativeOrderRetirement(payload.coRef, false);
+      }
+      queueDispatchOrderPoolRefresh("Order data updated.");
+      return;
+    }
+
+    if (
+      event.type === "dispatch.orders.updated"
+      && Array.isArray(payload.retiredGlobalOrderRefs)
+      && payload.retiredGlobalOrderRefs.length
+    ) {
+      applyRetiredStructuralLiveEvent(payload.retiredGlobalOrderRefs);
+      renderDispatchOrderPoolPatch();
+      renderDispatchSaveStatePatch();
+    }
+
     if ([
       "delivery.order.unpacked",
       "delivery.order.loaded",
@@ -7288,7 +7630,6 @@ function connectEvents() {
       "delivery.line.updated",
       "dispatch.operator_request.created",
       "dispatch.orders.updated",
-      "dispatch.co.updated",
       "receiving.order.received"
     ].includes(event.type)) {
       queueDispatchOrderPoolRefresh(
@@ -7516,10 +7857,7 @@ function reconcilePickupStopRepresentatives({ audit = false } = {}) {
     for (const load of truck.loads || []) {
       for (const stop of load.stops || []) {
         if (stop.type !== "pick") continue;
-        const direct = directOrderForStop(stop);
-        const directStillUsesPickup = direct && orderRequiresPickupLocation(direct, stop.location);
-        if (directStillUsesPickup) continue;
-        const replacement = pickupRepresentativeOrder(load, stop);
+        const replacement = pickupOrdersForStop(load, stop)[0] || pickupRepresentativeOrder(load, stop);
         if (!replacement || String(replacement.id || "") === String(stop.orderId || "")) continue;
         // Started jobs retain their original identity; display and timing still resolve through the related drops.
         if (stopHasDriverActivity(load, stop)) continue;
@@ -7565,17 +7903,23 @@ function requiredPickupLocations(order) {
 }
 
 function sequenceWarningsForStops(stops) {
-  const picked = new Set();
+  const load = { stops };
+  const pickedOrderLocations = new Set();
   const warnings = [];
   for (const stop of stops) {
     if (stop.type === "pick") {
-      picked.add(normalizedPickupLocation(stop.location));
+      for (const pickupOrder of pickupOrdersForStop(load, stop)) {
+        pickedOrderLocations.add(`${String(pickupOrder.id).toLowerCase()}|${normalizedPickupLocation(stop.location)}`);
+      }
       continue;
     }
     if (stop.type !== "drop") continue;
     const order = stopOrder(stop);
     if (!order) continue;
-    const missing = requiredPickupLocations(order).filter((location) => !picked.has(normalizedPickupLocation(location)));
+    const orderKey = String(order.id).toLowerCase();
+    const missing = requiredPickupLocations(order).filter((location) =>
+      !pickedOrderLocations.has(`${orderKey}|${normalizedPickupLocation(location)}`)
+    );
     if (missing.length) warnings.push(`${order.id}: pickup ${missing.join(", ")} before drop.`);
   }
   for (const warning of replenishmentSequenceWarningsForStops(stops)) {
@@ -7635,6 +7979,13 @@ function pickupFootprintForLocation(load, location) {
     total += pickupFootprintForOrderLocation(order, pickupLocation);
   }
   return total;
+}
+
+function pickupFootprintForStop(load, stop) {
+  return pickupOrdersForStop(load, stop).reduce(
+    (total, order) => total + pickupFootprintForOrderLocation(order, stop.location),
+    0
+  );
 }
 
 function pickupFootprintForOrderLocation(order, location) {
@@ -7891,7 +8242,7 @@ function physicalVisitStayMinutes(visit = {}, truck) {
     return truckStopMinutes(
       truck,
       stopServiceType(first.stop, first.order),
-      pickupFootprintForLocation(loadContainingStop(first.stop), first.stop.location)
+      pickupFootprintForStop(loadContainingStop(first.stop), first.stop)
     );
   }
   const serviceTypes = entries.map((entry) => stopServiceType(entry.stop, entry.order));
@@ -7970,7 +8321,7 @@ function loadStats(parentTruck, load) {
     warnings.push(`${unresolvedStop.orderId || unresolvedStop.id || "Stop"}: order details are temporarily unavailable. Refresh orders before saving this stop timing.`);
   }
   const sequenceWarnings = sequenceWarningsForStops(load.stops);
-  const pickedLocations = new Set();
+  const pickedOrderLocations = new Set();
   const onboardOrderIds = new Set();
   const droppedOrderIds = new Set();
   const remainingDropCounts = new Map();
@@ -8016,20 +8367,14 @@ function loadStats(parentTruck, load) {
       routeLegIndex += 1;
     }
     if (visit.type === "pick") {
-      pickedLocations.add(normalizedPickupLocation(stop.location));
       let pickedFootprint = 0;
-      const pickedOrderIdsAtLocation = new Set();
-      for (const dropStop of load.stops) {
-        if (dropStop.type !== "drop" || droppedOrderIds.has(dropStop.orderId)) continue;
-        if (pickedOrderIdsAtLocation.has(String(dropStop.orderId))) continue;
-        const dropOrder = stopOrder(dropStop);
-        if (!dropOrder) continue;
-        if (!requiredPickupLocations(dropOrder)
-          .some((location) => sameDispatchLocation(location, stop.location))) continue;
-        currentWeightLbs += pickupWeightForOrderLocation(dropOrder, stop.location);
-        pickedFootprint += pickupFootprintForOrderLocation(dropOrder, stop.location);
-        pickedOrderIdsAtLocation.add(String(dropStop.orderId));
-        onboardOrderIds.add(dropStop.orderId);
+      for (const pickupOrder of pickupOrdersForStop(load, stop)) {
+        const allocationKey = `${String(pickupOrder.id).toLowerCase()}|${normalizedPickupLocation(stop.location)}`;
+        if (pickedOrderLocations.has(allocationKey) || droppedOrderIds.has(pickupOrder.id)) continue;
+        currentWeightLbs += pickupWeightForOrderLocation(pickupOrder, stop.location);
+        pickedFootprint += pickupFootprintForOrderLocation(pickupOrder, stop.location);
+        pickedOrderLocations.add(allocationKey);
+        onboardOrderIds.add(pickupOrder.id);
         peakWeightLbs = Math.max(peakWeightLbs, currentWeightLbs);
       }
       const arrival = current;
@@ -8054,8 +8399,9 @@ function loadStats(parentTruck, load) {
     for (const entry of visit.entries) {
       const entryStop = entry.stop;
       const entryOrder = entry.order;
+      const entryOrderKey = String(entryOrder.id).toLowerCase();
       const missingPickupLocations = requiredPickupLocations(entryOrder)
-        .filter((location) => !pickedLocations.has(normalizedPickupLocation(location)));
+        .filter((location) => !pickedOrderLocations.has(`${entryOrderKey}|${normalizedPickupLocation(location)}`));
       const dropFootprint = dropFootprintPallets(entryOrder, entryStop);
       const dropWeight = dropWeightLbs(entryOrder, entryStop);
       palletTotal += dropPallets(entryOrder, entryStop);
@@ -8355,24 +8701,135 @@ function opaqueDispatchStopId() {
     : `stop-${Date.now().toString(36)}-${Math.random().toString(36).slice(2)}`;
 }
 
+function materializePickupVisitOrderRefs(load) {
+  const pickupGroups = new Map();
+  for (const stop of load?.stops || []) {
+    if (stop.type !== "pick") continue;
+    const key = normalizedPickupLocation(stop.location);
+    if (!pickupGroups.has(key)) pickupGroups.set(key, []);
+    pickupGroups.get(key).push(stop);
+  }
+  for (const [locationKey, pickupStops] of pickupGroups) {
+    const legacyStops = pickupStops.filter((stop) => !Array.isArray(stop.orderRefs));
+    if (legacyStops.length !== 1) continue;
+    const explicitlyAllocated = new Set(pickupStops
+      .filter((stop) => Array.isArray(stop.orderRefs))
+      .flatMap((stop) => stop.orderRefs)
+      .map((ref) => String(ref || "").trim().toLowerCase())
+      .filter(Boolean));
+    const refs = [];
+    for (const candidate of load.stops || []) {
+      if (candidate.type !== "drop") continue;
+      const order = stopOrder(candidate);
+      const ref = String(order?.id || "").trim();
+      if (!order || !ref || explicitlyAllocated.has(ref.toLowerCase())) continue;
+      if (!requiredPickupLocations(order).some((location) => normalizedPickupLocation(location) === locationKey)) continue;
+      if (!refs.some((value) => value.toLowerCase() === ref.toLowerCase())) refs.push(ref);
+    }
+    legacyStops[0].orderRefs = refs;
+  }
+}
+
+function driverActivityDetails(record = {}) {
+  const value = record.job_details || record.jobDetails || {};
+  if (value && typeof value === "object") return value;
+  try {
+    return JSON.parse(String(value || "{}"));
+  } catch {
+    return {};
+  }
+}
+
+function dispatchEditableRouteBoundary(load) {
+  const stops = load?.stops || [];
+  let boundary = stops.reduce((maximum, stop, index) =>
+    stopHasDriverActivity(load, stop) ? Math.max(maximum, index) : maximum
+  , -1);
+  for (const record of loadDriverActivityRecords(load)) {
+    const status = executionStatusFromRecord(record);
+    const type = String(record.stop_type || record.stopType || "").toLowerCase();
+    if (status !== "in_progress" || type !== "travel") continue;
+    const details = driverActivityDetails(record);
+    const toStopId = String(details.toStopId || details.to_stop_id || "").trim();
+    let targetIndex = toStopId
+      ? stops.findIndex((stop) => String(stop.id || "") === toStopId)
+      : -1;
+    if (targetIndex < 0) {
+      const travelStopId = String(record.stop_id || record.stopId || "");
+      targetIndex = stops.findIndex((stop) => travelStopId.endsWith(`-${String(stop.id || "")}`));
+    }
+    boundary = Math.max(boundary, targetIndex);
+  }
+  return boundary;
+}
+
+function lateOrderRoutePlacement(load, order, requestedIndex = null, stopDetails = {}) {
+  const stops = load?.stops || [];
+  const boundary = dispatchEditableRouteBoundary(load);
+  if (!loadHasDriverActivity(load)) {
+    const index = Number.isInteger(requestedIndex)
+      ? Math.max(0, Math.min(requestedIndex, stops.length))
+      : stops.length;
+    return { pickupInsertIndex: index, dropInsertIndex: index, boundary };
+  }
+  const desiredAddress = String(stopDetails.dropAddress || order?.address || order?.defaultDestinationAddress || "").trim();
+  const matchingIndexes = stops.map((candidate, index) => {
+    if (index <= boundary || candidate.type !== "drop" || stopHasDriverActivity(load, candidate)) return -1;
+    const candidateOrder = stopOrder(candidate);
+    if (!candidateOrder || !desiredAddress) return -1;
+    return samePhysicalAddress(stopAddress(candidate, candidateOrder), desiredAddress) ? index : -1;
+  }).filter((index) => index >= 0);
+  if (matchingIndexes.length) {
+    const first = matchingIndexes[0];
+    let last = first;
+    while (matchingIndexes.includes(last + 1)) last += 1;
+    return { pickupInsertIndex: first, dropInsertIndex: last + 1, boundary };
+  }
+  const requested = Number.isInteger(requestedIndex) ? requestedIndex : stops.length;
+  const index = Math.max(boundary + 1, Math.min(requested, stops.length));
+  return { pickupInsertIndex: index, dropInsertIndex: index, boundary };
+}
+
 function makePickupStop(load, order, location) {
   return {
     id: opaqueDispatchStopId(),
     loadId: load.id,
     orderId: order.id,
+    orderRefs: [order.id],
     type: "pick",
     location
   };
 }
 
-function ensurePickupStops(load, order, insertIndex = null) {
+function enablePickupVisitSchema(load) {
+  load.pickupVisitSchemaVersion = 1;
+}
+
+function ensurePickupStops(load, order, insertIndex = null, { activateSchema = false } = {}) {
+  materializePickupVisitOrderRefs(load);
   let added = 0;
   for (const location of requiredPickupLocations(order)) {
-    const exists = load.stops.some((stop) =>
+    const alreadyAllocated = load.stops.some((stop) =>
       stop.type === "pick"
       && normalizedPickupLocation(stop.location) === normalizedPickupLocation(location)
+      && pickupStopIncludesOrder(load, stop, order.id)
     );
-    if (exists) continue;
+    if (alreadyAllocated) continue;
+    const boundary = dispatchEditableRouteBoundary(load);
+    const pickupLimit = Number.isInteger(insertIndex) ? insertIndex + added : load.stops.length;
+    const reusable = load.stops.find((stop, index) =>
+      stop.type === "pick"
+      && normalizedPickupLocation(stop.location) === normalizedPickupLocation(location)
+      && index > boundary
+      && index <= pickupLimit
+      && !stopHasDriverActivity(load, stop)
+    );
+    if (reusable) {
+      reusable.orderRefs = [...pickupStopOrderRefs(load, reusable), order.id];
+      if (!reusable.orderId) reusable.orderId = order.id;
+      if (activateSchema) enablePickupVisitSchema(load);
+      continue;
+    }
     const stop = makePickupStop(load, order, location);
     if (Number.isInteger(insertIndex)) {
       load.stops.splice(insertIndex + added, 0, stop);
@@ -8380,8 +8837,105 @@ function ensurePickupStops(load, order, insertIndex = null) {
     } else {
       load.stops.push(stop);
     }
+    if (activateSchema) enablePickupVisitSchema(load);
   }
   return added;
+}
+
+function canSplitPickupVisit(load, stop) {
+  if (!load || !stop || stop.type !== "pick" || stopHasDriverActivity(load, stop)) return false;
+  const stopIndex = (load.stops || []).indexOf(stop);
+  return stopIndex > dispatchEditableRouteBoundary(load) && pickupStopOrderRefs(load, stop).length >= 2;
+}
+
+function pickupSplitDestinationOptions(load, stop, selectedRefs = null) {
+  if (!canSplitPickupVisit(load, stop)) return [];
+  const sourceIndex = load.stops.indexOf(stop);
+  const refs = Array.isArray(selectedRefs) && selectedRefs.length
+    ? selectedRefs
+    : pickupStopOrderRefs(load, stop);
+  const earliestDropIndex = Math.min(...refs.map((ref) => load.stops.findIndex((candidate, index) =>
+    index > sourceIndex
+    && candidate.type === "drop"
+    && String(candidate.orderId || "").toLowerCase() === String(ref).toLowerCase()
+  )).filter((index) => index >= 0));
+  const lastLegalIndex = Number.isFinite(earliestDropIndex) ? earliestDropIndex : load.stops.length;
+  const options = (load.stops || []).flatMap((candidate, index) => {
+    if (
+      candidate === stop
+      || candidate.type !== "pick"
+      || !sameDispatchLocation(candidate.location, stop.location)
+      || stopHasDriverActivity(load, candidate)
+      || index <= sourceIndex
+      || index > lastLegalIndex
+    ) return [];
+    return [{ value: `target:${candidate.id}`, label: `Add to existing pickup at stop ${index + 1}` }];
+  });
+  for (let index = sourceIndex + 1; index <= lastLegalIndex; index += 1) {
+    const nextStop = load.stops[index];
+    options.push({
+      value: `gap:${index}`,
+      label: nextStop ? `New pickup before stop ${index + 1}` : "New pickup at end of load"
+    });
+  }
+  return options;
+}
+
+function splitPickupVisit(loadId, stopId, orderRefs, destination = "") {
+  const found = findStop(stopId);
+  const load = found?.load;
+  const source = found?.stop;
+  if (!load || String(load.id || "") !== String(loadId || "") || !canSplitPickupVisit(load, source)) {
+    routeNotice = "This pickup visit changed or already started. Refresh before splitting it.";
+    return false;
+  }
+  const sourceRefs = pickupStopOrderRefs(load, source);
+  const selectedKeys = new Set((orderRefs || []).map((ref) => String(ref || "").trim().toLowerCase()).filter(Boolean));
+  const movedRefs = sourceRefs.filter((ref) => selectedKeys.has(String(ref).toLowerCase()));
+  const remainingRefs = sourceRefs.filter((ref) => !selectedKeys.has(String(ref).toLowerCase()));
+  if (!movedRefs.length || !remainingRefs.length || movedRefs.length !== selectedKeys.size) {
+    routeNotice = "Choose at least one whole order to move and leave at least one order in the first pickup.";
+    return false;
+  }
+  const boundary = dispatchEditableRouteBoundary(load);
+  const targetId = String(destination || "").startsWith("target:")
+    ? String(destination).slice("target:".length)
+    : "";
+  const target = targetId ? (load.stops || []).find((candidate) => String(candidate.id || "") === targetId) : null;
+  let insertionIndex = String(destination || "").startsWith("gap:")
+    ? Number(String(destination).slice("gap:".length))
+    : -1;
+  const targetIndex = target ? load.stops.indexOf(target) : insertionIndex;
+  const invalidDestination = target
+    ? target.type !== "pick" || !sameDispatchLocation(target.location, source.location) || stopHasDriverActivity(load, target)
+    : !Number.isInteger(insertionIndex);
+  const movedDropIndexes = movedRefs.map((ref) => load.stops.findIndex((candidate) =>
+    candidate.type === "drop" && String(candidate.orderId || "").toLowerCase() === String(ref).toLowerCase()
+  ));
+  if (
+    invalidDestination
+    || targetIndex <= Math.max(boundary, found.index)
+    || movedDropIndexes.some((index) => index < 0 || index < targetIndex)
+  ) {
+    routeNotice = "The later pickup must remain after completed work and before every selected order is delivered.";
+    return false;
+  }
+  source.orderRefs = remainingRefs;
+  source.orderId = remainingRefs[0];
+  if (target) {
+    target.orderRefs = [...new Set([...pickupStopOrderRefs(load, target), ...movedRefs])];
+    target.orderId = target.orderRefs[0];
+  } else {
+    insertionIndex = Math.max(0, Math.min(insertionIndex, load.stops.length));
+    const representative = orderById(movedRefs[0]) || { id: movedRefs[0] };
+    const created = makePickupStop(load, representative, source.location);
+    created.orderRefs = movedRefs;
+    load.stops.splice(insertionIndex, 0, created);
+  }
+  enablePickupVisitSchema(load);
+  invalidateDriverRoutesFromLoad(load.id);
+  routeNotice = `${movedRefs.length} order${movedRefs.length === 1 ? "" : "s"} moved to a later ${source.location} pickup visit.`;
+  return true;
 }
 
 function isScmGroupedPoOrder(order = {}) {
@@ -8502,18 +9056,20 @@ function cleanupOrphanPickupStops() {
       load.stops = load.stops.filter((stop) =>
         stop.type !== "drop" || Boolean(stopOrder(stop)) || stopHasDriverActivity(load, stop)
       );
-      const needed = new Set();
-      for (const stop of load.stops) {
-        if (stop.type !== "drop") continue;
-        const order = stopOrder(stop);
-        if (!order) continue;
-        for (const location of requiredPickupLocations(order)) needed.add(normalizedPickupLocation(location));
-      }
-      load.stops = load.stops.filter((stop) =>
-        stop.type !== "pick"
-        || needed.has(normalizedPickupLocation(stop.location))
-        || stopHasDriverActivity(load, stop)
-      );
+      materializePickupVisitOrderRefs(load);
+      load.stops = load.stops.filter((stop) => {
+        if (stop.type !== "pick" || stopHasDriverActivity(load, stop)) return true;
+        const validRefs = pickupStopOrderRefs(load, stop).filter((ref) => {
+          const matchingDrop = load.stops.find((candidate) =>
+            candidate.type === "drop" && String(candidate.orderId || "").toLowerCase() === String(ref).toLowerCase()
+          );
+          const order = matchingDrop ? stopOrder(matchingDrop) : null;
+          return Boolean(order && orderRequiresPickupLocation(order, stop.location));
+        });
+        stop.orderRefs = validRefs;
+        if (validRefs.length) stop.orderId = validRefs[0];
+        return validRefs.length > 0;
+      });
     }
   }
 }
@@ -9095,14 +9651,14 @@ function selectedOrders() {
 }
 
 function removeStopsForOrders(orderIds = []) {
-  const ids = new Set(orderIds.filter(Boolean));
+  const ids = new Set(orderIds.map(dispatchOrderRefKey).filter(Boolean));
   if (!ids.size) return [];
   const removed = [];
   for (const truck of trucks) {
     for (const load of truck.loads) {
       const beforeCount = load.stops.length;
       load.stops = load.stops.filter((stop) => {
-        const shouldRemove = ids.has(stop.orderId);
+        const shouldRemove = ids.has(dispatchOrderRefKey(stop.orderId));
         if (shouldRemove) removed.push({ truckId: truck.id, loadId: load.id, stop: summarizeStop(stop) });
         return !shouldRemove;
       });
@@ -9256,6 +9812,17 @@ function pickupStopLabel(stop, order) {
   return String(place.label || place.address || stop?.location || "Pickup");
 }
 
+function pickupVisitDisplayLabel(load, stop, order) {
+  const visits = (load?.stops || []).filter((candidate) =>
+    candidate.type === "pick" && sameDispatchLocation(candidate.location, stop?.location)
+  );
+  const visitCount = Math.max(visits.length, 1);
+  const visitNumber = Math.max(visits.indexOf(stop) + 1, 1);
+  const orderCount = pickupOrdersForStop(load, stop).length;
+  const visitText = visitCount > 1 ? ` · Visit ${visitNumber}/${visitCount}` : "";
+  return `${pickupStopLabel(stop, order)}${visitText} · ${orderCount} order${orderCount === 1 ? "" : "s"}`;
+}
+
 function stopIsOwnYard(stop, order) {
   if (stop.type === "pick") return resolveStopPlace(stop, order).kind === "own";
   const destinationYard = dropLocationForStop(stop, order);
@@ -9338,7 +9905,7 @@ function stopTimingBasisText(stop, order, parentTruck, load) {
   const minutesPerPallet = truckMinutesPerPallet(truck);
   const footprint = stop.type === "drop"
     ? dropFootprintPallets(order, stop)
-    : pickupFootprintForLocation(load, stop.location);
+    : pickupFootprintForStop(load, stop);
   const variableText = footprint > 0 && minutesPerPallet > 0
     ? ` + ${compactMinuteValue(minutesPerPallet)}/pos × ${Number(footprint.toFixed(2))}`
     : "";
@@ -10794,6 +11361,15 @@ function renderSelectedOrderActions() {
   const selected = selectedOrders();
   const includesCustomOrder = selected.some((item) => item.type === "CUSTOM");
   const label = selected.length > 1 ? `${selected.length} selected` : order.id;
+  const planningRestricted = selected.find(isDispatchPlanningRestricted);
+  if (planningRestricted) {
+    return `
+      <div class="selected-order-actions">
+        <span>${escapeHtml(label)}</span>
+        <span class="chip complete-chip">${escapeHtml(dispatchPlanningRestrictionText(planningRestricted))}</span>
+      </div>
+    `;
+  }
   const groupedCount = order.childOrders?.length || 0;
   const reviewOnly = selected.some((item) => isReviewOnlyOrder(item));
   const reconciliationBlocked = selected.some((item) => isScmReconciliationBlocked(item));
@@ -10859,7 +11435,9 @@ function renderOrderCard(order) {
   const dependencyParentPlanned = dependencyLinked && Boolean(dependentSalesAssignment.load || dependentSalesOrder?.dispatchPlanned);
   const anyPlanned = planned || plannedElsewhere;
   const reconciliationBlocked = isScmReconciliationBlocked(order);
-  const dragBlocked = anyPlanned || dependencyLinked || reconciliationBlocked;
+  const dispatchCompleted = order.dispatchCompletionStatus === "completed";
+  const planningRestricted = isDispatchPlanningRestricted(order);
+  const dragBlocked = anyPlanned || dependencyLinked || reconciliationBlocked || planningRestricted;
   const reviewOnly = isReviewOnlyOrder(order);
   const packedText = packedUnitText(order);
   const executionStatus = orderExecutionStatus(order.id);
@@ -10868,7 +11446,7 @@ function renderOrderCard(order) {
     : orderPlannedElsewhereText(order);
   const poReferenceText = poSourceReferenceText(order);
   return `
-    <article class="order-card status-${executionStatus} ${selectedOrderIds.has(order.id) ? "selected" : ""} ${planned ? "planned" : ""} ${plannedElsewhere ? "planned-elsewhere" : ""} ${dependencyLinked && !dependencyParentPlanned ? "dependency-linked" : ""} ${dependencyParentPlanned ? "dependency-parent-planned" : ""} ${reviewOnly ? "review-only" : ""} ${reconciliationBlocked || missingAddress || transitBlocked || order.dependencyAttention ? "warning" : ""}" draggable="${dragBlocked ? "false" : "true"}" data-order="${escapeHtml(order.id)}" data-planned="${anyPlanned ? "true" : "false"}" data-dependency-linked="${dependencyLinked ? "true" : "false"}" data-review-only="${reviewOnly ? "true" : "false"}" data-reconciliation-blocked="${reconciliationBlocked ? "true" : "false"}" data-planned-elsewhere="${plannedElsewhere ? "true" : "false"}">
+    <article class="order-card status-${executionStatus} ${selectedOrderIds.has(order.id) ? "selected" : ""} ${planned ? "planned" : ""} ${plannedElsewhere ? "planned-elsewhere" : ""} ${dependencyLinked && !dependencyParentPlanned ? "dependency-linked" : ""} ${dependencyParentPlanned ? "dependency-parent-planned" : ""} ${reviewOnly ? "review-only" : ""} ${planningRestricted ? "search-only" : ""} ${reconciliationBlocked || planningRestricted || missingAddress || transitBlocked || order.dependencyAttention ? "warning" : ""}" draggable="${dragBlocked ? "false" : "true"}" data-order="${escapeHtml(order.id)}" data-planned="${anyPlanned ? "true" : "false"}" data-dependency-linked="${dependencyLinked ? "true" : "false"}" data-review-only="${reviewOnly ? "true" : "false"}" data-reconciliation-blocked="${reconciliationBlocked ? "true" : "false"}" data-planning-restricted="${planningRestricted ? "true" : "false"}" data-planned-elsewhere="${plannedElsewhere ? "true" : "false"}">
       <strong>${escapeHtml(order.id)} | ${escapeHtml(order.customer)}</strong>
       ${poReferenceText ? `<span class="order-compact-line po-source-reference">${escapeHtml(poReferenceText)}</span>` : ""}
       <span>${plannedElsewhere ? escapeHtml(orderPlannedElsewhereText(order)) : missingAddress ? "Missing delivery address" : transitBlocked ? escapeHtml(transitMessage) : escapeHtml(movementText(order))}</span>
@@ -10882,6 +11460,7 @@ function renderOrderCard(order) {
         ${order.historicalReconciliationComplete ? `<span class="chip history-chip">Reconciliation history</span>` : ""}
         ${executionStatus === "complete" ? `<span class="chip complete-chip">Completed</span>` : executionStatus === "in_progress" ? `<span class="chip progress-chip">In progress</span>` : ""}
         ${reviewOnly ? `<span class="chip complete-chip">${escapeHtml(reviewOnlyText(order))}</span>` : ""}
+        ${planningRestricted ? `<span class="chip complete-chip" title="${escapeHtml(dispatchPlanningRestrictionText(order))}">Completed · search only</span>` : ""}
         ${reconciliationBlocked ? `<span class="chip warn" title="${escapeHtml(scmReconciliationBlockText(order))}">Reconcile Review</span>` : ""}
         ${anyPlanned ? `<span class="chip planned-chip">${escapeHtml(plannedText)}</span>` : ""}
         ${missingAddress ? `<span class="chip warn">Update address</span>` : ""}
@@ -10891,7 +11470,7 @@ function renderOrderCard(order) {
         ${order.type === "CO" ? `<span class="chip">For ${escapeHtml(order.sourceOrderId || order.relatedSoId || "SO")}</span>` : ""}
         ${order.scm?.isSpecialOrder ? `<span class="chip warn">Sp.O</span>` : ""}
         ${order.testFixture ? `<span class="chip">TEST</span>` : ""}
-        ${order.scm?.status && order.scm.status !== "Queued" ? `<span class="chip">${escapeHtml(order.scm.status)}</span>` : ""}
+        ${!dispatchCompleted && order.scm?.status && order.scm.status !== "Queued" ? `<span class="chip">${escapeHtml(order.scm.status)}</span>` : ""}
         ${order.scm?.packingSlipRef ? `<span class="chip">Ref ${escapeHtml(order.scm.packingSlipRef)}</span>` : ""}
         ${order.scm?.groupRef ? `<span class="chip">PGOB ${escapeHtml(order.scm.groupRef.replace(/^PGOB-/, ""))}</span>` : ""}
         ${(order.dependencyLabels || []).map((label) => `<span class="chip ${/attention|uncovered/i.test(label) ? "warn" : ""}">${escapeHtml(label)}</span>`).join("")}
@@ -11305,8 +11884,9 @@ function renderStop(truck, load, stop, index, row) {
     <article class="stop-card compact status-${executionStatus} ${isPick ? "pick" : ""} ${selectedOrderId === order.id ? "selected-order-stop" : ""} ${showWarning ? "warning" : ""}" draggable="${isDispatchPlanEditor()}" data-load="${escapeHtml(stop.loadId)}" data-stop="${escapeHtml(stop.id)}" data-order="${escapeHtml(order.id)}" data-index="${index}">
       <button class="stop-remove" data-action="remove-stop" data-stop="${escapeHtml(stop.id)}" ${removalLocked ? "disabled" : ""} title="${removalLocked ? escapeHtml(stopActivityLockNotice(stop)) : "Remove stop"}" type="button">x</button>
       <div class="stop-main">
-        <strong>${index + 1}. ${escapeHtml(isPick ? `Pickup ${pickupStopLabel(stop, order)}` : dropStopLabel(stop, order))}</strong>
+        <strong>${index + 1}. ${escapeHtml(isPick ? `Pickup ${pickupVisitDisplayLabel(load, stop, order)}` : dropStopLabel(stop, order))}</strong>
         <span>${escapeHtml(stopAddress(stop, order))}</span>
+        ${isPick && canSplitPickupVisit(load, stop) ? `<button class="pickup-visit-split" data-action="open-pickup-visit-split" data-load="${escapeHtml(load.id)}" data-stop="${escapeHtml(stop.id)}" type="button">Split pickup visit</button>` : ""}
       </div>
       <div class="stop-time">${timingSummaryHtml({
         status: executionStatus,
@@ -11954,7 +12534,7 @@ function renderPreviewTruckSwitchStop(truck, load, stats, displayOffset = 0) {
 function renderPreviewStop(truck, load, stop, index, row, displayIndex = index) {
   const order = stopOrder(stop);
   if (!order) return "";
-  const label = stop.type === "pick" ? `${displayIndex + 1}. Pickup | ${pickupStopLabel(stop, order)}` : `${displayIndex + 1}. Drop | ${dropStopLabel(stop, order)}`;
+  const label = stop.type === "pick" ? `${displayIndex + 1}. Pickup | ${pickupVisitDisplayLabel(load, stop, order)}` : `${displayIndex + 1}. Drop | ${dropStopLabel(stop, order)}`;
   const sub = stopAddress(stop, order);
   const executionStatus = stopExecutionStatus(truck, load, stop);
   const record = driverRecordForStop(truck, load, stop);
@@ -11969,6 +12549,7 @@ function renderPreviewStop(truck, load, stop, index, row, displayIndex = index) 
       <div class="stop-main">
         <strong>${escapeHtml(label)}</strong>
         <span>${escapeHtml(sub)}</span>
+        ${stop.type === "pick" && canSplitPickupVisit(load, stop) ? `<button class="pickup-visit-split" data-action="open-pickup-visit-split" data-load="${escapeHtml(load.id)}" data-stop="${escapeHtml(stop.id)}" type="button">Split pickup visit</button>` : ""}
       </div>
       <div class="stop-time">
         ${timingSummaryHtml({
@@ -12851,6 +13432,55 @@ function renderModal() {
       </div>
     `;
   }
+  if (modalType === "pickup-visit") {
+    const { load } = findLoad(modalLoadId);
+    const stop = (load?.stops || []).find((candidate) => String(candidate.id || "") === String(modalStopId || ""));
+    const refs = stop ? pickupStopOrderRefs(load, stop) : [];
+    const defaultMoveCount = Math.min(2, Math.max(refs.length - 1, 0));
+    const defaultMovedRefs = refs.slice(refs.length - defaultMoveCount);
+    const destinations = stop ? pickupSplitDestinationOptions(load, stop, defaultMovedRefs) : [];
+    const defaultDestination = destinations.at(-1)?.value || "";
+    return `
+      <div class="modal-backdrop show">
+        <section class="dispatch-modal">
+          <div class="modal-header">
+            <div>
+              <h2>Split Pickup Visit</h2>
+              <p>${escapeHtml(stop?.location || "Pickup")} · move whole orders to a later visit</p>
+            </div>
+            <button data-action="close-modal" type="button">Close</button>
+          </div>
+          <form class="modal-body" data-form="pickup-visit-split">
+            <div class="pickup-visit-order-list">
+              ${refs.map((ref, index) => {
+                const pickupOrder = orderById(ref);
+                const checked = index >= refs.length - defaultMoveCount ? "checked" : "";
+                return `
+                  <label class="modal-choice">
+                    <input name="pickupOrderRef" value="${escapeHtml(ref)}" type="checkbox" ${checked} />
+                    <strong>${escapeHtml(ref)}</strong>
+                    <span>${escapeHtml(pickupOrder?.customer || "")} · ${pickupOrder ? orderFootprintPallets(pickupOrder) : 0} pos</span>
+                  </label>
+                `;
+              }).join("") || `<div class="warning-detail">This pickup allocation is no longer available.</div>`}
+            </div>
+            <label class="split-field">
+              <span>Later pickup position</span>
+              <select name="pickupDestination" ${destinations.length ? "" : "disabled"}>
+                ${destinations.map((option) => `<option value="${escapeHtml(option.value)}" ${option.value === defaultDestination ? "selected" : ""}>${escapeHtml(option.label)}</option>`).join("")}
+              </select>
+            </label>
+            <div class="warning-detail">Only the selected whole orders move. Completed and in-progress stops remain unchanged.</div>
+            <div class="modal-status" data-edit-status></div>
+            <div class="modal-footer">
+              <button data-action="close-modal" type="button">Cancel</button>
+              <button class="primary" type="submit" ${refs.length >= 2 && destinations.length ? "" : "disabled"}>Create Later Pickup</button>
+            </div>
+          </form>
+        </section>
+      </div>
+    `;
+  }
   const order = orderById(modalOrderId) || selectedOrder();
   if (!order) return "";
   if (modalType === "transit-co") {
@@ -13308,6 +13938,12 @@ function addOrderToLoad(orderId, loadId, type = "drop", location = "", insertInd
   const { truck, load } = findLoad(loadId);
   const order = orderById(orderId);
   if (!load || !order) return false;
+  if (type === "drop" && isDispatchPlanningRestricted(order)) {
+    selectedOrderId = orderId;
+    selectedOrderIds = new Set([orderId]);
+    routeNotice = dispatchPlanningRestrictionText(order);
+    return false;
+  }
   if (type === "drop" && isScmReconciliationBlocked(order)) {
     selectedOrderId = orderId;
     selectedOrderIds = new Set([orderId]);
@@ -13360,10 +13996,20 @@ function addOrderToLoad(orderId, loadId, type = "drop", location = "", insertInd
     return false;
   }
   const beforeStops = (load.stops || []).map((stop) => ({ ...stop }));
-  let cleanInsertIndex = Number.isInteger(normalizedInsertIndex) ? normalizedInsertIndex : null;
+  const routePlacement = type === "drop"
+    ? lateOrderRoutePlacement(load, order, normalizedInsertIndex, stopDetails)
+    : null;
+  let cleanInsertIndex = routePlacement
+    ? routePlacement.dropInsertIndex
+    : Number.isInteger(normalizedInsertIndex) ? normalizedInsertIndex : null;
   if (type === "drop") {
-    const addedPickups = ensurePickupStops(load, order, cleanInsertIndex);
-    if (Number.isInteger(cleanInsertIndex)) cleanInsertIndex += addedPickups;
+    const pickupInsertIndex = routePlacement?.pickupInsertIndex ?? cleanInsertIndex;
+    const addedPickups = ensurePickupStops(load, order, pickupInsertIndex, { activateSchema: true });
+    if (
+      Number.isInteger(cleanInsertIndex)
+      && Number.isInteger(pickupInsertIndex)
+      && pickupInsertIndex <= cleanInsertIndex
+    ) cleanInsertIndex += addedPickups;
     if (["SO", "TO"].includes(order.type)) pendingOperatorAlertRefs.add(order.id);
   }
   const stopLocation = location || order.pickupLocations[0] || "3445";
@@ -13892,6 +14538,7 @@ function groupOrder(orderId) {
     id: uniqueGroupedDispatchOrderId(leafItems),
     groupPlanId: currentPlan?.id || "",
     groupPlanDate: currentPlanDate,
+    planOwned: true,
     customer: `${leafItems.length} orders grouped`,
     address: groupItems[0].address,
     pallets: groupItems.reduce((sum, item) => sum + Number(item.pallets || 0), 0),
@@ -14068,6 +14715,7 @@ function consolidatePick(orderId, sourceYard) {
       y: HUBS[dispatchLocationHierarchyRoot(targetYard)]?.y || 50
     });
   }
+  queueGlobalOrderReactivation(draftId);
   order.notes = `Consolidate ${shortage} units from ${sourceYard} to ${targetYard} one day before. ${order.notes}`;
   activeOrderType = "TO";
   searchText = "";
@@ -14188,7 +14836,9 @@ async function saveTransitCoToServer(sourceOrder, coOrder) {
     })
   });
   if (!response.ok) throw new Error(await response.text());
-  return response.json();
+  const payload = await response.json();
+  setAuthoritativeOrderRetirement(coOrder.id, false);
+  return payload;
 }
 
 async function cancelTransitCoOnServer(coId) {
@@ -14214,8 +14864,8 @@ function persistTransitCoInBackground(promise, successMessage = "") {
 }
 
 function clearTransitCoFromOrderSnapshot(order = {}, coId = "") {
-  const targetCoId = String(coId || "").trim();
-  const activeCoId = String(order?.transitCo?.id || "").trim();
+  const targetCoId = dispatchOrderRefKey(coId);
+  const activeCoId = dispatchOrderRefKey(order?.transitCo?.id);
   const shouldClear = Boolean(activeCoId) && (!targetCoId || activeCoId === targetCoId);
   const childOrderDetails = (Array.isArray(order?.childOrderDetails) ? order.childOrderDetails : [])
     .map((child) => clearTransitCoFromOrderSnapshot(child, targetCoId));
@@ -14299,10 +14949,7 @@ function cancelTransitCoForOrder(orderId) {
 function optimizeSelectedRoute() {
   const { load } = selectedLoad();
   if (!load) return;
-  const activityIndexes = (load.stops || [])
-    .map((stop, index) => stopHasDriverActivity(load, stop) ? index : -1)
-    .filter((index) => index >= 0);
-  const boundary = activityIndexes.length ? Math.max(...activityIndexes) : -1;
+  const boundary = dispatchEditableRouteBoundary(load);
   const lockedPrefix = load.stops.slice(0, boundary + 1);
   const editableSuffix = load.stops.slice(boundary + 1).sort((a, b) => {
     if (a.type !== b.type) return a.type === "pick" ? -1 : 1;
@@ -14447,6 +15094,12 @@ app.addEventListener("dragstart", (event) => {
       });
       renderDispatchOrderPoolPatch();
       return;
+    }
+    if (orderCard.dataset.planningRestricted === "true" || isDispatchPlanningRestricted(order)) {
+      event.preventDefault();
+      dragged = null;
+      routeNotice = dispatchPlanningRestrictionText(order);
+      return render({ save: false });
     }
     if (orderCard.dataset.reconciliationBlocked === "true" || isScmReconciliationBlocked(order)) {
       event.preventDefault();
@@ -14870,6 +15523,7 @@ app.addEventListener("click", async (event) => {
     modalType = "";
     modalOrderId = "";
     modalLoadId = "";
+    modalStopId = "";
     poAllocationOptions = null;
     poAllocationLoading = false;
     poAllocationError = "";
@@ -15135,7 +15789,12 @@ app.addEventListener("click", async (event) => {
     try {
       const payload = await cancelTransitCoOnServer(coId);
       mergeTargetedDispatchMutationOrders(payload);
+      setAuthoritativeOrderRetirement(coId, true);
       const cancelled = cancelTransitCoForOrder(order.id);
+      plannedAssignmentRefs = new Set([...plannedAssignmentRefs]
+        .filter((ref) => dispatchOrderRefKey(ref) !== dispatchOrderRefKey(coId)));
+      plannedAssignmentsByRef.delete(dispatchOrderRefKey(coId));
+      resetUndoHistory();
       requestTargetedOrderPoolRefresh([order.id, coId]);
       routeNotice = `${cancelled?.coId || coId} cancelled. ${order.id} pickup restored.`;
       modalType = "";
@@ -15168,6 +15827,20 @@ app.addEventListener("click", async (event) => {
     selectedOrderId = actionOrderId;
     if (!selectedOrderIds.has(actionOrderId)) selectedOrderIds = new Set([actionOrderId]);
   }
+  if (action === "open-pickup-visit-split") {
+    const found = findStop(button.dataset.stop);
+    if (!found || !canSplitPickupVisit(found.load, found.stop)) {
+      routeNotice = "This pickup visit changed or already started. Refresh before splitting it.";
+      render({ save: false });
+      return;
+    }
+    modalType = "pickup-visit";
+    modalLoadId = found.load.id;
+    modalStopId = found.stop.id;
+    modalOrderId = pickupStopOrderRefs(found.load, found.stop)[0] || found.stop.orderId || "";
+    renderDispatchModalInPlace();
+    return;
+  }
   if (action === "open-group-modal") {
     modalType = "group";
     modalOrderId = actionOrderId;
@@ -15182,7 +15855,7 @@ app.addEventListener("click", async (event) => {
       render({ save: false });
       return;
     }
-    pendingGlobalOrderRetireRefs.add(actionOrderId);
+    queueGlobalOrderRetirement(actionOrderId);
     requestTargetedOrderPoolRefresh(refreshRefs);
     commitPlanMutation("ungroup_order");
     return;
@@ -15200,6 +15873,7 @@ app.addEventListener("click", async (event) => {
         originalOrderId: prepared.parent.id,
         orderType: prepared.parent.type,
         splitOrderIds: prepared.siblingIds,
+        planId: currentPlan?.id || "",
         planDate: currentPlanDate,
         editLeaseToken: planEditLeaseToken,
         audit: { sessionId: dispatchSessionId }
@@ -15209,6 +15883,7 @@ app.addEventListener("click", async (event) => {
       return response.json();
     }).then(() => {
       applyUnsplitOrder(prepared);
+      prepared.siblingIds.forEach(queueGlobalOrderRetirement);
       requestTargetedOrderPoolRefresh([prepared.parent.id]);
       commitPlanMutation("unsplit_order");
     }).catch((error) => {
@@ -15396,7 +16071,8 @@ app.addEventListener("click", async (event) => {
       render({ save: false });
       return;
     }
-    replacedGroupRefs.forEach((ref) => pendingGlobalOrderRetireRefs.add(ref));
+    replacedGroupRefs.forEach(queueGlobalOrderRetirement);
+    queueGlobalOrderReactivation(selectedOrderId);
     requestTargetedOrderPoolRefresh([selectedOrderId]);
     logDispatchAudit({
       action: "orders_grouped",
@@ -15452,6 +16128,10 @@ app.addEventListener("click", async (event) => {
       .then((seed) => {
         splitOrder(button.dataset.order, splitParts, seed.nextSuffix);
         const created = orders.filter((item) => item.originalOrderId === button.dataset.order).map(summarizeOrder);
+        created.forEach((item) => {
+          const ref = String(item?.id || "").trim();
+          if (ref) queueGlobalOrderReactivation(ref);
+        });
         requestTargetedOrderPoolRefresh(created.map((item) => item?.id).filter(Boolean));
         logDispatchAudit({
           action: "order_split",
@@ -16477,8 +17157,23 @@ app.addEventListener("submit", async (event) => {
   if (!form) return;
   if (form.dataset.form === "dispatch-login") return;
   event.preventDefault();
-  if (["po-link", "to-link", "transit-co", "edit-order-details"].includes(form.dataset.form) && !ensureDispatchPlanEditor()) return;
+  if (["po-link", "to-link", "transit-co", "edit-order-details", "pickup-visit-split"].includes(form.dataset.form) && !ensureDispatchPlanEditor()) return;
   const data = Object.fromEntries(new FormData(form).entries());
+  if (form.dataset.form === "pickup-visit-split") {
+    const formData = new FormData(form);
+    const selectedRefs = formData.getAll("pickupOrderRef").map(String);
+    const destination = String(formData.get("pickupDestination") || "");
+    if (!splitPickupVisit(modalLoadId, modalStopId, selectedRefs, destination)) {
+      setEditFormStatus(form, routeNotice, "error");
+      return;
+    }
+    modalType = "";
+    modalOrderId = "";
+    modalLoadId = "";
+    modalStopId = "";
+    commitPlanMutation("split_pickup_visit");
+    return;
+  }
   if (form.dataset.form === "to-link") {
     const order = orderById(modalOrderId);
     if (!order) return;

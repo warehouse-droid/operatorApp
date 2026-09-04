@@ -1,6 +1,8 @@
 import crypto from "node:crypto";
 
 import { query, withTransaction } from "./db.js";
+import { overlayDispatchOrderCompletionStatuses } from "./dispatch-completion-repository.js";
+import { reconcileDispatchGlobalOrderSources } from "./dispatch-delivery-group-repository.js";
 import {
   compactDispatchOrderCard,
   dispatchOrderSearchText
@@ -71,6 +73,40 @@ function catalogRows(orders = [], source = "") {
   return rows;
 }
 
+async function catalogOrdersExcludingGlobalDefinitions(orders = []) {
+  const candidates = Array.isArray(orders) ? orders : [];
+  const refs = [...new Set(candidates.map((order) => orderRef(order).toLowerCase()).filter(Boolean))];
+  if (!refs.length) return candidates;
+  const definitions = await query(
+    `SELECT lower(group_ref) AS order_ref
+       FROM dispatch_global_order_groups
+      WHERE lower(group_ref) = ANY($1::text[])
+     UNION
+     SELECT lower(split_ref) AS order_ref
+       FROM dispatch_global_order_splits
+      WHERE lower(split_ref) = ANY($1::text[])`,
+    [refs]
+  );
+  const definitionRefs = new Set(definitions.rows.map((row) => text(row.order_ref)).filter(Boolean));
+  if (!definitionRefs.size) return candidates;
+  const deleted = await query(
+    `DELETE FROM dispatch_order_catalog_entries
+      WHERE lower(order_ref) = ANY($1::text[])
+      RETURNING order_ref`,
+    [[...definitionRefs]]
+  );
+  if (deleted.rowCount) {
+    await query(
+      `UPDATE dispatch_order_catalog_state
+          SET generation = generation + 1,
+              catalog_count = (SELECT count(*)::int FROM dispatch_order_catalog_entries),
+              updated_at = now()
+        WHERE singleton = true`
+    );
+  }
+  return candidates.filter((order) => !definitionRefs.has(orderRef(order).toLowerCase()));
+}
+
 async function upsertRows(rows = []) {
   if (!rows.length) return { upserted: 0 };
   const result = await query(
@@ -114,14 +150,20 @@ async function upsertRows(rows = []) {
 }
 
 export async function upsertDispatchOrderCatalog({ orders = [], source = "" } = {}) {
-  return withTransaction(() => upsertRows(catalogRows(orders, source)));
+  return withTransaction(async () => {
+    const sourceOrders = await catalogOrdersExcludingGlobalDefinitions(orders);
+    const upserted = await upsertRows(catalogRows(sourceOrders, source));
+    await reconcileDispatchGlobalOrderSources({ orders: sourceOrders });
+    return upserted;
+  });
 }
 
 export async function replaceDispatchOrderCatalog({ orders = [], source = "", type = "" } = {}) {
   const requestedType = text(type).toUpperCase();
-  const rows = catalogRows(orders, source)
-    .filter((row) => !requestedType || row.order_type === requestedType);
   return withTransaction(async () => {
+    const sourceOrders = await catalogOrdersExcludingGlobalDefinitions(orders);
+    const rows = catalogRows(sourceOrders, source)
+      .filter((row) => !requestedType || row.order_type === requestedType);
     const upserted = await upsertRows(rows);
     const refs = rows.map((row) => row.order_ref.toLowerCase());
     const deleted = requestedType
@@ -153,6 +195,7 @@ export async function replaceDispatchOrderCatalog({ orders = [], source = "", ty
         WHERE singleton = true`,
       [text(source), rows.length]
     );
+    await reconcileDispatchGlobalOrderSources({ orders: sourceOrders });
     return {
       ...upserted,
       deleted: deleted.rowCount,
@@ -182,6 +225,11 @@ export async function getDispatchOrderCatalogOrder(ref) {
           WHERE lower(catalog.order_ref) = lower($1)
             AND NOT EXISTS (
               SELECT 1
+                FROM dispatch_global_order_groups global_group
+               WHERE lower(global_group.group_ref) = lower(catalog.order_ref)
+            )
+            AND NOT EXISTS (
+              SELECT 1
                 FROM dispatch_global_order_splits retired_split
                WHERE retired_split.active = false
                  AND lower(retired_split.split_ref) = lower(catalog.order_ref)
@@ -191,7 +239,9 @@ export async function getDispatchOrderCatalogOrder(ref) {
       LIMIT 1`,
     [cleanRef]
   );
-  return result.rows[0]?.full_order || null;
+  const order = result.rows[0]?.full_order || null;
+  if (!order) return null;
+  return (await overlayDispatchOrderCompletionStatuses([order]))[0] || null;
 }
 
 export async function removeDispatchOrderCatalogOrder(ref) {
@@ -281,8 +331,7 @@ export async function listDispatchOrderPool({
         WHERE NOT EXISTS (
           SELECT 1
             FROM dispatch_global_order_groups global_group
-           WHERE global_group.active = true
-             AND lower(global_group.group_ref) = lower(catalog.order_ref)
+           WHERE lower(global_group.group_ref) = lower(catalog.order_ref)
         )
           AND NOT EXISTS (
             SELECT 1
@@ -415,9 +464,14 @@ export async function listDispatchOrderPool({
   const hasMore = result.rows.length > safeLimit;
   const page = result.rows.slice(0, safeLimit);
   const last = page.at(-1);
-  const state = await getDispatchOrderCatalogState();
+  const [orders, state] = await Promise.all([
+    overlayDispatchOrderCompletionStatuses(
+      page.map((row) => ({ ...row.card, ...assignmentFields(row) }))
+    ),
+    getDispatchOrderCatalogState()
+  ]);
   return {
-    orders: page.map((row) => ({ ...row.card, ...assignmentFields(row) })),
+    orders,
     nextCursor: hasMore && last ? encodeCursor({
       e: Number(last.exact_rank || 0),
       d: new Date(last.activity_at).toISOString(),
@@ -434,6 +488,17 @@ export async function getDispatchOrderCatalogState() {
   const result = await query(
     `SELECT state.status, state.generation, state.source, state.catalog_count,
             state.legacy_count, state.assignments_ready,
+            NOT EXISTS (
+              SELECT 1
+                FROM dispatch_plans plan
+                LEFT JOIN dispatch_plan_projection_state projection
+                  ON projection.plan_id = plan.id
+               WHERE plan.status <> 'cancelled'
+                 AND (
+                   projection.plan_id IS NULL
+                   OR projection.source_revision <> COALESCE(plan.revision, 0)
+                 )
+            ) AS actual_assignments_ready,
             state.shadow_match_count, state.shadow_mismatch_count,
             state.last_shadow_comparison_at,
             state.last_full_refresh_at, state.last_error, state.updated_at,
@@ -451,7 +516,7 @@ export async function getDispatchOrderCatalogState() {
     source: row.source || "",
     catalogCount: Number(row.catalog_count || 0),
     legacyCount: Number(row.legacy_count || 0),
-    assignmentsReady: row.assignments_ready === true,
+    assignmentsReady: row.assignments_ready === true && row.actual_assignments_ready === true,
     shadowMatchCount: Number(row.shadow_match_count || 0),
     shadowMismatchCount: Number(row.shadow_mismatch_count || 0),
     pendingRefreshCount: Number(row.pending_refresh_count || 0),
@@ -467,7 +532,17 @@ export async function markDispatchOrderCatalogReady({ source = "", assignmentsRe
     `UPDATE dispatch_order_catalog_state
         SET status = 'ready',
             source = $1,
-            assignments_ready = $2,
+            assignments_ready = $2::boolean AND NOT EXISTS (
+              SELECT 1
+                FROM dispatch_plans plan
+                LEFT JOIN dispatch_plan_projection_state projection
+                  ON projection.plan_id = plan.id
+               WHERE plan.status <> 'cancelled'
+                 AND (
+                   projection.plan_id IS NULL
+                   OR projection.source_revision <> COALESCE(plan.revision, 0)
+                 )
+            ),
             catalog_count = (SELECT count(*)::int FROM dispatch_order_catalog_entries),
             last_error = '',
             updated_at = now()

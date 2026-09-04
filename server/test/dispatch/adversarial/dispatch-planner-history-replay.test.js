@@ -5,9 +5,47 @@ import {
   DISPATCH_RISKY_INTERACTION_KEYS,
   buildDispatchHistoricalReplayArtifact,
   buildDispatchHistoricalReplayReport,
+  buildDispatchPickupRevisitReplay,
   compareDispatchReplayProjections,
   sanitizeDispatchReplayPlan
 } from "../../../src/dispatch-planner-replay.js";
+
+function repeatPickupPlan() {
+  return {
+    id: "REVISIT-PLAN",
+    planDate: "2026-09-01",
+    revision: 4,
+    pickupVisitSchemaVersion: 1,
+    orders: [{
+      id: "SO-A",
+      type: "SO",
+      pickupLocations: ["3445"],
+      sourceYard: "3445",
+      address: "55 Customer Road, Milton",
+      items: [{ lineRowId: "A", pallets: 3 }]
+    }, {
+      id: "SO-V",
+      type: "SO",
+      pickupLocations: ["Vendor Yard"],
+      address: "77 Vendor Customer Road",
+      items: [{ lineRowId: "V", pallets: 1 }]
+    }],
+    trucks: [{
+      id: "T",
+      plate: "TRUCK-PRIVATE",
+      driverLogin: "private-driver",
+      loads: [{
+        id: "L",
+        stops: [
+          { id: "P-A", type: "pick", location: "3445", orderId: "SO-A", orderRefs: ["SO-A"] },
+          { id: "P-V", type: "pick", location: "Vendor Yard", orderId: "SO-V", orderRefs: ["SO-V"] },
+          { id: "D-V", type: "drop", orderId: "SO-V", orderRefs: ["SO-V"] },
+          { id: "D-A", type: "drop", orderId: "SO-A", orderRefs: ["SO-A"] }
+        ]
+      }]
+    }]
+  };
+}
 
 function interactingPlan() {
   return {
@@ -64,6 +102,50 @@ test("DPO-14 replay sanitizer removes PII while retaining every risky relationsh
     groupPoLink: true,
     groupToLink: true
   });
+});
+
+test("RP-10 replay sanitizer preserves private location/address equality and synthetic revisit is safe", () => {
+  const plan = sanitizeDispatchReplayPlan(repeatPickupPlan(), { salt: "repeat-pickup-replay" });
+  const serialized = JSON.stringify(plan);
+  assert.doesNotMatch(serialized, /Customer Road|Vendor Yard|3445|private-driver|TRUCK-PRIVATE/u);
+  assert.equal(plan.orders[0].pickupLocations[0], plan.trucks[0].loads[0].stops[0].location);
+  assert.ok(plan.orders[0].address.startsWith("ADDRESS_"));
+  const report = buildDispatchPickupRevisitReplay({
+    capture: {
+      events: [{
+        stream: "dispatch",
+        id: "plan-state",
+        serverAt: "2026-09-01T12:00:00.000Z",
+        planState: plan
+      }],
+      driverActivity: [{
+        planId: plan.id,
+        loadId: plan.trucks[0].loads[0].id,
+        stopId: plan.trucks[0].loads[0].stops[0].id,
+        stopType: "pickup",
+        status: "complete",
+        orderRefs: [plan.orders[0].id]
+      }, {
+        planId: plan.id,
+        loadId: plan.trucks[0].loads[0].id,
+        stopId: "TRAVEL",
+        stopType: "travel",
+        status: "in_progress",
+        jobDetails: { toStopId: plan.trucks[0].loads[0].stops[1].id }
+      }]
+    }
+  });
+  assert.equal(report.planStatesExamined, 1);
+  assert.equal(report.compatibilityPlanStatesChecked, 1);
+  assert.equal(report.legacyPassthroughConflictCount, 0);
+  assert.equal(report.legacyPassthroughRouteMutationCount, 0);
+  assert.equal(report.sourcePlanStatesEligibleForInjection, 1);
+  assert.equal(report.fakeOrdersInjected, 1);
+  assert.equal(report.revisitPickupsCreated, 1);
+  assert.equal(report.validationFailureCount, 0);
+  assert.equal(report.prefixViolationCount, 0);
+  assert.equal(report.driverScopeFailureCount, 0);
+  assert.ok(Object.values(report.assertions).every(Boolean), JSON.stringify(report));
 });
 
 test("DPO-14 causal replay compares after every cross-system event and keeps evidence gaps visible", () => {

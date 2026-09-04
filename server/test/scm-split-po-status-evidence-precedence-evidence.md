@@ -2,8 +2,8 @@
 
 Date: 2026-08-27
 
-Deployment state: not deployed. Production was inspected read-only and was not
-mutated by this work.
+Original deployment state: not deployed. The 2026-09-01 addendum below records
+the later authorized deployment and targeted production recalculation.
 
 ## Diagnosis
 
@@ -63,3 +63,25 @@ After an explicitly authorized deployment, a targeted reconciliation replay
 for source families `POB03535` and `POB03658` can apply the corrected
 projection idempotently. No blanket production reconciliation and no forced
 completion of `TOB00960` is authorized by this evidence.
+
+## 2026-09-01 deployment and live replay addendum
+
+- Inferred prior `Completed` and `Partially Done` states now fall back to an
+  operational scheduling state when exact/pinned/Driver completion evidence is
+  absent: `Planned` only with a real active assignment, otherwise `Queued`.
+- Authoritative completion remains terminal and monotonic; genuine review,
+  cancellation, and closure behavior is unchanged.
+- The final evidence gate passed status coverage at 100% statements/functions/
+  lines and 97.29% branches, with 10/10 mutants killed. The combined allocation
+  gate also passed 11/11 mutants, lint, typecheck, secret scans, and source-state
+  restoration.
+- Release `mbbs-operator-app:split-po-queued-20260901T215140Z` was deployed to
+  app and webhook worker in 2.20 seconds. The database was not restarted and
+  Driver PWA asset hashes were unchanged.
+- POB03535 was recalculated twice in separate committed transactions. Both
+  passes produced the same child result for `3022143273`: received `0`,
+  remaining `2323.2`, `Queued`, reconciliation `ok`, not blocked, no active
+  assignment, and zero open review cases.
+- The persisted raw schedule observation remains `Partially Done` for audit
+  history; both the SCM UI and Dispatch projection consume the authoritative
+  `calculatedStatus`, which is `Queued`.

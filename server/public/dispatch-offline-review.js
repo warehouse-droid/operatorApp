@@ -3,6 +3,7 @@ const offlineReviewT = (key, fallback) => window.MBBS_I18N?.t?.(key, fallback) |
 const OFFLINE_REVIEW_COUNT_ENDPOINT = "/api/dispatch/offline-review/count";
 const OFFLINE_REVIEW_LIST_ENDPOINT = "/api/dispatch/offline-review";
 const DRIVER_PWA_STOPS_ENDPOINT = "/api/dispatch/driver-pwa/stops";
+const DRIVER_PWA_VISITS_ENDPOINT = "/api/dispatch/driver-pwa/visits";
 const HISTORICAL_ASSIST_ENDPOINT = "/api/dispatch/driver-pwa/historical-assist";
 const DRIVER_OFFLINE_OPEN_STATUSES = new Set([
   "registered",
@@ -16,6 +17,7 @@ const DRIVER_OFFLINE_OPEN_STATUSES = new Set([
 
 let offlineReviewOperator = null;
 let driverPwaSurface = "stops";
+let driverPwaStopsMode = "recorded";
 let driverPwaStopsDate = driverPwaTorontoDate();
 let driverPwaStops = [];
 let driverPwaClientSyncIssues = [];
@@ -24,6 +26,21 @@ let driverPwaStopsLoading = false;
 let driverPwaReopening = false;
 let driverPwaStopsError = "";
 let driverPwaStopsRequest = 0;
+let driverPwaCompletedPayload = { visits: [], facets: {}, count: 0 };
+let driverPwaSelectedVisitId = "";
+let driverPwaCompletedLoading = false;
+let driverPwaCompletedError = "";
+let driverPwaCompletedRequest = 0;
+let driverPwaCompletedSubmittingId = "";
+let driverPwaCompletedPhotoBusyId = "";
+let driverPwaCompletedFilters = {
+  status: "complete",
+  driverLogin: "",
+  stopType: "all",
+  photoState: "all",
+  completionSource: "all",
+  q: ""
+};
 let historicalAssistDate = driverPwaPastTorontoDate();
 let historicalAssistPayload = { routes: [], count: 0 };
 let historicalAssistLoading = false;
@@ -56,6 +73,7 @@ const offlineReviewDeviceDismissDrafts = new Map();
 const driverPwaReopenDrafts = new Map();
 const driverPwaReopenAttempts = new Map();
 const historicalAssistDrafts = new Map();
+const driverPwaCompletedDrafts = new Map();
 
 function driverPwaTorontoDate() {
   try {
@@ -558,24 +576,31 @@ async function historicalAssistLoad({ quiet = false } = {}) {
   }
 }
 
-async function historicalAssistAddPhotos(input) {
-  const form = input.closest("[data-form='historical-assist-complete']");
-  const jobId = String(form?.dataset.jobId || "");
-  const draft = historicalAssistDraft(jobId);
-  const files = [...(input.files || [])];
-  input.value = "";
-  if (!jobId || !files.length) return;
-  if (draft.photos.length + files.length > 20) {
+async function historicalAssistAddPhotoFiles({ jobId, form = null, files = [] } = {}) {
+  const normalizedJobId = String(jobId || form?.dataset.jobId || "");
+  const photoFiles = [...files].filter((file) => String(file?.type || "").toLowerCase().startsWith("image/"));
+  if (!normalizedJobId || !photoFiles.length) {
+    if (files.length) {
+      offlineReviewNotice = { message: "Choose one or more image files.", tone: "error" };
+      offlineReviewRender();
+    }
+    return;
+  }
+  const activeForm = form || offlineReviewApp.querySelector(
+    `[data-form="historical-assist-complete"][data-job-id="${CSS.escape(normalizedJobId)}"]`
+  );
+  const draft = historicalAssistDraft(normalizedJobId);
+  if (draft.photos.length + photoFiles.length > 20) {
     offlineReviewNotice = { message: "A historical stop can contain at most 20 photos.", tone: "error" };
     offlineReviewRender();
     return;
   }
-  historicalAssistCaptureDraft(form);
-  historicalAssistPhotoBusyJobId = jobId;
-  offlineReviewNotice = { message: `Preparing ${files.length} photo${files.length === 1 ? "" : "s"}…`, tone: "" };
+  historicalAssistCaptureDraft(activeForm);
+  historicalAssistPhotoBusyJobId = normalizedJobId;
+  offlineReviewNotice = { message: `Preparing ${photoFiles.length} photo${photoFiles.length === 1 ? "" : "s"}…`, tone: "" };
   offlineReviewRender();
   try {
-    for (const file of files) {
+    for (const file of photoFiles) {
       const compressed = await window.DriverOfflinePhotos.compress(file);
       draft.photos.push({
         photoId: historicalAssistNewUuid(),
@@ -595,6 +620,15 @@ async function historicalAssistAddPhotos(input) {
     historicalAssistPhotoBusyJobId = "";
     offlineReviewRender();
   }
+}
+
+async function historicalAssistAddPhotos(input) {
+  const form = input.closest("[data-form='historical-assist-complete']");
+  const jobId = String(form?.dataset.jobId || "");
+  const files = [...(input.files || [])];
+  input.value = "";
+  if (!jobId || !files.length) return;
+  await historicalAssistAddPhotoFiles({ jobId, form, files });
 }
 
 async function historicalAssistMapConcurrency(items, limit, worker) {
@@ -735,6 +769,335 @@ async function historicalAssistSubmit(form) {
     if (error.status === 409) await historicalAssistLoad({ quiet: true });
   } finally {
     historicalAssistSubmittingJobId = "";
+    offlineReviewRender();
+  }
+}
+
+function driverPwaCompletedVisits() {
+  return offlineReviewArray(offlineReviewObject(driverPwaCompletedPayload).visits);
+}
+
+function driverPwaCompletedFacets() {
+  return offlineReviewObject(offlineReviewObject(driverPwaCompletedPayload).facets);
+}
+
+function driverPwaCompletedRecordId(value) {
+  return String(offlineReviewFirst(value, "recordId", "record_id", "id") || "");
+}
+
+function driverPwaSelectedCompletedVisit() {
+  return driverPwaCompletedVisits().find(
+    (visit) => driverPwaCompletedRecordId(visit) === String(driverPwaSelectedVisitId || "")
+  ) || null;
+}
+
+function driverPwaCompletedDraftHasContent(draft) {
+  return Boolean(
+    String(draft?.reason || "").trim()
+    || draft?.confirmed
+    || offlineReviewArray(draft?.photos).length
+  );
+}
+
+function driverPwaCompletedDraft(recordId, stateHash = "") {
+  const key = String(recordId || "");
+  if (!driverPwaCompletedDrafts.has(key)) {
+    driverPwaCompletedDrafts.set(key, {
+      requestId: historicalAssistNewUuid(),
+      additionEventId: historicalAssistNewUuid(),
+      reason: "",
+      confirmed: false,
+      photos: [],
+      stateHash: String(stateHash || ""),
+      stale: false
+    });
+  }
+  const draft = driverPwaCompletedDrafts.get(key);
+  if (!draft.stateHash && stateHash) draft.stateHash = String(stateHash);
+  return draft;
+}
+
+function driverPwaCompletedCaptureVisibleDraft() {
+  const form = offlineReviewApp.querySelector("[data-form='completed-stop-photo-append']");
+  if (!form) return;
+  const recordId = String(form.dataset.recordId || "");
+  if (!recordId) return;
+  const visit = driverPwaCompletedVisits().find(
+    (candidate) => driverPwaCompletedRecordId(candidate) === recordId
+  );
+  const draft = driverPwaCompletedDraft(recordId, visit?.stateHash);
+  draft.reason = String(form.elements.reason?.value || "");
+  draft.confirmed = Boolean(form.elements.confirmAddition?.checked);
+}
+
+function driverPwaReleaseCompletedDraft(recordId) {
+  const key = String(recordId || "");
+  const draft = driverPwaCompletedDrafts.get(key);
+  for (const photo of draft?.photos || []) {
+    if (String(photo.objectUrl || "").startsWith("blob:")) URL.revokeObjectURL(photo.objectUrl);
+  }
+  driverPwaCompletedDrafts.delete(key);
+}
+
+function driverPwaCompletedApplyPayload(payload, { keepSelection = false } = {}) {
+  const visits = offlineReviewArray(offlineReviewObject(payload).visits);
+  for (const visit of visits) {
+    const recordId = driverPwaCompletedRecordId(visit);
+    const draft = driverPwaCompletedDrafts.get(recordId);
+    if (!draft) continue;
+    if (!driverPwaCompletedDraftHasContent(draft)) {
+      draft.stateHash = String(visit.stateHash || "");
+      draft.stale = false;
+      continue;
+    }
+    if (draft.stateHash && draft.stateHash !== String(visit.stateHash || "")) {
+      draft.stale = true;
+      draft.confirmed = false;
+    }
+  }
+  driverPwaCompletedPayload = payload;
+  const selectionExists = visits.some(
+    (visit) => driverPwaCompletedRecordId(visit) === String(driverPwaSelectedVisitId || "")
+  );
+  if (!keepSelection || !selectionExists) {
+    driverPwaSelectedVisitId = driverPwaCompletedRecordId(visits[0]);
+  }
+}
+
+async function driverPwaLoadCompletedVisits({ keepSelection = false, quiet = false } = {}) {
+  driverPwaCompletedCaptureVisibleDraft();
+  const requestId = ++driverPwaCompletedRequest;
+  driverPwaCompletedLoading = true;
+  driverPwaCompletedError = "";
+  if (!quiet) offlineReviewRender();
+  try {
+    const query = new URLSearchParams({
+      planDate: driverPwaStopsDate,
+      status: driverPwaCompletedFilters.status,
+      driverLogin: driverPwaCompletedFilters.driverLogin,
+      stopType: driverPwaCompletedFilters.stopType,
+      photoState: driverPwaCompletedFilters.photoState,
+      completionSource: driverPwaCompletedFilters.completionSource,
+      q: driverPwaCompletedFilters.q,
+      limit: "200"
+    });
+    const payload = await offlineReviewApi(`${DRIVER_PWA_VISITS_ENDPOINT}?${query}`);
+    if (requestId !== driverPwaCompletedRequest) return;
+    driverPwaCompletedApplyPayload(payload, { keepSelection });
+  } catch (error) {
+    if (requestId !== driverPwaCompletedRequest) return;
+    driverPwaCompletedError = error.message;
+    if (!driverPwaCompletedVisits().length) driverPwaSelectedVisitId = "";
+  } finally {
+    if (requestId !== driverPwaCompletedRequest) return;
+    driverPwaCompletedLoading = false;
+    offlineReviewRender();
+  }
+}
+
+async function driverPwaAddCompletedPhotoFiles({ recordId, form = null, files = [] } = {}) {
+  const normalizedRecordId = String(recordId || form?.dataset.recordId || "");
+  const visit = driverPwaCompletedVisits().find(
+    (candidate) => driverPwaCompletedRecordId(candidate) === normalizedRecordId
+  );
+  const photoFiles = [...files].filter((file) => String(file?.type || "").toLowerCase().startsWith("image/"));
+  if (!normalizedRecordId || !visit || !photoFiles.length) {
+    if (files.length) {
+      offlineReviewNotice = { message: "Choose one or more image files.", tone: "error" };
+      offlineReviewRender();
+    }
+    return;
+  }
+  const activeForm = form || offlineReviewApp.querySelector(
+    `[data-form="completed-stop-photo-append"][data-record-id="${CSS.escape(normalizedRecordId)}"]`
+  );
+  driverPwaCompletedCaptureVisibleDraft();
+  const draft = driverPwaCompletedDraft(normalizedRecordId, visit.stateHash);
+  const remainingSlots = Number(visit.remainingPhotoSlots || 0);
+  if (draft.photos.length + photoFiles.length > remainingSlots) {
+    offlineReviewNotice = {
+      message: `Only ${remainingSlots} more photo${remainingSlots === 1 ? "" : "s"} can be appended to this physical visit.`,
+      tone: "error"
+    };
+    offlineReviewRender();
+    return;
+  }
+  if (activeForm) {
+    draft.reason = String(activeForm.elements.reason?.value || draft.reason || "");
+    draft.confirmed = Boolean(activeForm.elements.confirmAddition?.checked);
+  }
+  driverPwaCompletedPhotoBusyId = normalizedRecordId;
+  offlineReviewNotice = { message: `Preparing ${photoFiles.length} photo${photoFiles.length === 1 ? "" : "s"}…`, tone: "" };
+  offlineReviewRender();
+  try {
+    for (const file of photoFiles) {
+      const compressed = await window.DriverOfflinePhotos.compress(file);
+      draft.photos.push({
+        photoId: historicalAssistNewUuid(),
+        ordinal: draft.photos.length + 1,
+        mimeType: "image/jpeg",
+        byteSize: compressed.byteSize,
+        sha256: compressed.sha256,
+        blob: compressed.blob,
+        objectUrl: URL.createObjectURL(compressed.blob),
+        objectReference: ""
+      });
+    }
+    offlineReviewNotice = {
+      message: "Photos are prepared in memory. Existing evidence remains immutable.",
+      tone: "success"
+    };
+  } catch (error) {
+    offlineReviewNotice = { message: `Photo preparation failed: ${error.message}`, tone: "error" };
+  } finally {
+    driverPwaCompletedPhotoBusyId = "";
+    offlineReviewRender();
+  }
+}
+
+async function driverPwaRevalidateCompletedDraft(recordId) {
+  const normalizedRecordId = String(recordId || "");
+  driverPwaCompletedCaptureVisibleDraft();
+  await driverPwaLoadCompletedVisits({ keepSelection: true, quiet: true });
+  const visit = driverPwaCompletedVisits().find(
+    (candidate) => driverPwaCompletedRecordId(candidate) === normalizedRecordId
+  );
+  const draft = driverPwaCompletedDrafts.get(normalizedRecordId);
+  if (!visit || !draft) {
+    offlineReviewNotice = { message: "The completed visit is no longer in this filtered result.", tone: "error" };
+    offlineReviewRender();
+    return;
+  }
+  if (!visit.appendable || draft.photos.length > Number(visit.remainingPhotoSlots || 0)) {
+    draft.stale = true;
+    offlineReviewNotice = {
+      message: visit.blockReason || "The refreshed visit cannot accept this prepared evidence. Remove excess photos or adjust the filters.",
+      tone: "error"
+    };
+    offlineReviewRender();
+    return;
+  }
+  draft.stateHash = String(visit.stateHash || "");
+  draft.stale = false;
+  draft.confirmed = false;
+  offlineReviewNotice = {
+    message: "Draft revalidated against the latest physical visit. Review and confirm it again before appending.",
+    tone: "success"
+  };
+  offlineReviewRender();
+}
+
+async function driverPwaSubmitCompletedPhotos(form) {
+  driverPwaCompletedCaptureVisibleDraft();
+  const recordId = String(form.dataset.recordId || "");
+  const visit = driverPwaCompletedVisits().find(
+    (candidate) => driverPwaCompletedRecordId(candidate) === recordId
+  );
+  const draft = driverPwaCompletedDraft(recordId, visit?.stateHash);
+  if (!visit?.appendable) {
+    offlineReviewNotice = { message: visit?.blockReason || "This visit cannot accept more photos.", tone: "error" };
+    offlineReviewRender();
+    return;
+  }
+  if (draft.stale || draft.stateHash !== String(visit.stateHash || "")) {
+    draft.stale = true;
+    draft.confirmed = false;
+    offlineReviewNotice = { message: "This visit changed on another computer. Revalidate the retained draft before submitting.", tone: "error" };
+    offlineReviewRender();
+    return;
+  }
+  if (!String(draft.reason || "").trim()) {
+    offlineReviewNotice = { message: "Enter the mandatory reason for adding evidence after completion.", tone: "error" };
+    offlineReviewRender();
+    offlineReviewApp.querySelector("[data-form='completed-stop-photo-append'] textarea[name='reason']")?.focus();
+    return;
+  }
+  if (!draft.photos.length) {
+    offlineReviewNotice = { message: "Select at least one photo to append.", tone: "error" };
+    offlineReviewRender();
+    return;
+  }
+  if (draft.photos.length > Number(visit.remainingPhotoSlots || 0)) {
+    offlineReviewNotice = { message: "The prepared photos exceed the latest 20-photo limit.", tone: "error" };
+    offlineReviewRender();
+    return;
+  }
+  if (!draft.confirmed) {
+    offlineReviewNotice = { message: "Confirm the physical visit and append-only evidence before submitting.", tone: "error" };
+    offlineReviewRender();
+    return;
+  }
+
+  driverPwaCompletedSubmittingId = recordId;
+  offlineReviewNotice = { message: "Uploading appended evidence with two concurrent transfers…", tone: "" };
+  offlineReviewRender();
+  try {
+    const pending = draft.photos.filter((photo) => !photo.objectReference);
+    if (pending.length) {
+      const ticketPayload = await offlineReviewApi(
+        `${DRIVER_PWA_VISITS_ENDPOINT}/${encodeURIComponent(recordId)}/photo-tickets`,
+        {
+          method: "POST",
+          body: JSON.stringify({
+            requestId: draft.requestId,
+            expectedStateHash: draft.stateHash,
+            photos: pending.map((photo) => ({
+              photoId: photo.photoId,
+              ordinal: photo.ordinal,
+              byteSize: photo.byteSize,
+              sha256: photo.sha256,
+              mimeType: photo.mimeType
+            }))
+          })
+        }
+      );
+      const ticketById = new Map(
+        offlineReviewArray(ticketPayload.tickets).map((ticket) => [ticket.photoId, ticket])
+      );
+      await historicalAssistMapConcurrency(pending, 2, (photo) => {
+        const ticket = ticketById.get(photo.photoId);
+        if (!ticket) throw new Error("The server did not issue every requested photo ticket.");
+        return historicalAssistUploadPhoto(photo, ticket);
+      });
+    }
+    const result = await offlineReviewApi(
+      `${DRIVER_PWA_VISITS_ENDPOINT}/${encodeURIComponent(recordId)}/photos`,
+      {
+        method: "POST",
+        body: JSON.stringify({
+          requestId: draft.requestId,
+          additionEventId: draft.additionEventId,
+          expectedStateHash: draft.stateHash,
+          reason: String(draft.reason).trim(),
+          photos: draft.photos.map((photo) => ({
+            photoId: photo.photoId,
+            ordinal: photo.ordinal,
+            byteSize: photo.byteSize,
+            sha256: photo.sha256,
+            mimeType: photo.mimeType,
+            objectReference: photo.objectReference
+          }))
+        })
+      }
+    );
+    driverPwaReleaseCompletedDraft(recordId);
+    offlineReviewNotice = {
+      message: `${result.addedPhotoCount} photo${result.addedPhotoCount === 1 ? "" : "s"} appended to the complete physical visit${result.exactReplay ? " (safe replay)" : ""}.`,
+      tone: "success"
+    };
+    await driverPwaLoadCompletedVisits({ keepSelection: true, quiet: true });
+  } catch (error) {
+    if (error.status === 409) {
+      draft.stale = true;
+      draft.confirmed = false;
+      await driverPwaLoadCompletedVisits({ keepSelection: true, quiet: true });
+    }
+    offlineReviewNotice = {
+      message: `${error.status === 409 ? "The completed visit changed" : "Photo append failed"}: ${error.message}. Prepared photos remain for retry.`,
+      tone: "error"
+    };
+  } finally {
+    driverPwaCompletedSubmittingId = "";
     offlineReviewRender();
   }
 }
@@ -1735,18 +2098,8 @@ function driverPwaRenderStopDetail() {
   `;
 }
 
-function driverPwaRenderStopsSurface() {
+function driverPwaRenderRecordedStops() {
   return `
-    <div class="offline-review-toolbar driver-pwa-stop-toolbar">
-      <label class="driver-pwa-date-filter">
-        <span>Plan date</span>
-        <input data-action="stops-date" type="date" value="${offlineReviewEscape(driverPwaStopsDate)}" />
-      </label>
-      <div class="offline-review-notice ${offlineReviewEscape(offlineReviewNotice.tone)}" aria-live="polite">${offlineReviewEscape(offlineReviewNotice.message)}</div>
-      <div class="offline-review-toolbar-actions">
-        <button data-action="refresh-stops" type="button" ${driverPwaStopsLoading ? "disabled" : ""}>${driverPwaStopsLoading ? "Refreshing…" : "Refresh stops"}</button>
-      </div>
-    </div>
     <div class="offline-review-grid ${driverPwaClientSyncIssues.length ? "has-client-sync-issues" : ""}">
       ${driverPwaRenderClientSyncIssues()}
       <section class="offline-review-panel offline-review-list-panel">
@@ -1760,6 +2113,283 @@ function driverPwaRenderStopsSurface() {
       </section>
       ${driverPwaRenderStopDetail()}
     </div>
+  `;
+}
+
+function driverPwaCompletedSelectOptions(items, valueKey, labelFor, selectedValue) {
+  return offlineReviewArray(items).map((item) => {
+    const value = String(item?.[valueKey] || "");
+    return `<option value="${offlineReviewEscape(value)}" ${value === selectedValue ? "selected" : ""}>${offlineReviewEscape(labelFor(item))}</option>`;
+  }).join("");
+}
+
+function driverPwaRenderCompletedFilters() {
+  const facets = driverPwaCompletedFacets();
+  return `
+    <form class="driver-pwa-completed-filters" data-form="completed-stop-filters">
+      <label>
+        <span>Driver</span>
+        <select name="driverLogin">
+          <option value="">All drivers</option>
+          ${driverPwaCompletedSelectOptions(
+            facets.drivers,
+            "driverLogin",
+            (item) => `${item.driverName || item.driverLogin} (${item.count})`,
+            driverPwaCompletedFilters.driverLogin
+          )}
+        </select>
+      </label>
+      <label>
+        <span>Status</span>
+        <select name="status">
+          <option value="complete" ${driverPwaCompletedFilters.status === "complete" ? "selected" : ""}>Completed</option>
+          <option value="in_progress" ${driverPwaCompletedFilters.status === "in_progress" ? "selected" : ""}>In progress</option>
+          <option value="all" ${driverPwaCompletedFilters.status === "all" ? "selected" : ""}>All statuses</option>
+        </select>
+      </label>
+      <label>
+        <span>Stop</span>
+        <select name="stopType">
+          <option value="all" ${driverPwaCompletedFilters.stopType === "all" ? "selected" : ""}>All stops</option>
+          <option value="pickup" ${driverPwaCompletedFilters.stopType === "pickup" ? "selected" : ""}>Pickup</option>
+          <option value="dropoff" ${driverPwaCompletedFilters.stopType === "dropoff" ? "selected" : ""}>Drop-off</option>
+        </select>
+      </label>
+      <label>
+        <span>Photos</span>
+        <select name="photoState">
+          <option value="all" ${driverPwaCompletedFilters.photoState === "all" ? "selected" : ""}>Any photo state</option>
+          <option value="none" ${driverPwaCompletedFilters.photoState === "none" ? "selected" : ""}>No photos</option>
+          <option value="below_required" ${driverPwaCompletedFilters.photoState === "below_required" ? "selected" : ""}>Below requirement</option>
+          <option value="has_photos" ${driverPwaCompletedFilters.photoState === "has_photos" ? "selected" : ""}>Has photos</option>
+          <option value="at_limit" ${driverPwaCompletedFilters.photoState === "at_limit" ? "selected" : ""}>At 20-photo limit</option>
+        </select>
+      </label>
+      <label>
+        <span>Completion source</span>
+        <select name="completionSource">
+          <option value="all" ${driverPwaCompletedFilters.completionSource === "all" ? "selected" : ""}>All sources</option>
+          <option value="driver_online" ${driverPwaCompletedFilters.completionSource === "driver_online" ? "selected" : ""}>Driver online</option>
+          <option value="driver_offline" ${driverPwaCompletedFilters.completionSource === "driver_offline" ? "selected" : ""}>Driver offline</option>
+          <option value="dispatch_historical_assist" ${driverPwaCompletedFilters.completionSource === "dispatch_historical_assist" ? "selected" : ""}>Dispatch historical</option>
+          <option value="legacy_unknown" ${driverPwaCompletedFilters.completionSource === "legacy_unknown" ? "selected" : ""}>Legacy / unknown</option>
+          <option value="mixed" ${driverPwaCompletedFilters.completionSource === "mixed" ? "selected" : ""}>Mixed</option>
+        </select>
+      </label>
+      <label class="driver-pwa-completed-search">
+        <span>Search orders, jobs, locations, loads</span>
+        <input name="q" type="search" maxlength="240" value="${offlineReviewEscape(driverPwaCompletedFilters.q)}" placeholder="SOA07894, GOA…, yard, load…" />
+      </label>
+      <div class="driver-pwa-completed-filter-actions">
+        <button type="submit" ${driverPwaCompletedLoading ? "disabled" : ""}>Apply filters</button>
+        <button data-action="clear-completed-stop-filters" type="button" ${driverPwaCompletedLoading ? "disabled" : ""}>Clear</button>
+      </div>
+    </form>
+  `;
+}
+
+function driverPwaRenderCompletedVisitList() {
+  if (driverPwaCompletedLoading && !driverPwaCompletedVisits().length) {
+    return `<div class="offline-review-empty">Loading physical visits…</div>`;
+  }
+  if (driverPwaCompletedError) {
+    return `<div class="offline-review-empty error" role="alert">${offlineReviewEscape(driverPwaCompletedError)}</div>`;
+  }
+  if (!driverPwaCompletedVisits().length) {
+    return `<div class="offline-review-empty">No physical visits match these filters.</div>`;
+  }
+  return driverPwaCompletedVisits().map((visit) => {
+    const recordId = driverPwaCompletedRecordId(visit);
+    const selected = recordId === String(driverPwaSelectedVisitId || "");
+    const draft = driverPwaCompletedDrafts.get(recordId);
+    return `
+      <button class="offline-review-case ${selected ? "selected" : ""}" data-action="select-completed-visit" data-record-id="${offlineReviewEscape(recordId)}" type="button" aria-pressed="${selected ? "true" : "false"}">
+        <span class="offline-review-case-head">
+          <strong>${offlineReviewEscape(offlineReviewEventLabel(visit.stopType))} · ${offlineReviewEscape(offlineReviewDisplayValue(visit.orderRefs))}</strong>
+          <span class="offline-review-pill ${visit.status === "complete" ? "resolved" : ""}">${offlineReviewEscape(offlineReviewEventLabel(visit.status))}</span>
+        </span>
+        <span class="offline-review-case-meta">${offlineReviewEscape(visit.driverName || visit.driverLogin)} · ${offlineReviewEscape(offlineReviewDisplayValue(visit.location || visit.address))}</span>
+        <span class="offline-review-case-reason">${offlineReviewEscape(offlineReviewFormatDateTime(visit.completedAt || visit.startedAt))} · ${Number(visit.photoCount || 0)}/20 photos${draft?.stale ? " · draft needs revalidation" : ""}</span>
+      </button>
+    `;
+  }).join("");
+}
+
+function driverPwaCompletedPreparedPhotoGrid(recordId, draft) {
+  if (!draft.photos.length) return `<p class="historical-assist-photo-empty">No appended photos prepared.</p>`;
+  return `
+    <div class="historical-assist-photo-grid" aria-label="Prepared appended photos">
+      ${draft.photos.map((photo, index) => `
+        <figure>
+          <img src="${offlineReviewEscape(photo.objectUrl)}" alt="Prepared appended evidence ${index + 1}" />
+          <figcaption>
+            <span>${offlineReviewEscape(offlineReviewFormatBytes(photo.byteSize))}${photo.objectReference ? " · uploaded" : " · in memory"}</span>
+            <button data-action="remove-completed-photo-draft" data-record-id="${offlineReviewEscape(recordId)}" data-photo-id="${offlineReviewEscape(photo.photoId)}" type="button" ${driverPwaCompletedSubmittingId === recordId ? "disabled" : ""}>Remove</button>
+          </figcaption>
+        </figure>
+      `).join("")}
+    </div>
+  `;
+}
+
+function driverPwaCompletedCommittedPhotos(visit) {
+  const photos = offlineReviewArray(visit.photos);
+  if (!photos.length) return `<p class="historical-assist-photo-empty">No committed photo evidence.</p>`;
+  return `
+    <div class="driver-pwa-completed-photo-grid" aria-label="Committed completion photos">
+      ${photos.map((photo, index) => `
+        <article class="driver-pwa-completed-photo-card">
+          <div>
+            <strong>Photo ${index + 1}</strong>
+            <span>${offlineReviewEscape(offlineReviewEventLabel(photo.source || visit.completionSource))}</span>
+          </div>
+          <dl>
+            ${photo.addedAt ? `<dt>Added</dt><dd>${offlineReviewEscape(offlineReviewFormatDateTime(photo.addedAt))}</dd>` : ""}
+            ${photo.addedBy ? `<dt>By</dt><dd>${offlineReviewEscape(photo.addedBy)}</dd>` : ""}
+            ${photo.additionReason ? `<dt>Reason</dt><dd>${offlineReviewEscape(photo.additionReason)}</dd>` : ""}
+          </dl>
+          <button data-action="open-completed-photo" data-record-id="${offlineReviewEscape(driverPwaCompletedRecordId(visit))}" data-ordinal="${index + 1}" type="button">Open photo</button>
+        </article>
+      `).join("")}
+    </div>
+  `;
+}
+
+function driverPwaRenderCompletedPhotoAppend(visit) {
+  const recordId = driverPwaCompletedRecordId(visit);
+  const draft = driverPwaCompletedDraft(recordId, visit.stateHash);
+  const busy = driverPwaCompletedSubmittingId === recordId || driverPwaCompletedPhotoBusyId === recordId;
+  if (!visit.appendable) {
+    return `
+      <section class="offline-review-section driver-pwa-completed-append-blocked">
+        <h3>Append more photos</h3>
+        <p>${offlineReviewEscape(visit.blockReason || (visit.status === "complete" ? "This visit already has 20 photos." : "Only completed physical visits can accept appended photos."))}</p>
+      </section>
+    `;
+  }
+  return `
+    <form class="historical-assist-form driver-pwa-completed-append" data-form="completed-stop-photo-append" data-record-id="${offlineReviewEscape(recordId)}">
+      ${draft.stale ? `
+        <div class="driver-pwa-completed-stale" role="alert">
+          <strong>This physical visit changed on another computer.</strong>
+          <span>Your in-memory photos and reason were retained. Review the latest committed evidence, then revalidate this draft.</span>
+          <button data-action="revalidate-completed-photo-draft" data-record-id="${offlineReviewEscape(recordId)}" type="button" ${busy ? "disabled" : ""}>Revalidate retained draft</button>
+        </div>
+      ` : ""}
+      <label class="offline-review-field historical-assist-reason">
+        <span>Mandatory reason for post-completion evidence</span>
+        <textarea name="reason" maxlength="2000" required placeholder="Explain why Dispatch is adding photos after this stop was completed.">${offlineReviewEscape(draft.reason)}</textarea>
+      </label>
+      <section class="historical-assist-photos driver-photo-drop-zone" data-photo-drop-zone="completed-stop" data-record-id="${offlineReviewEscape(recordId)}" tabindex="0" aria-label="Drop completed-stop photos here or choose files">
+        <div class="historical-assist-section-head">
+          <div>
+            <strong>Append photo evidence</strong>
+            <span>Drop images here or choose files · ${draft.photos.length}/${Number(visit.remainingPhotoSlots || 0)} available slots prepared · uploads run two at a time</span>
+          </div>
+          <label class="historical-assist-photo-picker">
+            <span>${driverPwaCompletedPhotoBusyId === recordId ? "Preparing…" : "Choose camera/gallery photos"}</span>
+            <input data-action="completed-stop-photos" type="file" accept="image/*" multiple ${busy ? "disabled" : ""} />
+          </label>
+        </div>
+        ${driverPwaCompletedPreparedPhotoGrid(recordId, draft)}
+      </section>
+      <label class="offline-review-evidence-confirm">
+        <input name="confirmAddition" type="checkbox" required ${draft.confirmed ? "checked" : ""} ${draft.stale ? "disabled" : ""} />
+        <span>I verified the driver, physical visit, order references, and latest committed photos. Append these photos without changing completion or operational state.</span>
+      </label>
+      <div class="offline-review-resolution-actions">
+        <span class="offline-review-resolution-help">Append only. No NetSuite attachment, status, billing, fulfillment, route, or Driver action is changed.</span>
+        <button class="historical-assist-submit" type="submit" ${busy || draft.stale ? "disabled" : ""}>${driverPwaCompletedSubmittingId === recordId ? "Appending…" : "Append photos"}</button>
+      </div>
+    </form>
+  `;
+}
+
+function driverPwaRenderCompletedVisitDetail() {
+  if (driverPwaCompletedLoading && !driverPwaSelectedCompletedVisit()) {
+    return `<section class="offline-review-panel offline-review-detail-panel"><div class="offline-review-empty">Loading visit details…</div></section>`;
+  }
+  const visit = driverPwaSelectedCompletedVisit();
+  if (!visit) {
+    return `<section class="offline-review-panel offline-review-detail-panel"><div class="offline-review-empty">Select a physical visit to review its evidence.</div></section>`;
+  }
+  return `
+    <section class="offline-review-panel offline-review-detail-panel">
+      <div class="offline-review-panel-heading">
+        <div>
+          <h2>${offlineReviewEscape(offlineReviewEventLabel(visit.stopType))} · ${offlineReviewEscape(offlineReviewDisplayValue(visit.orderRefs))}</h2>
+          <p>${offlineReviewEscape(visit.driverName || visit.driverLogin)} · ${offlineReviewEscape(offlineReviewFormatPlanDate(visit.planDate))}</p>
+        </div>
+        <span class="offline-review-pill ${visit.status === "complete" ? "resolved" : ""}">${offlineReviewEscape(offlineReviewEventLabel(visit.status))}</span>
+      </div>
+      <div class="offline-review-detail-scroll">
+        <div class="offline-review-summary-grid">
+          ${offlineReviewSummaryItem("Completed", offlineReviewFormatDateTime(visit.completedAt))}
+          ${offlineReviewSummaryItem("Location", visit.location || visit.address)}
+          ${offlineReviewSummaryItem("Driver", visit.driverName || visit.driverLogin)}
+          ${offlineReviewSummaryItem("Load", visit.loadName || visit.loadId)}
+          ${offlineReviewSummaryItem("Truck", visit.truckPlate || visit.truckId)}
+          ${offlineReviewSummaryItem("Completion source", offlineReviewEventLabel(visit.completionSource))}
+          ${offlineReviewSummaryItem("Photos", `${Number(visit.photoCount || 0)} / ${Number(visit.maxPhotos || 20)}`)}
+          ${offlineReviewSummaryItem("Required at completion", Number(visit.requiredPhotos || 0))}
+          ${offlineReviewSummaryItem("Physical job IDs", visit.jobIds)}
+          ${offlineReviewSummaryItem("Consolidated visit", visit.consolidatedPhysicalVisit ? "Yes" : "No")}
+          ${offlineReviewSummaryItem("State", offlineReviewShortId(visit.stateHash))}
+          ${offlineReviewSummaryItem("Record IDs", visit.recordIds)}
+        </div>
+        <section class="offline-review-section">
+          <div class="driver-pwa-completed-section-head">
+            <div>
+              <h3>Committed evidence</h3>
+              <p>Photos already committed are read only. Their source and Dispatch addition provenance are preserved.</p>
+            </div>
+          </div>
+          ${driverPwaCompletedCommittedPhotos(visit)}
+        </section>
+        ${driverPwaRenderCompletedPhotoAppend(visit)}
+      </div>
+    </section>
+  `;
+}
+
+function driverPwaRenderCompletedStops() {
+  return `
+    <div class="driver-pwa-completed-surface">
+      ${driverPwaRenderCompletedFilters()}
+      <div class="offline-review-grid driver-pwa-completed-grid">
+        <section class="offline-review-panel offline-review-list-panel">
+          <div class="offline-review-panel-heading">
+            <div>
+              <h2>Completed-stop evidence</h2>
+              <p>${Number(driverPwaCompletedPayload.count || 0)} physical visit${Number(driverPwaCompletedPayload.count || 0) === 1 ? "" : "s"}</p>
+            </div>
+          </div>
+          <div class="offline-review-list">${driverPwaRenderCompletedVisitList()}</div>
+        </section>
+        ${driverPwaRenderCompletedVisitDetail()}
+      </div>
+    </div>
+  `;
+}
+
+function driverPwaRenderStopsSurface() {
+  const loading = driverPwaStopsMode === "completed" ? driverPwaCompletedLoading : driverPwaStopsLoading;
+  return `
+    <div class="offline-review-toolbar driver-pwa-stop-toolbar">
+      <div class="driver-pwa-stop-subtabs" role="tablist" aria-label="Driver stop records">
+        <button class="offline-review-filter ${driverPwaStopsMode === "recorded" ? "active" : ""}" data-action="set-stops-mode" data-mode="recorded" role="tab" aria-selected="${driverPwaStopsMode === "recorded" ? "true" : "false"}" type="button">Recorded stops / reopen</button>
+        <button class="offline-review-filter ${driverPwaStopsMode === "completed" ? "active" : ""}" data-action="set-stops-mode" data-mode="completed" role="tab" aria-selected="${driverPwaStopsMode === "completed" ? "true" : "false"}" type="button">Completed stop photos</button>
+      </div>
+      <label class="driver-pwa-date-filter">
+        <span>Plan date</span>
+        <input data-action="stops-date" type="date" value="${offlineReviewEscape(driverPwaStopsDate)}" />
+      </label>
+      <div class="offline-review-notice ${offlineReviewEscape(offlineReviewNotice.tone)}" aria-live="polite">${offlineReviewEscape(offlineReviewNotice.message)}</div>
+      <div class="offline-review-toolbar-actions">
+        <button data-action="refresh-stops" type="button" ${loading ? "disabled" : ""}>${loading ? "Refreshing…" : driverPwaStopsMode === "completed" ? "Refresh evidence" : "Refresh stops"}</button>
+      </div>
+    </div>
+    ${driverPwaStopsMode === "completed" ? driverPwaRenderCompletedStops() : driverPwaRenderRecordedStops()}
   `;
 }
 
@@ -1859,11 +2489,11 @@ function historicalAssistCompletionForm(visit) {
         <span>Mandatory reason</span>
         <textarea name="reason" maxlength="2000" required placeholder="Explain why Dispatch is completing this historical Driver stop.">${offlineReviewEscape(draft.reason)}</textarea>
       </label>
-      <section class="historical-assist-photos">
+      <section class="historical-assist-photos driver-photo-drop-zone" data-photo-drop-zone="historical-assist" data-job-id="${offlineReviewEscape(jobId)}" tabindex="0" aria-label="Drop historical completion photos here or choose files">
         <div class="historical-assist-section-head">
           <div>
             <strong>Photo evidence</strong>
-            <span>${visit.requiredPhotos} required · ${draft.photos.length}/20 prepared · uploads run two at a time</span>
+            <span>Drop images here or choose files · ${visit.requiredPhotos} required · ${draft.photos.length}/20 prepared · uploads run two at a time</span>
           </div>
           <label class="historical-assist-photo-picker">
             <span>${historicalAssistPhotoBusyJobId === jobId ? "Preparing…" : "Add camera/gallery photos"}</span>
@@ -2419,6 +3049,57 @@ async function offlineReviewOpenPhoto(button) {
   }
 }
 
+async function driverPwaOpenCompletedPhoto(button) {
+  const recordId = String(button?.dataset.recordId || "");
+  const ordinal = Number(button?.dataset.ordinal);
+  const visit = driverPwaCompletedVisits().find(
+    (candidate) => driverPwaCompletedRecordId(candidate) === recordId
+  );
+  const photo = offlineReviewArray(visit?.photos)[ordinal - 1];
+  if (!visit || !photo || !Number.isSafeInteger(ordinal) || ordinal < 1) return;
+  button.setAttribute("aria-busy", "true");
+  button.disabled = true;
+  try {
+    const response = await fetch(
+      `${DRIVER_PWA_VISITS_ENDPOINT}/${encodeURIComponent(recordId)}/photos/${ordinal}`,
+      { headers: { Accept: "image/*" } }
+    );
+    if (!response.ok) {
+      const message = await response.text();
+      throw new Error(message || `Photo request failed (${response.status})`);
+    }
+    const blob = await response.blob();
+    if (!String(blob.type || "").toLowerCase().startsWith("image/")) {
+      throw new Error("The evidence endpoint did not return an image.");
+    }
+    const objectUrl = URL.createObjectURL(blob);
+    offlineReviewClosePhoto();
+    const modal = document.createElement("div");
+    modal.className = "offline-review-photo-lightbox";
+    modal.dataset.objectUrl = objectUrl;
+    modal.innerHTML = `
+      <div class="offline-review-photo-lightbox-panel" role="dialog" aria-modal="true" aria-label="Completed-stop evidence photo">
+        <button class="offline-review-photo-lightbox-close" data-action="close-photo" type="button" aria-label="Close photo">×</button>
+        <img src="${offlineReviewEscape(objectUrl)}" alt="Completed-stop evidence photo ${ordinal}" />
+        <p>Photo ${ordinal} · ${offlineReviewEscape(offlineReviewEventLabel(photo.source || visit.completionSource))}${photo.addedBy ? ` · added by ${offlineReviewEscape(photo.addedBy)}` : ""}</p>
+      </div>
+    `;
+    modal.addEventListener("click", (event) => {
+      if (event.target === modal || event.target.closest("[data-action='close-photo']")) offlineReviewClosePhoto();
+    });
+    document.body.appendChild(modal);
+    modal.querySelector("[data-action='close-photo']")?.focus();
+  } catch (error) {
+    offlineReviewNotice = { message: `Photo preview failed: ${error.message}`, tone: "error" };
+    offlineReviewRender();
+  } finally {
+    if (button.isConnected) {
+      button.removeAttribute("aria-busy");
+      button.disabled = false;
+    }
+  }
+}
+
 function offlineReviewConnectEvents() {
   if (!("EventSource" in window) || offlineReviewEventSource) return;
   offlineReviewEventSource = new EventSource("/api/events?client=dispatch-offline-review");
@@ -2429,14 +3110,35 @@ function offlineReviewConnectEvents() {
     } catch {
       return;
     }
-    if (event.type === "connected" || offlineReviewResolving || offlineReviewRetrying || offlineReviewDismissingDeviceSessionId || driverPwaReopening) return;
+    if (
+      event.type === "connected"
+      || offlineReviewResolving
+      || offlineReviewRetrying
+      || offlineReviewDismissingDeviceSessionId
+      || driverPwaReopening
+      || historicalAssistSubmittingJobId
+      || historicalAssistPhotoBusyJobId
+      || driverPwaCompletedSubmittingId
+      || driverPwaCompletedPhotoBusyId
+    ) return;
+    const completedPhotoEvent = event.type === "driver.stop.photos_added";
     window.clearTimeout(offlineReviewEventTimer);
     offlineReviewEventTimer = window.setTimeout(() => {
-      const refresh = driverPwaSurface === "stops"
-        ? driverPwaLoadStops({ keepSelection: true, quiet: true })
-        : driverPwaSurface === "historical-assist"
-          ? historicalAssistLoad({ quiet: true })
-          : offlineReviewLoadList({ keepSelection: true, quiet: true });
+      let refresh;
+      if (driverPwaSurface === "stops" && completedPhotoEvent) {
+        refresh = Promise.all([
+          driverPwaLoadStops({ keepSelection: true, quiet: true }),
+          driverPwaLoadCompletedVisits({ keepSelection: true, quiet: true })
+        ]);
+      } else if (driverPwaSurface === "stops") {
+        refresh = driverPwaStopsMode === "completed"
+          ? driverPwaLoadCompletedVisits({ keepSelection: true, quiet: true })
+          : driverPwaLoadStops({ keepSelection: true, quiet: true });
+      } else if (driverPwaSurface === "historical-assist") {
+        refresh = historicalAssistLoad({ quiet: true });
+      } else {
+        refresh = offlineReviewLoadList({ keepSelection: true, quiet: true });
+      }
       refresh.catch(() => {});
     }, 400);
   });
@@ -2458,17 +3160,34 @@ offlineReviewApp.addEventListener("click", (event) => {
     const surface = String(button.dataset.surface || "");
     if (!["stops", "sync-review", "historical-assist"].includes(surface) || surface === driverPwaSurface) return;
     driverPwaCaptureStopDraft();
+    driverPwaCompletedCaptureVisibleDraft();
     offlineReviewCaptureDraft();
     historicalAssistCaptureVisibleDrafts();
     driverPwaSurface = surface;
     offlineReviewNotice = { message: "", tone: "" };
     offlineReviewRender();
     if (surface === "stops") {
-      driverPwaLoadStops({ keepSelection: true });
+      if (driverPwaStopsMode === "completed") driverPwaLoadCompletedVisits({ keepSelection: true });
+      else driverPwaLoadStops({ keepSelection: true });
     } else if (surface === "historical-assist") {
       historicalAssistLoad();
     } else {
       offlineReviewLoadList({ keepSelection: true });
+    }
+    return;
+  }
+  if (action === "set-stops-mode") {
+    const mode = String(button.dataset.mode || "");
+    if (!["recorded", "completed"].includes(mode) || mode === driverPwaStopsMode) return;
+    driverPwaCaptureStopDraft();
+    driverPwaCompletedCaptureVisibleDraft();
+    driverPwaStopsMode = mode;
+    offlineReviewNotice = { message: "", tone: "" };
+    offlineReviewRender();
+    if (mode === "completed") {
+      driverPwaLoadCompletedVisits({ keepSelection: true });
+    } else {
+      driverPwaLoadStops({ keepSelection: true });
     }
     return;
   }
@@ -2491,7 +3210,59 @@ offlineReviewApp.addEventListener("click", (event) => {
   }
   if (action === "refresh-stops") {
     driverPwaCaptureStopDraft();
-    driverPwaLoadStops({ keepSelection: true });
+    driverPwaCompletedCaptureVisibleDraft();
+    if (driverPwaStopsMode === "completed") {
+      driverPwaLoadCompletedVisits({ keepSelection: true });
+    } else {
+      driverPwaLoadStops({ keepSelection: true });
+    }
+    return;
+  }
+  if (action === "clear-completed-stop-filters") {
+    driverPwaCompletedCaptureVisibleDraft();
+    driverPwaCompletedFilters = {
+      status: "complete",
+      driverLogin: "",
+      stopType: "all",
+      photoState: "all",
+      completionSource: "all",
+      q: ""
+    };
+    driverPwaSelectedVisitId = "";
+    offlineReviewNotice = { message: "", tone: "" };
+    driverPwaLoadCompletedVisits();
+    return;
+  }
+  if (action === "select-completed-visit") {
+    const recordId = String(button.dataset.recordId || "");
+    if (!recordId || recordId === String(driverPwaSelectedVisitId || "")) return;
+    driverPwaCompletedCaptureVisibleDraft();
+    driverPwaSelectedVisitId = recordId;
+    offlineReviewNotice = { message: "", tone: "" };
+    offlineReviewRender();
+    return;
+  }
+  if (action === "remove-completed-photo-draft") {
+    const recordId = String(button.dataset.recordId || "");
+    const photoId = String(button.dataset.photoId || "");
+    driverPwaCompletedCaptureVisibleDraft();
+    const draft = driverPwaCompletedDrafts.get(recordId);
+    const photo = draft?.photos.find((candidate) => candidate.photoId === photoId);
+    if (String(photo?.objectUrl || "").startsWith("blob:")) URL.revokeObjectURL(photo.objectUrl);
+    if (draft) {
+      draft.photos = draft.photos.filter((candidate) => candidate.photoId !== photoId)
+        .map((candidate, index) => ({ ...candidate, ordinal: index + 1 }));
+    }
+    offlineReviewNotice = { message: "Prepared photo removed. Committed photos were not changed.", tone: "" };
+    offlineReviewRender();
+    return;
+  }
+  if (action === "revalidate-completed-photo-draft") {
+    driverPwaRevalidateCompletedDraft(button.dataset.recordId);
+    return;
+  }
+  if (action === "open-completed-photo") {
+    driverPwaOpenCompletedPhoto(button);
     return;
   }
   if (action === "view-device-issue") {
@@ -2501,6 +3272,7 @@ offlineReviewApp.addEventListener("click", (event) => {
     driverPwaStopsDate = planDate;
     driverPwaSelectedStopId = "";
     driverPwaStops = [];
+    driverPwaStopsMode = "recorded";
     driverPwaSurface = "stops";
     offlineReviewNotice = { message: "Showing the route date reported by the selected device sync issue.", tone: "" };
     offlineReviewRender();
@@ -2569,6 +3341,39 @@ offlineReviewApp.addEventListener("click", (event) => {
   }
 });
 
+offlineReviewApp.addEventListener("dragover", (event) => {
+  const zone = event.target.closest("[data-photo-drop-zone]");
+  if (!zone) return;
+  event.preventDefault();
+  if (event.dataTransfer) event.dataTransfer.dropEffect = "copy";
+  zone.classList.add("drag-active");
+});
+
+offlineReviewApp.addEventListener("dragleave", (event) => {
+  const zone = event.target.closest("[data-photo-drop-zone]");
+  if (!zone || zone.contains(event.relatedTarget)) return;
+  zone.classList.remove("drag-active");
+});
+
+offlineReviewApp.addEventListener("drop", (event) => {
+  const zone = event.target.closest("[data-photo-drop-zone]");
+  if (!zone) return;
+  event.preventDefault();
+  zone.classList.remove("drag-active");
+  const files = [...(event.dataTransfer?.files || [])];
+  if (zone.dataset.photoDropZone === "historical-assist") {
+    const jobId = String(zone.dataset.jobId || "");
+    const form = zone.closest("[data-form='historical-assist-complete']");
+    historicalAssistAddPhotoFiles({ jobId, form, files });
+    return;
+  }
+  if (zone.dataset.photoDropZone === "completed-stop") {
+    const recordId = String(zone.dataset.recordId || "");
+    const form = zone.closest("[data-form='completed-stop-photo-append']");
+    driverPwaAddCompletedPhotoFiles({ recordId, form, files });
+  }
+});
+
 offlineReviewApp.addEventListener("change", (event) => {
   if (event.target.matches("input[data-action='historical-assist-date']")) {
     const date = String(event.target.value || "");
@@ -2585,6 +3390,17 @@ offlineReviewApp.addEventListener("change", (event) => {
     historicalAssistAddPhotos(event.target);
     return;
   }
+  if (event.target.matches("input[data-action='completed-stop-photos']")) {
+    const form = event.target.closest("[data-form='completed-stop-photo-append']");
+    const files = [...(event.target.files || [])];
+    event.target.value = "";
+    driverPwaAddCompletedPhotoFiles({ recordId: form?.dataset.recordId, form, files });
+    return;
+  }
+  if (event.target.closest("[data-form='completed-stop-photo-append']")) {
+    driverPwaCompletedCaptureVisibleDraft();
+    return;
+  }
   if (event.target.closest("[data-form='historical-assist-complete']")) {
     const form = event.target.closest("[data-form='historical-assist-complete']");
     historicalAssistCaptureDraft(form);
@@ -2598,8 +3414,11 @@ offlineReviewApp.addEventListener("change", (event) => {
     driverPwaStopsDate = date;
     driverPwaSelectedStopId = "";
     driverPwaStops = [];
+    driverPwaSelectedVisitId = "";
+    driverPwaCompletedPayload = { visits: [], facets: {}, count: 0 };
     offlineReviewNotice = { message: "", tone: "" };
-    driverPwaLoadStops();
+    if (driverPwaStopsMode === "completed") driverPwaLoadCompletedVisits();
+    else driverPwaLoadStops();
     return;
   }
   if (event.target.closest("[data-form='driver-pwa-reopen']")) {
@@ -2625,6 +3444,10 @@ offlineReviewApp.addEventListener("input", (event) => {
     historicalAssistCaptureDraft(event.target.closest("[data-form='historical-assist-complete']"));
     return;
   }
+  if (event.target.closest("[data-form='completed-stop-photo-append']")) {
+    driverPwaCompletedCaptureVisibleDraft();
+    return;
+  }
   if (event.target.closest("[data-form='driver-pwa-reopen']")) {
     driverPwaCaptureStopDraft();
     return;
@@ -2638,6 +3461,31 @@ offlineReviewApp.addEventListener("input", (event) => {
 });
 
 offlineReviewApp.addEventListener("submit", (event) => {
+  if (event.target.matches("[data-form='completed-stop-filters']")) {
+    event.preventDefault();
+    driverPwaCompletedCaptureVisibleDraft();
+    const form = event.target;
+    driverPwaCompletedFilters = {
+      status: String(form.elements.status?.value || "complete"),
+      driverLogin: String(form.elements.driverLogin?.value || ""),
+      stopType: String(form.elements.stopType?.value || "all"),
+      photoState: String(form.elements.photoState?.value || "all"),
+      completionSource: String(form.elements.completionSource?.value || "all"),
+      q: String(form.elements.q?.value || "").trim()
+    };
+    driverPwaSelectedVisitId = "";
+    offlineReviewNotice = { message: "", tone: "" };
+    driverPwaLoadCompletedVisits();
+    return;
+  }
+  if (event.target.matches("[data-form='completed-stop-photo-append']")) {
+    event.preventDefault();
+    const recordId = String(event.target.dataset.recordId || "");
+    if (!driverPwaCompletedSubmittingId && driverPwaCompletedPhotoBusyId !== recordId) {
+      driverPwaSubmitCompletedPhotos(event.target);
+    }
+    return;
+  }
   if (event.target.matches("[data-form='historical-assist-complete']")) {
     event.preventDefault();
     const jobId = String(event.target.dataset.jobId || "");
@@ -2674,6 +3522,7 @@ window.addEventListener("keydown", (event) => {
 
 window.addEventListener("mbbs-language-changed", () => {
   driverPwaCaptureStopDraft();
+  driverPwaCompletedCaptureVisibleDraft();
   offlineReviewCaptureDraft();
   historicalAssistCaptureVisibleDrafts();
   offlineReviewRender();
@@ -2684,6 +3533,7 @@ window.addEventListener("beforeunload", () => {
   offlineReviewClosePhoto();
   window.clearTimeout(offlineReviewEventTimer);
   for (const jobId of historicalAssistDrafts.keys()) historicalAssistReleaseDraft(jobId);
+  for (const recordId of driverPwaCompletedDrafts.keys()) driverPwaReleaseCompletedDraft(recordId);
 });
 
 requireDispatchLogin({

@@ -10,6 +10,7 @@ files=(
   public/dispatch.html
   public/dispatch.js
   src/dispatch-completion-repository.js
+  src/dispatch-order-catalog-repository.js
   src/mbt/mbbs-billing-candidate-service.js
   src/server.js
   test/dispatch/frontend/dispatch-completion-ui.test.js
@@ -18,10 +19,12 @@ files=(
   test/mbt/integration/dispatch-completion-http.red.test.js
   test/mbt/integration/dispatch-completion-migration.test.js
   test/mbt/integration/dispatch-completion-status.red.test.js
+  test/mbt/integration/driver-direct-pickup-online-offline.test.js
   test/mbt/infrastructure/p3-gauntlet-contract.test.js
   test/mbt/specs/dispatch-completion-status.md
   test/support/p3-mutation-manifest.mjs
   test/support/run-dispatch-order-completion-mutations.mjs
+  test/support/run-dispatch-direct-terminal-lifecycle.mjs
   tools/dispatch-order-completion-gauntlet.sh
   tools/dispatch-order-completion-source-state.sh
   tools/mbt-predeploy-readiness.mjs

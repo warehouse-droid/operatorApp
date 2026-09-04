@@ -89,7 +89,13 @@ import { operationalPlanOrderRefs } from "./netsuite-closed-order-policy.js";
 import { isNetSuiteOperationalWorkActive } from "./netsuite-operational-work.js";
 import { getScmSchedulePreference, normalizeScmSchedulePreferenceSurface, updateScmSchedulePreference } from "./scm-schedule-preference-repository.js";
 import { getScmScheduleFormatting, updateScmScheduleFormatting } from "./scm-schedule-formatting-repository.js";
-import { canViewRestrictedScmOrders, filterRestrictedScmOrders, isRestrictedScmOrder } from "./scm-order-visibility.js";
+import {
+  canViewRestrictedScmOrders,
+  filterRestrictedScmOrders,
+  isCompletedScmOrder,
+  isDispatchExplicitSearchVisibleScmOrder,
+  isRestrictedScmOrder
+} from "./scm-order-visibility.js";
 import { changedPlacedDispatchScmAssignmentRefs } from "./dispatch-scm-placement.js";
 import {
   assertHistoricalInactiveSalesOrdersReconciled,
@@ -152,8 +158,8 @@ import { listDispatchOrders, enrichDispatchOrdersWithPoTargetAllocations, listSc
 import { setPurchaseOrderBlanketFlag } from "./dispatch-repository.js";
 import { cancelDispatchCustomOrder, canonicalizeDispatchCustomOrdersInPlan, completeDispatchCustomOrders, createDispatchCustomOrder, dispatchOrderFromCustomOrder, getDispatchCustomOrderForUpdate, listDispatchCustomOrders, updateDispatchCustomOrder } from "./dispatch-custom-order-repository.js";
 import {
-  listDispatchOrderCompletionStatuses,
-  manuallyCompleteDispatchOrder
+  manuallyCompleteDispatchOrder,
+  overlayDispatchOrderCompletionStatuses
 } from "./dispatch-completion-repository.js";
 import { DISPATCH_VENDOR_WEEK_DAYS, listDispatchVendorYards, listDispatchLocalVendors, saveDispatchVendorYardSchedule, updateDispatchVendorYard, upsertDispatchVendorYard, listDispatchParserRules, updateDispatchParserRule, listOllamaAudit, listDispatchVendorMappings, discoverDispatchVendorMappingsFromPurchaseOrders, updateDispatchVendorMapping, createDispatchLocalVendor, updateDispatchLocalVendor } from "./dispatch-enrichment.js";
 import { listDispatchAudit, writeDispatchAudit } from "./dispatch-audit-repository.js";
@@ -188,9 +194,7 @@ import {
   listDispatchV2Checkpoints,
   pendingDispatchV2Followups,
   pruneExpiredDispatchV2Checkpoints,
-  repairDispatchV2SummaryMarkers,
-  syncDispatchPlanOrderAssignments,
-  syncDispatchPlanRelationEdges
+  repairDispatchV2SummaryMarkers
 } from "./dispatch-planner-v2-repository.js";
 import {
   claimDispatchOrderCatalogRefreshes,
@@ -198,7 +202,6 @@ import {
   enqueueDispatchOrderCatalogRefresh,
   failDispatchOrderCatalogRefresh,
   getDispatchOrderCatalogOrder,
-  getDispatchOrderCatalogState,
   listDispatchOrderPool,
   markDispatchOrderCatalogFailed,
   markDispatchOrderCatalogReady,
@@ -312,6 +315,17 @@ import {
   listHistoricalDriverAssists,
   normalizeHistoricalAssistPhotoDescriptors
 } from "./driver-historical-assist-repository.js";
+import {
+  appendDriverCompletedVisitPhotos,
+  getDriverCompletedPhotoReplay,
+  getDriverCompletedVisit,
+  listDriverCompletedVisits
+} from "./driver-completed-photo-repository.js";
+import {
+  driverCompletedPhotoReferenceMatches,
+  normalizeDriverCompletedPhotoDescriptors,
+  uniqueDriverPhotoReferences
+} from "./driver-completed-photo-evidence.js";
 import { assertDriverPlanExecutionDate } from "./driver-plan-date-policy.js";
 import { processDriverOfflineQueue } from "./driver-offline-service.js";
 import {
@@ -820,6 +834,11 @@ function dispatchPlanDataSignature({ orders = [], trucks = [] } = {}) {
 
 function dispatchPlanDataChanged(previousPlan = {}, nextPlan = {}) {
   return dispatchPlanDataSignature(previousPlan || {}) !== dispatchPlanDataSignature(nextPlan || {});
+}
+
+function dispatchPlanProjectionRefreshRequired(plan = {}) {
+  return (plan.trucks || []).some((truck) => (truck.loads || [])
+    .some((load) => load.routeProjectionRefreshRequired === true));
 }
 
 function dispatchBinConfirmComparisonValue(plan = {}) {
@@ -1511,34 +1530,8 @@ function dispatchOrderScmRestrictionRefs(order = {}) {
     .filter(Boolean);
 }
 
-function dispatchCompletionKindForOrder(order = {}) {
-  if (String(order.sourceTable || "").trim() === "scm_vrma_orders") return "VRMA";
-  const kind = String(order.type || "").trim().toUpperCase();
-  return ["SO", "TO", "PO", "VRMA", "CUSTOM"].includes(kind) ? kind : "";
-}
-
 async function enrichDispatchOrdersWithCompletionStatus(orders = []) {
-  const requests = orders.map((order) => ({
-    orderKind: dispatchCompletionKindForOrder(order),
-    orderRef: order.id
-  }));
-  const completions = await listDispatchOrderCompletionStatuses(requests);
-  const byKey = new Map(completions.map((completion) => [
-    `${completion.orderKind}|${String(completion.orderRef || "").trim().toUpperCase()}`,
-    completion
-  ]));
-  return orders.map((order) => {
-    const kind = dispatchCompletionKindForOrder(order);
-    const completion = byKey.get(`${kind}|${String(order.id || "").trim().toUpperCase()}`);
-    return completion ? {
-      ...order,
-      dispatchCompletionStatus: completion.dispatchCompletionStatus,
-      dispatchCompletedAt: completion.dispatchCompletedAt,
-      completionEvidenceType: completion.completionEvidenceType,
-      completionEvidenceId: completion.completionEvidenceId,
-      completionEventId: completion.completionEventId
-    } : order;
-  });
+  return overlayDispatchOrderCompletionStatuses(orders);
 }
 
 function snapshotDerivedGroupBelongsToPlan(order = {}, plan = {}) {
@@ -1762,9 +1755,12 @@ function dispatchOrderMatchesSearch(order = {}, search = "") {
   ].join(" ").toLowerCase().includes(term);
 }
 
-function filterDispatchPlanningVisibleOrders(orders = []) {
+function filterDispatchPlanningVisibleOrders(orders = [], { includeCompletedScmSearch = false } = {}) {
   return (orders || []).filter((order) => (
-    order?.historicalReconciliationComplete === true || !isRestrictedScmOrder(order)
+    order?.historicalReconciliationComplete === true
+    || (includeCompletedScmSearch
+      ? isDispatchExplicitSearchVisibleScmOrder(order)
+      : !isRestrictedScmOrder(order))
   ));
 }
 
@@ -1821,7 +1817,8 @@ async function loadDispatchOrdersForResponse({
   type = null,
   search = "",
   historyPlanDate = "",
-  exactOrderRefs = []
+  exactOrderRefs = [],
+  includeCompletedScmSearch = false
 } = {}) {
   const searchTerm = String(search || "").trim().slice(0, 120);
   const normalizedExactOrderRefs = [...new Set((Array.isArray(exactOrderRefs) ? exactOrderRefs : [])
@@ -1831,6 +1828,7 @@ async function loadDispatchOrdersForResponse({
   const requestedType = String(type || "").trim().toUpperCase();
   const includeCustom = !requestedType || requestedType === "TO" || requestedType === "CUSTOM";
   const historicalDate = historicalDispatchPlanDate(historyPlanDate);
+  const revealCompletedScmSearch = Boolean(includeCompletedScmSearch && searchTerm && !historicalDate);
   const [orders, customOrders, snapshotOrders, initialRestrictedScmRefs, billedSalesOrders, hiddenScmOrders, completedReconciliationRefs] = await Promise.all([
     listDispatchOrders({
       type,
@@ -1850,7 +1848,7 @@ async function loadDispatchOrdersForResponse({
       ? Promise.resolve(new Set())
       : listRestrictedScmDispatchOrderRefs(),
     listBilledSalesOrderFamilyRefs(),
-    historicalDate && searchTerm
+    searchTerm && (historicalDate || revealCompletedScmSearch)
       ? listDispatchOrders({
           type,
           search: searchTerm,
@@ -1919,7 +1917,33 @@ async function loadDispatchOrdersForResponse({
     if (!["PO", "TO", "VRMA"].includes(String(order?.type || "").trim().toUpperCase())) return true;
     return !dispatchOrderScmRestrictionRefs(order).some((ref) => restrictedScmRefs.has(ref));
   });
-  const assigned = await enrichDispatchOrdersWithPlanAssignments(mergeDispatchOrderFeedWithSnapshotDerivedOrders(currentOrders, derivedOrders));
+  const planningVisibleOrders = mergeDispatchOrderFeedWithSnapshotDerivedOrders(currentOrders, derivedOrders);
+  const planningVisibleIds = new Set(planningVisibleOrders.map((order) => String(order?.id || "").trim().toLowerCase()));
+  const completedSearchCandidatesById = new Map();
+  if (revealCompletedScmSearch) {
+    for (const order of hiddenScmOrders) {
+      if (!["PO", "TO"].includes(String(order?.type || "").trim().toUpperCase())) continue;
+      const key = String(order?.id || "").trim().toLowerCase();
+      if (!key || planningVisibleIds.has(key)) continue;
+      const existing = completedSearchCandidatesById.get(key);
+      const candidateIsCompleted = isCompletedScmOrder(order);
+      const existingIsCompleted = isCompletedScmOrder(existing);
+      const candidateHasSchedule = Boolean(order?.scm?.scheduleId);
+      const existingHasSchedule = Boolean(existing?.scm?.scheduleId);
+      if (
+        !existing
+        || (candidateIsCompleted && !existingIsCompleted)
+        || (candidateIsCompleted === existingIsCompleted && candidateHasSchedule && !existingHasSchedule)
+      ) {
+        completedSearchCandidatesById.set(key, order);
+      }
+    }
+  }
+  const completedSearchCandidates = [...completedSearchCandidatesById.values()];
+  const assigned = await enrichDispatchOrdersWithPlanAssignments([
+    ...planningVisibleOrders,
+    ...completedSearchCandidates
+  ]);
   const poLinked = await enrichDispatchOrdersWithPoTargetAllocations(assigned);
   const enriched = await enrichDispatchOrdersWithDependencies(poLinked);
   const reconciliationRows = await enrichScmScheduleWithReconciliation(
@@ -1960,26 +1984,39 @@ async function loadDispatchOrdersForResponse({
       }
     };
   });
-  const visibleOrders = filterDispatchPlanningVisibleOrders(withReconciliation)
+  const visibleOrders = filterDispatchPlanningVisibleOrders(withReconciliation, {
+    includeCompletedScmSearch: revealCompletedScmSearch
+  })
     .filter((order) => !isBilledSalesOrderFamily(order)).filter((order) => {
     if (order.historicalReconciliationComplete === true) return true;
     if (!["PO", "TO", "VRMA"].includes(String(order?.type || "").trim().toUpperCase())) return true;
-    return !dispatchOrderScmRestrictionRefs(order).some((ref) => restrictedScmRefs.has(ref));
+    const restricted = dispatchOrderScmRestrictionRefs(order).some((ref) => restrictedScmRefs.has(ref));
+    return !restricted || (revealCompletedScmSearch && isCompletedScmOrder(order));
   });
   const searchedOrders = exactIdentityRequest
     ? visibleOrders
     : searchTerm
     ? visibleOrders.filter((order) => dispatchOrderMatchesSearch(order, searchTerm))
     : visibleOrders;
-  return enrichDispatchOrdersWithCompletionStatus(searchedOrders);
+  const planningAnnotatedOrders = searchedOrders.map((order) => (
+    revealCompletedScmSearch && isCompletedScmOrder(order)
+      ? {
+          ...order,
+          dispatchPlanningRestricted: true,
+          dispatchPlanningRestrictionReason: `${order.id} is completed in PO/TO Schedule and is available for search only.`
+        }
+      : order
+  ));
+  return enrichDispatchOrdersWithCompletionStatus(planningAnnotatedOrders);
 }
 
 const dispatchOrderResponseSingleFlight = createSingleFlight({
-  key({ type = null, search = "", historyPlanDate = "", exactOrderRefs = [] } = {}) {
+  key({ type = null, search = "", historyPlanDate = "", exactOrderRefs = [], includeCompletedScmSearch = false } = {}) {
     return JSON.stringify({
       type: String(type || "").trim().toUpperCase(),
       search: String(search || "").trim().slice(0, 120).toLowerCase(),
       historyPlanDate: String(historyPlanDate || "").trim().slice(0, 10),
+      includeCompletedScmSearch: Boolean(includeCompletedScmSearch),
       exactOrderRefs: [...new Set((Array.isArray(exactOrderRefs) ? exactOrderRefs : [])
         .map((ref) => String(ref || "").trim().toLowerCase())
         .filter(Boolean))].sort()
@@ -4176,7 +4213,8 @@ async function checkDriverJobLocation(job) {
 
 async function startDriverPhysicalVisitJobs(driverLogin, job, routeJobs = [], {
   occurredAt = null,
-  offlineTrace = null
+  offlineTrace = null,
+  requireCurrentJob = false
 } = {}) {
   await assertSalesOrderReattemptDriverReady(
     driverPhysicalVisitOrderRefs(job, routeJobs)
@@ -4187,6 +4225,8 @@ async function startDriverPhysicalVisitJobs(driverLogin, job, routeJobs = [], {
   );
   const jobs = driverPhysicalVisitExecutionJobs(job, routeJobs);
   const records = await withTransaction(async () => {
+    await query("SELECT pg_advisory_xact_lock(hashtext($1))", [DISPATCH_FLEET_PLANNING_LOCK]);
+    if (requireCurrentJob) await assertDriverExecutionJobIsCurrent(driverLogin, job);
     const completedResult = await query(
       `SELECT *
          FROM driver_job_records
@@ -4217,6 +4257,32 @@ async function startDriverPhysicalVisitJobs(driverLogin, job, routeJobs = [], {
     record: records[primaryIndex >= 0 ? primaryIndex : 0],
     records
   };
+}
+
+function driverExecutionJobFingerprint(job = {}) {
+  return JSON.stringify({
+    jobId: String(job.jobId || ""),
+    planId: String(job.planId || ""),
+    loadId: String(job.loadId || ""),
+    stopId: String(job.stopId || ""),
+    stopType: String(job.stopType || ""),
+    location: String(job.location || ""),
+    address: String(job.address || ""),
+    orderRefs: [...(job.orderRefs || [])].map(String).sort()
+  });
+}
+
+async function assertDriverExecutionJobIsCurrent(driverLogin, expectedJob) {
+  const current = (await getDriverNextJobContext(driverLogin)).job;
+  if (
+    !current
+    || driverExecutionJobFingerprint(current) !== driverExecutionJobFingerprint(expectedJob)
+  ) {
+    throw Object.assign(
+      new Error("The dispatch route changed before Driver activity was recorded. Refresh and use the current next stop."),
+      { status: 409, code: "DRIVER_FOREGROUND_TARGET_CHANGED" }
+    );
+  }
 }
 
 async function startDriverPhysicalVisitOperationalEffects({
@@ -4339,7 +4405,8 @@ export async function completeDriverJobOperationalEffects({
   driverRemark = undefined,
   completionContext = null,
   rejectExistingCompletion = false,
-  strictPlanCleanup = false
+  strictPlanCleanup = false,
+  requireCurrentJob = false
 } = {}) {
   if (!job?.jobId) throw new Error("Driver job is no longer available.");
   await assertSalesOrderReattemptDriverReady(
@@ -4352,6 +4419,8 @@ export async function completeDriverJobOperationalEffects({
   const physicalVisitJobs = driverPhysicalVisitExecutionJobs(job, routeJobs);
   const yardDependencyMode = await getDriverYardDependencyMode();
   const completion = await withTransaction(async () => {
+    await query("SELECT pg_advisory_xact_lock(hashtext($1))", [DISPATCH_FLEET_PLANNING_LOCK]);
+    if (requireCurrentJob) await assertDriverExecutionJobIsCurrent(driverLogin, job);
     const lockedResult = await query(
       `SELECT *
          FROM driver_job_records
@@ -4972,7 +5041,7 @@ async function applyDriverOfflineReviewResolution({ event, action, effectiveJobI
   const requiredPhotoCount = event.eventType === "dvir_captured"
     ? 4
     : event.eventType === "job_completed"
-      ? Math.max(0, Number(job?.requiredPhotos || 0))
+      ? Math.max(0, Number(job?.remainingRequiredPhotos ?? job?.requiredPhotos ?? 0))
       : 0;
   if (photoReferences.length < requiredPhotoCount) {
     throw Object.assign(
@@ -5057,18 +5126,6 @@ function emitAppEvent(type, payload = {}) {
           source: refresh.source
         }).catch((error) => console.error("SCM PO catalog enqueue failed:", error.message));
       }
-    }
-    if (
-      ["dispatch.plan.saved", "dispatch.plan.confirmed", "dispatch.plan.reopened", "dispatch.plan.created", "dispatch.plan.cleared"].includes(type)
-      && payload.planId
-      && config.dispatch?.plannerOrderPoolMode !== "off"
-    ) {
-      void getDispatchPlan(String(payload.planId))
-        .then((plan) => plan && withTransaction(async () => {
-          await syncDispatchPlanOrderAssignments(plan);
-          await syncDispatchPlanRelationEdges(plan);
-        }))
-        .catch((error) => console.error("Dispatch plan projection refresh failed:", error.message));
     }
     const event = {
       id: ++eventSeq,
@@ -10805,6 +10862,262 @@ app.post("/api/dispatch/driver-pwa/historical-assist/:jobId/complete", requireDi
   }
 });
 
+function completedStopPhotoRequestId(value) {
+  const requestId = String(value || "").trim().toLowerCase();
+  if (!/^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(requestId)) {
+    throw Object.assign(new Error("Completed-stop photo request ID must be a UUID."), {
+      status: 400,
+      code: "DRIVER_COMPLETED_PHOTO_REQUEST_ID_INVALID"
+    });
+  }
+  return requestId;
+}
+
+function completedStopPhotoExpectedStateHash(value) {
+  const stateHash = String(value || "").trim().toLowerCase();
+  if (!/^[0-9a-f]{64}$/.test(stateHash)) {
+    throw Object.assign(new Error("Completed-stop state hash is required."), {
+      status: 400,
+      code: "DRIVER_COMPLETED_VISIT_STATE_HASH_INVALID"
+    });
+  }
+  return stateHash;
+}
+
+app.get("/api/dispatch/driver-pwa/visits", requireDispatcher, async (req, res, next) => {
+  res.setHeader("Cache-Control", "no-store");
+  try {
+    res.json(await listDriverCompletedVisits({
+      planDate: req.query.planDate || req.query.date || "",
+      status: req.query.status || "complete",
+      driverLogin: req.query.driverLogin || "",
+      stopType: req.query.stopType || "all",
+      photoState: req.query.photoState || "all",
+      completionSource: req.query.completionSource || "all",
+      q: req.query.q || "",
+      cursor: req.query.cursor || 0,
+      limit: req.query.limit || 50
+    }));
+  } catch (error) {
+    next(error);
+  }
+});
+
+app.get("/api/dispatch/driver-pwa/visits/:recordId", requireDispatcher, async (req, res, next) => {
+  res.setHeader("Cache-Control", "no-store");
+  try {
+    res.json(await getDriverCompletedVisit({
+      recordId: req.params.recordId,
+      expectedStateHash: req.query.expectedStateHash || ""
+    }));
+  } catch (error) {
+    next(error);
+  }
+});
+
+app.get("/api/dispatch/driver-pwa/visits/:recordId/photos/:ordinal", requireDispatcher, async (req, res, next) => {
+  try {
+    const ordinal = Number(req.params.ordinal);
+    if (!Number.isSafeInteger(ordinal) || ordinal < 1 || ordinal > 20) {
+      return res.status(400).json({ error: "Completed-stop photo ordinal is invalid." });
+    }
+    const visit = await getDriverCompletedVisit({ recordId: req.params.recordId });
+    const reference = Array.isArray(visit.photoReferences)
+      ? visit.photoReferences[ordinal - 1]
+      : "";
+    if (!isR2PhotoReference(reference)) {
+      return res.status(404).json({ error: "Completed-stop photo was not found." });
+    }
+    const sendThumbnail = (thumbnail) => {
+      res.setHeader("Content-Type", thumbnail.contentType);
+      res.setHeader("Content-Length", String(thumbnail.byteSize));
+      res.setHeader("ETag", `"${thumbnail.sha256}"`);
+      res.setHeader("Cache-Control", "private, max-age=300");
+      res.setHeader("X-MBBS-Photo-Variant", thumbnail.transformed ? "thumbnail" : "original-fallback");
+      return res.send(thumbnail.bytes);
+    };
+    const cacheKey = `dispatch-completed-stop:${reference}`;
+    const cached = readCachedPhotoThumbnail(cacheKey);
+    if (cached) return sendThumbnail(cached);
+    const archived = await readArchivedPhoto(reference);
+    if (archived?.available) {
+      const thumbnail = await createPhotoThumbnail(archived.bytes, archived.contentType);
+      return sendThumbnail(cachePhotoThumbnail(cacheKey, thumbnail));
+    }
+    if (archived?.found && archived.remoteDeleted) {
+      return res.status(410).json({ error: "The completed-stop photo is no longer available." });
+    }
+    const readTicket = createPhotoReadToken({
+      actor: historicalAssistOperator(req).uploadActor,
+      key: reference
+    });
+    const response = await fetch(readTicket.objectUrl, {
+      headers: { Authorization: `Bearer ${readTicket.token}` }
+    });
+    if (!response.ok) {
+      const message = await response.text().catch(() => "");
+      return res.status(response.status).json({ error: message || "Completed-stop photo could not be loaded." });
+    }
+    const bytes = Buffer.from(await response.arrayBuffer());
+    const thumbnail = await createPhotoThumbnail(
+      bytes,
+      response.headers.get("content-type") || "application/octet-stream"
+    );
+    return sendThumbnail(cachePhotoThumbnail(cacheKey, thumbnail));
+  } catch (error) {
+    return next(error);
+  }
+});
+
+app.post("/api/dispatch/driver-pwa/visits/:recordId/photo-tickets", requireDispatcher, async (req, res, next) => {
+  res.setHeader("Cache-Control", "no-store");
+  try {
+    const requestId = completedStopPhotoRequestId(req.body?.requestId);
+    const expectedStateHash = completedStopPhotoExpectedStateHash(req.body?.expectedStateHash);
+    const descriptors = normalizeDriverCompletedPhotoDescriptors(req.body?.photos || []);
+    if (!descriptors.length) {
+      throw Object.assign(new Error("Select at least one photo to append."), {
+        status: 400,
+        code: "DRIVER_COMPLETED_PHOTO_REQUIRED"
+      });
+    }
+    const visit = await getDriverCompletedVisit({
+      recordId: req.params.recordId,
+      expectedStateHash
+    });
+    if (!visit.appendable) {
+      throw Object.assign(new Error(visit.blockReason || "This completed visit cannot accept more photos."), {
+        status: 409,
+        code: visit.blockCode || "DRIVER_COMPLETED_VISIT_NOT_APPENDABLE"
+      });
+    }
+    if (descriptors.length > Number(visit.remainingPhotoSlots || 0)) {
+      throw Object.assign(new Error(`Only ${visit.remainingPhotoSlots} more photo${visit.remainingPhotoSlots === 1 ? "" : "s"} can be added.`), {
+        status: 409,
+        code: "DRIVER_COMPLETED_PHOTO_LIMIT"
+      });
+    }
+    const operator = historicalAssistOperator(req);
+    const recordType = visit.stopType === "pickup"
+      ? "driver-pickup-photo"
+      : "driver-dropoff-photo";
+    const tickets = descriptors.map((photo) => ({
+      photoId: photo.photoId,
+      ordinal: photo.ordinal,
+      upload: createPhotoUploadToken({
+        actor: operator.uploadActor,
+        source: "dispatch-stop-evidence",
+        recordType,
+        metadata: {
+          photoId: `${requestId}-${photo.photoId}`,
+          jobId: visit.jobId,
+          stopId: visit.stopIds[0] || "",
+          planId: visit.planId,
+          loadId: visit.loadId,
+          manifestId: requestId,
+          sha256: photo.sha256,
+          byteSize: photo.byteSize,
+          mimeType: photo.mimeType
+        },
+        options: {
+          maxBytes: photo.byteSize,
+          allowedTypes: ["image/jpeg"]
+        }
+      })
+    }));
+    res.status(201).json({
+      requestId,
+      recordId: visit.recordId,
+      recordIds: visit.recordIds,
+      jobId: visit.jobId,
+      jobIds: visit.jobIds,
+      planId: visit.planId,
+      planDate: visit.planDate,
+      recordType,
+      tickets
+    });
+  } catch (error) {
+    next(error);
+  }
+});
+
+app.post("/api/dispatch/driver-pwa/visits/:recordId/photos", requireDispatcher, async (req, res, next) => {
+  res.setHeader("Cache-Control", "no-store");
+  try {
+    const requestId = completedStopPhotoRequestId(req.body?.requestId);
+    const expectedStateHash = completedStopPhotoExpectedStateHash(req.body?.expectedStateHash);
+    const operator = historicalAssistOperator(req);
+    const photos = normalizeDriverCompletedPhotoDescriptors(req.body?.photos || [], {
+      requireReferences: true
+    });
+    const replayPhotoReferences = uniqueDriverPhotoReferences(
+      photos.map((photo) => photo.objectReference)
+    );
+    const replay = await getDriverCompletedPhotoReplay({
+      requestId,
+      recordId: req.params.recordId,
+      actorId: operator.id,
+      reason: String(req.body?.reason || "").trim(),
+      expectedStateHash,
+      photoReferences: replayPhotoReferences
+    });
+    if (replay) return res.json(replay);
+    const visit = await getDriverCompletedVisit({
+      recordId: req.params.recordId,
+      expectedStateHash
+    });
+    const recordType = visit.stopType === "pickup"
+      ? "driver-pickup-photo"
+      : "driver-dropoff-photo";
+    for (const photo of photos) {
+      if (!driverCompletedPhotoReferenceMatches(photo.objectReference, {
+        requestId,
+        photoId: photo.photoId,
+        recordType
+      })) {
+        throw Object.assign(new Error("An uploaded photo does not belong to this completed-stop request."), {
+          status: 409,
+          code: "DRIVER_COMPLETED_PHOTO_REFERENCE_INVALID"
+        });
+      }
+      try {
+        await verifyDriverOfflinePhotoObject(photo, operator.uploadActor);
+      } catch (error) {
+        if (String(error?.code || "").startsWith("OFFLINE_PHOTO_")) {
+          error.code = String(error.code).replace("OFFLINE_PHOTO_", "DRIVER_COMPLETED_PHOTO_");
+        }
+        throw error;
+      }
+    }
+    const result = await appendDriverCompletedVisitPhotos({
+      recordId: req.params.recordId,
+      expectedStateHash,
+      requestId,
+      additionEventId: req.body?.additionEventId || crypto.randomUUID(),
+      actorId: operator.id,
+      actorName: operator.name,
+      reason: req.body?.reason,
+      photos
+    });
+    emitAppEvent("driver.stop.photos_added", {
+      source: "dispatch-stop-evidence",
+      driverLogin: result.driverLogin,
+      planId: result.planId,
+      planDate: result.planDate,
+      recordId: result.recordId,
+      recordIds: result.recordIds,
+      jobId: result.jobId,
+      jobIds: result.jobIds,
+      additionEventId: result.additionEventId,
+      addedPhotoCount: result.addedPhotoCount,
+      photoCount: result.photoCount
+    });
+    return res.json(result);
+  } catch (error) {
+    next(error);
+  }
+});
+
 app.get("/api/dispatch/driver-pwa/stops", requireDispatcher, async (req, res, next) => {
   try {
     const planDate = req.query.planDate || req.query.date || "";
@@ -10848,6 +11161,8 @@ app.post("/api/dispatch/driver-pwa/stops/:recordId/reopen", requireDispatcher, a
       driverLogin: result.driverLogin,
       planDate: result.planDate,
       jobId: result.jobId,
+      jobIds: result.physicalVisitJobIds || [result.jobId],
+      recordIds: result.recordIds || [result.recordId],
       correctionId: result.correctionId
     });
     res.json(result);
@@ -12507,7 +12822,12 @@ async function dispatchOrderPoolRuntimePolicy() {
 }
 
 async function legacyDispatchOrderPool({ type = "", search = "", historyPlanDate = "" } = {}) {
-  const orders = await listDispatchOrdersForResponse({ type: type || null, search, historyPlanDate });
+  const orders = await listDispatchOrdersForResponse({
+    type: type || null,
+    search,
+    historyPlanDate,
+    includeCompletedScmSearch: Boolean(String(search || "").trim())
+  });
   const visible = String(search || "").trim()
     ? orders
     : orders.filter((order) => order?.dispatchPlanned !== true);
@@ -12529,6 +12849,12 @@ app.get("/api/dispatch/v2/order-pool", async (req, res, next) => {
     if (historyPlanDate) {
       await requireDispatchV2PlanEditLease(req, historyPlanDate);
       return res.json(await legacyDispatchOrderPool({ type, search, historyPlanDate }));
+    }
+    // The optimized catalog intentionally contains only the bounded browse window.
+    // Explicit searches must use the authoritative repository so older eligible
+    // orders remain discoverable after a full catalog refresh replaces that window.
+    if (search) {
+      return res.json(await legacyDispatchOrderPool({ type, search }));
     }
     const policy = await dispatchOrderPoolRuntimePolicy();
     if (policy.effective) {
@@ -12829,7 +13155,9 @@ app.post("/api/dispatch/v2/plans/:id/commands", requireOperator, requireDispatch
         savedAt: result.payload.plan.savedAt,
         sourceSessionId: command.sessionId || "",
         commandType: command.commandType || command.type || "",
-        affectedOrderRefs: dispatchV2PatchOrderRefs(result.payload.patch || {})
+        affectedOrderRefs: dispatchV2PatchOrderRefs(result.payload.patch || {}),
+        retiredGlobalOrderRefs: command.payload?.retiredGlobalOrderRefs || [],
+        reactivatedGlobalOrderRefs: command.payload?.reactivatedGlobalOrderRefs || []
       });
       void writeDispatchAudit({
         action: `dispatch_plan_${String(result.payload.patch?.actionName || command.commandType || command.type || "command")}`,
@@ -13382,6 +13710,11 @@ app.put("/api/dispatch/plans/:id", reportDispatchSaveTiming, requireOperator, re
       : [])
       .map((ref) => String(ref || "").trim())
       .filter(Boolean))].slice(0, 200);
+    const reactivatedGlobalOrderRefs = [...new Set((Array.isArray(req.body?.reactivatedGlobalOrderRefs)
+      ? req.body.reactivatedGlobalOrderRefs
+      : [])
+      .map((ref) => String(ref || "").trim())
+      .filter(Boolean))].slice(0, 200);
     const explicitOperatorAlertRefs = Array.isArray(req.body?.audit?.details?.operatorAlertRefs)
       ? req.body.audit.details.operatorAlertRefs.map((ref) => String(ref || "").trim()).filter(Boolean)
       : [];
@@ -13390,6 +13723,8 @@ app.put("/api/dispatch/plans/:id", reportDispatchSaveTiming, requireOperator, re
       previousPlan
       && !explicitOperatorAlertRefs.length
       && !retiredGlobalOrderRefs.length
+      && !reactivatedGlobalOrderRefs.length
+      && !dispatchPlanProjectionRefreshRequired(previousPlan)
       && !dispatchPlanDataChanged(
         { orders: previousPlan.orders || [], trucks: previousPlan.trucks || [] },
         { orders: cleanOrders, trucks: cleanTrucks }
@@ -13459,7 +13794,8 @@ app.put("/api/dispatch/plans/:id", reportDispatchSaveTiming, requireOperator, re
       baseRevision: forceSave || saveMode === "truck_sequence" ? null : req.body?.baseRevision,
       planDate: req.body?.planDate || req.body?.date || "",
       sessionId: req.body?.audit?.sessionId || "",
-      retiredGlobalOrderRefs
+      retiredGlobalOrderRefs,
+      reactivatedGlobalOrderRefs
     });
     const followupWarnings = [];
     const followupContext = {
@@ -13529,7 +13865,7 @@ app.put("/api/dispatch/plans/:id", reportDispatchSaveTiming, requireOperator, re
         }
       }).catch(() => null);
     }
-    emitAppEvent("dispatch.plan.saved", { planId: plan.id, planDate: plan.planDate, savedAt: plan.savedAt, sourceSessionId: req.body?.audit?.sessionId, operatorFlags, changedOperatorRefs, refreshOrderPool, scmSchedule, forceSave, followupWarnings });
+    emitAppEvent("dispatch.plan.saved", { planId: plan.id, planDate: plan.planDate, savedAt: plan.savedAt, revision: plan.revision, sourceSessionId: req.body?.audit?.sessionId, operatorFlags, changedOperatorRefs, refreshOrderPool, retiredGlobalOrderRefs, reactivatedGlobalOrderRefs, scmSchedule, forceSave, followupWarnings });
     res.json({ ...plan, operatorFlags, scmSchedule, followupWarnings });
   } catch (error) {
     if (error instanceof DispatchPlanEditLeaseError) return sendDispatchPlanEditLeaseError(res, error);
@@ -14222,7 +14558,12 @@ app.get("/api/dispatch/orders", async (req, res, next) => {
     const search = req.query.search ? String(req.query.search) : "";
     const historyPlanDate = requestedDispatchHistoryPlanDate(req.query.historyPlanDate);
     if (historyPlanDate) await requireDispatchV2PlanEditLease(req, historyPlanDate);
-    res.json(await listDispatchOrdersForResponse({ type, search, historyPlanDate }));
+    res.json(await listDispatchOrdersForResponse({
+      type,
+      search,
+      historyPlanDate,
+      includeCompletedScmSearch: Boolean(search.trim())
+    }));
   } catch (error) {
     if (error instanceof DispatchPlanEditLeaseError) return sendDispatchPlanEditLeaseError(res, error);
     if (error?.code === "DISPATCH_HISTORY_DATE_INVALID") {
@@ -16866,6 +17207,9 @@ app.post("/api/dispatch/split-orders/unsplit", async (req, res, next) => {
     emitAppEvent("dispatch.orders.updated", {
       orderId: req.body?.originalOrderId || "",
       change: "order_unsplit",
+      planId: req.body?.planId || "",
+      planDate: req.body?.planDate || "",
+      retiredGlobalOrderRefs: result.deactivated || [],
       sourceSessionId: req.body?.audit?.sessionId,
       refreshOrderPool: true
     });
@@ -17050,6 +17394,11 @@ app.put("/api/dispatch/plan", async (req, res, next) => {
       : [])
       .map((ref) => String(ref || "").trim())
       .filter(Boolean))].slice(0, 200);
+    const reactivatedGlobalOrderRefs = [...new Set((Array.isArray(req.body?.reactivatedGlobalOrderRefs)
+      ? req.body.reactivatedGlobalOrderRefs
+      : [])
+      .map((ref) => String(ref || "").trim())
+      .filter(Boolean))].slice(0, 200);
     const explicitOperatorAlertRefs = Array.isArray(req.body?.audit?.details?.operatorAlertRefs)
       ? req.body.audit.details.operatorAlertRefs.map((ref) => String(ref || "").trim()).filter(Boolean)
       : [];
@@ -17058,6 +17407,8 @@ app.put("/api/dispatch/plan", async (req, res, next) => {
       previousPlan
       && !explicitOperatorAlertRefs.length
       && !retiredGlobalOrderRefs.length
+      && !reactivatedGlobalOrderRefs.length
+      && !dispatchPlanProjectionRefreshRequired(previousPlan)
       && !dispatchPlanDataChanged(
         { orders: previousPlan.orders || [], trucks: previousPlan.trucks || [] },
         { orders: payload.orders, trucks: payload.trucks }
@@ -17097,7 +17448,8 @@ app.put("/api/dispatch/plan", async (req, res, next) => {
       trucks: payload.trucks,
       summary: await dispatchPlanSummaryWithSetup(req.body?.summary || {}),
       baseRevision: saveMode === "truck_sequence" ? null : req.body?.baseRevision,
-      retiredGlobalOrderRefs
+      retiredGlobalOrderRefs,
+      reactivatedGlobalOrderRefs
     });
     await syncOrderDependenciesFromDispatchPlan(savedPlan, {
       allowEstablishedUngroupTargets: dependencyStructureChanges.safeUngroupTargets
@@ -17137,7 +17489,7 @@ app.put("/api/dispatch/plan", async (req, res, next) => {
         }
       }).catch(() => null);
     }
-    emitAppEvent("dispatch.plan.saved", { planId: savedPlan.id, planDate: savedPlan.planDate, savedAt: savedPlan.savedAt, sourceSessionId: req.body?.audit?.sessionId, operatorFlags, changedOperatorRefs, refreshOrderPool });
+    emitAppEvent("dispatch.plan.saved", { planId: savedPlan.id, planDate: savedPlan.planDate, savedAt: savedPlan.savedAt, revision: savedPlan.revision, sourceSessionId: req.body?.audit?.sessionId, operatorFlags, changedOperatorRefs, refreshOrderPool, retiredGlobalOrderRefs, reactivatedGlobalOrderRefs });
     res.json({ ...savedPlan, operatorFlags });
   } catch (error) {
     if (error instanceof DispatchPlanEditLeaseError) return sendDispatchPlanEditLeaseError(res, error);
@@ -19536,6 +19888,69 @@ app.get("/api/driver/jobs/:jobId/delivery-instructions", requireDriver, async (r
   }
 });
 
+app.get("/api/driver/jobs/:jobId/retained-photos/:ordinal", requireDriver, async (req, res, next) => {
+  try {
+    const ordinal = Number(req.params.ordinal);
+    if (!Number.isSafeInteger(ordinal) || ordinal < 1 || ordinal > 20) {
+      return res.status(400).json({ error: "Retained photo ordinal is invalid." });
+    }
+    const context = await getDriverNextJobContext(req.driverLogin, {
+      clientVersion: driverRequestClientVersion(req),
+      minimumClientVersion: DRIVER_PWA_MINIMUM_VERSION
+    });
+    const job = context.job;
+    const requestedJobId = String(req.params.jobId || "");
+    const authorizedJobIds = new Set([
+      String(job?.jobId || ""),
+      ...(job?.physicalVisitJobIds || []).map(String)
+    ].filter(Boolean));
+    const reference = Array.isArray(job?.retainedPhotoReferences)
+      ? job.retainedPhotoReferences[ordinal - 1]
+      : "";
+    if (!job || !authorizedJobIds.has(requestedJobId) || !isR2PhotoReference(reference)) {
+      return res.status(404).json({ error: "Retained photo was not found for the Driver's current stop." });
+    }
+    const sendThumbnail = (thumbnail) => {
+      res.setHeader("Content-Type", thumbnail.contentType);
+      res.setHeader("Content-Length", String(thumbnail.byteSize));
+      res.setHeader("ETag", `"${thumbnail.sha256}"`);
+      res.setHeader("Cache-Control", "private, max-age=300");
+      res.setHeader("X-MBBS-Photo-Variant", thumbnail.transformed ? "thumbnail" : "original-fallback");
+      return res.send(thumbnail.bytes);
+    };
+    const cacheKey = `driver-retained:${reference}`;
+    const cached = readCachedPhotoThumbnail(cacheKey);
+    if (cached) return sendThumbnail(cached);
+    const archived = await readArchivedPhoto(reference);
+    if (archived?.available) {
+      const thumbnail = await createPhotoThumbnail(archived.bytes, archived.contentType);
+      return sendThumbnail(cachePhotoThumbnail(cacheKey, thumbnail));
+    }
+    if (archived?.found && archived.remoteDeleted) {
+      return res.status(410).json({ error: "The retained photo is no longer available." });
+    }
+    const readTicket = createPhotoReadToken({
+      actor: { id: req.driverLogin, login: req.driverLogin, role: "driver", driverId: req.driverLogin },
+      key: reference
+    });
+    const response = await fetch(readTicket.objectUrl, {
+      headers: { Authorization: `Bearer ${readTicket.token}` }
+    });
+    if (!response.ok) {
+      const message = await response.text().catch(() => "");
+      return res.status(response.status).json({ error: message || "Retained photo could not be loaded." });
+    }
+    const bytes = Buffer.from(await response.arrayBuffer());
+    const thumbnail = await createPhotoThumbnail(
+      bytes,
+      response.headers.get("content-type") || "application/octet-stream"
+    );
+    return sendThumbnail(cachePhotoThumbnail(cacheKey, thumbnail));
+  } catch (error) {
+    next(error);
+  }
+});
+
 function driverOnlineBinEventId(value) {
   const eventId = String(value || "").trim().toLowerCase();
   if (!DRIVER_FOREGROUND_EVENT_ID_PATTERN.test(eventId)) {
@@ -19928,7 +20343,8 @@ app.post("/api/driver/jobs/:jobId/start", requireDriver, async (req, res, next) 
         job: liveJob
       });
       const started = await startDriverPhysicalVisitJobs(req.driverLogin, liveJob, liveContext.jobs || [], {
-        occurredAt: req.body?.deviceOccurredAt || null
+        occurredAt: req.body?.deviceOccurredAt || null,
+        requireCurrentJob: true
       });
       if (dependencyWarnings.length) {
         await writeDispatchAudit({
@@ -20011,7 +20427,7 @@ app.post("/api/driver/jobs/:jobId/confirm-truck-switch", requireDriver, async (r
       if (!receipt && nextJob && nextJob.stopType !== "truck_switch") {
         const nextContext = await getDriverNextJobContext(req.driverLogin);
         nextJob = nextContext.job || nextJob;
-        await startDriverPhysicalVisitJobs(req.driverLogin, nextJob, nextContext.jobs || []);
+        await startDriverPhysicalVisitJobs(req.driverLogin, nextJob, nextContext.jobs || [], { requireCurrentJob: true });
         nextJob = await getNextDriverJob(req.driverLogin);
       }
       const state = await getDriverDayState(req.driverLogin, {
@@ -20098,7 +20514,7 @@ app.post("/api/driver/jobs/:jobId/skip-samsara", requireDriver, async (req, res,
       if (!receipt && nextJob && nextJob.stopType !== "truck_switch") {
         const nextContext = await getDriverNextJobContext(req.driverLogin);
         nextJob = nextContext.job || nextJob;
-        await startDriverPhysicalVisitJobs(req.driverLogin, nextJob, nextContext.jobs || []);
+        await startDriverPhysicalVisitJobs(req.driverLogin, nextJob, nextContext.jobs || [], { requireCurrentJob: true });
         nextJob = await getNextDriverJob(req.driverLogin);
       }
       const state = await getDriverDayState(req.driverLogin, {
@@ -20186,7 +20602,8 @@ app.post("/api/driver/jobs/:jobId/photos", requireDriver, async (req, res, next)
     if (job.status !== "in_progress" || !job.startedAt) return res.status(409).json({ error: "Start this job before confirming it." });
     const photoDataUrls = requiredPhotoDataUrls(
       req.body?.photoDataUrls,
-      Number(job.requiredPhotos || 0) > 0 ? Math.max(2, Number(job.requiredPhotos)) : 0
+      Math.max(0, Number(job.remainingRequiredPhotos
+        ?? (Number(job.requiredPhotos || 0) > 0 ? Math.max(2, Number(job.requiredPhotos)) : 0)))
     );
     const secondsSinceStart = (Date.now() - new Date(job.startedAt).getTime()) / 1000;
     if (!Number.isFinite(secondsSinceStart) || secondsSinceStart < 10) {
@@ -20206,7 +20623,8 @@ app.post("/api/driver/jobs/:jobId/photos", requireDriver, async (req, res, next)
       job,
       routeJobs: jobContext.jobs || [],
       photoDataUrls,
-      driverRemark: req.body?.driverRemark
+      driverRemark: req.body?.driverRemark,
+      requireCurrentJob: true
     });
     const {
       record,
@@ -20309,7 +20727,7 @@ app.post("/api/driver/jobs/:jobId/photos", requireDriver, async (req, res, next)
           samsaraAccounts: samsaraAccountsForDriver(req.driver),
           job: nextJob
         });
-        await startDriverPhysicalVisitJobs(req.driverLogin, nextJob, nextJobContext.jobs || []);
+        await startDriverPhysicalVisitJobs(req.driverLogin, nextJob, nextJobContext.jobs || [], { requireCurrentJob: true });
         const startedNextJob = await getNextDriverJob(req.driverLogin);
         nextJob = startedNextJob
           ? { ...startedNextJob, dependencyWarnings: nextDependencyWarnings }
@@ -23535,6 +23953,9 @@ export async function dispatchOrderCatalogTick() {
   dispatchOrderCatalogTickRunning = true;
   const summary = { skipped: false, claimed: 0, completed: 0, failed: 0 };
   try {
+    await catalogRefreshExecutor.run(async () => {
+      await backfillDispatchPlanProjections({ batchSize: 25 });
+    });
     const refreshes = await claimDispatchOrderCatalogRefreshes({ limit: 25 });
     summary.claimed = refreshes.length;
     for (const refresh of refreshes) {
@@ -23555,13 +23976,9 @@ export async function dispatchOrderCatalogTick() {
               source: refresh.source || "full-refresh",
               type: requestedType
             });
-            const state = await getDispatchOrderCatalogState();
-            const projection = state.assignmentsReady
-              ? { ready: true }
-              : await backfillDispatchPlanProjections({ batchSize: 25 });
             await markDispatchOrderCatalogReady({
               source: refresh.source || "full-refresh",
-              assignmentsReady: projection.ready === true
+              assignmentsReady: true
             });
           }
         });

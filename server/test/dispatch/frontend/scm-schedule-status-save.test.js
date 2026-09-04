@@ -5,7 +5,7 @@ import vm from "node:vm";
 
 const client = fs.readFileSync(new URL("../../../public/scm-schedule.js", import.meta.url), "utf8");
 
-function scheduleSaveHelpersContext(fields = []) {
+function scheduleSaveHelpersContext(fields = [], row = {}) {
   const start = client.indexOf("function scheduleRowId");
   const end = client.indexOf("function collectScmScheduleReconciliationAllocations", start);
   assert.ok(start >= 0 && end > start, "The schedule save helper block must remain inspectable.");
@@ -16,7 +16,8 @@ function scheduleSaveHelpersContext(fields = []) {
       orderRef: "STATUS-SPLIT",
       updatedAt: "2026-08-13T20:00:00.456Z",
       isScmSplit: true,
-      scmSplitRevision: 7
+      scmSplitRevision: 7,
+      ...row
     }],
     scmScheduleApp: {
       querySelectorAll: () => fields
@@ -52,6 +53,39 @@ test("PO/TO Schedule renders row-owned route options and locks operational split
     "PO and TO drop-offs must use the server-owned route domain");
   assert.match(client, /splitOperationalLock/);
   assert.match(client, />Unplan first</);
+});
+
+test("a PO pickup without configured vendor-yard options is read-only and omitted from save", () => {
+  assert.match(client, /rowPickupOptions\.length\s*\?\s*selectHtml\(\{ rowId, field: "pickupPoint"/u,
+    "only a server-owned pickup option domain may render an editable pickup field");
+  assert.match(client, /:\s*readOnlyCell\(row\.pickupPoint\)/u,
+    "the derived NetSuite or legacy pickup must remain visible without entering the patch");
+});
+
+test("a full-row save omits an unchanged PO pickup but includes a real pickup change", () => {
+  const pickup = {
+    dataset: { field: "pickupPoint" },
+    type: "select-one",
+    value: "Castle Building Centres Group Ltd.#1580",
+    disabled: false
+  };
+  const method = {
+    dataset: { field: "method" },
+    type: "select-one",
+    value: "Vendor",
+    disabled: false
+  };
+  const context = scheduleSaveHelpersContext([method, pickup], {
+    pickupPoint: pickup.value
+  });
+  const unchanged = vm.runInContext('collectRowPatch("PO::STATUS-SPLIT")', context);
+  assert.equal(unchanged.method, "Vendor");
+  assert.equal(Object.hasOwn(unchanged, "pickupPoint"), false,
+    "a Method-only save must not reinterpret the displayed pickup as a route edit");
+
+  pickup.value = "Configured Vendor Yard";
+  const changed = vm.runInContext('collectRowPatch("PO::STATUS-SPLIT")', context);
+  assert.equal(changed.pickupPoint, "Configured Vendor Yard");
 });
 
 test("PO/TO Schedule submits an explicit order-wide PO destination override", () => {

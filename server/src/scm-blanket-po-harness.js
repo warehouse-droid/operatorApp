@@ -262,10 +262,10 @@ try {
          order_kind, source_order_netsuite_id, source_order_ref,
          netsuite_terminal_state, application_status, reconciliation_status,
          reconciliation_reason, ordered_qty, received_qty, remaining_qty,
-         destination_remaining_qty, exact_allocation, reconciled_at, completed_at
+         destination_remaining_qty, exact_allocation, reconciled_at
        ) VALUES (
-         'PO', $1, $2, 'open', 'Completed', 'review',
-         'Blanket reconciliation visibility harness', 10, 10, 0, 0, false, now(), now()
+         'PO', $1, $2, 'open', 'Reconcile Review', 'review',
+         'Blanket reconciliation visibility harness', 10, 10, 0, 0, false, now()
        )
        RETURNING id`,
       [existingSyncId, existingSyncRef]
@@ -282,6 +282,15 @@ try {
       status: "Reconcile Review",
       view: "scm working"
     });
+    const blanketCompletion = await query(
+      `SELECT 1
+         FROM dispatch_order_completion_status
+        WHERE order_kind = 'PO'
+          AND lower(order_ref) = lower($1)`,
+      [existingSyncRef]
+    );
+    assert.equal(blanketCompletion.rowCount, 0,
+      "Fully received review quantities must not fabricate authoritative completion.");
     assert(hasRef(visibleBlanketReview, existingSyncRef),
       "A blocking Blanket PO review must surface in SCM Working and its review filter.");
     assert.equal(rowFor(visibleBlanketReview, existingSyncRef)?.status, "Reconcile Review",

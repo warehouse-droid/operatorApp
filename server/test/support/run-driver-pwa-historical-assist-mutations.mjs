@@ -7,6 +7,9 @@ import path from "node:path";
 
 const TESTS = Object.freeze([
   "test/mbt/unit/driver-pwa-historical-assist-policy.red.test.js",
+  "test/mbt/unit/driver-completed-photo-evidence.red.test.js",
+  "test/mbt/property/driver-completed-photo-evidence.property.test.js",
+  "test/mbt/adversarial/driver-completed-photo-evidence.adversarial.test.js",
   "test/mbt/property/driver-pwa-historical-assist.property.test.js",
   "test/mbt/adversarial/driver-pwa-historical-assist-adversarial.test.js",
   "test/mbt/unit/driver-pwa-historical-assist-wiring.contract.test.js"
@@ -61,6 +64,24 @@ const MUTANTS = Object.freeze([
     target: "src/driver-historical-assist-policy.js",
     from: "  const actionable = visit.jobIds.includes(firstIncompleteJobId);",
     to: "  const actionable = true;"
+  },
+  {
+    name: "completed physical visits may exceed the twenty-photo ceiling",
+    target: "src/driver-completed-photo-evidence.js",
+    from: "export const DRIVER_COMPLETED_VISIT_MAX_PHOTOS = 20;",
+    to: "export const DRIVER_COMPLETED_VISIT_MAX_PHOTOS = 21;"
+  },
+  {
+    name: "supplemental photos may use the historical-assist namespace",
+    target: "src/driver-completed-photo-evidence.js",
+    from: '    parts[0] === "dispatch-stop-evidence",',
+    to: '    parts[0] === "dispatch-assist",'
+  },
+  {
+    name: "retained completion evidence no longer satisfies the requirement",
+    target: "src/driver-completed-photo-evidence.js",
+    from: "    remainingRequiredPhotos: Math.max(0, requiredPhotos - retainedPhotoCount),",
+    to: "    remainingRequiredPhotos: Math.max(0, requiredPhotos),"
   }
 ]);
 

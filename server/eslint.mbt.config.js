@@ -30,6 +30,7 @@ export default [
       "src/operator-linked-quantity-domain.js",
       "src/sales-order-auto-fulfillment-*.js",
       "src/driver-historical-assist-*.js",
+      "src/driver-completed-photo-*.js",
       "src/netsuite-m2m-*.js",
       "src/netsuite-delayed-status-refresh-*.js",
       "src/pending-approval-reconciliation*.js",

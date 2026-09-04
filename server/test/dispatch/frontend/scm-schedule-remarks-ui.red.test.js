@@ -31,6 +31,6 @@ test("the server exposes an optimistic, audited remark-only endpoint", () => {
 });
 
 test("each changed page carries its current fresh cache key", () => {
-  assert.match(schedulePage, /scm-schedule\.js\?v=20260831-manual-split-authority-v1/);
-  assert.match(splitPage, /dispatch-scm\.js\?v=20260831-live-schedule-v1/);
+  assert.match(schedulePage, /scm-schedule\.js\?v=20260902-netsuite-address-pickup-v1/);
+  assert.match(splitPage, /dispatch-scm\.js\?v=20260903-po-line-sequence-v1/);
 });

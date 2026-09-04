@@ -18,16 +18,29 @@ COMPOSE_PARALLEL_LIMIT=1 "${compose[@]}" --profile tools build test mutation
 "${compose[@]}" up -d --wait db
 "${compose[@]}" --profile tools run --rm migrate
 "${compose[@]}" --profile tools run --rm test npm run test:scm-split-receipt-allocation
+"${compose[@]}" --profile tools run --rm test npm run test:scm-split-status-evidence-precedence
+"${compose[@]}" --profile tools run --rm test npm run test:scm-po-split-status-consistency
+"${compose[@]}" --profile tools run --rm test node --input-type=module -e \
+  "import { runNodeTestFilesIsolated } from './test/support/test-database-isolation.mjs'; process.exitCode = await runNodeTestFilesIsolated(['test/dispatch/integration/scm-manual-split-authority.red.test.js','test/dispatch/integration/scm-po-split-editing.test.js','test/dispatch/integration/scm-pob03658-split-driver-lifecycle.red.test.js'], { label: 'SCM split receipt and Driver lifecycle' });"
 "${compose[@]}" --profile tools run --rm test npm run test:scm-reconciliation-repository
 "${compose[@]}" --profile tools run --rm test npm run test:scm-reconciliation
 "${compose[@]}" --profile tools run --rm test npm run test:grouped-po-reconciliation-integration
 "${compose[@]}" --profile tools run --rm test npm run test:scm-po-split-ui
 "${compose[@]}" --profile tools run --rm test npm run test:scm-authoritative-schedule-status
 "${compose[@]}" --profile tools run --rm test npm run coverage:scm-split-receipt-allocation
+"${compose[@]}" --profile tools run --rm test npm run coverage:scm-split-status-evidence-precedence
 "${compose[@]}" --profile tools run --rm test npm run lint:scm-split-receipt-allocation
+"${compose[@]}" --profile tools run --rm test npm run lint:scm-split-status-evidence-precedence
+"${compose[@]}" --profile tools run --rm test npm run lint:scm-po-split-status-consistency
 "${compose[@]}" --profile tools run --rm test npm run typecheck:mbt
 "${compose[@]}" --profile tools run --rm -e MBT_MUTATION_EPHEMERAL=1 mutation npm run mutate:scm-split-receipt-allocation
+"${compose[@]}" --profile tools run --rm -e MBT_MUTATION_EPHEMERAL=1 mutation npm run mutate:scm-split-status-evidence-precedence
+"${compose[@]}" --profile tools run --rm -e MBT_MUTATION_EPHEMERAL=1 mutation npm run mutate:scm-po-split-status-consistency
+"${compose[@]}" --profile tools run --rm -e MBT_MUTATION_EPHEMERAL=1 mutation \
+  node test/support/run-scm-manual-split-authority-mutations.mjs
 "${compose[@]}" --profile tools run --rm test npm run secrets:scm-split-receipt-allocation
+"${compose[@]}" --profile tools run --rm test npm run secrets:scm-split-status-evidence-precedence
+"${compose[@]}" --profile tools run --rm test npm run secrets:scm-po-split-status-consistency
 "${compose[@]}" --profile tools run --rm test bash tools/scm-split-receipt-allocation-source-state.sh
 
 echo "SCM split receipt allocation gauntlet complete."

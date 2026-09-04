@@ -411,6 +411,11 @@ const historicalRestore = Function(
   let lastAcknowledgedPlanState = null;
   let appliedPlanStructure = { planId: "", planDate: "", orderIds: new Set() };
   function dispatchPlanWireState(plan = {}) { return plan; }
+  function resetPendingGlobalOrderLifecycle() {}
+  function applyPendingRemoteStructuralRetirements() {}
+  function withoutAuthoritativelyRetiredOrders(list = []) { return list; }
+  function withoutAuthoritativelyRetiredStops(list = []) { return list; }
+  function isAuthoritativelyRetiredOrderRef() { return false; }
   function rememberAssignedOrderEvidence() {}
   function clearActiveRouteEstimates() {}
   function activePhysicalOrderEvidence() { return { all: new Set(), pickups: new Set(), drops: new Set() }; }
@@ -698,8 +703,10 @@ const planOwnedOrderSource = sourceSlice(
 );
 assert.match(planOwnedOrderSource, /order\.globalGroupDefinition\s*===\s*true/,
   "An unassigned global group must have an explicit plan-materialization rule.");
-assert.match(planOwnedOrderSource, /groupPlanId\s*===\s*currentPlanId/,
-  "Only a global group materialized onto the loaded plan may be persisted with it.");
+assert.match(planOwnedOrderSource, /sourcePlanId\s*===\s*currentPlanId/,
+  "Only a global group sourced from the loaded plan may be persisted with it.");
+assert.match(planOwnedOrderSource, /groupPlanId\s*&&\s*groupPlanId\s*!==\s*currentPlanId/,
+  "A legacy group owned by another plan must remain excluded.");
 const addOrderSource = sourceSlice(
   "function addOrderToLoad",
   "function pullExistingStop",

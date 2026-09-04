@@ -33,3 +33,41 @@ Production witness: split PO `3022019914` has two ledger lines totaling 1,584. I
 - Existing SCM reconciliation, split PO, PO/TO schedule, and status-precedence suites pass.
 - Lint, type checks, mutation checks, source-state checks, and secret scanning pass.
 - Deployment is excluded until separately requested.
+
+## Addendum: completed-child-first historical IR replay (2026-09-01)
+
+The user explicitly superseded invariants 2 and 5 for the narrow case where a
+historical IR can be conserved against an already-completed split child whose
+stored destination is stale. Production witness `POB03535` proves why the
+exception is required:
+
+- source line `4565764` has `13,807.2` total IR and exactly `13,807.2` of
+  already-completed child quantity;
+- the location buckets alone leave `2,301.2` surplus at yard 12441 and the
+  same `2,301.2` completed-child deficit at yard 2967;
+- `IR13777` supplied `2,301.2` plus 22 pallets on 2026-08-05, while unfinished
+  child `3022143273` was not created until 2026-08-20.
+
+The refined contract is:
+
+13. Exact/pinned child evidence remains first and keeps strict destination
+    validation.
+14. Inferred IR may be assigned to a split child only when that child is
+    operationally `Completed` (saved schedule completion or canonical
+    completion event). Record creation timestamps are not an IR-ownership
+    boundary because imported and repaired split records may be created after
+    their historical receipt.
+15. A historical IR may cross a stale child destination only to satisfy an
+    operationally completed child. It may never cross yards into an unfinished
+    child.
+16. After completed children are satisfied, remaining IR may use source-PO
+    residual capacity regardless of historical yard metadata. This global
+    fallback is source-parent-only: unfinished children remain ineligible.
+    Quantity beyond both completed-child and source residual capacity still
+    fails closed.
+17. An unfinished child without exact/pinned evidence receives zero inferred
+    quantity, including when its destination matches an older receipt.
+18. Allocation remains conservative: completed children + source residual +
+    unfinished children + overflow equals the authoritative source-line IR.
+19. For `POB03535`, `3022143273` must recalculate to received 0 and remaining
+    2,323.2; the family IR total remains 84,041.48.

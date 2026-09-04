@@ -64,3 +64,89 @@ test("no known-location quantity crosses destination under adversarial capacity"
     assert.equal(result.overflowQty, Number(Math.max(observed - capacity, 0).toFixed(6)));
   }
 });
+
+test("historical IR never allocates to an unfinished split and remains conserved", () => {
+  for (let index = 1; index <= 250; index += 1) {
+    const completedQty = Number((index + 0.25).toFixed(2));
+    const residualQty = Number(((index % 7) + 0.5).toFixed(2));
+    const total = Number((completedQty + residualQty).toFixed(2));
+    const result = allocateSplitReceiptsByDestination({
+      totalReceivedQty: total,
+      receiptRows: [{
+        transactionDate: "2026-08-05",
+        quantity: total,
+        actualLocationId: 15
+      }],
+      targets: [
+        {
+          targetOrderRef: "COMPLETED",
+          requestedQty: completedQty,
+          destinationLocationId: 28,
+          createdAt: "2026-08-01",
+          operationallyCompleted: true,
+          allowInferredReceipt: true
+        },
+        {
+          targetOrderRef: "FUTURE-UNFINISHED",
+          requestedQty: 1_000_000,
+          destinationLocationId: 15,
+          createdAt: "2026-08-01",
+          operationallyCompleted: false,
+          allowInferredReceipt: false
+        },
+        {
+          targetOrderRef: "PARENT",
+          requestedQty: residualQty,
+          destinationLocationId: 15,
+          isParent: true,
+          allowInferredReceipt: true
+        }
+      ]
+    });
+    const allocations = allocationMap(result);
+    assert.equal(allocations.COMPLETED, completedQty);
+    assert.equal(allocations["FUTURE-UNFINISHED"], 0);
+    assert.equal(allocations.PARENT, residualQty);
+    assert.equal(
+      Number(result.allocations.reduce((sum, row) => sum + row.allocatedQty, 0).toFixed(6)),
+      total
+    );
+    assert.equal(result.conflict, false);
+  }
+});
+
+test("historical IR may satisfy a completed child regardless of record creation date", () => {
+  for (let index = 1; index <= 250; index += 1) {
+    const quantity = Number((index + 0.125).toFixed(3));
+    const result = allocateSplitReceiptsByDestination({
+      totalReceivedQty: quantity,
+      receiptRows: [{
+        transactionDate: "2026-08-05",
+        quantity,
+        actualLocationId: 15
+      }],
+      targets: [
+        {
+          targetOrderRef: "FUTURE-COMPLETED",
+          requestedQty: quantity,
+          destinationLocationId: 15,
+          createdAt: "2026-08-20",
+          operationallyCompleted: true,
+          allowInferredReceipt: true
+        },
+        {
+          targetOrderRef: "PARENT",
+          requestedQty: quantity,
+          destinationLocationId: 15,
+          isParent: true,
+          allowInferredReceipt: true
+        }
+      ]
+    });
+    assert.deepEqual(allocationMap(result), {
+      "FUTURE-COMPLETED": quantity,
+      PARENT: 0
+    });
+    assert.equal(result.conflict, false);
+  }
+});

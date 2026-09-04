@@ -32,6 +32,7 @@ export function applySplitTargetEvidencePrecedence({
   targetKind = "",
   previousStatus = "Queued",
   hasActivePlan = false,
+  hasAuthoritativeCompletion = false,
   evidencedFulfilledQty = 0,
   evidencedReceivedQty = 0,
   derivedState = {}
@@ -49,8 +50,11 @@ export function applySplitTargetEvidencePrecedence({
   );
   const inferredCompletionLoss = applicationStatus === "Reconcile Review"
     && String(derivedState.reason || "").trim() === LOST_COMPLETION_EVIDENCE_REASON;
+  const hasEvidencedProgress = quantity(evidencedFulfilledQty) > EPSILON
+    || quantity(evidencedReceivedQty) > EPSILON;
   if (
     previousCompleted
+    && hasAuthoritativeCompletion === true
     && (
       inferredCompletionLoss
       || ["Queued", "Partially Done", "In Transit"].includes(applicationStatus)
@@ -64,11 +68,13 @@ export function applySplitTargetEvidencePrecedence({
     };
   }
 
-  const hasEvidencedProgress = quantity(evidencedFulfilledQty) > EPSILON
-    || quantity(evidencedReceivedQty) > EPSILON;
   if (
     !hasEvidencedProgress
-    && ["Partially Done", "In Transit"].includes(applicationStatus)
+    && hasAuthoritativeCompletion !== true
+    && (
+      inferredCompletionLoss
+      || ["Completed", "Partially Done", "In Transit"].includes(applicationStatus)
+    )
   ) {
     return {
       ...derivedState,

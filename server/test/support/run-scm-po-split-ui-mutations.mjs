@@ -53,7 +53,7 @@ const MUTANTS = Object.freeze([
   {
     name: "the concise NetSuite destination label regresses",
     target: CLIENT,
-    from: '${escapeHtml(effectiveDestination)} (NetSuite)',
+    from: '${escapeHtml(effectiveDestination)} (${destinationSource})',
     to: '${t("dispatch.useNetsuiteLineDestinations", "Use NetSuite line destinations")} (${escapeHtml(effectiveDestination)})'
   },
   {
@@ -106,6 +106,28 @@ const MUTANTS = Object.freeze([
     to: "      void destinationPayload;"
   },
   {
+    name: "split pickup persistence is skipped",
+    target: CLIENT,
+    from: `    if (isSplit
+      && requestedPickupPoint
+      && requestedPickupPoint.toLowerCase() !== String(previousPickupPoint || "").trim().toLowerCase()) {`,
+    to: `    if (false
+      && requestedPickupPoint
+      && requestedPickupPoint.toLowerCase() !== String(previousPickupPoint || "").trim().toLowerCase()) {`
+  },
+  {
+    name: "pickup save loses the new schedule concurrency timestamp",
+    target: CLIENT,
+    from: "      patch.expectedUpdatedAt = pickupPayload.updated?.scheduleUpdatedAt || patch.expectedUpdatedAt;",
+    to: "      patch.expectedUpdatedAt = patch.expectedUpdatedAt;"
+  },
+  {
+    name: "pickup save loses the new split revision",
+    target: CLIENT,
+    from: "      patch.expectedSplitRevision = pickupPayload.updated?.revision || patch.expectedSplitRevision;",
+    to: "      patch.expectedSplitRevision = patch.expectedSplitRevision;"
+  },
+  {
     name: "the responsive routing layout selector is disconnected",
     target: STYLES,
     occurrences: 3,
@@ -122,7 +144,7 @@ const MUTANTS = Object.freeze([
   {
     name: "the fixed client cache key is removed",
     target: PAGE,
-    from: "dispatch-scm.js?v=20260831-live-schedule-v1",
+    from: "dispatch-scm.js?v=20260903-po-line-sequence-v1",
     to: "dispatch-scm.js?v=stale-po-split-client"
   }
 ]);

@@ -142,11 +142,42 @@ test("a grouped order stays globally searchable while its CO and final-delivery 
         1,
         "Removing an assignment must keep the global definition."
       );
+      await query(
+        `INSERT INTO dispatch_order_catalog_entries (
+           order_ref, order_type, eligible, sort_date, sort_key, search_text,
+           card, full_order, source, source_updated_at, activity_at
+         )
+         SELECT group_ref, order_type, eligible, NULL,
+                'legacy-shadow|' || lower(group_ref), search_text,
+                card, full_order, 'global-group-stale-shadow-red', now(), now()
+           FROM dispatch_global_order_groups
+          WHERE group_ref = $1
+         ON CONFLICT (lower(order_ref)) DO UPDATE
+           SET card = EXCLUDED.card,
+               full_order = EXCLUDED.full_order,
+               source = EXCLUDED.source,
+               updated_at = now()`,
+        [groupRef]
+      );
+      assert.equal(
+        (await query("SELECT count(*)::int AS count FROM dispatch_order_catalog_entries WHERE order_ref = $1", [groupRef]))
+          .rows[0].count,
+        1,
+        "The fixture must reproduce the stale catalog shadow seen in production."
+      );
       await deactivateDispatchGlobalOrderDefinitions([groupRef]);
       assert.equal(
         (await listDispatchOrderPool({ type: "SO", search: groupRef, limit: 20 })).orders.length,
         0,
         "An explicit ungroup operation must retire the global definition."
+      );
+      assert.equal(await getDispatchOrderCatalogOrder(groupRef), null,
+        "Targeted hydration must not resurrect a retired group from its catalog shadow.");
+      assert.equal(
+        (await query("SELECT count(*)::int AS count FROM dispatch_order_catalog_entries WHERE order_ref = $1", [groupRef]))
+          .rows[0].count,
+        0,
+        "Ungroup must delete the retired group's stale catalog shadow."
       );
       assert.deepEqual(
         (await listDispatchOrderPool({ type: "SO", search: memberRefs[0], limit: 20 }))

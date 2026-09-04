@@ -112,3 +112,50 @@ the Driver sequence:
     destination or linked-customer completion evidence exists.
 14. NetSuite-derived/inferred reconciliation is not local operational evidence
     and therefore cannot claim the local-precedence rule.
+
+## Addendum: explicit reopen of inferred-only completion (2026-09-01)
+
+The user explicitly superseded invariants 5 and 6 for reconciliation-only
+completion. `3022143273` has a saved `Partially Done` schedule, no completion
+event, no Driver job, no active assignment, and zero exact child receipt. A
+historical inferred allocation incorrectly made its target `Completed`.
+
+15. `Completed` is monotonic only when backed by a saved local Completed status,
+    a canonical completion event, or exact/pinned child evidence.
+16. A previous reconciliation-only Completed target may reopen when corrected
+    evidence removes its inferred quantity; this is not a loss-of-evidence
+    review.
+17. A split child with no authoritative completion, no exact/pinned progress,
+    and no active assignment resolves to `Queued`, even if a stale schedule or
+    earlier reconciliation called it `Partially Done` or `Completed`.
+18. A real active assignment may produce `Planned`; it cannot manufacture
+    receipt progress or completion.
+19. Saved local Completed and canonical completion remain terminal and are not
+    weakened by this addendum.
+
+## Addendum: stale schedule text is not an edit lock (2026-09-01)
+
+After `3022143273` correctly recalculated to `Queued`, a remark-only save
+advanced the schedule row timestamp while retaining its historical raw
+`Partially Done` text. The read path then treated that non-status edit as newer
+status evidence, and the split editor treated the text itself as a dispatch
+plan. This produced the impossible instruction **Unplan first** even though no
+plan or assignment existed.
+
+20. For a reconciled split child without manual operational authority, the
+    reconciliation target status outranks a newer schedule timestamp. Updating
+    a remark or another non-status field cannot resurrect stale `Partially Done`
+    or `Completed` text.
+21. `Unplan first` requires an exact active dispatch assignment, a non-cancelled
+    plan referenced by the schedule, or a non-cancelled legacy plan snapshot.
+    Raw words such as `Planned`, `In Transit`, `Partially Done`, or `Completed`
+    are not plan evidence.
+22. A cancelled plan reference does not lock a split. A genuine active plan
+    still locks it, and receiving activity, Driver activity, active PO links,
+    and active schedule groups retain their existing independent locks.
+23. For the production witness `3022143273`, PO Split, PO/TO Schedule, and the
+    split editor must agree on effective `Queued`, zero receipt, no active plan,
+    and no `Unplan first` lock while retaining the raw historical status for
+    audit.
+24. Deployment is an app-and-worker short cutover only. The database and Driver
+    PWA assets must not restart or change.

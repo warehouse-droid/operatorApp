@@ -52,7 +52,7 @@ test("SPSE-P1: inferred partial quantities never create operational progress", (
     }
   ), { numRuns: 500 });
 });
-test("SPSE-P2: Completed is monotonic across arbitrary inferred redistributions", () => {
+test("SPSE-P2: authoritative Completed is monotonic across arbitrary inferred redistributions", () => {
   fc.assert(fc.property(
     fc.array(fc.double({ min: 0, max: 99.999999, noNaN: true }), {
       minLength: 1,
@@ -65,6 +65,7 @@ test("SPSE-P2: Completed is monotonic across arbitrary inferred redistributions"
           targetKind: "po_split",
           previousStatus,
           hasActivePlan: false,
+          hasAuthoritativeCompletion: true,
           evidencedReceivedQty: 0,
           derivedState: received > 0
             ? partialState(received)
@@ -78,6 +79,32 @@ test("SPSE-P2: Completed is monotonic across arbitrary inferred redistributions"
       }
     }
   ), { numRuns: 300 });
+});
+
+test("SPSE-P4: inferred-only Completed always reopens to a scheduling state", () => {
+  fc.assert(fc.property(
+    fc.boolean(),
+    (hasActivePlan) => {
+      const result = applySplitTargetEvidencePrecedence({
+        targetKind: "po_split",
+        previousStatus: "Completed",
+        hasActivePlan,
+        hasAuthoritativeCompletion: false,
+        evidencedReceivedQty: 0,
+        evidencedFulfilledQty: 0,
+        derivedState: {
+          ...partialState(100),
+          applicationStatus: "Completed",
+          quantities: {
+            ...partialState(100).quantities,
+            remaining: 0,
+            destinationRemaining: 0
+          }
+        }
+      });
+      assert.equal(result.applicationStatus, hasActivePlan ? "Planned" : "Queued");
+    }
+  ), { numRuns: 200 });
 });
 
 test("SPSE-P3: evidence precedence is deterministic and idempotent", () => {

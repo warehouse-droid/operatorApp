@@ -30,12 +30,14 @@ cleanup
 
 echo "[dispatch-order-completion] executable completion contract"
 "${compose[@]}" --profile tools run --rm test npm run test:dispatch-order-completion
+"${compose[@]}" --profile tools run --rm test npm run test:dispatch-direct-terminal-lifecycle
 
 echo "[dispatch-order-completion] type, lint, and browser syntax"
 "${compose[@]}" --profile tools run --rm test npm run typecheck:mbt
 "${compose[@]}" --profile tools run --rm test \
   npx eslint --config eslint.mbt.config.js --max-warnings=0 \
     src/dispatch-completion-repository.js \
+    src/dispatch-order-catalog-repository.js \
     src/mbt/mbbs-billing-candidate-service.js \
     test/dispatch/frontend/dispatch-completion-ui.test.js \
     test/mbt/adversarial/dispatch-completion-repository-adversarial.test.js \
@@ -43,6 +45,8 @@ echo "[dispatch-order-completion] type, lint, and browser syntax"
     test/mbt/integration/dispatch-completion-http.red.test.js \
     test/mbt/integration/dispatch-completion-migration.test.js \
     test/mbt/integration/dispatch-completion-status.red.test.js \
+    test/mbt/integration/driver-direct-pickup-online-offline.test.js \
+    test/support/run-dispatch-direct-terminal-lifecycle.mjs \
     test/support/run-dispatch-order-completion-mutations.mjs
 "${compose[@]}" --profile tools run --rm test npm run syntax:legacy
 
@@ -60,6 +64,7 @@ echo "[dispatch-order-completion] dependency, secret, and source-state boundarie
     migrations/159_dispatch_order_completion_status.sql \
     public/dispatch.html public/dispatch.js \
     src/dispatch-completion-repository.js \
+    src/dispatch-order-catalog-repository.js \
     src/mbt/mbbs-billing-candidate-service.js \
     src/server.js \
     test/dispatch/frontend/dispatch-completion-ui.test.js \
@@ -68,9 +73,11 @@ echo "[dispatch-order-completion] dependency, secret, and source-state boundarie
     test/mbt/integration/dispatch-completion-http.red.test.js \
     test/mbt/integration/dispatch-completion-migration.test.js \
     test/mbt/integration/dispatch-completion-status.red.test.js \
+    test/mbt/integration/driver-direct-pickup-online-offline.test.js \
     test/mbt/infrastructure/p3-gauntlet-contract.test.js \
     test/mbt/specs/dispatch-completion-status.md \
     test/support/p3-mutation-manifest.mjs \
+    test/support/run-dispatch-direct-terminal-lifecycle.mjs \
     test/support/run-dispatch-order-completion-mutations.mjs \
     tools/dispatch-order-completion-gauntlet.sh \
     tools/dispatch-order-completion-source-state.sh \

@@ -298,8 +298,9 @@ export async function listDriverPwaCompletedDispatchRefs({ candidateRefs = [] } 
              WHEN JSONB_TYPEOF(record.order_refs) = 'array' THEN record.order_refs
              ELSE '[]'::jsonb
            END
-         ) ref(value)
+        ) ref(value)
         WHERE LOWER(BTRIM(COALESCE(record.status, ''))) IN ('complete', 'completed')
+          AND LOWER(BTRIM(COALESCE(record.stop_type, ''))) = 'dropoff'
           AND COALESCE(BTRIM(ref.value), '') <> ''
           AND (
             $2::boolean

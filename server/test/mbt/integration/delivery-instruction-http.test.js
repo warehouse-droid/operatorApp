@@ -8,6 +8,7 @@ import { createOperator } from "../../../src/auth-repository.js";
 import { closeDb, query } from "../../../src/db.js";
 import { DRIVER_PWA_CURRENT_VERSION } from "../../../src/driver-client-version.js";
 import { DEFAULT_PHOTO_ARCHIVE_ROOT } from "../../../src/photo-archive-repository.js";
+import { getSalesPortalSettings, updateSalesPortalSettings } from "../../../src/sales-settings-repository.js";
 import { app } from "../../../src/server.js";
 
 const RUN_ID = crypto.randomUUID().replaceAll("-", "");
@@ -31,6 +32,7 @@ const MEDIA_BYTES = Buffer.from([0xff, 0xd8, 0x44, 0x49, 0x48, 0x54, 0x54, 0x50,
 
 let baseUrl = "";
 let server;
+let originalPublicSalesEnabled;
 const tokens = new Map();
 
 async function request(urlPath, { token = "", method = "GET", body, headers = {}, raw = false } = {}) {
@@ -59,6 +61,8 @@ async function loginOperator(username) {
 }
 
 before(async () => {
+  originalPublicSalesEnabled = (await getSalesPortalSettings({ fresh: true })).enabled;
+  await updateSalesPortalSettings({ enabled: false }, null);
   await Promise.all([
     createOperator({
       username: USERS.salesOne,
@@ -139,6 +143,9 @@ before(async () => {
 after(async () => {
   if (server) {
     await new Promise((resolve) => server.close(resolve));
+  }
+  if (typeof originalPublicSalesEnabled === "boolean") {
+    await updateSalesPortalSettings({ enabled: originalPublicSalesEnabled }, null);
   }
   await query("DELETE FROM delivery_audit_log WHERE order_id = ANY($1::bigint[])", [[ORDERS.one.id, ORDERS.two.id]]).catch(() => null);
   await query("DELETE FROM photo_archive_objects WHERE r2_key = $1", [R2_KEY]).catch(() => null);

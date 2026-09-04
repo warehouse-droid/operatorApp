@@ -142,12 +142,17 @@ function orderFootprintPallets(order, lineRowIds = []) {
   return numberValue(order.pallets) + (numberValue(order.layers) > 0 ? 1 : 0);
 }
 
-function pickupFootprintForLocation(plan, load, location) {
+function pickupFootprintForVisit(plan, load, pickup) {
+  const location = pickup?.location || pickup?.yard || "";
   const pickupLocation = dispatchLocationKey(location);
+  const explicitRefs = Array.isArray(pickup?.orderRefs)
+    ? new Set(pickup.orderRefs.map((ref) => String(ref || "").trim().toLowerCase()).filter(Boolean))
+    : null;
   const countedOrders = new Set();
   let total = 0;
   for (const stop of load.stops || []) {
     if (stop?.type !== "drop" || countedOrders.has(stop.orderId)) continue;
+    if (explicitRefs && !explicitRefs.has(String(stop.orderId || "").trim().toLowerCase())) continue;
     const order = orderByRef(plan, stop.orderId);
     if (!order) continue;
     if (!requiredPickupLocations(order).some((candidate) => dispatchLocationKey(candidate) === pickupLocation)) continue;
@@ -285,7 +290,7 @@ export function dispatchStatisticStopFromRow(row, { driverProfile = null } = {})
     .find((visit) => visit.stopIds.includes(String(stop?.id || row.stop_id || ""))) || null;
   const currentClass = physicalVisit?.serviceType || stopClass(plan, row, stop, order);
   const pallets = row.stop_type === "pickup"
-    ? pickupFootprintForLocation(plan, load, stop?.location)
+    ? pickupFootprintForVisit(plan, load, stop)
     : currentClass === "delivery"
       ? orderFootprintPallets(order, stop?.lineRowIds)
       : orderFootprintPallets(order, stop?.lineRowIds);

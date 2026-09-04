@@ -7,10 +7,20 @@ import { listStaleScmScheduleStatusCandidates } from "../../../src/scm-schedule-
 
 after(closeDb);
 
+async function excludePreexistingRefreshCandidates() {
+  await query(
+    `UPDATE scm_transport_schedule
+        SET status = 'Hold'
+      WHERE order_kind IN ('PO', 'TO')
+        AND status IN ('Queued', 'Planned')`
+  );
+}
+
 test("SAS-RI1: candidate discovery excludes fresh, completed, and recently attempted schedules", async () => {
   const rollback = await beginRollbackContext();
   try {
     await rollback.run(async () => {
+      await excludePreexistingRefreshCandidates();
       const suffix = crypto.randomUUID().replaceAll("-", "").toUpperCase();
       const base = 9_996_000_000 + Math.floor(Math.random() * 100_000);
       const refs = {
@@ -84,6 +94,7 @@ test("SAS-RI2: candidate discovery canonicalizes split/group aliases and skips l
   const rollback = await beginRollbackContext();
   try {
     await rollback.run(async () => {
+      await excludePreexistingRefreshCandidates();
       const suffix = crypto.randomUUID().replaceAll("-", "").toUpperCase();
       const sourceId = 9_997_000_000 + Math.floor(Math.random() * 100_000);
       const groupedSourceId = sourceId + 1;

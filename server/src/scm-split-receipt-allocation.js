@@ -71,6 +71,295 @@ function unallocatedExactQuantity(targets, allocations) {
   }, 0));
 }
 
+function dateKey(value) {
+  if (!value) return "";
+  const parsed = new Date(value);
+  if (Number.isNaN(parsed.getTime())) return "";
+  return parsed.toISOString().slice(0, 10);
+}
+
+function receiptDateKey(row = {}) {
+  return dateKey(
+    row.transactionDate
+    ?? row.transaction_date
+    ?? row.trandate
+    ?? row.snapshot?.transactionDate
+    ?? row.snapshot?.transaction_date
+    ?? row.snapshot?.trandate
+    ?? row.netsuiteModifiedAt
+    ?? row.netsuite_modified_at
+  );
+}
+
+function targetExistedForReceipt(target, receiptDate) {
+  if (target.isParent === true || !receiptDate) return true;
+  const createdDate = dateKey(target.createdAt);
+  return !createdDate || createdDate <= receiptDate;
+}
+
+function remainingExactTargets(targets, allocations, predicate = () => true) {
+  return remainingTargets(targets, allocations, predicate)
+    .map((target) => ({
+      ...target,
+      requestedQty: Math.min(target.requestedQty, target.exactReceivedQty)
+    }))
+    .filter((target) => target.requestedQty > EPSILON);
+}
+
+function exactQuantityRemaining(target, allocations) {
+  const required = Math.min(
+    reconciliationQuantity(target.exactReceivedQty),
+    reconciliationQuantity(target.requestedQty)
+  );
+  return roundReconciliationQuantity(Math.max(
+    required - reconciliationQuantity(allocations[target._allocationIndex]?.allocatedQty),
+    0
+  ));
+}
+
+function applyStage(quantity, candidates, allocations, parentRef, {
+  inferredOnly = false
+} = {}) {
+  const available = roundReconciliationQuantity(quantity);
+  if (available <= EPSILON || !candidates.length) return available;
+  const stageTargets = inferredOnly
+    ? candidates.map((target) => ({ ...target, exactReceivedQty: 0, pinned: false }))
+    : candidates;
+  const result = allocateReconciliationProgress(available, stageTargets, {
+    exactField: "exactReceivedQty",
+    parentRef
+  });
+  applyAllocation(result, allocations);
+  return roundReconciliationQuantity(result.overflowQty);
+}
+
+function usesEvidenceProtectedAllocation(targets) {
+  return targets.some((target) => (
+    Object.prototype.hasOwnProperty.call(target, "allowInferredReceipt")
+    || Object.prototype.hasOwnProperty.call(target, "operationallyCompleted")
+  ));
+}
+
+function allocateEvidenceProtectedReceipts({
+  total,
+  normalizedTargets,
+  allocations,
+  receiptRows,
+  parentRef
+}) {
+  const rows = (Array.isArray(receiptRows) ? receiptRows : [])
+    .map((row, index) => ({
+      row,
+      index,
+      quantity: roundReconciliationQuantity(row?.quantity),
+      locationId: receiptLocationId(row),
+      receiptDate: receiptDateKey(row)
+    }))
+    .filter((entry) => entry.quantity > EPSILON);
+  const observedRowTotal = roundReconciliationQuantity(
+    rows.reduce((sum, entry) => sum + entry.quantity, 0)
+  );
+  const knownRows = rows
+    .filter((entry) => entry.locationId)
+    .sort((left, right) => (
+      (left.receiptDate || "9999-12-31").localeCompare(right.receiptDate || "9999-12-31")
+      || left.locationId - right.locationId
+      || String(left.row?.transactionRef || left.row?.transaction_ref || "").localeCompare(
+        String(right.row?.transactionRef || right.row?.transaction_ref || ""),
+        undefined,
+        { numeric: true, sensitivity: "base" }
+      )
+      || left.index - right.index
+    ));
+
+  let knownQuantityBudget = total;
+  let allocatedKnownBudget = 0;
+  let unallocatedKnownBudget = 0;
+  const unexplainedByLocation = new Map();
+  const preparedRows = knownRows.map((entry) => {
+    const budget = roundReconciliationQuantity(Math.min(
+      entry.quantity,
+      Math.max(knownQuantityBudget, 0)
+    ));
+    knownQuantityBudget = roundReconciliationQuantity(Math.max(knownQuantityBudget - budget, 0));
+    allocatedKnownBudget = roundReconciliationQuantity(allocatedKnownBudget + budget);
+    return { ...entry, budget, remaining: budget };
+  });
+  const rowsByDate = new Map();
+  for (const entry of preparedRows) {
+    const key = entry.receiptDate || "unknown";
+    if (!rowsByDate.has(key)) rowsByDate.set(key, []);
+    rowsByDate.get(key).push(entry);
+  }
+
+  for (const entries of rowsByDate.values()) {
+    for (const entry of entries) {
+      entry.remaining = applyStage(
+        entry.remaining,
+        remainingExactTargets(
+          normalizedTargets,
+          allocations,
+          (target) => target.destinationLocationId === entry.locationId
+        ),
+        allocations,
+        parentRef
+      );
+    }
+
+    const completedForReceipt = (target) => (
+      target.operationallyCompleted === true
+      && target.allowInferredReceipt !== false
+      && exactQuantityRemaining(target, allocations) <= EPSILON
+    );
+    for (const entry of entries) {
+      entry.remaining = applyStage(
+        entry.remaining,
+        remainingTargets(
+          normalizedTargets,
+          allocations,
+          (target) => target.destinationLocationId === entry.locationId
+            && completedForReceipt(target)
+        ),
+        allocations,
+        parentRef,
+        { inferredOnly: true }
+      );
+    }
+
+    const groupAvailable = roundReconciliationQuantity(
+      entries.reduce((sum, entry) => sum + entry.remaining, 0)
+    );
+    const groupRemaining = applyStage(
+      groupAvailable,
+      remainingTargets(normalizedTargets, allocations, completedForReceipt),
+      allocations,
+      parentRef,
+      { inferredOnly: true }
+    );
+    let crossLocationApplied = roundReconciliationQuantity(groupAvailable - groupRemaining);
+    for (const entry of entries) {
+      if (crossLocationApplied <= EPSILON) break;
+      const consumed = Math.min(entry.remaining, crossLocationApplied);
+      entry.remaining = roundReconciliationQuantity(entry.remaining - consumed);
+      crossLocationApplied = roundReconciliationQuantity(crossLocationApplied - consumed);
+    }
+
+    for (const entry of entries) {
+      entry.remaining = applyStage(
+        entry.remaining,
+        remainingTargets(
+          normalizedTargets,
+          allocations,
+          (target) => target.destinationLocationId === entry.locationId
+            && target.allowInferredReceipt !== false
+            && target.operationallyCompleted !== true
+            && targetExistedForReceipt(target, entry.receiptDate)
+            && exactQuantityRemaining(target, allocations) <= EPSILON
+        ),
+        allocations,
+        parentRef,
+        { inferredOnly: true }
+      );
+    }
+
+    const sourceResidualAvailable = roundReconciliationQuantity(
+      entries.reduce((sum, entry) => sum + entry.remaining, 0)
+    );
+    const sourceResidualRemaining = applyStage(
+      sourceResidualAvailable,
+      remainingTargets(
+        normalizedTargets,
+        allocations,
+        (target) => target.isParent === true
+          && target.allowInferredReceipt !== false
+          && exactQuantityRemaining(target, allocations) <= EPSILON
+      ),
+      allocations,
+      parentRef,
+      { inferredOnly: true }
+    );
+    let sourceResidualApplied = roundReconciliationQuantity(
+      sourceResidualAvailable - sourceResidualRemaining
+    );
+    for (const entry of entries) {
+      if (sourceResidualApplied <= EPSILON) break;
+      const consumed = Math.min(entry.remaining, sourceResidualApplied);
+      entry.remaining = roundReconciliationQuantity(entry.remaining - consumed);
+      sourceResidualApplied = roundReconciliationQuantity(sourceResidualApplied - consumed);
+    }
+  }
+
+  for (const entry of preparedRows) {
+    unallocatedKnownBudget = roundReconciliationQuantity(
+      unallocatedKnownBudget + entry.remaining
+    );
+    const unexplained = roundReconciliationQuantity(
+      entry.quantity - (entry.budget - entry.remaining)
+    );
+    if (unexplained <= EPSILON) continue;
+    unexplainedByLocation.set(
+      entry.locationId,
+      roundReconciliationQuantity((unexplainedByLocation.get(entry.locationId) || 0) + unexplained)
+    );
+  }
+
+  let unlocatedQty = roundReconciliationQuantity(Math.max(total - allocatedKnownBudget, 0));
+  unlocatedQty = applyStage(
+    unlocatedQty,
+    remainingExactTargets(normalizedTargets, allocations),
+    allocations,
+    parentRef
+  );
+  unlocatedQty = applyStage(
+    unlocatedQty,
+    remainingTargets(
+      normalizedTargets,
+      allocations,
+      (target) => target.operationallyCompleted === true
+        && target.allowInferredReceipt !== false
+        && exactQuantityRemaining(target, allocations) <= EPSILON
+    ),
+    allocations,
+    parentRef,
+    { inferredOnly: true }
+  );
+  unlocatedQty = applyStage(
+    unlocatedQty,
+    remainingTargets(
+      normalizedTargets,
+      allocations,
+      (target) => target.allowInferredReceipt !== false
+        && target.operationallyCompleted !== true
+        && exactQuantityRemaining(target, allocations) <= EPSILON
+    ),
+    allocations,
+    parentRef,
+    { inferredOnly: true }
+  );
+
+  const unallocatedExactQty = unallocatedExactQuantity(normalizedTargets, allocations);
+  const overflowQty = roundReconciliationQuantity(
+    Math.max(observedRowTotal - total, 0)
+    + unallocatedKnownBudget
+    + unlocatedQty
+  );
+  return {
+    total,
+    exactTotal: roundReconciliationQuantity(normalizedTargets.reduce(
+      (sum, target) => sum + Math.min(target.exactReceivedQty, target.requestedQty),
+      0
+    )),
+    unallocatedExactQty,
+    overflowQty,
+    conflict: overflowQty > EPSILON || unallocatedExactQty > EPSILON,
+    allocations: allocations.map(({ _allocationIndex, ...allocation }) => allocation),
+    locationAware: knownRows.length > 0,
+    unexplainedLocations: [...unexplainedByLocation.entries()]
+      .map(([locationId, quantity]) => ({ locationId, quantity }))
+      .sort((left, right) => left.locationId - right.locationId)
+  };
+}
+
 /**
  * Allocates source-PO receipt progress without allowing a known receipt yard
  * to consume a split child's capacity at a different yard. Unknown-location
@@ -96,6 +385,16 @@ export function allocateSplitReceiptsByDestination({
     allocatedQty: 0,
     allocationMethod: ""
   }));
+
+  if (usesEvidenceProtectedAllocation(normalizedTargets)) {
+    return allocateEvidenceProtectedReceipts({
+      total,
+      normalizedTargets,
+      allocations,
+      receiptRows,
+      parentRef
+    });
+  }
 
   const quantitiesByLocation = new Map();
   let observedRowTotal = 0;
@@ -160,7 +459,11 @@ export function allocateSplitReceiptsByDestination({
       unexplainedLocations.push({ locationId, quantity: unexplained });
     }
     overflowQty = roundReconciliationQuantity(overflowQty + bucket.overflowQty);
-    conflict ||= bucket.conflict || bucket.overflowQty > EPSILON;
+    // An exact child quantity can be larger than the linked rows currently
+    // available for its yard. The remaining authoritative parent progress is
+    // allocated below, so a bucket-level exact shortfall is only provisional.
+    // Final unallocatedExactQty is the family-wide fail-closed check.
+    conflict ||= bucket.overflowQty > EPSILON;
   }
 
   const unlocatedQty = roundReconciliationQuantity(Math.max(total - allocatedKnownBudget, 0));
@@ -172,7 +475,7 @@ export function allocateSplitReceiptsByDestination({
     });
     applyAllocation(fallback, allocations);
     overflowQty = roundReconciliationQuantity(overflowQty + fallback.overflowQty);
-    conflict ||= fallback.conflict || fallback.overflowQty > EPSILON;
+    conflict ||= fallback.overflowQty > EPSILON;
   }
 
   const unallocatedExactQty = unallocatedExactQuantity(normalizedTargets, allocations);
