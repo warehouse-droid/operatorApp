@@ -24,30 +24,20 @@ const YARD = {
 test("server pricing resolves and hashes a toll-free Google route without retaining the API key", async () => {
   const requests = [];
   const adapter = createFrontdeskPricingAdapter({
-    apiKey: "test-secret-key",
     database: {
       async query(_sql, values) {
         assert.deepEqual(values, ["3445"]);
         return { rowCount: 1, rows: [YARD] };
       }
     },
-    async transport(url, options) {
-      requests.push({ url: String(url), options });
+    async routeEstimator(input) {
+      requests.push(input);
       return {
-        ok: true,
-        status: 200,
-        async json() {
-          return {
-            status: "OK",
-            routes: [{
-              summary: "ON-401 E",
-              legs: [
-                { distance: { value: 12_500 }, duration: { value: 1_000 } },
-                { distance: { value: 18_500 }, duration: { value: 1_500 } }
-              ]
-            }]
-          };
-        }
+        source: "google_routes_v2",
+        distanceMeters: 31_000,
+        legDistanceMeters: [12_500, 18_500],
+        rawLegMinutes: [17, 25],
+        fallbackReason: ""
       };
     }
   });
@@ -57,7 +47,7 @@ test("server pricing resolves and hashes a toll-free Google route without retain
     serviceAddressText: "100 Queen Street West, Toronto, ON"
   });
 
-  assert.equal(result.provider, "google_directions_v1");
+  assert.equal(result.provider, "google_routes_v2");
   assert.equal(result.providerMetres, 31_000);
   assert.match(result.routeHash, /^[0-9a-f]{64}$/u);
   assert.equal(result.originSnapshot.kind, "yard");
@@ -65,29 +55,17 @@ test("server pricing resolves and hashes a toll-free Google route without retain
   assert.equal(result.destinationSnapshot.addressText, "100 Queen Street West, Toronto, ON");
   assert.deepEqual(result.routeSnapshot.legMetres, [12_500, 18_500]);
   assert.equal(requests.length, 1);
-  const requested = new URL(requests[0].url);
-  assert.equal(requested.searchParams.get("avoid"), "tolls");
-  assert.equal(requested.searchParams.get("mode"), "driving");
-  assert.equal(requested.searchParams.get("key"), "test-secret-key");
-  assert.doesNotMatch(JSON.stringify(result), /test-secret-key/u);
+  assert.equal(requests[0].allowTolls, false);
+  assert.equal(requests[0].reason, "frontdesk_distance");
+  assert.doesNotMatch(JSON.stringify(result), /secret/u);
 });
 
 test("server pricing also accepts explicit origin and destination addresses for local MBBS calculation", async () => {
   let databaseReads = 0;
   const adapter = createFrontdeskPricingAdapter({
-    apiKey: "test-secret-key",
     database: { async query() { databaseReads += 1; return { rowCount: 0, rows: [] }; } },
-    async transport() {
-      return {
-        ok: true,
-        status: 200,
-        async json() {
-          return {
-            status: "OK",
-            routes: [{ summary: "Local route", legs: [{ distance: { value: 75_001 }, duration: { value: 4_000 } }] }]
-          };
-        }
-      };
+    async routeEstimator() {
+      return { source: "google_routes_v2", distanceMeters: 75_001, legDistanceMeters: [75_001], rawLegMinutes: [67] };
     }
   });
   const result = await adapter.resolveDistance({
@@ -100,7 +78,7 @@ test("server pricing also accepts explicit origin and destination addresses for 
 });
 
 test("server pricing fails closed without route authority and exposes the Ontario HST policy", async () => {
-  const adapter = createFrontdeskPricingAdapter({ apiKey: "" });
+  const adapter = createFrontdeskPricingAdapter({});
   await assert.rejects(
     () => adapter.resolveDistance({ originYardCode: "3445", serviceAddressText: "Toronto" }),
     (error) => error?.code === "MBT_FRONTDESK_DISTANCE_UNAVAILABLE" && error?.status === 503
@@ -115,6 +93,7 @@ test("server pricing fails closed without route authority and exposes the Ontari
 test("the production MBT router is wired to the server-owned pricing adapter", () => {
   const source = fs.readFileSync(new URL("../../../src/server.js", import.meta.url), "utf8");
   assert.match(source, /import \{ createFrontdeskPricingAdapter \} from "\.\/mbt\/frontdesk-pricing-adapter\.js";/u);
-  assert.match(source, /createMbtRouter\(\{\s*frontdeskPricing:\s*createFrontdeskPricingAdapter\(\{\s*apiKey:\s*config\.googleMapsApiKey/u);
+  assert.match(source, /createMbtRouter\(\{\s*frontdeskPricing:\s*createFrontdeskPricingAdapter\(\{\s*routeEstimator:/u);
+  assert.match(source, /googleMapsGateway\.estimateRoute/u);
   assert.doesNotMatch(source, /app\.use\("\/api\/mbt", requireOperator, createMbtRouter\(\)\)/u);
 });

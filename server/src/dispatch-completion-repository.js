@@ -206,6 +206,22 @@ export async function overlayDispatchOrderCompletionStatuses(orders = []) {
     const reference = projectedOrderReference(order);
     const completion = byKey.get(`${kind}|${reference.toUpperCase()}`);
     if (!completion) return order;
+    if (
+      order.dispatchReconciliationPlanningEligible === true
+      && completion.completionEvidenceType.toLowerCase() === "reconciliation"
+    ) {
+      return {
+        ...order,
+        dispatchCompletionStatus: "",
+        dispatchCompletedAt: "",
+        completionEvidenceType: "",
+        completionEvidenceId: "",
+        completionEventId: "",
+        reconciliationCompletionProjected: true,
+        reconciliationCompletedAt: completion.dispatchCompletedAt,
+        reconciliationCompletionEvidenceId: completion.completionEvidenceId
+      };
+    }
     const scm = order.scm && typeof order.scm === "object" && !Array.isArray(order.scm)
       ? { ...order.scm, status: "Completed" }
       : null;

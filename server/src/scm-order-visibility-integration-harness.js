@@ -95,6 +95,11 @@ const completedSearchRefs = new Set(
     .filter((fixture) => fixture.status === "Completed" || fixture.reconciliationStatus === "Completed")
     .map((fixture) => fixture.ref)
 );
+const reconciliationPlanningRefs = new Set(
+  allFixtures
+    .filter((fixture) => fixture.reconciliationStatus === "Completed" && fixture.status !== "Completed")
+    .map((fixture) => fixture.ref)
+);
 const nonSearchableRestrictedRefs = new Set(
   [...restrictedRefs].filter((ref) => !completedSearchRefs.has(ref))
 );
@@ -160,12 +165,19 @@ function assertDispatchExplicitSearchResults(payload, label) {
       row,
       `${label} did not return completed PO/TO ${ref}; returned ${[...returned].join(", ")}.`
     );
-    assert.equal(row.dispatchPlanningRestricted, true, `${label} must mark ${ref} search-only.`);
-    assert.match(
-      String(row.dispatchPlanningRestrictionReason || ""),
-      /completed/i,
-      `${label} must explain why ${ref} cannot be planned.`
-    );
+    if (reconciliationPlanningRefs.has(ref)) {
+      assert.notEqual(row.dispatchPlanningRestricted, true,
+        `${label} must allow reconciliation-only completed target ${ref} to be planned.`);
+      assert.equal(row.dispatchReconciliationPlanningEligible, true,
+        `${label} must identify ${ref} as reconciliation-complete but operationally pending.`);
+    } else {
+      assert.equal(row.dispatchPlanningRestricted, true, `${label} must mark ${ref} search-only.`);
+      assert.match(
+        String(row.dispatchPlanningRestrictionReason || ""),
+        /completed/i,
+        `${label} must explain why ${ref} cannot be planned.`
+      );
+    }
   }
 }
 
@@ -478,7 +490,10 @@ try {
             [fixture.ref]: {
               ordered: 10,
               remaining: 10,
-              applicationStatus: fixture.targetStatus
+              applicationStatus: fixture.targetStatus,
+              hidden: false,
+              operationallyCompleted: false,
+              preserveOperationalStatus: false
             }
           }
         })
@@ -558,6 +573,17 @@ try {
     versionedDispatch.payload?.orders,
     "Versioned Dispatcher search response"
   );
+
+  const targetedReconciliationPending = await requestJson(
+    baseUrl,
+    `/api/dispatch/v2/order-feed/${encodeURIComponent(staleReconciliationCompletedRef)}`,
+    { token: tokens.dispatcher }
+  );
+  assert.equal(targetedReconciliationPending.response.status, 200,
+    "Targeted mutation hydration must resolve a reconciliation-only completed target.");
+  assert.equal(targetedReconciliationPending.payload?.order?.id, staleReconciliationCompletedRef);
+  assert.equal(targetedReconciliationPending.payload?.order?.dispatchReconciliationPlanningEligible, true);
+  assert.notEqual(targetedReconciliationPending.payload?.order?.dispatchPlanningRestricted, true);
 
   await assertRestrictedScheduleHidden(baseUrl, tokens.dispatcher, "Dispatcher");
   const dispatcherNormal = await requestJson(

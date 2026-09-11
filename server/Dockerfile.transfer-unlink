@@ -1,0 +1,4 @@
+FROM mbbs-operator-app:co-cargo-preservation-20260905-v1
+COPY src/order-dependency-repository.js src/scm-dependency-management-policy.js src/scm-dependency-preview-service.js src/scm-dependency-command-service.js /app/src/
+COPY tools/build-transfer-unlink-plan-patch.mjs /tmp/build-transfer-unlink-plan-patch.mjs
+RUN node /tmp/build-transfer-unlink-plan-patch.mjs

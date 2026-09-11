@@ -2,6 +2,7 @@ import crypto from "node:crypto";
 
 import { query, withTransaction } from "./db.js";
 import { overlayDispatchOrderCompletionStatuses } from "./dispatch-completion-repository.js";
+import { reconcileDispatchPlanLocalCos } from "./dispatch-co-lifecycle.js";
 import { reconcileDispatchGlobalOrderSources } from "./dispatch-delivery-group-repository.js";
 import {
   compactDispatchOrderCard,
@@ -241,7 +242,10 @@ export async function getDispatchOrderCatalogOrder(ref) {
   );
   const order = result.rows[0]?.full_order || null;
   if (!order) return null;
-  return (await overlayDispatchOrderCompletionStatuses([order]))[0] || null;
+  const canonical = order.type === "CO"
+    ? (await reconcileDispatchPlanLocalCos({ orders: [order], trucks: [] })).orders
+    : [order];
+  return (await overlayDispatchOrderCompletionStatuses(canonical))[0] || null;
 }
 
 export async function removeDispatchOrderCatalogOrder(ref) {

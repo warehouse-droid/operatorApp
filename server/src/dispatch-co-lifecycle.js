@@ -1,6 +1,7 @@
 import { query, withTransaction } from "./db.js";
 import { canonicalizeDispatchCoGroupIdentities } from "./dispatch-co-group-identity.js";
 import { DISPATCH_FLEET_PLANNING_LOCK } from "./dispatch-fleet-status.js";
+import { applyLocalCoCargo } from "./dispatch-local-co-cargo.js";
 import {
   applyActiveTransitCoMetadata,
   clearCancelledTransitCoMetadata
@@ -81,7 +82,7 @@ export function applyActiveLocalCoOrderRoute(order = {}, activeCo = null) {
   const destinationAddress = toMetadata?.address || toYard;
   const status = text(activeCo?.status);
   return {
-    ...order,
+    ...applyLocalCoCargo(order, activeCo),
     sourceYard: fromYard,
     pickupLocations: [fromYard],
     sourceAddress,
@@ -341,7 +342,7 @@ export async function reconcileDispatchPlanLocalCos(plan) {
   if (!sourceRefs.size && !coRefs.size && !directCoOrderRefs.size) return plan;
   const queriedCoRefs = [...new Set([...coRefs, ...directCoOrderRefs])];
   const result = await query(
-    `SELECT co_ref, source_order_ref,
+    `SELECT id, co_ref, source_order_ref, details, loaded_at, received_at, preparing_started_at,
             from_location_id, from_location, to_location_id, to_location,
             status, created_at, updated_at
        FROM local_co_orders
@@ -354,6 +355,35 @@ export async function reconcileDispatchPlanLocalCos(plan) {
   const cancelledLocalCoRefs = new Set();
   const activeByRef = new Map();
   const activeBySource = new Map();
+  const directKeys = new Set([...directCoOrderRefs].map((ref) => ref.toLowerCase()));
+  const cargoIds = result.rows.filter((row) => directKeys.has(text(row.co_ref).toLowerCase())).map((row) => row.id);
+  const cargoRows = cargoIds.length ? await query(
+    "SELECT * FROM local_co_order_lines WHERE co_id = ANY($1::bigint[]) ORDER BY co_id, line_id, id",
+    [cargoIds]
+  ) : { rows: [] };
+  const cargoById = new Map();
+  for (const line of cargoRows.rows) {
+    const key = String(line.co_id);
+    if (!cargoById.has(key)) cargoById.set(key, []);
+    cargoById.get(key).push(line);
+  }
+  const executedRefs = new Set();
+  for (const truck of plan.trucks || []) for (const load of truck.loads || []) {
+    for (const stop of load.stops || []) {
+      if (load.completed || ["in_progress", "complete", "completed"].includes(text(stop.status).toLowerCase())) {
+        for (const ref of stopOrderRefs(stop)) executedRefs.add(ref.toLowerCase());
+      }
+    }
+  }
+  if (cargoIds.length && /^\d+$/.test(text(plan.id || plan.planId))) {
+    const activity = await query(
+      `SELECT order_refs FROM driver_job_records
+        WHERE plan_id = $1 AND status IN ('in_progress', 'complete', 'completed')
+          AND order_refs ?| $2::text[]`,
+      [plan.id || plan.planId, [...directCoOrderRefs]]
+    );
+    for (const row of activity.rows) for (const ref of row.order_refs || []) executedRefs.add(text(ref).toLowerCase());
+  }
   for (const row of result.rows) {
     const record = {
       coRef: text(row.co_ref),
@@ -363,7 +393,12 @@ export async function reconcileDispatchPlanLocalCos(plan) {
       toLocationId: Number(row.to_location_id) || null,
       toYard: text(row.to_location),
       status: text(row.status),
-      createdAt: row.created_at || null
+      createdAt: row.created_at || null,
+      details: row.details,
+      cargoLines: cargoById.get(String(row.id)),
+      cargoLocked: Boolean(row.loaded_at || row.received_at || row.preparing_started_at
+        || ["loaded", "received", "completed"].includes(text(row.status).toLowerCase())
+        || executedRefs.has(text(row.co_ref).toLowerCase()))
     };
     if (String(row.status || "").toLowerCase() === "cancelled") {
       cancelledByRef.set(record.coRef.toLowerCase(), record);

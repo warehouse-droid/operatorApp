@@ -1,7 +1,7 @@
 /* global caches, document, indexedDB, localStorage, navigator, Response, sessionStorage */
 import { expect, test } from "./mbt-e2e-test.js";
 
-const ACTIVE_CACHE = "mbbs-driver-shell-v40";
+const ACTIVE_CACHE = "mbbs-driver-shell-v41";
 const OLD_DRIVER_CACHE = "mbbs-driver-shell-v26";
 const OPERATOR_CACHE = "mbbs-yard-operator-cache-repair-probe";
 const PROBE_DB = "mbbs-driver-cache-repair-probe";
@@ -198,5 +198,5 @@ test("iPhone Driver hard reset clears origin storage and returns to a fresh onli
   expect(cleared.cookie).not.toContain("mbbs_driver_hard_reset_probe");
   expect(cleared.staleCachePresent).toBe(false);
   expect(cleared.staleDatabasePresent).toBe(false);
-  expect(cleared.workerScriptUrl).toContain("20260903-retained-photo-i18n-v1");
+  expect(cleared.workerScriptUrl).toContain("20260910-route-prefix-cursor-v1");
 });

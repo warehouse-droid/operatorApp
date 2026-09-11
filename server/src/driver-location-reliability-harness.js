@@ -48,9 +48,11 @@ const geocodeSource = sourceSection(
 );
 assert.match(
   geocodeSource,
-  /setTimeout\(\(\) => timeoutController\.abort\(\), DRIVER_GEOCODE_TIMEOUT_MS\)/,
-  "Google geocoding must have a bounded timeout."
+  /googleMapsGateway\.geocode\(/,
+  "Google geocoding must pass through the budgeted server gateway."
 );
+assert.doesNotMatch(geocodeSource, /maps\.googleapis\.com/, "Driver location checks must not bypass the central gateway.");
+assert.match(completionRoute, /consumeDriverLocationVerification[\s\S]*checkDriverJobLocation/, "Photo completion must reuse a recent location verification before requesting another geocode.");
 const coordinateSource = sourceSection(
   serverSource,
   "function validCoordinate(latitude, longitude)",

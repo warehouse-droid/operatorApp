@@ -79,6 +79,24 @@ export async function withTransaction(fn, { rollback = false } = {}) {
   return result;
 }
 
+// Usage reservations must commit independently of the business operation that
+// triggers an external paid request. Otherwise an outer rollback could erase
+// the reservation after Google has already billed the call.
+export async function withIndependentTransaction(fn, { rollback = false } = {}) {
+  const client = await pool.connect();
+  try {
+    await client.query("BEGIN");
+    const result = await fn((text, params = []) => client.query(text, params));
+    await client.query(rollback ? "ROLLBACK" : "COMMIT");
+    return result;
+  } catch (error) {
+    await client.query("ROLLBACK").catch(() => null);
+    throw error;
+  } finally {
+    client.release();
+  }
+}
+
 export async function beginRollbackContext() {
   const client = await pool.connect();
   let closed = false;

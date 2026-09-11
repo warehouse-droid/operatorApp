@@ -85,7 +85,7 @@ test("SCM-PERF-1/2: Completed jobs are skipped by default and restored only by a
     await insertPurchaseOrder(completed);
     await completePurchaseOrder(completed.ref, `SCM-PERF-COMPLETE-${completed.id}`);
 
-    const defaultRows = await listScmSchedule({ search: searchPrefix });
+    const defaultRows = await listScmSchedule({ orderSearch: searchPrefix });
     assert.ok(defaultRows.some((row) => row.orderRef === queued.ref), "queued work must remain visible");
     assert.equal(
       defaultRows.some((row) => row.orderRef === completed.ref),
@@ -94,7 +94,7 @@ test("SCM-PERF-1/2: Completed jobs are skipped by default and restored only by a
     );
 
     const completedRows = await listScmSchedule({
-      search: searchPrefix,
+      orderSearch: searchPrefix,
       status: ["Completed"]
     });
     assert.deepEqual(
@@ -104,7 +104,7 @@ test("SCM-PERF-1/2: Completed jobs are skipped by default and restored only by a
     );
 
     const mixedRows = await listScmSchedule({
-      search: searchPrefix,
+      orderSearch: searchPrefix,
       status: ["Queued", "Completed"]
     });
     assert.deepEqual(

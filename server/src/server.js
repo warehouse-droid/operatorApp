@@ -1,4 +1,5 @@
 import express from "express";
+import { completeScmVendorOrder } from "./scm-vendor-completion.js";
 import crypto from "node:crypto";
 import fs from "node:fs/promises";
 import path from "node:path";
@@ -7,6 +8,11 @@ import { Readable } from "node:stream";
 import { pipeline } from "node:stream/promises";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { config, isNetSuiteSandboxEnvironment, listEnvFiles, selectEnvFile } from "./config.js";
+import {
+  authorizeGoogleBrowserMap,
+  googleMapsGateway,
+  googleMapsUsageRepository
+} from "./google-maps-service.js";
 import { netSuiteOrderWebhookLineFinancials } from "./netsuite-order-webhook-financials.js";
 import { createMbtRouter } from "./mbt/router.js";
 import { createFrontdeskPricingAdapter } from "./mbt/frontdesk-pricing-adapter.js";
@@ -103,7 +109,8 @@ import {
   historicalDispatchPlanDate,
   historicalReconciliationDispatchAllowance,
   listCompletedReconciliationDispatchRefs,
-  listDriverPwaCompletedDispatchRefs
+  listDriverPwaCompletedDispatchRefs,
+  listReconciliationCompletedOperationallyPendingDispatchRefs
 } from "./dispatch-history-mode.js";
 import { syncTargetedNetSuiteOrder } from "./targeted-order-sync.js";
 import { authorizeSalesOrderReload, cancelSalesOrderReload } from "./sales-order-reload.js";
@@ -274,6 +281,7 @@ import {
   authorizeOfflinePhotoUpload,
   beginDriverOfflineRetry,
   completeDriverOfflineRetry,
+  consumeDriverLocationVerification,
   createDriverSession,
   createDriverLocationVerification,
   driverOfflineManifestMatchesJobs,
@@ -544,7 +552,6 @@ const receivingJobs = new Map();
 const eventClients = new Set();
 const driverGeocodeCache = new Map();
 const transferDependencyAllocationRefreshAt = new Map();
-const DRIVER_GEOCODE_TIMEOUT_MS = 5_000;
 let transferDependencyAllocationRefreshQueue = Promise.resolve();
 let transferDependencyAllocationRefreshScheduled = false;
 let eventSeq = 0;
@@ -719,17 +726,22 @@ function dispatchPlacedScmRefs(plan = {}) {
   return [...refs];
 }
 
-async function assertNoRestrictedScmDispatchOrders(orderRefs = [], action = "plan", { planDate = "" } = {}) {
+export async function assertNoRestrictedScmDispatchOrders(orderRefs = [], action = "plan", { planDate = "" } = {}) {
   const requestedRefs = [...new Set((orderRefs || [])
     .map((ref) => String(ref || "").trim())
     .filter(Boolean))];
   if (!requestedRefs.length) return;
-  const [restrictedRefs, historicalAllowance] = await Promise.all([
+  const [restrictedRefs, historicalAllowance, reconciliationPendingAllowance] = await Promise.all([
     listRestrictedScmDispatchOrderRefs({ exactOrderRefs: requestedRefs }),
-    historicalReconciliationDispatchAllowance({ planDate, orderRefs: requestedRefs })
+    historicalReconciliationDispatchAllowance({ planDate, orderRefs: requestedRefs }),
+    listReconciliationCompletedOperationallyPendingDispatchRefs({ candidateRefs: requestedRefs })
   ]);
   const conflicts = requestedRefs
-    .filter((ref) => restrictedRefs.has(ref.toLowerCase()) && !historicalAllowance.has(ref.toLowerCase()))
+    .filter((ref) => (
+      restrictedRefs.has(ref.toLowerCase())
+      && !historicalAllowance.has(ref.toLowerCase())
+      && !reconciliationPendingAllowance.has(ref.toLowerCase())
+    ))
     .map((orderRef) => ({
       orderRef,
       reason: `${orderRef} is Blanket, Hold, Complete, or Cancelled and cannot be added to Dispatch.`
@@ -1797,6 +1809,14 @@ function dispatchOrderCompletedByReconciliation(order = {}, completedRefs = new 
   return dispatchOrderLogicalRefs(order).some((ref) => completedRefs.has(ref));
 }
 
+function dispatchOrderReconciliationCompletedButOperationallyPending(order = {}, eligibleRefs = new Set()) {
+  const childRefs = [...new Set((order.childOrders || [])
+    .map((ref) => String(ref || "").trim().toLowerCase())
+    .filter(Boolean))];
+  if (childRefs.length) return childRefs.every((ref) => eligibleRefs.has(ref));
+  return dispatchOrderLogicalRefs(order).some((ref) => eligibleRefs.has(ref));
+}
+
 function historicalReconciliationOrder(order = {}, {
   historyPlanDate = "",
   completedRefs = new Set(),
@@ -1813,7 +1833,7 @@ function historicalReconciliationOrder(order = {}, {
   };
 }
 
-async function loadDispatchOrdersForResponse({
+export async function loadDispatchOrdersForResponse({
   type = null,
   search = "",
   historyPlanDate = "",
@@ -1940,6 +1960,11 @@ async function loadDispatchOrdersForResponse({
     }
   }
   const completedSearchCandidates = [...completedSearchCandidatesById.values()];
+  const reconciliationPendingRefs = revealCompletedScmSearch && completedSearchCandidates.length
+    ? await listReconciliationCompletedOperationallyPendingDispatchRefs({
+        candidateRefs: completedSearchCandidates.flatMap((order) => dispatchOrderLogicalRefs(order))
+      })
+    : new Set();
   const assigned = await enrichDispatchOrdersWithPlanAssignments([
     ...planningVisibleOrders,
     ...completedSearchCandidates
@@ -1998,15 +2023,24 @@ async function loadDispatchOrdersForResponse({
     : searchTerm
     ? visibleOrders.filter((order) => dispatchOrderMatchesSearch(order, searchTerm))
     : visibleOrders;
-  const planningAnnotatedOrders = searchedOrders.map((order) => (
-    revealCompletedScmSearch && isCompletedScmOrder(order)
-      ? {
-          ...order,
-          dispatchPlanningRestricted: true,
-          dispatchPlanningRestrictionReason: `${order.id} is completed in PO/TO Schedule and is available for search only.`
-        }
-      : order
-  ));
+  const planningAnnotatedOrders = searchedOrders.map((order) => {
+    if (!revealCompletedScmSearch || !isCompletedScmOrder(order)) return order;
+    if (dispatchOrderReconciliationCompletedButOperationallyPending(order, reconciliationPendingRefs)) {
+      return {
+        ...order,
+        dispatchPlanningRestricted: false,
+        dispatchPlanningRestrictionReason: "",
+        dispatchReconciliationPlanningEligible: true,
+        dispatchReconciliationPlanningReason:
+          `${order.id} is receipt-reconciled but still requires a Driver completion.`
+      };
+    }
+    return {
+      ...order,
+      dispatchPlanningRestricted: true,
+      dispatchPlanningRestrictionReason: `${order.id} is completed in PO/TO Schedule and is available for search only.`
+    };
+  });
   return enrichDispatchOrdersWithCompletionStatus(planningAnnotatedOrders);
 }
 
@@ -2036,7 +2070,8 @@ async function targetedDispatchMutationOrders(orderRefs = []) {
   if (!refs.length) return [];
   const feeds = await Promise.all(refs.map((search) => listDispatchOrdersForResponse({
     search,
-    exactOrderRefs: [search]
+    exactOrderRefs: [search],
+    includeCompletedScmSearch: true
   })));
   const byId = new Map();
   for (const feed of feeds) {
@@ -4050,47 +4085,16 @@ function validCoordinate(latitude, longitude) {
 
 async function geocodeStopAddress(address) {
   const text = String(address || "").trim();
-  if (!text || !config.googleMapsApiKey) return null;
+  if (!text || !config.googleMaps?.serverApiKey) return null;
   const key = normalizedLocationText(text);
   if (driverGeocodeCache.has(key)) return driverGeocodeCache.get(key);
-  const url = new URL("https://maps.googleapis.com/maps/api/geocode/json");
-  url.searchParams.set("address", text);
-  url.searchParams.set("region", "ca");
-  url.searchParams.set("components", "country:CA");
-  url.searchParams.set("key", config.googleMapsApiKey);
-  const timeoutController = new AbortController();
-  const timeoutId = setTimeout(() => timeoutController.abort(), DRIVER_GEOCODE_TIMEOUT_MS);
-  timeoutId.unref?.();
-  let payload = {};
-  try {
-    const response = await fetch(url, { signal: timeoutController.signal });
-    const responseText = await response.text();
-    if (responseText) {
-      try {
-        payload = JSON.parse(responseText);
-      } catch {
-        payload = {};
-      }
-    }
-  } catch (error) {
-    if (timeoutController.signal.aborted) {
-      const timeoutError = new Error(
-        `Google geocoding timed out after ${Math.round(DRIVER_GEOCODE_TIMEOUT_MS / 1000)} seconds.`
-      );
-      timeoutError.code = "DRIVER_GEOCODE_TIMEOUT";
-      timeoutError.timeoutMs = DRIVER_GEOCODE_TIMEOUT_MS;
-      timeoutError.cause = error;
-      throw timeoutError;
-    }
-    throw error;
-  } finally {
-    clearTimeout(timeoutId);
-  }
-  const location = payload.results?.[0]?.geometry?.location;
-  const point = validCoordinate(location?.lat, location?.lng)
-    ? { latitude: Number(location.lat), longitude: Number(location.lng), source: "google_geocode" }
-    : null;
-  driverGeocodeCache.set(key, point);
+  const point = await googleMapsGateway.geocode({
+    subsystem: "driver_geocode",
+    reason: "driver_location_check",
+    address: text,
+    automatic: false
+  });
+  if (point) driverGeocodeCache.set(key, point);
   return point;
 }
 
@@ -8819,7 +8823,7 @@ app.use((req, res, next) => {
     res.setHeader("Cache-Control", "no-cache, no-store, must-revalidate");
   } else if (req.path === "/mbt" || req.path.startsWith("/mbt/")) {
     res.setHeader("Cache-Control", "no-cache, no-store, must-revalidate");
-  } else if (req.path.endsWith(".webmanifest") || ["/", "/operator", "/driver", "/control", "/control/returns", "/admin", "/admin/accounts", "/admin/sync", "/admin/reconciliation", "/admin/printers", "/admin/photo-storage", "/admin/audit", "/admin/return-automation", "/admin/mbt-gates", "/dispatch", "/dispatch/custom-orders", "/dispatch/special-stock", "/dispatch/driver-pwa", "/dispatch/offline-review", "/sales", "/sales/planning", "/sales/schedule", "/sales/monitor", "/sales/printing", "/sales/in-outbound-record", "/sales/returns", "/sales/stock-requests", "/sales/delivery-instructions", "/dispatch/loaded-export", "/dispatch/in-outbound-record", "/control/in-outbound-record", "/dispatch/po-to-schedule", "/scm/custom-orders", "/scm/smart", "/scm/stock-requests", "/scm/to-printing", "/scm/dependency-management", "/scm/printers", "/scm/route-rules", "/scm/schedule-formatting", "/operator.html", "/driver.html", "/control.html", "/admin.html", "/dispatch-menu.html", "/dispatch-special-stock.html", "/dispatch-custom-orders.html", "/dispatch-offline-review.html", "/sales.html", "/sales-stock-requests.html", "/sales-delivery-instructions.html", "/sales-printing.html", "/dispatch-loaded-export.html", "/scm-smart.html", "/scm-stock-requests.html", "/scm-to-printing.html", "/scm-dependency-management.html", "/scm-dependency-management.js", "/scm-dependency-management.css", "/scm-printers.html", "/scm-route-rules.html", "/scm-schedule-formatting.html"].includes(req.path)) {
+  } else if (req.path.endsWith(".webmanifest") || ["/", "/operator", "/driver", "/control", "/control/returns", "/admin", "/admin/accounts", "/admin/sync", "/admin/maps-usage", "/admin/reconciliation", "/admin/printers", "/admin/photo-storage", "/admin/audit", "/admin/return-automation", "/admin/mbt-gates", "/dispatch", "/dispatch/custom-orders", "/dispatch/special-stock", "/dispatch/driver-pwa", "/dispatch/offline-review", "/sales", "/sales/planning", "/sales/schedule", "/sales/monitor", "/sales/printing", "/sales/in-outbound-record", "/sales/returns", "/sales/stock-requests", "/sales/delivery-instructions", "/dispatch/loaded-export", "/dispatch/in-outbound-record", "/control/in-outbound-record", "/dispatch/po-to-schedule", "/scm/custom-orders", "/scm/smart", "/scm/stock-requests", "/scm/to-printing", "/scm/dependency-management", "/scm/printers", "/scm/route-rules", "/scm/schedule-formatting", "/operator.html", "/driver.html", "/control.html", "/admin.html", "/dispatch-menu.html", "/dispatch-special-stock.html", "/dispatch-custom-orders.html", "/dispatch-offline-review.html", "/sales.html", "/sales-stock-requests.html", "/sales-delivery-instructions.html", "/sales-printing.html", "/dispatch-loaded-export.html", "/scm-smart.html", "/scm-stock-requests.html", "/scm/to-printing.html", "/scm/dependency-management.html", "/scm-dependency-management.js", "/scm-dependency-management.css", "/scm-printers.html", "/scm-route-rules.html", "/scm-schedule-formatting.html"].includes(req.path)) {
     res.setHeader("Cache-Control", "no-cache, no-store, must-revalidate");
   }
   next();
@@ -10288,7 +10292,9 @@ app.post("/api/dispatch/order-completions", requireDispatcher, async (req, res, 
 });
 app.use("/api/sales", requireSalesOperator, requireSalesAccess);
 app.use("/api/mbt", requireOperator, createMbtRouter({
-  frontdeskPricing: createFrontdeskPricingAdapter({ apiKey: config.googleMapsApiKey })
+  frontdeskPricing: createFrontdeskPricingAdapter({
+    routeEstimator: (input) => googleMapsGateway.estimateRoute({ ...input, subsystem: "support_route" })
+  })
 }));
 
 function deliveryInstructionContext(req, source) {
@@ -11648,7 +11654,9 @@ app.get("/api/dispatch/config", async (_req, res, next) => {
     const orderPoolPolicy = await dispatchOrderPoolRuntimePolicy();
     dispatchPrivateNoStore(res);
     res.json({
-      googleMapsApiKey: config.googleMapsApiKey,
+      googleMapsApiKey: "",
+      googleMapsEnabled: Boolean(config.googleMaps?.browserApiKey),
+      googleMapsMode: config.googleMaps?.mode || "conserve",
       driverOrientedPlanning: Boolean(config.dispatch?.driverOrientedPlanning),
       plannerOrderPoolMode: orderPoolPolicy.runtimeMode,
       plannerOrderPool: {
@@ -11672,6 +11680,88 @@ app.get("/api/dispatch/config", async (_req, res, next) => {
       },
       plannerCommandMode: config.dispatch?.plannerCommandMode || "off"
     });
+  } catch (error) {
+    next(error);
+  }
+});
+
+function dispatchGoogleRouteStops(value) {
+  if (!Array.isArray(value) || value.length < 2 || value.length > 25) {
+    throw Object.assign(new Error("A Google route requires between 2 and 25 ordered stops."), { status: 400 });
+  }
+  return value.map((raw, index) => {
+    const stop = raw && typeof raw === "object" && !Array.isArray(raw) ? raw : {};
+    const rawLatitude = stop.latitude ?? stop.lat;
+    const rawLongitude = stop.longitude ?? stop.lng;
+    const latitude = Number(rawLatitude);
+    const longitude = Number(rawLongitude);
+    const location = String(stop.location ?? stop.routeLocation ?? stop.address ?? "").trim();
+    const coordinateValid = validCoordinate(rawLatitude, rawLongitude)
+      && latitude >= -90
+      && latitude <= 90
+      && longitude >= -180
+      && longitude <= 180;
+    if (!location && !coordinateValid) {
+      throw Object.assign(new Error(`Google route stop ${index + 1} has no valid location.`), { status: 400 });
+    }
+    if (location.length > 500) {
+      throw Object.assign(new Error(`Google route stop ${index + 1} is too long.`), { status: 400 });
+    }
+    return {
+      ...(location ? { location } : { latitude, longitude }),
+      stayMinutes: Math.min(1_440, Math.max(0, Number(stop.stayMinutes) || 0))
+    };
+  });
+}
+
+app.post("/api/dispatch/maps/browser-session", async (req, res) => {
+  dispatchPrivateNoStore(res);
+  const authorization = await authorizeGoogleBrowserMap({
+    actorId: req.operator?.id || req.operator?.username || "public-sales",
+    sessionId: String(req.body?.sessionId || "").slice(0, 120),
+    automatic: req.body?.manual !== true
+  }).catch(() => ({ available: false, reason: "accounting_unavailable", budgetState: "exhausted" }));
+  res.json(authorization);
+});
+
+app.post("/api/dispatch/maps/route-estimate", requireDispatcher, async (req, res, next) => {
+  try {
+    const stops = dispatchGoogleRouteStops(req.body?.stops);
+    const result = await googleMapsGateway.estimateRoute({
+      subsystem: "dispatch_route",
+      reason: req.body?.reason === "manual_refresh" ? "manual_refresh" : "confirm",
+      stops,
+      fallbackLegMinutes: Array.isArray(req.body?.fallbackLegMinutes) ? req.body.fallbackLegMinutes.slice(0, 24) : [],
+      travelTimePercent: Math.min(200, Math.max(0, Number(req.body?.travelTimePercent) || 0)),
+      allowTolls: Boolean(req.body?.allowTolls),
+      trafficAware: req.body?.reason === "manual_refresh",
+      departureTime: req.body?.departureTime,
+      routeSignature: String(req.body?.routeSignature || "").slice(0, 500),
+      routeEstimateId: String(req.body?.routeEstimateId || "").slice(0, 500),
+      actorId: req.operator?.id || req.operator?.username || "",
+      sessionId: String(req.body?.sessionId || "").slice(0, 120)
+    });
+    dispatchPrivateNoStore(res);
+    res.json(result);
+  } catch (error) {
+    next(error);
+  }
+});
+
+app.post("/api/dispatch/maps/monitor-eta", requireDispatcher, async (req, res, next) => {
+  try {
+    const stops = dispatchGoogleRouteStops([req.body?.origin, req.body?.destination]);
+    const result = await googleMapsGateway.estimateRoute({
+      subsystem: "monitor_eta",
+      reason: "manual_refresh",
+      stops,
+      fallbackLegMinutes: [Math.min(1_440, Math.max(1, Number(req.body?.fallbackMinutes) || 30))],
+      trafficAware: true,
+      actorId: req.operator?.id || req.operator?.username || "",
+      sessionId: String(req.body?.sessionId || "").slice(0, 120)
+    });
+    dispatchPrivateNoStore(res);
+    res.json(result);
   } catch (error) {
     next(error);
   }
@@ -15716,6 +15806,21 @@ app.get("/api/scm/schedule", async (req, res, next) => {
   }
 });
 
+app.post("/api/scm/schedule/:id/complete-vendor", requireSmartScmWriteAccess, async (req, res, next) => {
+  try {
+    const result = await completeScmVendorOrder({
+      orderKind: req.body?.orderKind,
+      orderRef: req.params.id,
+      expectedUpdatedAt: req.body?.expectedUpdatedAt,
+      actor: req.operator
+    });
+    emitAppEvent("dispatch.orders.updated", { source: "scm-vendor-completion", orderRef: result.orderRef });
+    res.json({ result });
+  } catch (error) {
+    next(error);
+  }
+});
+
 app.get("/api/scm/schedule-formatting", async (_req, res, next) => {
   try {
     res.setHeader("Cache-Control", "no-store");
@@ -17604,6 +17709,7 @@ app.get([
   "/admin",
   "/admin/accounts",
   "/admin/sync",
+  "/admin/maps-usage",
   "/admin/reconciliation",
   "/admin/photo-storage",
   "/admin/audit",
@@ -19788,6 +19894,15 @@ app.get("/api/driver/next-job", requireDriver, async (req, res, next) => {
       })()
     ]);
     const job = jobContext.job;
+    const routeAttention = jobContext.routeAttention || state.routeAttention || null;
+    if (routeAttention) {
+      emitAppEvent("driver.route.attention", {
+        driverLogin: req.driverLogin,
+        planId: jobContext.planId,
+        planDate: jobContext.planDate,
+        ...routeAttention
+      });
+    }
     const routeBootstrap = await nextJobOfflineRouteBootstrap(req, state, jobContext);
     let presentedJob = job;
     if (job && (job.stopType === "pickup" || job.stopType === "dropoff")) {
@@ -19832,6 +19947,7 @@ app.get("/api/driver/next-job", requireDriver, async (req, res, next) => {
         job: presentedJob,
         pendingCompletion,
         routeBootstrap,
+        routeAttention,
         offlineEnabled: driverMode.enabled,
         offlineModeRevision: driverMode.revision
       });
@@ -19846,10 +19962,19 @@ app.get("/api/driver/next-job", requireDriver, async (req, res, next) => {
       restSummary,
       pendingCompletion,
       routeBootstrap,
+      routeAttention,
       offlineEnabled: driverMode.enabled,
       offlineModeRevision: driverMode.revision
     });
   } catch (error) {
+    if (error?.code === "DRIVER_ACTIVE_ROUTE_CONFLICT") {
+      emitAppEvent("driver.route.attention", {
+        driverLogin: req.driverLogin,
+        code: error.code,
+        activeJobIds: error.activeJobIds || [],
+        reason: error.reason || "active_route_conflict"
+      });
+    }
     next(error);
   }
 });
@@ -20609,7 +20734,18 @@ app.post("/api/driver/jobs/:jobId/photos", requireDriver, async (req, res, next)
     if (!Number.isFinite(secondsSinceStart) || secondsSinceStart < 10) {
       return res.status(409).json({ error: "Please wait 10 seconds after starting the job before confirming it." });
     }
-    const locationCheck = await checkDriverJobLocation(job);
+    const verificationId = String(req.body?.locationVerificationId || "").trim();
+    const reusedVerification = verificationId
+      ? await consumeDriverLocationVerification(verificationId, {
+          driverLogin: req.driverLogin,
+          deviceId: driverDeviceId(req) || req.driverSession?.deviceId || "",
+          jobId: job.jobId,
+          occurredAt: new Date()
+        }).catch(() => null)
+      : null;
+    const locationCheck = reusedVerification?.details && typeof reusedVerification.details === "object"
+      ? { ...reusedVerification.details, verificationReused: true }
+      : await checkDriverJobLocation(job);
     if (locationCheck.status !== "ok" && !req.body?.locationOverride) {
       return res.status(409).json({
         error: locationCheck.status === "warning"
@@ -20773,6 +20909,16 @@ app.get("/api/admin/public-sales", requireOperator, requireAdmin, async (_req, r
   try {
     res.setHeader("Cache-Control", "no-store");
     res.json(await getSalesPortalSettings({ fresh: true }));
+  } catch (error) {
+    next(error);
+  }
+});
+
+app.get("/api/admin/maps-usage", requireOperator, requireAdmin, async (_req, res, next) => {
+  try {
+    const summary = await googleMapsUsageRepository.summary();
+    res.setHeader("Cache-Control", "no-store");
+    res.json({ ...summary, mode: config.googleMaps?.mode || "conserve" });
   } catch (error) {
     next(error);
   }

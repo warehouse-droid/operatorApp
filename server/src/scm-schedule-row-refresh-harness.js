@@ -91,7 +91,7 @@ assert.deepEqual(
   {
     matching: true,
     wrongSearch: false,
-    wrongStatus: false,
+    wrongStatus: true,
     wrongBrand: false,
     wrongPickup: false,
     wrongRemark: false,
@@ -100,7 +100,7 @@ assert.deepEqual(
     wrongDriver: false,
     wrongSla: false
   },
-  "Global search and every selected column filter must be applied conjunctively to a refreshed row."
+  "Global search spans statuses while preserving every non-status column filter on a refreshed row."
 );
 
 const saveHandler = client.match(/if \(action === "save-row"\) \{([\s\S]*?)\n  \}\n\}\);/)?.[1] || "";

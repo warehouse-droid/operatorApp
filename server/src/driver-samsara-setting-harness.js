@@ -140,8 +140,8 @@ const completionRoute = sourceSection(
 );
 assert.match(
   completionRoute,
-  /const locationCheck = await checkDriverJobLocation\(job\);/,
-  "Job completion must always re-run the read-only Samsara GPS verification."
+  /const reusedVerification = verificationId[\s\S]{0,700}consumeDriverLocationVerification\(verificationId,[\s\S]{0,700}const locationCheck = reusedVerification\?\.details[\s\S]{0,300}: await checkDriverJobLocation\(job\);/,
+  "Job completion must reuse a valid one-time location receipt or perform a fresh read-only Samsara GPS verification."
 );
 assert.doesNotMatch(
   sourceSection(completionRoute, "const locationCheck =", "if (locationCheck.status"),

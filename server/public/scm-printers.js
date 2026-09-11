@@ -92,7 +92,7 @@ function printerTokenPanel() {
   const command = `powershell -ExecutionPolicy Bypass -File .\\Install-MBBSYardPrinterAgent.ps1 -ServerUrl \"${window.location.origin}\" -AgentId \"${revealed.printer.agentId}\" -Token \"${revealed.token}\"`;
   return `<section class="printer-token-panel">
     <h3>Save the ${printerEscape(revealed.printer.yardCode)} agent token now</h3>
-    <p>This secret is shown once. Yard agent v3 prints to both configured Windows printers, applies input-bin routing, and reports detailed timing. Rotating the token immediately invalidates the previous agent.</p>
+    <p>This secret is shown once. Yard agent v4 prints TO and SO tickets single-sided, applies input-bin routing, and reports detailed timing. Rotating the token immediately invalidates the previous agent.</p>
     <div class="printer-secret"><code id="printerTokenValue">${printerEscape(revealed.token)}</code><button class="smart-button" data-printer-action="copy-token" type="button">Copy token</button></div>
     <div class="printer-secret"><code id="printerInstallCommand">${printerEscape(command)}</code><button class="smart-button" data-printer-action="copy-command" type="button">Copy setup command</button></div>
     <div class="smart-actions" style="margin-top:10px"><a class="smart-button blue" href="/tools/Install-MBBSYardPrinterAgent.ps1" download>Download Windows agent</a><button class="smart-button" data-printer-action="close-token" type="button">I saved it</button></div>
@@ -130,6 +130,7 @@ function printerCard(printer) {
   const toCount = destinations.filter((destination) => destination.printerName && destination.printTransferOrders).length;
   const soCount = destinations.filter((destination) => destination.printerName && destination.printSalesOrders).length;
   const requiresAgentUpgrade = destinations.some((destination) => destination.inputBin != null) && Number(printer.agentVersion || 1) < 3;
+  const requiresSingleSidedUpgrade = Number(printer.agentVersion || 1) < 4;
   return `<article class="printer-card" data-printer-location="${printer.locationId}">
     <div class="printer-yard"><strong>${printerEscape(printer.yardCode)}</strong><span>Location ${printer.locationId}</span></div>
     <div class="printer-config">
@@ -143,6 +144,7 @@ function printerCard(printer) {
       <label class="smart-check"><input data-printer-enabled type="checkbox" ${printer.enabled ? "checked" : ""} ${printerCanWrite() ? "" : "disabled"} /> Enable this yard print queue</label>
       <div class="printer-meta"><span>${printer.hasToken ? "Agent token configured" : "Generate an agent token"}</span><span>Last seen: ${printerDate(printer.lastSeenAt)}</span></div>
       ${requiresAgentUpgrade ? `<div class="smart-notice error">Input-bin jobs are fail-safe blocked at the head of this yard queue until agent v3 is installed.</div>` : ""}
+      ${requiresSingleSidedUpgrade ? `<div class="smart-notice">Install agent v4 on this yard's printer PC to make every TO and SO print single-sided.</div>` : ""}
       ${printer.lastError ? `<div class="smart-notice error">${printerEscape(printer.lastError)}</div>` : ""}
       ${printerCanWrite() ? `<div class="smart-actions"><button class="smart-button primary" data-printer-action="save" type="button">Save routing</button><button class="smart-button" data-printer-action="rotate-token" type="button">${printer.hasToken ? "Rotate" : "Generate"} token</button></div>` : ""}
     </div>
@@ -191,13 +193,13 @@ function printerJobs() {
 function printerRender() {
   yardPrinterApp.innerHTML = `${printerHeader()}<div class="smart-main">${printerState.error ? `<div class="smart-notice error">${printerEscape(printerState.error)}</div>` : ""}${printerState.notice ? `<div class="smart-notice">${printerEscape(printerState.notice)}</div>` : ""}${printerState.busy ? `<div class="smart-notice">${printerEscape(printerState.busy)}…</div>` : ""}${printerTokenPanel()}<section class="smart-section">
     <div class="smart-section-head">
-      <div><h2>Windows yard agent v3</h2><p>Existing agent PC: download the script, open PowerShell as Administrator, then paste the command below. It preserves the existing token and settings and restarts as v3.</p></div>
-      <a class="smart-button blue" href="/tools/Install-MBBSYardPrinterAgent.ps1" download>Download agent v3</a>
+      <div><h2>Windows yard agent v4</h2><p>Install this update on each printer PC to make TO and SO tickets always print single-sided. Download the script, open PowerShell as Administrator, then paste the command below. It preserves the existing token and settings and restarts as v4.</p></div>
+      <a class="smart-button blue" href="/tools/Install-MBBSYardPrinterAgent.ps1" download>Download agent v4</a>
     </div>
     <div class="smart-section-body">
       <div class="printer-secret"><code id="printerAgentUpgradeCommand">${printerEscape(printerAgentUpgradeCommand)}</code><button class="smart-button" data-printer-action="copy-upgrade-command" type="button">Copy command</button></div>
     </div>
-  </section><section class="smart-section"><div class="smart-section-head"><div><h2>Two printers per yard</h2><p>Assign both named printers to TO for two copies. Assign exactly one named printer to SO for one copy. Input bins are sent explicitly by yard agent v3, so multiple queues on the same physical printer can select different trays.</p></div></div><div class="smart-section-body printer-grid">${printerState.printers.map(printerCard).join("") || `<div class="smart-empty">Run the Smart SCM migrations to create yard printer records.</div>`}</div></section>${printerJobs()}</div>`;
+  </section><section class="smart-section"><div class="smart-section-head"><div><h2>Two printers per yard</h2><p>Assign both named printers to TO for two single-sided copies. Assign exactly one named printer to SO for one single-sided copy. Input bins are sent explicitly by yard agent v4, so multiple queues on the same physical printer can select different trays.</p></div></div><div class="smart-section-body printer-grid">${printerState.printers.map(printerCard).join("") || `<div class="smart-empty">Run the Smart SCM migrations to create yard printer records.</div>`}</div></section>${printerJobs()}</div>`;
 }
 
 async function printerWork(label, task, success = "Saved") {
@@ -267,7 +269,7 @@ yardPrinterApp.addEventListener("click", async (event) => {
       printerRender();
     } else if (action === "copy-upgrade-command") {
       await navigator.clipboard.writeText(printerAgentUpgradeCommand);
-      printerState.notice = "Agent v3 upgrade command copied";
+      printerState.notice = "Agent v4 upgrade command copied";
       printerRender();
     } else if (action === "close-token") {
       printerState.revealed = null;

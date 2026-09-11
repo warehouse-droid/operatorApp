@@ -14,7 +14,7 @@ $InstalledScript = Join-Path $InstallDirectory "MBBSYardPrinterAgent.ps1"
 $ConfigPath = Join-Path $InstallDirectory "agent.json"
 $LogPath = Join-Path $InstallDirectory "agent.log"
 $TaskName = "MBBS Yard Printer Agent"
-$AgentVersion = "3"
+$AgentVersion = "4"
 
 function Write-AgentLog {
   param([string]$Message)
@@ -264,13 +264,16 @@ function Start-AgentLoop {
           $phase = "printing"
           $diagnostics.phase = $phase
           $binLogValue = if ($null -eq $target.inputBin) { "default" } else { [string]$target.inputBin }
-          Write-AgentLog "Printing job $($job.id) to '$printerName' with inputBin=$binLogValue."
+          Write-AgentLog "Printing job $($job.id) single-sided to '$printerName' with inputBin=$binLogValue."
           $quotedPrinter = '"' + $printerName.Replace('"', '\"') + '"'
           $sumatraArguments = @("-print-to", $quotedPrinter)
+          # Apply simplex to every copy, including retries and jobs using the default tray.
+          $printSettings = @("simplex")
           if ($null -ne $target.inputBin) {
-            $quotedPrintSettings = '"bin=' + ([string]$target.inputBin) + '"'
-            $sumatraArguments += @("-print-settings", $quotedPrintSettings)
+            $printSettings += "bin=$($target.inputBin)"
           }
+          $quotedPrintSettings = '"' + ($printSettings -join ',') + '"'
+          $sumatraArguments += @("-print-settings", $quotedPrintSettings)
           $sumatraArguments += @("-silent", $quotedFile)
 
           $targetWatch = [Diagnostics.Stopwatch]::StartNew()

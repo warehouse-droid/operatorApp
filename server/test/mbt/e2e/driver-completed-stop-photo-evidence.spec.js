@@ -225,8 +225,25 @@ test("dispatcher filters, drops, appends, and revalidates a retained draft after
     expectedStateHash: FIRST_HASH,
     reason: "Customer requested a clearer completed-stop condition photo."
   }));
+  await expect(page.locator("[data-form='completed-stop-photo-append'] textarea[name='reason']"))
+    .toHaveValue("");
+  await expect(page.locator("[data-form='completed-stop-photo-append'] input[name='confirmAddition']"))
+    .not.toBeChecked();
 
+  await page.evaluate(() => {
+    const compress = window.DriverOfflinePhotos.compress.bind(window.DriverOfflinePhotos);
+    let releaseCompression;
+    const compressionGate = new Promise((resolve) => {
+      releaseCompression = resolve;
+    });
+    window.__releaseCompletedPhotoCompression = releaseCompression;
+    window.DriverOfflinePhotos.compress = async (file) => {
+      await compressionGate;
+      return compress(file);
+    };
+  });
   await dropJpeg(page.locator("[data-photo-drop-zone='completed-stop']"), jpeg, "retained-draft.jpg");
+  await expect(page.locator(".offline-review-notice")).toContainText("Preparing 1 photo");
   await page.locator("[data-form='completed-stop-photo-append'] textarea[name='reason']")
     .fill("Second requested angle retained through a remote refresh.");
   state.photos.push({
@@ -244,6 +261,8 @@ test("dispatcher filters, drops, appends, and revalidates a retained draft after
     type: "driver.stop.photos_added",
     payload: { driverLogin: "li", planDate: "2026-09-02", recordId: 410 }
   }));
+  await page.waitForTimeout(500);
+  await page.evaluate(() => window.__releaseCompletedPhotoCompression());
   await expect(page.locator(".driver-pwa-completed-stale")).toContainText("changed on another computer");
   await expect(page.locator("[aria-label='Prepared appended photos'] figure")).toHaveCount(1);
   await expect(page.locator("[data-form='completed-stop-photo-append'] textarea[name='reason']"))

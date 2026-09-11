@@ -1,0 +1,5 @@
+ARG BASE_IMAGE=mbbs-operator-app:pickup-required-20260905T032950Z
+FROM ${BASE_IMAGE}
+COPY --chown=node:node src/dispatch-local-co-cargo.js src/dispatch-co-cargo-repair.js src/dispatch-co-lifecycle.js src/dispatch-delivery-group-repository.js src/dispatch-order-catalog-repository.js /app/src/
+COPY --chown=node:node public/dispatch.js public/dispatch.html /app/public/
+COPY --chown=node:node tools/dispatch-co-cargo-repair.mjs /app/tools/

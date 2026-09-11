@@ -272,6 +272,43 @@ test("empty receipt rows preserve the legacy aggregate allocator", () => {
   assert.equal(result.conflict, false);
 });
 
+test("blanket location fallback fails closed when more than one unfinished child matches", () => {
+  const result = allocateSplitReceiptsByDestination({
+    totalReceivedQty: 5,
+    receiptRows: [{
+      transactionRef: "IR-BWS-AMBIGUOUS",
+      transactionMemo: "BWS blanket receipt",
+      transactionDate: "2026-09-08",
+      quantity: 5,
+      actualLocationId: 15
+    }],
+    targets: [
+      {
+        targetOrderRef: "BWS-CHILD-A",
+        requestedQty: 5,
+        destinationLocationId: 15,
+        operationallyCompleted: false,
+        allowInferredReceipt: true,
+        requireUniqueLocationReceipt: true,
+        createdAt: "2026-09-01"
+      },
+      {
+        targetOrderRef: "BWS-CHILD-B",
+        requestedQty: 5,
+        destinationLocationId: 15,
+        operationallyCompleted: false,
+        allowInferredReceipt: true,
+        requireUniqueLocationReceipt: true,
+        createdAt: "2026-09-01"
+      }
+    ]
+  });
+  assert.deepEqual(byRef(result), { "BWS-CHILD-A": 0, "BWS-CHILD-B": 0 });
+  assert.equal(result.conflict, true);
+  assert.equal(result.overflowQty, 5);
+  assert.deepEqual(result.unexplainedLocations, [{ locationId: 15, quantity: 5 }]);
+});
+
 test("POB03535 completed children consume historical IR globally before unfinished 3022143273", () => {
   const result = allocateSplitReceiptsByDestination({
     totalReceivedQty: 13_807.2,

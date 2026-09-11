@@ -7,6 +7,143 @@
   --danger: #a40000;
 }
 
+.maps-usage-panel {
+  gap: 20px;
+}
+
+.maps-usage-metrics {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  gap: 12px;
+}
+
+.maps-usage-metrics article {
+  display: grid;
+  gap: 6px;
+  min-width: 0;
+  padding: 16px;
+  border: 1px solid #d9e2ec;
+  border-radius: 12px;
+  background: #f8fafc;
+}
+
+.maps-usage-metrics span,
+.maps-usage-metrics small {
+  color: #536274;
+}
+
+.maps-usage-metrics strong {
+  font-size: clamp(1.35rem, 2vw, 2rem);
+}
+
+.maps-usage-budget {
+  height: 14px;
+  overflow: hidden;
+  border-radius: 999px;
+  background: #e8edf3;
+}
+
+.maps-usage-budget span {
+  display: block;
+  height: 100%;
+  border-radius: inherit;
+  background: linear-gradient(90deg, #087f5b 0%, #f59f00 78%, #c92a2a 100%);
+}
+
+.maps-usage-highlight {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+  padding: 14px 16px;
+  border-left: 5px solid #155eef;
+  border-radius: 8px;
+  background: #eef4ff;
+}
+
+.maps-usage-chart-section,
+.maps-usage-actions {
+  display: grid;
+  gap: 12px;
+}
+
+.maps-usage-chart-section h3,
+.maps-usage-chart-section p,
+.maps-usage-actions h3 {
+  margin: 0;
+}
+
+.maps-usage-chart {
+  display: grid;
+  grid-template-columns: repeat(30, minmax(8px, 1fr));
+  align-items: end;
+  gap: 4px;
+  min-height: 230px;
+  padding: 18px 10px 8px;
+  overflow-x: auto;
+  border: 1px solid #d9e2ec;
+  border-radius: 12px;
+  background: repeating-linear-gradient(to top, #f8fafc 0, #f8fafc 44px, #e8edf3 45px);
+}
+
+.maps-usage-day {
+  display: grid;
+  grid-template-rows: 180px 20px;
+  align-items: end;
+  min-width: 11px;
+  text-align: center;
+}
+
+.maps-usage-bar {
+  display: block;
+  width: min(18px, 100%);
+  min-height: 2px;
+  justify-self: center;
+  border-radius: 5px 5px 1px 1px;
+  background: #155eef;
+}
+
+.maps-usage-day small {
+  overflow: hidden;
+  color: #667085;
+  font-size: 9px;
+  writing-mode: vertical-rl;
+}
+
+.maps-usage-actions .table-scroll {
+  overflow-x: auto;
+}
+
+.maps-usage-actions table {
+  width: 100%;
+  border-collapse: collapse;
+}
+
+.maps-usage-actions th,
+.maps-usage-actions td {
+  padding: 10px 9px;
+  border-bottom: 1px solid #e8edf3;
+  text-align: left;
+  white-space: nowrap;
+}
+
+@media (max-width: 920px) {
+  .maps-usage-metrics {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+}
+
+@media (max-width: 560px) {
+  .maps-usage-metrics {
+    grid-template-columns: minmax(0, 1fr);
+  }
+
+  .maps-usage-highlight {
+    align-items: flex-start;
+    flex-direction: column;
+  }
+}
+
 * {
   box-sizing: border-box;
 }

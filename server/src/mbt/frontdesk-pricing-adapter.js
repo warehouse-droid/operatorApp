@@ -4,9 +4,6 @@ import { query } from "../db.js";
 import { canonicalSha256, canonicalize } from "./canonical-json.js";
 import { MbtError } from "./errors.js";
 
-const GOOGLE_DIRECTIONS_URL = "https://maps.googleapis.com/maps/api/directions/json";
-const DEFAULT_TIMEOUT_MS = 15_000;
-
 /** @param {number} status @param {string} code @param {string} message @param {unknown} [cause] */
 function failure(status, code, message, cause) {
   return new MbtError({ status, code, message, cause });
@@ -101,21 +98,17 @@ function object(value) {
  * MBBS previews. The adapter performs a read-only route lookup and returns a
  * bounded immutable snapshot; the Google credential is never retained.
  *
- * @param {{apiKey?: string, database?: {query: Function}, transport?: Function, timeoutMs?: number}} [dependencies]
+ * @param {{database?: {query: Function}, routeEstimator?: Function}} [dependencies]
  */
 export function createFrontdeskPricingAdapter(dependencies = {}) {
-  const apiKey = text(dependencies.apiKey);
   const database = dependencies.database || { query };
-  const transport = dependencies.transport || globalThis.fetch;
-  const timeoutMs = Number.isSafeInteger(dependencies.timeoutMs) && Number(dependencies.timeoutMs) > 0
-    ? Number(dependencies.timeoutMs)
-    : DEFAULT_TIMEOUT_MS;
+  const routeEstimator = dependencies.routeEstimator;
 
   return Object.freeze({
     /** @param {Record<string, any>} rawInput */
     // eslint-disable-next-line complexity
     async resolveDistance(rawInput = {}) {
-      if (!apiKey || typeof transport !== "function") {
+      if (typeof routeEstimator !== "function") {
         throw failure(
           503,
           "MBT_FRONTDESK_DISTANCE_UNAVAILABLE",
@@ -151,37 +144,27 @@ export function createFrontdeskPricingAdapter(dependencies = {}) {
         addressText: destinationAddress
       });
 
-      const url = new URL(GOOGLE_DIRECTIONS_URL);
-      url.searchParams.set("origin", originAddress);
-      url.searchParams.set("destination", destinationAddress);
-      url.searchParams.set("mode", "driving");
-      url.searchParams.set("avoid", "tolls");
-      url.searchParams.set("region", "ca");
-      url.searchParams.set("key", apiKey);
-      let response;
-      let payload;
+      let route;
       try {
-        response = await transport(url, { signal: AbortSignal.timeout(timeoutMs) });
-        payload = object(await response.json());
+        route = object(await routeEstimator({
+          subsystem: "frontdesk",
+          reason: "frontdesk_distance",
+          stops: [{ location: originAddress }, { location: destinationAddress }],
+          allowTolls: false,
+          automatic: false
+        }));
       } catch (error) {
         throw failure(503, "MBT_FRONTDESK_DISTANCE_UNAVAILABLE", "The server could not resolve a driving route.", error);
       }
-      if (response?.ok !== true || payload.status !== "OK") {
+      if (route.source === "fallback" || !Number.isSafeInteger(Number(route.distanceMeters))) {
         throw failure(422, "MBT_FRONTDESK_ROUTE_NOT_FOUND", "No supported driving route was found for these addresses.");
       }
-      const route = object(Array.isArray(payload.routes) ? payload.routes[0] : null);
-      const legs = Array.isArray(route.legs) ? route.legs.map(object) : [];
-      if (!legs.length) {
-        throw failure(422, "MBT_FRONTDESK_ROUTE_NOT_FOUND", "No supported driving route was found for these addresses.");
-      }
-      const legMetres = legs.map((leg, index) => safeNonnegativeInteger(
-        object(leg.distance).value,
-        `Route leg ${index + 1} distance`
-      ));
-      const legDurationSeconds = legs.map((leg) => {
-        const raw = object(leg.duration).value;
-        return Number.isSafeInteger(Number(raw)) && Number(raw) >= 0 ? Number(raw) : null;
-      });
+      const legMetres = (Array.isArray(route.legDistanceMeters) && route.legDistanceMeters.length
+        ? route.legDistanceMeters
+        : [route.distanceMeters]
+      ).map((value, index) => safeNonnegativeInteger(value, `Route leg ${index + 1} distance`));
+      const legDurationSeconds = (Array.isArray(route.rawLegMinutes) ? route.rawLegMinutes : [])
+        .map((minutes) => Number.isFinite(Number(minutes)) ? Math.max(0, Math.round(Number(minutes) * 60)) : null);
       const providerMetres = legMetres.reduce((sum, value) => {
         const next = sum + value;
         if (!Number.isSafeInteger(next)) {
@@ -190,16 +173,15 @@ export function createFrontdeskPricingAdapter(dependencies = {}) {
         return next;
       }, 0);
       const routeSnapshot = canonicalize({
-        provider: "google_directions_v1",
+        provider: "google_routes_v2",
         mode: "driving",
         avoid: ["tolls"],
         region: "ca",
-        summary: text(route.summary),
         legMetres,
         legDurationSeconds
       });
       return {
-        provider: "google_directions_v1",
+        provider: "google_routes_v2",
         providerMetres,
         routeHash: canonicalSha256({ originSnapshot, destinationSnapshot, routeSnapshot }),
         originSnapshot,

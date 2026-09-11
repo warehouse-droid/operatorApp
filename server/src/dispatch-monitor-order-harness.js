@@ -211,8 +211,9 @@ try {
   assert.match(monitorClientSource, /function sortedMonitorTrucks\(\)/, "Active trucks need a stable active-first list ordering.");
   assert.match(monitorClientSource, /function monitorCarryingManifestHtml\(load/, "Truck hover and map bubbles need the full onboard manifest.");
   assert.match(monitorClientSource, /function showMonitorTruckTooltip\(card, event\)/, "Truck cards need a manifest hover window.");
-  assert.match(monitorClientSource, /new google\.maps\.DirectionsService\(\)/, "ETA should use the already configured Google Maps client.");
-  assert.match(monitorClientSource, /duration_in_traffic/, "ETA should prefer traffic-aware duration when Google returns it.");
+  assert.doesNotMatch(monitorClientSource, /new google\.maps\.DirectionsService\(\)/, "Monitor polling must never create a browser Directions client.");
+  assert.match(monitorClientSource, /data-action="refresh-monitor-eta"/, "Traffic ETA must require an explicit selected-truck refresh.");
+  assert.match(monitorClientSource, /\/api\/dispatch\/maps\/monitor-eta/, "Manual ETA must pass through the budgeted server gateway.");
   assert.match(monitorClientSource, /ETA_CACHE_MS\s*=\s*2\s*\*\s*60\s*\*\s*1000/, "ETA routes must be throttled across the ten-second monitor refresh.");
   assert.match(monitorCssSource, /\.monitor-grid\s*\{[\s\S]*grid-template-columns:\s*minmax\(360px,\s*\.8fr\)\s+minmax\(380px,\s*460px\)/, "The truck column should be wider while the map gives up width.");
   assert.match(monitorCssSource, /\.monitor-info\s*\{[\s\S]*max-width:\s*420px/, "The map bubble must be wide enough for order lines.");
@@ -221,7 +222,7 @@ try {
   assert.match(monitorClientSource, /let monitorInfoWindowPlate = "";/, "The open map bubble needs its own stable truck identity.");
   assert.match(monitorClientSource, /if \(monitorInfoWindowPlate && monitorInfoWindow\)/, "An ETA refresh must update the actually open truck bubble, not a previously selected truck.");
   assert.match(monitorClientSource, /const renderGeneration = \+\+monitorMapRenderGeneration;/, "Overlapping map refreshes must discard stale marker renders.");
-  assert.match(monitorHtmlSource, /dispatch-monitor\.js\?v=20260814-order-actual-v3/, "The order actual-time repair must not be hidden by an old browser cache.");
+  assert.match(monitorHtmlSource, /dispatch-monitor\.js\?v=20260911-maps-usage-v1/, "The Maps usage repair must not be hidden by an old browser cache.");
 
   console.log("Dispatch monitor planned-order checks passed.");
 } finally {

@@ -1,4 +1,9 @@
 import crypto from "node:crypto";
+import {
+  changedDriverActivityAssignments,
+  changedLockedLoadAssignments,
+  driverLoadLanes
+} from "./dispatch-load-assignment.js";
 import { applyDispatchPlanDelta } from "./dispatch-planner-optimization.js";
 import { dispatchExecutedStopFingerprint } from "./dispatch-pickup-visits.js";
 
@@ -710,18 +715,47 @@ function activityJobDetails(record = {}) {
   }
 }
 
+function routeLoadMetadata(row = null) {
+  if (!row) {return "";}
+  return stableJson({
+    id: loadIdentity(row.load),
+    name: text(row.load?.name || row.load?.loadName || row.load?.load_name),
+    driverLogin: row.driverLogin,
+    driverName: row.driverName,
+    truckId: row.truckId,
+    truckPlate: row.truckPlate,
+    switchYard: row.switchYard,
+    parkingSpot: row.parkingSpot,
+    driverSequence: row.driverSequence,
+    plannedStartMinute: row.plannedStartMinute,
+    handoffTravelMinutes: row.handoffTravelMinutes,
+    handoffTravelFrom: row.handoffTravelFrom,
+    handoffTravelTo: row.handoffTravelTo,
+    returnOnly: row.load?.returnOnly === true,
+    returnYard: text(row.load?.returnYard || row.load?.return_yard)
+  });
+}
+
+function routeLaneMap(plan = {}) {
+  return new Map(driverLoadLanes(plan)
+    .map((lane) => [text(lane.driverLogin).toLowerCase(), lane]));
+}
+
 export function evaluateExecutedPrefixPolicy({ previousPlan = {}, nextPlan = {}, activity = [] } = {}) {
   const previousLoads = planLoads(previousPlan);
   const nextLoads = planLoads(nextPlan);
   const conflicts = [];
+  const routeConflicts = [];
   const protectedByLoad = new Map();
+  const activeLoadIds = new Set();
   for (const record of activity || []) {
     if (!["in_progress", "complete"].includes(text(record.status).toLowerCase())) {continue;}
     const type = text(record.stopType || record.stop_type).toLowerCase();
-    if (type && type !== "travel" && !PHYSICAL_STOP_TYPES.has(type)) {continue;}
+    if (type && !["travel", "truck_switch"].includes(type) && !PHYSICAL_STOP_TYPES.has(type)) {continue;}
     const loadId = text(record.loadId || record.load_id);
     const previous = previousLoads.get(loadId);
     if (!previous) {continue;}
+    activeLoadIds.add(loadId);
     const physical = (previous.load.stops || []).filter(physicalStop);
     let index = -1;
     if (type === "travel") {
@@ -732,7 +766,9 @@ export function evaluateExecutedPrefixPolicy({ previousPlan = {}, nextPlan = {},
         const travelStopId = text(record.stopId || record.stop_id);
         index = physical.findIndex((stop) => travelStopId.endsWith(`-${stopIdentity(stop)}`));
       }
-      if (index < 0) {continue;}
+      if (index < 0 && physical.length) {index = 0;}
+    } else if (type === "truck_switch") {
+      index = -1;
     } else {
       index = physical.findIndex((stop) => stopIdentity(stop) === text(record.stopId || record.stop_id));
       if (index < 0 && record.orderRef) {
@@ -742,6 +778,52 @@ export function evaluateExecutedPrefixPolicy({ previousPlan = {}, nextPlan = {},
     }
     protectedByLoad.set(loadId, Math.max(protectedByLoad.get(loadId) ?? -1, index));
   }
+
+  const previousLanes = routeLaneMap(previousPlan);
+  const nextLanes = routeLaneMap(nextPlan);
+  for (const [driverLogin, previousLane] of previousLanes) {
+    const boundaryIndex = (previousLane.loads || []).reduce((latest, row, index) =>
+      activeLoadIds.has(loadIdentity(row.load)) ? Math.max(latest, index) : latest,
+    -1);
+    if (boundaryIndex < 0) {continue;}
+    const lockedRows = previousLane.loads.slice(0, boundaryIndex + 1);
+    const lockedLoadIds = lockedRows.map((row) => loadIdentity(row.load));
+    const nextLane = nextLanes.get(driverLogin);
+    const nextPrefixIds = (nextLane?.loads || [])
+      .slice(0, boundaryIndex + 1)
+      .map((row) => loadIdentity(row.load));
+    const lanePrefixChanged = stableJson(nextPrefixIds) !== stableJson(lockedLoadIds);
+    const priorLoadChanges = changedLockedLoadAssignments(
+      previousPlan,
+      nextPlan,
+      new Set(lockedLoadIds.slice(0, -1))
+    );
+    const boundaryLoadId = lockedLoadIds.at(-1);
+    const nextBoundary = (nextLane?.loads || []).find((row) => loadIdentity(row.load) === boundaryLoadId) || null;
+    const boundaryMetadataChanged = routeLoadMetadata(lockedRows.at(-1)) !== routeLoadMetadata(nextBoundary);
+    if (lanePrefixChanged || priorLoadChanges.length || boundaryMetadataChanged) {
+      routeConflicts.push({
+        code: "DISPATCH_ROUTE_PREFIX_LOCKED",
+        driverLogin,
+        boundaryLoadId,
+        boundaryLoadIndex: boundaryIndex,
+        lockedLoadIds,
+        changedLoadIds: priorLoadChanges.map((change) => change.loadId),
+        reasons: [
+          ...(lanePrefixChanged ? ["lane_prefix"] : []),
+          ...(priorLoadChanges.length ? ["preceding_load"] : []),
+          ...(boundaryMetadataChanged ? ["boundary_load"] : [])
+        ],
+        message: "Driver progress locks every load before and through the current route position; only later work may be replanned."
+      });
+    }
+  }
+
+  const activityDetailsChanged = new Set(changedDriverActivityAssignments(
+    previousPlan,
+    nextPlan,
+    activity
+  ).map((change) => text(change.loadId)));
   for (const [loadId, throughIndex] of protectedByLoad) {
     const previous = previousLoads.get(loadId);
     const next = nextLoads.get(loadId);
@@ -755,7 +837,7 @@ export function evaluateExecutedPrefixPolicy({ previousPlan = {}, nextPlan = {},
     )) !== stableJson(afterPrefix.map((stop) =>
       dispatchExecutedStopFingerprint(nextPlan, next?.load || {}, stop, { previousPlan })
     ));
-    if (assignmentChanged || prefixChanged) {
+    if (assignmentChanged || prefixChanged || activityDetailsChanged.has(loadId)) {
       conflicts.push({
         code: "DISPATCH_ACTIVE_LOAD_LOCKED",
         loadId,
@@ -764,6 +846,7 @@ export function evaluateExecutedPrefixPolicy({ previousPlan = {}, nextPlan = {},
       });
     }
   }
+  conflicts.push(...routeConflicts);
   return { allowed: conflicts.length === 0, conflicts };
 }
 

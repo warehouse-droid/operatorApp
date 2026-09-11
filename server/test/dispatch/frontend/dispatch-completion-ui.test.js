@@ -22,5 +22,5 @@ test("Dispatch exposes the guarded manual completion command for supported selec
   assert.match(source, /!dispatchCompleted && order\.scm\?\.status/u);
   assert.match(source, /!SALES_PLANNING_HOST && !dispatchCompleted/u);
   assert.match(source, /Dispatch completed/u);
-  assert.match(html, /dispatch\.js\?v=20260903-repeat-pickup-visits-v1/u);
+  assert.match(html, /dispatch\.js\?v=20260911-maps-usage-v1/u);
 });

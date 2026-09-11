@@ -6,6 +6,7 @@ import {
   DRIVER_PWA_CURRENT_VERSION,
   DRIVER_PWA_MINIMUM_VERSION
 } from "./driver-client-version.js";
+import { selectDriverRouteCursor } from "./driver-route-cursor.js";
 import { createSamsaraDriverVehicleAssignment, createSamsaraMechanicDvir, findSamsaraDvirForVehicle, setSamsaraDriverDutyStatus } from "./samsara.js";
 import {
   dispatchLoadAssignment,
@@ -999,18 +1000,6 @@ function buildBinJob(plan, truck, load, stop, truckIndex, loadIndex, stopIndex) 
   };
 }
 
-async function completedJobIds(jobIds) {
-  if (!jobIds.length) return new Set();
-  const result = await query(
-    `SELECT job_id
-       FROM driver_job_records
-      WHERE job_id = ANY($1::text[])
-        AND status = 'complete'`,
-    [jobIds]
-  );
-  return new Set(result.rows.map((row) => row.job_id));
-}
-
 async function jobStatusMap(jobIds) {
   if (!jobIds.length) return new Map();
   const result = await query(
@@ -1022,6 +1011,21 @@ async function jobStatusMap(jobIds) {
     [jobIds]
   );
   return new Map(result.rows.map((row) => [row.job_id, row]));
+}
+
+async function activeDriverJobRecords(planId, driverLogin) {
+  if (!planId || !driverKey(driverLogin)) return [];
+  const result = await query(
+    `SELECT job_id, status, started_at, completed_at, load_id, stop_id,
+            stop_type, job_details
+       FROM driver_job_records
+      WHERE plan_id = $1
+        AND lower(driver_login) = $2
+        AND status = 'in_progress'
+      ORDER BY started_at ASC NULLS LAST, id ASC`,
+    [planId, driverKey(driverLogin)]
+  );
+  return result.rows;
 }
 
 async function confirmedPlans({ startDate = "", exactDate = "" } = {}) {
@@ -1409,12 +1413,17 @@ export async function getDriverDayState(driverLogin, {
   if (samsaraEnabled) row = await clearUnconfirmedDvirIfNeeded(row);
   const jobs = assignment ? planJobsForDriver(plan, driverLogin, { allowBin }) : [];
   const jobIds = jobs.map((job) => job.jobId);
-  const completed = await completedJobIds(jobIds);
-  const allJobsComplete = jobs.length > 0 && jobs.every((job) => completed.has(job.jobId));
+  const [statuses, activeRecords] = await Promise.all([
+    jobStatusMap(jobIds),
+    activeDriverJobRecords(plan?.id, driverLogin)
+  ]);
+  const cursor = selectDriverRouteCursor({ jobs, statuses, activeRecords });
+  const completedJobCount = jobs.filter((job) => statuses.get(job.jobId)?.status === "complete").length;
+  const allJobsComplete = jobs.length > 0 && completedJobCount === jobs.length;
   const currentTruck = assignment?.assignments?.find((item) =>
     normalizedPlate(item.truck.plate) === normalizedPlate(row.current_truck_plate || row.truck_plate)
   )?.truck || initialTruck;
-  const nextPendingJob = jobs.find((job) => !completed.has(job.jobId)) || null;
+  const nextPendingJob = cursor.job;
   const nextTruck = nextPendingJob
     ? assignment?.assignments?.find((item) => normalizedPlate(item.truck.plate) === normalizedPlate(nextPendingJob.truckPlate))?.truck || null
     : null;
@@ -1499,7 +1508,9 @@ export async function getDriverDayState(driverLogin, {
       : "",
     allJobsComplete,
     jobCount: jobs.length,
-    completedJobCount: completed.size
+    completedJobCount,
+    routeAttention: cursor.attention,
+    passedPendingJobIds: cursor.passedPendingJobIds
   };
 }
 
@@ -2425,9 +2436,12 @@ export async function getDriverNextJobContext(driverLogin, {
   }
   const baseJobs = planJobsForDriver(assignment.plan, driverLogin, { allowBin });
   const jobIds = baseJobs.map((job) => job.jobId);
-  const completed = await completedJobIds(jobIds);
-  const statuses = await jobStatusMap(jobIds);
-  const next = baseJobs.find((job) => !completed.has(job.jobId));
+  const [statuses, activeRecords] = await Promise.all([
+    jobStatusMap(jobIds),
+    activeDriverJobRecords(assignment.plan.id, driverLogin)
+  ]);
+  const cursor = selectDriverRouteCursor({ jobs: baseJobs, statuses, activeRecords });
+  const next = cursor.job;
   return {
     planId: assignment.plan.id,
     planDate: assignment.plan.planDate,
@@ -2436,6 +2450,8 @@ export async function getDriverNextJobContext(driverLogin, {
     // /day-plan materializes the complete route in the background; first paint
     // enriches only the one actionable BIN stop.
     jobs: baseJobs,
+    routeAttention: cursor.attention,
+    passedPendingJobIds: cursor.passedPendingJobIds,
     job: next
       ? (await decorateReattemptReadiness([await materializeDriverJob(
           assignment.plan,

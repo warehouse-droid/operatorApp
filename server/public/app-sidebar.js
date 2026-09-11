@@ -117,6 +117,7 @@
     { label: "Overview", href: "/admin", controlSection: "dashboard", icon: "OV" },
     { label: "Accounts", href: "/admin/accounts", controlSection: "operators", icon: "AC" },
     { label: "Sync", href: "/admin/sync", controlSection: "sync", icon: "SY" },
+    { label: "Maps Usage", href: "/admin/maps-usage", controlSection: "maps-usage", icon: "MU" },
     { label: "SO / PO / TO Reconcile", href: "/admin/reconciliation", controlSection: "reconciliation", icon: "RC" },
     { label: "Return Automation", href: "/admin/return-automation", controlSection: "return-automation", icon: "RA" },
     { label: "Yard Printers", href: "/admin/printers", icon: "PR" },

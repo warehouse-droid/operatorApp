@@ -2,6 +2,7 @@ import crypto from "node:crypto";
 import { pool, query, withTransaction } from "./db.js";
 import { dispatchLoadAssignment } from "./dispatch-load-assignment.js";
 import { DISPATCH_FLEET_PLANNING_LOCK } from "./dispatch-fleet-status.js";
+import { assertDispatchExecutedPrefixPreserved } from "./dispatch-executed-prefix-repository.js";
 import {
   syncDispatchPlanOrderAssignments,
   syncDispatchPlanRelationEdges
@@ -325,6 +326,7 @@ function rowToDispatchOrder(row) {
     type: row.dispatch_type,
     sourceTable: row.source_table,
     isBlanket: row.is_blanket_po === true,
+    isScmSplit: row.scm_is_split === true,
     sourceOrderId: row.dispatch_type === "CO"
       ? localOrderDetails.sourceOrderId
         || (String(visibleRef || "").startsWith("CO-") ? String(visibleRef).slice(3) : "")
@@ -627,14 +629,15 @@ export async function listDispatchOrders({
     ),
     active_po_split_lookup AS (
       SELECT relation.po_id,
+             BOOL_OR(relation.is_split) AS is_split,
              jsonb_agg(DISTINCT relation.source_po_ref ORDER BY relation.source_po_ref) AS source_po_refs,
              jsonb_agg(DISTINCT relation.split_po_ref ORDER BY relation.split_po_ref) AS corresponding_po_refs
         FROM (
-          SELECT split.source_po_id AS po_id, split.source_po_ref, split.split_po_ref
+          SELECT split.source_po_id AS po_id, split.source_po_ref, split.split_po_ref, false AS is_split
             FROM dispatch_scm_po_splits split
            WHERE split.status = 'active'
           UNION ALL
-          SELECT split.split_po_id AS po_id, split.source_po_ref, split.split_po_ref
+          SELECT split.split_po_id AS po_id, split.source_po_ref, split.split_po_ref, true AS is_split
             FROM dispatch_scm_po_splits split
            WHERE split.status = 'active'
        ) relation
@@ -1643,6 +1646,7 @@ export async function listDispatchOrders({
          )
     )
     SELECT orders.*,
+           COALESCE(split_lookup.is_split, false) AS scm_is_split,
            COALESCE(split_lookup.source_po_refs, '[]'::jsonb)
              || COALESCE(group_ref_lookup.source_po_refs, '[]'::jsonb) AS scm_source_po_refs,
            COALESCE(split_lookup.corresponding_po_refs, '[]'::jsonb)
@@ -2453,16 +2457,27 @@ async function updateDispatchSnapshotsForRef(executor, { oldRef = "", newRef = "
           orders: replaceRefDeep(row.orders || [], ref, String(newRef || "").trim()),
           trucks: replaceRefDeep(row.trucks || [], ref, String(newRef || "").trim())
         };
-    const nextPlan = {
+    const previousPlan = {
       id: String(row.plan_id),
       planDate: String(row.plan_date || "").slice(0, 10),
       status: row.status || "draft",
       note: row.note || "",
-      revision: Number(row.revision || 0) + 1,
-      orders: next.orders,
-      trucks: next.trucks,
+      revision: Number(row.revision || 0),
+      orders: row.orders || [],
+      trucks: row.trucks || [],
       summary: row.summary || {}
     };
+    const nextPlan = {
+      ...previousPlan,
+      revision: previousPlan.revision + 1,
+      orders: next.orders,
+      trucks: next.trucks
+    };
+    await assertDispatchExecutedPrefixPreserved({
+      previousPlan,
+      nextPlan,
+      execute: runQuery
+    });
     await runQuery(
       `UPDATE dispatch_plan_snapshots
           SET orders = $2::jsonb,
@@ -3342,9 +3357,10 @@ export async function listScmSchedule({
   const rawKind = String(kind || "").trim().toUpperCase();
   const cleanKind = rawKind === "SP.O" ? "Sp.O" : rawKind;
   const cleanExactRef = String(exactRef || "").trim();
-  const statusFilters = normalizeScmScheduleFilterValues(status);
+  const searchAllStatuses = Boolean(globalSearch) && String(audience).trim().toLowerCase() !== "operations";
+  const statusFilters = searchAllStatuses ? [] : normalizeScmScheduleFilterValues(status);
   const cleanView = String(view || "").trim().toLowerCase();
-  const includeCompleted = cleanView === "completed"
+  const includeCompleted = searchAllStatuses || cleanView === "completed"
     || statusFilters.some((value) => value.toLowerCase() === "completed");
   const params = [
     globalSearch,
@@ -4097,11 +4113,12 @@ export async function listScmSchedule({
         $9 = ''
         OR $9 <> 'dispatch'
         OR (COALESCE(s.method, 'MBT') = 'MBT'
-          AND effective_status.status NOT IN ('Cancelled', 'Hold'))
+          AND (($1 <> '' AND $11::boolean) OR effective_status.status NOT IN ('Cancelled', 'Hold')))
       )
       AND (
         $9 = ''
         OR $9 <> 'completed'
+        OR ($1 <> '' AND $11::boolean)
         OR effective_status.status IN ('Completed', 'Cancelled')
       )
     ORDER BY

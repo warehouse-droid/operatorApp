@@ -792,7 +792,7 @@ export async function reconcileSalesOrderFromNetSuite({
       planCleanup,
       reconciliationStatus: planCleanup.deferred ? "current" : "current",
       reason: planCleanup.deferred
-        ? "Completed order is hidden from planning; dispatch-plan cleanup is deferred until the in-progress driver job finishes."
+        ? "Completed order is hidden from planning; dispatch-plan cleanup is deferred because Driver execution evidence protects the route prefix."
         : ""
     };
     await persistSalesOrderCalculation({

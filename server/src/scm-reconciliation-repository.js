@@ -257,6 +257,7 @@ export function scmReconciliationReviewFingerprint(
           transactionType: text(transaction.transactionType),
           transactionId: positiveId(transaction.transactionId),
           transactionRef: text(transaction.transactionRef),
+          transactionMemo: text(transaction.transactionMemo),
           statusText: text(transaction.statusText),
           transactionLineKey: text(transaction.transactionLineKey),
           sourceOrderLineKey: text(transaction.sourceOrderLineKey),
@@ -391,6 +392,13 @@ export function normalizeScmIfIrWebhook(payload = {}, {
       ? new Date(Number(timestamp) * 1000).toISOString()
       : new Date().toISOString());
   const transactionRef = text(record.tranid ?? record.transactionRef ?? record.ref);
+  const transactionMemo = text(
+    record.memo
+      ?? record.transactionMemo
+      ?? record.transaction_memo
+      ?? payload.transactionMemo
+      ?? payload.transaction_memo
+  );
   const lines = (Array.isArray(record.lines) ? record.lines : [])
     .map(normalizedWebhookLine)
     .filter((line) => line.transactionLineKey && line.reconciliationRelevant);
@@ -408,6 +416,7 @@ export function normalizeScmIfIrWebhook(payload = {}, {
     transactionType,
     transactionId,
     transactionRef,
+    transactionMemo,
     statusCode: text(record.statusCode ?? status.value ?? record.status),
     statusText: text(record.statusText ?? record.status_text ?? status.text),
     lastModifiedAt: dateValue(record.lastModifiedAt ?? record.lastModifiedDate ?? record.lastmodifieddate ?? eventTime),
@@ -1435,7 +1444,7 @@ async function storeCurrentTransactionSnapshot(normalized, auditEventId, payload
   const isDeleted = normalized.tombstone === true;
   const result = await query(
     `INSERT INTO scm_reconciliation_transaction_snapshots (
-       transaction_type, netsuite_transaction_id, transaction_ref,
+       transaction_type, netsuite_transaction_id, transaction_ref, transaction_memo,
        source_order_kind, source_order_netsuite_id, source_order_ref,
        status_code, status_text, last_action, source_location_id,
        source_location, destination_location_id, destination_location,
@@ -1443,15 +1452,16 @@ async function storeCurrentTransactionSnapshot(normalized, auditEventId, payload
        netsuite_modified_at, observed_at, latest_event_id, payload_hash,
        snapshot, created_at, updated_at
      ) VALUES (
-       $1, $2, NULLIF($3, ''), $4, $5, NULLIF($6, ''),
-       NULLIF($7, ''), NULLIF($8, ''), $9, $10,
-       NULLIF($11, ''), $12, NULLIF($13, ''), $14,
-       NULLIF($15, ''), $16, CASE WHEN $16 THEN $17::timestamptz ELSE NULL END,
-       $18::timestamptz, $17::timestamptz, $19, NULLIF($20, ''),
-       $21::jsonb, now(), now()
+       $1, $2, NULLIF($3, ''), NULLIF($4, ''), $5, $6, NULLIF($7, ''),
+       NULLIF($8, ''), NULLIF($9, ''), $10, $11,
+       NULLIF($12, ''), $13, NULLIF($14, ''), $15,
+       NULLIF($16, ''), $17, CASE WHEN $17 THEN $18::timestamptz ELSE NULL END,
+       $19::timestamptz, $18::timestamptz, $20, NULLIF($21, ''),
+       $22::jsonb, now(), now()
      )
      ON CONFLICT (transaction_type, netsuite_transaction_id) DO UPDATE SET
        transaction_ref = EXCLUDED.transaction_ref,
+       transaction_memo = EXCLUDED.transaction_memo,
        source_order_kind = EXCLUDED.source_order_kind,
        source_order_netsuite_id = EXCLUDED.source_order_netsuite_id,
        source_order_ref = EXCLUDED.source_order_ref,
@@ -1481,6 +1491,7 @@ async function storeCurrentTransactionSnapshot(normalized, auditEventId, payload
       normalized.transactionType,
       normalized.transactionId,
       normalized.transactionRef,
+      normalized.transactionMemo,
       normalized.sourceOrderKind,
       normalized.sourceOrderId,
       normalized.sourceOrderRef,
@@ -1629,6 +1640,7 @@ export async function storeLinkedScmReconciliationTransactions({
         transactionType: type,
         transactionId,
         transactionRef: row.transactionRef || "",
+        transactionMemo: row.transactionMemo || "",
         statusCode: row.status || "",
         statusText: row.statusText || "",
         lastModifiedAt: dateValue(row.lastModifiedAt || row.transactionDate) || new Date().toISOString(),
@@ -1669,6 +1681,7 @@ export async function storeLinkedScmReconciliationTransactions({
     normalized.raw = {
       source: "suiteql",
       order: { id: sourceOrderId, kind, tranid: order.tranid || "" },
+      transactionMemo: normalized.transactionMemo,
       lines: normalized.lines.map((line) => line.snapshot)
     };
     const payloadHash = crypto.createHash("sha256").update(JSON.stringify(normalized.raw)).digest("hex");
@@ -1865,7 +1878,7 @@ export async function loadLocalScmReconciliationOrder(kind, sourceOrderId) {
               po.foreign_total, po.source_location_id, po.source_location,
               po.destination_location_id, po.destination_location,
               po.expected_delivery_date, po.receipt_status,
-              po.initial_scm_status, po.netsuite_active,
+              po.initial_scm_status, po.is_blanket_po, po.netsuite_active,
               po.status_updated_at, po.synced_at,
               schedule.id AS schedule_id,
               schedule.status AS schedule_status,
@@ -2005,6 +2018,7 @@ export async function loadLocalScmReconciliationOrder(kind, sourceOrderId) {
       destinationLocationId: row.destination_location_id || null,
       destinationLocation: row.destination_location || "",
       expectedDeliveryDate: row.expected_delivery_date,
+      isBlanketPo: row.is_blanket_po === true,
       localStatus: row.schedule_status || row.initial_scm_status || "Hold",
       localStatusScheduleId: positiveId(row.schedule_id),
       localStatusUpdatedAt: row.schedule_updated_at || null,
@@ -2144,6 +2158,7 @@ async function currentTransactionProgress(sourceOrderKind, sourceOrderId) {
     `SELECT snapshot.transaction_type,
             snapshot.netsuite_transaction_id,
             snapshot.transaction_ref,
+            snapshot.transaction_memo,
             snapshot.status_text,
             snapshot.actual_location_id,
             snapshot.actual_location,
@@ -2208,6 +2223,9 @@ async function loadSplitLineTargets(order, sourceLine) {
       `SELECT split_line.id AS ledger_line_id,
               split_header.split_po_ref AS target_order_ref,
               split_header.split_po_id AS target_order_id,
+              split_header.details AS split_details,
+              child.tranid AS child_tranid,
+              child.dispatch_ref AS child_dispatch_ref,
               split_header.created_at,
               split_line.split_line_id AS target_local_line_id,
               split_line.sales_qty,
@@ -2270,6 +2288,14 @@ async function loadSplitLineTargets(order, sourceLine) {
       targetKind: "po_split",
       ledgerLineId: Number(row.ledger_line_id),
       targetOrderRef: row.target_order_ref,
+      targetOrderRefAliases: textList([
+        row.target_order_ref,
+        row.child_dispatch_ref,
+        row.child_tranid,
+        ...(Array.isArray(row.split_details?.previousRefs)
+          ? row.split_details.previousRefs
+          : [])
+      ]),
       targetOrderId: Number(row.target_order_id),
       targetLocalLineId: Number(row.target_local_line_id),
       requestedQty: roundReconciliationQuantity(row.requested_sales_qty ?? row.sales_qty),
@@ -2294,8 +2320,10 @@ async function loadSplitLineTargets(order, sourceLine) {
       plannedEta: row.eta_date,
       operationallyCompleted: Boolean(row.completion_event_id)
         || ["complete", "completed"].includes(text(row.schedule_status).toLowerCase()),
-      allowInferredReceipt: Boolean(row.completion_event_id)
+      allowInferredReceipt: order.isBlanketPo === true
+        || Boolean(row.completion_event_id)
         || ["complete", "completed"].includes(text(row.schedule_status).toLowerCase()),
+      requireUniqueLocationReceipt: order.isBlanketPo === true,
       hasActiveDispatchAssignment: row.has_active_dispatch_assignment === true,
       createdAt: row.created_at
     }));
@@ -3749,6 +3777,7 @@ export async function reconcileScmOrderFamily({
   const linePlans = [];
   const reasons = [text(explicitReviewReason)].filter(Boolean);
   const unexplainedReceiptLocations = [];
+  const unexplainedReceiptReferences = [];
   let exactAllocation = true;
   let anyPlannedTarget = order.dispatchPlanned === true;
 
@@ -4051,6 +4080,10 @@ export async function reconcileScmOrderFamily({
         targetKind: "source_residual",
         ledgerLineId: null,
         targetOrderRef: order.scheduleRef,
+        receiptReferenceAliases: order.kind === "PO"
+          && text(order.scheduleRef).toLowerCase() !== text(order.tranid).toLowerCase()
+          ? [order.scheduleRef]
+          : [],
         targetOrderId: order.id,
         targetLocalLineId: line.localLineId,
         requestedQty: parentResidual,
@@ -4116,6 +4149,23 @@ export async function reconcileScmOrderFamily({
       reasons.push(
         `Received quantity ${unexplained.quantity} at location ${unexplained.locationId}`
         + ` cannot be allocated to an active split PO destination for ${line.sku || line.itemName || line.sourceLineKey}.`
+      );
+    }
+    for (const unexplained of receivedAllocation.unexplainedReferences || []) {
+      const receiptReference = text(unexplained.transactionRef)
+        || text(unexplained.transactionId)
+        || "unknown";
+      const splitReference = text(unexplained.reference)
+        || text(unexplained.transactionMemo)
+        || "unknown";
+      unexplainedReceiptReferences.push({
+        sourceLineKey: line.sourceLineKey,
+        itemName: line.itemName || line.sku || "",
+        ...unexplained
+      });
+      reasons.push(
+        `NetSuite IR ${receiptReference} memo reference ${splitReference} could not be allocated`
+        + ` for ${line.sku || line.itemName || line.sourceLineKey}: ${unexplained.reason}`
       );
     }
     if (
@@ -4262,7 +4312,8 @@ export async function reconcileScmOrderFamily({
       itemId: row.item_id,
       quantity: row.quantity
     })),
-    unexplainedReceiptLocations
+    unexplainedReceiptLocations,
+    unexplainedReceiptReferences
   };
   const conflictFingerprint = reconciliationReason
     ? reconciliationConflictFingerprint({
@@ -4502,6 +4553,7 @@ export async function reconcileScmOrderFamily({
         transactionType: row.transaction_type,
         transactionId: row.netsuite_transaction_id,
         transactionRef: row.transaction_ref,
+        transactionMemo: row.transaction_memo,
         statusText: row.status_text,
         transactionLineKey: row.netsuite_line_key,
         sourceOrderLineKey: row.source_order_line_key,

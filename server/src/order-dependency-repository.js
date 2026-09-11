@@ -1,6 +1,7 @@
 import crypto from "node:crypto";
 import { config, isNetSuiteSandboxEnvironment } from "./config.js";
 import { query, withTransaction } from "./db.js";
+import { completedTransferUnlinkAllowed } from "./scm-dependency-management-policy.js";
 import { writeDispatchAudit } from "./dispatch-audit-repository.js";
 import { resolveDispatchSalesTarget } from "./dispatch-order-target-repository.js";
 import { dispatchLoadAssignment } from "./dispatch-load-assignment.js";
@@ -1928,26 +1929,6 @@ function selectedTransferDependencyReservationOverrides(
   };
 }
 
-async function googleRouteMinutes(origin, destination) {
-  if (!config.googleMapsApiKey || !origin || !destination) return null;
-  const url = new URL("https://maps.googleapis.com/maps/api/directions/json");
-  url.searchParams.set("origin", origin);
-  url.searchParams.set("destination", destination);
-  url.searchParams.set("mode", "driving");
-  url.searchParams.set("avoid", "tolls");
-  url.searchParams.set("region", "ca");
-  url.searchParams.set("key", config.googleMapsApiKey);
-  try {
-    const response = await fetch(url, { signal: AbortSignal.timeout?.(15000) });
-    if (!response.ok) return null;
-    const payload = await response.json();
-    const seconds = payload.routes?.[0]?.legs?.[0]?.duration?.value;
-    return Number.isFinite(Number(seconds)) ? Math.max(1, Math.round(Number(seconds) / 60)) : null;
-  } catch {
-    return null;
-  }
-}
-
 export async function generateTransferDependencySuggestion({
   salesOrderId,
   mode = "yard_replenishment",
@@ -1981,12 +1962,13 @@ export async function generateTransferDependencySuggestion({
       };
     })
   }));
-  const routeRows = await Promise.all(DEPENDENCY_YARDS.map(async (yard) => ({
+  const routeRows = DEPENDENCY_YARDS.map((yard) => ({
     ...yard,
-    routeMinutes: yard.locationId === destination.locationId
-      ? 0
-      : await googleRouteMinutes(yard.address, order.customerAddress || destination.address)
-  })));
+    // Suggestions are generated frequently and do not need paid live traffic.
+    // Stable configured priority remains deterministic; an operator can obtain
+    // a route later from Dispatch when confirming the selected movement.
+    routeMinutes: yard.locationId === destination.locationId ? 0 : null
+  }));
   const rankedYards = routeRows
     .filter((yard) => yard.locationId !== destination.locationId)
     .map((yard) => ({
@@ -4305,6 +4287,47 @@ export async function createOrderDependency({
   });
 }
 
+export async function completedOrderDependencyUnlinkAllowed(dependencyId) {
+  const result = await query(
+    `SELECT d.status, d.reconciliation_status,
+            t.receiving_status AS transfer_receiving_status,
+            t.status_text AS transfer_status_text,
+            state.application_status AS transfer_application_status,
+            state.reconciliation_status AS transfer_reconciliation_status,
+            state.ordered_qty AS transfer_ordered_qty,
+            state.received_qty AS transfer_received_qty,
+            state.remaining_qty AS transfer_remaining_qty,
+            state.destination_remaining_qty AS transfer_destination_remaining_qty,
+            EXISTS (
+              SELECT 1 FROM driver_job_records job
+               WHERE job.order_refs ? d.transfer_order_ref
+                 AND lower(job.stop_type) = 'dropoff'
+                 AND lower(job.status) IN ('complete', 'completed')
+                 AND job.completed_at IS NOT NULL
+            ) AS completed_drop,
+            EXISTS (
+              SELECT 1 FROM driver_job_records job
+               WHERE job.order_refs ? d.transfer_order_ref
+                 AND (job.started_at IS NOT NULL
+                      OR lower(job.status) IN ('in_progress', 'in-progress', 'started'))
+                 AND NOT (lower(job.status) IN ('complete', 'completed') AND job.completed_at IS NOT NULL)
+            ) AS active_driver_work
+       FROM order_dependencies d
+       LEFT JOIN transfer_orders t ON t.netsuite_id = d.transfer_order_id
+       LEFT JOIN scm_reconciliation_order_state state
+         ON state.order_kind = 'TO' AND state.source_order_netsuite_id = d.transfer_order_id
+      WHERE d.id = $1 AND d.status <> 'cancelled'`,
+    [Number(dependencyId)]
+  );
+  const row = result.rows[0];
+  return Boolean(row) && completedTransferUnlinkAllowed({
+    action: "unlink_to",
+    receiptComplete: transferDependencyReceiptComplete(row),
+    completedDrop: row.completed_drop,
+    activeDriverWork: row.active_driver_work
+  });
+}
+
 async function loadDependencyMutationContext(
   dependencyId,
   requestedPlanDate,
@@ -4327,7 +4350,7 @@ async function loadDependencyMutationContext(
   if (
     dependency.status === "cancelled"
     || dependency.dispatch_target_kind !== "group"
-    || !["active", "attention"].includes(dependency.status)
+    || (!allowHistoricalGroupTarget && !["active", "attention"].includes(dependency.status))
   ) {
     return dependency;
   }
@@ -4452,18 +4475,19 @@ export async function cancelOrderDependency(
     if (context.status === "cancelled") {
       return { cancelled: true, id: Number(dependencyId), alreadyCancelled: true };
     }
+    const completedUnlink = await completedOrderDependencyUnlinkAllowed(dependencyId);
     const result = await query(
       `UPDATE order_dependencies
           SET status = 'cancelled', updated_by = $2, updated_at = now()
         WHERE id = $1
-          AND status IN ('active', 'attention')
+          AND ($3 OR (status IN ('active', 'attention')
           AND NOT EXISTS (
             SELECT 1 FROM order_dependency_lines l
              WHERE l.dependency_id = order_dependencies.id
                AND (l.loaded_quantity > 0 OR l.delivered_quantity > 0 OR l.locally_received_quantity > 0)
-          )
+          )))
         RETURNING *`,
-      [Number(dependencyId), operatorId]
+      [Number(dependencyId), operatorId, completedUnlink]
     );
     if (!result.rowCount) {
       const existing = await query(
@@ -4495,7 +4519,7 @@ export async function cancelOrderDependency(
       entityId: String(dependencyId),
       orderId: result.rows[0].dispatch_target_ref || result.rows[0].sales_order_ref,
       operatorId,
-      details: { transferOrderRef: result.rows[0].transfer_order_ref }
+      details: { transferOrderRef: result.rows[0].transfer_order_ref, completedTransfer: completedUnlink }
     });
     return { cancelled: true, id: Number(dependencyId) };
   });

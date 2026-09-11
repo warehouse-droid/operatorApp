@@ -66,6 +66,7 @@ let offlineReviewListRequest = 0;
 let offlineReviewDetailRequest = 0;
 let offlineReviewEventSource = null;
 let offlineReviewEventTimer = null;
+let offlineReviewPendingCompletedPhotoRefresh = false;
 const offlineReviewDrafts = new Map();
 const offlineReviewResolutionAttempts = new Map();
 const offlineReviewRetryAttempts = new Map();
@@ -864,8 +865,8 @@ function driverPwaCompletedApplyPayload(payload, { keepSelection = false } = {})
   }
 }
 
-async function driverPwaLoadCompletedVisits({ keepSelection = false, quiet = false } = {}) {
-  driverPwaCompletedCaptureVisibleDraft();
+async function driverPwaLoadCompletedVisits({ keepSelection = false, quiet = false, captureDraft = true } = {}) {
+  if (captureDraft) driverPwaCompletedCaptureVisibleDraft();
   const requestId = ++driverPwaCompletedRequest;
   driverPwaCompletedLoading = true;
   driverPwaCompletedError = "";
@@ -1085,7 +1086,7 @@ async function driverPwaSubmitCompletedPhotos(form) {
       message: `${result.addedPhotoCount} photo${result.addedPhotoCount === 1 ? "" : "s"} appended to the complete physical visit${result.exactReplay ? " (safe replay)" : ""}.`,
       tone: "success"
     };
-    await driverPwaLoadCompletedVisits({ keepSelection: true, quiet: true });
+    await driverPwaLoadCompletedVisits({ keepSelection: true, quiet: true, captureDraft: false });
   } catch (error) {
     if (error.status === 409) {
       draft.stale = true;
@@ -3100,6 +3101,48 @@ async function driverPwaOpenCompletedPhoto(button) {
   }
 }
 
+function offlineReviewEventRefreshBusy() {
+  return Boolean(
+    offlineReviewResolving
+    || offlineReviewRetrying
+    || offlineReviewDismissingDeviceSessionId
+    || driverPwaReopening
+    || historicalAssistSubmittingJobId
+    || historicalAssistPhotoBusyJobId
+    || driverPwaCompletedSubmittingId
+    || driverPwaCompletedPhotoBusyId
+  );
+}
+
+function offlineReviewScheduleEventRefresh({ completedPhotoEvent = false } = {}) {
+  offlineReviewPendingCompletedPhotoRefresh ||= completedPhotoEvent;
+  window.clearTimeout(offlineReviewEventTimer);
+  offlineReviewEventTimer = window.setTimeout(() => {
+    if (offlineReviewEventRefreshBusy()) {
+      offlineReviewScheduleEventRefresh();
+      return;
+    }
+    const refreshCompletedPhotos = offlineReviewPendingCompletedPhotoRefresh;
+    offlineReviewPendingCompletedPhotoRefresh = false;
+    let refresh;
+    if (driverPwaSurface === "stops" && refreshCompletedPhotos) {
+      refresh = Promise.all([
+        driverPwaLoadStops({ keepSelection: true, quiet: true }),
+        driverPwaLoadCompletedVisits({ keepSelection: true, quiet: true })
+      ]);
+    } else if (driverPwaSurface === "stops") {
+      refresh = driverPwaStopsMode === "completed"
+        ? driverPwaLoadCompletedVisits({ keepSelection: true, quiet: true })
+        : driverPwaLoadStops({ keepSelection: true, quiet: true });
+    } else if (driverPwaSurface === "historical-assist") {
+      refresh = historicalAssistLoad({ quiet: true });
+    } else {
+      refresh = offlineReviewLoadList({ keepSelection: true, quiet: true });
+    }
+    refresh.catch(() => {});
+  }, 400);
+}
+
 function offlineReviewConnectEvents() {
   if (!("EventSource" in window) || offlineReviewEventSource) return;
   offlineReviewEventSource = new EventSource("/api/events?client=dispatch-offline-review");
@@ -3110,37 +3153,9 @@ function offlineReviewConnectEvents() {
     } catch {
       return;
     }
-    if (
-      event.type === "connected"
-      || offlineReviewResolving
-      || offlineReviewRetrying
-      || offlineReviewDismissingDeviceSessionId
-      || driverPwaReopening
-      || historicalAssistSubmittingJobId
-      || historicalAssistPhotoBusyJobId
-      || driverPwaCompletedSubmittingId
-      || driverPwaCompletedPhotoBusyId
-    ) return;
+    if (event.type === "connected") return;
     const completedPhotoEvent = event.type === "driver.stop.photos_added";
-    window.clearTimeout(offlineReviewEventTimer);
-    offlineReviewEventTimer = window.setTimeout(() => {
-      let refresh;
-      if (driverPwaSurface === "stops" && completedPhotoEvent) {
-        refresh = Promise.all([
-          driverPwaLoadStops({ keepSelection: true, quiet: true }),
-          driverPwaLoadCompletedVisits({ keepSelection: true, quiet: true })
-        ]);
-      } else if (driverPwaSurface === "stops") {
-        refresh = driverPwaStopsMode === "completed"
-          ? driverPwaLoadCompletedVisits({ keepSelection: true, quiet: true })
-          : driverPwaLoadStops({ keepSelection: true, quiet: true });
-      } else if (driverPwaSurface === "historical-assist") {
-        refresh = historicalAssistLoad({ quiet: true });
-      } else {
-        refresh = offlineReviewLoadList({ keepSelection: true, quiet: true });
-      }
-      refresh.catch(() => {});
-    }, 400);
+    offlineReviewScheduleEventRefresh({ completedPhotoEvent });
   });
 }
 

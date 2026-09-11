@@ -718,6 +718,72 @@ button[data-action="enter-edit-mode"]:disabled:hover {
   white-space: nowrap;
 }
 
+.scm-columns-chooser {
+  position: relative;
+  font-weight: 500;
+}
+
+.scm-columns-chooser > summary {
+  min-height: 30px;
+  padding: 6px 10px;
+  border: 1px solid #b8c8d1;
+  border-radius: 6px;
+  background: #fff;
+  color: #20313a;
+  font-weight: 800;
+  cursor: pointer;
+  white-space: nowrap;
+}
+
+.scm-columns-chooser > summary:focus-visible {
+  outline: 2px solid #176f75;
+  outline-offset: 2px;
+}
+
+.scm-columns-menu {
+  position: absolute;
+  top: calc(100% + 6px);
+  right: 0;
+  z-index: 60;
+  width: 250px;
+  max-width: calc(100vw - 32px);
+  max-height: min(65vh, 540px);
+  overflow-y: auto;
+  padding: 10px;
+  border: 1px solid #b8c8d1;
+  border-radius: 8px;
+  background: #fff;
+  box-shadow: 0 8px 24px #20313a26;
+}
+
+.scm-columns-menu-heading {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  margin-bottom: 6px;
+}
+
+.scm-sheet-settings .scm-columns-menu label {
+  padding: 5px 4px;
+  gap: 8px;
+  cursor: pointer;
+}
+
+.scm-columns-menu input[type="checkbox"] {
+  width: 16px;
+  height: 16px;
+  min-height: 16px;
+  margin: 0;
+  accent-color: #176f75;
+}
+
+.scm-columns-menu small {
+  display: block;
+  margin-top: 8px;
+  color: #60717c;
+}
+
 .scm-review-filter {
   display: inline-flex;
   align-items: center;
@@ -2366,6 +2432,30 @@ button[data-action="enter-edit-mode"]:disabled:hover {
   display: contents;
 }
 
+.scm-sheet-header[hidden],
+.scm-sheet-row > .scm-sheet-cell[hidden] {
+  display: none !important;
+}
+
+.scm-timing-filters {
+  display: flex;
+  gap: 4px;
+  width: 100%;
+}
+
+.scm-timing-filter {
+  flex: 1;
+  min-width: 0;
+  text-align: center;
+}
+
+.scm-timing-filter > span {
+  display: block;
+  margin-bottom: 2px;
+  font-size: 10px;
+  color: #526875;
+}
+
 .scm-sheet-cell {
   display: flex;
   align-items: center;
@@ -2458,6 +2548,36 @@ button[data-action="enter-edit-mode"]:disabled:hover {
   gap: 2px;
   font-size: var(--scm-schedule-font-size);
   font-weight: 800;
+}
+
+.scm-sheet-cell.scm-timing-cell {
+  flex-direction: column;
+  align-items: stretch;
+  justify-content: flex-start;
+  gap: 2px;
+  overflow-y: auto;
+}
+
+.scm-timing-value {
+  display: grid;
+  grid-template-columns: 34px minmax(0, 1fr);
+  gap: 4px;
+  align-items: baseline;
+  flex-shrink: 0;
+  line-height: 1.15;
+}
+
+.scm-timing-label {
+  font-size: 10px;
+  font-weight: 700;
+  color: #526875;
+}
+
+.scm-timing-value .scm-readonly-value {
+  min-width: 0;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
 }
 
 .scm-sheet-cell.readonly small {

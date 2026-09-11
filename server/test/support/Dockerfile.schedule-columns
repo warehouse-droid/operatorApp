@@ -1,0 +1,5 @@
+FROM mbbs-mbt-p1-test-test:latest
+USER root
+RUN npx playwright install-deps chromium
+ENV PLAYWRIGHT_BROWSERS_PATH=/ms-playwright
+USER node

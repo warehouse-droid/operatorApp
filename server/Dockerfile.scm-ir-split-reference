@@ -1,0 +1,20 @@
+FROM mbbs-operator-app:transfer-unlink-20260908-v1
+
+USER root
+COPY migrations/196_scm_ir_split_reference.sql /app/migrations/196_scm_ir_split_reference.sql
+COPY src/netsuite.js /app/src/netsuite.js
+COPY src/scm-ir-split-reference.js /app/src/scm-ir-split-reference.js
+COPY src/scm-reconciliation-repository.js /app/src/scm-reconciliation-repository.js
+COPY src/scm-split-receipt-allocation.js /app/src/scm-split-receipt-allocation.js
+COPY tools/scm-ir-split-reference-replay.mjs /app/tools/scm-ir-split-reference-replay.mjs
+COPY tools/scm-ir-split-reference-repair.mjs /app/tools/scm-ir-split-reference-repair.mjs
+RUN chown node:node \
+  /app/migrations/196_scm_ir_split_reference.sql \
+  /app/src/netsuite.js \
+  /app/src/scm-ir-split-reference.js \
+  /app/src/scm-reconciliation-repository.js \
+  /app/src/scm-split-receipt-allocation.js \
+  /app/tools/scm-ir-split-reference-replay.mjs \
+  /app/tools/scm-ir-split-reference-repair.mjs
+
+USER node

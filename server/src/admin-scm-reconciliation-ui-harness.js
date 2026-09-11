@@ -480,19 +480,19 @@ assert.match(
 );
 
 assert.ok(
-  adminHtml.includes("/control.css?v=20260730-reconciliation-multi-ref-v1"),
+  adminHtml.includes("/control.css?v=20260911-maps-usage-v1"),
   "Admin reconciliation CSS cache bust is missing."
 );
 assert.ok(
-  adminHtml.includes("/control.js?v=20260825-so-reattempt-current-item-v1"),
+  adminHtml.includes("/control.js?v=20260911-maps-usage-v1"),
   "Admin reconciliation client cache bust is missing."
 );
 assert.ok(
-  controlHtml.includes("/control.css?v=20260825-so-reattempt-current-item-v1"),
+  controlHtml.includes("/control.css?v=20260911-maps-usage-v1"),
   "Control reconciliation CSS cache bust is missing."
 );
 assert.ok(
-  controlHtml.includes("/control.js?v=20260825-so-reattempt-current-item-v1"),
+  controlHtml.includes("/control.js?v=20260911-maps-usage-v1"),
   "Control reconciliation client cache bust is missing."
 );
 includesAll(sidebar, [
@@ -500,7 +500,7 @@ includesAll(sidebar, [
 ], "dedicated reconciliation sidebar navigation");
 for (const html of [adminHtml, controlHtml]) {
   assert.ok(
-    html.includes("/app-sidebar.js?v=20260805-so-type-filter-v2"),
+    html.includes("/app-sidebar.js?v=20260911-maps-usage-v1"),
     "Reconciliation sidebar cache bust is missing."
   );
 }

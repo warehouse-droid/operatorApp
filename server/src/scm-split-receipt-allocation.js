@@ -3,6 +3,7 @@ import {
   reconciliationQuantity,
   roundReconciliationQuantity
 } from "./scm-reconciliation.js";
+import { allocateScmReceiptRowsBySplitReference } from "./scm-ir-split-reference.js";
 
 const EPSILON = 0.000001;
 
@@ -147,7 +148,19 @@ function allocateEvidenceProtectedReceipts({
   receiptRows,
   parentRef
 }) {
-  const rows = (Array.isArray(receiptRows) ? receiptRows : [])
+  const allReceiptRows = Array.isArray(receiptRows) ? receiptRows : [];
+  const referenceAllocation = allocateScmReceiptRowsBySplitReference({
+    totalReceivedQty: total,
+    targets: normalizedTargets,
+    receiptRows: allReceiptRows
+  });
+  for (const [index, allocatedQty] of referenceAllocation.allocations.entries()) {
+    if (reconciliationQuantity(allocatedQty) <= EPSILON) continue;
+    allocations[index].allocatedQty = roundReconciliationQuantity(allocatedQty);
+    allocations[index].allocationMethod = "exact";
+  }
+
+  const observedRows = allReceiptRows
     .map((row, index) => ({
       row,
       index,
@@ -157,8 +170,17 @@ function allocateEvidenceProtectedReceipts({
     }))
     .filter((entry) => entry.quantity > EPSILON);
   const observedRowTotal = roundReconciliationQuantity(
-    rows.reduce((sum, entry) => sum + entry.quantity, 0)
+    observedRows.reduce((sum, entry) => sum + entry.quantity, 0)
   );
+  const rows = referenceAllocation.remainingReceiptRows
+    .map((row, index) => ({
+      row,
+      index,
+      quantity: roundReconciliationQuantity(row?.quantity),
+      locationId: receiptLocationId(row),
+      receiptDate: receiptDateKey(row)
+    }))
+    .filter((entry) => entry.quantity > EPSILON);
   const knownRows = rows
     .filter((entry) => entry.locationId)
     .sort((left, right) => (
@@ -172,7 +194,7 @@ function allocateEvidenceProtectedReceipts({
       || left.index - right.index
     ));
 
-  let knownQuantityBudget = total;
+  let knownQuantityBudget = referenceAllocation.remainingTotalQty;
   let allocatedKnownBudget = 0;
   let unallocatedKnownBudget = 0;
   const unexplainedByLocation = new Map();
@@ -245,17 +267,26 @@ function allocateEvidenceProtectedReceipts({
     }
 
     for (const entry of entries) {
+      const unfinishedAtLocation = remainingTargets(
+        normalizedTargets,
+        allocations,
+        (target) => target.destinationLocationId === entry.locationId
+          && target.allowInferredReceipt !== false
+          && target.operationallyCompleted !== true
+          && (
+            target.requireUniqueLocationReceipt === true
+            || targetExistedForReceipt(target, entry.receiptDate)
+          )
+          && exactQuantityRemaining(target, allocations) <= EPSILON
+      );
+      const locationCandidates = unfinishedAtLocation.some(
+        (target) => target.requireUniqueLocationReceipt === true
+      ) && unfinishedAtLocation.length !== 1
+        ? []
+        : unfinishedAtLocation;
       entry.remaining = applyStage(
         entry.remaining,
-        remainingTargets(
-          normalizedTargets,
-          allocations,
-          (target) => target.destinationLocationId === entry.locationId
-            && target.allowInferredReceipt !== false
-            && target.operationallyCompleted !== true
-            && targetExistedForReceipt(target, entry.receiptDate)
-            && exactQuantityRemaining(target, allocations) <= EPSILON
-        ),
+        locationCandidates,
         allocations,
         parentRef,
         { inferredOnly: true }
@@ -303,7 +334,10 @@ function allocateEvidenceProtectedReceipts({
     );
   }
 
-  let unlocatedQty = roundReconciliationQuantity(Math.max(total - allocatedKnownBudget, 0));
+  let unlocatedQty = roundReconciliationQuantity(Math.max(
+    referenceAllocation.remainingTotalQty - allocatedKnownBudget,
+    0
+  ));
   unlocatedQty = applyStage(
     unlocatedQty,
     remainingExactTargets(normalizedTargets, allocations),
@@ -340,6 +374,7 @@ function allocateEvidenceProtectedReceipts({
   const unallocatedExactQty = unallocatedExactQuantity(normalizedTargets, allocations);
   const overflowQty = roundReconciliationQuantity(
     Math.max(observedRowTotal - total, 0)
+    + referenceAllocation.referenceOverflowQty
     + unallocatedKnownBudget
     + unlocatedQty
   );
@@ -354,6 +389,9 @@ function allocateEvidenceProtectedReceipts({
     conflict: overflowQty > EPSILON || unallocatedExactQty > EPSILON,
     allocations: allocations.map(({ _allocationIndex, ...allocation }) => allocation),
     locationAware: knownRows.length > 0,
+    referenceAware: referenceAllocation.referencedRowCount > 0,
+    referencedRowCount: referenceAllocation.referencedRowCount,
+    unexplainedReferences: referenceAllocation.unexplainedReferences,
     unexplainedLocations: [...unexplainedByLocation.entries()]
       .map(([locationId, quantity]) => ({ locationId, quantity }))
       .sort((left, right) => left.locationId - right.locationId)

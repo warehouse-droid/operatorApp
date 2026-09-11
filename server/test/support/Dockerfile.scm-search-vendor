@@ -1,0 +1,12 @@
+FROM mbbs-schedule-columns-test:20260910
+USER root
+COPY package.json package-lock.json Dockerfile Dockerfile.test .c8rc.json eslint.mbt.config.js tsconfig.mbt.json /app/
+COPY Dockerfile.scm-ir-split-reference /app/
+COPY src /app/src
+COPY public /app/public
+COPY test /app/test
+COPY tools /app/tools
+COPY migrations /app/migrations
+COPY contracts /app/contracts
+RUN chown -R node:node /app/src /app/public /app/test /app/tools /app/migrations /app/test-artifacts
+USER node

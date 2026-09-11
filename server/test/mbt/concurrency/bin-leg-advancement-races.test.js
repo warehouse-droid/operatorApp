@@ -196,7 +196,11 @@ test("P3-F17: twenty-five advancement commands promote the next front leg exactl
   assert.equal(feed.items.some(({ mbt }) => mbt.visitId === fixture.frontVisitId), false);
   const state = await durableBinDispatchState(fixture);
   assert.equal(state.reservations, 0);
-  assert.deepEqual(assignedVisitStops(state, fixture.frontVisitId), []);
+  assert.deepEqual(
+    assignedVisitStops(state, fixture.frontVisitId).map(({ stop }) => stop.id),
+    fixture.frontStops.map(({ stopId }) => stopId),
+    "advancing the contract must retain its completed Driver route in the issued plan"
+  );
 });
 
 test("P3-F17: simultaneous exact advancement retries replay one refresh and one successor transition", {

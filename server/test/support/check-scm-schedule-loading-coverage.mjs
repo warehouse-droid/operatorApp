@@ -24,7 +24,7 @@ const probes = Object.freeze([
   {
     file: "src/dispatch-repository.js",
     label: "Completed history requires an explicit opt-in",
-    needle: "const includeCompleted = cleanView === \"completed\""
+    needle: "const includeCompleted = searchAllStatuses || cleanView === \"completed\""
   },
   {
     file: "src/dispatch-repository.js",

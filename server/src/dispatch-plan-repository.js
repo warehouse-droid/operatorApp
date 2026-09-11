@@ -13,6 +13,10 @@ import {
   normalizeDispatchPlanLoadAssignments
 } from "./dispatch-load-assignment.js";
 import { materializeDispatchPickupVisits } from "./dispatch-pickup-visits.js";
+import {
+  assertDispatchExecutedPrefixPreserved,
+  evaluateDispatchExecutedPrefixPreservation
+} from "./dispatch-executed-prefix-repository.js";
 import { syncDispatchPlanLoadAssignments } from "./dispatch-load-assignment-repository.js";
 import { assertBinDispatchCapability } from "./mbt/dispatch-bin-safety.js";
 import {
@@ -46,7 +50,7 @@ async function reconcileDispatchPlanOrderAuthorities(plan, options = {}) {
   return reconcileDispatchPlanLocalCos(await reconcileDispatchPlanGlobalOrderDefinitions(plan, options));
 }
 
-async function refreshDispatchPlanAuthoritativeOrderProjection(plan, { comparisonOrders = plan?.orders || [] } = {}) {
+export async function refreshDispatchPlanAuthoritativeOrderProjection(plan, { comparisonOrders = plan?.orders || [] } = {}) {
   if (!plan || !(plan.orders || []).length) return plan;
   const projectionContext = dispatchRelationshipProjectionContext(plan.orders || []);
   const strippedOrders = stripDispatchRelationshipProjections(plan.orders || []);
@@ -62,7 +66,9 @@ async function refreshDispatchPlanAuthoritativeOrderProjection(plan, { compariso
     projectionContext
   );
   const reconciled = reconcileAuthoritativeDispatchOrderProjection({
-    plan,
+    // Omitted projection fields mean the relationship was removed. Do not
+    // merge fresh orders into stale manifests and resurrect a cancelled link.
+    plan: { ...plan, orders: strippedOrders },
     projectedOrders,
     comparisonOrders
   }).plan;
@@ -133,34 +139,6 @@ async function assertActiveDispatchFleetAssignments(plan = {}, { previousPlan = 
     allowedInactiveLoadIds
   });
   if (conflicts.length) throw new DisabledDispatchFleetAssignmentError(conflicts);
-}
-
-async function assertDispatchExecutedPrefixPreserved(previousPlan = {}, nextPlan = {}) {
-  const planId = String(nextPlan?.id || nextPlan?.planId || previousPlan?.id || previousPlan?.planId || "").trim();
-  if (!planId) return;
-  const activity = await query(
-    `SELECT status, load_id, stop_id, stop_type, order_refs, job_details
-       FROM driver_job_records
-      WHERE plan_id = $1
-        AND status IN ('in_progress', 'complete')
-      ORDER BY id`,
-    [planId]
-  );
-  const policy = evaluateExecutedPrefixPolicy({
-    previousPlan,
-    nextPlan,
-    activity: activity.rows
-  });
-  if (policy.allowed) return;
-  const first = policy.conflicts[0] || {};
-  throw Object.assign(
-    new Error(first.message || "Driver activity protects the executed physical prefix."),
-    {
-      code: first.code || "DISPATCH_ACTIVE_LOAD_LOCKED",
-      status: 409,
-      conflicts: policy.conflicts
-    }
-  );
 }
 
 function uniqueTextValues(values = []) {
@@ -1195,6 +1173,7 @@ export async function reconcileSalesOrderFamilyInDispatchPlans({
       [refs]
     );
     const changedPlans = [];
+    const deferredPlans = [];
     for (const row of snapshots.rows) {
       const originalPlan = {
         id: String(row.id),
@@ -1223,6 +1202,18 @@ export async function reconcileSalesOrderFamilyInDispatchPlans({
             removedOrderRefs: []
           };
       if (!refreshed.changed && !scrubbed.changed) continue;
+      const executionPolicy = await evaluateDispatchExecutedPrefixPreservation({
+        previousPlan: originalPlan,
+        nextPlan: scrubbed.plan
+      });
+      if (!executionPolicy.allowed) {
+        deferredPlans.push({
+          planId: String(row.id),
+          planDate: row.plan_date,
+          conflicts: executionPolicy.conflicts
+        });
+        continue;
+      }
       await query(
         `INSERT INTO dispatch_plan_snapshot_history (
            plan_id, plan_date, revision, orders, trucks, summary,
@@ -1284,7 +1275,12 @@ export async function reconcileSalesOrderFamilyInDispatchPlans({
         updatedGroupRefs: refreshed.updatedGroupRefs
       });
     }
-    return { changedPlans, deferred: false, familyRefs: refs };
+    return {
+      changedPlans,
+      deferred: deferredPlans.length > 0,
+      deferredPlans,
+      familyRefs: refs
+    };
   });
 }
 
@@ -1589,6 +1585,7 @@ export async function saveDispatchPlanSnapshot(planId, {
     let sanitizedPlan = await refreshDispatchPlanAuthoritativeOrderProjection(
       await sanitizeDispatchPlan({
         id: String(planId),
+        planDate: expectedPlanDate,
         orders: canonicalPlan.orders || [],
         trucks: canonicalPlan.trucks || [],
         summary: summary || {}
@@ -1608,7 +1605,10 @@ export async function saveDispatchPlanSnapshot(planId, {
       });
     }
     sanitizedPlan = pickupVisits.plan;
-    await assertDispatchExecutedPrefixPreserved(previousPlan, sanitizedPlan);
+    await assertDispatchExecutedPrefixPreserved({
+      previousPlan,
+      nextPlan: sanitizedPlan
+    });
     await assertDispatchPlanAuthoritativeProjectionValid(sanitizedPlan);
     await assertCustomOrderPlanDateExclusivity(sanitizedPlan, {
       previousPlan
@@ -2044,7 +2044,10 @@ async function confirmDispatchPlanTransaction(planId, { note = "", binBoundary =
       await sanitizeDispatchPlan(structuralPlan),
       { comparisonOrders: structuralPlan.orders || [] }
     );
-    await assertDispatchExecutedPrefixPreserved(currentPlan, canonicalPlan);
+    await assertDispatchExecutedPrefixPreserved({
+      previousPlan: currentPlan,
+      nextPlan: canonicalPlan
+    });
     await assertDispatchPlanAuthoritativeProjectionValid(canonicalPlan);
     await assertCustomOrderPlanDateExclusivity(canonicalPlan, { previousPlan: currentPlan });
     await assertSpecialStockHandoffPlanning(canonicalPlan);

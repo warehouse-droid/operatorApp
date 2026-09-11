@@ -869,6 +869,12 @@ export async function reconcileDispatchGlobalOrderTransitCos() {
 }
 
 function aggregateGlobalGroup(order = {}, childOrderDetails = [], { preserveTransitCo = false } = {}) {
+  // A CO for a grouped SO/TO owns its persisted manifest. Source children are
+  // informational and may be incomplete cards, not constituent CO cargo.
+  if (text(order.type).toUpperCase() === "CO" && order.sourceTable === "local_co_orders"
+    && text(order.sourceOrderId) && !(order.childOrders || []).some((ref) => text(ref).toUpperCase().startsWith("CO-"))) {
+    return order;
+  }
   const sum = (field) => childOrderDetails.reduce(
     (total, child) => total + Number(child?.[field] || 0),
     0

@@ -223,7 +223,7 @@ async function refreshAffectedPlan(command, actor, preview, relationship) {
     refreshedPurchaseOrders,
     purchaseRefs
   );
-  orders = await enrichDispatchOrdersWithDependencies(orders);
+  orders = await enrichDispatchOrdersWithDependencies(stripDispatchRelationshipProjections(orders));
   orders = await enrichDispatchOrdersWithPoTargetAllocations(orders, {
     projectUnallocatedPoRefs: relationship.relatedOrderRefs || [],
     releasedTargetRefs: [relationship.targetRef || command.targetRef].filter(Boolean)
@@ -404,6 +404,7 @@ import {
   syncScmScheduleFromDispatchPlan
 } from "./dispatch-repository.js";
 import { saveDispatchPlanSnapshot } from "./dispatch-plan-repository.js";
+import { stripDispatchRelationshipProjections } from "./dispatch-plan-order-projection.js";
 import {
   cancelOrderDependency,
   createOrderDependency,

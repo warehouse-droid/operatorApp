@@ -351,10 +351,12 @@ async function openDispatch(page, request) {
 
 async function enterDispatchEditMode(page) {
   const button = page.getByRole("button", { name: "Enter Edit Mode" });
+  // Unlike click(), press() does not wait for enabled controls. The initial
+  // shell renders this button disabled until the saved snapshot is verified.
+  await expect(button).toBeEnabled();
   if ((page.viewportSize()?.width || 0) >= 1180) {
     await button.click();
   } else {
-    await button.focus();
     await button.press("Enter");
   }
   await expect(page.getByText("Edit mode", { exact: true })).toBeVisible();

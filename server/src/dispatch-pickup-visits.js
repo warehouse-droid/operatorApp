@@ -1,6 +1,7 @@
 import crypto from "node:crypto";
 
 import { dispatchLocationKey } from "./dispatch-location.js";
+import { dispatchRequiredPickupLocations } from "./dispatch-load-assignment.js";
 
 const PICKUP_TYPES = new Set(["pick", "pickup"]);
 const DELIVERY_TYPES = new Set(["drop", "dropoff", "delivery"]);
@@ -79,7 +80,7 @@ function manifestPickupLocations(order = {}) {
   ].map((entry) => text(entry?.location)).filter(Boolean);
 }
 
-export function dispatchRequiredPickupVisitLocations(order = {}) {
+function configuredPickupVisitLocations(order = {}) {
   const configured = Array.isArray(order.pickupLocations) && order.pickupLocations.length
     ? order.pickupLocations
     : [order.sourceYard || order.outboundLocation || "3445"];
@@ -92,9 +93,19 @@ export function dispatchRequiredPickupVisitLocations(order = {}) {
   }).map(text);
 }
 
+export function dispatchRequiredPickupVisitLocations(order = {}, plan = {}) {
+  const pickupLocations = configuredPickupVisitLocations(order);
+  // Missing legacy item details are unknown, not evidence that a pickup is
+  // empty. Detailed orders use the same location-scoped cargo rule as the UI.
+  if (!Array.isArray(order.items)) return pickupLocations;
+  return dispatchRequiredPickupLocations(plan, { ...order, pickupLocations });
+}
+
 function orderRequiresLocation(order = {}, location = "") {
   const wanted = locationKey(location);
-  return Boolean(wanted && dispatchRequiredPickupVisitLocations(order)
+  // A configured visit already in the route remains valid even if its current
+  // cargo is empty; only the missing-pickup check requires nonempty visits.
+  return Boolean(wanted && configuredPickupVisitLocations(order)
     .some((candidate) => locationKey(candidate) === wanted));
 }
 
@@ -292,7 +303,7 @@ function validateMaterializedPickupVisits(plan = {}, { allowLegacyPassthrough = 
       for (const [refKey, firstDeliveryIndex] of deliveryIndexes) {
         const order = orderByRef(plan, refKey);
         if (!order) continue;
-        for (const location of dispatchRequiredPickupVisitLocations(order)) {
+        for (const location of dispatchRequiredPickupVisitLocations(order, plan)) {
           const allocationKey = `${refKey}|${locationKey(location)}`;
           if (allocations.has(allocationKey)) continue;
           conflicts.push(conflict(
@@ -531,7 +542,7 @@ export function insertDispatchLateOrder({
   const createdPickupStopIds = [];
   const reusedPickupStopIds = [];
 
-  for (const [ordinal, location] of dispatchRequiredPickupVisitLocations(order).entries()) {
+  for (const [ordinal, location] of dispatchRequiredPickupVisitLocations(order, next).entries()) {
     const candidates = (load.stops || [])
       .map((stop, index) => ({ stop, index }))
       .filter(({ stop, index }) =>

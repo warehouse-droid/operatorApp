@@ -1,7 +1,6 @@
 // @ts-check
 
 import { performance } from "node:perf_hooks";
-import { config } from "./config.js";
 import {
   actualArrivalDistanceMeters,
   actualArrivalHistoryWindows,
@@ -25,7 +24,6 @@ import {
   listSamsaraVehicleTrips
 } from "./samsara.js";
 
-const GOOGLE_GEOCODE_TIMEOUT_MS = 5_000;
 const SAMSARA_STOP_HISTORY_BUDGET_MS = 10_000;
 
 function text(value) {
@@ -198,32 +196,6 @@ function ownYardPoint(visit = {}, ownYards = []) {
   return null;
 }
 
-const geocodeCache = new Map();
-
-async function geocodeAddress(address) {
-  const retained = text(address);
-  const key = normalizedPlace(retained);
-  if (!key || !config.googleMapsApiKey) {return null;}
-  if (geocodeCache.has(key)) {return geocodeCache.get(key);}
-  const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), GOOGLE_GEOCODE_TIMEOUT_MS);
-  timer.unref?.();
-  try {
-    const url = new URL("https://maps.googleapis.com/maps/api/geocode/json");
-    url.searchParams.set("address", retained);
-    url.searchParams.set("key", config.googleMapsApiKey);
-    const response = await fetch(url, { signal: controller.signal });
-    if (!response.ok) {throw new Error(`Google geocode returned HTTP ${response.status}.`);}
-    const payload = await response.json();
-    const point = pointFromObject(payload.results?.[0]);
-    const resolved = point ? { ...point, source: "google_geocode" } : null;
-    geocodeCache.set(key, resolved);
-    return resolved;
-  } finally {
-    clearTimeout(timer);
-  }
-}
-
 async function destinationPoint(visit, planPoints, ownYards) {
   const evidence = pointFromRecordEvidence(visit);
   if (evidence) {return evidence;}
@@ -233,8 +205,10 @@ async function destinationPoint(visit, planPoints, ownYards) {
   }
   const yard = ownYardPoint(visit, ownYards);
   if (yard) {return yard;}
-  const geocoded = await geocodeAddress(visit.destinationAddress).catch(() => null);
-  return geocoded || null;
+  // Background arrival reconstruction must never spend Google quota. A
+  // missing application-owned coordinate stays explicit and can be repaired
+  // through the location data-quality workflow.
+  return null;
 }
 
 function samePhysicalPlace(previous, current, previousPoint, currentPoint) {

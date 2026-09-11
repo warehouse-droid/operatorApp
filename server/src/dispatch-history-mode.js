@@ -229,6 +229,94 @@ export async function listCompletedReconciliationDispatchRefs() {
   return new Set(result.rows.map((row) => refKey(row.order_ref)).filter(Boolean));
 }
 
+/**
+ * Return only reconciliation-completed PO/TO targets that still have an
+ * operationally open Dispatch schedule. Quantity reconciliation is not proof
+ * that a Driver performed the physical visit.
+ *
+ * The lookup is intentionally bounded. Callers must name the target refs they
+ * are about to expose or validate so this cannot become an unbounded hot-path
+ * scan of reconciliation history.
+ */
+export async function listReconciliationCompletedOperationallyPendingDispatchRefs({
+  candidateRefs = []
+} = {}) {
+  const requested = [...new Set((candidateRefs || []).map(refKey).filter(Boolean))];
+  if (!requested.length) return new Set();
+  const result = await query(
+    `SELECT DISTINCT LOWER(BTRIM(target.target_ref)) AS order_ref,
+                     LOWER(BTRIM(state.source_order_ref)) AS source_order_ref
+       FROM scm_reconciliation_order_state state
+       CROSS JOIN LATERAL JSONB_EACH(
+         CASE
+           WHEN JSONB_TYPEOF(state.quantity_summary->'targets') = 'object'
+             THEN state.quantity_summary->'targets'
+           ELSE '{}'::jsonb
+         END
+       ) target(target_ref, target_state)
+       JOIN scm_transport_schedule schedule
+         ON schedule.order_kind = state.order_kind
+        AND LOWER(BTRIM(schedule.order_ref)) = LOWER(BTRIM(target.target_ref))
+        AND LOWER(BTRIM(COALESCE(schedule.status, 'Queued'))) NOT IN (
+          'hold', 'complete', 'completed', 'cancelled', 'canceled'
+        )
+        AND COALESCE(schedule.reconciliation_blocked, false) = false
+        AND UPPER(BTRIM(COALESCE(schedule.method, 'MBT'))) = 'MBT'
+      WHERE state.reconciled_at IS NOT NULL
+        AND state.order_kind IN ('PO', 'TO')
+        AND LOWER(BTRIM(COALESCE(state.reconciliation_status, ''))) IN ('ok', 'current')
+        AND LOWER(BTRIM(target.target_ref)) = ANY($1::text[])
+        AND LOWER(BTRIM(COALESCE(target.target_state->>'applicationStatus', ''))) IN (
+          'complete', 'completed'
+        )
+        AND LOWER(BTRIM(COALESCE(target.target_state->>'hidden', 'false'))) NOT IN (
+          'true', '1', 'yes', 'on'
+        )
+        AND LOWER(BTRIM(COALESCE(target.target_state->>'preserveOperationalStatus', 'false'))) NOT IN (
+          'true', '1', 'yes', 'on'
+        )
+        AND LOWER(BTRIM(COALESCE(target.target_state->>'operationallyCompleted', 'false'))) NOT IN (
+          'true', '1', 'yes', 'on'
+        )
+        AND (
+          state.order_kind <> 'PO'
+          OR NOT EXISTS (
+            SELECT 1
+              FROM purchase_orders blanket_po
+             WHERE blanket_po.is_blanket_po = true
+               AND (
+                 blanket_po.netsuite_id = state.source_order_netsuite_id
+                 OR LOWER(BTRIM(blanket_po.tranid)) = LOWER(BTRIM(state.source_order_ref))
+                 OR LOWER(BTRIM(COALESCE(blanket_po.dispatch_ref, ''))) = LOWER(BTRIM(target.target_ref))
+               )
+          )
+        )
+        AND NOT EXISTS (
+          SELECT 1
+            FROM dispatch_order_completion_status completion
+           WHERE completion.order_kind = state.order_kind
+             AND completion.dispatch_completion_status = 'completed'
+             AND LOWER(BTRIM(COALESCE(completion.completion_evidence_type, ''))) <> 'reconciliation'
+             AND LOWER(BTRIM(completion.order_ref)) IN (
+               LOWER(BTRIM(target.target_ref)),
+               LOWER(BTRIM(state.source_order_ref))
+             )
+        )`,
+    [requested]
+  );
+  if (!result.rows.length) return new Set();
+  const driverCompletedRefs = await listDriverPwaCompletedDispatchRefs({
+    candidateRefs: result.rows.flatMap((row) => [row.order_ref, row.source_order_ref])
+  });
+  return new Set(result.rows
+    .filter((row) => (
+      !driverCompletedRefs.has(refKey(row.order_ref))
+      && !driverCompletedRefs.has(refKey(row.source_order_ref))
+    ))
+    .map((row) => refKey(row.order_ref))
+    .filter(Boolean));
+}
+
 export async function listDriverPwaCompletedDispatchRefs({ candidateRefs = [] } = {}) {
   const requested = [...new Set((candidateRefs || []).map(refKey).filter(Boolean))];
   const result = await query(

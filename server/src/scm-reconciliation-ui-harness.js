@@ -125,8 +125,8 @@ includesAll(css, [
   ".scm-complete-vrma"
 ], "reconciliation schedule styling");
 
-assert.ok(html.includes("/dispatch.css?v=20260828-all-column-filters-v1"), "Reconciliation CSS cache bust is missing.");
-assert.ok(html.includes("/scm-schedule.js?v=20260902-netsuite-address-pickup-v1"), "Reconciliation client cache bust is missing.");
+assert.ok(html.includes("/dispatch.css?v=20260910-schedule-columns-v1"), "Reconciliation CSS cache bust is missing.");
+assert.ok(html.includes("/scm-schedule.js?v=20260910-search-vendor-complete-v1"), "Reconciliation client cache bust is missing.");
 
 const payloadStart = schedule.indexOf("function normalizeScmSchedulePayload");
 const payloadEnd = schedule.indexOf("function loadScmSchedulePresetsOnce", payloadStart);

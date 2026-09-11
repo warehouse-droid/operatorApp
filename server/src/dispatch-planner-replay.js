@@ -24,6 +24,8 @@ import {
   validateDispatchPickupVisits
 } from "./dispatch-pickup-visits.js";
 import { evaluateExecutedPrefixPolicy } from "./dispatch-planner-performance.js";
+import { dispatchOwnYardCodes } from "./dispatch-load-assignment.js";
+import { dispatchLocationRoot } from "./dispatch-location.js";
 
 function text(value) {
   return String(value ?? "").trim();
@@ -34,7 +36,7 @@ function identity(value = {}) {
 }
 
 function token(namespace, value, salt) {
-  const clean = text(value);
+  const clean = namespace === "LOCATION" ? dispatchLocationRoot(value) : text(value);
   if (!clean) {return "";}
   return `${namespace}_${crypto.createHash("sha256").update(`${salt}\0${namespace}\0${clean}`).digest("hex").slice(0, 16)}`;
 }
@@ -93,6 +95,27 @@ function normalizeReplayWindow(window = {}) {
   }
 }
 
+function sanitizeReplayItem(item = {}, index, ref, salt) {
+  const label = `${item.sku || ""} ${item.itemName || item.item_name || ""}`;
+  const quantityFields = ["poAllocatedPallets", "poAllocatedLayers", "poAllocatedSections", "poAllocatedPieces", "poAllocatedSalesQty",
+    "palletQty", "layerQty", "sectionQty", "pieceQty"];
+  return {
+    lineRowId: token("LINE", item.lineRowId || item.lineId || `${ref}:${index}`, salt),
+    itemId: token("ITEM", item.itemId || item.item_id, salt),
+    sku: token("SKU", item.sku || item.itemName || item.item_name, salt),
+    itemType: text(item.itemType || item.item_type),
+    itemTypeText: text(item.itemTypeText || item.item_type_text),
+    isSpecial: item.isSpecial === true || item.salesQuantityOnly === true || Number(item.itemId ?? item.item_id) === 2055,
+    dispatchServiceFee: item.dispatchServiceFee === true || /delivery\s*(charge|fee)|shipping\s*(charge|fee)|sales\s*credit|discount/i.test(label),
+    pallets: Number(item.pallets || item.pallet_qty || 0),
+    layers: Number(item.layers || item.layer_qty || 0),
+    sections: Number(item.sections || item.section_qty || 0),
+    pieces: Number(item.pieces || item.piece_qty || 0),
+    quantity: Number(item.quantity || item.salesQty || item.sales_qty || 0),
+    ...Object.fromEntries(quantityFields.filter((key) => item[key] !== undefined).map((key) => [key, Number(item[key] || 0)]))
+  };
+}
+
 function sanitizeOrder(order = {}, salt) {
   const ref = identity(order);
   const childDetails = (Array.isArray(order.childOrderDetails) ? order.childOrderDetails : [])
@@ -100,6 +123,11 @@ function sanitizeOrder(order = {}, salt) {
   return {
     id: token("ORDER", ref, salt),
     type: text(order.type).toUpperCase(),
+    sourceTable: text(order.sourceTable),
+    sourceOrderType: text(order.sourceOrderType),
+    pallets: Number(order.pallets || 0),
+    layers: Number(order.layers || 0),
+    ...(order.pickupAddressOverride ? { pickupAddressOverride: token("ADDRESS", order.pickupAddressOverride, salt) } : {}),
     pickupLocations: (Array.isArray(order.pickupLocations) ? order.pickupLocations : [])
       .map((location) => token("LOCATION", location, salt)).filter(Boolean),
     ...(text(order.sourceYard || order.outboundLocation) ? {
@@ -108,14 +136,7 @@ function sanitizeOrder(order = {}, salt) {
     ...(text(order.address || order.dropAddress || order.defaultDestinationAddress) ? {
       address: token("ADDRESS", order.address || order.dropAddress || order.defaultDestinationAddress, salt)
     } : {}),
-    items: (Array.isArray(order.items) ? order.items : []).map((item, index) => ({
-      lineRowId: token("LINE", item?.lineRowId || item?.lineId || `${ref}:${index}`, salt),
-      pallets: Number(item?.pallets || item?.pallet_qty || 0),
-      layers: Number(item?.layers || item?.layer_qty || 0),
-      sections: Number(item?.sections || item?.section_qty || 0),
-      pieces: Number(item?.pieces || item?.piece_qty || 0),
-      quantity: Number(item?.quantity || item?.salesQty || item?.sales_qty || 0)
-    })),
+    items: (Array.isArray(order.items) ? order.items : []).map((item, index) => sanitizeReplayItem(item, index, ref, salt)),
     ...(text(order.originalOrderId || order.parentOrderRef)
       ? { originalOrderId: token("ORDER", order.originalOrderId || order.parentOrderRef, salt) }
       : {}),
@@ -127,13 +148,15 @@ function sanitizeOrder(order = {}, salt) {
     poPickupManifest: (Array.isArray(order.poPickupManifest) ? order.poPickupManifest : [])
       .map((entry) => ({
         poOrderRef: token("ORDER", entry?.poOrderRef || entry?.orderRef || entry?.id, salt),
-        location: token("LOCATION", entry?.location, salt)
+        location: token("LOCATION", entry?.location, salt),
+        items: (entry.items || []).map((item, index) => sanitizeReplayItem(item, index, ref, salt))
       }))
       .filter((entry) => entry.poOrderRef),
     directPickupManifest: (Array.isArray(order.directPickupManifest) ? order.directPickupManifest : [])
       .map((entry) => ({
         transferOrderRef: token("ORDER", entry?.transferOrderRef || entry?.orderRef || entry?.id, salt),
-        location: token("LOCATION", entry?.location, salt)
+        location: token("LOCATION", entry?.location, salt),
+        items: (entry.items || []).map((item, index) => sanitizeReplayItem(item, index, ref, salt))
       })).filter((entry) => entry.transferOrderRef || entry.location),
     orderDependencies: (Array.isArray(order.orderDependencies) ? order.orderDependencies : [])
       .map((entry) => ({
@@ -161,6 +184,7 @@ export function sanitizeDispatchReplayPlan(plan = {}, { salt = "dispatch-planner
     status: text(plan.status),
     revision: Number(plan.revision || 0),
     pickupVisitSchemaVersion: Number(plan.pickupVisitSchemaVersion || 0),
+    ownYardCodes: dispatchOwnYardCodes(plan).map((yard) => token("LOCATION", yard, salt)),
     orders: sourceOrders.map((order) => sanitizeOrder(order, salt)).filter((order) => order.id),
     trucks: (Array.isArray(plan.trucks) ? plan.trucks : []).map((truck) => ({
       id: token("TRUCK", truck?.id || truck?.plate || truck?.truckPlate, salt),
@@ -411,7 +435,11 @@ export function buildDispatchPickupRevisitReplay({ capture = {}, maxInjections =
               pickupLocations: [pickupLocation],
               sourceYard: pickupLocation,
               address: templateOrder.address,
-              items: [{ lineRowId: `${fakeRef}_LINE`, pallets: 1 }]
+              items: [{ lineRowId: `${fakeRef}_LINE`, pallets: 1 }],
+              // Vendor cargo needs a vendor manifest, just like a real linked SO.
+              ...(dispatchOwnYardCodes(sourcePlan).includes(pickupLocation) ? {} : {
+                poPickupManifest: [{ location: pickupLocation, items: [{ pallets: 1, quantity: 1 }] }]
+              })
             },
             activity,
             makeStopId: (kind, ordinal) => deterministicReplayStopId(
@@ -803,20 +831,6 @@ export function buildDispatchHistoricalReplayReport({ events = [], window = {}, 
   };
 }
 
-const REPLAY_SOURCE_STREAMS = Object.freeze({
-  dispatch_plan_commands: "dispatch",
-  dispatch_plan_snapshot_history: "dispatch",
-  dispatch_plan_snapshots: "dispatch",
-  dispatch_audit_log: "dispatch",
-  scm_netsuite_po_history_changes: "scm",
-  scm_reconciliation_audit_events: "netsuite",
-  netsuite_mirror_events: "netsuite",
-  driver_offline_events: "driver",
-  driver_job_records: "driver",
-  dispatch_order_completion_events: "driver",
-  driver_job_corrections: "driver"
-});
-
 function nonNegativeCount(value) {
   const count = Number(value);
   return Number.isSafeInteger(count) && count >= 0 ? count : Number.NaN;
@@ -839,10 +853,12 @@ export function buildDispatchHistoricalReplayArtifact({ capture = {}, expectedLo
     ? entries.filter(([, value]) => nonNegativeCount(value) === 0).length : 0;
   const expectedEventCount = sourceRecordCount + zeroSourceCount;
   const sourceStreamCounts = { dispatch: 0, scm: 0, netsuite: 0, driver: 0 };
-  for (const [source, value] of entries) {
-    const stream = REPLAY_SOURCE_STREAMS[source];
-    const count = nonNegativeCount(value);
-    if (stream && Number.isFinite(count)) {sourceStreamCounts[stream] += count;}
+  // One audit table contains both Dispatch and SCM actions. Count the captured
+  // row's classified stream, never a table-level guess or a gap placeholder.
+  for (const event of events) {
+    if (Object.hasOwn(sourceStreamCounts, event.stream) && !text(event.action).startsWith("coverage_gap:")) {
+      sourceStreamCounts[event.stream] += 1;
+    }
   }
   const fromTime = Date.parse(report.window?.from);
   const toTime = Date.parse(report.window?.to);

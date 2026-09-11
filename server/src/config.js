@@ -47,11 +47,23 @@ function buildConfig(env) {
       ? Math.min(maximum, Math.max(minimum, Math.trunc(parsed)))
       : fallback;
   };
+  const googleMapsServerApiKey = String(env.GOOGLE_MAPS_SERVER_API_KEY || env.GOOGLE_MAPS_API_KEY || "").trim();
+  const configuredBrowserApiKey = String(env.GOOGLE_MAPS_BROWSER_API_KEY || "").trim();
+  const googleMapsBrowserApiKey = configuredBrowserApiKey && configuredBrowserApiKey !== googleMapsServerApiKey
+    ? configuredBrowserApiKey
+    : "";
   return {
     port: Number(env.PORT || 3000),
     appBaseUrl: env.APP_BASE_URL || "http://localhost:3000",
     databaseUrl: env.DATABASE_URL,
-    googleMapsApiKey: env.GOOGLE_MAPS_API_KEY || "",
+    googleMapsApiKey: googleMapsServerApiKey,
+    googleMaps: {
+      serverApiKey: googleMapsServerApiKey,
+      browserApiKey: googleMapsBrowserApiKey,
+      mode: ["disabled", "conserve", "normal"].includes(String(env.GOOGLE_MAPS_MODE || "").trim().toLowerCase())
+        ? String(env.GOOGLE_MAPS_MODE).trim().toLowerCase()
+        : "conserve"
+    },
     mbt: {
       enabled: booleanValue(env.MBT_ENABLED, false),
       netSuiteWritesEnabled: booleanValue(env.MBT_NETSUITE_WRITES_ENABLED, false)
@@ -166,6 +178,7 @@ function replaceConfig(target, next) {
   target.appBaseUrl = next.appBaseUrl;
   target.databaseUrl = next.databaseUrl;
   target.googleMapsApiKey = next.googleMapsApiKey;
+  target.googleMaps = { ...next.googleMaps };
   target.mbt = { ...next.mbt };
   target.mbtPhase3 = { ...next.mbtPhase3 };
   target.dispatch = { ...next.dispatch };

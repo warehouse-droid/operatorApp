@@ -7,6 +7,16 @@
  */
 export const P3_DEDICATED_MUTATION_RUNNERS = Object.freeze([
   Object.freeze({
+    runner: "run-scm-search-vendor-mutations.mjs",
+    adminUrlEnvironment: null,
+    sourcePaths: Object.freeze(["src/scm-vendor-completion.js", "src/dispatch-repository.js"])
+  }),
+  Object.freeze({
+    runner: "run-transfer-unlink-mutations.mjs",
+    adminUrlEnvironment: null,
+    sourcePaths: Object.freeze(["src/scm-dependency-management-policy.js", "src/order-dependency-repository.js", "src/dispatch-plan-repository.js"])
+  }),
+  Object.freeze({
     runner: "run-auto-transfer-auto-approval-mutations.mjs",
     adminUrlEnvironment: null,
     sourcePaths: Object.freeze([
@@ -16,6 +26,11 @@ export const P3_DEDICATED_MUTATION_RUNNERS = Object.freeze([
       "src/server.js",
       "src/transfer-dependency-netsuite.js"
     ])
+  }),
+  Object.freeze({
+    runner: "run-co-cargo-mutations.mjs",
+    adminUrlEnvironment: null,
+    sourcePaths: Object.freeze(["public/dispatch.js", "src/dispatch-local-co-cargo.js"])
   }),
   Object.freeze({
     runner: "run-customer-charge-mutations.mjs",
@@ -250,6 +265,15 @@ export const P3_DEDICATED_MUTATION_RUNNERS = Object.freeze([
     ])
   }),
   Object.freeze({
+    runner: "run-google-maps-usage-mutations.mjs",
+    adminUrlEnvironment: null,
+    sourcePaths: Object.freeze([
+      "src/google-maps-gateway.js",
+      "src/google-maps-usage-policy.js",
+      "src/google-maps-usage-replay.js"
+    ])
+  }),
+  Object.freeze({
     runner: "run-mbbs-cross-charge-v4-mutations.mjs",
     adminUrlEnvironment: null,
     sourcePaths: Object.freeze([
@@ -400,6 +424,14 @@ export const P3_DEDICATED_MUTATION_RUNNERS = Object.freeze([
     ])
   }),
   Object.freeze({
+    runner: "run-schedule-column-mutations.mjs",
+    adminUrlEnvironment: null,
+    sourcePaths: Object.freeze([
+      "public/dispatch.css",
+      "public/scm-schedule.js"
+    ])
+  }),
+  Object.freeze({
     runner: "run-scm-authoritative-schedule-status-mutations.mjs",
     adminUrlEnvironment: null,
     sourcePaths: Object.freeze([
@@ -421,6 +453,16 @@ export const P3_DEDICATED_MUTATION_RUNNERS = Object.freeze([
       "src/scm-dependency-command-service.js",
       "src/scm-dependency-management-policy.js",
       "src/scm-dependency-plan-reconciler.js"
+    ])
+  }),
+  Object.freeze({
+    runner: "run-scm-ir-split-reference-mutations.mjs",
+    adminUrlEnvironment: null,
+    sourcePaths: Object.freeze([
+      "src/netsuite.js",
+      "src/scm-ir-split-reference.js",
+      "src/scm-reconciliation-repository.js",
+      "src/scm-split-receipt-allocation.js"
     ])
   }),
   Object.freeze({

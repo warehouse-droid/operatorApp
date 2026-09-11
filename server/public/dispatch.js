@@ -535,7 +535,7 @@ let sequenceCollapsed = false;
 let lastSavedAt = "";
 let routeNotice = "";
 let dispatchDateFilter = "";
-let dispatchConfig = { googleMapsApiKey: "" };
+let dispatchConfig = { googleMapsApiKey: "", googleMapsEnabled: false, googleMapsMode: "conserve" };
 let dispatchSetupLoaded = false;
 let dispatchPlanningSettings = { truckSwitchMinutes: 10 };
 const driverNewTruckSelections = new Map();
@@ -552,6 +552,8 @@ let dispatchForecastRequestSequence = 0;
 let dispatchForecastInFlight = false;
 let dispatchForecastPollTimer = null;
 let googleMapsPromise = null;
+let googleMapsScriptFailed = false;
+let googleMapsAutomaticDenied = false;
 let routeEstimates = {};
 let routeCache = {};
 let persistedRouteEstimateCache = loadPersistedRouteEstimateCache();
@@ -561,7 +563,6 @@ let backgroundRoutesRunning = false;
 let backgroundRouteRunPromise = null;
 let backgroundRouteRenderQueued = false;
 let backgroundRouteInFlight = new Set();
-let geocodeCache = {};
 let orderListScrollTop = 0;
 let loadPreviewWidth = Number(dispatchStorageGet("mbbs.dispatch.previewWidth", "520"));
 let isResizingPreview = false;
@@ -3127,7 +3128,10 @@ function flattenDispatchGroupMembers(order = {}) {
         .map((detail) => [String(detail.id), detail])
     );
     for (const childId of childIds) {
-      const detail = detailById.get(childId) || { id: childId, type: fallbackType };
+      const detail = detailById.get(childId) || {
+        id: childId,
+        type: canonicalDispatchOrderType(fallbackType === "CO" ? "" : fallbackType, childId)
+      };
       const preserveDirectCo = canonicalDispatchOrderType(order.type, order.id) === "CO"
         && canonicalDispatchOrderType(detail.type, detail.id) === "CO"
         && !isAggregateDispatchCoGroup(detail);
@@ -3276,6 +3280,10 @@ function specialOrderPalletItemQuantity(items = []) {
 }
 
 function effectiveOrderPalletQuantity(order = {}, items = [], childOrderDetails = []) {
+  if (String(order.type).toUpperCase() === "CO" && order.sourceOrderId
+    && !(order.childOrders || []).some((ref) => String(ref).toUpperCase().startsWith("CO-"))) {
+    return Number(order.pallets || 0);
+  }
   if (Array.isArray(childOrderDetails) && childOrderDetails.length) {
     return Number(childOrderDetails.reduce((sum, child) => {
       const specialPallets = specialOrderPalletItemQuantity(child.items || []);
@@ -3825,7 +3833,7 @@ async function loadDispatchConfig() {
     if (!response.ok) return;
     dispatchConfig = await response.json();
   } catch {
-    dispatchConfig = { googleMapsApiKey: "" };
+    dispatchConfig = { googleMapsApiKey: "", googleMapsEnabled: false, googleMapsMode: "conserve" };
   }
 }
 
@@ -4252,7 +4260,10 @@ function applyDispatchOrderFeed(feed) {
   orders = [
     ...orderCatalog.map((order) => {
       const previous = byId.get(order.id) || {};
-      return normalizeOrder(preserveActiveOrderEvidence(previous, { ...previous, ...order }, activityEvidence));
+      const refreshed = order.type === "CO"
+        ? preserveDispatchPlanningFields(previous, order)
+        : { ...previous, ...order };
+      return normalizeOrder(preserveActiveOrderEvidence(previous, refreshed, activityEvidence));
     }),
     ...localOrders.filter((order) => !nextIds.has(order.id)).map(normalizeOrder)
   ];
@@ -4266,7 +4277,17 @@ function applyDispatchOrderFeed(feed) {
 }
 
 function preserveDispatchPlanningFields(existing = {}, fresh = {}) {
+  if (fresh.type === "CO" && fresh.catalogHydrated === false && existing.catalogHydrated === true
+    && existing.sourceTable === "local_co_orders" && existing.sourceOrderId) {
+    const cargoFields = ["items", "pallets", "layers", "sections", "pieces", "salesQty", "weight",
+      "childOrders", "childOrderDetails", "globalGroupDefinition", "isGrouped", "catalogHydrated"];
+    return { ...existing, ...fresh, ...Object.fromEntries(cargoFields
+      .filter((key) => existing[key] !== undefined).map((key) => [key, existing[key]])) };
+  }
   const authoritativeTransitCoState = Object.prototype.hasOwnProperty.call(fresh, "transitCo");
+  const authoritativeLocalCo = fresh.type === "CO" && fresh.sourceTable === "local_co_orders"
+    && fresh.catalogHydrated !== false && Boolean(fresh.sourceOrderId)
+    && !(fresh.childOrders || []).some((ref) => String(ref).toUpperCase().startsWith("CO-"));
   const planningKeys = [
     "assigned",
     "localDispatchStatus",
@@ -4286,6 +4307,7 @@ function preserveDispatchPlanningFields(existing = {}, fresh = {}) {
     "isGrouped"
   ];
   const planning = Object.fromEntries(planningKeys
+    .filter((key) => !(authoritativeLocalCo && ["childOrders", "childOrderDetails", "groupAliases", "isGrouped"].includes(key)))
     .filter((key) => !(authoritativeTransitCoState && [
       "transitCo",
       "transitOriginalPickupLocations",
@@ -4293,7 +4315,7 @@ function preserveDispatchPlanningFields(existing = {}, fresh = {}) {
     ].includes(key)))
     .filter((key) => existing[key] !== undefined)
     .map((key) => [key, existing[key]]));
-  return { ...fresh, ...planning };
+  return { ...fresh, ...planning, ...(authoritativeLocalCo ? { globalGroupDefinition: false, isGrouped: false } : {}) };
 }
 
 function mergeFreshDispatchOperationalOrder(existing = {}, candidate = {}, activityEvidence = activePhysicalOrderEvidence()) {
@@ -5577,20 +5599,44 @@ function orderExecutionStatus(orderId) {
   return "pending";
 }
 
-function loadGoogleMaps() {
-  if (!dispatchConfig.googleMapsApiKey) return Promise.resolve(false);
-  if (window.google?.maps) return Promise.resolve(true);
-  if (googleMapsPromise) return googleMapsPromise;
-  googleMapsPromise = new Promise((resolve) => {
-    const script = document.createElement("script");
-    script.src = `https://maps.googleapis.com/maps/api/js?key=${encodeURIComponent(dispatchConfig.googleMapsApiKey)}`;
-    script.async = true;
-    script.defer = true;
-    script.onload = () => resolve(true);
-    script.onerror = () => resolve(false);
-    document.head.appendChild(script);
-  });
-  return googleMapsPromise;
+function loadGoogleMaps({ manual = false } = {}) {
+  if (!dispatchConfig.googleMapsEnabled) return Promise.resolve(false);
+  if (!manual && googleMapsAutomaticDenied) return Promise.resolve(false);
+  if (googleMapsScriptFailed) return Promise.resolve(false);
+  return (async () => {
+    let authorization;
+    try {
+      const response = await fetch("/api/dispatch/maps/browser-session", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ sessionId: dispatchSessionId, manual })
+      });
+      authorization = response.ok ? await response.json() : null;
+    } catch {
+      authorization = null;
+    }
+    if (!authorization?.available || !authorization.googleMapsApiKey) {
+      if (!manual) googleMapsAutomaticDenied = true;
+      return false;
+    }
+    dispatchConfig.googleMapsApiKey = authorization.googleMapsApiKey;
+    if (window.google?.maps) return true;
+    if (!googleMapsPromise) {
+      googleMapsPromise = new Promise((resolve) => {
+        const script = document.createElement("script");
+        script.src = `https://maps.googleapis.com/maps/api/js?key=${encodeURIComponent(dispatchConfig.googleMapsApiKey)}`;
+        script.async = true;
+        script.defer = true;
+        script.onload = () => resolve(true);
+        script.onerror = () => resolve(false);
+        document.head.appendChild(script);
+      }).then((loaded) => {
+        if (!loaded) googleMapsScriptFailed = true;
+        return loaded;
+      });
+    }
+    return googleMapsPromise;
+  })();
 }
 
 function planPayload(savedAt = new Date()) {
@@ -6304,13 +6350,16 @@ function applySavedPlan(saved) {
     return localStatus !== "planned" || savedAssignedIds.has(order.id);
   };
   const savedById = new Map(savedOrders.filter((order) => defaultById.has(order.id) || allowSavedOnlyOrder(order)).map((order) => {
-    const base = defaultById.get(order.id) || {};
+    const catalogBase = defaultById.get(order.id) || {};
+    const base = order.type === "CO" && catalogBase.id
+      ? preserveDispatchPlanningFields(order, catalogBase)
+      : catalogBase;
     const keepPlanningFields = {
       assigned: order.assigned,
       localDispatchStatus: savedAssignedIds.has(order.id) ? "planned" : (order.localDispatchStatus || "open"),
       netsuiteFeedMissing: !base.id && isNetSuiteDispatchOrder(order),
-      childOrders: order.childOrders,
-      childOrderDetails: order.childOrderDetails,
+      childOrders: order.type === "CO" ? base.childOrders || order.childOrders : order.childOrders,
+      childOrderDetails: order.type === "CO" ? base.childOrderDetails || order.childOrderDetails : order.childOrderDetails,
       groupPlanId: order.groupPlanId,
       groupPlanDate: order.groupPlanDate,
       consolidation: order.consolidation,
@@ -6745,16 +6794,6 @@ async function flushPlanSaveQueue() {
     try {
       while (saveQueued) {
         saveQueued = false;
-        if (dispatchConfig.plannerCommandMode !== "on") {
-          try {
-            await ensureGoogleRouteEstimatesBeforeSave();
-          } catch (error) {
-            routeNotice = `Plan not saved: ${error.message}`;
-            finalResult = { blocked: true, code: error.code || "DISPATCH_GOOGLE_ROUTE_PENDING", error };
-            render({ save: false });
-            break;
-          }
-        }
         const savedAt = new Date();
         const payload = planPayload(savedAt);
         const payloadHash = stablePlanHashPayload(payload);
@@ -7082,7 +7121,7 @@ async function confirmCurrentPlanAtomic() {
   if (!ensureDispatchPlanEditor()) throw new Error(dispatchEditModeMessage());
   if (!currentPlan?.id) throw new Error("Dispatch plan is not loaded.");
   clearTimeout(saveTimer);
-  await ensureGoogleRouteEstimatesBeforeSave("confirm");
+  await refreshGoogleRouteEstimatesForConfirmation();
   const saveResult = await saveCurrentPlanNow();
   if (saveResult?.recoverySaved) {
     const error = new Error(routeNotice || "The latest draft was backed up but not applied. Fix it before confirming.");
@@ -8068,6 +8107,7 @@ function routeEstimateHasCompleteGoogleLegs(stops = [], estimate = null) {
 function serializableRouteEstimateForLoad(truck, load) {
   const estimate = estimateForLoad(load);
   if (!estimate || !load?.id) return null;
+  if (!["google", "google_routes_v2"].includes(String(estimate.source || ""))) return null;
   const stops = mapStopsForLoad(load, truck);
   if (stops.length <= 1) return null;
   const meta = routeEstimateMeta(truck, load, stops);
@@ -8130,7 +8170,12 @@ function routeStopIsOwnYard(stop = {}) {
 }
 
 function routePendingForLoad(truck, load) {
-  if (!dispatchConfig.googleMapsApiKey) return false;
+  // Saving and rendering always have deterministic local timing. Google is an
+  // optional confirmation/manual refinement and must never block a workflow.
+  return false;
+}
+
+function routeNeedsGoogleEstimateForLoad(truck, load) {
   const stops = mapStopsForLoad(load, effectiveTruckForLoad(truck, load));
   if (stops.length <= 1) return false;
   const hasPhysicalTravel = stops.slice(1).some((stop, index) =>
@@ -8140,6 +8185,7 @@ function routePendingForLoad(truck, load) {
   const estimate = estimateForLoad(load);
   const meta = routeEstimateMeta(truck, load, stops);
   return !estimate
+    || !["google", "google_routes_v2"].includes(String(estimate.source || ""))
     || !routeEstimateMatchesMeta(estimate, meta)
     || !routeEstimateHasCompleteGoogleLegs(stops, estimate);
 }
@@ -10317,32 +10363,6 @@ function spreadOverlappingMarkers(markerStops) {
   return spread;
 }
 
-function geocodeAddress(address) {
-  const key = normalizedPlaceKey(address);
-  if (!key || !window.google?.maps?.Geocoder) return Promise.resolve(null);
-  if (geocodeCache[key]) return Promise.resolve(geocodeCache[key]);
-  const geocoder = new google.maps.Geocoder();
-  return new Promise((resolve) => {
-    geocoder.geocode({ address }, (results, status) => {
-      if (status !== "OK" || !results?.[0]?.geometry?.location) return resolve(null);
-      const location = results[0].geometry.location;
-      const point = { lat: location.lat(), lng: location.lng() };
-      geocodeCache[key] = point;
-      const oldestKey = Object.keys(geocodeCache).length >= 400 ? Object.keys(geocodeCache)[0] : "";
-      if (oldestKey) delete geocodeCache[oldestKey];
-      resolve(point);
-    });
-  });
-}
-
-async function geocodeMarkerStops(markerStops = []) {
-  return Promise.all(markerStops.map(async (stop) => {
-    if (typeof stop.routeLocation !== "string") return stop;
-    const point = await geocodeAddress(stop.routeLocation);
-    return point ? { ...stop, ...point } : stop;
-  }));
-}
-
 function mapMarkerLogicalStops(load, markerStop = {}) {
   const sourceStops = markerStop.sourceStops?.length ? markerStop.sourceStops : [markerStop];
   const sourceStopIds = new Set(sourceStops.flatMap((sourceStop) =>
@@ -10396,166 +10416,86 @@ function mapMarkerInfoWindowHtml(load, markerStop = {}) {
   `;
 }
 
-function googleLegDurationSeconds(leg) {
-  return Number((leg?.duration_in_traffic || leg?.duration)?.value);
-}
-
-function googleLegsResolvePhysicalRoute(stops = [], legs = []) {
-  if (legs.length !== Math.max(0, stops.length - 1)) return false;
-  return legs.every((leg, index) => samePhysicalRouteStop(stops[index], stops[index + 1])
-    || (Number.isFinite(googleLegDurationSeconds(leg)) && googleLegDurationSeconds(leg) > 0));
-}
-
-function routeEstimateFromGoogleLegs(load, stops, legs = [], truck = {}) {
-  if (!googleLegsResolvePhysicalRoute(stops, legs)) return null;
-  truck = effectiveTruckForLoad(findLoad(load?.id).truck || truck, load);
-  const rawLegMinutes = legs.map((leg, index) => {
-    const from = stops[index];
-    const to = stops[index + 1];
-    if (samePhysicalRouteStop(from, to)) return 0;
-    return Math.max(1, Math.round(Number((leg.duration_in_traffic || leg.duration)?.value || 0) / 60));
+function fallbackLegMinutesForRouteStops(stops = []) {
+  return stops.slice(1).map((stop, index) => {
+    if (samePhysicalRouteStop(stops[index], stop)) return 0;
+    const order = orderById(stop.orderId);
+    const configured = Number(order?.travelMinutes);
+    return Number.isFinite(configured) && configured > 0 ? Math.round(configured) : 30;
   });
-  const legMinutes = rawLegMinutes.map((value) => adjustedTravelMinutesForTruck(truck, value));
-  const rawDriveMinutes = rawLegMinutes.reduce((sum, value) => sum + value, 0);
-  const driveMinutes = legMinutes.reduce((sum, value) => sum + value, 0);
-  const stayMinutes = routeStayMinutesForLoad(load, stops);
-  const totalMinutes = driveMinutes + stayMinutes;
+}
+
+function applyServerRouteEstimate(truck, load, stops, response = {}) {
+  if (!routeEstimateHasCompleteGoogleLegs(stops, response)) return null;
+  const meta = routeEstimateMeta(truck, load, stops);
   const estimate = {
-    rawDriveMinutes,
-    driveMinutes,
-    stayMinutes,
-    totalMinutes,
-    legMinutes,
-    rawLegMinutes,
+    ...response,
+    routeEstimateId: meta.id,
+    routeSignature: meta.signature,
     allowTolls: Boolean(load?.allowTolls),
     travelTimePercent: truckTravelTimePercent(truck)
   };
-  const meta = routeEstimateMeta(truck, load, stops);
-  estimate.routeEstimateId = meta.id;
-  estimate.routeSignature = meta.signature;
-  estimate.source = "google";
   routeEstimates[load.id] = estimate;
-  cacheRouteEstimate(truck, load, stops, estimate);
+  if (estimate.source === "google_routes_v2") cacheRouteEstimate(truck, load, stops, estimate);
   return estimate;
 }
 
-function directionsRequestForLoad(truck, load, stops, meta = routeEstimateMeta(truck, load, stops)) {
-  return {
-    origin: stopRouteLocation(stops[0]),
-    destination: stopRouteLocation(stops[stops.length - 1]),
-    waypoints: stops.slice(1, -1).map((stop) => ({ location: stopRouteLocation(stop), stopover: true })),
-    travelMode: google.maps.TravelMode.DRIVING,
-    avoidTolls: !meta.allowTolls,
-    optimizeWaypoints: false,
-    drivingOptions: {
-      departureTime: plannedDepartureDate(meta.loadStart + Number(stops[0]?.stayMinutes || 0)),
-      trafficModel: google.maps.TrafficModel.BEST_GUESS
-    }
-  };
-}
-
-function directionsRequestForLeg(load, from, to, departureTime) {
-  return {
-    origin: stopRouteLocation(from),
-    destination: stopRouteLocation(to),
-    travelMode: google.maps.TravelMode.DRIVING,
-    avoidTolls: !Boolean(load?.allowTolls),
-    optimizeWaypoints: false,
-    drivingOptions: {
-      departureTime,
-      trafficModel: google.maps.TrafficModel.BEST_GUESS
-    }
-  };
-}
-
-function requestGoogleDirections(request) {
-  const directionsService = new google.maps.DirectionsService();
-  return new Promise((resolve) => {
-    directionsService.route(request, (result, status) => resolve({ result, status }));
-  });
-}
-
-async function trafficAwareGoogleLegs(load, stops, fullLegs = [], meta = routeEstimateMeta(findLoad(load?.id).truck, load, stops)) {
-  const physicalLegIndexes = stops.slice(0, -1)
-    .map((from, index) => ({ from, to: stops[index + 1], index }))
-    .filter(({ from, to }) => !samePhysicalRouteStop(from, to));
-  const needsSeparateLegs = fullLegs.length !== stops.length - 1
-    || physicalLegIndexes.some(({ index }) => !fullLegs[index]?.duration_in_traffic?.value);
-  if (!needsSeparateLegs) return fullLegs;
-
-  const trafficLegs = [];
-  let departureTime = plannedDepartureDate(meta.loadStart + Number(stops[0]?.stayMinutes || 0));
-  for (let index = 0; index < stops.length - 1; index += 1) {
-    const from = stops[index];
-    const to = stops[index + 1];
-    let leg = fullLegs[index];
-    if (!samePhysicalRouteStop(from, to)) {
-      const response = await requestGoogleDirections(directionsRequestForLeg(load, from, to, departureTime));
-      leg = response.status === "OK" && response.result?.routes?.[0]?.legs?.[0]
-        ? response.result.routes[0].legs[0]
-        : leg;
-    }
-    trafficLegs.push(leg || null);
-    const seconds = Math.max(0, Number(googleLegDurationSeconds(leg) || 0));
-    departureTime = new Date(departureTime.getTime() + (seconds * 1000) + (Number(to?.stayMinutes || 0) * 60000));
-  }
-  return trafficLegs;
-}
-
-function googleRouteForLoad(truck, load) {
-  if (!window.google?.maps?.DirectionsService || !load?.id) return Promise.resolve(null);
+async function googleRouteForLoad(truck, load, { reason = "confirm" } = {}) {
+  if (!load?.id) return null;
   truck = effectiveTruckForLoad(findLoad(load.id).truck || truck, load);
   const stops = mapStopsForLoad(load, truck);
-  if (stops.length <= 1) return Promise.resolve(null);
-  if (applyCachedRouteEstimate(truck, load, stops)) return Promise.resolve({ source: "persistent-cache", stops, estimate: estimateForLoad(load) });
-  const meta = routeEstimateMeta(truck, load, stops);
-  const cached = routeCache[load.id];
-  if (cached?.signature === meta.signature && cached.result) {
-    const legs = cached.trafficLegs || cached.result.routes?.[0]?.legs || [];
-    if (googleLegsResolvePhysicalRoute(stops, legs)) {
-      const estimate = routeEstimateFromGoogleLegs(load, stops, legs, truck);
-      return Promise.resolve({ source: "memory-cache", stops, result: cached.result, markerStops: cached.markerStops || stops, estimate });
-    }
-    discardRouteEstimateForLoad(load);
+  if (stops.length <= 1) return null;
+  if (reason !== "manual_refresh" && applyCachedRouteEstimate(truck, load, stops)) {
+    return { source: "persistent-cache", stops, estimate: estimateForLoad(load) };
   }
-  if (backgroundRouteInFlight.has(meta.id)) return Promise.resolve(null);
+  const meta = routeEstimateMeta(truck, load, stops);
+  if (backgroundRouteInFlight.has(meta.id)) return null;
   backgroundRouteInFlight.add(meta.id);
-  return new Promise((resolve) => {
-    requestGoogleDirections(directionsRequestForLoad(truck, load, stops, meta)).then(async ({ result, status }) => {
-      if (status !== "OK" || !result) {
-        const separateLegs = await trafficAwareGoogleLegs(load, stops, [], meta);
-        if (!googleLegsResolvePhysicalRoute(stops, separateLegs)) {
-          return resolve({ source: "google-error", status, stops });
-        }
-        const estimate = routeEstimateFromGoogleLegs(load, stops, separateLegs, truck);
-        return resolve({ source: "google-per-leg", status, stops, estimate });
-      }
-      const fullLegs = result.routes?.[0]?.legs || [];
-      const legs = await trafficAwareGoogleLegs(load, stops, fullLegs, meta);
-      if (!googleLegsResolvePhysicalRoute(stops, legs)) {
-        return resolve({ source: "google-error", status: "INCOMPLETE_GOOGLE_LEGS", stops });
-      }
-      const routeMarkerStops = stops.map((stop, index) => {
-        if (typeof stop.routeLocation !== "string") return stop;
-        const routePoint = index === 0
-          ? fullLegs[0]?.start_location
-          : fullLegs[index - 1]?.end_location;
-        return routePoint ? { ...stop, lat: routePoint.lat(), lng: routePoint.lng() } : stop;
-      });
-      const estimate = routeEstimateFromGoogleLegs(load, stops, legs, truck);
-      routeCache[load.id] = { signature: meta.signature, result, trafficLegs: legs, markerStops: routeMarkerStops };
-      resolve({ source: "google", status, stops, result, markerStops: routeMarkerStops, estimate });
-    }).catch((error) => resolve({ source: "google-error", status: error?.message || "ERROR", stops }))
-      .finally(() => backgroundRouteInFlight.delete(meta.id));
-  });
+  try {
+    const response = await fetch("/api/dispatch/maps/route-estimate", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        reason,
+        stops: stops.map((stop) => ({
+          ...(typeof stop.routeLocation === "string"
+            ? { location: stop.routeLocation }
+            : { latitude: Number(stop.routeLocation?.lat ?? stop.lat), longitude: Number(stop.routeLocation?.lng ?? stop.lng) }),
+          stayMinutes: Number(stop.stayMinutes || 0)
+        })),
+        fallbackLegMinutes: fallbackLegMinutesForRouteStops(stops),
+        travelTimePercent: truckTravelTimePercent(truck),
+        allowTolls: Boolean(load.allowTolls),
+        departureTime: plannedDepartureDate(meta.loadStart + Number(stops[0]?.stayMinutes || 0)).toISOString(),
+        routeSignature: meta.signature,
+        routeEstimateId: meta.id,
+        sessionId: dispatchSessionId
+      })
+    });
+    if (!response.ok) throw new Error(await dispatchErrorMessage(response));
+    const result = await response.json();
+    return {
+      source: result.source || "fallback",
+      status: result.fallbackReason || "OK",
+      stops,
+      estimate: applyServerRouteEstimate(truck, load, stops, result)
+    };
+  } catch (error) {
+    return { source: "fallback", status: error?.message || "ERROR", stops, estimate: null };
+  } finally {
+    backgroundRouteInFlight.delete(meta.id);
+  }
 }
 
 function routeEstimateSummaryHtml(estimate, truck, suffix = "") {
+  const provider = estimate?.source === "google_routes_v2" || estimate?.source === "google"
+    ? "Google"
+    : "Local estimate";
   const adjustment = truckTravelTimePercent(truck) > 0
-    ? ` | Google ${durationText(estimate.rawDriveMinutes)} +${truckTravelTimePercent(truck)}%`
+    ? ` | ${provider} ${durationText(estimate.rawDriveMinutes)} +${truckTravelTimePercent(truck)}%`
     : "";
   const tollText = estimate.allowTolls ? " | tolls allowed" : " | avoiding tolls";
-  return `<strong>${durationText(estimate.totalMinutes)} total</strong><span>${durationText(estimate.driveMinutes)} drive + ${durationText(estimate.stayMinutes)} stop time${adjustment}${tollText}${suffix}</span>`;
+  return `<strong>${durationText(estimate.totalMinutes)} total</strong><span>${provider} · ${durationText(estimate.driveMinutes)} drive + ${durationText(estimate.stayMinutes)} stop time${adjustment}${tollText}${suffix}</span>`;
 }
 
 function routeEstimateChangesVisibleTiming(previousEstimate, estimate) {
@@ -10582,139 +10522,44 @@ async function renderGoogleMapPreview() {
   const available = await loadGoogleMaps();
   if (canvas !== document.getElementById("googleMapPreview")) return;
   if (!available || !window.google?.maps) {
-    canvas.innerHTML = dispatchConfig.googleMapsApiKey ? "Google Maps could not load." : "Add GOOGLE_MAPS_API_KEY to enable Google Maps.";
+    canvas.innerHTML = "Local route preview is active. Google map tiles are disabled by usage policy.";
     return;
   }
-  const allowTolls = meta.allowTolls;
+  const markerStops = stops.filter((stop) => Number.isFinite(Number(stop.lat)) && Number.isFinite(Number(stop.lng)));
   const map = new google.maps.Map(canvas, {
-    center: stops[0] || MAP_CENTER,
+    center: markerStops[0] || MAP_CENTER,
     zoom: 9,
     mapTypeControl: false,
     streetViewControl: false,
     fullscreenControl: false
   });
-  const routeSummary = document.getElementById("routeEstimateSummary");
   const bounds = new google.maps.LatLngBounds();
-  const drawStopMarkers = (markerStops) => {
-    spreadOverlappingMarkers(mergeConsecutiveExactDropMarkers(markerStops)).forEach((stop) => {
-      const marker = new google.maps.Marker({
-        position: { lat: stop.lat, lng: stop.lng },
-        map,
-        icon: mapMarkerIcon(stop),
-        title: stop.title
-      });
-      const info = new google.maps.InfoWindow({
-        content: mapMarkerInfoWindowHtml(load, stop)
-      });
-      marker.addListener("click", () => info.open({ anchor: marker, map }));
-      marker.addListener("mouseover", () => info.open({ anchor: marker, map }));
-      marker.addListener("mouseout", () => info.close());
-      bounds.extend(marker.getPosition());
-    });
-    if (markerStops.length) map.fitBounds(bounds, 36);
-  };
-  if (stops.length > 1 && google.maps.DirectionsService) {
-    const directionsRenderer = new google.maps.DirectionsRenderer({
+  spreadOverlappingMarkers(mergeConsecutiveExactDropMarkers(markerStops)).forEach((stop) => {
+    const marker = new google.maps.Marker({
+      position: { lat: Number(stop.lat), lng: Number(stop.lng) },
       map,
-      suppressMarkers: true,
-      preserveViewport: false,
-      polylineOptions: {
-        strokeColor: "#006f6b",
-        strokeOpacity: 0.9,
-        strokeWeight: 5
-      }
+      icon: mapMarkerIcon(stop),
+      title: stop.title
     });
-    const cached = routeCache[load.id];
-    if (cached?.signature === meta.signature && cached.result) {
-      const legs = cached.trafficLegs || cached.result.routes?.[0]?.legs || [];
-      if (googleLegsResolvePhysicalRoute(stops, legs)) {
-        directionsRenderer.setDirections(cached.result);
-        drawStopMarkers(cached.markerStops || stops);
-        const previousEstimate = routeEstimates[load.id];
-        const estimate = routeEstimateFromGoogleLegs(load, stops, legs, truck);
-        if (routeSummary) {
-          routeSummary.innerHTML = routeEstimateSummaryHtml(estimate, truck, " | cached route");
-        }
-        if (
-          selectedLoadId === load.id
-          && routeEstimateChangesVisibleTiming(previousEstimate, estimate)
-        ) {
-          setTimeout(() => render({ save: false }), 0);
-        }
-        return;
-      }
-      discardRouteEstimateForLoad(load);
-    }
-    requestGoogleDirections(directionsRequestForLoad(truck, load, stops, meta)).then(async ({ result, status }) => {
-      if (status !== "OK" || !result) {
-        const separateLegs = await trafficAwareGoogleLegs(load, stops, [], meta);
-        const resolved = googleLegsResolvePhysicalRoute(stops, separateLegs);
-        const previousEstimate = routeEstimates[load.id];
-        const estimate = resolved ? routeEstimateFromGoogleLegs(load, stops, separateLegs, truck) : null;
-        if (routeSummary) {
-          routeSummary.innerHTML = estimate
-            ? routeEstimateSummaryHtml(estimate, truck, " | separate Google legs")
-            : `Google route unavailable (${escapeHtml(status)}). Plan timing remains pending.`;
-        }
-        const markerStops = await geocodeMarkerStops(stops);
-        drawStopMarkers(markerStops);
-        new google.maps.Polyline({
-          path: markerStops.map((stop) => ({ lat: stop.lat, lng: stop.lng })),
-          geodesic: true,
-          strokeColor: "#006f6b",
-          strokeOpacity: 0.55,
-          strokeWeight: 4,
-          map
-        });
-        if (estimate && selectedLoadId === load.id && routeEstimateChangesVisibleTiming(previousEstimate, estimate)) {
-          setTimeout(() => render({ save: false }), 0);
-        }
-        return;
-      }
-      directionsRenderer.setDirections(result);
-      const fullLegs = result.routes?.[0]?.legs || [];
-      const legs = await trafficAwareGoogleLegs(load, stops, fullLegs, meta);
-      if (!googleLegsResolvePhysicalRoute(stops, legs)) {
-        if (routeSummary) routeSummary.textContent = "Google route incomplete. Plan timing remains pending.";
-        drawStopMarkers(await geocodeMarkerStops(stops));
-        return;
-      }
-      const routeMarkerStops = stops.map((stop, index) => {
-        if (typeof stop.routeLocation !== "string") return stop;
-        const routePoint = index === 0
-          ? fullLegs[0]?.start_location
-          : fullLegs[index - 1]?.end_location;
-        return routePoint ? { ...stop, lat: routePoint.lat(), lng: routePoint.lng() } : stop;
-      });
-      drawStopMarkers(routeMarkerStops);
-      const previousEstimate = routeEstimates[load.id];
-      const estimate = routeEstimateFromGoogleLegs(load, stops, legs, truck);
-      routeCache[load.id] = { signature: meta.signature, result, trafficLegs: legs, markerStops: routeMarkerStops };
-      if (routeSummary) {
-        routeSummary.innerHTML = routeEstimateSummaryHtml(estimate, truck);
-      }
-      if (selectedLoadId === load.id && routeEstimateChangesVisibleTiming(previousEstimate, estimate)) {
-        setTimeout(() => render({ save: false }), 0);
-      }
-    }).catch((error) => {
-      if (routeSummary) routeSummary.textContent = `Google route unavailable (${error?.message || "ERROR"}).`;
+    const info = new google.maps.InfoWindow({
+      content: mapMarkerInfoWindowHtml(load, stop)
     });
-  } else if (stops.length > 1) {
-    const markerStops = await geocodeMarkerStops(stops);
-    drawStopMarkers(markerStops);
+    marker.addListener("click", () => info.open({ anchor: marker, map }));
+    marker.addListener("mouseover", () => info.open({ anchor: marker, map }));
+    marker.addListener("mouseout", () => info.close());
+    bounds.extend(marker.getPosition());
+  });
+  if (markerStops.length > 1) {
     new google.maps.Polyline({
-      path: markerStops.map((stop) => ({ lat: stop.lat, lng: stop.lng })),
+      path: markerStops.map((stop) => ({ lat: Number(stop.lat), lng: Number(stop.lng) })),
       geodesic: true,
       strokeColor: "#006f6b",
-      strokeOpacity: 0.9,
+      strokeOpacity: 0.55,
       strokeWeight: 4,
       map
     });
-    const stayMinutes = routeStayMinutesForLoad(load, stops);
-    if (routeSummary) routeSummary.innerHTML = `<strong>${stayMinutes} min stay</strong><span>Add more stops for Google travel estimate.</span>`;
-  } else {
-    drawStopMarkers(await geocodeMarkerStops(stops));
   }
+  if (!bounds.isEmpty()) map.fitBounds(bounds, 36);
 }
 
 function routeLoadsNeedingEstimate() {
@@ -10724,7 +10569,7 @@ function routeLoadsNeedingEstimate() {
       const stops = mapStopsForLoad(load, truck);
       if (stops.length <= 1) continue;
       if (applyCachedRouteEstimate(truck, load, stops)) continue;
-      if (!routePendingForLoad(truck, load)) continue;
+      if (!routeNeedsGoogleEstimateForLoad(truck, load)) continue;
       const meta = routeEstimateMeta(truck, load, stops);
       candidates.push({ truck, load, meta });
     }
@@ -10732,35 +10577,26 @@ function routeLoadsNeedingEstimate() {
   return candidates;
 }
 
-function scheduleBackgroundRouteEstimates() {
-  if (!dispatchConfig.googleMapsApiKey) return;
-  clearTimeout(backgroundRouteTimer);
-  backgroundRouteTimer = setTimeout(runBackgroundRouteEstimates, 650);
-}
-
-async function runBackgroundRouteEstimates() {
+async function refreshGoogleRouteEstimatesForConfirmation() {
   if (backgroundRoutesRunning) return backgroundRouteRunPromise;
-  if (!dispatchConfig.googleMapsApiKey) return null;
   const candidates = routeLoadsNeedingEstimate();
   if (!candidates.length) return { attempted: 0, failed: [] };
   backgroundRoutesRunning = true;
   backgroundRouteRunPromise = (async () => {
     const failed = [];
     try {
-      const available = await loadGoogleMaps();
-      if (!available || !window.google?.maps?.DirectionsService) {
-        return { attempted: 0, failed: candidates.map((candidate) => ({ loadId: candidate.load.id, status: "MAPS_UNAVAILABLE" })) };
-      }
       for (const candidate of candidates) {
         const latest = findLoad(candidate.load.id);
         if (!latest.truck || !latest.load) continue;
         // An earlier load can change this load's inherited departure while the
         // queue is running. Re-check the exact route identity before calling
         // Google so a now-valid downstream estimate is not replaced needlessly.
-        if (!routePendingForLoad(latest.truck, latest.load)) continue;
+        if (!routeNeedsGoogleEstimateForLoad(latest.truck, latest.load)) continue;
         const previousEstimate = estimateForLoad(latest.load);
-        const result = await googleRouteForLoad(latest.truck, latest.load);
-        if (!result?.estimate) failed.push({ loadId: latest.load.id, status: result?.status || "NO_RESULT" });
+        const result = await googleRouteForLoad(latest.truck, latest.load, { reason: "confirm" });
+        if (!result?.estimate || result.source !== "google_routes_v2") {
+          failed.push({ loadId: latest.load.id, status: result?.status || "LOCAL_FALLBACK" });
+        }
         if (routeEstimateChangesVisibleTiming(previousEstimate, result?.estimate)) {
           backgroundRouteRenderQueued = true;
         }
@@ -10776,21 +10612,6 @@ async function runBackgroundRouteEstimates() {
     }
   })();
   return backgroundRouteRunPromise;
-}
-
-async function ensureGoogleRouteEstimatesBeforeSave(action = "save") {
-  if (!dispatchConfig.googleMapsApiKey) return;
-  await runBackgroundRouteEstimates();
-  const unresolved = routeLoadsNeedingEstimate();
-  if (!unresolved.length) return;
-  const labels = unresolved.slice(0, 4).map(({ truck, load }) =>
-    `${loadTruckPlate(truck, load) || truck?.plate || "Truck"} ${load.name || load.id}`
-  );
-  const suffix = unresolved.length > labels.length ? ` and ${unresolved.length - labels.length} more` : "";
-  const retryAction = action === "confirm" ? "confirm" : "save";
-  const error = new Error(`Google travel time is still unavailable for ${labels.join(", ")}${suffix}. Wait for routing to finish, then ${retryAction} again.`);
-  error.code = "DISPATCH_GOOGLE_ROUTE_PENDING";
-  throw error;
 }
 
 function planBadgeText() {
@@ -11062,7 +10883,6 @@ function renderDispatchPlannerPatch() {
   restoreRenderUiState(uiState, uiSequence);
   renderDispatchSaveStatePatch();
   if (!mapPreserved) renderGoogleMapPreview();
-  scheduleBackgroundRouteEstimates();
 }
 
 function renderDispatchExecutionPatch() {
@@ -11130,7 +10950,6 @@ function render(options = {}) {
   const mapPreserved = restoreGoogleMapPreviewState(mapState);
   restoreRenderUiState(uiState, uiSequence);
   if (!mapPreserved) renderGoogleMapPreview();
-  scheduleBackgroundRouteEstimates();
 }
 
 function orderPoolSubtitle() {
@@ -11374,7 +11193,8 @@ function renderSelectedOrderActions() {
   const reviewOnly = selected.some((item) => isReviewOnlyOrder(item));
   const reconciliationBlocked = selected.some((item) => isScmReconciliationBlocked(item));
   const blockedUngroup = groupedCount && groupedOrderTransitCoId(order);
-  const dispatchCompleted = order.dispatchCompletionStatus === "completed";
+  const dispatchCompleted = order.dispatchCompletionStatus === "completed"
+    && order.dispatchReconciliationPlanningEligible !== true;
   const transitCoSupported = selected.length === 1 && supportsTransitCoForOrder(order);
   return `
     <div class="selected-order-actions">
@@ -11435,8 +11255,10 @@ function renderOrderCard(order) {
   const dependencyParentPlanned = dependencyLinked && Boolean(dependentSalesAssignment.load || dependentSalesOrder?.dispatchPlanned);
   const anyPlanned = planned || plannedElsewhere;
   const reconciliationBlocked = isScmReconciliationBlocked(order);
-  const dispatchCompleted = order.dispatchCompletionStatus === "completed";
+  const dispatchCompleted = order.dispatchCompletionStatus === "completed"
+    && order.dispatchReconciliationPlanningEligible !== true;
   const planningRestricted = isDispatchPlanningRestricted(order);
+  const reconciliationPlanningEligible = order.dispatchReconciliationPlanningEligible === true;
   const dragBlocked = anyPlanned || dependencyLinked || reconciliationBlocked || planningRestricted;
   const reviewOnly = isReviewOnlyOrder(order);
   const packedText = packedUnitText(order);
@@ -11461,6 +11283,7 @@ function renderOrderCard(order) {
         ${executionStatus === "complete" ? `<span class="chip complete-chip">Completed</span>` : executionStatus === "in_progress" ? `<span class="chip progress-chip">In progress</span>` : ""}
         ${reviewOnly ? `<span class="chip complete-chip">${escapeHtml(reviewOnlyText(order))}</span>` : ""}
         ${planningRestricted ? `<span class="chip complete-chip" title="${escapeHtml(dispatchPlanningRestrictionText(order))}">Completed · search only</span>` : ""}
+        ${reconciliationPlanningEligible ? `<span class="chip warn" title="${escapeHtml(order.dispatchReconciliationPlanningReason || "Receipt reconciliation is complete, but Driver delivery is still pending.")}">Reconciled · dispatch pending</span>` : ""}
         ${reconciliationBlocked ? `<span class="chip warn" title="${escapeHtml(scmReconciliationBlockText(order))}">Reconcile Review</span>` : ""}
         ${anyPlanned ? `<span class="chip planned-chip">${escapeHtml(plannedText)}</span>` : ""}
         ${missingAddress ? `<span class="chip warn">Update address</span>` : ""}
@@ -11470,7 +11293,7 @@ function renderOrderCard(order) {
         ${order.type === "CO" ? `<span class="chip">For ${escapeHtml(order.sourceOrderId || order.relatedSoId || "SO")}</span>` : ""}
         ${order.scm?.isSpecialOrder ? `<span class="chip warn">Sp.O</span>` : ""}
         ${order.testFixture ? `<span class="chip">TEST</span>` : ""}
-        ${!dispatchCompleted && order.scm?.status && order.scm.status !== "Queued" ? `<span class="chip">${escapeHtml(order.scm.status)}</span>` : ""}
+        ${!reconciliationPlanningEligible && !dispatchCompleted && order.scm?.status && order.scm.status !== "Queued" ? `<span class="chip">${escapeHtml(order.scm.status)}</span>` : ""}
         ${order.scm?.packingSlipRef ? `<span class="chip">Ref ${escapeHtml(order.scm.packingSlipRef)}</span>` : ""}
         ${order.scm?.groupRef ? `<span class="chip">PGOB ${escapeHtml(order.scm.groupRef.replace(/^PGOB-/, ""))}</span>` : ""}
         ${(order.dependencyLabels || []).map((label) => `<span class="chip ${/attention|uncovered/i.test(label) ? "warn" : ""}">${escapeHtml(label)}</span>`).join("")}
@@ -12621,18 +12444,19 @@ function renderPreviewMap() {
   return `
     <div class="google-map-preview" id="googleMapPreview">Loading map...</div>
     <div class="route-estimate-summary" id="routeEstimateSummary">
-      ${estimate ? routeEstimateSummaryHtml(estimate, truck) : `<strong>Calculating route...</strong><span>Google travel time, truck adjustment, plus driver stop time.</span>`}
+      ${estimate ? routeEstimateSummaryHtml(estimate, truck) : `<strong>Local route timing active</strong><span>Google refinement runs only on confirmation or an explicit refresh.</span>`}
     </div>
     <div class="route-option-row">
       <button class="${allowTolls ? "" : "active"}" data-action="toggle-route-tolls" data-load="${escapeHtml(load?.id || "")}" type="button">
         ${allowTolls ? "Tolls Allowed" : "Avoid Tolls"}
       </button>
       <span>${allowTolls ? "Google may use toll roads for faster ETA." : "Default: route avoids toll roads."}</span>
+      <button data-action="refresh-google-route" data-load="${escapeHtml(load?.id || "")}" type="button">Refresh Google estimate</button>
     </div>
-    ${dispatchConfig.googleMapsApiKey ? "" : `<div class="map-preview load-map-preview fallback-map-preview">
+    <div class="map-preview load-map-preview fallback-map-preview">
       <div class="route-line"></div>
       ${pins.map((pin) => `<div class="map-pin ${pin.className}" style="left:${pin.x}%;top:${pin.y}%">${pin.label}</div>`).join("")}
-    </div>`}
+    </div>
   `;
 }
 
@@ -15569,6 +15393,20 @@ app.addEventListener("click", async (event) => {
   if (!button) return;
   const action = button.dataset.action;
   if (!action) return;
+  if (action === "refresh-google-route") {
+    const found = findLoad(button.dataset.load || selectedLoadId);
+    if (!found.load) return;
+    button.disabled = true;
+    routeNotice = "Refreshing this load's Google estimate…";
+    renderDispatchNoticePatch();
+    const result = await googleRouteForLoad(found.truck, found.load, { reason: "manual_refresh" });
+    const usedGoogle = result?.source === "google_routes_v2";
+    routeNotice = usedGoogle
+      ? "Google estimate refreshed for this load."
+      : `Local estimate remains active (${result?.status || "Google budget unavailable"}); no request is queued for later.`;
+    render({ save: false });
+    return;
+  }
   if (action === "reload-delivery-instructions") {
     loadDeliveryInstructionEditor(orderById(modalOrderId));
     return;
@@ -16411,8 +16249,8 @@ app.addEventListener("click", async (event) => {
     delete routeCache[load.id];
     delete routeEstimates[load.id];
     routeNotice = load.allowTolls
-      ? `${truck?.plate || "Truck"} ${load.name} may use toll roads. ETA recalculating.`
-      : `${truck?.plate || "Truck"} ${load.name} will avoid toll roads. ETA recalculating.`;
+      ? `${truck?.plate || "Truck"} ${load.name} may use toll roads. Google refines this on confirmation or manual refresh.`
+      : `${truck?.plate || "Truck"} ${load.name} will avoid toll roads. Google refines this on confirmation or manual refresh.`;
     logDispatchAudit({
       action: "route_toll_preference_updated",
       entityType: "load",

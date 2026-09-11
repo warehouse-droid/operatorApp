@@ -1303,14 +1303,14 @@ for (const asset of [
   "driver-location-override.js",
   "driver.js"
 ]) {
-  assert.ok(driverHtml.includes(`/${asset}?v=20260903-retained-photo-i18n-v1`));
-  assert.ok(driverWorker.includes(`/${asset}?v=20260903-retained-photo-i18n-v1`));
+  assert.ok(driverHtml.includes(`/${asset}?v=20260910-route-prefix-cursor-v1`));
+  assert.ok(driverWorker.includes(`/${asset}?v=20260910-route-prefix-cursor-v1`));
 }
-assert.match(driverWorker, /DRIVER_CACHE_NAME = `\$\{DRIVER_CACHE_PREFIX\}v40`/);
-assert.match(driverWorker, /DRIVER_REFRESH_CACHE_NAME = `\$\{DRIVER_CACHE_PREFIX\}refresh-v40`/);
+assert.match(driverWorker, /DRIVER_CACHE_NAME = `\$\{DRIVER_CACHE_PREFIX\}v41`/);
+assert.match(driverWorker, /DRIVER_REFRESH_CACHE_NAME = `\$\{DRIVER_CACHE_PREFIX\}refresh-v41`/);
 assert.match(
   driverSource,
-  /serviceWorker\.register\("\/driver-service-worker\.js\?v=20260903-retained-photo-i18n-v1"/
+  /serviceWorker\.register\("\/driver-service-worker\.js\?v=20260910-route-prefix-cursor-v1"/
 );
 assert.match(
   offlineSyncSource,

@@ -314,9 +314,14 @@ test.beforeAll(async () => {
 
 test.afterAll(removeOperator);
 
-test("DAO Load 1 renders the Techo PO pickup as the fifth of seven physical stops", async ({ page, request }) => {
+test("DAO Load 1 renders the Techo PO pickup as the fifth of seven physical stops", async ({ page, request, browserName }) => {
   const dispatchWrites = [];
-  await page.coverage.startJSCoverage({ resetOnNavigation: false });
+  // This incident replay exercises the fixed-width desktop planning board
+  // (minimum width 1180px), including on the mobile-profile browser engines.
+  await page.setViewportSize({ width: 1440, height: 1000 });
+  if (browserName === "chromium") {
+    await page.coverage.startJSCoverage({ resetOnNavigation: false });
+  }
   await page.addInitScript(({ date }) => {
     globalThis.localStorage.setItem("mbbs.dispatch.planDate", date);
     globalThis.EventSource = class {
@@ -388,20 +393,24 @@ test("DAO Load 1 renders the Techo PO pickup as the fifth of seven physical stop
   )).toBeVisible();
   expect(dispatchWrites).toEqual([]);
 
-  const coverage = await page.coverage.stopJSCoverage();
-  const dispatchCoverage = coverage.find((entry) => new URL(entry.url).pathname === "/dispatch.js");
-  expect(dispatchCoverage, "dispatch.js must be present in Chromium coverage").toBeTruthy();
-  for (const functionName of [
-    "dispatchRelationshipPickupLocations",
-    "activeTransitPickupLocations",
-    "normalizeOrder",
-    "applyTransitPickupToOrder"
-  ]) {
-    const functionCoverage = dispatchCoverage.functions.find((entry) => entry.functionName === functionName);
-    expect(functionCoverage, `${functionName} must be instrumented`).toBeTruthy();
-    expect(
-      functionCoverage.ranges.some((range) => Number(range.count) > 0),
-      `${functionName} must execute in the incident replay`
-    ).toBe(true);
+  // Playwright JavaScript coverage is Chromium-only; every engine still runs
+  // all of the physical-stop, timing, preview, and read-only assertions above.
+  if (browserName === "chromium") {
+    const coverage = await page.coverage.stopJSCoverage();
+    const dispatchCoverage = coverage.find((entry) => new URL(entry.url).pathname === "/dispatch.js");
+    expect(dispatchCoverage, "dispatch.js must be present in Chromium coverage").toBeTruthy();
+    for (const functionName of [
+      "dispatchRelationshipPickupLocations",
+      "activeTransitPickupLocations",
+      "normalizeOrder",
+      "applyTransitPickupToOrder"
+    ]) {
+      const functionCoverage = dispatchCoverage.functions.find((entry) => entry.functionName === functionName);
+      expect(functionCoverage, `${functionName} must be instrumented`).toBeTruthy();
+      expect(
+        functionCoverage.ranges.some((range) => Number(range.count) > 0),
+        `${functionName} must execute in the incident replay`
+      ).toBe(true);
+    }
   }
 });

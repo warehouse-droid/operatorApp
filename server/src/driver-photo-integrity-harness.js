@@ -165,7 +165,7 @@ const abcBlob = new Blob([new TextEncoder().encode("abc")], { type: "image/jpeg"
   );
 }
 
-const recoveryAssetVersion = "20260903-retained-photo-i18n-v1";
+const recoveryAssetVersion = "20260910-route-prefix-cursor-v1";
 const htmlHashIndex = driverHtml.indexOf(`/driver-photo-hash.js?v=${recoveryAssetVersion}`);
 const htmlPhotosIndex = driverHtml.indexOf(`/driver-offline-photos.js?v=${recoveryAssetVersion}`);
 const htmlSyncIndex = driverHtml.indexOf(`/driver-offline-sync.js?v=${recoveryAssetVersion}`);
@@ -175,12 +175,12 @@ assert.ok(
 );
 assert.match(
   driverWorker,
-  /importScripts\("\/driver-photo-hash\.js\?v=20260903-retained-photo-i18n-v1"\);[\s\S]*importScripts\("\/driver-offline-sync\.js\?v=20260903-retained-photo-i18n-v1"\);/,
+  /importScripts\("\/driver-photo-hash\.js\?v=20260910-route-prefix-cursor-v1"\);[\s\S]*importScripts\("\/driver-offline-sync\.js\?v=20260910-route-prefix-cursor-v1"\);/,
   "Background sync must import the shared hasher before sync code."
 );
 assert.match(
   driverWorker,
-  /DRIVER_CACHE_NAME = `\$\{DRIVER_CACHE_PREFIX\}v40`/,
+  /DRIVER_CACHE_NAME = `\$\{DRIVER_CACHE_PREFIX\}v41`/,
   "The recovery shell must use a new cache generation."
 );
 for (const asset of ["driver-photo-hash.js", "driver-offline-photos.js", "driver-offline-sync.js"]) {

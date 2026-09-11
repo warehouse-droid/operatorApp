@@ -338,11 +338,11 @@ test("DPO-10b: Planning searches split POs by source and displays each correspon
   assert.match(serverSource, /includeScmLinkedSearchRefs:\s*Boolean\(searchTerm\)/u);
 });
 
-test("DPO-11 frontend: route estimates cannot block compact autosave, while confirm remains strict", () => {
+test("DPO-11 frontend: route estimates never block autosave and confirm uses one budgeted refinement pass", () => {
   const flush = functionBody("flushPlanSaveQueue");
-  assert.match(flush, /plannerCommandMode\s*!==\s*["']on["'][\s\S]*ensureGoogleRouteEstimatesBeforeSave/u);
+  assert.doesNotMatch(flush, /GoogleRoute|route-estimate|ensureGoogleRoute/u);
   const confirm = functionBody("confirmCurrentPlanAtomic");
-  assert.match(confirm, /await\s+ensureGoogleRouteEstimatesBeforeSave\(["']confirm["']\)/u);
+  assert.match(confirm, /await\s+refreshGoogleRouteEstimatesForConfirmation\(\)/u);
 });
 
 test("DPO-12 frontend: Save Now drains autosave then creates an idempotent manual checkpoint", () => {

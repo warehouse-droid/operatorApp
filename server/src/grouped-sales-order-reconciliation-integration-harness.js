@@ -306,6 +306,11 @@ try {
     )).rows[0];
     assert.equal(snapshot.orders[0].id, groupRef);
     assert.equal(snapshot.trucks[0].loads[0].stops[0].orderId, groupRef);
+    const protectedSnapshot = structuredClone(snapshot);
+    const protectedRevision = Number((await query(
+      "SELECT revision FROM dispatch_plans WHERE id = $1",
+      [plan.rows[0].id]
+    )).rows[0].revision);
 
     await query(
       `UPDATE driver_job_records
@@ -317,18 +322,17 @@ try {
       planId: plan.rows[0].id,
       actor: "grouped-so-reconciliation-harness"
     });
-    assert.equal(cleanup.deferredFamilies.length, 0);
-    assert.equal(cleanup.changedPlans.length, 1);
+    assert.equal(cleanup.deferredFamilies.length, 1);
+    assert.equal(cleanup.changedPlans.length, 0);
     snapshot = (await query(
       "SELECT orders, trucks FROM dispatch_plan_snapshots WHERE plan_id = $1",
       [plan.rows[0].id]
     )).rows[0];
-    assert.deepEqual(snapshot.orders.map((order) => order.id), [soRefs[1]],
-      "Billing one child must dissolve a two-child group into the remaining real SO.");
-    assert.deepEqual(
-      snapshot.trucks[0].loads[0].stops.map((stop) => stop.orderId),
-      [soRefs[1]],
-      "Dissolving a group must rewrite its stop instead of leaving an orphan GOA stop."
+    assert.deepEqual(snapshot, protectedSnapshot,
+      "Billing one child must not dissolve a group already recorded in Driver completion evidence.");
+    assert.equal(
+      Number((await query("SELECT revision FROM dispatch_plans WHERE id = $1", [plan.rows[0].id])).rows[0].revision),
+      protectedRevision
     );
 
     const exactRetry = await reconcileSalesOrderFromNetSuite({
@@ -339,7 +343,8 @@ try {
       dryRun: false
     });
     assert.equal(exactRetry.planCleanup.changedPlans.length, 0,
-      "An exact billed retry must not rewrite the already repaired plan again.");
+      "An exact billed retry must not rewrite the protected plan.");
+    assert.equal(exactRetry.planCleanup.deferred, true);
 
     await query(
       `UPDATE sales_orders
@@ -349,7 +354,7 @@ try {
         WHERE netsuite_id = $1`,
       [soIds[1]]
     );
-    await reconcileSalesOrderFromNetSuite({
+    const finalChild = await reconcileSalesOrderFromNetSuite({
       order: authoritativeSalesOrder({
         id: soIds[1], ref: soRefs[1], lineKey: lineKeys[1], billed: true
       }),
@@ -360,10 +365,9 @@ try {
       "SELECT orders, trucks FROM dispatch_plan_snapshots WHERE plan_id = $1",
       [plan.rows[0].id]
     )).rows[0];
-    assert.deepEqual(snapshot.orders, [],
-      "Billing the final grouped child must remove the dissolved order.");
-    assert.deepEqual(snapshot.trucks[0].loads[0].stops, [],
-      "Billing the final grouped child must remove its stop exactly once.");
+    assert.equal(finalChild.planCleanup.deferred, true);
+    assert.deepEqual(snapshot, protectedSnapshot,
+      "Billing the final child must retain the completed grouped route as historical evidence.");
   });
   console.log("Grouped Sales Order reconciliation integration harness passed.");
 } finally {

@@ -43,6 +43,7 @@ let scmSchedulePoSplitLineOptionsLoading = new Set();
 let scmSchedulePoSplitLineOptionsErrors = new Map();
 let scmSchedulePoSplitLineAdjustmentBusy = new Set();
 let scmScheduleVrmaCompletingRef = "";
+let scmScheduleVendorCompletingRef = "";
 let scmScheduleFocusAfterRender = "";
 let scmSchedulePresetsRequest = null;
 let scmScheduleSearchTimer = null;
@@ -52,6 +53,7 @@ let scmScheduleFormattingLoaded = false;
 let scmScheduleFormattingRequest = null;
 
 const SCM_SCHEDULE_SHEET_PREF_KEY = "mbbs.scmSchedule.sheetPreferences.v1";
+const SCM_SCHEDULE_COLUMN_PREF_KEY = "mbbs.scmSchedule.columns.v1";
 const SCM_SCHEDULE_RECONCILIATION_PREF_KEY = "mbbs.scmSchedule.showReconciliationDetails.v1";
 const SCM_SCHEDULE_FILTER_PREF_KEY = "mbbs.scmSchedule.filters.v1";
 const SCM_SCHEDULE_EXTENDED_FILTER_KEYS = new Set([
@@ -69,7 +71,7 @@ const SCM_SCHEDULE_EXTENDED_FILTER_KEYS = new Set([
   "slaMax"
 ]);
 const SCM_SCHEDULE_COLUMNS = [
-  { key: "select", label: "", width: 40, minWidth: 36, editableOnly: true },
+  { key: "select", label: "", width: 40, minWidth: 36, editableOnly: true, utility: true },
   { key: "date", label: "Date Added", width: 112, minWidth: 84 },
   { key: "type", label: "Type", width: 100, minWidth: 80 },
   { key: "method", label: "Method", width: 132, minWidth: 105 },
@@ -81,14 +83,13 @@ const SCM_SCHEDULE_COLUMNS = [
   { key: "order", label: "Order Number", width: 170, minWidth: 130 },
   { key: "weight", label: "Weight LBs", width: 104, minWidth: 90 },
   { key: "packing", label: "Packing Slip Number", width: 168, minWidth: 130 },
-  { key: "eta", label: "ETA", width: 140, minWidth: 110 },
-  { key: "driver", label: "Driver", width: 120, minWidth: 95 },
+  { key: "timing", label: "ETA / Driver / SLA", width: 170, minWidth: 140 },
   { key: "status", label: "Status", width: 132, minWidth: 100 },
-  { key: "sla", label: "SLA", width: 95, minWidth: 75 },
-  { key: "action", label: "Save", width: 82, minWidth: 70 }
+  { key: "action", label: "Save", width: 82, minWidth: 70, utility: true }
 ];
 const SCM_SCHEDULE_SHEET_DEFAULTS = Object.freeze({ fontSize: 12, rowHeight: 58 });
 let scmScheduleSheetPreferences = loadScmScheduleSheetPreferences();
+let scmScheduleHiddenColumns = new Set();
 
 const SCM_METHODS = ["MBT", "Vendor", "Customer Pickup"];
 const SCM_STATUS_FILTERS = ["Queued", "Planned", "Partially Done", "In Transit", "Completed", "Reconcile Review", "Urgent", "Cancelled", "Hold", "Priority", "Surplus Only", "Book Appt"];
@@ -234,8 +235,76 @@ function saveScmScheduleSheetPreferences() {
   }
 }
 
-function scmScheduleVisibleColumns(editable = canEditScmSchedule()) {
+function scmScheduleAvailableColumns(editable = canEditScmSchedule()) {
   return SCM_SCHEDULE_COLUMNS.filter((column) => !column.editableOnly || editable);
+}
+
+function scmScheduleColumnPreferenceKey() {
+  const userKey = scmScheduleOperator?.id || scmScheduleOperator?.username || "browser";
+  return `${SCM_SCHEDULE_COLUMN_PREF_KEY}.${scmScheduleSurface()}.${userKey}`;
+}
+
+function loadScmScheduleColumnPreferences() {
+  let saved;
+  try {
+    saved = JSON.parse(localStorage.getItem(scmScheduleColumnPreferenceKey()) || "{}");
+  } catch {
+    saved = {};
+  }
+  const known = new Set(SCM_SCHEDULE_COLUMNS.map((column) => column.key));
+  const hidden = new Set((Array.isArray(saved?.hiddenColumns) ? saved.hiddenColumns : [])
+    .filter((key) => known.has(key)));
+  if (SCM_SCHEDULE_COLUMNS.filter((column) => !column.utility).every((column) => hidden.has(column.key))) {
+    hidden.delete("order");
+  }
+  scmScheduleHiddenColumns = hidden;
+}
+
+function saveScmScheduleColumnPreferences() {
+  try {
+    localStorage.setItem(scmScheduleColumnPreferenceKey(), JSON.stringify({ hiddenColumns: [...scmScheduleHiddenColumns] }));
+  } catch {
+    // Column choices still work for this page when browser storage is unavailable.
+  }
+}
+
+function scmScheduleVisibleColumns(editable = canEditScmSchedule()) {
+  return scmScheduleAvailableColumns(editable).filter((column) => !scmScheduleHiddenColumns.has(column.key));
+}
+
+function scmScheduleColumnAttributes(key) {
+  return `data-column-key="${scmScheduleEscape(key)}"${scmScheduleHiddenColumns.has(key) ? " hidden" : ""}`;
+}
+
+function scmScheduleColumnIsRequired(column) {
+  return !column.utility && !scmScheduleHiddenColumns.has(column.key)
+    && scmScheduleVisibleColumns().filter((item) => !item.utility).length === 1;
+}
+
+function scmScheduleColumnsChooserHtml() {
+  return `<details class="scm-columns-chooser" data-schedule-columns>
+    <summary>Columns</summary>
+    <div class="scm-columns-menu">
+      <div class="scm-columns-menu-heading"><strong>Show columns</strong><button data-action="show-all-columns" type="button">Show all</button></div>
+      ${scmScheduleAvailableColumns().map((column) => `<label>
+        <input type="checkbox" data-schedule-column="${scmScheduleEscape(column.key)}" ${scmScheduleHiddenColumns.has(column.key) ? "" : "checked"} ${scmScheduleColumnIsRequired(column) ? "disabled" : ""} />
+        <span>${scmScheduleEscape(column.key === "action" ? "Actions" : column.label || "Selection")}</span>
+      </label>`).join("")}
+      <small>Keep at least one data column visible.</small>
+    </div>
+  </details>`;
+}
+
+function applyScmScheduleColumnVisibility() {
+  scmScheduleApp.querySelectorAll(".scm-sheet-header[data-column-key], .scm-sheet-cell[data-column-key]").forEach((cell) => {
+    cell.hidden = scmScheduleHiddenColumns.has(cell.dataset.columnKey);
+  });
+  scmScheduleApp.querySelectorAll("[data-schedule-column]").forEach((control) => {
+    const column = SCM_SCHEDULE_COLUMNS.find((item) => item.key === control.dataset.scheduleColumn);
+    control.checked = !scmScheduleHiddenColumns.has(column.key);
+    control.disabled = scmScheduleColumnIsRequired(column);
+  });
+  applyScmScheduleSheetPreferences();
 }
 
 function scmScheduleGridMetrics(editable = canEditScmSchedule()) {
@@ -350,6 +419,14 @@ function scmScheduleColumnFilterHtml(column, {
   dropoffOptions = [],
   brandOptions = []
 } = {}) {
+  if (column.key === "timing") {
+    const context = { showScmWorkingControls, showTypeFilter, showFullColumnFilters, yardManagerView, dropoffOptions, brandOptions };
+    const filters = [["eta", "ETA"], ["driver", "Driver"], ["sla", "SLA"]].map(([key, label]) => {
+      const filter = scmScheduleColumnFilterHtml({ key }, context);
+      return filter ? `<div class="scm-timing-filter"><span>${label}</span>${filter}</div>` : "";
+    }).join("");
+    return filters ? `<div class="scm-timing-filters">${filters}</div>` : "";
+  }
   if (column.key === "date" && showFullColumnFilters) return scmScheduleQueuedDateFilterHtml();
   if (column.key === "type" && showTypeFilter) {
     return scmScheduleHeaderSelect({
@@ -467,7 +544,7 @@ function scmScheduleColumnFilterHtml(column, {
 
 function scmScheduleHeaderHtml(column, context = {}) {
   const filter = scmScheduleColumnFilterHtml(column, context);
-  return `<div class="scm-sheet-header ${filter ? "has-column-filter" : ""}" data-column-key="${scmScheduleEscape(column.key)}">
+  return `<div class="scm-sheet-header ${filter ? "has-column-filter" : ""}" ${scmScheduleColumnAttributes(column.key)}>
     <span class="scm-sheet-header-label">${scmScheduleEscape(column.label)}</span>
     ${filter}
     <button class="scm-column-resizer" data-action="resize-column" data-column-key="${scmScheduleEscape(column.key)}" type="button" aria-label="Resize ${scmScheduleEscape(column.label || "selection")} column" title="Drag to resize column"></button>
@@ -576,6 +653,7 @@ function scmScheduleQuery() {
   if (search) params.set("search", search);
   Object.entries(scmScheduleFilters).forEach(([key, value]) => {
     if (key === "search") return;
+    if (key === "status" && search && scmScheduleCanViewRestrictedOrders()) return;
     if (key === "kind" && !scmScheduleCanShowTypeFilter()) return;
     if (key === "method" && !scmScheduleCanShowScmWorkingControls()) return;
     if (SCM_SCHEDULE_EXTENDED_FILTER_KEYS.has(key) && !scmScheduleCanShowFullColumnFilters()) return;
@@ -1213,7 +1291,8 @@ function scmScheduleRowMatchesCurrentFilters(row = {}) {
     if (!searchable.includes(search)) return false;
   }
   const statuses = scmScheduleFilterValues(scmScheduleFilters.status);
-  if (statuses.length && !statuses.includes(effectiveStatus)) return false;
+  const searchAllStatuses = Boolean(search) && scmScheduleCanViewRestrictedOrders();
+  if (!searchAllStatuses && statuses.length && !statuses.includes(effectiveStatus)) return false;
   if (scmScheduleFilters.method && row.method !== scmScheduleFilters.method) return false;
   if (scmScheduleFilters.kind === "Sp.O" && !(row.orderKind === "PO" && row.isSpecialOrder)) return false;
   if (scmScheduleFilters.kind && scmScheduleFilters.kind !== "Sp.O" && row.orderKind !== scmScheduleFilters.kind) return false;
@@ -1252,8 +1331,8 @@ function scmScheduleRowMatchesCurrentFilters(row = {}) {
   if (view !== "blanket" && row.isBlanket) return false;
   if (view === "blanket" && (row.orderKind !== "PO" || !row.isBlanket)) return false;
   if (view === "dispatch"
-    && (row.method !== "MBT" || ["Cancelled", "Hold"].includes(effectiveStatus))) return false;
-  if (view === "completed" && !["Completed", "Cancelled"].includes(effectiveStatus)) return false;
+    && (row.method !== "MBT" || (!searchAllStatuses && ["Cancelled", "Hold"].includes(effectiveStatus)))) return false;
+  if (!searchAllStatuses && view === "completed" && !["Completed", "Cancelled"].includes(effectiveStatus)) return false;
   if (scmScheduleReviewOnly && !scmScheduleNeedsReconciliationReview(row)) return false;
   return true;
 }
@@ -1818,6 +1897,24 @@ function scmScheduleDisplayType(row = {}, { scmWorkingView = canEditScmSchedule(
   return row.isSpecialOrder && !scmWorkingView ? "Sp.O" : row.orderKind;
 }
 
+function scmScheduleTimingCell(row) {
+  const eta = [row.etaDate, row.etaTime].filter(Boolean).join(" ");
+  return [["ETA", eta], ["Driver", row.driver], ["SLA", row.sla]].map(([label, value]) =>
+    `<div class="scm-timing-value" title="${label}: ${scmScheduleEscape(value || "--")}"><span class="scm-timing-label">${label}</span>${readOnlyCell(value)}</div>`
+  ).join("");
+}
+
+function scmScheduleCanCompleteVendor(row = {}) {
+  return canEditScmSchedule()
+    && scmScheduleCanViewRestrictedOrders()
+    && ["PO", "TO", "VRMA"].includes(row.orderKind)
+    && String(row.method || "").trim().toLowerCase() === "vendor"
+    && !["Cancelled", "Closed"].includes(scmScheduleEffectiveStatus(row))
+    && !scmScheduleNeedsReconciliationReview(row)
+    && row.scmSplitLocked !== true
+    && (!row.dispatchCompletionEvidenceType || row.dispatchCompletionEvidenceType === "reconciliation");
+}
+
 function scmScheduleTableRowHtml(row, { pickupOptions = [], dropoffOptions = OWN_YARDS } = {}) {
     const rowId = scheduleRowId(row);
     const editable = canEditScmSchedule();
@@ -1830,7 +1927,6 @@ function scmScheduleTableRowHtml(row, { pickupOptions = [], dropoffOptions = OWN
     const statusEditable = rowEditable && !SCM_SYSTEM_STATUSES.has(displayStatus);
     const selectable = rowEditable && row.orderKind === "PO" && !row.groupRef && !String(row.orderRef || "").toUpperCase().startsWith("PGOB-");
     const displayType = scmScheduleDisplayType(row, { scmWorkingView });
-    const eta = [row.etaDate, row.etaTime].filter(Boolean).join(" ") || "--";
     const isGroupOrder = Boolean(row.groupRef) || String(row.orderRef || "").toUpperCase().startsWith("PGOB-");
     const blanketView = scmScheduleFilters.view === "blanket";
     const canManageBlankets = scmScheduleCanManageBlankets();
@@ -1843,6 +1939,7 @@ function scmScheduleTableRowHtml(row, { pickupOptions = [], dropoffOptions = OWN
     const canCompleteVrma = editable
       && scmScheduleCanCompleteVrma()
       && row.orderKind === "VRMA"
+      && String(row.method || "").trim().toLowerCase() !== "vendor"
       && !["Completed", "Cancelled", "Hold"].includes(displayStatus);
     const rowFormatting = scmScheduleRowFormatting(displayStatus);
     const typeFormatting = scmScheduleCellFormatting("type", row.isSpecialOrder ? "Sp.O" : row.orderKind);
@@ -1852,9 +1949,9 @@ function scmScheduleTableRowHtml(row, { pickupOptions = [], dropoffOptions = OWN
     const rowDropoffOptions = Array.isArray(row.dropoffOptions) ? row.dropoffOptions : dropoffOptions;
     return `
       <div class="scm-sheet-row status-${scmScheduleEscape(displayStatus.toLowerCase().replaceAll(" ", "-"))} ${isGroupOrder ? "group-order" : ""} ${reconciliationReview ? "reconcile-review" : ""} ${splitOperationalLock ? "split-operational-lock" : ""}${rowFormatting.className}" data-schedule-row="${scmScheduleEscape(rowId)}" data-row-ref="${scmScheduleEscape(row.orderRef)}"${rowFormatting.style}>
-        ${editable ? `<div class="scm-sheet-cell scm-select-cell">${selectable ? `<input data-action="select-row" data-row="${scmScheduleEscape(rowId)}" type="checkbox" ${scmScheduleSelectedRows.has(rowId) ? "checked" : ""} aria-label="Select ${scmScheduleEscape(row.orderRef)}" />` : ""}</div>` : ""}
-        <div class="scm-sheet-cell readonly">${readOnlyCell(scheduleDateText(row))}</div>
-        <div class="scm-sheet-cell readonly scm-type-cell${typeFormatting.className}"${typeFormatting.style}>
+        ${editable ? `<div class="scm-sheet-cell scm-select-cell" ${scmScheduleColumnAttributes("select")}>${selectable ? `<input data-action="select-row" data-row="${scmScheduleEscape(rowId)}" type="checkbox" ${scmScheduleSelectedRows.has(rowId) ? "checked" : ""} aria-label="Select ${scmScheduleEscape(row.orderRef)}" />` : ""}</div>` : ""}
+        <div class="scm-sheet-cell readonly" ${scmScheduleColumnAttributes("date")}>${readOnlyCell(scheduleDateText(row))}</div>
+        <div class="scm-sheet-cell readonly scm-type-cell${typeFormatting.className}"${typeFormatting.style} ${scmScheduleColumnAttributes("type")}>
           <strong>${scmScheduleEscape(displayType)}</strong>
           ${scmWorkingView && row.orderKind === "PO" ? `<label class="scm-sheet-check"><input data-row="${scmScheduleEscape(rowId)}" data-field="isSpecialOrder" type="checkbox" ${row.isSpecialOrder ? "checked" : ""} ${rowEditable ? "" : "disabled"} /><span>Sp.O</span></label>` : ""}
           ${blanketView && row.orderKind === "PO" ? `<label class="scm-blanket-flag ${row.isBlanket ? "active" : ""}" title="${row.isBlanket ? "Flagged blanket parent: hidden from normal schedules and dispatch planning" : "Flag this large parent PO as a blanket order"}">
@@ -1863,33 +1960,31 @@ function scmScheduleTableRowHtml(row, { pickupOptions = [], dropoffOptions = OWN
             <span aria-hidden="true">⚑</span> Blanket
           </label>` : ""}
         </div>
-        <div class="scm-sheet-cell">${rowEditable ? selectHtml({ rowId, field: "method", value: row.method, options: SCM_METHODS }) : readOnlyCell(row.method)}</div>
-        <div class="scm-sheet-cell">${rowEditable && rowPickupOptions.length
+        <div class="scm-sheet-cell" ${scmScheduleColumnAttributes("method")}>${rowEditable ? selectHtml({ rowId, field: "method", value: row.method, options: SCM_METHODS }) : readOnlyCell(row.method)}</div>
+        <div class="scm-sheet-cell" ${scmScheduleColumnAttributes("pickup")}>${rowEditable && rowPickupOptions.length
           ? selectHtml({ rowId, field: "pickupPoint", value: row.pickupPoint, options: rowPickupOptions })
           : readOnlyCell(row.pickupPoint)}</div>
-        <div class="scm-sheet-cell scm-dropoff-cell${dropoffFormatting.className}"${dropoffFormatting.style}>${rowEditable
+        <div class="scm-sheet-cell scm-dropoff-cell${dropoffFormatting.className}"${dropoffFormatting.style} ${scmScheduleColumnAttributes("dropoff")}>${rowEditable
           ? row.orderKind === "PO"
             ? poDestinationOverrideSelectHtml({ rowId, row, options: rowDropoffOptions })
             : selectHtml({ rowId, field: "dropoffPoint", value: row.dropoffPoint, options: rowDropoffOptions })
           : readOnlyCell(row.dropoffPoint)}</div>
-        <div class="scm-sheet-cell readonly">${readOnlyCell(row.orderKind === "TO" ? "Transfer Order" : row.brand || row.party)}</div>
-        <div class="scm-sheet-cell readonly content-cell">${contentCell(row)}</div>
-        <div class="scm-sheet-cell ${remarkEditable ? "" : "readonly"} remark-cell">${remarkCell(row, { rowId, editable: remarkEditable })}</div>
-        <div class="scm-sheet-cell readonly">
+        <div class="scm-sheet-cell readonly" ${scmScheduleColumnAttributes("brand")}>${readOnlyCell(row.orderKind === "TO" ? "Transfer Order" : row.brand || row.party)}</div>
+        <div class="scm-sheet-cell readonly content-cell" ${scmScheduleColumnAttributes("content")}>${contentCell(row)}</div>
+        <div class="scm-sheet-cell ${remarkEditable ? "" : "readonly"} remark-cell" ${scmScheduleColumnAttributes("remark")}>${remarkCell(row, { rowId, editable: remarkEditable })}</div>
+        <div class="scm-sheet-cell readonly" ${scmScheduleColumnAttributes("order")}>
           ${orderNumberCell(row)}
         </div>
-        <div class="scm-sheet-cell readonly number-cell">${readOnlyCell(Math.round(Number(row.weightLbs || 0)).toLocaleString())}</div>
-        <div class="scm-sheet-cell ${rowEditable ? "" : "readonly"}">${rowEditable
+        <div class="scm-sheet-cell readonly number-cell" ${scmScheduleColumnAttributes("weight")}>${readOnlyCell(Math.round(Number(row.weightLbs || 0)).toLocaleString())}</div>
+        <div class="scm-sheet-cell ${rowEditable ? "" : "readonly"}" ${scmScheduleColumnAttributes("packing")}>${rowEditable
           ? inputHtml({ rowId, field: "packingSlipRef", value: row.packingSlipRef, placeholder: "Packing slip" })
           : reconciliationReview ? readOnlyCell(row.packingSlipRef) : poSplitLink(row.packingSlipRef)}</div>
-        <div class="scm-sheet-cell readonly">${readOnlyCell(eta)}</div>
-        <div class="scm-sheet-cell readonly">${readOnlyCell(row.driver)}</div>
-        <div class="scm-sheet-cell scm-reconcile-status-cell ${statusEditable ? "" : "readonly"}${statusFormatting.className}"${statusFormatting.style}>
+        <div class="scm-sheet-cell readonly scm-timing-cell" ${scmScheduleColumnAttributes("timing")}>${scmScheduleTimingCell(row)}</div>
+        <div class="scm-sheet-cell scm-reconcile-status-cell ${statusEditable ? "" : "readonly"}${statusFormatting.className}"${statusFormatting.style} ${scmScheduleColumnAttributes("status")}>
           ${statusEditable ? selectHtml({ rowId, field: "status", value: displayStatus, options: SCM_MANUAL_STATUSES }) : readOnlyCell(displayStatus)}
           ${scmScheduleReconciliationBadge(row)}
         </div>
-        <div class="scm-sheet-cell readonly">${readOnlyCell(row.sla)}</div>
-        <div class="scm-sheet-cell action-cell">
+        <div class="scm-sheet-cell action-cell" ${scmScheduleColumnAttributes("action")}>
           ${editable
             ? reconciliationReview
               ? `<span class="scm-review-blocked" title="Resolve reconciliation review before editing this order.">Review blocked</span>`
@@ -1898,6 +1993,11 @@ function scmScheduleTableRowHtml(row, { pickupOptions = [], dropoffOptions = OWN
                   <button data-action="save-remark-row" data-row="${scmScheduleEscape(rowId)}" data-ref="${scmScheduleEscape(row.orderRef)}" type="button" ${scmScheduleSavingRef === rowId ? "disabled" : ""}>${scmScheduleSavingRef === rowId ? "Saving" : "Save remark"}</button>`
                 : `<button data-action="save-row" data-row="${scmScheduleEscape(rowId)}" data-ref="${scmScheduleEscape(row.orderRef)}" data-kind="${scmScheduleEscape(row.orderKind)}" type="button" ${scmScheduleSavingRef === rowId ? "disabled" : ""}>${scmScheduleSavingRef === rowId ? "Saving" : "Save"}</button>`
             : `<span class="view-only-chip">View</span>`}
+          ${scmScheduleCanCompleteVendor(row)
+            ? `<button class="primary scm-complete-vrma" data-action="complete-vendor"
+                data-row="${scmScheduleEscape(rowId)}" type="button"
+                ${scmScheduleVendorCompletingRef === rowId ? "disabled" : ""}>${scmScheduleVendorCompletingRef === rowId ? "Completing…" : "Complete"}</button>`
+            : ""}
           ${canCompleteVrma
             ? `<button class="primary scm-complete-vrma" data-action="complete-vrma"
                 data-row="${scmScheduleEscape(rowId)}" type="button"
@@ -1938,7 +2038,6 @@ function renderScmSchedule() {
   const pickupOptions = scheduleOptionList("pickupPoint");
   const dropoffOptions = scheduleOptionList("dropoffPoint");
   const brandOptions = scheduleOptionList("brand");
-  const sheetMetrics = scmScheduleGridMetrics(editable);
   const reconciliationReviewCount = scmScheduleReviewCount();
   scmScheduleApp.innerHTML = `
     <header class="dispatch-topbar">
@@ -1970,14 +2069,15 @@ function renderScmSchedule() {
           <span>Show reconciliation details</span>
         </label>` : ""}
         <div class="scm-sheet-settings" role="group" aria-label="Schedule display settings">
+          ${scmScheduleColumnsChooserHtml()}
           <label>Font <input data-sheet-setting="fontSize" type="range" min="10" max="18" step="1" value="${scmScheduleSheetPreferences.fontSize}" /><output data-sheet-output="fontSize">${scmScheduleSheetPreferences.fontSize}px</output></label>
           <label>Row <input data-sheet-setting="rowHeight" type="range" min="38" max="120" step="2" value="${scmScheduleSheetPreferences.rowHeight}" /><output data-sheet-output="rowHeight">${scmScheduleSheetPreferences.rowHeight}px</output></label>
-          <button data-action="reset-sheet-layout" type="button" title="Reset column widths, row height, and font size">Reset layout</button>
+          <button data-action="reset-sheet-layout" type="button" title="Show all columns and reset widths, row height, and font size">Reset layout</button>
         </div>
       </div>
       <div class="scm-sheet-wrap">
         <div class="scm-sheet-grid ${editable ? "with-select" : ""}" style="${scmScheduleGridStyle(editable)}">
-          ${sheetMetrics.columns.map((column) => scmScheduleHeaderHtml(column, {
+          ${scmScheduleAvailableColumns(editable).map((column) => scmScheduleHeaderHtml(column, {
             showScmWorkingControls,
             showTypeFilter,
             showFullColumnFilters,
@@ -2153,6 +2253,16 @@ scmScheduleApp.addEventListener("input", (event) => {
 });
 
 scmScheduleApp.addEventListener("change", async (event) => {
+  const columnControl = event.target.closest("[data-schedule-column]");
+  if (columnControl) {
+    const column = scmScheduleAvailableColumns().find((item) => item.key === columnControl.dataset.scheduleColumn);
+    if (!column) return;
+    if (columnControl.checked) scmScheduleHiddenColumns.delete(column.key);
+    else if (!scmScheduleColumnIsRequired(column)) scmScheduleHiddenColumns.add(column.key);
+    saveScmScheduleColumnPreferences();
+    applyScmScheduleColumnVisibility();
+    return;
+  }
   const preference = event.target.closest("[data-reconciliation-preference]");
   if (preference) {
     try {
@@ -2467,6 +2577,29 @@ scmScheduleApp.addEventListener("click", async (event) => {
     return;
   }
 
+  if (action === "complete-vendor") {
+    const rowId = target.dataset.row || "";
+    const row = scmScheduleRows.find((item) => scheduleRowId(item) === rowId);
+    if (!row || !scmScheduleCanCompleteVendor(row) || scmScheduleVendorCompletingRef) return;
+    scmScheduleVendorCompletingRef = rowId;
+    scmScheduleNotice = `Completing ${row.orderRef}...`;
+    renderScmSchedule();
+    try {
+      await scmScheduleApi(`/api/scm/schedule/${encodeURIComponent(row.orderRef)}/complete-vendor`, {
+        method: "POST",
+        body: JSON.stringify({ orderKind: row.orderKind, expectedUpdatedAt: row.updatedAt })
+      });
+      scmScheduleNotice = `${row.orderRef} was marked Completed.`;
+      await loadScmSchedule();
+    } catch (error) {
+      scmScheduleNotice = `Completion failed: ${error.message}`;
+    } finally {
+      scmScheduleVendorCompletingRef = "";
+      renderScmSchedule();
+    }
+    return;
+  }
+
   if (action === "complete-vrma") {
     const rowId = target.dataset.row || "";
     const row = scmScheduleRows.find((item) => scheduleRowId(item) === rowId);
@@ -2578,13 +2711,25 @@ scmScheduleApp.addEventListener("click", async (event) => {
     return;
   }
 
+  if (action === "show-all-columns") {
+    scmScheduleHiddenColumns.clear();
+    saveScmScheduleColumnPreferences();
+    applyScmScheduleColumnVisibility();
+    return;
+  }
+
   if (action === "reset-sheet-layout") {
     scmScheduleSheetPreferences = loadScmScheduleSheetPreferences();
     scmScheduleSheetPreferences.fontSize = SCM_SCHEDULE_SHEET_DEFAULTS.fontSize;
     scmScheduleSheetPreferences.rowHeight = SCM_SCHEDULE_SHEET_DEFAULTS.rowHeight;
     scmScheduleSheetPreferences.widths = Object.fromEntries(SCM_SCHEDULE_COLUMNS.map((column) => [column.key, column.width]));
     saveScmScheduleSheetPreferences();
-    renderScmSchedule();
+    scmScheduleHiddenColumns.clear();
+    saveScmScheduleColumnPreferences();
+    applyScmScheduleColumnVisibility();
+    scmScheduleApp.querySelectorAll("[data-sheet-setting]").forEach((control) => {
+      control.value = scmScheduleSheetPreferences[control.dataset.sheetSetting];
+    });
     return;
   }
 
@@ -2721,6 +2866,20 @@ scmScheduleApp.addEventListener("click", async (event) => {
 
 window.addEventListener("mbbs-language-changed", renderScmSchedule);
 
+scmScheduleApp.addEventListener("keydown", (event) => {
+  if (event.key !== "Escape") return;
+  const chooser = event.target.closest("[data-schedule-columns]");
+  if (!chooser?.open) return;
+  chooser.open = false;
+  chooser.querySelector("summary").focus({ preventScroll: true });
+  event.preventDefault();
+});
+
+document.addEventListener("click", (event) => {
+  const chooser = scmScheduleApp.querySelector("[data-schedule-columns][open]");
+  if (chooser && !chooser.contains(event.target)) chooser.open = false;
+});
+
 requireDispatchLogin({
   mount: scmScheduleApp,
   roles: scmScheduleSalesHost
@@ -2728,6 +2887,7 @@ requireDispatchLogin({
     : ["admin", "scm", "scm_staff", "dispatcher", "yard_manager"],
   async onReady(operator) {
     scmScheduleOperator = operator;
+    loadScmScheduleColumnPreferences();
     scmScheduleFilters.view = scmScheduleDefaultViewForRole();
     await loadScmScheduleFilterPreference();
     await loadScmScheduleReconciliationPreference();

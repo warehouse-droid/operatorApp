@@ -1,0 +1,11 @@
+FROM mbbs-operator-app:scm-ir-split-ref-20260908-v1
+
+USER root
+COPY --chown=node:node src/server.js /app/src/server.js
+COPY --chown=node:node src/dispatch-history-mode.js /app/src/dispatch-history-mode.js
+COPY --chown=node:node src/dispatch-completion-repository.js /app/src/dispatch-completion-repository.js
+COPY --chown=node:node public/dispatch.js /app/public/dispatch.js
+COPY --chown=node:node public/dispatch.html /app/public/dispatch.html
+COPY --chown=node:node tools/dispatch-reconciliation-completed-planning-replay.mjs /app/tools/dispatch-reconciliation-completed-planning-replay.mjs
+
+USER node

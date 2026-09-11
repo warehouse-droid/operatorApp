@@ -13,6 +13,7 @@ const CHECKOUT_SHA = "11d5960a326750d5838078e36cf38b85af677262";
 const UPLOAD_ARTIFACT_SHA = "043fb46d1a93c77aae656e7c1c64a875d1fc6a0a";
 const P3_DEDICATED_MUTATION_RUNNERS = Object.freeze([
   "run-auto-transfer-auto-approval-mutations.mjs",
+  "run-co-cargo-mutations.mjs",
   "run-customer-charge-mutations.mjs",
   "run-delivery-instruction-mutations.mjs",
   "run-dispatch-active-load-mutations.mjs",
@@ -41,6 +42,7 @@ const P3_DEDICATED_MUTATION_RUNNERS = Object.freeze([
   "run-driver-pwa-site-reset-mutations.mjs",
   "run-frontdesk-mutations.mjs",
   "run-global-order-pool-dependency-preview-mutations.mjs",
+  "run-google-maps-usage-mutations.mjs",
   "run-mbbs-cross-charge-v4-mutations.mjs",
   "run-mbbs-vendor-route-rate-mutations.mjs",
   "run-netsuite-delayed-status-refresh-mutations.mjs",
@@ -57,8 +59,10 @@ const P3_DEDICATED_MUTATION_RUNNERS = Object.freeze([
   "run-p39-client-mutations.mjs",
   "run-p39-mutations.mjs",
   "run-p39-reservation-mutations.mjs",
+  "run-schedule-column-mutations.mjs",
   "run-scm-authoritative-schedule-status-mutations.mjs",
   "run-scm-dependency-management-mutations.mjs",
+  "run-scm-ir-split-reference-mutations.mjs",
   "run-scm-manual-split-authority-mutations.mjs",
   "run-scm-netsuite-address-pickup-mutations.mjs",
   "run-scm-po-group-rollup-recovery-mutations.mjs",
@@ -71,6 +75,7 @@ const P3_DEDICATED_MUTATION_RUNNERS = Object.freeze([
   "run-scm-schedule-loading-mutations.mjs",
   "run-scm-schedule-remark-mutations.mjs",
   "run-scm-schedule-status-mutations.mjs",
+  "run-scm-search-vendor-mutations.mjs",
   "run-scm-split-receipt-allocation-mutations.mjs",
   "run-scm-split-status-evidence-precedence-mutations.mjs",
   "run-smart-scm-blanket-merge-mutations.mjs",
@@ -82,7 +87,8 @@ const P3_DEDICATED_MUTATION_RUNNERS = Object.freeze([
   "run-special-stock-request-mutations.mjs",
   "run-stock-request-mutations.mjs",
   "run-test-database-isolation-mutations.mjs",
-  "run-transfer-dependency-source-backorder-mutations.mjs"
+  "run-transfer-dependency-source-backorder-mutations.mjs",
+  "run-transfer-unlink-mutations.mjs"
 ]);
 const P3_BASE_MUTANT_NAMES = Object.freeze([
   "P3 predeploy no longer requires migration 110",
@@ -137,6 +143,7 @@ const P3_BASE_MUTANT_NAMES = Object.freeze([
 const P3_ADVERSARIAL_TESTS = Object.freeze([
   "dispatch-completion-repository-adversarial.test.js",
   "driver-completed-photo-evidence.adversarial.test.js",
+  "driver-live-route-prefix-lock.adversarial.test.js",
   "driver-plan-date-execution-adversarial.test.js",
   "driver-pwa-historical-assist-adversarial.test.js",
   "operator-netsuite-posting-adversarial.test.js",

@@ -23,7 +23,7 @@ const IS_ADMIN_PAGE = window.location.pathname.startsWith("/admin");
 const SECTION_STORAGE_KEY = IS_ADMIN_PAGE ? "mbbs.admin.section" : "mbbs.control.section";
 const ACCOUNT_SELECTION_KEY = "mbbs.admin.selectedAccount";
 const SCM_RECONCILIATION_SELECTED_RUN_KEY = "mbbs.admin.reconciliation.selectedRun";
-const ADMIN_SECTIONS = new Set(["dashboard", "operators", "sync", "reconciliation", "return-automation", "storage", "audit"]);
+const ADMIN_SECTIONS = new Set(["dashboard", "operators", "sync", "maps-usage", "reconciliation", "return-automation", "storage", "audit"]);
 const CONTROL_SECTIONS = new Set(["dashboard", "returns", "locks", "classification", "vendor-mapping", "warnings", "loaded-export", "cycle-count", "fulfillment"]);
 const CONTROL_SECTION_ROUTES = {
   dashboard: "/control",
@@ -40,6 +40,7 @@ const ADMIN_SECTION_ROUTES = {
   dashboard: "/admin",
   operators: "/admin/accounts",
   sync: "/admin/sync",
+  "maps-usage": "/admin/maps-usage",
   reconciliation: "/admin/reconciliation",
   "return-automation": "/admin/return-automation",
   storage: "/admin/photo-storage",
@@ -232,6 +233,19 @@ let token = readStaffToken();
 let operator = null;
 let operators = [];
 let publicSalesSettings = { enabled: false, updatedBy: null, updatedAt: null };
+let mapsUsage = {
+  rolling30Day: 0,
+  projected30DayFromSevenDays: 0,
+  remaining: 0,
+  hardLimit: 4_500,
+  consoleTarget: 5_000,
+  deniedCount30Day: 0,
+  failedCount30Day: 0,
+  budgetState: "normal",
+  mode: "conserve",
+  daily: [],
+  actions: []
+};
 let selectedOperatorId = localStorage.getItem(ACCOUNT_SELECTION_KEY) || "";
 let audit = [];
 let classifications = [];
@@ -1621,12 +1635,98 @@ function renderActiveSection() {
   if (activeSection === "storage") return renderStorageSection();
   if (activeSection === "reconciliation") return renderScmReconciliationSection();
   if (activeSection === "sync") return renderSyncSection();
+  if (activeSection === "maps-usage") return renderMapsUsageSection();
   if (activeSection === "warnings") return renderWarningsSection();
   if (activeSection === "loaded-export") return renderLoadedExportSection();
   if (activeSection === "cycle-count") return renderCycleCountSection();
   if (activeSection === "fulfillment") return renderFulfillmentSection();
   if (activeSection === "audit") return renderAuditSection();
   return renderDashboardSection();
+}
+
+function mapsUsageActionLabel(action = {}) {
+  const labels = {
+    confirm: "Dispatch plan confirmation",
+    manual_refresh: "Manual route / ETA refresh",
+    driver_location_check: "Driver location verification",
+    frontdesk_distance: "MBT Front Desk distance",
+    browser_page_load: "Google browser map",
+    dependency_suggestion: "Dependency route suggestion"
+  };
+  return labels[action.reason] || String(action.reason || action.subsystem || "Unknown action")
+    .replaceAll("_", " ")
+    .replace(/\b\w/gu, (letter) => letter.toUpperCase());
+}
+
+function mapsUsagePercent(value, maximum) {
+  return Math.max(0, Math.min(100, Math.round((Number(value || 0) / Math.max(1, Number(maximum || 1))) * 100)));
+}
+
+function renderMapsUsageSection() {
+  if (!hasStaffAuthority(operator, ["admin"])) return "";
+  const actions = [...(mapsUsage.actions || [])].sort((left, right) =>
+    Number(right.admittedUnits || 0) - Number(left.admittedUnits || 0)
+      || Number(right.attemptedUnits || 0) - Number(left.attemptedUnits || 0)
+  );
+  const daily = mapsUsage.daily || [];
+  const dailyMaximum = Math.max(1, ...daily.map((row) => Number(row.admittedUnits || 0)));
+  const topAction = actions[0] || null;
+  const usagePercent = mapsUsagePercent(mapsUsage.rolling30Day, mapsUsage.hardLimit);
+  return `
+    <section class="panel maps-usage-panel">
+      <div class="section-heading">
+        <div>
+          <h2>Google Maps API Usage</h2>
+          <p class="muted">Application-metered calls for the rolling 30-day window. Google Cloud billing remains the final authority.</p>
+        </div>
+        <button data-action="refresh-maps-usage" type="button">Refresh</button>
+      </div>
+      ${mapsUsage.error ? `<div class="notice sync-error" role="alert"><strong>Usage data unavailable</strong><span>${escapeHtml(mapsUsage.error)}</span></div>` : ""}
+      <div class="maps-usage-metrics">
+        <article><span>Admitted units · rolling 30 days</span><strong>${Number(mapsUsage.rolling30Day || 0).toLocaleString()}</strong><small>${usagePercent}% of the ${Number(mapsUsage.hardLimit || 0).toLocaleString()} app limit</small></article>
+        <article><span>Projected 30 days</span><strong>${Number(mapsUsage.projected30DayFromSevenDays || 0).toLocaleString()}</strong><small>Based on the latest seven complete UTC days</small></article>
+        <article><span>Capacity remaining</span><strong>${Number(mapsUsage.remaining || 0).toLocaleString()}</strong><small>Requests over capacity fall back immediately; they are not queued</small></article>
+        <article><span>Blocked / failed</span><strong>${Number(mapsUsage.deniedCount30Day || 0).toLocaleString()} / ${Number(mapsUsage.failedCount30Day || 0).toLocaleString()}</strong><small>Denied before Google / admitted calls that failed</small></article>
+      </div>
+      <div class="maps-usage-budget" role="img" aria-label="${usagePercent}% of Google Maps application budget used">
+        <span style="width:${usagePercent}%"></span>
+      </div>
+      <div class="maps-usage-highlight">
+        <strong>Highest usage action</strong>
+        <span>${topAction ? `${escapeHtml(mapsUsageActionLabel(topAction))} · ${Number(topAction.admittedUnits || 0).toLocaleString()} admitted unit(s)` : "No metered calls recorded yet."}</span>
+      </div>
+      <section class="maps-usage-chart-section">
+        <div><h3>Daily admitted usage</h3><p class="muted">UTC days · ${escapeHtml(mapsUsage.mode || "conserve")} mode · hover a bar for attempted, denied, and failed counts</p></div>
+        <div class="maps-usage-chart" data-maps-usage-chart role="img" aria-label="Thirty-day Google Maps API usage graph">
+          ${daily.map((row) => {
+            const height = mapsUsagePercent(row.admittedUnits, dailyMaximum);
+            const label = String(row.day || "").slice(5);
+            return `<div class="maps-usage-day" title="${escapeHtml(`${row.day}: ${row.admittedUnits} admitted, ${row.attemptedUnits} attempted, ${row.deniedCount} denied, ${row.failedCount} failed`)}"><span class="maps-usage-bar" style="height:${height}%"></span><small>${escapeHtml(label)}</small></div>`;
+          }).join("") || `<div class="notice">No daily usage has been recorded yet.</div>`}
+        </div>
+      </section>
+      <section class="maps-usage-actions">
+        <h3>Usage by action</h3>
+        <div class="table-scroll">
+          <table>
+            <thead><tr><th>Action</th><th>Subsystem</th><th>API</th><th>Admitted</th><th>Attempted</th><th>Denied</th><th>Failed</th><th>Avg latency</th></tr></thead>
+            <tbody>${actions.map((action) => `
+              <tr>
+                <td><strong>${escapeHtml(mapsUsageActionLabel(action))}</strong></td>
+                <td>${escapeHtml(action.subsystem || "—")}</td>
+                <td>${escapeHtml(action.api || "—")}</td>
+                <td>${Number(action.admittedUnits || 0).toLocaleString()}</td>
+                <td>${Number(action.attemptedUnits || 0).toLocaleString()}</td>
+                <td>${Number(action.deniedCount || 0).toLocaleString()}</td>
+                <td>${Number(action.failedCount || 0).toLocaleString()}</td>
+                <td>${action.averageLatencyMs == null ? "—" : `${Number(action.averageLatencyMs).toLocaleString()} ms`}</td>
+              </tr>
+            `).join("") || `<tr><td colspan="8">No metered actions recorded yet.</td></tr>`}</tbody>
+          </table>
+        </div>
+      </section>
+    </section>
+  `;
 }
 
 function renderDashboardSection() {
@@ -1646,6 +1746,11 @@ function renderDashboardSection() {
           <span>${t("control.netsuiteSync", "NetSuite Sync")}</span>
           <strong>${syncSettings.mode === "auto" ? t("control.auto", "Auto") : t("control.manual", "Manual")}</strong>
           <em>${syncSettings.running ? t("control.syncRunning", "sync running") : syncSettings.lastStatus || "idle"}</em>
+        </button>
+        <button class="metric-card ${["conserve", "reserve", "exhausted"].includes(mapsUsage.budgetState) ? "warning" : ""}" data-action="control-section" data-section="maps-usage" type="button">
+          <span>Google Maps Usage</span>
+          <strong>${Number(mapsUsage.rolling30Day || 0).toLocaleString()} / ${Number(mapsUsage.hardLimit || 4_500).toLocaleString()}</strong>
+          <em>${Number(mapsUsage.projected30DayFromSevenDays || 0).toLocaleString()} projected from 7 complete UTC days</em>
         </button>
         <button class="metric-card" data-action="control-section" data-section="return-automation" type="button">
           <span>Return Automation</span>
@@ -4601,7 +4706,7 @@ async function loadAdminReturnSettings() {
 
 async function loadControlData() {
   if (IS_ADMIN_PAGE) {
-    const [nextOperators, nextAuditOptions, nextAudit, nextSyncSettings, nextM2mStatus, nextEnvSettings, nextPhotoArchiveSettings, nextMirrorStatus, nextPublicSalesSettings] = await Promise.all([
+    const [nextOperators, nextAuditOptions, nextAudit, nextSyncSettings, nextM2mStatus, nextEnvSettings, nextPhotoArchiveSettings, nextMirrorStatus, nextPublicSalesSettings, nextMapsUsage] = await Promise.all([
       request("/api/operators"),
       request(auditOptionsQueryString()),
       request(auditQueryString()),
@@ -4610,7 +4715,8 @@ async function loadControlData() {
       request("/api/control/env-settings"),
       request("/api/admin/photo-archive"),
       request("/api/admin/netsuite-mirror"),
-      request("/api/admin/public-sales")
+      request("/api/admin/public-sales"),
+      request("/api/admin/maps-usage").catch((error) => ({ ...mapsUsage, error: error.message }))
     ]);
     operators = nextOperators;
     auditOptions = nextAuditOptions;
@@ -4621,6 +4727,7 @@ async function loadControlData() {
     photoArchiveSettings = nextPhotoArchiveSettings;
     mirrorStatus = nextMirrorStatus;
     publicSalesSettings = nextPublicSalesSettings;
+    mapsUsage = nextMapsUsage;
     await Promise.all([
       loadAdminReturnSettings(),
       loadScmReconciliationControl()
@@ -4768,6 +4875,12 @@ app.addEventListener("click", async (event) => {
   try {
     if (button.dataset.action === "control-section") {
       return setActiveSection(button.dataset.section);
+    }
+    if (button.dataset.action === "refresh-maps-usage") {
+      button.disabled = true;
+      mapsUsage = await request("/api/admin/maps-usage");
+      render();
+      return;
     }
     if (button.dataset.action === "new-account") {
       selectedOperatorId = "new";

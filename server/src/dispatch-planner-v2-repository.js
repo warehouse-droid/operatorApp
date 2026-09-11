@@ -16,7 +16,8 @@ import { dispatchLoadAssignment } from "./dispatch-load-assignment.js";
 import { materializeDispatchPickupVisits } from "./dispatch-pickup-visits.js";
 import {
   dispatchPlannedAssignmentMap,
-  dispatchPlanV2Summary
+  dispatchPlanV2Summary,
+  refreshDispatchPlanAuthoritativeOrderProjection
 } from "./dispatch-plan-repository.js";
 import {
   applyDispatchPlanDelta,
@@ -964,6 +965,10 @@ export async function applyDispatchV2Command({ planId, command = {}, actorId = n
       reactivatedGlobalOrderRefs: commandReactivatedRefs,
       rejectRetiredGlobalOrderRefs: true
     });
+    // Global definitions can replace hydrated group lines with raw allocation
+    // quantities. Refresh relationships after that replacement, just as a full
+    // save does, before deciding which physical pickups are actually required.
+    result.plan = await refreshDispatchPlanAuthoritativeOrderProjection(result.plan);
     const pickupVisits = materializeDispatchPickupVisits(result.plan, {
       previousPlan: plan,
       allowLegacyPassthrough: true

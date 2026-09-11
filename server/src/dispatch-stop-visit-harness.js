@@ -205,7 +205,7 @@ assert.deepEqual(
   ["CUSTOM-1", "SOB-1"],
   "A Google-map hover must resolve every logical order represented by the consolidated marker."
 );
-const mapInfoSource = sourceSlice("function mapMarkerInfoWindowHtml", "function routeEstimateFromGoogleLegs");
+const mapInfoSource = sourceSlice("function mapMarkerInfoWindowHtml", "function fallbackLegMinutesForRouteStops");
 assert.match(mapInfoSource, /mapMarkerOrderEntries/);
 assert.match(mapInfoSource, /tooltipItemRowsForOrder/);
 assert.match(mapInfoSource, /includeOrderHeader:\s*true/);
@@ -239,13 +239,13 @@ assert.match(
 assert.match(mapPreviewSource, /marker\.addListener\("mouseover"/);
 assert.match(mapPreviewSource, /marker\.addListener\("mouseout"/);
 
-const directionsSource = sourceSlice("function directionsRequestForLoad", "function googleRouteForLoad");
+const directionsSource = sourceSlice("async function googleRouteForLoad", "function routeEstimateSummaryHtml");
 assert.doesNotMatch(
   directionsSource,
   /mergeConsecutiveExactDropMarkers/,
-  "Marker grouping must never change Google Directions inputs or logical leg indexes."
+  "Marker grouping must never change route inputs or logical leg indexes."
 );
-assert.match(directionsSource, /waypoints: stops\.slice\(1, -1\)/);
+assert.match(directionsSource, /stops: stops\.map\(\(stop\)/, "The server route request must retain the complete physical stop order.");
 
 const durationHelperSource = sourceSlice("function normalizedStopTimeOverride", "function loadStats");
 const durationHelpers = Function(

@@ -3,6 +3,8 @@
 import crypto from "node:crypto";
 
 import { query } from "../db.js";
+import { assertDispatchExecutedPrefixPreserved } from "../dispatch-executed-prefix-repository.js";
+import { DISPATCH_FLEET_PLANNING_LOCK } from "../dispatch-fleet-status.js";
 import { confirmValidatedBinDispatchPlan } from "../dispatch-plan-repository.js";
 import { reserveAsset, releaseAssetReservation } from "./asset-service.js";
 import { canonicalSha256 } from "./canonical-json.js";
@@ -521,9 +523,10 @@ function requiredLoadDriverId(located) {
 
 /** @param {string} planId */
 async function lockPlan(planId) {
+  await query("SELECT pg_advisory_xact_lock(hashtext($1))", [DISPATCH_FLEET_PLANNING_LOCK]);
   const result = await query(
     `SELECT plan.id::text, plan.plan_date::text, plan.status,
-            plan.revision::int, snapshot.trucks
+            plan.revision::int, snapshot.orders, snapshot.trucks, snapshot.summary
        FROM dispatch_plans plan
        JOIN dispatch_plan_snapshots snapshot ON snapshot.plan_id = plan.id
       WHERE plan.id = $1
@@ -907,15 +910,28 @@ function reservationMode(visit, assignments, assignment) {
   return assignments.length > 1 || customerLocated ? "exact_hold" : "state_transition";
 }
 
-/** @param {string} planId @param {number} planRevision @param {Array<Record<string, any>>} trucks */
-async function persistPlan(planId, planRevision, trucks) {
+/** @param {Record<string, any>} plan @param {number} planRevision @param {Array<Record<string, any>>} trucks */
+async function persistPlan(plan, planRevision, trucks) {
+  const previousPlan = {
+    id: String(plan.id),
+    planDate: String(plan.plan_date || "").slice(0, 10),
+    status: String(plan.status || "draft"),
+    revision: Number(plan.revision),
+    orders: arrayValue(plan.orders),
+    trucks: arrayValue(plan.trucks),
+    summary: objectValue(plan.summary)
+  };
+  await assertDispatchExecutedPrefixPreserved({
+    previousPlan,
+    nextPlan: { ...previousPlan, revision: planRevision, trucks }
+  });
   await query(
     "UPDATE dispatch_plan_snapshots SET trucks = $2::jsonb, saved_at = now() WHERE plan_id = $1",
-    [planId, JSON.stringify(trucks)]
+    [plan.id, JSON.stringify(trucks)]
   );
   await query(
     "UPDATE dispatch_plans SET revision = $2, updated_at = now() WHERE id = $1",
-    [planId, planRevision]
+    [plan.id, planRevision]
   );
 }
 
@@ -1587,7 +1603,7 @@ export async function assignMbtBinFrontLeg(input, { capability, hooks = {} }) {
         assetReservations,
         stops
       };
-      await persistPlan(normalized.planId, nextPlanRevision, trucks);
+      await persistPlan(plan, nextPlanRevision, trucks);
       await query(
         `UPDATE mbt_service_visits
             SET status = 'planned', planned_truck_id = $2,
@@ -1731,7 +1747,7 @@ async function transferAssignment(input, normalized, recovery) {
     visitRevision: nextVisitRevision,
     stops: group.map(({ stop }) => stop)
   };
-  await persistPlan(normalized.planId, nextPlanRevision, trucks);
+  await persistPlan(plan, nextPlanRevision, trucks);
   await query(
     `UPDATE mbt_service_visits
         SET planned_truck_id = $2, planned_driver_id = $3,
@@ -1930,10 +1946,10 @@ export async function advanceMbtBinContractLeg(input, { capability }) {
         completed,
         next
       );
-      const trucks = clonePlanJson(plan.trucks);
-      removeAssignedStops(trucks, normalized.completedVisitId);
-      const nextPlanRevision = Number(plan.revision) + 1;
-      await persistPlan(normalized.planId, nextPlanRevision, trucks);
+      // Advancement changes the contract lifecycle, not the historical route.
+      // Retain the completed stops in their issued plan so a later system task
+      // cannot move the Driver cursor back or erase completion context.
+      const nextPlanRevision = Number(plan.revision);
       const activeReservations = await query(
         `SELECT reservation_id::text
            FROM mbt_bin_asset_reservations

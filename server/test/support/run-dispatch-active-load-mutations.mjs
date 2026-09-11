@@ -8,6 +8,10 @@ import { fileURLToPath } from "node:url";
 const supportDirectory = path.dirname(fileURLToPath(import.meta.url));
 const serverRoot = path.resolve(supportDirectory, "../..");
 
+if (process.env.MBT_MUTATION_EPHEMERAL !== "1") {
+  throw new Error("Dispatch active-load mutations require a disposable writable test container.");
+}
+
 const mutants = [
   {
     name: "does not atomically shift the active-load finish",
@@ -57,6 +61,41 @@ const mutants = [
     before: "  commitPlanMutation(\"dispatch_plan_redo\", null, { forceSave: true });",
     after: "  commitPlanMutation(\"dispatch_plan_redo\");",
     command: ["--test", "test/dispatch/frontend/dispatch-planner-performance.contract.test.js"]
+  },
+  {
+    name: "allows deletion or resequencing of loads before active Driver work",
+    file: "src/dispatch-planner-performance.js",
+    before: "    if (lanePrefixChanged || priorLoadChanges.length || boundaryMetadataChanged) {",
+    after: "    if (false) {",
+    command: ["--test", "test/mbt/unit/driver-live-route-prefix-lock.red.test.js"]
+  },
+  {
+    name: "lets billed reconciliation delete completed Driver route evidence",
+    file: "src/dispatch-plan-repository.js",
+    before: "      if (!executionPolicy.allowed) {",
+    after: "      if (false) {",
+    command: ["--test", "test/mbt/integration/driver-live-route-prefix-lock.integration.test.js"]
+  },
+  {
+    name: "ignores durable in-progress Driver work when choosing the cursor",
+    file: "src/driver-route-cursor.js",
+    before: "  if (activeById.size) {",
+    after: "  if (false) {",
+    command: ["--test", "test/mbt/unit/driver-live-route-prefix-lock.red.test.js"]
+  },
+  {
+    name: "lets the cursor return to pending work before completed progress",
+    file: "src/driver-route-cursor.js",
+    before: "  for (let candidate = latestCompletedIndex + 1; candidate < orderedJobs.length; candidate += 1) {",
+    after: "  for (let candidate = 0; candidate < orderedJobs.length; candidate += 1) {",
+    command: ["--test", "test/mbt/unit/driver-live-route-prefix-lock.red.test.js"]
+  },
+  {
+    name: "lets the offline PWA fall back to the first pending route gap",
+    file: "public/driver.js",
+    before: "  const nextPending = jobs.find((job, index) => index > latestCompletedIndex && !jobIsComplete(job));",
+    after: "  const nextPending = jobs.find((job) => !jobIsComplete(job));",
+    command: ["--test", "test/mbt/unit/driver-offline-route-cursor.red.test.js"]
   }
 ];
 

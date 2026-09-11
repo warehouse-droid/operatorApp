@@ -114,6 +114,6 @@ includesAll(schedule, [
   ': ["admin", "scm", "scm_staff", "dispatcher", "yard_manager"]',
   'if (role === "dispatcher") return ["dispatch"];'
 ], "Shared schedule host and dispatcher access");
-assert.ok(scheduleHtml.includes("/scm-schedule.js?v=20260902-netsuite-address-pickup-v1"), "Shared schedule client cache busting missing.");
+assert.ok(scheduleHtml.includes("/scm-schedule.js?v=20260910-search-vendor-complete-v1"), "Shared schedule client cache busting missing.");
 
 console.log("Operator camera and Dispatch PO/TO Schedule harness passed.");

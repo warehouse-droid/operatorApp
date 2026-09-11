@@ -444,16 +444,26 @@ function dispatchItemHasQuantity(item = {}) {
   );
 }
 
+function dispatchOperationalPickupItem(item = {}) {
+  if (item.dispatchServiceFee === true) return false;
+  if (item.isSpecial === true || item.salesQuantityOnly === true || Number(item.itemId ?? item.item_id) === 2055) return true;
+  const label = `${item.sku || ""} ${item.itemName || item.item_name || ""}`.trim();
+  const type = `${item.itemType || item.item_type || ""} ${item.itemTypeText || item.item_type_text || ""}`.trim();
+  if (/delivery\s*(charge|fee)|shipping\s*(charge|fee)|sales\s*credit|discount/i.test(label)) return false;
+  return !/oth\s*charge|other\s*charge|service|discount|description|subtotal|payment|markup/i.test(type);
+}
+
 function dispatchPickupItemsForLocation(plan = {}, order = {}, location = "") {
-  if (text(order.type).toUpperCase() === "PO") return dispatchRouteItems(order).filter(dispatchItemHasQuantity);
+  if (text(order.type).toUpperCase() === "PO") return dispatchRouteItems(order).filter(dispatchOperationalPickupItem).filter(dispatchItemHasQuantity);
   const directItems = dispatchDirectPickupItemsForLocation(order, location);
   if (directItems.length && !dispatchLocationsShareYard(order.sourceYard || order.outboundLocation, location)) {
-    return directItems.filter(dispatchItemHasQuantity);
+    return directItems.filter(dispatchOperationalPickupItem).filter(dispatchItemHasQuantity);
   }
   const poItems = dispatchPoPickupItemsForLocation(order, location);
   const ownYard = dispatchOwnYardLocationKeys(plan).has(normalizedYardLocationText(location));
-  if (poItems.length && !ownYard) return poItems.filter(dispatchItemHasQuantity);
+  if (poItems.length && !ownYard) return poItems.filter(dispatchOperationalPickupItem).filter(dispatchItemHasQuantity);
   return (order.items || [])
+    .filter(dispatchOperationalPickupItem)
     .map((item) => dispatchItemForPickupLocation(plan, order, item, location))
     .filter(dispatchItemHasQuantity);
 }
@@ -477,7 +487,7 @@ function dispatchPickupFootprintForOrderLocation(plan = {}, order = {}, location
     + (dispatchNumber(order.layers ?? order.layer_qty) > 0 ? 1 : 0);
 }
 
-function dispatchRequiredPickupLocations(plan = {}, order = {}) {
+export function dispatchRequiredPickupLocations(plan = {}, order = {}) {
   const locations = Array.isArray(order.pickupLocations) && order.pickupLocations.length
     ? order.pickupLocations
     : ["3445"];
@@ -1494,19 +1504,20 @@ function semanticOrderAllocation(order = {}) {
 }
 
 export function changedLockedLoadAssignments(previousPlan = {}, nextPlan = {}, lockedLoadIds = new Set()) {
-  const before = new Map(flattenDispatchPlanLoads(previousPlan).map((row) => [text(row.load.id), row]));
-  const after = new Map(flattenDispatchPlanLoads(nextPlan).map((row) => [text(row.load.id), row]));
+  const before = new Map(flattenDispatchPlanLoads(previousPlan).map((row) => [text(row.load.id || row.load.loadId), row]));
+  const after = new Map(flattenDispatchPlanLoads(nextPlan).map((row) => [text(row.load.id || row.load.loadId), row]));
   const allocationSignature = (plan, row) => {
-    const refs = new Set((row?.load?.stops || []).map((stop) => text(stop.orderId)).filter(Boolean));
+    const refs = new Set((row?.load?.stops || []).map((stop) => text(stop.orderId || stop.orderRef)).filter(Boolean));
     return (plan.orders || [])
       .filter((order) => refs.has(text(order.id)))
       .map(semanticOrderAllocation)
       .sort((left, right) => left.id.localeCompare(right.id));
   };
   const stopSignature = (stop = {}) => ({
-    id: text(stop.id),
-    type: text(stop.type),
-    orderId: text(stop.orderId),
+    id: text(stop.id || stop.stopId),
+    type: text(stop.type || stop.stopType),
+    orderId: text(stop.orderId || stop.orderRef),
+    instructions: text(stop.instructions || stop.instruction || stop.notes),
     location: text(stop.location),
     address: text(stop.address),
     yard: text(stop.yard),
@@ -1532,6 +1543,7 @@ export function changedLockedLoadAssignments(previousPlan = {}, nextPlan = {}, l
     }, {});
   };
   const lockedSignature = (plan, row) => row ? JSON.stringify({
+    loadName: text(row.load.name || row.load.loadName || row.load.load_name),
     driverLogin: row.driverLogin,
     driverName: row.driverName,
     truckId: row.truckId,
@@ -1607,12 +1619,13 @@ function driverActivityOrderForRef(plan = {}, orderRef = "") {
 
 function driverActivityStopSignature(plan = {}, stop = null) {
   if (!stop) return "";
-  const order = driverActivityOrderForRef(plan, stop.orderId) || {};
+  const order = driverActivityOrderForRef(plan, stop.orderId || stop.orderRef) || {};
   const pickup = ["pick", "pickup"].includes(text(stop.type).toLowerCase());
   return JSON.stringify({
-    id: text(stop.id),
-    type: text(stop.type),
-    orderId: text(stop.orderId),
+    id: text(stop.id || stop.stopId),
+    type: text(stop.type || stop.stopType),
+    orderId: text(stop.orderId || stop.orderRef),
+    instructions: text(stop.instructions || stop.instruction || stop.notes),
     location: text(stop.location),
     address: text(stop.address),
     yard: text(stop.yard),
@@ -1719,8 +1732,8 @@ export function changedDriverActivityAssignments(previousPlan = {}, nextPlan = {
   }
   if (!scopes.size) return [];
 
-  const before = new Map(flattenDispatchPlanLoads(previousPlan).map((row) => [text(row.load.id), row]));
-  const after = new Map(flattenDispatchPlanLoads(nextPlan).map((row) => [text(row.load.id), row]));
+  const before = new Map(flattenDispatchPlanLoads(previousPlan).map((row) => [text(row.load.id || row.load.loadId), row]));
+  const after = new Map(flattenDispatchPlanLoads(nextPlan).map((row) => [text(row.load.id || row.load.loadId), row]));
   const fullLoadChanges = new Map(changedLockedLoadAssignments(
     previousPlan,
     nextPlan,
@@ -1756,14 +1769,14 @@ export function changedDriverActivityAssignments(previousPlan = {}, nextPlan = {
       }
       const previousStopList = previous.load.stops || [];
       const currentStopList = current.load.stops || [];
-      const previousStops = new Map(previousStopList.map((stop, index) => [text(stop.id), { stop, index }]));
-      const currentStops = new Map(currentStopList.map((stop, index) => [text(stop.id), { stop, index }]));
+      const previousStops = new Map(previousStopList.map((stop, index) => [text(stop.id || stop.stopId), { stop, index }]));
+      const currentStops = new Map(currentStopList.map((stop, index) => [text(stop.id || stop.stopId), { stop, index }]));
       const previousActivityIndexes = [...scope.stopIds]
         .map((stopId) => previousStops.get(stopId)?.index)
         .filter(Number.isInteger);
       const activityBoundary = previousActivityIndexes.length ? Math.max(...previousActivityIndexes) : -1;
-      const previousPrefix = previousStopList.slice(0, activityBoundary + 1).map((stop) => text(stop.id));
-      const currentPrefix = currentStopList.slice(0, activityBoundary + 1).map((stop) => text(stop.id));
+      const previousPrefix = previousStopList.slice(0, activityBoundary + 1).map((stop) => text(stop.id || stop.stopId));
+      const currentPrefix = currentStopList.slice(0, activityBoundary + 1).map((stop) => text(stop.id || stop.stopId));
       const sequenceChanged = activityBoundary >= 0
         && JSON.stringify(previousPrefix) !== JSON.stringify(currentPrefix);
       for (const stopId of scope.stopIds) {
@@ -1781,7 +1794,7 @@ export function changedDriverActivityAssignments(previousPlan = {}, nextPlan = {
         ) {
           changedStopIds.push(stopId);
         }
-        const canonicalOrderRef = text(previousStop?.orderId);
+        const canonicalOrderRef = text(previousStop?.orderId || previousStop?.orderRef);
         if (canonicalOrderRef) scope.orderRefs.add(canonicalOrderRef);
       }
       if (changedStopIds.length) reasons.push("stop");

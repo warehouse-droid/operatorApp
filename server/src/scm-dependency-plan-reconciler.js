@@ -1,4 +1,5 @@
 import { dispatchDependencyOrderRefs } from "./yard-dependency-structure.js";
+import { dispatchRequiredPickupVisitLocations } from "./dispatch-pickup-visits.js";
 
 function text(value) {
   return String(value ?? "").trim();
@@ -43,6 +44,15 @@ function orderIndex(orders = []) {
 
 function targetRefForDrop(drop = {}, order = {}) {
   return text(order.id || drop.orderId);
+}
+
+function requiredPickupLocations(order, plan) {
+  const configured = uniqueLocations(order.pickupLocations?.length
+    ? order.pickupLocations
+    : [order.sourceYard || order.outboundLocation].filter(Boolean));
+  if (!configured.length) {return [];}
+  const required = dispatchRequiredPickupVisitLocations(order, plan);
+  return configured.filter((location) => required.some((candidate) => samePlace(candidate, location)));
 }
 
 function requirementsForStops(stops = [], ordersByRef = new Map()) {
@@ -228,7 +238,7 @@ function reconcilePurchaseOrderResidualDrops({ trucks = [], orders = [], affecte
   return nextTrucks;
 }
 
-function reconcileLoad(load = {}, ordersByRef, affected) {
+function reconcileLoad(load = {}, ordersByRef, affected, plan) {
   let stops = Array.isArray(load.stops) ? load.stops.map((stop) => ({ ...stop })) : [];
   const requirements = requirementsForStops(stops, ordersByRef);
 
@@ -254,9 +264,7 @@ function reconcileLoad(load = {}, ordersByRef, affected) {
     const targetRef = targetRefForDrop(drop, order);
     if (!affected.has(targetRef.toLowerCase())
       && !dispatchDependencyOrderRefs(order).some((ref) => affected.has(ref.toLowerCase()))) {continue;}
-    const locations = uniqueLocations(order.pickupLocations?.length
-      ? order.pickupLocations
-      : [order.sourceYard || order.outboundLocation].filter(Boolean));
+    const locations = requiredPickupLocations(order, plan);
     for (const location of locations) {
       const priorPickup = stops.slice(0, index).find((stop) => stop?.type === "pick" && samePlace(stop.location, location));
       if (priorPickup) {
@@ -310,7 +318,7 @@ export function reconcileDependencyManagedPickups({
     orders,
     trucks: residualTrucks.map((truck) => ({
       ...truck,
-      loads: (truck.loads || []).map((load) => reconcileLoad(load, ordersByRef, affected))
+      loads: (truck.loads || []).map((load) => reconcileLoad(load, ordersByRef, affected, plan))
     }))
   };
 }

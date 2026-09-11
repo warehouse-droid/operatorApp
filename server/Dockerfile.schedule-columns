@@ -1,0 +1,3 @@
+ARG BASE_IMAGE=mbbs-operator-app:dispatch-recon-pending-20260908-v1
+FROM ${BASE_IMAGE}
+COPY --chown=node:node public/scm-schedule.js public/scm-schedule.html public/dispatch.css /app/public/

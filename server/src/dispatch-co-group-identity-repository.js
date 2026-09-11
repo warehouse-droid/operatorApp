@@ -5,6 +5,7 @@ import {
   dispatchCoGroupIdentityMappings
 } from "./dispatch-co-group-identity.js";
 import { syncDispatchDeliveryGroupsFromPlan } from "./dispatch-delivery-group-repository.js";
+import { evaluateDispatchExecutedPrefixPreservation } from "./dispatch-executed-prefix-repository.js";
 import { DISPATCH_FLEET_PLANNING_LOCK } from "./dispatch-fleet-status.js";
 import {
   syncDispatchPlanOrderAssignments,
@@ -38,6 +39,7 @@ export async function repairDispatchCoGroupIdentities({ planIds = [], limit = 50
       [selectedPlanIds, safeLimit]
     );
     const repairedPlanIds = [];
+    const deferredPlanIds = [];
     const repairedMappings = [];
     for (const row of candidates.rows) {
       const current = {
@@ -55,6 +57,14 @@ export async function repairDispatchCoGroupIdentities({ planIds = [], limit = 50
       const mappings = dispatchCoGroupIdentityMappings(current);
       if (!mappings.length) continue;
       const canonical = buildCompactDispatchSnapshot(canonicalizeDispatchCoGroupIdentities(current));
+      const executionPolicy = await evaluateDispatchExecutedPrefixPreservation({
+        previousPlan: current,
+        nextPlan: canonical
+      });
+      if (!executionPolicy.allowed) {
+        deferredPlanIds.push(text(row.id));
+        continue;
+      }
       const board = dispatchPlanBoard(canonical);
       await query(
         `UPDATE dispatch_plan_snapshots
@@ -110,6 +120,7 @@ export async function repairDispatchCoGroupIdentities({ planIds = [], limit = 50
       scanned: candidates.rowCount,
       repaired: repairedPlanIds.length,
       planIds: repairedPlanIds,
+      deferredPlanIds,
       mappings: repairedMappings
     };
   });

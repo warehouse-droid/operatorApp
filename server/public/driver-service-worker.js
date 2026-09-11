@@ -1,28 +1,28 @@
 /* global DriverOfflineSync */
 "use strict";
 
-importScripts("/driver-offline-db.js?v=20260903-retained-photo-i18n-v1");
-importScripts("/driver-photo-hash.js?v=20260903-retained-photo-i18n-v1");
-importScripts("/driver-offline-sync.js?v=20260903-retained-photo-i18n-v1");
+importScripts("/driver-offline-db.js?v=20260910-route-prefix-cursor-v1");
+importScripts("/driver-photo-hash.js?v=20260910-route-prefix-cursor-v1");
+importScripts("/driver-offline-sync.js?v=20260910-route-prefix-cursor-v1");
 
 const DRIVER_PWA_CLIENT_VERSION = "2026.08.12.3";
 const DRIVER_CACHE_PREFIX = "mbbs-driver-shell-";
-const DRIVER_CACHE_NAME = `${DRIVER_CACHE_PREFIX}v40`;
-const DRIVER_REFRESH_CACHE_NAME = `${DRIVER_CACHE_PREFIX}refresh-v40`;
+const DRIVER_CACHE_NAME = `${DRIVER_CACHE_PREFIX}v41`;
+const DRIVER_REFRESH_CACHE_NAME = `${DRIVER_CACHE_PREFIX}refresh-v41`;
 const DRIVER_OFFLINE_MODE_REQUEST = "/__mbbs_driver_offline_mode__";
 const DRIVER_SHELL = [
   "/driver",
   "/driver.html",
-  "/driver.css?v=20260903-retained-photo-i18n-v1",
-  "/i18n.css?v=20260903-retained-photo-i18n-v1",
-  "/i18n.js?v=20260903-retained-photo-i18n-v1",
-  "/driver-offline-db.js?v=20260903-retained-photo-i18n-v1",
-  "/driver-photo-hash.js?v=20260903-retained-photo-i18n-v1",
-  "/driver-offline-photos.js?v=20260903-retained-photo-i18n-v1",
-  "/driver-offline-sync.js?v=20260903-retained-photo-i18n-v1",
-  "/driver-bin-ui.js?v=20260903-retained-photo-i18n-v1",
-  "/driver-location-override.js?v=20260903-retained-photo-i18n-v1",
-  "/driver.js?v=20260903-retained-photo-i18n-v1",
+  "/driver.css?v=20260910-route-prefix-cursor-v1",
+  "/i18n.css?v=20260910-route-prefix-cursor-v1",
+  "/i18n.js?v=20260910-route-prefix-cursor-v1",
+  "/driver-offline-db.js?v=20260910-route-prefix-cursor-v1",
+  "/driver-photo-hash.js?v=20260910-route-prefix-cursor-v1",
+  "/driver-offline-photos.js?v=20260910-route-prefix-cursor-v1",
+  "/driver-offline-sync.js?v=20260910-route-prefix-cursor-v1",
+  "/driver-bin-ui.js?v=20260910-route-prefix-cursor-v1",
+  "/driver-location-override.js?v=20260910-route-prefix-cursor-v1",
+  "/driver.js?v=20260910-route-prefix-cursor-v1",
   "/driver-manifest.webmanifest",
   "/icons/mbbs-yard-192.png",
   "/icons/mbbs-yard-512.png",

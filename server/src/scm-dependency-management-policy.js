@@ -1,5 +1,12 @@
 const HEARTBEAT_FRESHNESS_MS = 15_000;
 
+/** Historical completion permits relationship removal, never new work or mode changes. */
+export function completedTransferUnlinkAllowed({
+  action = "", receiptComplete = false, completedDrop = false, activeDriverWork = false
+} = {}) {
+  return action === "unlink_to" && !activeDriverWork && (receiptComplete || completedDrop);
+}
+
 function hasEntries(value) {
   if (Array.isArray(value)) {
     return value.length > 0;

@@ -11,8 +11,8 @@ const PUBLIC = path.resolve(HERE, "../../../public");
 const DRIVER_SOURCE = fs.readFileSync(path.join(PUBLIC, "driver.js"), "utf8");
 const WORKER_SOURCE = fs.readFileSync(path.join(PUBLIC, "driver-service-worker.js"), "utf8");
 const ORIGIN = "https://driver-cache.test";
-const ACTIVE_CACHE = "mbbs-driver-shell-v40";
-const REFRESH_CACHE = "mbbs-driver-shell-refresh-v40";
+const ACTIVE_CACHE = "mbbs-driver-shell-v41";
+const REFRESH_CACHE = "mbbs-driver-shell-refresh-v41";
 const OFFLINE_MODE_URL = `${ORIGIN}/__mbbs_driver_offline_mode__`;
 
 function requestUrl(input) {
@@ -144,7 +144,7 @@ async function installWorker(listeners) {
   await completion;
 }
 
-test("a fresh Driver worker reloads every v37 shell asset and initializes only its scoped sentinel", async () => {
+test("a fresh Driver worker reloads every v41 shell asset and initializes only its scoped sentinel", async () => {
   const cacheStorage = new MemoryCacheStorage();
   await installWorker(createWorker(cacheStorage));
 

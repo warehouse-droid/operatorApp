@@ -23,7 +23,8 @@ function linkedReceipt({
   itemId,
   itemName,
   quantity,
-  locationId
+  locationId,
+  transactionMemo = ""
 }) {
   return {
     sourceOrderId,
@@ -33,6 +34,7 @@ function linkedReceipt({
     transactionId,
     transactionType: "ItemRcpt",
     transactionRef: `IR-${transactionId}`,
+    transactionMemo,
     status: "B",
     statusText: "Posted",
     transactionDate: "2026-08-27",
@@ -54,12 +56,16 @@ async function seedFamily({
   materialReceiptQty = 1569,
   palletReceiptQty = 15,
   splitMaterialQty = 1569,
-  scheduleStatus = "Planned"
+  scheduleStatus = "Planned",
+  receiptMemo = "",
+  separatePalletReceipt = false,
+  isBlanket = false
 }) {
   const parentId = 8_700_000_000 + seed + suffix;
   const parentRef = `PO-SPLIT-RECEIPT-${seed}-${suffix}`;
   const childId = -parentId;
   const childRef = suffix === 10 ? "3022019914" : `3022019914-WITNESS-${seed}-${suffix}`;
+  const transactionMemo = receiptMemo === "$child" ? childRef : receiptMemo;
   const materialLineKey = 7_100_000_000 + seed + suffix;
   const palletLineKey = materialLineKey + 1;
 
@@ -75,6 +81,12 @@ async function seedFamily({
         5001, 'Split Vendor', 15, '12441', 'not_received', true, now())`,
     [parentId, parentRef, childId, childRef]
   );
+  if (isBlanket) {
+    await query(
+      "UPDATE purchase_orders SET is_blanket_po = true WHERE netsuite_id = $1",
+      [parentId]
+    );
+  }
   const lines = await query(
     `INSERT INTO purchase_order_lines (
        purchase_order_id, line_id, item_id, item_name, sku, quantity,
@@ -170,18 +182,20 @@ async function seedFamily({
         itemId: 920001,
         itemName: "Split material",
         quantity: materialReceiptQty,
-        locationId: receiptLocationId
+        locationId: receiptLocationId,
+        transactionMemo
       }),
       linkedReceipt({
         sourceOrderId: parentId,
         sourceOrderRef: parentRef,
         sourceLineKey: palletLineKey,
-        transactionId: 6_100_000_000 + seed + suffix,
+        transactionId: 6_100_000_000 + seed + suffix + (separatePalletReceipt ? 100_000 : 0),
         transactionLineKey: 6_120_000_000 + seed + suffix,
         itemId: 920002,
         itemName: "PALLET",
         quantity: palletReceiptQty,
-        locationId: receiptLocationId
+        locationId: receiptLocationId,
+        transactionMemo
       })
     ].filter((transaction) => Number(transaction.quantity) > 0)
   });
@@ -380,6 +394,238 @@ test("historical inferred receipt reopens an unfinished Partially Done child as 
       const projectedCompleted = projected.find((row) => row.orderRef === completed.childRef);
       assert.equal(projectedCompleted?.calculatedStatus, "Completed",
         "authoritative Completed must remain displayed while review stays metadata");
+    });
+  } finally {
+    await rollback.rollback();
+  }
+});
+
+test("IR memo reference overrides a wrong yard, supports a separate pallet IR, and preserves HOLD authority", async () => {
+  const rollback = await beginRollbackContext();
+  try {
+    await rollback.run(async () => {
+      const referenced = await seedFamily({
+        suffix: 60,
+        receiptLocationId: 1,
+        scheduleStatus: "Hold",
+        receiptMemo: "$child",
+        separatePalletReceipt: true
+      });
+      const before = await query(
+        `SELECT po.destination_location_id, po.destination_location, schedule.status
+           FROM purchase_orders po
+           JOIN scm_transport_schedule schedule
+             ON schedule.order_kind = 'PO'
+            AND lower(schedule.order_ref) = lower($2)
+          WHERE po.netsuite_id = $1`,
+        [-referenced.parentId, referenced.childRef]
+      );
+
+      const result = await reconcileScmOrderFamily({
+        kind: "PO",
+        sourceOrderId: referenced.parentId,
+        source: "manual"
+      });
+      assert.equal(result.reconciliationStatus, "ok");
+      assert.equal(result.targets[referenced.childRef].received, 1584);
+      assert.deepEqual(result.targets[referenced.childRef].allocationMethods, ["exact"]);
+      assert.equal(result.targets[referenced.childRef].applicationStatus, "Hold");
+      assert.doesNotMatch(result.reason, /location|destination|reference|capacity/i);
+
+      const after = await query(
+        `SELECT po.destination_location_id, po.destination_location,
+                schedule.status, schedule.reconciliation_blocked
+           FROM purchase_orders po
+           JOIN scm_transport_schedule schedule
+             ON schedule.order_kind = 'PO'
+            AND lower(schedule.order_ref) = lower($2)
+          WHERE po.netsuite_id = $1`,
+        [-referenced.parentId, referenced.childRef]
+      );
+      assert.deepEqual(after.rows[0], {
+        ...before.rows[0],
+        reconciliation_blocked: false
+      });
+
+      const stored = await query(
+        `SELECT transaction_memo
+           FROM scm_reconciliation_transaction_snapshots
+          WHERE source_order_kind = 'PO'
+            AND source_order_netsuite_id = $1
+          ORDER BY netsuite_transaction_id`,
+        [referenced.parentId]
+      );
+      assert.deepEqual(stored.rows.map((row) => row.transaction_memo), [
+        referenced.childRef,
+        referenced.childRef
+      ]);
+    });
+  } finally {
+    await rollback.rollback();
+  }
+});
+
+test("BWS blanket IR without a child memo may use one matching destination and preserves HOLD authority", async () => {
+  const rollback = await beginRollbackContext();
+  try {
+    await rollback.run(async () => {
+      const blanket = await seedFamily({
+        suffix: 65,
+        receiptLocationId: 15,
+        scheduleStatus: "Hold",
+        receiptMemo: "BWS Uxbridge blanket receipt",
+        isBlanket: true
+      });
+      const result = await reconcileScmOrderFamily({
+        kind: "PO",
+        sourceOrderId: blanket.parentId,
+        source: "manual"
+      });
+      assert.equal(result.reconciliationStatus, "ok");
+      assert.equal(result.targets[blanket.childRef].received, 1584);
+      assert.equal(result.targets[blanket.childRef].applicationStatus, "Hold");
+      assert.deepEqual(result.targets[blanket.childRef].allocationMethods, ["inferred"]);
+      assert.doesNotMatch(result.reason, /location|destination|reference|capacity/i);
+    });
+  } finally {
+    await rollback.rollback();
+  }
+});
+
+test("a later PO refresh and new HOLD split do not recycle an old referenced receipt into review", async () => {
+  const rollback = await beginRollbackContext();
+  try {
+    await rollback.run(async () => {
+      const original = await seedFamily({
+        suffix: 67,
+        receiptLocationId: 1,
+        materialReceiptQty: 1000,
+        palletReceiptQty: 0,
+        splitMaterialQty: 1000,
+        scheduleStatus: "Hold",
+        receiptMemo: "$child"
+      });
+      const first = await reconcileScmOrderFamily({
+        kind: "PO",
+        sourceOrderId: original.parentId,
+        source: "manual"
+      });
+      assert.equal(first.reconciliationStatus, "ok");
+      assert.equal(first.targets[original.childRef].received, 1000);
+
+      const sourceLine = await query(
+        `SELECT id, line_id
+           FROM purchase_order_lines
+          WHERE purchase_order_id = $1
+            AND item_id = 920001`,
+        [original.parentId]
+      );
+      const secondChildId = -original.parentId - 1;
+      const secondChildRef = `SN${1_500_000 + (seed % 1_000_000)}`;
+      await query(
+        `INSERT INTO purchase_orders (
+           netsuite_id, tranid, trandate, status, status_text,
+           vendor_id, vendor, destination_location_id, destination_location,
+           receipt_status, initial_scm_status, netsuite_active, synced_at
+         ) VALUES (
+           $1, $2, DATE '2026-09-08', 'B', 'Pending Receipt',
+           5001, 'Split Vendor', 28, '150', 'not_received', 'Hold', true, now()
+         )`,
+        [secondChildId, secondChildRef]
+      );
+      const childLine = await query(
+        `INSERT INTO purchase_order_lines (
+           purchase_order_id, line_id, item_id, item_name, sku, quantity,
+           netsuite_received_qty, unit, location_id, location, netsuite_active, raw
+         ) VALUES (
+           $1, $2, 920001, 'Split material', 'SPLIT-MATERIAL', 569,
+           0, 'EA', 28, '150', true, $3::jsonb
+         ) RETURNING id`,
+        [
+          secondChildId,
+          -Number(sourceLine.rows[0].line_id) - 1,
+          JSON.stringify({ identityStatus: "exact" })
+        ]
+      );
+      const secondSplit = await query(
+        `INSERT INTO dispatch_scm_po_splits (
+           source_po_id, source_po_ref, split_po_id, split_po_ref,
+           status, created_by, created_at
+         ) VALUES ($1, $2, $3, $4, 'active', $5, now())
+         RETURNING id`,
+        [original.parentId, `PO-SPLIT-RECEIPT-${seed}-67`, secondChildId, secondChildRef, actor]
+      );
+      await query(
+        `INSERT INTO dispatch_scm_po_split_lines (
+           split_id, source_line_id, split_line_id, item_id, sku, item_name,
+           sales_qty, requested_sales_qty, unit
+         ) VALUES ($1, $2, $3, 920001, 'SPLIT-MATERIAL', 'Split material', 569, 569, 'EA')`,
+        [Number(secondSplit.rows[0].id), Number(sourceLine.rows[0].id), Number(childLine.rows[0].id)]
+      );
+      await query(
+        `INSERT INTO scm_transport_schedule (
+           order_kind, source_table, source_id, order_ref, status,
+           created_by, updated_by
+         ) VALUES ('PO', 'purchase_orders', $1, $2, 'Hold', $3, $3)`,
+        [secondChildId, secondChildRef, actor]
+      );
+      await query(
+        `UPDATE purchase_orders
+            SET memo = 'Later NetSuite PO refresh',
+                status_updated_at = now(),
+                synced_at = now()
+          WHERE netsuite_id = $1`,
+        [original.parentId]
+      );
+
+      const replayed = await reconcileScmOrderFamily({
+        kind: "PO",
+        sourceOrderId: original.parentId,
+        source: "manual"
+      });
+      assert.equal(replayed.reconciliationStatus, "ok");
+      assert.equal(replayed.targets[original.childRef].received, 1000);
+      assert.equal(replayed.targets[original.childRef].applicationStatus, "Hold");
+      assert.equal(replayed.targets[secondChildRef].received, 0);
+      assert.equal(replayed.targets[secondChildRef].applicationStatus, "Hold");
+      assert.doesNotMatch(replayed.reason, /location|destination|reference|capacity/i);
+    });
+  } finally {
+    await rollback.rollback();
+  }
+});
+
+test("unknown and multi-child IR memo references remain blocked instead of falling back to another yard target", async () => {
+  const rollback = await beginRollbackContext();
+  try {
+    await rollback.run(async () => {
+      const unknown = await seedFamily({
+        suffix: 70,
+        receiptLocationId: 15,
+        receiptMemo: "SN9999999"
+      });
+      const unknownResult = await reconcileScmOrderFamily({
+        kind: "PO",
+        sourceOrderId: unknown.parentId,
+        source: "manual"
+      });
+      assert.equal(unknownResult.reconciliationStatus, "review");
+      assert.match(unknownResult.reason, /IR.*reference|reference.*IR/i);
+      assert.equal(unknownResult.targets[unknown.childRef].received, 0);
+
+      const ambiguous = await seedFamily({
+        suffix: 80,
+        receiptLocationId: 15,
+        receiptMemo: "SN1111111 / SN2222222"
+      });
+      const ambiguousResult = await reconcileScmOrderFamily({
+        kind: "PO",
+        sourceOrderId: ambiguous.parentId,
+        source: "manual"
+      });
+      assert.equal(ambiguousResult.reconciliationStatus, "review");
+      assert.match(ambiguousResult.reason, /ambiguous|multiple|reference/i);
+      assert.equal(ambiguousResult.targets[ambiguous.childRef].received, 0);
     });
   } finally {
     await rollback.rollback();

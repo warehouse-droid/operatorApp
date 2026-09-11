@@ -19,7 +19,7 @@ RUN npx playwright install --with-deps chromium webkit \
 
 FROM test-dependencies AS test-base
 
-COPY Dockerfile Dockerfile.test ./
+COPY Dockerfile Dockerfile.test Dockerfile.scm-ir-split-reference ./
 COPY .c8rc.json .env.example eslint.mbt.config.js eslint.driver-offline-stress.config.js tsconfig.mbt.json ./
 COPY contracts ./contracts
 COPY migrations ./migrations
@@ -45,7 +45,7 @@ CMD ["npm", "run", "test:mbt:infrastructure"]
 
 FROM playwright-dependencies AS test-e2e
 
-COPY Dockerfile Dockerfile.test ./
+COPY Dockerfile Dockerfile.test Dockerfile.scm-ir-split-reference ./
 COPY .c8rc.json .env.example eslint.mbt.config.js eslint.driver-offline-stress.config.js tsconfig.mbt.json ./
 COPY contracts ./contracts
 COPY migrations ./migrations

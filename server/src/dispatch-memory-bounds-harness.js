@@ -196,8 +196,8 @@ assert.doesNotMatch(source, /structuredClone\(/, "Dispatch rendering must not de
 const historySnapshotSource = sourceSlice("function historySnapshot", "function packHistorySnapshot", "lightweight live history snapshot");
 assert.doesNotMatch(historySnapshotSource, /JSON\.parse|JSON\.stringify|structuredClone/, "Building a live history snapshot must not deep-clone orders or trucks.");
 
-const backgroundDebounceSource = sourceSlice("function scheduleBackgroundRouteEstimates", "async function runBackgroundRouteEstimates", "background route debounce");
-assert.match(backgroundDebounceSource, /clearTimeout\(backgroundRouteTimer\)/, "A pending background estimate batch must be cancelled before rescheduling.");
-assert.match(backgroundDebounceSource, /setTimeout\(runBackgroundRouteEstimates,\s*650\)/, "Background route estimates must be debounced.");
+assert.doesNotMatch(renderSource, /scheduleBackgroundRouteEstimates|googleRouteForLoad/, "Ordinary Dispatch renders must not schedule paid route work.");
+const confirmationRouteSource = sourceSlice("async function refreshGoogleRouteEstimatesForConfirmation", "function planBadgeText", "confirmation route refresh");
+assert.doesNotMatch(confirmationRouteSource, /setTimeout\(|setInterval\(/, "Denied or failed confirmation routes must not be queued for a later retry.");
 
 console.log("Dispatch memory, history, and route-cache bounds checks passed.");

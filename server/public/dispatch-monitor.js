@@ -17,7 +17,7 @@ const TRUCK_COLORS = [
 ];
 
 let monitorOperator = null;
-let monitorConfig = { googleMapsApiKey: "" };
+let monitorConfig = { googleMapsApiKey: "", googleMapsEnabled: false, googleMapsMode: "conserve" };
 let monitorData = { trucks: [], trails: {}, yards: [], plannedOrders: [], refreshSeconds: 10 };
 let monitorError = "";
 let monitorLoading = false;
@@ -29,6 +29,8 @@ let monitorMarkers = [];
 let monitorTrailLines = [];
 let monitorTruckMarkers = new Map();
 let googleMapsPromise = null;
+let googleMapsScriptFailed = false;
+let googleMapsAutomaticDenied = false;
 let monitorGeocodeCache = readGeocodeCache();
 let monitorLastTruckLocations = readLastTruckLocations();
 let selectedTruckPlate = "";
@@ -37,11 +39,10 @@ let monitorOrderSearch = "";
 let monitorTooltipIdentity = "";
 let monitorEtaByPlate = new Map();
 let monitorEtaRequests = new Map();
-let monitorDirectionsService = null;
-let monitorEtaRoutingAvailable = null;
 let mapHasFitBounds = false;
 let monitorMapRenderGeneration = 0;
 let monitorLoadGeneration = 0;
+const monitorMapsSessionId = `monitor-${Date.now()}-${Math.random().toString(16).slice(2)}`;
 
 function escapeHtml(value) {
   return String(value ?? "").replace(/[&<>"']/g, (char) => ({
@@ -58,14 +59,6 @@ function readGeocodeCache() {
     return JSON.parse(localStorage.getItem("mbbs.monitor.geocodeCache") || "{}");
   } catch {
     return {};
-  }
-}
-
-function writeGeocodeCache() {
-  try {
-    localStorage.setItem("mbbs.monitor.geocodeCache", JSON.stringify(monitorGeocodeCache));
-  } catch {
-    // Cache is an optimization only.
   }
 }
 
@@ -203,15 +196,16 @@ function monitorTruckLocationFresh(truck = {}) {
 
 function monitorEtaText(truck = {}) {
   if (!truck.activeLoad?.nextStop) return "";
-  if (monitorEtaRoutingAvailable === false || !monitorTruckLocationFresh(truck) || !monitorEtaDestination(truck)) return "ETA unavailable";
+  if (!monitorTruckLocationFresh(truck) || !monitorEtaDestination(truck)) return "ETA unavailable";
   const eta = monitorEtaForTruck(truck);
-  if (!eta) return "Calculating ETA…";
+  if (!eta) return monitorEtaRequests.has(normalizedPlate(truck.plate)) ? "Refreshing ETA…" : "ETA available on request";
   if (eta.unavailable) return "ETA unavailable";
   const details = [
     `${Math.max(1, Math.round(Number(eta.durationSeconds || 0) / 60))} min`,
     eta.distanceText || ""
   ].filter(Boolean).join(" · ");
-  return `ETA ${formatEtaArrival(eta.arrivalAt)}${details ? ` (${details})` : ""}`;
+  const label = eta.source === "google_routes_v2" ? "Google ETA" : "Plan ETA";
+  return `${label} ${formatEtaArrival(eta.arrivalAt)}${details ? ` (${details})` : ""}`;
 }
 
 function monitorEtaHtml(truck = {}) {
@@ -238,8 +232,8 @@ function isCanadaPoint(point) {
     && lng <= -52;
 }
 
-async function api(path) {
-  const response = await fetch(path);
+async function api(path, options = {}) {
+  const response = await fetch(path, options);
   const text = await response.text();
   const payload = text ? JSON.parse(text) : {};
   if (!response.ok) throw new Error(payload.error || text || "Request failed");
@@ -250,20 +244,43 @@ async function loadConfig() {
   monitorConfig = await api("/api/dispatch/config");
 }
 
-function loadGoogleMaps() {
-  if (!monitorConfig.googleMapsApiKey) return Promise.resolve(false);
-  if (window.google?.maps) return Promise.resolve(true);
-  if (googleMapsPromise) return googleMapsPromise;
-  googleMapsPromise = new Promise((resolve) => {
-    const script = document.createElement("script");
-    script.src = `https://maps.googleapis.com/maps/api/js?key=${encodeURIComponent(monitorConfig.googleMapsApiKey)}`;
-    script.async = true;
-    script.defer = true;
-    script.onload = () => resolve(true);
-    script.onerror = () => resolve(false);
-    document.head.appendChild(script);
-  });
-  return googleMapsPromise;
+function loadGoogleMaps({ manual = false } = {}) {
+  if (!monitorConfig.googleMapsEnabled) return Promise.resolve(false);
+  if (!manual && googleMapsAutomaticDenied) return Promise.resolve(false);
+  if (googleMapsScriptFailed) return Promise.resolve(false);
+  return (async () => {
+    let authorization;
+    try {
+      authorization = await api("/api/dispatch/maps/browser-session", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ sessionId: monitorMapsSessionId, manual })
+      });
+    } catch {
+      authorization = null;
+    }
+    if (!authorization?.available || !authorization.googleMapsApiKey) {
+      if (!manual) googleMapsAutomaticDenied = true;
+      return false;
+    }
+    monitorConfig.googleMapsApiKey = authorization.googleMapsApiKey;
+    if (window.google?.maps) return true;
+    if (!googleMapsPromise) {
+      googleMapsPromise = new Promise((resolve) => {
+        const script = document.createElement("script");
+        script.src = `https://maps.googleapis.com/maps/api/js?key=${encodeURIComponent(monitorConfig.googleMapsApiKey)}`;
+        script.async = true;
+        script.defer = true;
+        script.onload = () => resolve(true);
+        script.onerror = () => resolve(false);
+        document.head.appendChild(script);
+      }).then((loaded) => {
+        if (!loaded) googleMapsScriptFailed = true;
+        return loaded;
+      });
+    }
+    return googleMapsPromise;
+  })();
 }
 
 async function geocodeYard(yard) {
@@ -271,31 +288,8 @@ async function geocodeYard(yard) {
     const point = { lat: Number(yard.lat), lng: Number(yard.lng) };
     return isCanadaPoint(point) ? { ...yard, ...point } : yard;
   }
-  const key = normalizedAddress(yard.address);
-  if (!key || !window.google?.maps?.Geocoder) return yard;
-  if (monitorGeocodeCache[key] && isCanadaPoint(monitorGeocodeCache[key])) return { ...yard, ...monitorGeocodeCache[key] };
-  if (monitorGeocodeCache[key] && !isCanadaPoint(monitorGeocodeCache[key])) {
-    delete monitorGeocodeCache[key];
-    writeGeocodeCache();
-  }
-  const geocoder = new google.maps.Geocoder();
-  return new Promise((resolve) => {
-    geocoder.geocode({
-      address: yard.address,
-      componentRestrictions: { country: "CA" },
-      region: "ca"
-    }, (results, status) => {
-      if (status !== "OK" || !results?.[0]?.geometry?.location) return resolve(yard);
-      const point = {
-        lat: results[0].geometry.location.lat(),
-        lng: results[0].geometry.location.lng()
-      };
-      if (!isCanadaPoint(point)) return resolve(yard);
-      monitorGeocodeCache[key] = point;
-      writeGeocodeCache();
-      resolve({ ...yard, ...point });
-    });
-  });
+  const cached = monitorGeocodeCache[normalizedAddress(yard.address)];
+  return cached && isCanadaPoint(cached) ? { ...yard, ...cached } : yard;
 }
 
 function svgIcon(svg, width, height, anchorX = width / 2, anchorY = height) {
@@ -527,11 +521,16 @@ async function renderMap() {
   const renderGeneration = ++monitorMapRenderGeneration;
   const canvas = document.getElementById("monitorMap");
   if (!canvas) return;
-  const available = await loadGoogleMaps();
+  const mapCanvasChanged = Boolean(monitorMap && monitorMap.getDiv?.() !== canvas);
+  if (mapCanvasChanged) {
+    clearMarkers();
+    monitorMap = null;
+    monitorInfoWindow = null;
+  }
+  const available = monitorMap ? Boolean(window.google?.maps) : await loadGoogleMaps();
   if (renderGeneration !== monitorMapRenderGeneration || !canvas.isConnected) return;
-  monitorEtaRoutingAvailable = Boolean(available && window.google?.maps);
   if (!available || !window.google?.maps) {
-    canvas.innerHTML = monitorConfig.googleMapsApiKey ? "Google Maps could not load." : "Add GOOGLE_MAPS_API_KEY to enable the monitor map.";
+    canvas.innerHTML = "Live truck list is active. Google map tiles are disabled by usage policy.";
     updateMonitorEtaUi();
     return;
   }
@@ -598,7 +597,6 @@ async function renderMap() {
     mapHasFitBounds = true;
   }
   if (selectedTruckPlate) focusTruckOnMap(selectedTruckPlate);
-  void refreshTruckEtas();
 }
 
 function focusTruckOnMap(plate) {
@@ -639,48 +637,45 @@ function updateMonitorEtaUi() {
   }
 }
 
-function requestTruckEta(truck = {}) {
-  if (!truck.activeLoad?.nextStop || !monitorTruckLocationFresh(truck) || !window.google?.maps?.DirectionsService) {
-    return Promise.resolve(false);
-  }
+async function requestTruckEta(truck = {}) {
+  if (!truck.activeLoad?.nextStop || !monitorTruckLocationFresh(truck)) return false;
   const destination = monitorEtaDestination(truck);
-  if (!destination) return Promise.resolve(false);
+  if (!destination) return false;
   const plate = normalizedPlate(truck.plate);
   const destinationKey = monitorEtaDestinationKey(destination);
   const cached = monitorEtaByPlate.get(plate);
-  if (monitorEtaCacheReusable(cached, truck, destinationKey)) return Promise.resolve(false);
+  if (monitorEtaCacheReusable(cached, truck, destinationKey)) return false;
   const requestKey = `${plate}|${destinationKey}`;
   const pending = monitorEtaRequests.get(plate);
   if (pending?.key === requestKey) return pending.promise;
-  monitorDirectionsService ||= new google.maps.DirectionsService();
   const origin = { lat: Number(truck.latitude), lng: Number(truck.longitude) };
-  const promise = new Promise((resolve) => {
+  const promise = (async () => {
     try {
-      monitorDirectionsService.route({
-        origin,
-        destination,
-        travelMode: google.maps.TravelMode.DRIVING,
-        drivingOptions: {
-          departureTime: new Date(),
-          trafficModel: google.maps.TrafficModel.BEST_GUESS
-        }
-      }, (result, status) => {
-        const leg = result?.routes?.[0]?.legs?.[0];
-        const duration = leg?.duration_in_traffic || leg?.duration;
-        const durationSeconds = Number(duration?.value);
-        const record = {
-          destinationKey,
-          fetchedAt: Date.now(),
-          origin,
-          unavailable: status !== "OK" || !Number.isFinite(durationSeconds),
-          durationSeconds: Number.isFinite(durationSeconds) ? durationSeconds : null,
-          durationText: duration?.text || "",
-          distanceText: leg?.distance?.text || "",
-          arrivalAt: Number.isFinite(durationSeconds) ? new Date(Date.now() + (durationSeconds * 1000)).toISOString() : ""
-        };
-        monitorEtaByPlate.set(plate, record);
-        resolve(true);
+      const result = await api("/api/dispatch/maps/monitor-eta", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          origin: { latitude: origin.lat, longitude: origin.lng },
+          destination: typeof destination === "string" ? { location: destination } : destination,
+          fallbackMinutes: Number(truck.activeLoad?.nextStop?.travelMinutes || 30),
+          sessionId: monitorMapsSessionId
+        })
       });
+      const durationMinutes = Number(result.driveMinutes);
+      const distanceMetres = Number(result.distanceMeters);
+      monitorEtaByPlate.set(plate, {
+        destinationKey,
+        fetchedAt: Date.now(),
+        origin,
+        unavailable: !Number.isFinite(durationMinutes),
+        durationSeconds: Number.isFinite(durationMinutes) ? durationMinutes * 60 : null,
+        durationText: Number.isFinite(durationMinutes) ? `${Math.max(1, Math.round(durationMinutes))} min` : "",
+        distanceText: Number.isFinite(distanceMetres) && distanceMetres > 0 ? `${(distanceMetres / 1000).toFixed(1)} km` : "",
+        arrivalAt: Number.isFinite(durationMinutes) ? new Date(Date.now() + (durationMinutes * 60 * 1000)).toISOString() : "",
+        source: result.source || "fallback",
+        fallbackReason: result.fallbackReason || ""
+      });
+      return true;
     } catch {
       monitorEtaByPlate.set(plate, {
         destinationKey,
@@ -688,22 +683,13 @@ function requestTruckEta(truck = {}) {
         origin,
         unavailable: true
       });
-      resolve(true);
+      return true;
     }
-  }).finally(() => {
+  })().finally(() => {
     if (monitorEtaRequests.get(plate)?.key === requestKey) monitorEtaRequests.delete(plate);
   });
   monitorEtaRequests.set(plate, { key: requestKey, promise });
   return promise;
-}
-
-async function refreshTruckEtas() {
-  if (!monitorEtaRoutingAvailable) {
-    updateMonitorEtaUi();
-    return;
-  }
-  const results = await Promise.all(sortedMonitorTrucks().filter((truck) => truck.activeLoad).map(requestTruckEta));
-  if (results.some(Boolean)) updateMonitorEtaUi();
 }
 
 async function loadMonitor({ silent = false } = {}) {
@@ -770,6 +756,7 @@ function renderTruckList() {
           </div>
           ${monitorNextStopHtml(load)}
           <div class="monitor-truck-eta monitor-eta" data-monitor-eta-plate="${escapeHtml(truck.plate || "")}">${monitorEtaHtml(truck)}</div>
+          <button class="monitor-eta-refresh" data-action="refresh-monitor-eta" data-plate="${escapeHtml(truck.plate || "")}" type="button">Refresh ETA</button>
         ` : ""}
       </article>
     `;
@@ -978,7 +965,20 @@ function renderMonitorApp() {
   `;
 }
 
-monitorApp.addEventListener("click", (event) => {
+monitorApp.addEventListener("click", async (event) => {
+  const actionButton = event.target.closest("[data-action]");
+  const action = actionButton?.dataset.action;
+  if (action === "refresh-monitor-eta") {
+    const truck = monitorTruckByPlate(actionButton.dataset.plate || selectedTruckPlate);
+    if (!truck) return;
+    selectedTruckPlate = truck.plate || selectedTruckPlate;
+    actionButton.disabled = true;
+    updateMonitorEtaUi();
+    await requestTruckEta(truck);
+    actionButton.disabled = false;
+    updateMonitorEtaUi();
+    return;
+  }
   const orderCard = event.target.closest("[data-monitor-order-key]");
   if (orderCard) {
     selectedMonitorOrderKey = orderCard.dataset.monitorOrderKey || "";
@@ -994,7 +994,6 @@ monitorApp.addEventListener("click", (event) => {
     focusTruckOnMap(selectedTruckPlate);
     return;
   }
-  const action = event.target.closest("[data-action]")?.dataset.action;
   if (action === "refresh-monitor") loadMonitor({ silent: true });
 });
 

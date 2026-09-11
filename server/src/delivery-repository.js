@@ -1,6 +1,8 @@
 import crypto from "node:crypto";
 import { query, withTransaction } from "./db.js";
 import { dispatchLoadAssignment } from "./dispatch-load-assignment.js";
+import { assertDispatchExecutedPrefixPreserved } from "./dispatch-executed-prefix-repository.js";
+import { DISPATCH_FLEET_PLANNING_LOCK } from "./dispatch-fleet-status.js";
 import { isNetSuiteSandboxEnvironment } from "./config.js";
 import { writeAudit } from "./auth-repository.js";
 import { getDispatchDeliveryGroup, listDispatchDeliveryGroups } from "./dispatch-delivery-group-repository.js";
@@ -3291,6 +3293,7 @@ async function deactivateUnplannedDispatchSplitOrdersInTransaction({ originalOrd
     .map((ref) => String(ref || "").trim())
     .filter((ref) => ref && ref !== originalRef);
   if (!originalRef) throw new Error("Original order is required for unsplit.");
+  await query("SELECT pg_advisory_xact_lock(hashtext($1))", [DISPATCH_FLEET_PLANNING_LOCK]);
 
   const type = String(orderType || "").trim().toUpperCase();
   const isSales = type === "SO";
@@ -3368,6 +3371,34 @@ async function deactivateUnplannedDispatchSplitOrdersInTransaction({ originalOrd
   );
   if (blocked.length) {
     throw new Error(`Unsplit blocked. Unplan or clear these split orders first: ${blocked.map((row) => row.tranid).join(", ")}.`);
+  }
+
+  const snapshotCandidates = await query(
+    `SELECT p.id::text, p.plan_date::text AS plan_date, p.status, p.note, p.revision,
+            s.orders, s.trucks, s.summary
+       FROM dispatch_plans p
+       JOIN dispatch_plan_snapshots s ON s.plan_id = p.id
+      WHERE s.orders::text LIKE $1
+      ORDER BY p.id
+      FOR UPDATE OF p, s`,
+    [`%${originalRef}%`]
+  );
+  for (const row of snapshotCandidates.rows) {
+    const previousPlan = {
+      id: row.id,
+      planDate: row.plan_date,
+      status: row.status || "draft",
+      note: row.note || "",
+      revision: Number(row.revision || 0),
+      orders: row.orders || [],
+      trucks: row.trucks || [],
+      summary: row.summary || {}
+    };
+    const nextPlan = {
+      ...previousPlan,
+      orders: previousPlan.orders.filter((order) => !refs.includes(String(order?.id || "")))
+    };
+    await assertDispatchExecutedPrefixPreserved({ previousPlan, nextPlan });
   }
 
   const deleted = isSales

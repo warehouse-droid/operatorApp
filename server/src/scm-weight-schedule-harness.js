@@ -75,6 +75,7 @@ const scheduleQueryContext = {
     slaMax: "30"
   },
   scmScheduleReviewOnly: true,
+  scmScheduleCanViewRestrictedOrders: () => true,
   scmScheduleCanShowScmWorkingControls: () => true,
   scmScheduleCanShowTypeFilter: () => true,
   scmScheduleCanShowFullColumnFilters: () => true,
@@ -90,7 +91,11 @@ vm.runInNewContext(
 );
 const combinedScheduleParams = new URLSearchParams(String(scheduleQueryContext.result).replace(/^\?/, ""));
 assert.equal(combinedScheduleParams.get("search"), "cement");
-assert.deepEqual(combinedScheduleParams.getAll("status"), ["Hold", "Queued"]);
+assert.deepEqual(
+  combinedScheduleParams.getAll("status"),
+  [],
+  "An authorized explicit search must not be trapped inside the current status filters."
+);
 for (const [key, value] of [
   ["view", "scm working"],
   ["method", "Vendor"],
@@ -206,7 +211,7 @@ includesAll(enrichment, [
   "options.allowOllama !== false"
 ], "Reusable PO enrichment context");
 assert.equal((server.match(/req\.query\.includeSchedule === "false"/g) || []).length, 3, "Schedule mutations must support omitting unused full-list responses.");
-assert.ok(scheduleHtml.includes("/scm-schedule.js?v=20260902-netsuite-address-pickup-v1"), "Schedule cache bust missing.");
+assert.ok(scheduleHtml.includes("/scm-schedule.js?v=20260910-search-vendor-complete-v1"), "Schedule cache bust missing.");
 assert.ok(poHtml.includes("/dispatch-scm.js?v=20260903-po-line-sequence-v1"), "PO Split cache bust missing.");
 assert.ok(vrmaHtml.includes("/scm-vrma.js?v=20260730-vrma-delete-v1"), "VRMA cache bust missing.");
 

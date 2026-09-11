@@ -20,8 +20,7 @@ import {
 import { listDispatchOrders } from "./dispatch-repository.js";
 import { listDeliveryOrders } from "./delivery-repository.js";
 import {
-  cleanupBilledSalesOrderFamiliesFromDispatchPlan,
-  restoreDispatchPlanSnapshot
+  cleanupBilledSalesOrderFamiliesFromDispatchPlan
 } from "./dispatch-plan-repository.js";
 
 const rollback = await beginRollbackContext();
@@ -534,6 +533,14 @@ try {
       [sourceRef, splitRef, "TST-SOB-OTHER"],
       "An in-progress driver job must preserve the live route."
     );
+    const protectedRevision = Number((await query(
+      "SELECT revision FROM dispatch_plans WHERE id = $1",
+      [plan.rows[0].id]
+    )).rows[0].revision);
+    const protectedHistoryCount = Number((await query(
+      "SELECT count(*)::int AS count FROM dispatch_plan_snapshot_history WHERE plan_id = $1",
+      [plan.rows[0].id]
+    )).rows[0].count);
     await query(
       `UPDATE driver_job_records
           SET status = 'complete', completed_at = now()
@@ -545,8 +552,8 @@ try {
       actor: "so-reconciliation-harness-driver-complete"
     });
     assert.equal(postDriverCleanup.familyCount, 1);
-    assert.equal(postDriverCleanup.deferredFamilies.length, 0);
-    assert.equal(postDriverCleanup.changedPlans.length, 1);
+    assert.equal(postDriverCleanup.deferredFamilies.length, 1);
+    assert.equal(postDriverCleanup.changedPlans.length, 0);
 
     const headers = await query(
       `SELECT netsuite_id, status, status_text, netsuite_active,
@@ -624,37 +631,28 @@ try {
       "A valid inventory source line excluded from calculation must remain active.");
 
     const currentPlan = await query(
-      `SELECT orders, trucks FROM dispatch_plan_snapshots WHERE plan_id = $1`,
+      `SELECT p.revision, s.orders, s.trucks
+         FROM dispatch_plans p
+         JOIN dispatch_plan_snapshots s ON s.plan_id = p.id
+        WHERE p.id = $1`,
       [plan.rows[0].id]
     );
-    assert.deepEqual(currentPlan.rows[0].orders.map((order) => order.id), ["TST-SOB-OTHER"]);
+    assert.equal(Number(currentPlan.rows[0].revision), protectedRevision);
+    assert.deepEqual(
+      currentPlan.rows[0].orders.map((order) => order.id),
+      [sourceRef, splitRef, "TST-SOB-OTHER"],
+      "Reconciliation must retain the completed Driver route as historical planning evidence."
+    );
     assert.deepEqual(
       currentPlan.rows[0].trucks[0].loads[0].stops.map((stop) => stop.id),
-      ["STOP-OTHER"]
+      ["STOP-12441", "STOP-OTHER"]
     );
-    const history = await query(
-      `SELECT id, archive_reason, orders
-         FROM dispatch_plan_snapshot_history
-        WHERE plan_id = $1
-        ORDER BY id DESC
-        LIMIT 1`,
+    const historyCount = Number((await query(
+      "SELECT count(*)::int AS count FROM dispatch_plan_snapshot_history WHERE plan_id = $1",
       [plan.rows[0].id]
-    );
-    assert.equal(history.rows[0].archive_reason, "before_billed_so_reconciliation");
-    assert.deepEqual(history.rows[0].orders.map((order) => order.id), [sourceRef, splitRef, "TST-SOB-OTHER"]);
-
-    const restored = await restoreDispatchPlanSnapshot(history.rows[0].id, {
-      sessionId: "so-reconciliation-harness-restore"
-    });
-    assert.deepEqual(
-      restored.plan.orders.map((order) => order.id),
-      ["TST-SOB-OTHER"],
-      "Restoring an archived snapshot must not resurrect a Billed SO family."
-    );
-    assert.deepEqual(
-      restored.plan.trucks[0].loads[0].stops.map((stop) => stop.id),
-      ["STOP-OTHER"]
-    );
+    )).rows[0].count);
+    assert.equal(historyCount, protectedHistoryCount,
+      "A deferred reconciliation must not archive or increment an unchanged protected plan.");
 
     await query(
       `UPDATE sales_orders

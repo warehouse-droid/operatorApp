@@ -2,6 +2,7 @@ import { query } from "./db.js";
 import { getDispatchPlan } from "./dispatch-plan-repository.js";
 import { resolveDispatchSalesTarget } from "./dispatch-order-target-repository.js";
 import { listClosedNetSuiteOrders } from "./netsuite-closed-order-repository.js";
+import { completedOrderDependencyUnlinkAllowed } from "./order-dependency-repository.js";
 import {
   evaluateDependencyMutationBlockers,
   normalizeDependencyMutationAction
@@ -336,14 +337,20 @@ export async function previewScmDependencyMutation(command = {}, actor = {}, { l
   const transferRefs = transferRef ? [transferRef] : [];
   const purchaseRefs = purchaseRef ? [purchaseRef] : [];
   const affectedRefs = [...new Set([...memberRefs, ...transferRefs, ...purchaseRefs])];
+  // Unlink is metadata removal, not a rewind of the completed transfer. Keep
+  // every target/lease/revision/offline guard; exempt only that finished TO.
+  const completedUnlink = action === "unlink_to"
+    && await completedOrderDependencyUnlinkAllowed(relation.dependency.id);
+  const guardedTransferRefs = completedUnlink ? [] : transferRefs;
+  const guardedRefs = [...new Set([...memberRefs, ...guardedTransferRefs, ...purchaseRefs])];
   // Preview often runs under the command transaction's row/advisory locks.
   // Keep these reads sequential because pg clients do not support concurrent
   // queries on the same transaction connection.
-  const closed = await closedOrderRefs(affectedRefs);
-  const operatorRefs = await operatorActivityRefs({ salesRefs: memberRefs, transferRefs });
-  const receivingRefs = await receivingActivityRefs({ purchaseRefs, transferRefs });
-  const executionIds = await dependencyExecutionIds({ dependencyIds, transferRefs });
-  const jobIds = await driverActivity({ refs: affectedRefs });
+  const closed = await closedOrderRefs(guardedRefs);
+  const operatorRefs = await operatorActivityRefs({ salesRefs: memberRefs, transferRefs: guardedTransferRefs });
+  const receivingRefs = await receivingActivityRefs({ purchaseRefs, transferRefs: guardedTransferRefs });
+  const executionIds = completedUnlink ? [] : await dependencyExecutionIds({ dependencyIds, transferRefs });
+  const jobIds = await driverActivity({ refs: guardedRefs });
   const evidenceIds = await offlineEvidence({ planId });
   const lease = await activeForeignLease(
     plan?.planDate || command.planDate || resolved.target.planDate,

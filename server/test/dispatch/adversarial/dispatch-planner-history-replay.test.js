@@ -109,6 +109,7 @@ test("RP-10 replay sanitizer preserves private location/address equality and syn
   const serialized = JSON.stringify(plan);
   assert.doesNotMatch(serialized, /Customer Road|Vendor Yard|3445|private-driver|TRUCK-PRIVATE/u);
   assert.equal(plan.orders[0].pickupLocations[0], plan.trucks[0].loads[0].stops[0].location);
+  assert.ok(plan.ownYardCodes?.includes(plan.orders[0].pickupLocations[0]), "sanitization must preserve own-yard classification");
   assert.ok(plan.orders[0].address.startsWith("ADDRESS_"));
   const report = buildDispatchPickupRevisitReplay({
     capture: {

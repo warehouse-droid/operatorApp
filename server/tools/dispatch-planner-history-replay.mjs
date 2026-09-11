@@ -242,7 +242,8 @@ try {
   }
   for (const row of audits.rows) {
     const event = {
-      stream: "dispatch",
+      stream: /^(?:scm\.|dispatch\.scm_)/i.test(String(row.action || ""))
+        || ["scm", "dispatch-scm"].includes(String(row.source || "").toLowerCase()) ? "scm" : "dispatch",
       id: eventId("dispatch", "audit", row.id),
       serverAt: iso(row.created_at),
       sourceSequence: Number(row.id),

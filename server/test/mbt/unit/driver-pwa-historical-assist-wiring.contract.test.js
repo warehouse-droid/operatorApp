@@ -118,6 +118,8 @@ test("S42: completed-stop evidence UI is filterable, append-only, stale-safe, an
     'name="q"',
     "driverPwaCompletedCaptureVisibleDraft",
     "driverPwaRevalidateCompletedDraft",
+    "offlineReviewPendingCompletedPhotoRefresh",
+    "offlineReviewScheduleEventRefresh",
     "expectedStateHash",
     "additionEventId",
     "historicalAssistMapConcurrency(pending, 2",
@@ -130,4 +132,9 @@ test("S42: completed-stop evidence UI is filterable, append-only, stale-safe, an
   assert.match(client, /name=["']confirmAddition["'][^>]*required/u);
   assert.match(client, /DRIVER_PWA_VISITS_ENDPOINT/u);
   assert.match(client, /driver\.stop\.photos_added/u);
+  assert.match(
+    client,
+    /driverPwaReleaseCompletedDraft\(recordId\);[\s\S]*?driverPwaLoadCompletedVisits\(\{ keepSelection: true, quiet: true, captureDraft: false \}\)/u,
+    "a successful append must not resurrect the submitted form while refreshing"
+  );
 });

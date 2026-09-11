@@ -29,7 +29,7 @@ const MUTANTS = Object.freeze([
   {
     name: "Dispatch serves a stale browser generation",
     target: "public/dispatch.html",
-    from: "dispatch.js?v=20260903-repeat-pickup-visits-v1",
+    from: "dispatch.js?v=20260911-maps-usage-v1",
     to: "dispatch.js?v=stale-unplan-client"
   }
 ]);

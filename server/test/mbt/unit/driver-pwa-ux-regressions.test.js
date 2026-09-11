@@ -156,11 +156,11 @@ test("a location override belongs to one stop and survives only same-stop refres
 });
 
 test("the updated override policy is atomically included in the Driver PWA shell", () => {
-  const assetVersion = "20260903-retained-photo-i18n-v1";
+  const assetVersion = "20260910-route-prefix-cursor-v1";
   assert.ok(driverHtml.includes(`/driver-location-override.js?v=${assetVersion}`));
   assert.ok(workerSource.includes(`/driver-location-override.js?v=${assetVersion}`));
-  assert.match(workerSource, /DRIVER_CACHE_NAME = `\$\{DRIVER_CACHE_PREFIX\}v40`/u);
-  assert.match(driverSource, /driver-service-worker\.js\?v=20260903-retained-photo-i18n-v1/u);
+  assert.match(workerSource, /DRIVER_CACHE_NAME = `\$\{DRIVER_CACHE_PREFIX\}v41`/u);
+  assert.match(driverSource, /driver-service-worker\.js\?v=20260910-route-prefix-cursor-v1/u);
 });
 
 test("delivery instruction text follows the selected language with source fallback", () => {

@@ -3965,8 +3965,23 @@ function projectOfflineRoute(manifest, events) {
       }
     }
   }
-  const inProgress = jobs.find((job) => String(job.status || "").toLowerCase() === "in_progress");
-  const nextPending = jobs.find((job) => !jobIsComplete(job));
+  const inProgress = jobs
+    .map((job, index) => ({
+      job,
+      index,
+      startedAt: Date.parse(job.startedAt || "")
+    }))
+    .filter(({ job }) => String(job.status || "").toLowerCase() === "in_progress")
+    .sort((left, right) => {
+      const leftStarted = Number.isFinite(left.startedAt) ? left.startedAt : Number.MAX_SAFE_INTEGER;
+      const rightStarted = Number.isFinite(right.startedAt) ? right.startedAt : Number.MAX_SAFE_INTEGER;
+      return leftStarted - rightStarted || left.index - right.index;
+    })[0]?.job || null;
+  let latestCompletedIndex = -1;
+  jobs.forEach((job, index) => {
+    if (jobIsComplete(job)) latestCompletedIndex = index;
+  });
+  const nextPending = jobs.find((job, index) => index > latestCompletedIndex && !jobIsComplete(job));
   const projectedJob = inProgress || nextPending || null;
   projectedState.allJobsComplete = Boolean(manifest?.complete && jobs.length > 0 && jobs.every(jobIsComplete));
   return {
@@ -6894,7 +6909,7 @@ if ("serviceWorker" in navigator) {
     window.setTimeout(requestDriverWorkerVersion, 0);
     window.setTimeout(publishDriverOfflineMode, 0);
   });
-  navigator.serviceWorker.register("/driver-service-worker.js?v=20260903-retained-photo-i18n-v1", {
+  navigator.serviceWorker.register("/driver-service-worker.js?v=20260910-route-prefix-cursor-v1", {
     scope: "/driver",
     updateViaCache: "none"
   })
