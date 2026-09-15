@@ -62,7 +62,8 @@ try {
     username,
     displayName: "Yard Access Harness",
     password: "Rollback123",
-    role: "yard_manager"
+    role: "yard_manager",
+    operatorYardLocationIds: [1]
   });
   dispatcher = await createOperator({
     username: `dispatch_access_${runId}`,

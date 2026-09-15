@@ -46,7 +46,7 @@ async function installSession(page, state) {
     localStorage.setItem("mbbs.staff.token", "operator-page-confirm-browser-token");
     localStorage.setItem("mbbs.operator.token", "operator-page-confirm-browser-token");
     localStorage.setItem("mbbs.operator.locationId", "1");
-    localStorage.setItem("mbbs.operator.state", JSON.stringify({ locationId: 1, ...restoredState }));
+    localStorage.setItem("mbbs.operator.state", JSON.stringify({ accountId: "operator-page-confirm-browser-operator", sessionKey: "18836d81177ddd0577a929b4fbf9ce523f4421da26b123c6256f31be4c73d185", locationId: 1, ...restoredState }));
   }, state);
 }
 
@@ -59,7 +59,8 @@ function commonApi(route) {
         username: "operator-page-confirm-browser-operator",
         display_name: "Page Confirm Operator",
         role: "operator",
-        roles: ["operator"]
+        roles: ["operator"],
+          operatorYardLocationIds: [1]
       }
     });
   }

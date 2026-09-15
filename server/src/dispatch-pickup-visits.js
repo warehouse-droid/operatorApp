@@ -225,7 +225,22 @@ function pickupAmbiguityConflicts(plan = {}, previousPlan = null, { allowLegacyP
   return conflicts;
 }
 
-function validateMaterializedPickupVisits(plan = {}, { allowLegacyPassthrough = false } = {}) {
+function retainedStartedVoyageGap(previousPlan, load, stop, order, location, activity) {
+  const sovRefs = [orderRef(order), ...(order.childOrders || []), ...(order.childOrderDetails || []).map(orderRef)];
+  if (locationKey(location) !== "195" || !sovRefs.some(ref => /^SOV/iu.test(ref))) return false;
+  const previousLoad = previousLoadFor(previousPlan, load);
+  if (!previousLoad) return false;
+  const index = previousLoad.stops.findIndex(entry => visitStopId(entry) === visitStopId(stop)
+    && directDeliveryRefs(entry).includes(orderRef(order)));
+  if (index < 0 || index > dispatchLoadProtectedBoundary(previousLoad, activity)) return false;
+  // Only preserve an existing historical omission. Removing a recorded pickup
+  // cannot obtain this compatibility treatment.
+  return !previousLoad.stops.slice(0, index).some(entry => pickupStop(entry)
+    && locationKey(entry.location || entry.yard) === locationKey(location)
+    && resolveDispatchPickupVisit({ plan: previousPlan, load: previousLoad, stop: entry }).orderRefs.includes(orderRef(order)));
+}
+
+function validateMaterializedPickupVisits(plan = {}, { allowLegacyPassthrough = false, previousPlan = {}, activity = [] } = {}) {
   const conflicts = [];
   for (const truck of Array.isArray(plan.trucks) ? plan.trucks : []) {
     for (const load of Array.isArray(truck?.loads) ? truck.loads : []) {
@@ -306,6 +321,8 @@ function validateMaterializedPickupVisits(plan = {}, { allowLegacyPassthrough = 
         for (const location of dispatchRequiredPickupVisitLocations(order, plan)) {
           const allocationKey = `${refKey}|${locationKey(location)}`;
           if (allocations.has(allocationKey)) continue;
+          if (allowLegacyPassthrough && retainedStartedVoyageGap(previousPlan, load,
+            stops[firstDeliveryIndex], order, location, activity)) continue;
           conflicts.push(conflict(
             "DISPATCH_PICKUP_ORDER_MISSING",
             `${orderRef(order)} requires pickup at ${location} before delivery.`,
@@ -320,7 +337,7 @@ function validateMaterializedPickupVisits(plan = {}, { allowLegacyPassthrough = 
 
 export function materializeDispatchPickupVisits(
   plan = {},
-  { previousPlan = null, allowLegacyPassthrough = false } = {}
+  { previousPlan = null, allowLegacyPassthrough = false, activity = [] } = {}
 ) {
   const next = clone(plan) || {};
   const ambiguity = pickupAmbiguityConflicts(next, previousPlan, { allowLegacyPassthrough });
@@ -352,7 +369,7 @@ export function materializeDispatchPickupVisits(
       }
     }
   }
-  const conflicts = validateMaterializedPickupVisits(next, { allowLegacyPassthrough });
+  const conflicts = validateMaterializedPickupVisits(next, { allowLegacyPassthrough, previousPlan: previousPlan || {}, activity });
   const fullyMaterialized = (next.trucks || []).every((truck) => (truck.loads || []).every((load) => {
     if (load.returnOnly === true) return true;
     const stops = Array.isArray(load.stops) ? load.stops : [];
@@ -418,7 +435,10 @@ export function dispatchLoadProtectedBoundary(load = {}, activity = []) {
   for (const record of activityForLoad(activity, load)) {
     const type = stopType(record);
     if (type === "travel") {
-      if (recordStatus(record) === "in_progress") boundary = Math.max(boundary, travelTargetIndex(load, record));
+      if (recordStatus(record) === "in_progress") {
+        const target = travelTargetIndex(load, record);
+        boundary = Math.max(boundary, target >= 0 ? target : stops.length - 1);
+      }
       continue;
     }
     if (!PICKUP_TYPES.has(type) && !DELIVERY_TYPES.has(type)) continue;

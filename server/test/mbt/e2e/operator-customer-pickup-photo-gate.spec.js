@@ -90,7 +90,7 @@ async function installPickupSession(page) {
     localStorage.setItem("mbbs.staff.token", "pickup-photo-gate-browser-token");
     localStorage.setItem("mbbs.operator.token", "pickup-photo-gate-browser-token");
     localStorage.setItem("mbbs.operator.locationId", "1");
-    localStorage.setItem("mbbs.operator.state", JSON.stringify({
+    localStorage.setItem("mbbs.operator.state", JSON.stringify({ accountId: "pickup-photo-gate-operator", sessionKey: "37c6f3afffb7d4eacf3a6ca85a9e34549e3164915c74d7b53039d216633e5fb2",
       currentModule: "customer-pickup",
       locationId: 1,
       selectedId: orderId,
@@ -116,7 +116,8 @@ async function installPickupApi(page, policySequence) {
           username: "pickup-photo-gate-operator",
           display_name: "Pickup Photo Gate Operator",
           role: "operator",
-          roles: ["operator"]
+          roles: ["operator"],
+          operatorYardLocationIds: [1]
         }
       });
     }

@@ -127,11 +127,18 @@ assertBlocked(
   "DRIVER_PWA_STOP_NOT_FOUND",
   "A missing canonical stop must be blocked."
 );
-assertBlocked(
-  validateDriverPwaStopReopen({ ...clearEligibility, record: { ...pickupRecord, stop_type: "travel" } }),
-  "DRIVER_PWA_STOP_TYPE_BLOCKED",
-  "Travel/rest/switch jobs must not be reopened as physical stops."
+assert.equal(
+  validateDriverPwaStopReopen({ ...clearEligibility, record: { ...pickupRecord, stop_type: "travel" } }).allowed,
+  true,
+  "Travel can be reopened through the same audited correction as physical stops."
 );
+for (const stop_type of ["rest", "truck_switch"]) {
+  assertBlocked(
+    validateDriverPwaStopReopen({ ...clearEligibility, record: { ...pickupRecord, stop_type } }),
+    "DRIVER_PWA_STOP_TYPE_BLOCKED",
+    "Rest and truck-switch jobs retain their separate correction workflows."
+  );
+}
 assert.equal(
   validateDriverPwaStopReopen({ ...clearEligibility, record: { ...pickupRecord, status: "in_progress" } }).allowed,
   true,

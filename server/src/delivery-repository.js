@@ -1,3 +1,4 @@
+import { deliveryOrderWithinYards } from "./operator-yard-access.js";
 import crypto from "node:crypto";
 import { query, withTransaction } from "./db.js";
 import { dispatchLoadAssignment } from "./dispatch-load-assignment.js";
@@ -1169,13 +1170,14 @@ function buildDispatchGroupDeliveryListOrder(group, orders = []) {
   };
 }
 
-async function listDispatchGroupDeliveryOrders({ locationId = null, status = "active", orderType = "sales_order", planDate = null, truckPlate = null } = {}) {
+async function listDispatchGroupDeliveryOrders({ locationId = null, status = "active", orderType = "sales_order", planDate = null, truckPlate = null, allowedOperatorYards = null } = {}) {
   const definitions = await listDispatchDeliveryGroups({ orderType });
   const childOrdersByGroup = await loadDispatchGroupChildOrders(definitions);
   const rows = [];
   for (const group of definitions) {
     const order = buildDispatchGroupDeliveryListOrder(group, childOrdersByGroup.get(group.id) || []);
     if (!order) continue;
+    if (!deliveryOrderWithinYards({ ...order, child_orders: childOrdersByGroup.get(group.id) || [] }, allowedOperatorYards)) continue;
     if (locationId && String(order.outbound_location_id || "") !== String(locationId)) continue;
     if (planDate && String(order.dispatch_plan_date || "").slice(0, 10) !== String(dateOnly(planDate) || "")) continue;
     if (truckPlate && String(order.dispatch_truck_plate || "") !== String(truckPlate)) continue;
@@ -1769,7 +1771,7 @@ async function getVrmaDeliveryPrepOrder(ref) {
   }, lines.rows);
 }
 
-export async function listDeliveryOrders({ locationId = null, status = "active", orderType = "sales_order", planDate = null, truckPlate = null } = {}) {
+export async function listDeliveryOrders({ locationId = null, status = "active", orderType = "sales_order", planDate = null, truckPlate = null, allowedOperatorYards = null } = {}) {
   const sandboxFixtures = isNetSuiteSandboxEnvironment();
   const sandboxSql = sandboxFixtures ? "true" : "false";
   const statuses = parseStatusFilter(status);
@@ -1997,7 +1999,7 @@ export async function listDeliveryOrders({ locationId = null, status = "active",
     ,
     params
   );
-  const groupRows = await listDispatchGroupDeliveryOrders({ locationId, status, orderType, planDate, truckPlate });
+  const groupRows = await listDispatchGroupDeliveryOrders({ locationId, status, orderType, planDate, truckPlate, allowedOperatorYards });
   const localCoRows = orderType === "sales_order"
     ? await listLocalCoDeliveryOrders({ locationId, status, planDate, truckPlate })
     : [];
@@ -2111,11 +2113,11 @@ export async function listDeliveryLoadTrucks({ locationId = null, planDate = nul
     .sort((left, right) => String(left.truck_plate || "").localeCompare(String(right.truck_plate || "")));
 }
 
-export async function listDeliveryLoadOrders({ locationId = null, status = "active", planDate = null, truckPlate = null } = {}) {
+export async function listDeliveryLoadOrders({ locationId = null, status = "active", planDate = null, truckPlate = null, allowedOperatorYards = null } = {}) {
   if (!dateOnly(planDate)) return [];
   const [salesOrders, transferOrders] = await Promise.all([
-    listDeliveryOrders({ locationId, status, orderType: "sales_order", planDate, truckPlate }),
-    listDeliveryOrders({ locationId, status, orderType: "transfer_order", planDate, truckPlate })
+    listDeliveryOrders({ locationId, status, orderType: "sales_order", planDate, truckPlate, allowedOperatorYards }),
+    listDeliveryOrders({ locationId, status, orderType: "transfer_order", planDate, truckPlate, allowedOperatorYards })
   ]);
   return [...salesOrders, ...transferOrders].sort((a, b) =>
     String(a.dispatch_load_name || "").localeCompare(String(b.dispatch_load_name || ""), undefined, { numeric: true, sensitivity: "base" })
@@ -2168,7 +2170,7 @@ export async function removeSavedDeliveryOrderForOperator(operatorId, { location
   return { removed: result.rowCount };
 }
 
-export async function listSavedDeliveryOrdersForOperator(operatorId, { locationId } = {}) {
+export async function listSavedDeliveryOrdersForOperator(operatorId, { locationId, allowedOperatorYards = null } = {}) {
   if (!operatorId || !locationId) return [];
   const saved = await query(
     `SELECT order_key, order_ref, order_type, created_at
@@ -2183,7 +2185,7 @@ export async function listSavedDeliveryOrdersForOperator(operatorId, { locationI
   const rows = [];
   for (const item of saved.rows) {
     const order = orderByKey.get(String(item.order_key));
-    if (!order) continue;
+    if (!order || !deliveryOrderWithinYards(order, allowedOperatorYards) || Number(order.outbound_location_id ?? order.source_location_id) !== Number(locationId)) continue;
     if (order.order_type === "sales_order" && isNetSuiteSalesOrderBilled(order)) continue;
     if (isFullyLoadedDeliveryOrder(order)) continue;
     rows.push({
@@ -2196,7 +2198,7 @@ export async function listSavedDeliveryOrdersForOperator(operatorId, { locationI
   return rows;
 }
 
-export async function listSavedDeliveryOrderKeysForOperator(operatorId, { locationId } = {}) {
+export async function listSavedDeliveryOrderKeysForOperator(operatorId, { locationId, allowedOperatorYards = null } = {}) {
   if (!operatorId || !locationId) return [];
   const result = await query(
     `SELECT saved.order_key
@@ -2236,7 +2238,10 @@ export async function listSavedDeliveryOrderKeysForOperator(operatorId, { locati
       ORDER BY saved.created_at DESC`,
     [operatorId, locationId]
   );
-  return result.rows.map((row) => String(row.order_key));
+  const orders = await getDeliveryOrdersBatch(result.rows.map((row) => row.order_key));
+  const allowedKeys = new Set(orders.filter((order) => deliveryOrderWithinYards(order, allowedOperatorYards) && Number(order.outbound_location_id ?? order.source_location_id) === Number(locationId))
+    .map((order) => String(order.netsuite_id)));
+  return result.rows.map((row) => String(row.order_key)).filter((key) => allowedKeys.has(key));
 }
 
 function todayKey() {
@@ -2517,21 +2522,21 @@ export async function getDeliveryOrder(id, { includeNetSuiteClosed = false } = {
   });
 }
 
-export async function getDeliveryPrepNotifications({ locationId = null } = {}) {
+export async function getDeliveryPrepNotifications({ locationId = null, allowedOperatorYards = null } = {}) {
   if (!locationId) return buildDeliveryPrepNotifications({ locationId });
   const [salesActive, transferActive] = await Promise.all([
-    listDeliveryOrders({ locationId, status: "active", orderType: "sales_order" }),
-    listDeliveryOrders({ locationId, status: "active", orderType: "transfer_order" })
+    listDeliveryOrders({ locationId, status: "active", orderType: "sales_order", allowedOperatorYards }),
+    listDeliveryOrders({ locationId, status: "active", orderType: "transfer_order", allowedOperatorYards })
   ]);
   return buildDeliveryPrepNotifications({ locationId, salesActive, transferActive });
 }
 
-export async function getDeliveryBootstrap({ operatorId = null, locationId = null } = {}) {
+export async function getDeliveryBootstrap({ operatorId = null, locationId = null, allowedOperatorYards = null } = {}) {
   const [salesOrder, transferOrder, vrmaOrder, savedOrderKeys, activeDraft] = await Promise.all([
-    listDeliveryOrders({ locationId, status: "active", orderType: "sales_order" }),
-    listDeliveryOrders({ locationId, status: "active", orderType: "transfer_order" }),
+    listDeliveryOrders({ locationId, status: "active", orderType: "sales_order", allowedOperatorYards }),
+    listDeliveryOrders({ locationId, status: "active", orderType: "transfer_order", allowedOperatorYards }),
     listVrmaDeliveryPrepOrders({ locationId }),
-    listSavedDeliveryOrderKeysForOperator(operatorId, { locationId }),
+    listSavedDeliveryOrderKeysForOperator(operatorId, { locationId, allowedOperatorYards }),
     getCurrentOperatorDeliveryDraft(operatorId, { locationId })
   ]);
   return {
@@ -5743,7 +5748,18 @@ export async function confirmDeliveryLines(orderId, lines = [], operatorId) {
   return { confirmed, failures };
 }
 
+function customerPickupAbsoluteQuantity(values) {
+  const mode = values?.quantityMode === undefined ? "additive" : values.quantityMode;
+  if (mode !== "additive" && mode !== "absolute") {
+    const error = new Error("Unsupported pickup quantity mode.");
+    error.status = 400;
+    throw error;
+  }
+  return mode === "absolute";
+}
+
 export async function confirmCustomerPickupLine(orderId, lineId, values, operatorId) {
+  const absolute = customerPickupAbsoluteQuantity(values);
   await assertNoClosedNetSuiteOrders([orderId], "confirm a Customer Pick-Up line");
   if (!operatorId) throw new Error("Operator ID is required.");
   const order = await getDeliveryOrder(orderId);
@@ -5761,17 +5777,18 @@ export async function confirmCustomerPickupLine(orderId, lineId, values, operato
   const next = salesOnly
     ? { pallets: 0, layers: 0, pieces: 0, sections: 0 }
     : {
-      pallets: Math.min(available.pallets, positiveQuantity(line.packed_pallet_qty) + pallets),
-      layers: Math.min(available.layers, positiveQuantity(line.packed_layer_qty) + layers),
-      pieces: Math.min(available.pieces, positiveQuantity(line.packed_piece_qty) + pieces),
-      sections: Math.min(available.sections, positiveQuantity(line.packed_section_qty) + sections)
+      pallets: Math.min(available.pallets, (absolute ? 0 : positiveQuantity(line.packed_pallet_qty)) + pallets),
+      layers: Math.min(available.layers, (absolute ? 0 : positiveQuantity(line.packed_layer_qty)) + layers),
+      pieces: Math.min(available.pieces, (absolute ? 0 : positiveQuantity(line.packed_piece_qty)) + pieces),
+      sections: Math.min(available.sections, (absolute ? 0 : positiveQuantity(line.packed_section_qty)) + sections)
     };
   const packedSalesQty = salesOnly
-    ? resolveSalesOnlyPackedQuantity(line, values)
+    ? resolveSalesOnlyPackedQuantity(line, values, { absolute })
     : resolveIndependentPackedSalesQuantity(line, next, requestedSalesQty, {
+      absolute,
       physicalChanged: pallets + layers + pieces + sections > 0
     });
-  if ((next.pallets + next.layers + next.pieces + next.sections + packedSalesQty) <= 0) {
+  if (!absolute && (next.pallets + next.layers + next.pieces + next.sections + packedSalesQty) <= 0) {
     throw new Error("This pickup line has no remaining quantity to load.");
   }
 
@@ -5782,8 +5799,8 @@ export async function confirmCustomerPickupLine(orderId, lineId, values, operato
          packed_piece_qty = $5,
          packed_section_qty = $6,
          packed_sales_qty = $7,
-         confirmed = true,
-         confirmed_at = now()
+         confirmed = ($3::numeric + $4::numeric + $5::numeric + $6::numeric + $7::numeric) > 0,
+         confirmed_at = CASE WHEN ($3::numeric + $4::numeric + $5::numeric + $6::numeric + $7::numeric) > 0 THEN now() ELSE null END
      WHERE sales_order_id = $1
        AND sync_exception IS NULL
        AND id = $2`,
@@ -5819,6 +5836,7 @@ export async function confirmCustomerPickupLines(orderId, lines = [], operatorId
   if (!order || !isPickupOrder(order)) throw new Error("Customer pickup sales order not found.");
 
   const requestedLines = uniqueCustomerPickupLineRequests(lines);
+  for (const item of requestedLines) customerPickupAbsoluteQuantity(item.values);
   let confirmed = 0;
   const failures = [];
   for (const item of requestedLines) {

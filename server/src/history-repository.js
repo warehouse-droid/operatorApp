@@ -13,6 +13,12 @@ function dateClause(alias, date, params) {
   return ` AND ${alias}.created_at::date = $${params.length}::date`;
 }
 
+function yardClause(expression, yardLocationIds, params) {
+  if (yardLocationIds === null) return "";
+  params.push(yardLocationIds);
+  return ` AND (${expression}) = ANY($${params.length}::bigint[])`;
+}
+
 function normalizeRecord(row) {
   return {
     id: row.id,
@@ -29,22 +35,23 @@ function normalizeRecord(row) {
   };
 }
 
-export async function listOperatorHistory({ operatorId, date = "", limit = 100 } = {}) {
+export async function listOperatorHistory({ operatorId, date = "", limit = 100, yardLocationIds = null } = {}) {
   const safeLimit = cleanLimit(limit);
   const records = [];
 
   const auditParams = [operatorId, HISTORY_ACTIONS];
   const auditDate = dateClause("a", date, auditParams);
+  const auditYard = yardClause("CASE WHEN a.source = 'receiving' THEN ro.location_id ELSE dord.location_id END", yardLocationIds, auditParams);
   const audit = await query(
     `WITH delivery_order_lookup AS (
-       SELECT netsuite_id, tranid FROM sales_orders
+       SELECT netsuite_id, tranid, outbound_location_id AS location_id FROM sales_orders
        UNION ALL
-       SELECT netsuite_id, tranid FROM transfer_orders
+       SELECT netsuite_id, tranid, from_location_id AS location_id FROM transfer_orders
      ),
      receiving_order_lookup AS (
-       SELECT netsuite_id, tranid FROM purchase_orders
+       SELECT netsuite_id, tranid, destination_location_id AS location_id FROM purchase_orders
        UNION ALL
-       SELECT netsuite_id, tranid FROM transfer_orders
+       SELECT netsuite_id, tranid, to_location_id AS location_id FROM transfer_orders
      ),
      delivery_line_lookup AS (
        SELECT id, item_name, item_description, to_plt, to_lyr, to_sec, to_pcs
@@ -125,7 +132,7 @@ export async function listOperatorHistory({ operatorId, date = "", limit = 100 }
      LEFT JOIN receiving_line_lookup rl ON rl.order_id = ro.netsuite_id AND rl.line_id = a.line_id AND a.action = 'receiving.line.confirm'
      WHERE a.actor_operator_id = $1
        AND a.action = ANY($2::text[])
-       ${auditDate}
+       ${auditDate} ${auditYard}
      ORDER BY a.created_at DESC, a.id DESC
      LIMIT ${safeLimit}`,
     auditParams
@@ -134,6 +141,7 @@ export async function listOperatorHistory({ operatorId, date = "", limit = 100 }
 
   const loadParams = [operatorId];
   const loadDate = dateClause("l", date, loadParams);
+  const loadYard = yardClause("COALESCE(so.outbound_location_id, tr.from_location_id, co.from_location_id)", yardLocationIds, loadParams);
   const loads = await query(
     `SELECT ('load-' || l.id) AS id,
             l.load_type AS type,
@@ -174,6 +182,7 @@ export async function listOperatorHistory({ operatorId, date = "", limit = 100 }
      FROM operator_load_records l
      LEFT JOIN sales_orders so ON so.netsuite_id = l.order_id AND l.order_family = 'sales_order'
      LEFT JOIN transfer_orders tr ON tr.netsuite_id = l.order_id AND l.order_family = 'transfer_order'
+     LEFT JOIN local_co_orders co ON co.delivery_order_id = l.order_id AND l.order_family = 'co_order'
      LEFT JOIN LATERAL (
        SELECT jsonb_agg(jsonb_build_object(
          'itemName', line.value->>'itemName',
@@ -188,7 +197,7 @@ export async function listOperatorHistory({ operatorId, date = "", limit = 100 }
        FROM jsonb_array_elements(COALESCE(l.line_snapshot, '[]'::jsonb)) line(value)
      ) load_lines ON true
      WHERE l.operator_id = $1
-       ${loadDate}
+       ${loadDate} ${loadYard}
      ORDER BY l.created_at DESC, l.id DESC
      LIMIT ${safeLimit}`,
     loadParams
@@ -197,11 +206,12 @@ export async function listOperatorHistory({ operatorId, date = "", limit = 100 }
 
   const receiptParams = [operatorId];
   const receiptDate = dateClause("r", date, receiptParams);
+  const receiptYard = yardClause("o.location_id", yardLocationIds, receiptParams);
   const receipts = await query(
     `WITH receiving_order_lookup AS (
-       SELECT netsuite_id, tranid, 'purchase_order'::text AS order_type FROM purchase_orders
+       SELECT netsuite_id, tranid, destination_location_id AS location_id, 'purchase_order'::text AS order_type FROM purchase_orders
        UNION ALL
-       SELECT netsuite_id, tranid, 'transfer_order'::text AS order_type FROM transfer_orders
+       SELECT netsuite_id, tranid, to_location_id AS location_id, 'transfer_order'::text AS order_type FROM transfer_orders
      ),
      receiving_line_lookup AS (
        SELECT purchase_order_id AS order_id, line_id, id, item_name, item_description,
@@ -252,7 +262,7 @@ export async function listOperatorHistory({ operatorId, date = "", limit = 100 }
          AND NULLIF(item.value->>'quantity', '') IS NOT NULL
      ) received_lines ON true
      WHERE r.operator_id = $1
-       ${receiptDate}
+       ${receiptDate} ${receiptYard}
      ORDER BY r.created_at DESC, r.id DESC
      LIMIT ${safeLimit}`,
     receiptParams
@@ -262,6 +272,9 @@ export async function listOperatorHistory({ operatorId, date = "", limit = 100 }
   const cycleParams = [operatorId];
   const cycleDate = date ? " AND COALESCE(r.submitted_at, r.updated_at)::date = $2::date" : "";
   if (date) cycleParams.push(String(date).slice(0, 10));
+  const cycleYard = yardLocationIds === null ? "" : ` AND NOT EXISTS (
+    SELECT 1 FROM cycle_count_lines scope WHERE scope.record_id=r.id
+    AND NOT (scope.location_id = ANY($${cycleParams.push(yardLocationIds)}::bigint[])))`;
   const cycle = await query(
     `SELECT ('cycle-' || r.id) AS id,
             'cycle_count' AS type,
@@ -300,7 +313,7 @@ export async function listOperatorHistory({ operatorId, date = "", limit = 100 }
      LEFT JOIN inventory_balances b ON b.item_id = l.item_id AND b.location_id = l.location_id
      WHERE r.operator_id = $1
        AND r.status = 'submitted'
-       ${cycleDate}
+       ${cycleDate} ${cycleYard}
      GROUP BY r.id
      ORDER BY COALESCE(r.submitted_at, r.updated_at) DESC
      LIMIT ${safeLimit}`,
@@ -310,6 +323,7 @@ export async function listOperatorHistory({ operatorId, date = "", limit = 100 }
 
   const returnParams = [operatorId];
   const returnDate = dateClause("r", date, returnParams);
+  const returnYard = yardClause("r.receiving_location_id", yardLocationIds, returnParams);
   const returns = await query(
     `SELECT ('return-' || r.id) AS id,
             CASE WHEN r.record_type = 'pallet' THEN 'pallet_return' ELSE 'stock_return' END AS type,
@@ -366,7 +380,7 @@ export async function listOperatorHistory({ operatorId, date = "", limit = 100 }
           WHERE p.return_record_id = r.id
        ) photos ON true
       WHERE r.operator_id = $1
-        ${returnDate}
+        ${returnDate} ${returnYard}
       ORDER BY r.submitted_at DESC, r.id DESC
       LIMIT ${safeLimit}`,
     returnParams
@@ -378,16 +392,16 @@ export async function listOperatorHistory({ operatorId, date = "", limit = 100 }
     .slice(0, safeLimit);
 }
 
-export async function findOperatorHistoryRecord(operatorId, recordId) {
-  const records = await listOperatorHistory({ operatorId, limit: 200 });
+export async function findOperatorHistoryRecord(operatorId, recordId, yardLocationIds = null) {
+  const records = await listOperatorHistory({ operatorId, limit: 200, yardLocationIds });
   return records.find((record) => record.id === recordId) || null;
 }
 
-export async function reportOperatorRecordError({ operatorId, recordId, reason }) {
+export async function reportOperatorRecordError({ operatorId, recordId, reason, yardLocationIds = null }) {
   const cleanReason = String(reason || "").trim();
   if (!cleanReason) throw new Error("Please enter what was wrong with this record.");
-  const record = await findOperatorHistoryRecord(operatorId, recordId);
-  if (!record) throw new Error("History record not found.");
+  const record = await findOperatorHistoryRecord(operatorId, recordId, yardLocationIds);
+  if (!record) throw Object.assign(new Error("History record not found."), { status: 404 });
 
   const inserted = await query(
     `INSERT INTO operator_record_warnings (

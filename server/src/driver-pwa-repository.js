@@ -12,7 +12,7 @@ import {
 
 const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 const SHA256_PATTERN = /^[0-9a-f]{64}$/i;
-const REOPENABLE_STOP_TYPES = new Set(["pickup", "dropoff", "pick", "drop"]);
+const REOPENABLE_STOP_TYPES = new Set(["pickup", "dropoff", "pick", "drop", "travel"]);
 const ACTIVE_JOB_STATUSES = new Set(["in_progress", "complete"]);
 const RESTARTABLE_STOP_STATUSES = new Set(["in_progress", "complete"]);
 const NONTERMINAL_OFFLINE_STATUSES = [
@@ -124,7 +124,7 @@ export function validateDriverPwaStopReopen({
   }
   const stopType = String(record.stopType || record.stop_type || "").toLowerCase();
   if (!REOPENABLE_STOP_TYPES.has(stopType)) {
-    return { allowed: false, code: "DRIVER_PWA_STOP_TYPE_BLOCKED", reason: "Only pickup and drop-off stops can be reopened." };
+    return { allowed: false, code: "DRIVER_PWA_STOP_TYPE_BLOCKED", reason: "Only pickup, drop-off and travel stops can be reopened." };
   }
   if (!RESTARTABLE_STOP_STATUSES.has(String(record.status || "").toLowerCase())) {
     return { allowed: false, code: "DRIVER_PWA_STOP_NOT_RESTARTABLE", reason: "Only an in-progress or completed driver stop can be restarted." };
@@ -296,7 +296,7 @@ export async function listDriverPwaStops({ planDate = "", driverLogin = "", limi
           ORDER BY created_at DESC, id DESC
           LIMIT 1
        ) c ON true
-      WHERE lower(COALESCE(r.stop_type, '')) IN ('pickup', 'dropoff', 'pick', 'drop')
+      WHERE lower(COALESCE(r.stop_type, '')) IN ('pickup', 'dropoff', 'pick', 'drop', 'travel')
         AND ($1 = '' OR r.plan_date = NULLIF($1, '')::date)
         AND ($2 = '' OR lower(r.driver_login) = lower($2))
         AND ($1 <> '' OR r.plan_date >= (CURRENT_DATE - INTERVAL '14 days')::date)

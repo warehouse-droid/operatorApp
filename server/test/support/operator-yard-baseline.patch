@@ -1,0 +1,3245 @@
+--- /dev/null
++++ b/src/operator-yard-access.js
+@@ -0,0 +1,51 @@
++// @ts-check
++/** @typedef {{ id?: string, role?: string, roles?: string[], yardLocationIds?: number[], operatorYardLocationIds?: number[] }} OperatorYardAccount */
++
++export const OPERATOR_YARD_LOCATION_IDS = Object.freeze([1, 28, 15, 26]);
++
++/** @param {unknown} value */
++function yardId(value) {
++  if (typeof value !== "number" && (typeof value !== "string" || !/^\d+$/.test(value))) return NaN;
++  return Number(value);
++}
++
++/** @param {unknown} [values] @returns {number[]} */
++export function normalizeOperatorYardLocationIds(values = []) {
++  if (!Array.isArray(values) || values.some((value) => !OPERATOR_YARD_LOCATION_IDS.includes(yardId(value)))) {
++    throw Object.assign(new Error("Invalid Operator yard authorization."), { status: 400 });
++  }
++  const selected = new Set(values.map(yardId));
++  return OPERATOR_YARD_LOCATION_IDS.filter((id) => selected.has(id));
++}
++
++/** @param {OperatorYardAccount | null | undefined} operator */
++export function operatorYardLocationIds(operator) {
++  const roles = [...(Array.isArray(operator?.roles) ? operator.roles : []), operator?.role];
++  if (roles.includes("admin")) return [...OPERATOR_YARD_LOCATION_IDS];
++  return normalizeOperatorYardLocationIds(operator?.operatorYardLocationIds);
++}
++
++/** @param {OperatorYardAccount | null | undefined} operator */
++export function requireAssignedOperatorYards(operator) {
++  const allowed = operatorYardLocationIds(operator);
++  if (!allowed.length) throw operatorYardForbidden("No Operator yard access assigned. Contact an administrator.");
++  return allowed;
++}
++
++export function operatorYardForbidden(message = "This yard is outside your assigned Operator yards.") {
++  return Object.assign(new Error(message), { status: 403, code: "OPERATOR_YARD_FORBIDDEN" });
++}
++
++/** @param {OperatorYardAccount | null | undefined} operator @param {unknown} locationId */
++export function assertOperatorYard(operator, locationId) {
++  const id = yardId(locationId);
++  if (!requireAssignedOperatorYards(operator).includes(id)) throw operatorYardForbidden();
++  return id;
++}
++
++
++/** @param {any} order @param {number[] | null} [allowedYards] */
++export function deliveryOrderWithinYards(order, allowedYards = null) {
++  return allowedYards === null || [order, ...(order.child_orders || [])]
++    .every((child) => allowedYards.includes(Number(child.outbound_location_id ?? child.source_location_id)));
++}
+--- /dev/null
++++ b/src/operator-yard-authorization.js
+@@ -0,0 +1,230 @@
++// @ts-check
++import { query } from "./db.js";
++import { getDeliveryOrder } from "./delivery-repository.js";
++import { getReceivingOrder, getLocalCoReceivingOrder } from "./receiving-repository.js";
++import { getPublicOperatorNetSuitePostingCommand } from "./operator-netsuite-posting-controller.js";
++import { assertOperatorYard, deliveryOrderWithinYards, operatorYardLocationIds, requireAssignedOperatorYards, operatorYardForbidden } from "./operator-yard-access.js";
++
++/** @param {any} row */
++function found(row) {
++  if (!row) throw Object.assign(new Error("Operator record not found."), { status: 404 });
++  return row;
++}
++
++/** @param {import("./operator-yard-access.js").OperatorYardAccount} operator @param {any} id */
++export async function assertOperatorOrderYard(operator, id, { receiving = false, orderType = "" } = {}) {
++  let order;
++  if (receiving) {
++    const local = orderType === "co_order" || String(id).startsWith("CO-") || Number(id) < 0;
++    order = local ? await getLocalCoReceivingOrder(id) : await getReceivingOrder(id, { includeNetSuiteClosed: true });
++  } else {
++    order = await getDeliveryOrder(id, { includeNetSuiteClosed: true });
++  }
++  found(order);
++  assertOperatorYard(operator, receiving ? order.destination_location_id : order.outbound_location_id ?? order.source_location_id);
++  assertOperatorChildOrderYards(operator, order);
++  return order;
++}
++
++/** @param {import("./operator-yard-access.js").OperatorYardAccount} operator @param {any} order */
++function assertOperatorChildOrderYards(operator, order) {
++  for (const child of order.child_orders || []) assertOperatorYard(operator, child.outbound_location_id ?? child.source_location_id);
++}
++
++/** @param {import("./operator-yard-access.js").OperatorYardAccount} operator @param {Record<string, any>} [body] */
++export async function assertOperatorUploadYard(operator, body = {}) {
++  requireAssignedOperatorYards(operator);
++  if (body.recordType === "operator-return-photo") return assertOperatorYard(operator, body.locationId);
++  if (!body.orderId) throw Object.assign(new Error("An order is required for this photo."), { status: 400 });
++  const order = await assertOperatorOrderYard(operator, body.orderId, {
++    receiving: String(body.recordType).includes("receiving"), orderType: body.orderType
++  });
++  return Number(order.destination_location_id || order.outbound_location_id || order.source_location_id);
++}
++
++/** @param {import("./operator-yard-access.js").OperatorYardAccount} operator @param {string} reference */
++export async function assertOperatorOrderPhotoYard(operator, reference) {
++  requireAssignedOperatorYards(operator);
++  const parts = String(reference).replace(/^r2:\/\//, "").split("/");
++  const receiving = String(parts[1]).includes("receiving");
++  if (parts[0] !== "operator" || !/^operator-(?:load|customer-pickup|(?:co-)?receiving)-photo$/.test(parts[1] || "")) throw operatorYardForbidden();
++  const ref = parts[5];
++  const result = await query(`SELECT netsuite_id::text AS id FROM sales_orders WHERE tranid=$1
++    UNION ALL SELECT netsuite_id::text FROM transfer_orders WHERE tranid=$1
++    UNION ALL SELECT netsuite_id::text FROM purchase_orders WHERE tranid=$1`, [ref]);
++  await assertOperatorOrderYard(operator, result.rows[0]?.id || ref, { receiving });
++}
++
++/** @param {any} req @param {string[]} keys */
++function suppliedYards(req, keys) {
++  for (const input of [req.query, req.body]) {
++    for (const key of keys) {
++      if (input?.[key] !== undefined) assertOperatorYard(req.operator, input[key]);
++    }
++  }
++}
++
++/** @param {any} req @param {string[]} [keys] */
++function selectedYard(req, keys = ["locationId"]) {
++  suppliedYards(req, keys);
++  const value = keys.flatMap((key) => [req.body?.[key], req.query?.[key]]).find((id) => id !== undefined);
++  return assertOperatorYard(req.operator, value);
++}
++
++/** @param {any} req @param {string} kind @param {string} id */
++async function assertConsolidationYard(req, kind, id) {
++  const result = kind === "batches"
++    ? await query("SELECT id, location_id FROM operator_consolidation_batches WHERE id=$1 AND operator_id=$2", [id, req.operator.id])
++    : await query(`SELECT b.id, b.location_id FROM operator_consolidation_orders o
++        JOIN operator_consolidation_batches b ON b.id=o.batch_id WHERE o.id=$1 AND b.operator_id=$2`, [id, req.operator.id]);
++  const batch = found(result.rows[0]);
++  assertOperatorYard(req.operator, batch.location_id);
++  await assertConsolidationOrderYards(req.operator, batch.id);
++}
++
++/** @param {import("./operator-yard-access.js").OperatorYardAccount} operator @param {any} batchId */
++async function assertConsolidationOrderYards(operator, batchId) {
++  const result = await query("SELECT order_key FROM operator_consolidation_orders WHERE batch_id=$1", [batchId]);
++  for (const row of result.rows) {
++    const order = await getDeliveryOrder(row.order_key, { includeNetSuiteClosed: true });
++    if (order && !deliveryOrderWithinYards(order, operatorYardLocationIds(operator))) throw operatorYardForbidden();
++  }
++}
++
++/** @param {import("./operator-yard-access.js").OperatorYardAccount} operator @param {any} command */
++export async function assertOperatorPostingJobYard(operator, command) {
++  found(command);
++  if (String(command.actorOperatorId) !== String(operator.id) && !operator.roles?.includes("admin") && operator.role !== "admin") {
++    throw operatorYardForbidden("This job belongs to another operator.");
++  }
++  assertOperatorYard(operator, command.locationId);
++}
++
++/** @param {any} req @param {Map<string, any>} jobs @param {string} id @param {boolean} receiving */
++async function assertJobYard(req, jobs, id, receiving) {
++  const job = jobs.get(id);
++  if (!job) return assertOperatorPostingJobYard(req.operator, await getPublicOperatorNetSuitePostingCommand(id));
++  if (job.operatorId && job.operatorId !== req.operator.id && !req.operator.roles?.includes("admin")) throw operatorYardForbidden();
++  await assertOperatorOrderYard(req.operator, job.orderId, { receiving });
++}
++
++/** @param {import("./operator-yard-access.js").OperatorYardAccount} operator @param {any} id */
++export async function assertOperatorReturnDraftYard(operator, id, { allowNew = false } = {}) {
++  if (!id) return;
++  if (typeof id !== "string" || !/^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(id)) {
++    throw Object.assign(new Error("Invalid return draft ID."), { status: 400 });
++  }
++  const result = await query("SELECT operator_id, receiving_location_id FROM return_drafts WHERE id=$1", [id]);
++  if (!result.rowCount && allowNew) return;
++  const row = found(result.rows[0]);
++  if (row.operator_id !== operator.id) throw operatorYardForbidden("This draft belongs to another operator.");
++  assertOperatorYard(operator, row.receiving_location_id);
++}
++
++/** @param {any} req @param {string} pathname */
++async function authorizeReturnRequest(req, pathname) {
++  suppliedYards(req, ["receivingLocationId", "yardLocationId", "yard"]);
++  if (["/api/returns/orders/lookup", "/api/returns/drafts", "/api/returns/submit", "/api/returns/operator/drafts"].includes(pathname)) {
++    selectedYard(req, ["receivingLocationId", "yardLocationId"]);
++    await assertOperatorReturnDraftYard(req.operator, req.body?.draftId || req.body?.draft_id || (pathname === "/api/returns/drafts" ? req.body?.id : null), { allowNew: pathname === "/api/returns/drafts" || pathname === "/api/returns/submit" });
++  }
++  const draft = pathname.match(/^\/api\/returns\/drafts\/([^/]+)$/);
++  if (draft) await assertOperatorReturnDraftYard(req.operator, draft[1]);
++  const record = pathname.match(/^\/api\/returns\/operator\/history\/([^/]+)$/);
++  if (record) {
++    const result = await query("SELECT receiving_location_id FROM return_records WHERE id=$1 AND operator_id=$2", [record[1], req.operator.id]);
++    assertOperatorYard(req.operator, found(result.rows[0]).receiving_location_id);
++  }
++}
++
++/** @param {import("./operator-yard-access.js").OperatorYardAccount} operator */
++export async function assertOperatorCycleDraftYards(operator) {
++  const result = await query(`SELECT DISTINCT l.location_id FROM cycle_count_lines l
++    JOIN cycle_count_records r ON r.id=l.record_id WHERE r.operator_id=$1 AND r.status='draft'`, [operator.id]);
++  for (const line of result.rows) assertOperatorYard(operator, line.location_id);
++}
++
++/** @param {any} req @param {string} pathname */
++function controlInventorySync(req, pathname) {
++  if (pathname !== "/api/inventory/sync") return false;
++  const roles = [...(req.operator.roles || []), req.operator.role];
++  // This shared action is also available to Control. Only server-verified roles
++  // can supply that authority; a source/header flag never grants it.
++  if (!roles.some((role) => ["admin", "yard_manager"].includes(role))) return false;
++  const allowed = roles.includes("admin") ? [1, 28, 15, 26] : [...new Set([...(req.operator.yardLocationIds || []), ...operatorYardLocationIds(req.operator)])];
++  const ids = req.body?.locationIds;
++  if (!Array.isArray(ids) || !ids.length) throw operatorYardForbidden();
++  for (const id of ids) assertOperatorYard({ operatorYardLocationIds: allowed }, id);
++  return true;
++}
++
++const DELIVERY_LISTS = new Set(["sync", "orders", "vrma-orders", "bootstrap", "load-trucks", "load-orders", "saved-orders", "saved-order-keys", "consolidation/queue", "consolidation/active", "consolidation/start", "consolidation/release", "notifications", "current-draft"]);
++
++/** @param {any} req @param {string} pathname */
++async function authorizeDeliveryRequest(req, pathname) {
++  const name = pathname.slice("/api/delivery/".length);
++  if (DELIVERY_LISTS.has(name) || name.startsWith("saved-orders/")) selectedYard(req);
++  if (["consolidation/active", "consolidation/release"].includes(name)) {
++    const batches = await query("SELECT id FROM operator_consolidation_batches WHERE operator_id=$1 AND location_id=$2 AND status='active'", [req.operator.id, selectedYard(req)]);
++    for (const batch of batches.rows) await assertConsolidationOrderYards(req.operator, batch.id);
++  }
++  const savedId = req.body?.orderId || pathname.match(/^\/api\/delivery\/saved-orders\/([^/]+)$/)?.[1];
++  if (savedId) await assertOperatorOrderYard(req.operator, savedId);
++}
++
++/** @param {any} req */
++function authorizeInventorySync(req) {
++  const ids = req.body?.locationIds;
++  if (!Array.isArray(ids) || !ids.length) throw operatorYardForbidden();
++  for (const id of ids) assertOperatorYard(req.operator, id);
++}
++
++/** @param {any} req @param {string} pathname */
++async function authorizeListRequest(req, pathname) {
++  if (pathname.startsWith("/api/delivery/")) return authorizeDeliveryRequest(req, pathname);
++  if (pathname.startsWith("/api/receiving/")) return selectedYard(req, ["destinationLocationId", "locationId"]);
++  if (pathname === "/api/inventory/sync") return authorizeInventorySync(req);
++  if (pathname.startsWith("/api/inventory/")) return selectedYard(req);
++  if (["/api/customer-pickup/lookup", "/api/operator/requests", "/api/operator/netsuite-posting-policy", "/api/cycle-count/lines"].includes(pathname)) return selectedYard(req);
++  if (pathname === "/api/cycle-count/submit") return assertOperatorCycleDraftYards(req.operator);
++}
++
++/** @param {any} req @param {RegExpMatchArray} job @param {{receivingJobs: Map<string, any>, fulfillmentJobs: Map<string, any>}} jobs */
++async function authorizeJobRequest(req, job, { receivingJobs, fulfillmentJobs }) {
++  const kind = job[1] || "";
++  const id = job[2] || "";
++  if (kind.startsWith("operator/")) {
++    return assertOperatorPostingJobYard(req.operator, await getPublicOperatorNetSuitePostingCommand(id));
++  }
++  const receiving = kind.startsWith("receiving/");
++  return assertJobYard(req, receiving ? receivingJobs : fulfillmentJobs, id, receiving);
++}
++
++/** @param {any} req @param {string} pathname @param {{receivingJobs: Map<string, any>, fulfillmentJobs: Map<string, any>}} jobs */
++async function authorizeOperatorRequest(req, pathname, jobs) {
++  if (pathname.startsWith("/api/returns/")) return authorizeReturnRequest(req, pathname);
++  const order = pathname.match(/^\/api\/(delivery|receiving|customer-pickup)\/orders\/([^/]+)/);
++  if (order) {
++    return assertOperatorOrderYard(req.operator, order[2], { receiving: order[1] === "receiving", orderType: req.body?.orderType || req.query.orderType });
++  }
++  const consolidation = pathname.match(/^\/api\/delivery\/consolidation\/(orders|batches)\/([^/]+)/);
++  if (consolidation) return assertConsolidationYard(req, consolidation[1] || "", consolidation[2] || "");
++  const job = pathname.match(/^\/api\/(delivery\/fulfillment-jobs|receiving\/receipt-jobs|operator\/netsuite-posting-jobs)\/([^/]+)/);
++  if (job) return authorizeJobRequest(req, job, jobs);
++  return authorizeListRequest(req, pathname);
++}
++
++export function createOperatorYardGuard({ receivingJobs = new Map(), fulfillmentJobs = new Map() } = {}) {
++  /** @param {any} req @param {any} _res @param {(error?: any) => void} next */
++  return async function requireOperatorYardRequest(req, _res, next) {
++    try {
++      const pathname = decodeURI(req.originalUrl.split("?")[0]).replace(/\/$/, "");
++      if (/^\/api\/inventory\/classifications(?:\/|$)/.test(pathname) || pathname === "/api/cycle-count/records") return next();
++      if (controlInventorySync(req, pathname)) return next();
++      requireAssignedOperatorYards(req.operator);
++      suppliedYards(req, ["locationId", "destinationLocationId"]);
++      await authorizeOperatorRequest(req, pathname, { receivingJobs, fulfillmentJobs });
++      next();
++    } catch (error) { next(error); }
++  };
++}
+--- a/src/server.js
++++ b/src/server.js
+@@ -1,3 +1,5 @@
++import { createOperatorYardGuard, assertOperatorOrderYard, assertOperatorUploadYard, assertOperatorOrderPhotoYard } from "./operator-yard-authorization.js";
++import { assertOperatorYard, operatorYardLocationIds } from "./operator-yard-access.js";
+ import express from "express";
+ import { SALES_ORDER_SYNC_LOCATIONS, withVoyageDispatchYard } from "./dispatch-sales-order-locations.js";
+ import { completeScmVendorOrder } from "./scm-vendor-completion.js";
+@@ -551,6 +553,7 @@
+ const deliveryLocations = [1, 28, 15, 26];
+ const fulfillmentJobs = new Map();
+ const receivingJobs = new Map();
++const requireOperatorYardRequest = createOperatorYardGuard({ receivingJobs, fulfillmentJobs });
+ const eventClients = new Set();
+ const driverGeocodeCache = new Map();
+ const transferDependencyAllocationRefreshAt = new Map();
+@@ -5165,7 +5168,7 @@
+     const body = `id: ${event.id}\nevent: app-event\ndata: ${JSON.stringify(event)}\n\n`;
+     for (const client of eventClients) {
+       try {
+-        client.res.write(body);
++        client.res.write(client.detailed ? body : `id: ${event.id}\nevent: app-event\ndata: ${JSON.stringify({ ...event, payload: {} })}\n\n`);
+       } catch {
+         eventClients.delete(client);
+       }
+@@ -5174,6 +5177,12 @@
+ }
+ 
+ configureOperatorNetSuitePostingCompletionEvents(emitAppEvent);
++
++function closeOperatorEventStreams(id) {
++  for (const client of eventClients) {
++    if (client.operatorId === id) { client.res.end(); eventClients.delete(client); }
++  }
++}
+ 
+ function updateFulfillmentJob(jobId, patch) {
+   const current = fulfillmentJobs.get(jobId) || { id: jobId };
+@@ -5792,6 +5801,7 @@
+       username: operator.username,
+       role: operator.role,
+       roles: operator.roles,
++      operatorYardLocationIds: operator.operatorYardLocationIds,
+       yardLocationIds: operator.yardLocationIds,
+       source: operatorHasAnyRole(operator, ["dispatcher", "admin"]) ? "dispatch" : "operator"
+     };
+@@ -5832,9 +5842,6 @@
+   if (operatorHasAnyRole(viewer, ["admin"])) return;
+ 
+   const roles = new Set(normalizedOperatorRoles(viewer));
+-  if ((roles.has("operator") || roles.has("yard_manager")) && photoActorId === String(viewer.id || "")) {
+-    return;
+-  }
+   if (viewer.role === "driver") {
+     throw Object.assign(new Error("This return photo is outside your access."), { status: 403 });
+   }
+@@ -5875,6 +5882,16 @@
+     [reference]
+   );
+ 
++  if (photoActorId === String(viewer.id || "") && (roles.has("operator") || roles.has("yard_manager"))) {
++    const allowed = operatorYardLocationIds(viewer);
++    if (matches.rows.some((row) => row.operator_id === viewer.id && allowed.includes(Number(row.receiving_location_id)))) return;
++    if (!matches.rowCount) {
++      const yardSegment = String(value).replace(/^r2:\/\//, "").split("/")[6] || "";
++      const yard = yardSegment.match(/^yard-(\d+)$/)?.[1];
++      if (yard) { assertOperatorYard(viewer, yard); return; }
++    }
++  }
++
+   if (roles.has("yard_manager")) {
+     const allowed = new Set(returnControlYardLocationIds(viewer));
+     if (matches.rows.some((row) => allowed.has(Number(row.receiving_location_id)))) return;
+@@ -6170,11 +6187,7 @@
+ }
+ 
+ function assertReturnOperatorYard(operator, locationId) {
+-  if (operatorHasAnyRole(operator, ["admin"]) || !operatorHasAnyRole(operator, ["yard_manager"])) return;
+-  if (!locationId) {
+-    throw Object.assign(new Error("Select an assigned receiving yard."), { status: 400 });
+-  }
+-  assertReturnControlYard(operator, locationId);
++  return assertOperatorYard(operator, locationId);
+ }
+ 
+ const OPERATOR_RETURN_PRIVATE_KEYS = new Set([
+@@ -8805,7 +8818,12 @@
+   }
+ });
+ 
+-app.get("/api/events", (req, res) => {
++app.get("/api/events", async (req, res, next) => {
++  try {
++    const token = typeof req.query.token === "string" ? req.query.token : "";
++    const viewer = token ? await getOperatorByToken(token) : null;
++    const driver = token && !viewer ? await getDriverSession(token) : null;
++    const detailed = Boolean(driver || operatorHasAnyRole(viewer, ["admin", "dispatcher"]));
+   res.setHeader("Content-Type", "text/event-stream");
+   res.setHeader("Cache-Control", "no-cache, no-transform");
+   res.setHeader("Connection", "keep-alive");
+@@ -8815,6 +8833,8 @@
+   const client = {
+     id: crypto.randomUUID(),
+     client: req.query.client || "unknown",
++    operatorId: viewer?.id || null,
++    detailed,
+     res
+   };
+   eventClients.add(client);
+@@ -8834,6 +8854,7 @@
+     clearInterval(heartbeat);
+     eventClients.delete(client);
+   });
++  } catch (error) { next(error); }
+ });
+ 
+ app.use((req, res, next) => {
+@@ -10546,6 +10567,9 @@
+       if (!await driverCanViewDeliverySalesOrder(viewer.login, media.orderRef)) {
+         return res.status(403).json({ error: "This instruction media is outside your current confirmed route." });
+       }
++    } else if (operatorHasAnyRole(viewer, ["operator", "yard_manager"]) && !operatorHasAnyRole(viewer, ["admin", "dispatcher", "sales"])) {
++      const result = await query("SELECT netsuite_id FROM sales_orders WHERE tranid=$1", [media.orderRef]);
++      await assertOperatorOrderYard(viewer, result.rows[0]?.netsuite_id || media.orderRef);
+     } else if (operatorHasAnyRole(viewer, ["sales"])) {
+       if (!operatorSalesYardLocationIds(viewer).includes(Number(media.orderingLocationId))) {
+         return res.status(403).json({ error: "This instruction media belongs to a yard you cannot access." });
+@@ -18003,11 +18027,14 @@
+       action: "operator.logout"
+     });
+     await logoutToken(bearerToken(req));
++    closeOperatorEventStreams(req.operator.id);
+     res.json({ ok: true });
+   } catch (error) {
+     next(error);
+   }
+ });
++
++app.use("/api/operator", requireOperator, requireOperatorAccess, requireOperatorYardRequest);
+ 
+ app.get("/api/photo-upload/config", requireOperator, (req, res) => {
+   res.json(publicPhotoUploadConfig());
+@@ -18020,6 +18047,10 @@
+       return res.status(400).json({ error: "R2 photo reference is required." });
+     }
+     await assertReturnPhotoPreviewAccess(req.photoViewer, ref || req.query.key);
++    if (!returnPhotoActorId(ref || req.query.key) && operatorHasAnyRole(req.photoViewer, ["operator"])
++        && !operatorHasAnyRole(req.photoViewer, ["admin", "dispatcher", "yard_manager", "sales"])) {
++      await assertOperatorOrderPhotoYard(req.photoViewer, ref || req.query.key);
++    }
+     const wantsThumbnail = String(req.query.variant || "").trim().toLowerCase() === "thumbnail";
+     const thumbnailCacheKey = ref || String(req.query.key || "");
+     const sendThumbnail = (thumbnail) => {
+@@ -18092,6 +18123,8 @@
+ app.post("/api/photo-upload/token", requireOperator, async (req, res, next) => {
+   try {
+     const body = req.body || {};
++    const photoLocationId = String(body.recordType || "operator-load-photo").startsWith("operator-")
++      ? await assertOperatorUploadYard(req.operator, body) : null;
+     const token = createPhotoUploadToken({
+       actor: {
+         id: req.operator.id,
+@@ -18103,6 +18136,7 @@
+       source: body.source || "operator",
+       recordType: body.recordType || "operator-load-photo",
+       metadata: {
++        locationId: photoLocationId,
+         orderType: body.orderType,
+         orderId: body.orderId,
+         orderRef: body.orderRef,
+@@ -18123,6 +18157,8 @@
+ app.post("/api/operator/photo-upload-token", requireOperator, async (req, res, next) => {
+   try {
+     const body = req.body || {};
++    const photoLocationId = String(body.recordType || "operator-load-photo").startsWith("operator-")
++      ? await assertOperatorUploadYard(req.operator, body) : null;
+     res.json(createPhotoUploadToken({
+       actor: {
+         id: req.operator.id,
+@@ -18134,6 +18170,7 @@
+       source: "operator",
+       recordType: body.recordType || "operator-load-photo",
+       metadata: {
++        locationId: photoLocationId,
+         orderType: body.orderType,
+         orderId: body.orderId,
+         orderRef: body.orderRef,
+@@ -21005,13 +21042,15 @@
+       password: req.body?.password,
+       role: req.body?.role || "operator",
+       roles: req.body?.roles,
+-      yardLocationIds: req.body?.yardLocationIds
++      yardLocationIds: req.body?.yardLocationIds,
++      operatorYardLocationIds: req.body?.operatorYardLocationIds
+     });
+     await writeAudit({
+       actorOperatorId: req.operator.id,
+       source: "control",
+       action: "operator.create",
+-      details: { operatorId: operator.id, username: operator.username, role: operator.role, roles: operator.roles, yardLocationIds: operator.yardLocationIds }
++      details: { operatorId: operator.id, username: operator.username, role: operator.role, roles: operator.roles, operatorYardLocationIds: operator.operatorYardLocationIds,
++      yardLocationIds: operator.yardLocationIds }
+     });
+     res.json(operator);
+   } catch (error) {
+@@ -21022,6 +21061,7 @@
+ app.post("/api/operators/:id/active", requireOperator, requireAdmin, async (req, res, next) => {
+   try {
+     const operator = await setOperatorActive(req.params.id, req.body?.active);
++    closeOperatorEventStreams(req.params.id);
+     await writeAudit({
+       actorOperatorId: req.operator.id,
+       source: "control",
+@@ -21038,6 +21078,7 @@
+   try {
+     const operator = await updateOperatorPassword(req.params.id, req.body?.password);
+     if (!operator) return res.status(404).json({ error: "Operator not found" });
++    closeOperatorEventStreams(operator.id);
+     await writeAudit({
+       actorOperatorId: req.operator.id,
+       source: "control",
+@@ -21055,7 +21096,8 @@
+     const operator = await updateOperatorRoles(req.params.id, {
+       role: req.body?.role,
+       roles: req.body?.roles,
+-      yardLocationIds: req.body?.yardLocationIds
++      yardLocationIds: req.body?.yardLocationIds,
++      operatorYardLocationIds: req.body?.operatorYardLocationIds
+     });
+     if (!operator) return res.status(404).json({ error: "Operator not found" });
+     await writeAudit({
+@@ -21067,9 +21109,12 @@
+         username: operator.username,
+         role: operator.role,
+         roles: operator.roles,
++        operatorYardLocationIds: operator.operatorYardLocationIds,
+         yardLocationIds: operator.yardLocationIds
+       }
+     });
++    closeOperatorEventStreams(operator.id);
++    emitAppEvent("operator.access.updated", {});
+     res.json(operator);
+   } catch (error) {
+     next(error);
+@@ -21078,7 +21123,7 @@
+ 
+ // Return workflow operator endpoints. These routes intentionally use explicit
+ // staff middleware because /api/returns has no broader role middleware.
+-app.get("/api/returns/reasons", requireOperator, requireOperatorAccess, async (req, res, next) => {
++app.get("/api/returns/reasons", requireOperator, requireOperatorAccess, requireOperatorYardRequest, async (req, res, next) => {
+   try {
+     res.setHeader("Cache-Control", "no-store");
+     const [reasons, settings] = await Promise.all([
+@@ -21087,7 +21132,7 @@
+     ]);
+     res.json({
+       ...reasons,
+-      yardSettings: settings.map((setting) => ({
++      yardSettings: settings.filter((setting) => operatorYardLocationIds(req.operator).includes(Number(setting.locationId))).map((setting) => ({
+         locationId: setting.locationId,
+         yardCode: setting.yardCode,
+         allowCrossYardReturns: setting.allowCrossYardReturns
+@@ -21098,7 +21143,7 @@
+   }
+ });
+ 
+-app.post("/api/returns/orders/lookup", requireOperator, requireOperatorAccess, async (req, res, next) => {
++app.post("/api/returns/orders/lookup", requireOperator, requireOperatorAccess, requireOperatorYardRequest, async (req, res, next) => {
+   try {
+     assertReturnOperatorYard(req.operator, req.body?.receivingLocationId || req.body?.yardLocationId);
+     const returnMode = String(req.body?.mode || req.body?.returnMode || "").trim().toLowerCase();
+@@ -21115,7 +21160,7 @@
+   }
+ });
+ 
+-app.get("/api/returns/customers", requireOperator, requireOperatorAccess, async (req, res, next) => {
++app.get("/api/returns/customers", requireOperator, requireOperatorAccess, requireOperatorYardRequest, async (req, res, next) => {
+   try {
+     res.setHeader("Cache-Control", "no-store");
+     res.json({
+@@ -21126,7 +21171,7 @@
+   }
+ });
+ 
+-app.get("/api/returns/customers/:customerId/pallet-balance", requireOperator, requireOperatorAccess, async (req, res, next) => {
++app.get("/api/returns/customers/:customerId/pallet-balance", requireOperator, requireOperatorAccess, requireOperatorYardRequest, async (req, res, next) => {
+   try {
+     res.setHeader("Cache-Control", "no-store");
+     const result = await lookupReturnCustomerPalletBalance(req.params.customerId);
+@@ -21136,7 +21181,7 @@
+   }
+ });
+ 
+-app.get("/api/returns/operator/drafts", requireOperator, requireOperatorAccess, async (req, res, next) => {
++app.get("/api/returns/operator/drafts", requireOperator, requireOperatorAccess, requireOperatorYardRequest, async (req, res, next) => {
+   try {
+     assertReturnOperatorYard(req.operator, req.query.receivingLocationId || req.query.yardLocationId);
+     res.json(operatorSafeReturnPayload({
+@@ -21150,9 +21195,10 @@
+   }
+ });
+ 
+-app.get("/api/returns/operator/history", requireOperator, requireOperatorAccess, async (req, res, next) => {
++app.get("/api/returns/operator/history", requireOperator, requireOperatorAccess, requireOperatorYardRequest, async (req, res, next) => {
+   try {
+     const result = await listReturnRecords(returnListFilters(req, {
++      receivingLocationIds: operatorYardLocationIds(req.operator),
+       operatorId: req.operator.id
+     }));
+     const safe = operatorSafeReturnPayload(result);
+@@ -21162,7 +21208,7 @@
+   }
+ });
+ 
+-app.get("/api/returns/operator/history/:id", requireOperator, requireOperatorAccess, async (req, res, next) => {
++app.get("/api/returns/operator/history/:id", requireOperator, requireOperatorAccess, requireOperatorYardRequest, async (req, res, next) => {
+   try {
+     const record = await getReturnRecordDetail(req.params.id, { operatorId: req.operator.id });
+     if (!record) return res.status(404).json({ error: "Return record was not found." });
+@@ -21172,7 +21218,7 @@
+   }
+ });
+ 
+-app.post("/api/returns/drafts", requireOperator, requireOperatorAccess, async (req, res, next) => {
++app.post("/api/returns/drafts", requireOperator, requireOperatorAccess, requireOperatorYardRequest, async (req, res, next) => {
+   try {
+     assertReturnOperatorYard(req.operator, req.body?.receivingLocationId || req.body?.yardLocationId);
+     res.json(operatorSafeReturnPayload({
+@@ -21183,7 +21229,7 @@
+   }
+ });
+ 
+-app.delete("/api/returns/drafts/:draftId", requireOperator, requireOperatorAccess, async (req, res, next) => {
++app.delete("/api/returns/drafts/:draftId", requireOperator, requireOperatorAccess, requireOperatorYardRequest, async (req, res, next) => {
+   try {
+     const result = await deleteReturnDraft({
+       draftId: req.params.draftId,
+@@ -21196,10 +21242,11 @@
+   }
+ });
+ 
+-app.post("/api/returns/submit", requireOperator, requireOperatorAccess, async (req, res, next) => {
++app.post("/api/returns/submit", requireOperator, requireOperatorAccess, requireOperatorYardRequest, async (req, res, next) => {
+   try {
+     assertReturnOperatorYard(req.operator, req.body?.receivingLocationId || req.body?.yardLocationId);
+     const result = await submitReturnBatch({
++      operator: req.operator,
+       operatorId: req.operator.id,
+       input: req.body || {}
+     });
+@@ -22419,7 +22466,8 @@
+     res.json(await listOperatorHistory({
+       operatorId: req.operator.id,
+       date: req.query.date || "",
+-      limit: req.query.limit || 100
++      limit: req.query.limit || 100,
++      yardLocationIds: operatorYardLocationIds(req.operator)
+     }));
+   } catch (error) {
+     next(error);
+@@ -22443,7 +22491,8 @@
+     res.json(await reportOperatorRecordError({
+       operatorId: req.operator.id,
+       recordId: req.body?.recordId,
+-      reason: req.body?.reason
++      reason: req.body?.reason,
++      yardLocationIds: operatorYardLocationIds(req.operator)
+     }));
+   } catch (error) {
+     next(error);
+@@ -22655,11 +22704,11 @@
+   }
+ });
+ 
+-app.use("/api/delivery", requireOperator, requireOperatorAccess);
+-app.use("/api/customer-pickup", requireOperator, requireOperatorAccess);
+-app.use("/api/receiving", requireOperator, requireOperatorAccess);
+-app.use("/api/inventory", requireOperator, requireOperatorAccess);
+-app.use("/api/cycle-count", requireOperator, requireOperatorAccess);
++app.use("/api/delivery", requireOperator, requireOperatorAccess, requireOperatorYardRequest);
++app.use("/api/customer-pickup", requireOperator, requireOperatorAccess, requireOperatorYardRequest);
++app.use("/api/receiving", requireOperator, requireOperatorAccess, requireOperatorYardRequest);
++app.use("/api/inventory", requireOperator, requireOperatorAccess, requireOperatorYardRequest);
++app.use("/api/cycle-count", requireOperator, requireOperatorAccess, requireOperatorYardRequest);
+ 
+ app.use("/api/delivery/orders/:id", async (req, res, next) => {
+   try {
+@@ -22722,13 +22771,14 @@
+       if (isPendingApprovalStatus(order.status, order.status_text)) {
+         return res.status(409).json({ error: "This pickup sales order is still pending approval in NetSuite." });
+       }
++      assertOperatorYard(req.operator, order.outbound_location_id);
+       await upsertSalesOrders([order]);
+       const lines = await fetchDeliveryOrderDetailsFromNetSuite(order.id, locationId);
+       await upsertSalesOrderLines(order.id, lines);
+       await markMissingOutboundOrderLines(order.id, lines.map((line) => line.line_id));
+       orderId = order.id;
+     }
+-    const detail = await getDeliveryOrder(orderId);
++    const detail = await assertOperatorOrderYard(req.operator, orderId);
+     if (!detail || !isPickupDeliveryMethod(detail.delivery_method)) {
+       return res.status(409).json({ error: "This sales order is not a customer pickup order." });
+     }
+@@ -22815,6 +22865,7 @@
+     const locationId = Number(req.body?.locationId || req.query.locationId || 1);
+     const orderType = normalizeOrderType(req.body?.orderType || req.query.orderType);
+     const orders = await listDeliveryOrders({
++      allowedOperatorYards: operatorYardLocationIds(req.operator),
+       locationId,
+       status: req.body?.status || req.query.status || null,
+       orderType
+@@ -22851,6 +22902,7 @@
+ app.get("/api/delivery/orders", async (req, res, next) => {
+   try {
+     res.json(await listDeliveryOrders({
++      allowedOperatorYards: operatorYardLocationIds(req.operator),
+       locationId: req.query.locationId,
+       status: req.query.status,
+       orderType: normalizeOrderType(req.query.orderType)
+@@ -22874,6 +22926,7 @@
+ app.get("/api/delivery/bootstrap", async (req, res, next) => {
+   try {
+     res.json(await getDeliveryBootstrap({
++      allowedOperatorYards: operatorYardLocationIds(req.operator),
+       operatorId: operatorId(req),
+       locationId: req.query.locationId
+     }));
+@@ -22896,6 +22949,7 @@
+ app.get("/api/delivery/load-orders", async (req, res, next) => {
+   try {
+     res.json(await listDeliveryLoadOrders({
++      allowedOperatorYards: operatorYardLocationIds(req.operator),
+       locationId: req.query.locationId,
+       status: req.query.status,
+       planDate: req.query.planDate,
+@@ -22909,6 +22963,7 @@
+ app.get("/api/delivery/saved-orders", async (req, res, next) => {
+   try {
+     res.json(await listSavedDeliveryOrdersForOperator(operatorId(req), {
++      allowedOperatorYards: operatorYardLocationIds(req.operator),
+       locationId: req.query.locationId
+     }));
+   } catch (error) {
+@@ -22919,6 +22974,7 @@
+ app.get("/api/delivery/saved-order-keys", async (req, res, next) => {
+   try {
+     res.json(await listSavedDeliveryOrderKeysForOperator(operatorId(req), {
++      allowedOperatorYards: operatorYardLocationIds(req.operator),
+       locationId: req.query.locationId
+     }));
+   } catch (error) {
+@@ -22954,6 +23010,7 @@
+ app.get("/api/delivery/consolidation/queue", async (req, res, next) => {
+   try {
+     res.json(await getSavedConsolidationQueue(operatorId(req), {
++      allowedOperatorYards: operatorYardLocationIds(req.operator),
+       locationId: req.query.locationId
+     }));
+   } catch (error) {
+@@ -22974,6 +23031,7 @@
+ app.post("/api/delivery/consolidation/start", async (req, res, next) => {
+   try {
+     const result = await startSavedConsolidationBatch(operatorId(req), {
++      allowedOperatorYards: operatorYardLocationIds(req.operator),
+       locationId: req.body?.locationId || req.query.locationId
+     });
+     emitAppEvent("delivery.consolidation.updated", {
+@@ -23080,6 +23138,7 @@
+ app.get("/api/delivery/notifications", async (req, res, next) => {
+   try {
+     res.json(await getDeliveryPrepNotifications({
++      allowedOperatorYards: operatorYardLocationIds(req.operator),
+       locationId: req.query.locationId
+     }));
+   } catch (error) {
+@@ -23348,6 +23407,7 @@
+     const jobId = crypto.randomUUID();
+     receivingJobs.set(jobId, {
+       id: jobId,
++      operatorId: req.operator.id,
+       status: "running",
+       orderId: req.params.id,
+       stage: "queued",
+@@ -23786,7 +23846,7 @@
+ 
+ app.get("/api/cycle-count/draft", async (req, res, next) => {
+   try {
+-    res.json(await getCycleCountDraft(req.operator.id));
++    res.json(await getCycleCountDraft(req.operator.id, { yardLocationIds: operatorYardLocationIds(req.operator) }));
+   } catch (error) {
+     next(error);
+   }
+@@ -23837,7 +23897,7 @@
+         });
+       }
+     }
+-    res.json(await confirmCycleCountLine(req.operator.id, req.body || {}));
++    res.json(await confirmCycleCountLine(req.operator.id, req.body || {}, { yardLocationIds: operatorYardLocationIds(req.operator) }));
+   } catch (error) {
+     next(error);
+   }
+--- a/src/auth-repository.js
++++ b/src/auth-repository.js
+@@ -1,3 +1,4 @@
++import { normalizeOperatorYardLocationIds } from "./operator-yard-access.js";
+ import crypto from "node:crypto";
+ import { promisify } from "node:util";
+ import { query } from "./db.js";
+@@ -69,6 +70,7 @@
+     roles: authority.roles,
+     homeRoute: operatorHomeRoute(authority),
+     yardLocationIds: normalizeYardLocationIds(row.yard_location_ids),
++    operatorYardLocationIds: normalizeOperatorYardLocationIds(row.operator_yard_location_ids),
+     active: row.active,
+     created_at: row.created_at,
+     updated_at: row.updated_at
+@@ -96,7 +98,7 @@
+   return result.rowCount > 0;
+ }
+ 
+-export async function createOperator({ username, displayName, password, role = "operator", roles = null, yardLocationIds = [] }) {
++export async function createOperator({ username, displayName, password, role = "operator", roles = null, yardLocationIds = [], operatorYardLocationIds = [] }) {
+   const cleanUsername = String(username || "").trim().toLowerCase();
+   const cleanDisplayName = String(displayName || username || "").trim();
+   if (!cleanUsername) throw new Error("Username is required.");
+@@ -104,21 +106,22 @@
+   if (!password || String(password).length < 6) throw new Error("Password must be at least 6 characters.");
+   const authority = normalizeAuthorities(roles, role);
+   const yards = normalizeYardLocationIds(yardLocationIds);
++  const operatorYards = normalizeOperatorYardLocationIds(operatorYardLocationIds);
+ 
+   const { salt, hash } = await hashPassword(String(password));
+   const id = crypto.randomUUID();
+   const result = await query(
+-    `INSERT INTO operators (id, username, display_name, password_hash, password_salt, role, roles, yard_location_ids)
+-     VALUES ($1, $2, $3, $4, $5, $6, $7::text[], $8::integer[])
+-     RETURNING id, username, display_name, role, roles, yard_location_ids, active, created_at, updated_at`,
+-    [id, cleanUsername, cleanDisplayName, hash, salt, authority.role, authority.roles, yards]
++    `INSERT INTO operators (id, username, display_name, password_hash, password_salt, role, roles, yard_location_ids, operator_yard_location_ids)
++     VALUES ($1, $2, $3, $4, $5, $6, $7::text[], $8::integer[], $9::integer[])
++     RETURNING id, username, display_name, role, roles, yard_location_ids, operator_yard_location_ids, active, created_at, updated_at`,
++    [id, cleanUsername, cleanDisplayName, hash, salt, authority.role, authority.roles, yards, operatorYards]
+   );
+   return publicOperator(result.rows[0]);
+ }
+ 
+ export async function listOperators() {
+   const result = await query(
+-    `SELECT id, username, display_name, role, roles, yard_location_ids, active, created_at, updated_at
++    `SELECT id, username, display_name, role, roles, yard_location_ids, operator_yard_location_ids, active, created_at, updated_at
+      FROM operators
+      ORDER BY active DESC, display_name ASC`
+   );
+@@ -131,7 +134,7 @@
+      SET active = $2,
+          updated_at = now()
+      WHERE id = $1
+-     RETURNING id, username, display_name, role, roles, yard_location_ids, active, created_at, updated_at`,
++     RETURNING id, username, display_name, role, roles, yard_location_ids, operator_yard_location_ids, active, created_at, updated_at`,
+     [id, Boolean(active)]
+   );
+   return publicOperator(result.rows[0]);
+@@ -146,29 +149,32 @@
+          password_salt = $3,
+          updated_at = now()
+      WHERE id = $1
+-     RETURNING id, username, display_name, role, roles, yard_location_ids, active, created_at, updated_at`,
++     RETURNING id, username, display_name, role, roles, yard_location_ids, operator_yard_location_ids, active, created_at, updated_at`,
+     [id, hash, salt]
+   );
+   await query("DELETE FROM operator_sessions WHERE operator_id = $1", [id]);
+   return publicOperator(result.rows[0]);
+ }
+ 
+-export async function updateOperatorRoles(id, { role, roles, yardLocationIds } = {}) {
+-  const current = await query("SELECT id, role, roles, yard_location_ids FROM operators WHERE id = $1", [id]);
++export async function updateOperatorRoles(id, { role, roles, yardLocationIds, operatorYardLocationIds } = {}) {
++  const current = await query("SELECT id, role, roles, yard_location_ids, operator_yard_location_ids FROM operators WHERE id = $1", [id]);
+   if (!current.rowCount) return null;
+   const authority = normalizeAuthorities(roles, role || current.rows[0].role);
+   const yards = yardLocationIds === undefined
+     ? normalizeYardLocationIds(current.rows[0].yard_location_ids)
+     : normalizeYardLocationIds(yardLocationIds);
++  const operatorYards = normalizeOperatorYardLocationIds(operatorYardLocationIds === undefined
++    ? current.rows[0].operator_yard_location_ids : operatorYardLocationIds);
+   const result = await query(
+     `UPDATE operators
+      SET role = $2,
+          roles = $3::text[],
+          yard_location_ids = $4::integer[],
++         operator_yard_location_ids = $5::integer[],
+          updated_at = now()
+      WHERE id = $1
+-     RETURNING id, username, display_name, role, roles, yard_location_ids, active, created_at, updated_at`,
+-    [id, authority.role, authority.roles, yards]
++     RETURNING id, username, display_name, role, roles, yard_location_ids, operator_yard_location_ids, active, created_at, updated_at`,
++    [id, authority.role, authority.roles, yards, operatorYards]
+   );
+   return publicOperator(result.rows[0]);
+ }
+@@ -198,7 +204,7 @@
+ export async function getOperatorByToken(token) {
+   if (!token) return null;
+   const result = await query(
+-    `SELECT o.id, o.username, o.display_name, o.role, o.roles, o.yard_location_ids, o.active, o.created_at, o.updated_at
++    `SELECT o.id, o.username, o.display_name, o.role, o.roles, o.yard_location_ids, o.operator_yard_location_ids, o.active, o.created_at, o.updated_at
+      FROM operator_sessions s
+      INNER JOIN operators o ON o.id = s.operator_id
+      WHERE s.token_hash = $1
+--- a/src/history-repository.js
++++ b/src/history-repository.js
+@@ -11,6 +11,12 @@
+   if (!date) return "";
+   params.push(String(date).slice(0, 10));
+   return ` AND ${alias}.created_at::date = $${params.length}::date`;
++}
++
++function yardClause(expression, yardLocationIds, params) {
++  if (yardLocationIds === null) return "";
++  params.push(yardLocationIds);
++  return ` AND (${expression}) = ANY($${params.length}::bigint[])`;
+ }
+ 
+ function normalizeRecord(row) {
+@@ -29,22 +35,23 @@
+   };
+ }
+ 
+-export async function listOperatorHistory({ operatorId, date = "", limit = 100 } = {}) {
++export async function listOperatorHistory({ operatorId, date = "", limit = 100, yardLocationIds = null } = {}) {
+   const safeLimit = cleanLimit(limit);
+   const records = [];
+ 
+   const auditParams = [operatorId, HISTORY_ACTIONS];
+   const auditDate = dateClause("a", date, auditParams);
++  const auditYard = yardClause("CASE WHEN a.source = 'receiving' THEN ro.location_id ELSE dord.location_id END", yardLocationIds, auditParams);
+   const audit = await query(
+     `WITH delivery_order_lookup AS (
+-       SELECT netsuite_id, tranid FROM sales_orders
+-       UNION ALL
+-       SELECT netsuite_id, tranid FROM transfer_orders
++       SELECT netsuite_id, tranid, outbound_location_id AS location_id FROM sales_orders
++       UNION ALL
++       SELECT netsuite_id, tranid, from_location_id AS location_id FROM transfer_orders
+      ),
+      receiving_order_lookup AS (
+-       SELECT netsuite_id, tranid FROM purchase_orders
+-       UNION ALL
+-       SELECT netsuite_id, tranid FROM transfer_orders
++       SELECT netsuite_id, tranid, destination_location_id AS location_id FROM purchase_orders
++       UNION ALL
++       SELECT netsuite_id, tranid, to_location_id AS location_id FROM transfer_orders
+      ),
+      delivery_line_lookup AS (
+        SELECT id, item_name, item_description, to_plt, to_lyr, to_sec, to_pcs
+@@ -125,7 +132,7 @@
+      LEFT JOIN receiving_line_lookup rl ON rl.order_id = ro.netsuite_id AND rl.line_id = a.line_id AND a.action = 'receiving.line.confirm'
+      WHERE a.actor_operator_id = $1
+        AND a.action = ANY($2::text[])
+-       ${auditDate}
++       ${auditDate} ${auditYard}
+      ORDER BY a.created_at DESC, a.id DESC
+      LIMIT ${safeLimit}`,
+     auditParams
+@@ -134,6 +141,7 @@
+ 
+   const loadParams = [operatorId];
+   const loadDate = dateClause("l", date, loadParams);
++  const loadYard = yardClause("COALESCE(so.outbound_location_id, tr.from_location_id, co.from_location_id)", yardLocationIds, loadParams);
+   const loads = await query(
+     `SELECT ('load-' || l.id) AS id,
+             l.load_type AS type,
+@@ -174,6 +182,7 @@
+      FROM operator_load_records l
+      LEFT JOIN sales_orders so ON so.netsuite_id = l.order_id AND l.order_family = 'sales_order'
+      LEFT JOIN transfer_orders tr ON tr.netsuite_id = l.order_id AND l.order_family = 'transfer_order'
++     LEFT JOIN local_co_orders co ON co.delivery_order_id = l.order_id AND l.order_family = 'co_order'
+      LEFT JOIN LATERAL (
+        SELECT jsonb_agg(jsonb_build_object(
+          'itemName', line.value->>'itemName',
+@@ -188,7 +197,7 @@
+        FROM jsonb_array_elements(COALESCE(l.line_snapshot, '[]'::jsonb)) line(value)
+      ) load_lines ON true
+      WHERE l.operator_id = $1
+-       ${loadDate}
++       ${loadDate} ${loadYard}
+      ORDER BY l.created_at DESC, l.id DESC
+      LIMIT ${safeLimit}`,
+     loadParams
+@@ -197,11 +206,12 @@
+ 
+   const receiptParams = [operatorId];
+   const receiptDate = dateClause("r", date, receiptParams);
++  const receiptYard = yardClause("o.location_id", yardLocationIds, receiptParams);
+   const receipts = await query(
+     `WITH receiving_order_lookup AS (
+-       SELECT netsuite_id, tranid, 'purchase_order'::text AS order_type FROM purchase_orders
+-       UNION ALL
+-       SELECT netsuite_id, tranid, 'transfer_order'::text AS order_type FROM transfer_orders
++       SELECT netsuite_id, tranid, destination_location_id AS location_id, 'purchase_order'::text AS order_type FROM purchase_orders
++       UNION ALL
++       SELECT netsuite_id, tranid, to_location_id AS location_id, 'transfer_order'::text AS order_type FROM transfer_orders
+      ),
+      receiving_line_lookup AS (
+        SELECT purchase_order_id AS order_id, line_id, id, item_name, item_description,
+@@ -252,7 +262,7 @@
+          AND NULLIF(item.value->>'quantity', '') IS NOT NULL
+      ) received_lines ON true
+      WHERE r.operator_id = $1
+-       ${receiptDate}
++       ${receiptDate} ${receiptYard}
+      ORDER BY r.created_at DESC, r.id DESC
+      LIMIT ${safeLimit}`,
+     receiptParams
+@@ -262,6 +272,9 @@
+   const cycleParams = [operatorId];
+   const cycleDate = date ? " AND COALESCE(r.submitted_at, r.updated_at)::date = $2::date" : "";
+   if (date) cycleParams.push(String(date).slice(0, 10));
++  const cycleYard = yardLocationIds === null ? "" : ` AND NOT EXISTS (
++    SELECT 1 FROM cycle_count_lines scope WHERE scope.record_id=r.id
++    AND NOT (scope.location_id = ANY($${cycleParams.push(yardLocationIds)}::bigint[])))`;
+   const cycle = await query(
+     `SELECT ('cycle-' || r.id) AS id,
+             'cycle_count' AS type,
+@@ -300,7 +313,7 @@
+      LEFT JOIN inventory_balances b ON b.item_id = l.item_id AND b.location_id = l.location_id
+      WHERE r.operator_id = $1
+        AND r.status = 'submitted'
+-       ${cycleDate}
++       ${cycleDate} ${cycleYard}
+      GROUP BY r.id
+      ORDER BY COALESCE(r.submitted_at, r.updated_at) DESC
+      LIMIT ${safeLimit}`,
+@@ -310,6 +323,7 @@
+ 
+   const returnParams = [operatorId];
+   const returnDate = dateClause("r", date, returnParams);
++  const returnYard = yardClause("r.receiving_location_id", yardLocationIds, returnParams);
+   const returns = await query(
+     `SELECT ('return-' || r.id) AS id,
+             CASE WHEN r.record_type = 'pallet' THEN 'pallet_return' ELSE 'stock_return' END AS type,
+@@ -366,7 +380,7 @@
+           WHERE p.return_record_id = r.id
+        ) photos ON true
+       WHERE r.operator_id = $1
+-        ${returnDate}
++        ${returnDate} ${returnYard}
+       ORDER BY r.submitted_at DESC, r.id DESC
+       LIMIT ${safeLimit}`,
+     returnParams
+@@ -378,16 +392,16 @@
+     .slice(0, safeLimit);
+ }
+ 
+-export async function findOperatorHistoryRecord(operatorId, recordId) {
+-  const records = await listOperatorHistory({ operatorId, limit: 200 });
++export async function findOperatorHistoryRecord(operatorId, recordId, yardLocationIds = null) {
++  const records = await listOperatorHistory({ operatorId, limit: 200, yardLocationIds });
+   return records.find((record) => record.id === recordId) || null;
+ }
+ 
+-export async function reportOperatorRecordError({ operatorId, recordId, reason }) {
++export async function reportOperatorRecordError({ operatorId, recordId, reason, yardLocationIds = null }) {
+   const cleanReason = String(reason || "").trim();
+   if (!cleanReason) throw new Error("Please enter what was wrong with this record.");
+-  const record = await findOperatorHistoryRecord(operatorId, recordId);
+-  if (!record) throw new Error("History record not found.");
++  const record = await findOperatorHistoryRecord(operatorId, recordId, yardLocationIds);
++  if (!record) throw Object.assign(new Error("History record not found."), { status: 404 });
+ 
+   const inserted = await query(
+     `INSERT INTO operator_record_warnings (
+--- a/src/inventory-repository.js
++++ b/src/inventory-repository.js
+@@ -563,7 +563,7 @@
+   return created.rows[0].id;
+ }
+ 
+-export async function confirmCycleCountLine(operatorId, values) {
++export async function confirmCycleCountLine(operatorId, values, { yardLocationIds = null } = {}) {
+   const recordId = await getDraftCycleCount(operatorId);
+   const itemId = Number(values.itemId);
+   const locationId = Number(values.locationId);
+@@ -640,10 +640,10 @@
+     action: "cycle_count.line.confirm",
+     details: { recordId, itemId, locationId, pallets, layers, sections, pieces, countedTotal, variance }
+   });
+-  return getCycleCountDraft(operatorId);
+-}
+-
+-export async function getCycleCountDraft(operatorId) {
++  return getCycleCountDraft(operatorId, { yardLocationIds });
++}
++
++export async function getCycleCountDraft(operatorId, { yardLocationIds = null } = {}) {
+   const recordId = await getDraftCycleCount(operatorId);
+   const lines = await query(
+     `SELECT l.*,
+@@ -666,7 +666,7 @@
+      ORDER BY l.confirmed_at DESC`,
+     [recordId]
+   );
+-  return { id: recordId, lines: lines.rows };
++  return { id: recordId, lines: yardLocationIds === null ? lines.rows : lines.rows.filter((line) => yardLocationIds.includes(Number(line.location_id))) };
+ }
+ 
+ export async function submitCycleCount(operatorId) {
+--- a/src/delivery-repository.js
++++ b/src/delivery-repository.js
+@@ -1,3 +1,4 @@
++import { deliveryOrderWithinYards } from "./operator-yard-access.js";
+ import crypto from "node:crypto";
+ import { query, withTransaction } from "./db.js";
+ import { dispatchLoadAssignment } from "./dispatch-load-assignment.js";
+@@ -1169,13 +1170,14 @@
+   };
+ }
+ 
+-async function listDispatchGroupDeliveryOrders({ locationId = null, status = "active", orderType = "sales_order", planDate = null, truckPlate = null } = {}) {
++async function listDispatchGroupDeliveryOrders({ locationId = null, status = "active", orderType = "sales_order", planDate = null, truckPlate = null, allowedOperatorYards = null } = {}) {
+   const definitions = await listDispatchDeliveryGroups({ orderType });
+   const childOrdersByGroup = await loadDispatchGroupChildOrders(definitions);
+   const rows = [];
+   for (const group of definitions) {
+     const order = buildDispatchGroupDeliveryListOrder(group, childOrdersByGroup.get(group.id) || []);
+     if (!order) continue;
++    if (!deliveryOrderWithinYards({ ...order, child_orders: childOrdersByGroup.get(group.id) || [] }, allowedOperatorYards)) continue;
+     if (locationId && String(order.outbound_location_id || "") !== String(locationId)) continue;
+     if (planDate && String(order.dispatch_plan_date || "").slice(0, 10) !== String(dateOnly(planDate) || "")) continue;
+     if (truckPlate && String(order.dispatch_truck_plate || "") !== String(truckPlate)) continue;
+@@ -1769,7 +1771,7 @@
+   }, lines.rows);
+ }
+ 
+-export async function listDeliveryOrders({ locationId = null, status = "active", orderType = "sales_order", planDate = null, truckPlate = null } = {}) {
++export async function listDeliveryOrders({ locationId = null, status = "active", orderType = "sales_order", planDate = null, truckPlate = null, allowedOperatorYards = null } = {}) {
+   const sandboxFixtures = isNetSuiteSandboxEnvironment();
+   const sandboxSql = sandboxFixtures ? "true" : "false";
+   const statuses = parseStatusFilter(status);
+@@ -1997,7 +1999,7 @@
+     ,
+     params
+   );
+-  const groupRows = await listDispatchGroupDeliveryOrders({ locationId, status, orderType, planDate, truckPlate });
++  const groupRows = await listDispatchGroupDeliveryOrders({ locationId, status, orderType, planDate, truckPlate, allowedOperatorYards });
+   const localCoRows = orderType === "sales_order"
+     ? await listLocalCoDeliveryOrders({ locationId, status, planDate, truckPlate })
+     : [];
+@@ -2111,11 +2113,11 @@
+     .sort((left, right) => String(left.truck_plate || "").localeCompare(String(right.truck_plate || "")));
+ }
+ 
+-export async function listDeliveryLoadOrders({ locationId = null, status = "active", planDate = null, truckPlate = null } = {}) {
++export async function listDeliveryLoadOrders({ locationId = null, status = "active", planDate = null, truckPlate = null, allowedOperatorYards = null } = {}) {
+   if (!dateOnly(planDate)) return [];
+   const [salesOrders, transferOrders] = await Promise.all([
+-    listDeliveryOrders({ locationId, status, orderType: "sales_order", planDate, truckPlate }),
+-    listDeliveryOrders({ locationId, status, orderType: "transfer_order", planDate, truckPlate })
++    listDeliveryOrders({ locationId, status, orderType: "sales_order", planDate, truckPlate, allowedOperatorYards }),
++    listDeliveryOrders({ locationId, status, orderType: "transfer_order", planDate, truckPlate, allowedOperatorYards })
+   ]);
+   return [...salesOrders, ...transferOrders].sort((a, b) =>
+     String(a.dispatch_load_name || "").localeCompare(String(b.dispatch_load_name || ""), undefined, { numeric: true, sensitivity: "base" })
+@@ -2168,7 +2170,7 @@
+   return { removed: result.rowCount };
+ }
+ 
+-export async function listSavedDeliveryOrdersForOperator(operatorId, { locationId } = {}) {
++export async function listSavedDeliveryOrdersForOperator(operatorId, { locationId, allowedOperatorYards = null } = {}) {
+   if (!operatorId || !locationId) return [];
+   const saved = await query(
+     `SELECT order_key, order_ref, order_type, created_at
+@@ -2183,7 +2185,7 @@
+   const rows = [];
+   for (const item of saved.rows) {
+     const order = orderByKey.get(String(item.order_key));
+-    if (!order) continue;
++    if (!order || !deliveryOrderWithinYards(order, allowedOperatorYards) || Number(order.outbound_location_id ?? order.source_location_id) !== Number(locationId)) continue;
+     if (order.order_type === "sales_order" && isNetSuiteSalesOrderBilled(order)) continue;
+     if (isFullyLoadedDeliveryOrder(order)) continue;
+     rows.push({
+@@ -2196,7 +2198,7 @@
+   return rows;
+ }
+ 
+-export async function listSavedDeliveryOrderKeysForOperator(operatorId, { locationId } = {}) {
++export async function listSavedDeliveryOrderKeysForOperator(operatorId, { locationId, allowedOperatorYards = null } = {}) {
+   if (!operatorId || !locationId) return [];
+   const result = await query(
+     `SELECT saved.order_key
+@@ -2236,7 +2238,10 @@
+       ORDER BY saved.created_at DESC`,
+     [operatorId, locationId]
+   );
+-  return result.rows.map((row) => String(row.order_key));
++  const orders = await getDeliveryOrdersBatch(result.rows.map((row) => row.order_key));
++  const allowedKeys = new Set(orders.filter((order) => deliveryOrderWithinYards(order, allowedOperatorYards) && Number(order.outbound_location_id ?? order.source_location_id) === Number(locationId))
++    .map((order) => String(order.netsuite_id)));
++  return result.rows.map((row) => String(row.order_key)).filter((key) => allowedKeys.has(key));
+ }
+ 
+ function todayKey() {
+@@ -2517,21 +2522,21 @@
+   });
+ }
+ 
+-export async function getDeliveryPrepNotifications({ locationId = null } = {}) {
++export async function getDeliveryPrepNotifications({ locationId = null, allowedOperatorYards = null } = {}) {
+   if (!locationId) return buildDeliveryPrepNotifications({ locationId });
+   const [salesActive, transferActive] = await Promise.all([
+-    listDeliveryOrders({ locationId, status: "active", orderType: "sales_order" }),
+-    listDeliveryOrders({ locationId, status: "active", orderType: "transfer_order" })
++    listDeliveryOrders({ locationId, status: "active", orderType: "sales_order", allowedOperatorYards }),
++    listDeliveryOrders({ locationId, status: "active", orderType: "transfer_order", allowedOperatorYards })
+   ]);
+   return buildDeliveryPrepNotifications({ locationId, salesActive, transferActive });
+ }
+ 
+-export async function getDeliveryBootstrap({ operatorId = null, locationId = null } = {}) {
++export async function getDeliveryBootstrap({ operatorId = null, locationId = null, allowedOperatorYards = null } = {}) {
+   const [salesOrder, transferOrder, vrmaOrder, savedOrderKeys, activeDraft] = await Promise.all([
+-    listDeliveryOrders({ locationId, status: "active", orderType: "sales_order" }),
+-    listDeliveryOrders({ locationId, status: "active", orderType: "transfer_order" }),
++    listDeliveryOrders({ locationId, status: "active", orderType: "sales_order", allowedOperatorYards }),
++    listDeliveryOrders({ locationId, status: "active", orderType: "transfer_order", allowedOperatorYards }),
+     listVrmaDeliveryPrepOrders({ locationId }),
+-    listSavedDeliveryOrderKeysForOperator(operatorId, { locationId }),
++    listSavedDeliveryOrderKeysForOperator(operatorId, { locationId, allowedOperatorYards }),
+     getCurrentOperatorDeliveryDraft(operatorId, { locationId })
+   ]);
+   return {
+--- a/src/delivery-consolidation-repository.js
++++ b/src/delivery-consolidation-repository.js
+@@ -1,3 +1,4 @@
++import { deliveryOrderWithinYards } from "./operator-yard-access.js";
+ import { query, withTransaction } from "./db.js";
+ import { writeAudit } from "./auth-repository.js";
+ import {
+@@ -190,7 +191,7 @@
+   return new Map(result.rows.map((row) => [Number(row.canonical_order_id), row]));
+ }
+ 
+-async function savedSalesQueue(operatorId, locationId) {
++async function savedSalesQueue(operatorId, locationId, allowedOperatorYards = null) {
+   const savedResult = await query(
+     `SELECT order_key, order_ref, order_type, created_at
+        FROM operator_saved_delivery_orders
+@@ -202,13 +203,14 @@
+   );
+   const orders = await getDeliveryOrdersBatch(savedResult.rows.map((row) => row.order_key));
+   const orderByKey = new Map(orders.map((order) => [String(order.netsuite_id), order]));
+-  return savedResult.rows.map((saved) => ({ saved, order: orderByKey.get(String(saved.order_key)) || null }));
+-}
+-
+-export async function getSavedConsolidationQueue(operatorId, { locationId } = {}) {
++  return savedResult.rows.map((saved) => ({ saved, order: orderByKey.get(String(saved.order_key)) || null }))
++    .filter(({ order }) => !order || (deliveryOrderWithinYards(order, allowedOperatorYards) && Number(order.outbound_location_id ?? order.source_location_id) === Number(locationId)));
++}
++
++export async function getSavedConsolidationQueue(operatorId, { locationId, allowedOperatorYards = null } = {}) {
+   if (!operatorId) throw new Error("Operator login is required.");
+   if (!locationId) throw new Error("Location is required.");
+-  const queue = await savedSalesQueue(operatorId, locationId);
++  const queue = await savedSalesQueue(operatorId, locationId, allowedOperatorYards);
+   const claims = await activeClaimsByCanonicalOrder();
+   const rows = queue.map(({ saved, order }) => {
+     const issue = orderAvailabilityIssue(order, locationId, claims, operatorId);
+@@ -397,13 +399,13 @@
+   return error;
+ }
+ 
+-export async function startSavedConsolidationBatch(operatorId, { locationId } = {}) {
++export async function startSavedConsolidationBatch(operatorId, { locationId, allowedOperatorYards = null } = {}) {
+   if (!operatorId) throw new Error("Operator login is required.");
+   if (!locationId) throw new Error("Location is required.");
+   return withTransaction(async () => {
+     const existing = await activeBatchRow(operatorId, locationId);
+     if (existing) return getBatchState(existing);
+-    const queue = await savedSalesQueue(operatorId, locationId);
++    const queue = await savedSalesQueue(operatorId, locationId, allowedOperatorYards);
+     const claims = await activeClaimsByCanonicalOrder();
+     if (!queue.length) throw conflictError("Save at least one Sales Order before starting consolidation.");
+ 
+--- a/src/photo-upload.js
++++ b/src/photo-upload.js
+@@ -294,6 +294,7 @@
+       mm,
+       dd,
+       safePathSegment(actor?.id || actor?.login || "unknown"),
++      ...(metadata.locationId ? [`yard-${Number(metadata.locationId)}`] : []),
+       safePathSegment(subject)
+     ].filter(Boolean).join("/");
+   }
+--- a/src/return-repository.js
++++ b/src/return-repository.js
+@@ -1,3 +1,4 @@
++import { assertOperatorYard } from "./operator-yard-access.js";
+ import crypto from "node:crypto";
+ import { query, withTransaction } from "./db.js";
+ import { writeAudit } from "./auth-repository.js";
+@@ -1047,15 +1048,16 @@
+   return `${prefix}-${String(result.rows[0].value).padStart(6, "0")}`;
+ }
+ 
+-async function existingBatchByIdempotency(idempotencyKey) {
++async function existingBatchByIdempotency(idempotencyKey, operator = null) {
+   const result = await query(
+-    `SELECT b.id
++    `SELECT b.id, b.receiving_location_id
+        FROM return_batches b
+       WHERE b.idempotency_key = $1
+       LIMIT 1`,
+     [idempotencyKey]
+   );
+   if (!result.rows[0]?.id) return null;
++  if (operator) assertOperatorYard(operator, result.rows[0].receiving_location_id);
+   return listReturnRecords({ batchId: result.rows[0].id, limit: 10 });
+ }
+ 
+@@ -1354,6 +1356,7 @@
+ 
+ export async function submitReturnBatch({
+   operatorId,
++  operator = null,
+   input = {},
+   autoSync = true
+ } = {}) {
+@@ -1364,7 +1367,7 @@
+   );
+   if (explicitRequestKey) {
+     const earlyReplay = await existingBatchByIdempotency(
+-      normalizedIdempotencyKey({ idempotencyKey: explicitRequestKey }, operatorId)
++      normalizedIdempotencyKey({ idempotencyKey: explicitRequestKey }, operatorId), operator
+     );
+     if (earlyReplay) {
+       const records = earlyReplay.records || [];
+@@ -1411,7 +1414,7 @@
+   }
+   const receiving = yard(input.receivingLocationId);
+   const idempotencyKey = normalizedIdempotencyKey(input, operatorId);
+-  const prior = await existingBatchByIdempotency(idempotencyKey);
++  const prior = await existingBatchByIdempotency(idempotencyKey, operator);
+   if (prior) {
+     const records = prior.records || [];
+     return {
+--- a/public/operator.js
++++ b/public/operator.js
+@@ -113,13 +113,12 @@
+ const initialOperatorState = readOperatorState();
+ let authToken = readOperatorToken();
+ let operator = null;
+-
+-let locationId = Number(initialOperatorState.locationId || localStorage.getItem("mbbs.operator.locationId") || localStorage.getItem("mbbs.delivery.locationId") || 0);
+-if (locationId === 13) {
+-  locationId = 28;
+-  localStorage.setItem("mbbs.operator.locationId", "28");
+-  localStorage.setItem("mbbs.delivery.locationId", "28");
+-}
++let operatorSessionKey = "";
++let operatorWorkspaceLeaving = false;
++let operatorAccessRequest = null;
++let operatorAccessRefreshQueued = false;
++
++let locationId = Number(initialOperatorState.locationId || 0);
+ let currentModule = restorableModule(initialOperatorState.currentModule || "menu");
+ let locationDropdownOpen = false;
+ let viewMode = initialOperatorState.viewMode === "packed" ? "packed" : "active";
+@@ -672,16 +671,19 @@
+ }
+ 
+ async function api(path, options = {}) {
++  const requestToken = authToken;
++  const requestLocation = locationId;
+   const response = await fetch(path, {
+     headers: { "Content-Type": "application/json", ...(authToken ? { Authorization: `Bearer ${authToken}` } : {}) },
+     cache: "no-store",
+     ...options
+   });
++  if (operatorWorkspaceLeaving || requestToken !== authToken || requestLocation !== locationId) throw new Error("Operator session changed.");
+   if (response.status === 401) {
+     clearOperatorSession();
+     operator = null;
+     localStorage.removeItem(STATE_KEY);
+-    renderLogin("Login expired. Please login again.");
++    reloadOperatorWorkspace();
+     throw new Error("Login required");
+   }
+   if (!response.ok) {
+@@ -695,10 +697,15 @@
+     const error = new Error(payload?.error || text || "Request failed.");
+     error.status = response.status;
+     error.payload = payload;
++    if (response.status === 403 && payload?.code === "OPERATOR_YARD_FORBIDDEN") {
++      reloadOperatorWorkspace();
++    }
+     if (response.status === 403 && payload?.redirect) window.location.replace(payload.redirect);
+     throw error;
+   }
+-  return response.json();
++  const data = await response.json();
++  if (operatorWorkspaceLeaving || requestToken !== authToken || requestLocation !== locationId) throw new Error("Operator session changed.");
++  return data;
+ }
+ 
+ function dataUrlToFile(dataUrl, filename = "photo.jpg") {
+@@ -805,7 +812,7 @@
+   if (!String(photo).startsWith("data:image/")) return photo;
+   const ticket = await api("/api/operator/photo-upload-token", {
+     method: "POST",
+-    body: JSON.stringify(context)
++    body: JSON.stringify({ ...context, locationId })
+   });
+   const file = dataUrlToFile(photo, context.filename || `${context.recordType || "operator-photo"}.jpg`);
+   const formData = new FormData();
+@@ -905,7 +912,11 @@
+       return;
+     }
+     const payload = event.payload || {};
+-    if (event.type === "connected" || !operator || !locationId) return;
++    if (event.type === "operator.access.updated" || event.type === "connected") {
++      refreshOperatorAccess().catch(() => {});
++      return;
++    }
++    if (!operator || !locationId) return;
+     const deliveryEvents = [
+       "dispatch.plan.saved",
+       "dispatch.plan.confirmed",
+@@ -1926,8 +1937,96 @@
+   `;
+ }
+ 
++function allowedOperatorLocations() {
++  const roles = [...(Array.isArray(operator?.roles) ? operator.roles : []), operator?.role].map(normalizedStaffRole);
++  const ids = roles.includes("admin") ? LOCATIONS.map((yard) => yard.id) : operator?.operatorYardLocationIds || [];
++  return LOCATIONS.filter((yard) => ids.includes(yard.id));
++}
++
++function clearOperatorWorkspace() {
++  for (const key of [STATE_KEY, "mbbs.operator.locationId", "mbbs.delivery.locationId",
++    "mbbs.operator.deliveryOrderType", "mbbs.operator.deliveryBatchFilter", "mbbs.operator.deliveryPrepMode", "mbbs.operator.deliveryLoadViewDate"]) {
++    localStorage.removeItem(key);
++  }
++}
++
++function reloadOperatorWorkspace(nextLocation = 0) {
++  if (operatorWorkspaceLeaving) return;
++  operatorWorkspaceLeaving = true;
++  disconnectEvents();
++  stopFulfillmentCamera();
++  stopReceiptCamera();
++  stopPickupScannerCamera();
++  stopReturnCamera();
++  stopReturnScannerCamera();
++  releaseSecurePhotoImages(app);
++  clearOperatorWorkspace();
++  if (nextLocation && operator && operatorSessionKey) {
++    localStorage.setItem(STATE_KEY, JSON.stringify({ accountId: operator.id, sessionKey: operatorSessionKey, locationId: nextLocation, currentModule: "menu" }));
++  }
++  app.replaceChildren();
++  window.location.reload();
++}
++
++async function prepareOperatorWorkspace() {
++  const digest = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(authToken));
++  operatorSessionKey = [...new Uint8Array(digest)].map((byte) => byte.toString(16).padStart(2, "0")).join("");
++  const stored = readOperatorState();
++  if (Object.keys(stored).length && (stored.accountId !== operator.id || stored.sessionKey !== operatorSessionKey)) {
++    reloadOperatorWorkspace();
++    return false;
++  }
++  const yards = allowedOperatorLocations();
++  if (locationId && !yards.some((yard) => yard.id === locationId)) {
++    reloadOperatorWorkspace();
++    return false;
++  }
++  if (!locationId && yards.length === 1) locationId = yards[0].id;
++  return true;
++}
++
++async function refreshOperatorAccess() {
++  if (!operator || operatorWorkspaceLeaving) return;
++  if (readOperatorToken() !== authToken) return reloadOperatorWorkspace();
++  if (operatorAccessRequest) {
++    operatorAccessRefreshQueued = true;
++    return operatorAccessRequest;
++  }
++  operatorAccessRequest = (async () => {
++    const { operator: account } = await api("/api/auth/me");
++    if (account.id !== operator.id || !operatorRoleAllowed(account)) return reloadOperatorWorkspace();
++    const previous = JSON.stringify(allowedOperatorLocations());
++    operator = account;
++    if (previous !== JSON.stringify(allowedOperatorLocations())) {
++      if (!allowedOperatorLocations().some((yard) => yard.id === locationId)) return reloadOperatorWorkspace();
++      locationDropdownOpen = false;
++      const button = app.querySelector('[data-action="toggle-location-dropdown"]');
++      if (button) button.disabled = allowedOperatorLocations().length < 2 || (returnModuleActive() && (returnStage !== "lookup" || Boolean(returnDraftId)));
++      app.querySelector(".location-dropdown")?.remove();
++    }
++  })().finally(() => {
++    operatorAccessRequest = null;
++    if (operatorAccessRefreshQueued) {
++      operatorAccessRefreshQueued = false;
++      return refreshOperatorAccess();
++    }
++  });
++  return operatorAccessRequest;
++}
++
++function renderNoOperatorYards() {
++  app.innerHTML = `<section class="location-screen"><div class="location-panel">
++    <p>${t("app.operator", "MBBS Yard Operator Application")}</p>
++    <h1>${t("operator.yardAccess", "Operator yard access")}</h1>
++    <p>${t("operator.noYardAccess", "No Operator yard access assigned. Contact an administrator.")}</p>
++    ${languageToggle()}
++    <button class="primary-button" data-action="refresh-yard-access" type="button">${t("common.refresh", "Refresh")}</button>
++    <button class="secondary-button" data-action="logout" type="button">${t("common.logout", "Logout")}</button>
++  </div></section>`;
++}
++
+ function locationOptions() {
+-  return LOCATIONS.map((location) => `
++  return allowedOperatorLocations().map((location) => `
+     <option value="${location.id}" ${Number(location.id) === Number(locationId) ? "selected" : ""}>${location.text}</option>
+   `).join("");
+ }
+@@ -1937,10 +2036,10 @@
+   return `
+     <header class="topbar">
+       <div class="topbar-location">
+-        <button class="secondary-button location-button" data-action="toggle-location-dropdown" ${returnLocationLocked ? "disabled" : ""} type="button">${t("common.location", "Location")} ${currentLocation()?.text || locationId || ""}${returnLocationLocked ? ` · ${t("operator.locked", "Locked")}` : ""}</button>
+-        ${locationDropdownOpen ? `
++        <button class="secondary-button location-button" data-action="toggle-location-dropdown" ${returnLocationLocked || allowedOperatorLocations().length < 2 ? "disabled" : ""} type="button">${t("common.location", "Location")} ${currentLocation()?.text || locationId || ""}${returnLocationLocked ? ` · ${t("operator.locked", "Locked")}` : ""}</button>
++        ${locationDropdownOpen && allowedOperatorLocations().length > 1 ? `
+           <div class="location-dropdown">
+-            ${LOCATIONS.map((location) => `
++            ${allowedOperatorLocations().map((location) => `
+               <button class="${Number(location.id) === Number(locationId) ? "active" : ""}" data-action="set-location-dropdown" data-location-id="${location.id}" type="button">${location.text}</button>
+             `).join("")}
+           </div>
+@@ -1999,9 +2098,11 @@
+ }
+ 
+ function saveOperatorState() {
+-  if (!operator) return;
++  if (!operator || operatorWorkspaceLeaving) return;
+   const module = restorableModule(currentModule);
+   localStorage.setItem(STATE_KEY, JSON.stringify({
++    accountId: operator.id,
++    sessionKey: operatorSessionKey,
+     locationId,
+     currentModule: module,
+     viewMode,
+@@ -2049,8 +2150,10 @@
+ }
+ 
+ async function restoreOperatorView() {
++  if (operatorWorkspaceLeaving) return;
+   if (!operator) return renderLogin();
+-  if (!locationId) return renderLocationSelect();
++  if (!allowedOperatorLocations().length) return renderNoOperatorYards();
++  if (!allowedOperatorLocations().some((yard) => yard.id === locationId)) return renderLocationSelect();
+   currentModule = restorableModule(currentModule);
+   try {
+     if (currentModule === "delivery") {
+@@ -2128,6 +2231,7 @@
+           <select id="locationSelect">${locationOptions()}</select>
+         </label>
+         <button class="primary-button" data-action="save-location" type="button">${t("common.continue", "Continue")}</button>
++        <button class="secondary-button" data-action="logout" type="button">${t("common.logout", "Logout")}</button>
+       </div>
+     </section>
+   `;
+@@ -2198,8 +2302,10 @@
+ 
+ function render() {
+   if (currentModule !== "receiving") invalidateReceivingRequests();
++  if (operatorWorkspaceLeaving) return;
+   if (!operator) return renderLogin();
+-  if (!locationId) return renderLocationSelect();
++  if (!allowedOperatorLocations().length) return renderNoOperatorYards();
++  if (!allowedOperatorLocations().some((yard) => yard.id === locationId)) return renderLocationSelect();
+   saveOperatorState();
+   if (currentModule === "menu") return renderMenu();
+   if (currentModule === "cycle-count") return renderCycleCount();
+@@ -2396,9 +2502,6 @@
+   const lookedUpAt = balance.lookedUpAt || balance.looked_up_at || balance.lookupTimestamp || balance.lookup_timestamp;
+   return `
+     <div class="return-balance-grid">
+-      <div><span>${t("operator.fulfilled", "Fulfilled")}</span><strong>${displayReturnQty(returnBalanceValue(balance, "fulfilled", "fulfilled"))} ${escapeHtml(unit)}</strong></div>
+-      <div><span>${t("operator.netsuiteReturned", "NetSuite returned")}</span><strong>${displayReturnQty(returnBalanceValue(balance, "netsuiteReturned", "netsuite_returned"))} ${escapeHtml(unit)}</strong></div>
+-      <div><span>${t("operator.localReserved", "Local reserved")}</span><strong>${displayReturnQty(returnBalanceValue(balance, "localReserved", "local_reserved"))} ${escapeHtml(unit)}</strong></div>
+       <div class="available"><span>${t("operator.availableToReturn", "Available to return")}</span><strong>${displayReturnQty(returnBalanceAvailable(balance))} ${escapeHtml(unit)}</strong></div>
+     </div>
+     ${lookedUpAt ? `<small class="return-lookup-time">${tf("operator.checkedAt", "Checked {time}", { time: formatDateTime(lookedUpAt) })}</small>` : ""}
+@@ -4106,10 +4209,10 @@
+   const showActivePacked = deliveryPrepMode === "standard" || deliveryPrepMode === "load";
+ 
+   return `
+-    <div class="panel-title">
++    <div class="panel-title delivery-list-title">
+       <div class="order-panel-title">
+         ${showActivePacked ? `
+-          <div class="panel-segment">
++          <div class="panel-segment delivery-mode-segment delivery-status-segment">
+             <button class="${viewMode === "active" ? "active" : ""}" data-action="view-active" type="button">${t("operator.active", "Active")}</button>
+             <button class="${viewMode === "packed" ? "active" : ""}" data-action="view-packed" type="button">${t("operator.packed", "Packed")}</button>
+           </div>
+@@ -4121,7 +4224,6 @@
+             ${t("operator.consolidationPick", "Consolidation Pick")}
+           </button>
+         ` : ""}
+-        <strong>${panelOrders.length}</strong>
+       </div>
+     </div>
+     ${renderDeliveryLoadControls()}
+@@ -8056,7 +8158,7 @@
+ async function syncInventory() {
+   await api("/api/inventory/sync", {
+     method: "POST",
+-    body: JSON.stringify({ locationIds: LOCATIONS.map((location) => location.id) })
++    body: JSON.stringify({ locationIds: [locationId] })
+   });
+   showToast("Inventory synced");
+   await loadCycleData();
+@@ -8214,16 +8316,20 @@
+       await api("/api/auth/logout", { method: "POST" }).catch(() => ({}));
+       operator = null;
+       clearOperatorSession();
+-      localStorage.removeItem(STATE_KEY);
+-      disconnectEvents();
+-      return renderLogin();
++      return reloadOperatorWorkspace();
++    }
++    if (button.dataset.action === "refresh-yard-access") {
++      await refreshOperatorAccess();
++      return render();
+     }
+     if (button.dataset.action === "toggle-location-dropdown") {
++      if (allowedOperatorLocations().length < 2) return;
+       locationDropdownOpen = !locationDropdownOpen;
+       return render();
+     }
+     if (button.dataset.action === "set-location-dropdown") {
+       const value = Number(button.dataset.locationId || 0);
++      if (!allowedOperatorLocations().some((yard) => yard.id === value)) return;
+       if (!value || Number(locationId) === value) {
+         locationDropdownOpen = false;
+         return render();
+@@ -8240,17 +8346,7 @@
+       stopPickupScannerCamera();
+       stopReturnCamera();
+       stopReturnScannerCamera();
+-      locationId = value;
+-      locationDropdownOpen = false;
+-      localStorage.setItem("mbbs.operator.locationId", String(value));
+-      localStorage.removeItem(STATE_KEY);
+-      deliveryOrderBuckets = { active: null, packed: null };
+-      selectedId = null;
+-      selectedOrder = null;
+-      selectedLineId = null;
+-      currentModule = "menu";
+-      await loadDeliveryNotifications();
+-      return render();
++      return reloadOperatorWorkspace(value);
+     }
+     if (button.dataset.action === "main-menu") {
+       locationDropdownOpen = false;
+@@ -8696,23 +8792,9 @@
+     if (button.dataset.action === "submit-cycle-count") return submitCycleCount();
+     if (button.dataset.action === "save-location") {
+       const value = Number(document.getElementById("locationSelect").value);
++      if (!allowedOperatorLocations().some((yard) => yard.id === value)) return;
+       locationId = value;
+-      locationDropdownOpen = false;
+-      localStorage.setItem("mbbs.operator.locationId", String(value));
+-      deliveryOrderBuckets = { active: null, packed: null };
+-      orderPage = 0;
+-      linePage = 0;
+       currentModule = "menu";
+-      return render();
+-    }
+-    if (button.dataset.action === "change-location") {
+-      localStorage.removeItem("mbbs.operator.locationId");
+-      localStorage.removeItem(STATE_KEY);
+-      locationId = 0;
+-      locationDropdownOpen = false;
+-      deliveryOrderBuckets = { active: null, packed: null };
+-      selectedId = null;
+-      selectedOrder = null;
+       return render();
+     }
+     if (button.dataset.action === "view-active") {
+@@ -9103,9 +9185,7 @@
+       window.location.replace(staffRoleHome(operator.role));
+       return;
+     }
+-    connectEvents();
+-    showToast(`Welcome ${operator.display_name}`);
+-    await restoreOperatorView();
++    reloadOperatorWorkspace();
+   } catch (error) {
+     renderLogin("Invalid username or password.");
+   }
+@@ -9128,6 +9208,7 @@
+       window.location.replace(staffRoleHome(operator.role));
+       return;
+     }
++    if (!(await prepareOperatorWorkspace())) return;
+     connectEvents();
+     await restoreOperatorView();
+   } catch (error) {
+@@ -9135,6 +9216,14 @@
+     renderLogin("Please login to continue.");
+   }
+ }
++
++window.addEventListener("focus", () => { refreshOperatorAccess().catch(() => {}); });
++document.addEventListener("visibilitychange", () => {
++  if (document.visibilityState === "visible") refreshOperatorAccess().catch(() => {});
++});
++window.addEventListener("storage", (event) => {
++  if ([STAFF_TOKEN_KEY, TOKEN_KEY].includes(event.key) && readOperatorToken() !== authToken) reloadOperatorWorkspace();
++});
+ 
+ boot();
+ setInterval(() => {
+--- a/public/operator.css
++++ b/public/operator.css
+@@ -3315,7 +3315,7 @@
+ 
+ .return-balance-grid {
+   display: grid;
+-  grid-template-columns: repeat(4, minmax(0, 1fr));
++  grid-template-columns: minmax(0, 1fr);
+   gap: 7px;
+ }
+ 
+@@ -3718,7 +3718,7 @@
+ }
+ 
+ .return-selected-editor .return-balance-grid {
+-  grid-template-columns: repeat(2, minmax(0, 1fr));
++  grid-template-columns: minmax(0, 1fr);
+   gap: 5px;
+ }
+ 
+@@ -4175,3 +4175,14 @@
+   flex-direction: column;
+   gap: 10px;
+ }
++
++/* Match the two delivery list controls to the Batch / Saved Orders row. */
++.delivery-list-title .order-panel-title {
++  flex: 1;
++}
++.delivery-list-title .order-panel-heading-actions:empty {
++  display: none;
++}
++.delivery-list-title .delivery-status-segment {
++  margin: 0;
++}
+--- a/public/operator.html
++++ b/public/operator.html
+@@ -12,14 +12,14 @@
+     <link rel="manifest" href="/manifest.webmanifest" />
+     <link rel="icon" href="/icons/mbbs-yard.svg" type="image/svg+xml" />
+     <link rel="apple-touch-icon" href="/icons/mbbs-yard-192.png" />
+-    <link rel="stylesheet" href="/operator.css?v=20260911-operator-ui-v1" />
++    <link rel="stylesheet" href="/operator.css?v=20260915-operator-yards-v1" />
+     <link rel="stylesheet" href="/i18n.css?v=20260701-i18n-v2" />
+   </head>
+   <body>
+     <main id="app" class="tablet-shell"></main>
+     <div id="toast" class="toast"></div>
+     <script src="/vendor/quagga2/quagga.min.js?v=1.12.1"></script>
+-    <script src="/i18n.js?v=20260911-operator-ui-v1"></script>
+-    <script src="/operator.js?v=20260911-operator-ui-v1"></script>
++    <script src="/i18n.js?v=20260915-operator-yards-v1"></script>
++    <script src="/operator.js?v=20260915-operator-yards-v1"></script>
+   </body>
+ </html>
+--- a/public/control.js
++++ b/public/control.js
+@@ -4294,6 +4294,11 @@
+         <p class="muted">${t("control.salesYardsHelp", "Sales schedule, Sales Orders, printers, and print jobs are limited to these yards.")}</p>
+         <div class="authority-choice-grid">${renderSalesYardChoices([], "data-new-sales-yard")}</div>
+       </fieldset>
++      <fieldset class="authority-picker">
++        <legend>${t("control.operatorYards", "Operator yard access")}</legend>
++        <p class="muted">${t("control.operatorYardsHelp", "Assign yards for Operator work. No yards means no Operator access. Administrators can use all yards.")}</p>
++        <div class="authority-choice-grid">${renderSalesYardChoices([], "data-new-operator-yard")}</div>
++      </fieldset>
+       <div class="account-detail-actions">
+         <button class="primary" type="submit">${t("control.createAccount", "Create account")}</button>
+       </div>
+@@ -4344,6 +4349,11 @@
+           <span class="field-label">${t("control.salesYards", "Sales yard access")}</span>
+           <p class="muted">${t("control.salesYardsHelp", "Sales schedule, Sales Orders, printers, and print jobs are limited to these yards.")}</p>
+           <div class="authority-choice-grid">${renderSalesYardChoices(item.yardLocationIds, "data-account-sales-yard")}</div>
++        </div>
++        <div>
++          <span class="field-label">${t("control.operatorYards", "Operator yard access")}</span>
++          <p class="muted">${t("control.operatorYardsHelp", "Assign yards for Operator work. No yards means no Operator access. Administrators can use all yards.")}</p>
++          <div class="authority-choice-grid">${renderSalesYardChoices(item.operatorYardLocationIds, "data-account-operator-yard")}</div>
+         </div>
+         <div class="account-detail-actions">
+           <button class="primary" data-action="save-account-roles" data-id="${escapeHtml(item.id)}" type="button">${t("control.saveAccess", "Save access")}</button>
+@@ -4846,7 +4856,8 @@
+           password: document.getElementById("newPassword").value,
+           role: primaryRole,
+           roles,
+-          yardLocationIds
++          yardLocationIds,
++          operatorYardLocationIds: [...document.querySelectorAll("[data-new-operator-yard]:checked")].map((input) => Number(input.value))
+         })
+       });
+       selectedOperatorId = created.id;
+@@ -5634,7 +5645,9 @@
+       if (!roles.includes(role)) roles.push(role);
+       await request(`/api/operators/${button.dataset.id}/roles`, {
+         method: "PUT",
+-        body: JSON.stringify({ role, roles, yardLocationIds })
++        body: JSON.stringify({ role, roles, yardLocationIds,
++          operatorYardLocationIds: [...(row?.querySelectorAll("[data-account-operator-yard]:checked") || [])].map((input) => Number(input.value))
++        })
+       });
+       alert(t("control.accessSaved", "Account access updated."));
+       return loadControlData();
+--- a/public/control.html
++++ b/public/control.html
+@@ -9,8 +9,8 @@
+   </head>
+   <body>
+     <main id="controlApp"></main>
+-    <script src="/i18n.js?v=20260815-customer-pickup-photo-gate-v1"></script>
++    <script src="/i18n.js?v=20260915-operator-yards-v1"></script>
+     <script src="/app-sidebar.js?v=20260911-maps-usage-v1"></script>
+-    <script src="/control.js?v=20260911-maps-usage-v1"></script>
++    <script src="/control.js?v=20260915-operator-yards-v1"></script>
+   </body>
+ </html>
+--- a/public/admin.html
++++ b/public/admin.html
+@@ -9,8 +9,8 @@
+   </head>
+   <body>
+     <main id="controlApp"></main>
+-    <script src="/i18n.js?v=20260723-targeted-order-sync-v1"></script>
++    <script src="/i18n.js?v=20260915-operator-yards-v1"></script>
+     <script src="/app-sidebar.js?v=20260911-maps-usage-v1"></script>
+-    <script src="/control.js?v=20260911-maps-usage-v1"></script>
++    <script src="/control.js?v=20260915-operator-yards-v1"></script>
+   </body>
+ </html>
+--- a/public/i18n.js
++++ b/public/i18n.js
+@@ -4,6 +4,10 @@
+   const ZH = "zh-CN";
+ 
+   const dictionary = {
++    "operator.yardAccess": "操作员场地权限",
++    "operator.noYardAccess": "尚未分配操作员场地权限。请联系管理员。",
++    "control.operatorYards": "操作员场地权限",
++    "control.operatorYardsHelp": "分配操作员可工作的场地。未分配场地则无法使用操作员功能。管理员可使用所有场地。",
+     "dispatch.drivers": "\u53f8\u673a",
+     "dispatch.unassigned": "\u672a\u5206\u914d",
+     "dispatch.noTruck": "\u672a\u5206\u914d\u8f66\u8f86",
+--- a/public/service-worker.js
++++ b/public/service-worker.js
+@@ -1,13 +1,13 @@
+-const CACHE_NAME = "mbbs-yard-operator-v144-ui-enhancements-v1";
++const CACHE_NAME = "mbbs-yard-operator-v145-yard-access-v1";
+ const OPERATOR_CACHE_PREFIX = "mbbs-yard-operator-";
+ const APP_SHELL = [
+   "/operator",
+   "/operator.html",
+-  "/operator.css?v=20260911-operator-ui-v1",
++  "/operator.css?v=20260915-operator-yards-v1",
+   "/i18n.css?v=20260701-i18n-v2",
+   "/vendor/quagga2/quagga.min.js?v=1.12.1",
+-  "/i18n.js?v=20260911-operator-ui-v1",
+-  "/operator.js?v=20260911-operator-ui-v1",
++  "/i18n.js?v=20260915-operator-yards-v1",
++  "/operator.js?v=20260915-operator-yards-v1",
+   "/manifest.webmanifest",
+   "/icons/mbbs-yard-192.png",
+   "/icons/mbbs-yard-512.png",
+--- a/public/dispatch.js
++++ b/public/dispatch.js
+@@ -7728,7 +7728,7 @@
+ 
+ function connectEvents() {
+   if (eventSource) return;
+-  eventSource = new EventSource(`/api/events?client=dispatch&sessionId=${encodeURIComponent(dispatchSessionId)}`);
++  eventSource = new EventSource(`/api/events?client=dispatch&sessionId=${encodeURIComponent(dispatchSessionId)}&token=${encodeURIComponent(typeof readDispatchAuthToken === "function" ? readDispatchAuthToken() : "")}`);
+   eventSource.addEventListener("app-event", (message) => {
+     let event;
+     try {
+--- /dev/null
++++ b/migrations/199_operator_yard_access.sql
+@@ -0,0 +1,11 @@
++-- Operator grants are deliberately independent of Sales/Control grants.
++ALTER TABLE operators
++  ADD COLUMN IF NOT EXISTS operator_yard_location_ids integer[] NOT NULL DEFAULT '{}';
++
++ALTER TABLE operators
++  DROP CONSTRAINT IF EXISTS operators_operator_yards_check;
++ALTER TABLE operators
++  ADD CONSTRAINT operators_operator_yards_check CHECK (
++    operator_yard_location_ids <@ ARRAY[1, 28, 15, 26]::integer[]
++    AND array_position(operator_yard_location_ids, NULL) IS NULL
++  );
+--- a/src/admin-access-integration-harness.js
++++ b/src/admin-access-integration-harness.js
+@@ -62,7 +62,8 @@
+     username,
+     displayName: "Yard Access Harness",
+     password: "Rollback123",
+-    role: "yard_manager"
++    role: "yard_manager",
++    operatorYardLocationIds: [1]
+   });
+   dispatcher = await createOperator({
+     username: `dispatch_access_${runId}`,
+--- a/tools/mbt-predeploy-readiness.mjs
++++ b/tools/mbt-predeploy-readiness.mjs
+@@ -142,7 +142,8 @@
+   "195_dispatch_load_assignment_projection_invariant.sql",
+   "196_scm_ir_split_reference.sql",
+   "197_scm_vendor_completion.sql",
+-  "198_google_maps_usage_control.sql"
++  "198_google_maps_usage_control.sql",
++  "199_operator_yard_access.sql"
+ ]);
+ 
+ export const REQUIRED_MBT_P3_FLAGS = Object.freeze([
+--- a/test/support/operator-ui-enhancements-fixture.mjs
++++ b/test/support/operator-ui-enhancements-fixture.mjs
+@@ -11,7 +11,7 @@
+   const orderId = String(9_920_000_000 + crypto.randomInt(10_000_000));
+   const username = `operator-ui-${suffix}`;
+   const password = crypto.randomUUID();
+-  await createOperator({ username, displayName: "UI Test", password, role: "operator", yardLocationIds: [1] });
++  await createOperator({ username, displayName: "UI Test", password, role: "operator", yardLocationIds: [1], operatorYardLocationIds: [1] });
+   const session = await loginOperator(username, password);
+   const tranid = `PICKUP-UI-${suffix}`;
+   await query(`INSERT INTO sales_orders (
+--- a/test/mbt/e2e/operator-ui-enhancements.spec.js
++++ b/test/mbt/e2e/operator-ui-enhancements.spec.js
+@@ -25,8 +25,8 @@
+   await writeFile(`${directory}/coverage-browser-${crypto.randomUUID()}.json`, JSON.stringify({ result }));
+ });
+ 
+-async function session(page, state, token = "operator-ui-browser-test", language = "en") {
+-  await page.addInitScript(({ restored, auth, lang }) => {
++async function session(page, state, token = "operator-ui-browser-test", language = "en", accountId = "ui-operator") {
++  await page.addInitScript(({ restored, auth, lang, accountId, sessionKey }) => {
+     window.EventSource = class {
+       addEventListener() {}
+       close() {}
+@@ -35,8 +35,8 @@
+     localStorage.setItem("mbbs.operator.token", auth);
+     localStorage.setItem("mbbs.operator.locationId", "1");
+     localStorage.setItem("mbbs.ui.language", lang);
+-    localStorage.setItem("mbbs.operator.state", JSON.stringify({ locationId: 1, ...restored }));
+-  }, { restored: state, auth: token, lang: language });
++    localStorage.setItem("mbbs.operator.state", JSON.stringify({ locationId: 1, ...restored, accountId, sessionKey }));
++  }, { restored: state, auth: token, lang: language, accountId, sessionKey: crypto.createHash("sha256").update(token).digest("hex") });
+ }
+ 
+ const json = (route, value) => route.fulfill({ contentType: "application/json", body: JSON.stringify(value) });
+@@ -45,7 +45,7 @@
+   await page.route("**/api/**", async (route) => {
+     const url = new URL(route.request().url());
+     const responses = {
+-      "/api/auth/me": { operator: { id: "ui-operator", display_name: "UI Test", role: "operator", roles: ["operator"] } },
++      "/api/auth/me": { operator: { id: "ui-operator", display_name: "UI Test", role: "operator", roles: ["operator"], operatorYardLocationIds: [1] } },
+       "/api/delivery/notifications": { total: 0, salesOrder: {}, transferOrder: {}, items: [] },
+       "/api/delivery/current-draft": null,
+       "/api/receiving/vendors": [],
+@@ -277,7 +277,7 @@
+ 
+ async function pickup(page, { language = "en", viewMode = "active" } = {}) {
+   const f = await seedOperatorPickup();
+-  await session(page, { currentModule: "customer-pickup", selectedId: f.orderId, selectedLineId: f.lineId, viewMode }, f.token, language);
++  await session(page, { currentModule: "customer-pickup", selectedId: f.orderId, selectedLineId: f.lineId, viewMode }, f.token, language, f.operator.id);
+   await page.goto("/operator");
+   await expect(page.locator(`[data-selected-line="${f.lineId}"]`)).toBeVisible();
+   return f;
+--- a/test/mbt/e2e/operator-page-confirm.spec.js
++++ b/test/mbt/e2e/operator-page-confirm.spec.js
+@@ -46,7 +46,7 @@
+     localStorage.setItem("mbbs.staff.token", "operator-page-confirm-browser-token");
+     localStorage.setItem("mbbs.operator.token", "operator-page-confirm-browser-token");
+     localStorage.setItem("mbbs.operator.locationId", "1");
+-    localStorage.setItem("mbbs.operator.state", JSON.stringify({ locationId: 1, ...restoredState }));
++    localStorage.setItem("mbbs.operator.state", JSON.stringify({ accountId: "operator-page-confirm-browser-operator", sessionKey: "18836d81177ddd0577a929b4fbf9ce523f4421da26b123c6256f31be4c73d185", locationId: 1, ...restoredState }));
+   }, state);
+ }
+ 
+@@ -59,7 +59,8 @@
+         username: "operator-page-confirm-browser-operator",
+         display_name: "Page Confirm Operator",
+         role: "operator",
+-        roles: ["operator"]
++        roles: ["operator"],
++          operatorYardLocationIds: [1]
+       }
+     });
+   }
+--- a/test/mbt/e2e/operator-customer-pickup-photo-gate.spec.js
++++ b/test/mbt/e2e/operator-customer-pickup-photo-gate.spec.js
+@@ -90,7 +90,7 @@
+     localStorage.setItem("mbbs.staff.token", "pickup-photo-gate-browser-token");
+     localStorage.setItem("mbbs.operator.token", "pickup-photo-gate-browser-token");
+     localStorage.setItem("mbbs.operator.locationId", "1");
+-    localStorage.setItem("mbbs.operator.state", JSON.stringify({
++    localStorage.setItem("mbbs.operator.state", JSON.stringify({ accountId: "pickup-photo-gate-operator", sessionKey: "37c6f3afffb7d4eacf3a6ca85a9e34549e3164915c74d7b53039d216633e5fb2",
+       currentModule: "customer-pickup",
+       locationId: 1,
+       selectedId: orderId,
+@@ -116,7 +116,8 @@
+           username: "pickup-photo-gate-operator",
+           display_name: "Pickup Photo Gate Operator",
+           role: "operator",
+-          roles: ["operator"]
++          roles: ["operator"],
++          operatorYardLocationIds: [1]
+         }
+       });
+     }
+--- a/test/mbt/e2e/operator-fulfillment-long-group-layout.spec.js
++++ b/test/mbt/e2e/operator-fulfillment-long-group-layout.spec.js
+@@ -118,7 +118,7 @@
+     localStorage.setItem("mbbs.operator.locationId", "15");
+     localStorage.setItem("mbbs.operator.deliveryPrepMode", "load");
+     localStorage.setItem("mbbs.operator.deliveryLoadViewDate", "2026-08-25");
+-    localStorage.setItem("mbbs.operator.state", JSON.stringify({
++    localStorage.setItem("mbbs.operator.state", JSON.stringify({ accountId: "layout-operator", sessionKey: "b1e4a94950cc04c04036b72beefbdcd0e3fbab42e185375364cf62fd391cadaf",
+       currentModule: "delivery",
+       locationId: 15,
+       viewMode: "packed",
+@@ -143,7 +143,8 @@
+           username: "layout-operator",
+           display_name: "Layout Operator",
+           role: "operator",
+-          roles: ["operator"]
++          roles: ["operator"],
++          operatorYardLocationIds: [15]
+         }
+       });
+     }
+--- a/test/mbt/integration/migration-upgrade.test.js
++++ b/test/mbt/integration/migration-upgrade.test.js
+@@ -425,6 +425,7 @@
+     assert.match(firstRunner.stdout, /Applied 196_scm_ir_split_reference\.sql/);
+     assert.match(firstRunner.stdout, /Applied 197_scm_vendor_completion\.sql/);
+     assert.match(firstRunner.stdout, /Applied 198_google_maps_usage_control\.sql/);
++    assert.match(firstRunner.stdout, /Applied 199_operator_yard_access\.sql/);
+ 
+     const after = await captureLegacyState(client, ids);
+     assert.deepEqual(after, before, "Migrations 102-198 must not rewrite representative schema-101 field values.");
+@@ -725,10 +726,10 @@
+       immutable_trigger: true
+     }]);
+ 
+-    assert.equal(receiptsBeforeNoOp.rowCount, 198);
++    assert.equal(receiptsBeforeNoOp.rowCount, 199);
+     assert.equal(
+       receiptsBeforeNoOp.rows.at(-1)?.filename,
+-      "198_google_maps_usage_control.sql"
++      "199_operator_yard_access.sql"
+     );
+     assert.deepEqual(
+       receiptsBeforeNoOp.rows
+--- a/test/mbt/integration/p3-predeploy-readiness.test.js
++++ b/test/mbt/integration/p3-predeploy-readiness.test.js
+@@ -174,7 +174,8 @@
+     "195_dispatch_load_assignment_projection_invariant.sql",
+     "196_scm_ir_split_reference.sql",
+     "197_scm_vendor_completion.sql",
+-    "198_google_maps_usage_control.sql"
++    "198_google_maps_usage_control.sql",
++    "199_operator_yard_access.sql"
+   ]);
+   assert.deepEqual(REQUIRED_MBT_P3_FLAGS, EXPECTED_FLAGS);
+   const rows = EXPECTED_FLAGS.map((flag_key) => ({ flag_key, enabled: false }));
+--- a/test/mbt/unit/control-yard-photo-thumbnail.test.js
++++ b/test/mbt/unit/control-yard-photo-thumbnail.test.js
+@@ -69,7 +69,7 @@
+ });
+ 
+ test("Control and Admin request the cache-busted thumbnail hydration client", () => {
+-  const expectedAsset = "/control.js?v=20260911-maps-usage-v1";
++  const expectedAsset = "/control.js?v=20260915-operator-yards-v1";
+   assert.ok(controlHtml.includes(expectedAsset));
+   assert.ok(adminHtml.includes(expectedAsset));
+ });
+--- a/test/mbt/unit/operations-navigation-enhancements.test.js
++++ b/test/mbt/unit/operations-navigation-enhancements.test.js
+@@ -122,13 +122,13 @@
+ 
+ test("operator cache assets advance with the cycle-count pagination release", () => {
+   for (const asset of [
+-    "/operator.css?v=20260911-operator-ui-v1",
+-    "/operator.js?v=20260911-operator-ui-v1"
++    "/operator.css?v=20260915-operator-yards-v1",
++    "/operator.js?v=20260915-operator-yards-v1"
+   ]) {
+     assert.ok(operatorHtml.includes(asset));
+     assert.ok(serviceWorker.includes(asset));
+   }
+-  assert.ok(serviceWorker.includes("mbbs-yard-operator-v144-ui-enhancements-v1"));
++  assert.ok(serviceWorker.includes("mbbs-yard-operator-v145-yard-access-v1"));
+ });
+ 
+ test("Dispatch and SCM card menus scroll within the fixed-height application shell", () => {
+--- a/test/mbt/unit/operator-customer-pickup-photo-gate-ui.contract.test.js
++++ b/test/mbt/unit/operator-customer-pickup-photo-gate-ui.contract.test.js
+@@ -90,7 +90,7 @@
+     source("public/operator.html"),
+     source("public/service-worker.js")
+   ]);
+-  assert.match(html, /operator\.js\?v=20260911-operator-ui-v1/u);
+-  assert.match(serviceWorker, /mbbs-yard-operator-v144-ui-enhancements-v1/u);
+-  assert.match(serviceWorker, /operator\.js\?v=20260911-operator-ui-v1/u);
++  assert.match(html, /operator\.js\?v=20260915-operator-yards-v1/u);
++  assert.match(serviceWorker, /mbbs-yard-operator-v145-yard-access-v1/u);
++  assert.match(serviceWorker, /operator\.js\?v=20260915-operator-yards-v1/u);
+ });
+--- a/test/mbt/unit/operator-page-confirm-ui.contract.test.js
++++ b/test/mbt/unit/operator-page-confirm-ui.contract.test.js
+@@ -58,11 +58,11 @@
+   assert.match(operator, /pageConfirming = true;/u);
+   assert.match(operator, /pageConfirming = false;/u);
+   assert.match(css, /@media \(max-width: 700px\)[\s\S]*?\.receiving-grid\s*\{[\s\S]*?grid-template-columns:\s*minmax\(0, 1fr\)/u);
+-  assert.match(html, /operator\.css\?v=20260911-operator-ui-v1/u);
+-  assert.match(html, /operator\.js\?v=20260911-operator-ui-v1/u);
+-  assert.match(serviceWorker, /mbbs-yard-operator-v144-ui-enhancements-v1/u);
+-  assert.match(serviceWorker, /operator\.css\?v=20260911-operator-ui-v1/u);
+-  assert.match(serviceWorker, /operator\.js\?v=20260911-operator-ui-v1/u);
++  assert.match(html, /operator\.css\?v=20260915-operator-yards-v1/u);
++  assert.match(html, /operator\.js\?v=20260915-operator-yards-v1/u);
++  assert.match(serviceWorker, /mbbs-yard-operator-v145-yard-access-v1/u);
++  assert.match(serviceWorker, /operator\.css\?v=20260915-operator-yards-v1/u);
++  assert.match(serviceWorker, /operator\.js\?v=20260915-operator-yards-v1/u);
+ });
+ 
+ test("server exposes separate Customer Pickup and PO-only batch endpoints", async () => {
+--- /dev/null
++++ b/test/mbt/unit/operator-yard-access.test.js
+@@ -0,0 +1,50 @@
++import assert from "node:assert/strict";
++import test from "node:test";
++import fc from "fast-check";
++import { normalizeOperatorYardLocationIds, operatorYardLocationIds, assertOperatorYard } from "../../../src/operator-yard-access.js";
++
++const yards = [1, 28, 15, 26];
++
++test("Operator grants start empty and never inherit Sales or manager grants", () => {
++  for (const role of ["operator", "yard_manager", "sales"]) {
++    const account = { role, yardLocationIds: yards };
++    assert.deepEqual(operatorYardLocationIds(account), []);
++    assert.throws(() => assertOperatorYard(account, 1), { status: 403, code: "OPERATOR_YARD_FORBIDDEN" });
++  }
++});
++
++test("grant normalization accepts only complete supported IDs with stable deduplication", () => {
++  assert.deepEqual(normalizeOperatorYardLocationIds(["28", 1, 28, "26"]), [1, 28, 26]);
++  assert.deepEqual(normalizeOperatorYardLocationIds(), []);
++  for (const value of [null, "1", {}, [195], [0], [-1], [1.5], [true], ["1x"], [""], [null], [[1]]]) {
++    assert.throws(() => normalizeOperatorYardLocationIds(value), { status: 400 });
++  }
++});
++
++test("admin primary or secondary role has precisely the four Operator yards", () => {
++  for (const account of [{ role: "admin" }, { role: "dispatcher", roles: ["dispatcher", "admin"] }]) {
++    assert.deepEqual(operatorYardLocationIds(account), yards);
++    for (const id of yards) {assert.equal(assertOperatorYard(account, id), id);}
++    assert.throws(() => assertOperatorYard(account, 4), { status: 403 });
++  }
++});
++
++test("property: authorized set membership is exact in both directions and independent of Sales rights", () => {
++  fc.assert(fc.property(fc.subarray(yards), fc.subarray(yards), fc.integer({ min: -10, max: 200 }), (grants, sales, id) => {
++    const account = { role: "operator", operatorYardLocationIds: grants, yardLocationIds: sales };
++    assert.deepEqual(operatorYardLocationIds(account), yards.filter((yard) => grants.includes(yard)));
++    for (const candidate of [...yards, id]) {
++      if (grants.includes(candidate)) {assert.equal(assertOperatorYard(account, candidate), candidate);}
++      else {assert.throws(() => assertOperatorYard(account, candidate), { status: 403 });}
++    }
++  }), { seed: 20260915, numRuns: 200 });
++});
++
++test("property: grant parser preserves every assigned yard and rejects every other numeric ID", () => {
++  fc.assert(fc.property(fc.array(fc.constantFrom(...yards)), fc.integer().filter((id) => !yards.includes(id)), (grants, invalid) => {
++    const expected = yards.filter((id) => grants.includes(id));
++    assert.deepEqual(normalizeOperatorYardLocationIds(grants), expected);
++    assert.deepEqual(normalizeOperatorYardLocationIds(grants.map(String)), expected);
++    assert.throws(() => normalizeOperatorYardLocationIds([...grants, invalid]), { status: 400 });
++  }), { seed: 20260915, numRuns: 200 });
++});
+--- /dev/null
++++ b/test/mbt/unit/operator-yard-assets.test.js
+@@ -0,0 +1,60 @@
++import assert from "node:assert/strict";
++import { readFile } from "node:fs/promises";
++import path from "node:path";
++import vm from "node:vm";
++import test from "node:test";
++
++/* global Request */
++
++test("Operator service worker precaches the exact new page assets, preserves Driver caches, and bypasses API requests", async () => {
++  const source = await readFile("public/service-worker.js", "utf8");
++  const html = await readFile("public/operator.html", "utf8");
++  const events = new Map(), deleted = [], installed = [];
++  const context = vm.createContext({
++    URL,
++    Request,
++    self: { addEventListener: (name, listener) => events.set(name, listener), skipWaiting: async () => {}, clients: { claim: async () => {} }, location: { origin: "https://yard.invalid" } },
++    caches: {
++      open: async (name) => ({ addAll: async (assets) => installed.push({ name, assets: assets.map((request) => request.url) }) }),
++      keys: async () => ["mbbs-yard-operator-old", "mbbs-driver-stable"],
++      delete: async (name) => deleted.push(name)
++    }
++  });
++  new vm.Script(source, { filename: path.resolve("public/service-worker.js") }).runInContext(context);
++  const waits = [];
++  events.get("install")({ waitUntil: (promise) => waits.push(promise) });
++  await Promise.all(waits);
++  assert.equal(installed[0].name, "mbbs-yard-operator-v145-yard-access-v1");
++  for (const asset of ["operator.js", "operator.css", "i18n.js"]) {
++    const url = `/${asset}?v=20260915-operator-yards-v1`;
++    assert.ok(html.includes(url));
++    assert.ok(installed[0].assets.includes(`https://yard.invalid${url}`));
++  }
++  events.get("activate")({ waitUntil: (promise) => waits.push(promise) });
++  await Promise.all(waits);
++  assert.deepEqual(deleted, ["mbbs-yard-operator-old"]);
++  let intercepted = false;
++  events.get("fetch")({ request: { method: "GET", url: "https://yard.invalid/api/delivery/orders?locationId=1" }, respondWith: () => { intercepted = true; } });
++  assert.equal(intercepted, false);
++});
++
++test("Dispatch live events use the real login token and retain a single connection", async () => {
++  const source = await readFile("public/dispatch.js", "utf8");
++  const start = source.indexOf("function connectEvents() {");
++  const end = source.indexOf("\nfunction ", start + 1);
++  assert.ok(start >= 0 && end > start);
++  // Preserve source offsets for V8 coverage while executing the real connection
++  // function; EventSource is the only network boundary replaced by this test.
++  const executable = source.slice(0, start).replace(/[^\n]/g, " ") + source.slice(start, end) + source.slice(end).replace(/[^\n]/g, " ");
++  const urls = [];
++  const context = vm.createContext({
++    eventSource: null, dispatchSessionId: "dispatch-session", readDispatchAuthToken: () => "test-token +?&",
++    EventSource: class { constructor(url) { urls.push(url); } addEventListener() {} }
++  });
++  new vm.Script(executable, { filename: path.resolve("public/dispatch.js") }).runInContext(context);
++  vm.runInContext("connectEvents(); connectEvents();", context);
++  assert.equal(urls.length, 1);
++  const url = new URL(urls[0], "https://yard.invalid");
++  assert.equal(url.searchParams.get("token"), "test-token +?&");
++  assert.equal(url.searchParams.get("sessionId"), "dispatch-session");
++});
+--- /dev/null
++++ b/test/mbt/integration/operator-yard-access.test.js
+@@ -0,0 +1,533 @@
++import assert from "node:assert/strict";
++import crypto from "node:crypto";
++import { TextDecoder } from "node:util";
++import test, { before, after } from "node:test";
++import fc from "fast-check";
++import { app } from "../../../src/server.js";
++import { createOperator, loginOperator, getOperatorByToken, updateOperatorRoles, listOperators, writeAudit } from "../../../src/auth-repository.js";
++import { closeDb, query, pool } from "../../../src/db.js";
++import { seedOperatorPickup } from "../../support/operator-ui-enhancements-fixture.mjs";
++import { config } from "../../../src/config.js";
++
++let server, base, assigned, empty, admin, fixture;
++const password = crypto.randomUUID();
++async function account(role, grants) {
++  const username = `yard-access-${crypto.randomUUID()}`;
++  await createOperator({ username, displayName: "Yard access test", password, role,
++    yardLocationIds: [28], ...(grants === undefined ? {} : { operatorYardLocationIds: grants }) });
++  return loginOperator(username, password);
++}
++async function request(session, path, method = "GET", body) {
++  const response = await fetch(`${base}${path}`, { method,
++    headers: { authorization: `Bearer ${session.token}`, "content-type": "application/json" },
++    ...(body === undefined ? {} : { body: JSON.stringify(body) }) });
++  return { status: response.status, data: response.headers.get("content-type")?.includes("application/json") ? await response.json() : await response.text() };
++}
++before(async () => {
++  assert.equal(process.env.MBT_TEST_ISOLATED, "1");
++  assigned = await account("operator", [1]);
++  empty = await account("yard_manager");
++  admin = await account("admin");
++  fixture = await seedOperatorPickup();
++  server = app.listen(0, "127.0.0.1");
++  await new Promise((resolve) => server.once("listening", resolve));
++  base = `http://127.0.0.1:${server.address().port}`;
++});
++after(async () => {
++  if (server) {await new Promise((resolve) => server.close(resolve));}
++  await closeDb();
++});
++
++test("account grants survive create, login, listing and live session lookup independently", async () => {
++  assert.deepEqual(empty.operator.operatorYardLocationIds, []);
++  assert.deepEqual(assigned.operator.operatorYardLocationIds, [1]);
++  assert.deepEqual(assigned.operator.yardLocationIds, [28]);
++  assert.deepEqual((await getOperatorByToken(assigned.token)).operatorYardLocationIds, [1]);
++  assert.deepEqual((await listOperators()).find((row) => row.id === assigned.operator.id).operatorYardLocationIds, [1]);
++});
++
++test("empty Operator assignments deny operations while Control and admin access remain", async () => {
++  for (const path of ["/api/delivery/orders?locationId=28", "/api/receiving/orders?destinationLocationId=28", "/api/inventory/items?locationId=28", "/api/operator/history", "/api/returns/operator/drafts?receivingLocationId=28"]) {
++    assert.equal((await request(empty, path)).status, 403, path);
++  }
++  assert.equal((await request(empty, "/api/control/order-locks")).status, 200);
++  assert.equal((await request(admin, "/api/delivery/orders?locationId=28")).status, 200);
++});
++
++test("yard list filters reject foreign and malformed yards before data or sync operations", async () => {
++  assert.equal((await request(assigned, "/api/delivery/orders?locationId=1")).status, 200);
++  for (const path of ["/api/delivery/bootstrap?locationId=28", "/api/delivery/saved-orders?locationId=28", "/api/delivery/notifications?locationId=28", "/api/delivery/load-orders?locationId=28", "/api/receiving/vendors?destinationLocationId=28", "/api/receiving/items?destinationLocationId=28", "/api/inventory/items?locationId=28", "/api/operator/requests?locationId=28", "/api/delivery/orders?locationId=1&locationId=28"]) {
++    assert.equal((await request(assigned, path)).status, 403, path);
++  }
++  assert.equal((await request(assigned, "/api/inventory/sync", "POST", { locationIds: [28] })).status, 403);
++  assert.equal((await request(assigned, "/api/cycle-count/lines", "POST", { locationId: 28, itemId: 123 })).status, 403);
++});
++
++test("stored order yard wins over forged query and body yard on reads and mutations", async () => {
++  const id = fixture.orderId;
++  assert.equal((await request(assigned, `/api/delivery/orders/${id}`)).status, 200);
++  await query("UPDATE sales_orders SET outbound_location_id=28 WHERE netsuite_id=$1", [id]);
++  try {
++    for (const [path, method, body] of [
++      [`/api/delivery/orders/${id}?locationId=1`, "GET"],
++      [`/api/customer-pickup/orders/${id}/lines/${fixture.lineId}/confirm`, "POST", { locationId: 1, pieces: 2 }],
++      [`/api/delivery/orders/${id}/prepared`, "POST", { locationId: 1 }],
++      ["/api/delivery/saved-orders", "POST", { locationId: 1, orderId: id }]
++    ]) {assert.equal((await request(assigned, path, method, body)).status, 403, path);}
++    const row = (await query("SELECT packed_piece_qty FROM sales_order_lines WHERE id=$1", [fixture.lineId])).rows[0];
++    assert.equal(Number(row.packed_piece_qty), 0);
++  } finally { await query("UPDATE sales_orders SET outbound_location_id=1 WHERE netsuite_id=$1", [id]); }
++});
++
++test("admin grant changes are audited, omitted updates preserve them, and revocation affects existing sessions", async () => {
++  const session = await account("operator", [1]);
++  const path = `/api/operators/${session.operator.id}/roles`;
++  const updated = await request(admin, path, "PUT", { role: "operator", roles: ["operator"], operatorYardLocationIds: [15, 26] });
++  assert.equal(updated.status, 200);
++  assert.deepEqual(updated.data.operatorYardLocationIds, [15, 26]);
++  await updateOperatorRoles(session.operator.id, { role: "operator", roles: ["operator"], yardLocationIds: [1] });
++  assert.deepEqual((await getOperatorByToken(session.token)).operatorYardLocationIds, [15, 26]);
++  assert.equal((await request(session, "/api/delivery/orders?locationId=1")).status, 403);
++  const audit = await query("SELECT details FROM delivery_audit_log WHERE action='operator.roles_update' AND details->>'operatorId'=$1", [session.operator.id]);
++  assert.ok(audit.rows.some((row) => JSON.stringify(row.details).includes('operatorYardLocationIds')));
++  await request(admin, path, "PUT", { role: "operator", roles: ["operator"], operatorYardLocationIds: [] });
++  assert.equal((await request(session, "/api/delivery/orders?locationId=15")).status, 403);
++});
++
++test("receiving uses stored destination for PO, transfer and local CO regardless of claimed yard", async () => {
++  const po = 9_910_000_001, transfer = 9_910_000_002;
++  await query("INSERT INTO purchase_orders(netsuite_id,tranid,destination_location_id,status,netsuite_active) VALUES($1,'YARD-PO',28,'B',true)", [po]);
++  await query("INSERT INTO transfer_orders(netsuite_id,tranid,from_location_id,to_location_id,status,netsuite_active) VALUES($1,'YARD-TO',1,28,'B',true)", [transfer]);
++  await query("INSERT INTO local_co_orders(co_ref,source_order_ref,from_location_id,to_location_id,status) VALUES('CO-YARD-ACCESS','YARD-SOURCE',1,28,'loaded')");
++  for (const id of [po, transfer, "CO-YARD-ACCESS"]) {
++    for (const [tail, method, body] of [["?locationId=1", "GET"], ["/sync", "POST", { locationId: 1 }], ["/lines/1/confirm", "POST", { locationId: 1 }], ["/receive", "POST", { locationId: 1 }]]) {
++      assert.equal((await request(assigned, `/api/receiving/orders/${id}${tail}`, method, body)).status, 403, `${id}${tail}`);
++    }
++  }
++  const inbound = await account("operator", [28]);
++  assert.equal((await request(inbound, `/api/receiving/orders/${po}`)).status, 200);
++  assert.equal((await request(inbound, `/api/delivery/orders/${transfer}`)).status, 403);
++});
++
++test("foreign return draft yard cannot be deleted, replaced, submitted or hidden by a forged yard; Control still uses its own grant", async () => {
++  const id = crypto.randomUUID();
++  await query("INSERT INTO return_drafts(id,operator_id,receiving_location_id,draft_type,payload) VALUES($1,$2,28,'pallet','{}')", [id, assigned.operator.id]);
++  assert.equal((await request(assigned, `/api/returns/drafts/${id}`, "DELETE")).status, 403);
++  assert.equal((await request(assigned, "/api/returns/drafts", "POST", { id, receivingLocationId: 1 })).status, 403);
++  assert.equal((await request(assigned, "/api/returns/submit", "POST", { draftId: id, receivingLocationId: 1 })).status, 403);
++  assert.equal((await request(empty, `/api/returns/drafts/${id}`)).status, 200);
++  assert.equal((await query("SELECT 1 FROM return_drafts WHERE id=$1", [id])).rowCount, 1);
++});
++
++test("return replay checks stored batch yard even when the original draft has gone", async () => {
++  const key = crypto.randomUUID();
++  await query(`INSERT INTO return_batches(batch_reference,idempotency_key,operator_id,receiving_location_id,receiving_yard_code,vehicle_plate)
++    VALUES($1,$2,$3,28,'2967','TEST')`, [`YARD-${key}`, `client:${assigned.operator.id}:${key}`, assigned.operator.id]);
++  assert.equal((await request(assigned, "/api/returns/submit", "POST", { idempotencyKey: key, receivingLocationId: 1 })).status, 403);
++});
++
++test("consolidation checks stored batch yard before line, item or pack changes", async () => {
++  const batch = (await query("INSERT INTO operator_consolidation_batches(operator_id,location_id) VALUES($1,28) RETURNING id", [assigned.operator.id])).rows[0];
++  const order = (await query(`INSERT INTO operator_consolidation_orders(batch_id,order_key,order_ref,order_type)
++    VALUES($1,$2,$3,'sales_order') RETURNING id`, [batch.id, fixture.orderId, fixture.tranid])).rows[0];
++  for (const [path, method] of [[`orders/${order.id}/lines/1`, "PUT"], [`orders/${order.id}/pack`, "POST"], [`batches/${batch.id}/items/confirm`, "PUT"]]) {
++    assert.equal((await request(assigned, `/api/delivery/consolidation/${path}`, method, { locationId: 1, pieces: 1 })).status, 403);
++  }
++  assert.equal((await query("SELECT status FROM operator_consolidation_batches WHERE id=$1", [batch.id])).rows[0].status, "active");
++});
++
++test("Operator history retains authorized records and hides records after an order moves to another yard", async () => {
++  await writeAudit({ actorOperatorId: assigned.operator.id, source: "delivery", action: "delivery.line.confirm", orderId: fixture.orderId, lineId: fixture.lineId, details: { pieces: 1 } });
++  let result = await request(assigned, "/api/operator/history");
++  assert.equal(result.status, 200);
++  const record = result.data.find((row) => row.orderId === fixture.orderId || String(row.orderId) === fixture.orderId);
++  assert.ok(record);
++  await query("UPDATE sales_orders SET outbound_location_id=28 WHERE netsuite_id=$1", [fixture.orderId]);
++  try {
++    result = await request(assigned, "/api/operator/history");
++    assert.equal(result.status, 200);
++    assert.equal(result.data.some((row) => row.id === record.id), false);
++    const report = await request(assigned, "/api/operator/history/report-error", "POST", { recordId: record.id, reason: "test" });
++    assert.notEqual(report.status, 200);
++    assert.equal((await query("SELECT 1 FROM operator_record_warnings WHERE record_id=$1", [record.id])).rowCount, 0);
++  } finally { await query("UPDATE sales_orders SET outbound_location_id=1 WHERE netsuite_id=$1", [fixture.orderId]); }
++});
++
++test("cycle draft hides revoked lines and cannot submit them; stored work is preserved", async () => {
++  const item = 9_910_000_010;
++  await query("INSERT INTO inventory_items(item_id,item_name) VALUES($1,'YARD-CYCLE')", [item]);
++  const draft = (await query("INSERT INTO cycle_count_records(operator_id,status) VALUES($1,'draft') RETURNING id", [assigned.operator.id])).rows[0];
++  await query("INSERT INTO cycle_count_lines(record_id,item_id,location_id) VALUES($1,$2,28)", [draft.id, item]);
++  const result = await request(assigned, "/api/cycle-count/draft");
++  assert.equal(result.status, 200);
++  assert.deepEqual(result.data.lines, []);
++  assert.equal((await request(assigned, "/api/cycle-count/submit", "POST", { locationId: 1 })).status, 403);
++  assert.equal((await query("SELECT status FROM cycle_count_records WHERE id=$1", [draft.id])).rows[0].status, "draft");
++  assert.equal((await query("SELECT 1 FROM cycle_count_lines WHERE record_id=$1", [draft.id])).rowCount, 1);
++});
++
++test("invalid account yard payloads are rejected before writes and cannot grant location 195", async () => {
++  for (const operatorYardLocationIds of [[195], [true], ["1x"], "1", null, {}]) {
++    const result = await request(admin, `/api/operators/${assigned.operator.id}/roles`, "PUT", { role: "operator", roles: ["operator"], operatorYardLocationIds });
++    assert.equal(result.status, 400);
++    assert.deepEqual((await getOperatorByToken(assigned.token)).operatorYardLocationIds, [1]);
++  }
++});
++
++test("saved order lists and consolidation queues hide orders moved out of their saved yard without deleting saved work", async () => {
++  await query(`INSERT INTO operator_saved_delivery_orders(operator_id,location_id,order_key,order_ref,order_type)
++    VALUES($1,1,$2,$3,'sales_order') ON CONFLICT DO NOTHING`, [assigned.operator.id, fixture.orderId, fixture.tranid]);
++  await query("UPDATE sales_orders SET outbound_location_id=28 WHERE netsuite_id=$1", [fixture.orderId]);
++  try {
++    for (const path of ["/api/delivery/saved-orders?locationId=1", "/api/delivery/saved-order-keys?locationId=1", "/api/delivery/consolidation/queue?locationId=1"]) {
++      const result = await request(assigned, path);
++      assert.equal(result.status, 200);
++      assert.equal(JSON.stringify(result.data).includes(fixture.orderId), false, path);
++      assert.equal(JSON.stringify(result.data).includes(fixture.tranid), false, path);
++    }
++    assert.equal((await query("SELECT 1 FROM operator_saved_delivery_orders WHERE operator_id=$1 AND order_key=$2", [assigned.operator.id, fixture.orderId])).rowCount, 1);
++  } finally { await query("UPDATE sales_orders SET outbound_location_id=1 WHERE netsuite_id=$1", [fixture.orderId]); }
++});
++
++test("photo tickets and saved return previews cannot bypass Operator yards", async () => {
++  for (const endpoint of ["/api/operator/photo-upload-token", "/api/photo-upload/token"]) {
++    assert.equal((await request(empty, endpoint, "POST", { source: "operator", recordType: "operator-return-photo", locationId: 28 })).status, 403);
++  }
++  await query("UPDATE sales_orders SET outbound_location_id=28 WHERE netsuite_id=$1", [fixture.orderId]);
++  try {
++    assert.equal((await request(assigned, "/api/operator/photo-upload-token", "POST", { locationId: 1, recordType: "operator-load-photo", orderId: fixture.orderId })).status, 403);
++  } finally { await query("UPDATE sales_orders SET outbound_location_id=1 WHERE netsuite_id=$1", [fixture.orderId]); }
++  const photo = `r2://operator/operator-return-photo/2026/09/15/${assigned.operator.id}/TEST/return.jpg`;
++  await query("INSERT INTO return_drafts(id,operator_id,receiving_location_id,payload) VALUES($1,$2,28,$3)", [crypto.randomUUID(), assigned.operator.id, JSON.stringify({ palletPhotos: [photo] })]);
++  assert.equal((await request(assigned, `/api/photo-upload/preview?ref=${encodeURIComponent(photo)}`)).status, 403);
++});
++
++test("live events expose refresh signals to anonymous and Operator clients, and details to authenticated Dispatch authority", async () => {
++  const streams = [];
++  try {
++    for (const token of ["", assigned.token, admin.token]) {
++      const abort = new AbortController();
++      const response = await fetch(`${base}/api/events?client=dispatch&token=${encodeURIComponent(token)}`, { signal: abort.signal });
++      const reader = response.body.getReader();
++      streams.push({ abort, reader });
++      await reader.read();
++    }
++    const result = await request(admin, `/api/delivery/orders/${fixture.orderId}/prepared`, "POST", {});
++    assert.equal(result.status, 200);
++    const events = await Promise.all(streams.map(async ({ reader }) => {
++      let buffer = "";
++      const timeout = setTimeout(() => streams.forEach((stream) => stream.abort.abort()), 4000);
++      try {
++        for (;;) {
++          const { value, done } = await reader.read();
++          if (done) {throw new Error("Event stream ended without an update");}
++          buffer += new TextDecoder().decode(value);
++          const match = buffer.match(/data: (.+)\n/);
++          if (match) {return JSON.parse(match[1]);}
++        }
++      } finally { clearTimeout(timeout); }
++    }));
++    for (const event of events) {assert.equal(event.type, "delivery.order.updated");}
++    assert.deepEqual(events[0].payload, {});
++    assert.deepEqual(events[1].payload, {});
++    assert.equal(String(events[2].payload.orderId), fixture.orderId);
++  } finally { streams.forEach((stream) => stream.abort.abort()); }
++});
++
++test("property: stored order yard requires its own grant even with another authorized location in the request", async () => {
++  const session = await account("operator", []);
++  try {
++    await fc.assert(fc.asyncProperty(fc.subarray([1, 28, 15, 26]), fc.constantFrom(1, 28, 15, 26), async (grants, canonical) => {
++      await updateOperatorRoles(session.operator.id, { role: "operator", roles: ["operator"], operatorYardLocationIds: grants });
++      await query("UPDATE sales_orders SET outbound_location_id=$2 WHERE netsuite_id=$1", [fixture.orderId, canonical]);
++      const result = await request(session, `/api/delivery/orders/${fixture.orderId}?locationId=${grants[0] || 1}`);
++      assert.equal(result.status, grants.includes(canonical) ? 200 : 403);
++    }), { seed: 20260915, numRuns: 40 });
++  } finally { await query("UPDATE sales_orders SET outbound_location_id=1 WHERE netsuite_id=$1", [fixture.orderId]); }
++});
++
++test("posting jobs enforce stored yard and ownership while retaining accepted work", async () => {
++  const id = crypto.randomUUID();
++  await query(`INSERT INTO operator_netsuite_posting_commands(id,request_id,actor_operator_id,function_key,transaction_type,
++    canonical_location_id,yard_code,gate_key,gate_revision,input_hash) VALUES($1,$2,$3,'receiving','IR',1,'3445',
++    'operator_netsuite_receiving_ir_3445',1,$4)`, [id, crypto.randomUUID(), assigned.operator.id, "a".repeat(64)]);
++  for (const endpoint of [`/api/operator/netsuite-posting-jobs/${id}`, `/api/receiving/receipt-jobs/${id}`]) {
++    assert.equal((await request(assigned, endpoint)).status, 200, endpoint);
++    assert.equal((await request(fixture, endpoint)).status, 403);
++    await query("UPDATE operator_netsuite_posting_commands SET canonical_location_id=28 WHERE id=$1", [id]);
++    assert.equal((await request(assigned, endpoint)).status, 403);
++    await query("UPDATE operator_netsuite_posting_commands SET canonical_location_id=1 WHERE id=$1", [id]);
++  }
++  assert.equal((await query("SELECT status FROM operator_netsuite_posting_commands WHERE id=$1", [id])).rows[0].status, "queued");
++});
++
++test("account API creation, disabling and password reset preserve independent grants", async () => {
++  const username = `yard-created-${crypto.randomUUID()}`;
++  const created = await request(admin, "/api/operators", "POST", { username, displayName: "Created", password, role: "operator", yardLocationIds: [28], operatorYardLocationIds: [1] });
++  assert.equal(created.status, 200);
++  assert.deepEqual(created.data.operatorYardLocationIds, [1]);
++  const session = await loginOperator(username, password);
++  const disabled = await request(admin, `/api/operators/${created.data.id}/active`, "POST", { active: false });
++  assert.deepEqual(disabled.data.operatorYardLocationIds, [1]);
++  assert.equal((await request(session, "/api/auth/me")).status, 401);
++  await request(admin, `/api/operators/${created.data.id}/active`, "POST", { active: true });
++  const reset = await request(admin, `/api/operators/${created.data.id}/password`, "POST", { password: crypto.randomUUID() });
++  assert.deepEqual(reset.data.operatorYardLocationIds, [1]);
++  assert.equal(await getOperatorByToken(session.token), null);
++});
++
++test("customer pickup lookup and return metadata remain usable at an assigned yard", async () => {
++  const pickup = await request(assigned, "/api/customer-pickup/lookup", "POST", { code: fixture.tranid, locationId: 1 });
++  assert.equal(pickup.status, 200);
++  assert.equal(String(pickup.data.netsuite_id), fixture.orderId);
++  const reasons = await request(assigned, "/api/returns/reasons");
++  assert.equal(reasons.status, 200);
++  assert.deepEqual(reasons.data.yardSettings.map((yard) => yard.locationId), [1]);
++  assert.equal((await request(assigned, "/api/returns/operator/history")).status, 200);
++  assert.equal((await request(assigned, "/api/returns/drafts", "POST", { draftId: "invalid", receivingLocationId: 1 })).status, 400);
++});
++
++test("counting authorized inventory returns only authorized draft lines", async () => {
++  const item = 9_910_000_010;
++  await query("UPDATE inventory_items SET to_pcs=1 WHERE item_id=$1", [item]);
++  await query("INSERT INTO inventory_balances(item_id,location_id,quantity_on_hand,quantity_available) VALUES($1,1,10,10)", [item]);
++  const result = await request(assigned, "/api/cycle-count/lines", "POST", { locationId: 1, itemId: item, pieces: 7 });
++  assert.equal(result.status, 200);
++  assert.deepEqual(result.data.lines.map((line) => Number(line.location_id)), [1]);
++  assert.equal(Number(result.data.lines[0].counted_piece_qty), 7);
++});
++
++test("authorized photo tickets bind unsaved returns to a yard and order previews follow the current stored yard", async () => {
++  const oldConfig = { ...config.photoUpload }, nativeFetch = globalThis.fetch;
++  Object.assign(config.photoUpload, { workerUrl: "https://yard-photos.invalid", tokenSecret: crypto.randomUUID() });
++  globalThis.fetch = (url, options) => String(url).startsWith("https://yard-photos.invalid")
++    ? Promise.resolve(new Response("yard-photo-bytes", { headers: { "content-type": "image/jpeg" } })) : nativeFetch(url, options);
++  try {
++    for (const endpoint of ["/api/operator/photo-upload-token", "/api/photo-upload/token"]) {
++      const ticket = await request(assigned, endpoint, "POST", { recordType: "operator-return-photo", locationId: 1 });
++      assert.equal(ticket.status, 200);
++      assert.ok(ticket.data.metadata.keyPrefix.includes("/yard-1/"));
++      const ref = `r2://${ticket.data.metadata.keyPrefix}/return.jpg`;
++      assert.equal((await request(assigned, `/api/photo-upload/preview?ref=${encodeURIComponent(ref)}`)).status, 200);
++    }
++    const orderTicket = await request(assigned, "/api/operator/photo-upload-token", "POST", { recordType: "operator-customer-pickup-photo", orderId: fixture.orderId, orderRef: fixture.tranid, locationId: 1 });
++    assert.equal(orderTicket.status, 200);
++    const ref = `r2://${orderTicket.data.metadata.keyPrefix}/load.jpg`;
++    assert.equal((await request(assigned, `/api/photo-upload/preview?ref=${encodeURIComponent(ref)}`)).data, "yard-photo-bytes");
++    await query("UPDATE sales_orders SET outbound_location_id=28 WHERE netsuite_id=$1", [fixture.orderId]);
++    assert.equal((await request(assigned, `/api/photo-upload/preview?ref=${encodeURIComponent(ref)}`)).status, 403);
++  } finally {
++    globalThis.fetch = nativeFetch;
++    Object.assign(config.photoUpload, oldConfig);
++    await query("UPDATE sales_orders SET outbound_location_id=1 WHERE netsuite_id=$1", [fixture.orderId]);
++  }
++});
++
++test("instruction media uses the stored outbound yard and rejects foreign yards before reading photo storage", async () => {
++  const id = crypto.randomUUID();
++  await query(`INSERT INTO sales_order_delivery_instruction_media(id,sales_order_id,object_reference,media_kind,mime_type,
++    original_file_name,byte_size,position,instruction_revision,uploaded_source) VALUES($1,$2,$3,'image','image/jpeg','test.jpg',5,1,1,'sales')`,
++  [id, fixture.orderId, `r2://sales/instructions/${id}.jpg`]);
++  await query("UPDATE sales_orders SET outbound_location_id=28 WHERE netsuite_id=$1", [fixture.orderId]);
++  try {
++    assert.equal((await request(assigned, `/api/delivery-instruction-media/${id}/content`)).status, 403);
++  } finally { await query("UPDATE sales_orders SET outbound_location_id=1 WHERE netsuite_id=$1", [fixture.orderId]); }
++});
++
++async function withNetSuiteReadStub(responder, run) {
++  const oldConfig = { ...config.netsuite }, nativeFetch = globalThis.fetch;
++  assert.equal((await query("SELECT 1 FROM netsuite_tokens")).rowCount, 0);
++  await query("INSERT INTO netsuite_tokens(id,access_token,expires_at) VALUES(1,$1,now()+interval '1 hour')", [crypto.randomUUID()]);
++  Object.assign(config.netsuite, { restBaseUrl: "https://yard-netsuite.invalid/services/rest", directAccessEnabled: true });
++  globalThis.fetch = (url, options) => String(url).startsWith("https://yard-netsuite.invalid")
++    ? Promise.resolve(new Response(JSON.stringify(responder(JSON.parse(options.body))), { headers: { "content-type": "application/json" } })) : nativeFetch(url, options);
++  try { await run(); }
++  finally {
++    globalThis.fetch = nativeFetch;
++    Object.assign(config.netsuite, oldConfig);
++    await query("DELETE FROM netsuite_tokens WHERE id=1");
++  }
++}
++
++test("NetSuite pickup lookup confines its query to the assigned yard and checks returned yard before importing", async () => {
++  const id = 9_910_000_090;
++  let returnedYard = 28;
++  await withNetSuiteReadStub(({ q }) => {
++    if (q.includes("SELECT DISTINCT")) {
++      assert.match(q, /AND tl\.location = 1/);
++      return { items: [{ id, tranid: "SOB999900", status: "B", status_text: "Pending Fulfillment", outbound_location_id: returnedYard, sales_order_type: "Pick-Up", delivery_method: "Pick-Up", order_type: "sales_order" }] };
++    }
++    return { items: [] };
++  }, async () => {
++    const lookup = () => request(assigned, "/api/customer-pickup/lookup", "POST", { code: "SOB999900", locationId: 1 });
++    assert.equal((await lookup()).status, 403);
++    assert.equal((await query("SELECT 1 FROM sales_orders WHERE netsuite_id=$1", [id])).rowCount, 0);
++    returnedYard = 1;
++    assert.equal((await lookup()).status, 200);
++    assert.equal(Number((await query("SELECT outbound_location_id FROM sales_orders WHERE netsuite_id=$1", [id])).rows[0].outbound_location_id), 1);
++  });
++});
++
++test("shared inventory sync accepts existing Control grants or independent Operator grants and rejects empty scopes", async () => {
++  await withNetSuiteReadStub(() => ({ items: [] }), async () => {
++    assert.equal((await request(empty, "/api/inventory/sync", "POST", { locationIds: [28] })).status, 200);
++    assert.equal((await request(assigned, "/api/inventory/sync", "POST", { locationIds: [1] })).status, 200);
++    assert.equal((await request(assigned, "/api/inventory/sync", "POST", { locationIds: [] })).status, 403);
++    assert.equal((await request(empty, "/api/inventory/sync", "POST", { locationIds: [15] })).status, 403);
++  });
++});
++
++test("local receiving jobs remain readable by their owner at the assigned yard and cannot be polled from another account", async () => {
++  const id = 9_910_000_091;
++  const receiver = await account("operator", [28]);
++  const other = await account("operator", [28]);
++  await query("INSERT INTO purchase_orders(netsuite_id,tranid,destination_location_id,status,status_text,netsuite_active) VALUES($1,'YARD-RECEIPT',28,'B','Pending Receipt',true)", [id]);
++  await query(`INSERT INTO purchase_order_lines(purchase_order_id,line_id,item_id,item_name,item_type,quantity,unit,location_id,
++    piece_qty,to_pcs,received_piece_qty,netsuite_active,confirmed_at,confirmed_by)
++    VALUES($1,1,9910091,'YARD-RECEIVE','InvtPart',5,'PC',28,5,1,5,true,now(),$2)`, [id, receiver.operator.id]);
++  const submission = await request(receiver, `/api/receiving/orders/${id}/receive`, "POST", { locationId: 28, orderType: "purchase_order", photoDataUrls: ["data:image/jpeg;base64,dGVzdDE=", "data:image/jpeg;base64,dGVzdDI="] });
++  assert.equal(submission.status, 200, JSON.stringify(submission.data));
++  assert.ok(submission.data.jobId);
++  const endpoint = `/api/receiving/receipt-jobs/${submission.data.jobId}`;
++  assert.equal((await request(receiver, endpoint)).status, 200);
++  assert.equal((await request(other, endpoint)).status, 403);
++  assert.equal((await request(assigned, endpoint)).status, 403);
++  await updateOperatorRoles(receiver.operator.id, { role: "operator", roles: ["operator"], operatorYardLocationIds: [] });
++  assert.equal((await request(receiver, endpoint)).status, 403);
++  assert.equal((await request(admin, endpoint)).status, 200);
++  assert.equal((await request(assigned, `/api/delivery/fulfillment-jobs/${crypto.randomUUID()}`)).status, 404);
++});
++
++for (const change of ["roles", "active", "password", "logout"]) {
++  test(`an existing detailed live stream closes after account ${change}`, async () => {
++    const session = await account("dispatcher", [1]);
++    const abort = new AbortController();
++    const timeout = setTimeout(() => abort.abort(), 1500);
++    try {
++      const response = await fetch(`${base}/api/events?client=dispatch&token=${session.token}`, { signal: abort.signal });
++      const reader = response.body.getReader();
++      await reader.read();
++      const changeResult = change === "logout"
++        ? await request(session, "/api/auth/logout", "POST", {})
++        : await request(admin, `/api/operators/${session.operator.id}/${change}`, change === "roles" ? "PUT" : "POST",
++          change === "roles" ? { role: "operator", roles: ["operator"], operatorYardLocationIds: [] }
++            : change === "active" ? { active: false } : { password: crypto.randomUUID() });
++      assert.equal(changeResult.status, 200);
++      let done = false;
++      try { while (!done) { ({ done } = await reader.read()); } } catch { /* deadline: stream was not closed by the server */ }
++      assert.equal(done, true, "revoked sessions must lose their existing detailed event stream");
++    } finally { clearTimeout(timeout); abort.abort(); }
++  });
++}
++
++
++test("a saved consolidation checks its current child order yard before active reads and release", async () => {
++  const session = await account("operator", [1]);
++  const batch = (await query("INSERT INTO operator_consolidation_batches(operator_id,location_id) VALUES($1,1) RETURNING id", [session.operator.id])).rows[0];
++  await query("INSERT INTO operator_consolidation_orders(batch_id,order_key,order_ref,order_type) VALUES($1,$2,$3,'sales_order')", [batch.id, fixture.orderId, fixture.tranid]);
++  const allowed = await request(session, "/api/delivery/consolidation/active?locationId=1");
++  assert.equal(allowed.status, 200);
++  assert.equal(String(allowed.data.batch.id), String(batch.id));
++  await query("UPDATE sales_orders SET outbound_location_id=28 WHERE netsuite_id=$1", [fixture.orderId]);
++  try {
++    assert.equal((await request(session, "/api/delivery/consolidation/active?locationId=1")).status, 403);
++    assert.equal((await request(session, "/api/delivery/consolidation/release", "POST", { locationId: 1 })).status, 403);
++    assert.equal((await query("SELECT status FROM operator_consolidation_batches WHERE id=$1", [batch.id])).rows[0].status, "active");
++  } finally { await query("UPDATE sales_orders SET outbound_location_id=1 WHERE netsuite_id=$1", [fixture.orderId]); }
++});
++
++test("return history details use stored ownership and yard while retaining accepted records", async () => {
++  const ref = crypto.randomUUID();
++  const batch = (await query("INSERT INTO return_batches(batch_reference,idempotency_key,operator_id,receiving_location_id,receiving_yard_code,vehicle_plate) VALUES($1,$1,$2,1,'3445','TEST') RETURNING id", [ref, assigned.operator.id])).rows[0];
++  const record = (await query(`INSERT INTO return_records(record_reference,batch_id,record_type,operator_id,customer_id,customer_name,receiving_location_id,vehicle_plate,pallet_quantity,external_id)
++    VALUES($1,$2,'pallet',$3,9910,'Yard History Customer',1,'TEST',2,$1) RETURNING id`, [ref, batch.id, assigned.operator.id])).rows[0];
++  const endpoint = `/api/returns/operator/history/${record.id}`;
++  assert.equal((await request(assigned, endpoint)).status, 200);
++  assert.equal((await request(fixture, endpoint)).status, 404);
++  await query("UPDATE return_records SET receiving_location_id=28 WHERE id=$1", [record.id]);
++  assert.equal((await request(assigned, `${endpoint}?receivingLocationId=1`)).status, 403);
++  assert.equal((await query("SELECT status FROM return_records WHERE id=$1", [record.id])).rows[0].status, "accepted");
++});
++
++test("new submissions retain quantity validation and create no empty return batch", async () => {
++  const key = crypto.randomUUID();
++  const result = await request(assigned, "/api/returns/submit", "POST", { receivingLocationId: 1, vehiclePlate: "TEST", idempotencyKey: key, palletQuantity: 0 });
++  assert.equal(result.status, 400);
++  assert.match(result.data.error, /Add stock or PALLET quantities/);
++  assert.equal((await query("SELECT 1 FROM return_batches WHERE idempotency_key=$1", [`client:${assigned.operator.id}:${key}`])).rowCount, 0);
++});
++
++
++test("a failed authentication database read cannot open a detailed live stream", async () => {
++  const nativeQuery = pool.query;
++  const abort = new AbortController();
++  try {
++    // Replace only the database transport boundary; the real HTTP/auth path runs.
++    pool.query = () => Promise.reject(new Error("Authentication database unavailable"));
++    const response = await fetch(`${base}/api/events?client=dispatch&token=${admin.token}`, { signal: abort.signal });
++    assert.equal(response.status, 500);
++    assert.match(response.headers.get("content-type"), /application\/json/);
++    assert.doesNotMatch(await response.text(), /event: app-event|text\/event-stream/);
++  } finally { pool.query = nativeQuery; abort.abort(); }
++});
++
++
++async function crossYardGroup() {
++  const first = await seedOperatorPickup(), second = await seedOperatorPickup();
++  await query("UPDATE sales_orders SET sales_order_type='Delivery' WHERE netsuite_id=ANY($1::bigint[])", [[first.orderId, second.orderId]]);
++  await query("UPDATE sales_orders SET outbound_location_id=28 WHERE netsuite_id=$1", [second.orderId]);
++  const plan = (await query("INSERT INTO dispatch_plans(plan_date,status) VALUES(current_date,'confirmed') ON CONFLICT(plan_date) DO UPDATE SET plan_date=EXCLUDED.plan_date RETURNING id,plan_date::text", [])).rows[0];
++  const id = `GRP-YARD-${crypto.randomUUID()}`;
++  await query("INSERT INTO dispatch_delivery_groups(group_ref,plan_id,plan_date,order_type,truck_plate) VALUES($1,$2,current_date,'sales_order','YARD')", [id, plan.id]);
++  await query("INSERT INTO dispatch_delivery_group_members(group_ref,member_order_ref,position) VALUES($1,$2,0),($1,$3,1)", [id, first.tranid, second.tranid]);
++  return { id, first, second, date: plan.plan_date };
++}
++
++test("a grouped order requires every stored child yard before reads or packing", async () => {
++  const group = await crossYardGroup();
++  const session = await account("operator", [1]);
++  assert.equal((await request(session, `/api/delivery/orders/${group.id}?locationId=1`)).status, 403);
++  assert.equal((await request(session, `/api/delivery/orders/${group.id}/prepared`, "POST", { locationId: 1 })).status, 403);
++  assert.equal((await query("SELECT operator_status FROM sales_orders WHERE netsuite_id=$1", [group.second.orderId])).rows[0].operator_status, "open");
++  await updateOperatorRoles(session.operator.id, { role: "operator", roles: ["operator"], operatorYardLocationIds: [1, 28] });
++  const allowed = await request(session, `/api/delivery/orders/${group.id}`);
++  assert.equal(allowed.status, 200);
++  assert.equal(allowed.data.child_orders.length, 2);
++});
++
++test("yard lists and saved queues withhold unauthorized groups while preserving authorized standalone orders and saved rows", async () => {
++  const group = await crossYardGroup();
++  const session = await account("operator", [1]);
++  await query("INSERT INTO operator_saved_delivery_orders(operator_id,location_id,order_key,order_ref,order_type) VALUES($1,1,$2,$2,'group_order')", [session.operator.id, group.id]);
++  const paths = ["orders?locationId=1", "bootstrap?locationId=1", `load-orders?locationId=1&planDate=${group.date}`, "saved-orders?locationId=1", "saved-order-keys?locationId=1", "consolidation/queue?locationId=1", "notifications?locationId=1"];
++  for (const path of paths) {
++    const result = await request(session, `/api/delivery/${path}`);
++    assert.equal(result.status, 200, path);
++    assert.equal(JSON.stringify(result.data).includes(group.id), false, path);
++    assert.equal(JSON.stringify(result.data).includes(group.second.tranid), false, path);
++  }
++  const refresh = await request(session, "/api/delivery/sync", "POST", { locationId: 1 });
++  assert.equal(refresh.status, 200);
++  assert.equal(JSON.stringify(refresh.data).includes(group.second.tranid), false);
++  const standalone = await request(session, "/api/delivery/orders?locationId=1");
++  assert.ok(standalone.data.some((row) => String(row.netsuite_id) === group.first.orderId));
++  assert.equal((await request(session, "/api/delivery/consolidation/start", "POST", { locationId: 1 })).status, 409);
++  assert.equal((await query("SELECT 1 FROM operator_saved_delivery_orders WHERE operator_id=$1 AND order_key=$2", [session.operator.id, group.id])).rowCount, 1);
++  await updateOperatorRoles(session.operator.id, { role: "operator", roles: ["operator"], operatorYardLocationIds: [1, 28] });
++  for (const path of ["orders?locationId=1", "saved-orders?locationId=1", "saved-order-keys?locationId=1", "consolidation/queue?locationId=1"]) {
++    const result = await request(session, `/api/delivery/${path}`);
++    assert.equal(result.status, 200);
++    assert.ok(JSON.stringify(result.data).includes(group.id), path);
++  }
++});
++
++test("property: grouped access requires both the first yard and each child yard", async () => {
++  const group = await crossYardGroup();
++  const session = await account("operator", []);
++  await fc.assert(fc.asyncProperty(fc.subarray([1, 28, 15, 26]), fc.constantFrom(1, 28, 15, 26), async (grants, childYard) => {
++    await updateOperatorRoles(session.operator.id, { role: "operator", roles: ["operator"], operatorYardLocationIds: grants });
++    await query("UPDATE sales_orders SET outbound_location_id=$2 WHERE netsuite_id=$1", [group.second.orderId, childYard]);
++    const result = await request(session, `/api/delivery/orders/${group.id}`);
++    assert.equal(result.status, grants.includes(1) && grants.includes(childYard) ? 200 : 403);
++  }), { seed: 20260915, numRuns: 30 });
++});
+--- /dev/null
++++ b/test/dispatch/frontend/operator-yard-access.browser.test.mjs
+@@ -0,0 +1,407 @@
++import assert from "node:assert/strict";
++import { createServer } from "node:http";
++import { readFile, mkdir, writeFile } from "node:fs/promises";
++import path from "node:path";
++import crypto from "node:crypto";
++import test, { before, after } from "node:test";
++import { chromium } from "playwright";
++
++let browser, server, base;
++before(async () => {
++  browser = await chromium.launch({ headless: true, args: ["--no-sandbox"] });
++  server = createServer(async (req, res) => {
++    const name = new URL(req.url, "http://test").pathname;
++    const file = name === "/operator" ? "operator.html" : name === "/admin" ? "admin.html" : name.slice(1);
++    if (!/^[a-zA-Z0-9./_-]+$/.test(file) || file.includes("..")) return res.writeHead(404).end();
++    try {
++      const bytes = await readFile(path.resolve("public", file));
++      res.writeHead(200, { "content-type": { ".html": "text/html", ".js": "text/javascript", ".css": "text/css" }[path.extname(file)] || "application/octet-stream" }).end(bytes);
++    } catch { res.writeHead(404).end(); }
++  }).listen(0, "127.0.0.1");
++  await new Promise((resolve) => server.once("listening", resolve));
++  base = `http://127.0.0.1:${server.address().port}`;
++});
++after(async () => { await browser?.close(); if (server) await new Promise((resolve) => server.close(resolve)); });
++
++async function fixture(grants, run, { language = "en", role = "operator", restored } = {}) {
++  const context = await browser.newContext({ serviceWorkers: "block", viewport: { width: 1100, height: 900 } });
++  const page = await context.newPage();
++  const state = { account: { id: "yard-browser-a", display_name: "Yard Operator A", role, roles: [role], yardLocationIds: [1, 28, 15, 26], operatorYardLocationIds: grants }, token: "test-login-one", calls: [], delay: null };
++  await page.addInitScript(({ lang }) => {
++    window.EventSource = class {
++      constructor() { window.yardTestEvents = this; this.listeners = {}; }
++      addEventListener(name, callback) { this.listeners[name] = callback; }
++      close() {}
++    };
++    if (!sessionStorage.getItem("yard-test-initialized")) {
++      localStorage.setItem("mbbs.staff.token", "test-login-one");
++      localStorage.setItem("mbbs.ui.language", lang);
++      sessionStorage.setItem("yard-test-initialized", "1");
++    }
++  }, { lang: language });
++  if (restored) await page.addInitScript((value) => {
++    if (!sessionStorage.getItem("yard-test-restored")) {
++      localStorage.setItem("mbbs.operator.state", JSON.stringify(value));
++      sessionStorage.setItem("yard-test-restored", "1");
++    }
++  }, restored);
++  await page.route("**/api/**", async (route) => {
++    const url = new URL(route.request().url());
++    state.calls.push(url.pathname + url.search);
++    let response = [];
++    if (url.pathname === "/api/auth/me" || url.pathname === "/api/auth/login") response = { operator: state.account, token: state.token };
++    else if (url.pathname === "/api/auth/bootstrap-needed") response = { needed: false };
++    else if (url.pathname === "/api/auth/logout") response = { ok: true };
++    else if (url.pathname === "/api/delivery/notifications") response = { total: 0, salesOrder: {}, transferOrder: {}, items: [] };
++    else if (url.pathname === "/api/delivery/current-draft") response = null;
++    else if (url.pathname === "/api/delivery/bootstrap") response = { activeOrders: [], packedOrders: [], notifications: { total: 0, items: [] }, currentDraft: null, requests: [], savedOrderKeys: [] };
++    else if (url.pathname === "/api/returns/reasons") response = { reasons: [], yardSettings: [] };
++    if (state.delay && url.pathname === "/api/receiving/orders") response = await state.delay;
++    await route.fulfill({ contentType: "application/json", body: JSON.stringify(response) }).catch(() => {});
++  });
++  const coverageEnabled = process.env.OPERATOR_YARD_COVERAGE === "1";
++  let profiler;
++  const coverageErrors = [];
++  async function collectCoverage() {
++    const coverage = await profiler.send("Profiler.takePreciseCoverage");
++    const result = coverage.result.filter((entry) => {
++      try { return ["/operator.js", "/control.js", "/i18n.js"].includes(new URL(entry.url).pathname); } catch { return false; }
++    }).map((entry) => ({ ...entry, url: `file:///app/public${new URL(entry.url).pathname}` }));
++    const directory = "test-artifacts/operator-yard-access/coverage-tmp";
++    await mkdir(directory, { recursive: true });
++    await writeFile(`${directory}/coverage-browser-${crypto.randomUUID()}.json`, JSON.stringify({ result }));
++  }
++  if (coverageEnabled) {
++    profiler = await context.newCDPSession(page);
++    await profiler.send("Profiler.enable");
++    await profiler.send("Profiler.startPreciseCoverage", { callCount: true, detailed: true });
++    await profiler.send("Debugger.enable");
++    const source = await readFile("public/operator.js", "utf8");
++    const reloadLine = source.slice(0, source.indexOf("  window.location.reload();", source.indexOf("function reloadOperatorWorkspace"))).split("\n").length - 1;
++    await profiler.send("Debugger.setBreakpointByUrl", { lineNumber: reloadLine, urlRegex: "operator\\.js(?:\\?|$)" });
++    // Capture reload/logout before the old V8 context disappears. Normal browser
++    // verification also runs without this coverage-only debugger checkpoint.
++    profiler.on("Debugger.paused", async () => {
++      try { await collectCoverage(); } catch (error) { coverageErrors.push(error.message); }
++      finally { await profiler.send("Debugger.resume").catch(() => {}); }
++    });
++  }
++  state.captureCoverage = coverageEnabled ? collectCoverage : async () => {};
++  try { await page.goto(`${base}/operator`); await run(page, state); }
++  finally {
++    if (coverageEnabled) {
++      await collectCoverage();
++      await profiler.detach();
++      assert.deepEqual(coverageErrors, []);
++    }
++    await context.close();
++  }
++}
++const menu = (page) => page.locator('[data-action="open-module"][data-module="delivery"]').waitFor({ timeout: 6000 });
++
++test("zero grants shows no-access, logout, and no operational requests", async () => {
++  await fixture([], async (page, state) => {
++    await page.getByText("No Operator yard access assigned. Contact an administrator.", { exact: true }).waitFor({ timeout: 5000 });
++    assert.equal(await page.locator('[data-action="logout"]').count(), 1);
++    await page.evaluate(() => window.yardTestEvents.listeners["app-event"]({ data: JSON.stringify({ type: "delivery.order.updated", payload: {} }) }));
++    await page.waitForLoadState("networkidle");
++    assert.equal(state.calls.some((call) => /^\/api\/(delivery|receiving|returns)\//.test(call)), false);
++  });
++});
++
++test("one grant opens its menu directly and offers no other yard", async () => {
++  await fixture([28], async (page) => {
++    await menu(page);
++    assert.match(await page.locator(".topbar-location").innerText(), /2967/);
++    assert.equal(await page.locator('[data-action="toggle-location-dropdown"]').isDisabled(), true);
++    assert.equal(await page.locator("#locationSelect").count(), 0);
++  });
++});
++
++test("multiple grants choose each login, persist during reload, and discard another account's saved order", async () => {
++  await fixture([28, 26], async (page, state) => {
++    await page.locator("#locationSelect").waitFor();
++    assert.deepEqual(await page.locator("#locationSelect option").evaluateAll((options) => options.map((option) => option.value)), ["28", "26"]);
++    await page.selectOption("#locationSelect", "26");
++    await page.locator('[data-action="save-location"]').click();
++    await menu(page);
++    await page.reload();
++    await menu(page);
++    assert.match(await page.locator(".topbar-location").innerText(), /150/);
++    await page.locator('[data-action="logout"]').click();
++    await page.locator("#loginUsername").waitFor();
++    state.token = "test-login-two";
++    await page.locator("#loginUsername").fill("same-account");
++    await page.locator("#loginPassword").fill("test-password");
++    await page.locator('[data-form="login"] button[type="submit"]').click();
++    await page.locator("#locationSelect").waitFor({ timeout: 6000 });
++    assert.equal(state.calls.some((call) => call.includes("PRIVATE-OLD-ORDER")), false);
++  }, { restored: { accountId: "another-account", sessionKey: "another-login", locationId: 1, currentModule: "customer-pickup", selectedId: "PRIVATE-OLD-ORDER" } });
++});
++
++test("authorized yard switch resets operational selections and survives reload", async () => {
++  await fixture([1, 28], async (page) => {
++    await page.locator("#locationSelect").waitFor();
++    await page.locator('[data-action="save-location"]').click();
++    await menu(page);
++    await page.locator('[data-action="toggle-location-dropdown"]').click();
++    assert.deepEqual(await page.locator(".location-dropdown button").evaluateAll((buttons) => buttons.map((button) => button.dataset.locationId)), ["1", "28"]);
++    await page.locator('[data-action="set-location-dropdown"][data-location-id="28"]').click();
++    await menu(page);
++    assert.match(await page.locator(".topbar-location").innerText(), /2967/);
++    await page.reload();
++    await menu(page);
++    assert.match(await page.locator(".topbar-location").innerText(), /2967/);
++  });
++});
++
++test("permission revocation on focus removes inaccessible data and yard selection", async () => {
++  await fixture([1], async (page, state) => {
++    await menu(page);
++    state.account = { ...state.account, operatorYardLocationIds: [] };
++    await page.evaluate(() => window.dispatchEvent(new Event("focus")));
++    await page.getByText("No Operator yard access assigned. Contact an administrator.", { exact: true }).waitFor({ timeout: 6000 });
++    assert.equal(await page.locator(".module-menu").count(), 0);
++  });
++});
++
++test("admin retains all four yard choices", async () => {
++  await fixture([], async (page) => {
++    await page.locator("#locationSelect").waitFor();
++    assert.deepEqual(await page.locator("#locationSelect option").evaluateAll((options) => options.map((option) => option.value)), ["1", "28", "15", "26"]);
++  }, { role: "admin" });
++});
++
++for (const language of ["en", "zh-CN"]) {
++  test(`Delivery Active/Packed fill the panel, match Batch/Saved sizing and preserve filters (${language})`, async () => {
++    await fixture([1], async (page) => {
++      await menu(page);
++      await page.evaluate(() => { currentModule = "delivery"; render(); });
++      const active = await page.locator('[data-action="view-active"]').boundingBox();
++      const packed = await page.locator('[data-action="view-packed"]').boundingBox();
++      const batch = await page.locator('.delivery-mode-segment button').first().boundingBox();
++      const saved = await page.locator('.delivery-mode-segment button').last().boundingBox();
++      assert.ok(Math.abs(active.width - batch.width) < 2, `Active ${active.width}, Batch ${batch.width}`);
++      assert.ok(Math.abs(packed.width - saved.width) < 2);
++      assert.equal(active.height, batch.height);
++      assert.equal(await page.locator(".order-panel-heading-actions > strong").count(), 0);
++      assert.equal(await page.locator(".batch-segment b").count(), 4);
++      await page.locator('[data-action="view-packed"]').click();
++      await page.locator('[data-action="view-packed"].active').waitFor();
++      assert.match(await page.locator('[data-action="view-packed"]').getAttribute("class"), /active/);
++    }, { language, restored: { locationId: 1, currentModule: "menu" } });
++  });
++}
++
++test("pallet balance editor shows only 60 available and keeps lookup status and quantity controls", async () => {
++  await fixture([1], async (page) => {
++    await menu(page);
++    const html = await page.evaluate(() => {
++      returnMode = "pallet";
++      returnPalletBalance = { fulfilled: 100, netsuiteReturned: 30, localReserved: 10, available: 60, lookedUpAt: "2026-09-15T00:00:00Z" };
++      return renderReturnPalletEditor();
++    });
++    await page.locator("#app").evaluate((element, value) => { element.innerHTML = value; }, html);
++    assert.equal(await page.locator(".return-balance-grid > div").count(), 1);
++    assert.match(await page.locator(".return-balance-grid").innerText(), /Available to return[\s\S]*60 PALLET/);
++    assert.doesNotMatch(await page.locator(".return-balance-grid").innerText(), /Fulfilled|NetSuite returned|Local reserved/);
++    assert.equal(await page.locator(".return-lookup-time").count(), 1);
++    assert.equal(await page.locator('[data-action="return-step-quantity"]').count(), 2);
++  }, { restored: { locationId: 1, currentModule: "menu" } });
++});
++
++test("another account's login discards a delayed receiving response and opens only its assigned yard", async () => {
++  await fixture([1], async (page, state) => {
++    await menu(page);
++    let release;
++    state.delay = new Promise((resolve) => { release = resolve; });
++    await page.locator('[data-action="open-module"][data-module="receiving"]').click();
++    const pendingOrder = page.waitForRequest((request) => request.url().includes("/api/receiving/orders"));
++    await page.locator("#receivingSearch").fill("OLD");
++    await pendingOrder;
++    state.account = { ...state.account, id: "yard-browser-b", operatorYardLocationIds: [28] };
++    state.token = "test-login-b";
++    await page.evaluate(() => {
++      localStorage.setItem("mbbs.staff.token", "test-login-b");
++      window.dispatchEvent(new StorageEvent("storage", { key: "mbbs.staff.token", newValue: "test-login-b" }));
++    });
++    release([{ netsuite_id: "OLD-PRIVATE", tranid: "OLD-PRIVATE", destination_location_id: 1 }]);
++    await menu(page);
++    assert.match(await page.locator(".topbar-location").innerText(), /2967/);
++    assert.doesNotMatch(await page.locator("#app").innerText(), /OLD-PRIVATE/);
++    assert.equal(await page.evaluate(() => JSON.parse(localStorage.getItem("mbbs.operator.state")).accountId), "yard-browser-b");
++  });
++});
++
++test("removing a different yard preserves active work at a still-authorized yard", async () => {
++  await fixture([1, 28], async (page, state) => {
++    await page.locator("#locationSelect").waitFor();
++    await page.locator('[data-action="save-location"]').click();
++    await menu(page);
++    await page.evaluate(() => { currentModule = "pallet-return"; returnStage = "entry"; returnDirty = true; render(); window.yardWorkWitness = true; });
++    state.account = { ...state.account, operatorYardLocationIds: [1] };
++    const changed = page.waitForResponse((response) => response.url().includes("/api/auth/me"));
++    await page.evaluate(() => window.dispatchEvent(new Event("focus")));
++    await changed;
++    await page.waitForFunction(() => operator.operatorYardLocationIds.length === 1);
++    assert.equal(await page.evaluate(() => Boolean(window.yardWorkWitness && returnDirty)), true);
++    assert.equal(await page.locator('[data-action="toggle-location-dropdown"]').isDisabled(), true);
++  });
++});
++
++test("a locked return prevents yard switching and a forged unauthorized choice is ignored", async () => {
++  await fixture([1, 28], async (page) => {
++    await page.locator("#locationSelect").waitFor();
++    await page.locator('[data-action="save-location"]').click();
++    await menu(page);
++    await page.evaluate(() => {
++      currentModule = "pallet-return"; returnStage = "entry"; returnDirty = true; render();
++      const fake = document.createElement("button"); fake.dataset.action = "set-location-dropdown"; fake.dataset.locationId = "28"; app.append(fake); fake.click();
++    });
++    assert.equal(await page.evaluate(() => locationId), 1);
++    await page.evaluate(() => {
++      currentModule = "menu"; returnDirty = false; returnStage = "lookup"; render();
++      const fake = document.createElement("button"); fake.dataset.action = "set-location-dropdown"; fake.dataset.locationId = "15"; app.append(fake); fake.click();
++    });
++    assert.equal(await page.evaluate(() => locationId), 1);
++  });
++});
++
++test("admin account creation and editing submit independent Operator yard checkboxes", async () => {
++  await fixture([], async (page, state) => {
++    page.on("dialog", (dialog) => dialog.dismiss());
++    await page.goto(`${base}/admin`);
++    await page.waitForFunction(() => typeof renderNewOperatorDetail === "function");
++    await page.waitForLoadState("networkidle");
++    await page.evaluate(() => { app.innerHTML = renderNewOperatorDetail(); });
++    assert.equal(await page.locator("[data-new-operator-yard]").count(), 4);
++    assert.equal(await page.locator("[data-new-operator-yard]:checked").count(), 0);
++    await page.locator("#newUsername").fill("new-operator");
++    await page.locator("#newDisplayName").fill("New Operator");
++    await page.locator("#newPassword").fill("test-password");
++    await page.locator('[data-new-sales-yard][value="28"]').check();
++    await page.locator('[data-new-operator-yard][value="1"]').check();
++    const creating = page.waitForRequest((request) => request.url().endsWith("/api/operators") && request.method() === "POST");
++    await page.locator('[data-form="create-operator"] button[type="submit"]').click();
++    const created = (await creating).postDataJSON();
++    assert.deepEqual(created.yardLocationIds, [28]);
++    assert.deepEqual(created.operatorYardLocationIds, [1]);
++    await state.captureCoverage();
++    await page.goto(`${base}/admin`);
++    await page.waitForFunction(() => typeof renderOperatorDetail === "function");
++    await page.waitForLoadState("networkidle");
++    await page.evaluate(() => { app.innerHTML = renderOperatorDetail({ id: "edit-account", username: "edit", display_name: "Edit", role: "operator", roles: ["operator"], yardLocationIds: [28], operatorYardLocationIds: [1], active: true }); });
++    await page.locator('[data-account-operator-yard][value="1"]').uncheck();
++    await page.locator('[data-account-operator-yard][value="26"]').check();
++    const updating = page.waitForRequest((request) => request.url().endsWith("/api/operators/edit-account/roles"));
++    await page.locator('[data-action="save-account-roles"]').click();
++    const updated = (await updating).postDataJSON();
++    assert.deepEqual(updated.yardLocationIds, [28]);
++    assert.deepEqual(updated.operatorYardLocationIds, [26]);
++  }, { role: "admin" });
++});
++
++test("refreshing no-access after an administrator assigns one yard opens that yard", async () => {
++  await fixture([], async (page, state) => {
++    await page.locator('[data-action="refresh-yard-access"]').waitFor();
++    state.account = { ...state.account, operatorYardLocationIds: [26] };
++    await page.locator('[data-action="refresh-yard-access"]').click();
++    await menu(page);
++    assert.match(await page.locator(".topbar-location").innerText(), /150/);
++  });
++});
++
++for (const status of [401, 403]) {
++  test(`an API ${status} clears inaccessible work before showing the next screen`, async () => {
++    await fixture([1], async (page, state) => {
++      await menu(page);
++      await page.route("**/api/delivery/orders?**", (route) => route.fulfill({ status, contentType: "application/json", body: JSON.stringify({ error: "Access changed", code: "OPERATOR_YARD_FORBIDDEN" }) }));
++      if (status === 403) state.account = { ...state.account, operatorYardLocationIds: [] };
++      await page.evaluate(() => {
++        selectedId = "old-private-order";
++        void api("/api/delivery/orders?locationId=1").catch(() => {});
++      });
++      if (status === 401) {
++        await page.locator("#loginUsername").waitFor();
++        assert.equal(await page.evaluate(() => localStorage.getItem("mbbs.staff.token")), null);
++      } else await page.locator('[data-action="refresh-yard-access"]').waitFor();
++      assert.doesNotMatch(await page.locator("#app").innerText(), /old-private-order/);
++    });
++  });
++}
++
++test("inventory synchronization and return photo tickets use only the selected authorized yard", async () => {
++  await fixture([1], async (page) => {
++    await menu(page);
++    await page.route("**/api/inventory/facets?**", (route) => route.fulfill({ contentType: "application/json", body: '{"productTypes":[],"brands":[],"series":[]}' }));
++    await page.route("**/api/cycle-count/draft", (route) => route.fulfill({ contentType: "application/json", body: '{"lines":[]}' }));
++    const sync = page.waitForRequest((request) => request.url().endsWith("/api/inventory/sync"));
++    await page.evaluate(() => { void syncInventory().catch(() => {}); });
++    assert.deepEqual((await sync).postDataJSON().locationIds, [1]);
++    await page.route("**/api/operator/photo-upload-token", (route) => route.fulfill({ contentType: "application/json", body: JSON.stringify({ uploadUrl: `${base}/fake-upload`, token: "test-upload-ticket" }) }));
++    await page.route("**/fake-upload", (route) => route.fulfill({ contentType: "application/json", body: '{"key":"operator/return/test-photo"}' }));
++    const ticket = page.waitForRequest((request) => request.url().endsWith("/api/operator/photo-upload-token"));
++    const uploaded = await page.evaluate(() => uploadOperatorPhoto("data:image/jpeg;base64,dGVzdA==", { recordType: "operator-return-photo" }));
++    assert.equal((await ticket).postDataJSON().locationId, 1);
++    assert.equal(uploaded, "r2://operator/return/test-photo");
++  });
++});
++
++
++test("a revoked persisted yard is removed before restoring that account's saved order", async () => {
++  await fixture([28], async (page, state) => {
++    await menu(page);
++    assert.match(await page.locator(".topbar-location").innerText(), /2967/);
++    assert.equal(state.calls.some((call) => call.includes("REVOKED-ORDER")), false);
++  }, { restored: { accountId: "yard-browser-a", sessionKey: crypto.createHash("sha256").update("test-login-one").digest("hex"), locationId: 1, currentModule: "customer-pickup", selectedId: "REVOKED-ORDER" } });
++});
++
++test("live access updates refresh grants, and an unchanged no-access refresh stays usable", async () => {
++  await fixture([], async (page, state) => {
++    await page.locator('[data-action="refresh-yard-access"]').click();
++    await page.locator('[data-action="refresh-yard-access"]').waitFor();
++    state.account = { ...state.account, operatorYardLocationIds: [1] };
++    await page.evaluate(() => window.yardTestEvents.listeners["app-event"]({ data: JSON.stringify({ type: "operator.access.updated", payload: {} }) }));
++    await menu(page);
++    assert.match(await page.locator(".topbar-location").innerText(), /3445/);
++  });
++});
++
++
++test("an access update during an older pending check queues a fresh permission read", async () => {
++  await fixture([1], async (page, state) => {
++    await menu(page);
++    const previous = state.account;
++    let release, signal, requests = 0;
++    const pending = new Promise((resolve) => { release = resolve; });
++    const requested = new Promise((resolve) => { signal = resolve; });
++    await page.route("**/api/auth/me", async (route) => {
++      requests += 1;
++      if (requests === 1) {
++        signal();
++        await pending;
++        return route.fulfill({ contentType: "application/json", body: JSON.stringify({ operator: previous }) });
++      }
++      return route.fulfill({ contentType: "application/json", body: JSON.stringify({ operator: state.account }) });
++    });
++    await page.evaluate(() => { void refreshOperatorAccess(); });
++    await requested;
++    state.account = { ...state.account, operatorYardLocationIds: [] };
++    await page.evaluate(() => window.yardTestEvents.listeners["app-event"]({ data: JSON.stringify({ type: "operator.access.updated", payload: {} }) }));
++    release();
++    await page.locator('[data-action="refresh-yard-access"]').waitFor({ timeout: 6000 });
++    assert.ok(requests >= 2, "the updated grants must be fetched after the stale response");
++    assert.equal(await page.locator(".module-menu").count(), 0);
++  });
++});
++
++
++test("reconnecting after the server closes a changed account's stream refreshes its grants", async () => {
++  await fixture([1], async (page, state) => {
++    await menu(page);
++    state.account = { ...state.account, operatorYardLocationIds: [] };
++    await page.evaluate(() => window.yardTestEvents.listeners["app-event"]({ data: JSON.stringify({ type: "connected", payload: {} }) }));
++    await page.locator('[data-action="refresh-yard-access"]').waitFor({ timeout: 6000 });
++    assert.equal(await page.locator(".module-menu").count(), 0);
++  });
++});
+--- /dev/null
++++ b/test/support/operator-yard-eslint.config.mjs
+@@ -0,0 +1,10 @@
++import base from "../../eslint.mbt.config.js";
++
++export default [...base, {
++  files: ["src/operator-yard-*.js", "src/auth-repository.js", "src/history-repository.js", "src/inventory-repository.js", "src/server.js", "src/return-repository.js", "src/photo-upload.js", "src/delivery-repository.js", "src/delivery-consolidation-repository.js"],
++  languageOptions: base[0].languageOptions,
++  rules: { "no-undef": "error", "no-unused-vars": "error", "no-unreachable": "error", "eqeqeq": "error", "no-var": "error" }
++}, {
++  files: ["src/operator-yard-*.js"],
++  rules: { complexity: ["error", 12], "max-depth": ["error", 4] }
++}];
+--- /dev/null
++++ b/test/operator-yard-access-spec.md
+@@ -0,0 +1,31 @@
++# Operator yard access and PWA layout
++
++Approved by the user's “Implement the plan” on 2026-09-15, following the proposed plan and explicit choices: separate grants, start empty, no access without assignment, and choose on each login when multiple yards are assigned.
++
++## Acceptance scenarios
++
++1. **Independent grants:** New and migrated non-admin accounts have `operatorYardLocationIds: []`. Assigning Operator yards never changes Sales/Control `yardLocationIds`. Creating or updating accepts only the four existing yard IDs (1, 28, 15, 26), rejects malformed IDs, and records grants in the audit. Omitted updates preserve grants. Login and existing sessions expose current grants.
++2. **Entry:** Zero grants shows the no-access message with logout; one grant opens the menu at that yard; multiple grants show only those yards. Admin retains all four. Yard 195 is outside this change.
++3. **Session isolation:** Selection survives reload within the same login. A new login, another account, or logout discards local operational state. Switching is limited to authorized yards and preserves existing active-work restrictions. Revocation clears inaccessible views and blocks subsequent requests. Delayed responses from an old account/yard cannot restore inaccessible data.
++4. **API authorization:** Lists require authorized yard filters. Orders, lines, drafts, consolidation batches, history, job status and related media resolve yard rights from stored data before reads/writes. Forged location parameters cannot authorize another yard's records. Receiving uses destination; delivery/pickup uses outbound/source; returns use receiving yard; inventory/cycle count use stored location. Existing ownership checks remain.
++5. **Shared consumers:** Existing Control endpoint grants stay independent; shared inventory synchronization respects server-verified Control or Operator permissions. Saved records and accepted background jobs remain intact after revocation.
++6. **Pallet balance:** A balance with 100 purchased, 30 returned and 10 reserved shows only “Available to return: 60”. Historical totals are absent in every shared editor. Lookup status, photos, current quantity and over-limit validation remain.
++7. **Delivery lists:** Active/Packed fill one equal-width row matching Batch/Saved Orders sizing. The page order count is removed. Pagination, individual batch counts, filters and consolidation actions work in English and Chinese.
++8. **Rollout:** Additive migration, no copied grants, no deleted work; refresh Operator PWA HTML and service-worker asset versions. Admin must assign non-admin yards before use.
++
++## Failure model and validation
++
++- Cross-yard disclosure or mutation: real authenticated API tests, hostile record IDs/filters, property tests for authorization sets, targeted mutants.
++- Stale login/yard state or in-flight replies: real browser login/reload/logout/switch/revocation checks including delayed responses.
++- Privilege coupling: independent grant round trips, omitted updates, admin and Control regression checks.
++- Invalid permission input or partial migration: malformed input properties, repeatable migration on isolated PostgreSQL, existing-account default checks.
++- Hidden quota enforcement or broken layout: real browser return validation and measured button geometry with both translations.
++- Silent regressions: full existing suite with baseline failures recorded; static checks, changed-line coverage, mutation and randomized ordering; evidence never treats unexecuted layers as passing.
++
++## Setup
++
++Tier 3 old-coder workflow. Use existing Docker Node, PostgreSQL and Chromium images, existing fast-check, coverage, lint and type tooling. No new dependencies or commits. Preserve the dirty workspace; task baseline snapshots live in ignored test-artifacts. Add focused tests, fixtures, a reproducible runner and evidence. Deployment uses the approved additive migration/application rollout; retain rollback image and a database backup. No automatic non-admin yard assignments.
++
++## Record-scope clarification from implementation review
++
++Grouped Delivery records aggregate several stored orders. Scenario 4 applies to every child yard, including saved lists, consolidation and load views. A group with an unassigned child yard is withheld; authorized standalone orders remain visible. Accounts assigned all child yards retain grouped access, and the stored group and saved rows are preserved. The review also adds a delayed authentication-check scenario: a newer access-change event must queue a fresh read after an older check completes.

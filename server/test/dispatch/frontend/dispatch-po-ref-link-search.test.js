@@ -44,5 +44,5 @@ test("Link PO matches the current PO ref and retained source PO number", () => {
 });
 
 test("Dispatch loads the PO-ref search client generation", () => {
-  assert.match(page, /dispatch\.js\?v=20260911-maps-usage-v1/u);
+  assert.match(page, /dispatch\.js\?v=20260911-map-geometry-v2/u);
 });

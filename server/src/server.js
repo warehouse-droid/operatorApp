@@ -1,4 +1,7 @@
+import { createOperatorYardGuard, assertOperatorOrderYard, assertOperatorUploadYard, assertOperatorOrderPhotoYard } from "./operator-yard-authorization.js";
+import { assertOperatorYard, operatorYardLocationIds } from "./operator-yard-access.js";
 import express from "express";
+import { SALES_ORDER_SYNC_LOCATIONS, withVoyageDispatchYard } from "./dispatch-sales-order-locations.js";
 import { completeScmVendorOrder } from "./scm-vendor-completion.js";
 import crypto from "node:crypto";
 import fs from "node:fs/promises";
@@ -173,6 +176,7 @@ import { listDispatchAudit, writeDispatchAudit } from "./dispatch-audit-reposito
 import { repairDispatchCoGroupIdentities } from "./dispatch-co-group-identity-repository.js";
 import {
   deactivateDispatchGlobalOrderDefinitions,
+  reconcileDispatchPlanGlobalOrderDefinitions,
   reconcileDispatchGlobalOrderTransitCos,
   removeDispatchGlobalGroupedMember,
   syncDispatchGlobalOrderTransitCo
@@ -549,6 +553,7 @@ const dispatchSetupPath = path.join(dataDir, "dispatch-setup.json");
 const deliveryLocations = [1, 28, 15, 26];
 const fulfillmentJobs = new Map();
 const receivingJobs = new Map();
+const requireOperatorYardRequest = createOperatorYardGuard({ receivingJobs, fulfillmentJobs });
 const eventClients = new Set();
 const driverGeocodeCache = new Map();
 const transferDependencyAllocationRefreshAt = new Map();
@@ -566,12 +571,12 @@ const defaultDispatchSetup = {
     { plate: "MBBS-205", capacityLbs: 44000, travelTimePercent: 0 },
     { plate: "MBBS-318", capacityLbs: 52000, travelTimePercent: 0 }
   ],
-  ownYards: [
+  ownYards: withVoyageDispatchYard([
     { code: "3445", name: "3445", locationId: 1, address: "3445 Kennedy Road, Toronto, ON", lat: 43.8204306, lng: -79.3053423 },
     { code: "2967", name: "2967", locationId: 28, address: "2967 Kennedy Road, Toronto, ON", lat: 43.806119, lng: -79.2986377 },
     { code: "12441", name: "12441", locationId: 15, address: "12441 Woodbine Avenue, Whitchurch-Stouffville, ON", lat: 43.948694, lng: -79.3727582 },
     { code: "150", name: "150", locationId: 26, address: "150 Clark Blvd, Brampton, ON L6T 4Y8, Canada" }
-  ],
+  ]),
   sync: {
     mode: "manual",
     intervalSeconds: 60,
@@ -1733,8 +1738,22 @@ function mergeDispatchOrderFeedWithSnapshotDerivedOrders(orders = [], derivedOrd
   const byId = new Map((orders || []).map((order) => [String(order?.id || ""), order]));
   for (const derived of derivedOrders || []) {
     const id = String(derived?.id || "").trim();
-    if (!id || byId.has(id)) continue;
-    byId.set(id, derived);
+    if (!id) continue;
+    const source = byId.get(id);
+    if (!source) {
+      byId.set(id, derived);
+      continue;
+    }
+    if (derived.globalGroupDefinition !== true && derived.globalOrderDefinition !== true) continue;
+    const merged = { ...source };
+    for (const field of [
+      "globalGroupDefinition", "globalGroupSourcePlanId", "globalGroupSourcePlanDate",
+      "globalOrderDefinition", "globalOrderDefinitionKind", "globalOrderSourcePlanId",
+      "globalOrderSourcePlanDate", "planOwned"
+    ]) {
+      if (Object.hasOwn(derived, field)) merged[field] = derived[field];
+    }
+    byId.set(id, merged);
   }
   return [...byId.values()];
 }
@@ -1937,7 +1956,16 @@ export async function loadDispatchOrdersForResponse({
     if (!["PO", "TO", "VRMA"].includes(String(order?.type || "").trim().toUpperCase())) return true;
     return !dispatchOrderScmRestrictionRefs(order).some((ref) => restrictedScmRefs.has(ref));
   });
-  const planningVisibleOrders = mergeDispatchOrderFeedWithSnapshotDerivedOrders(currentOrders, derivedOrders);
+  // Materialized source rows can outlive a retired definition. Apply the same
+  // lifecycle authority to the merged feed that plan reads and saves use.
+  const mergedPlanningOrders = mergeDispatchOrderFeedWithSnapshotDerivedOrders(currentOrders, derivedOrders);
+  const visibleDefinitions = await reconcileDispatchPlanGlobalOrderDefinitions({
+    orders: mergedPlanningOrders.map((order) => ({ id: order.id })),
+    trucks: []
+  });
+  const visibleOrderRefs = new Set(visibleDefinitions.orders.map((order) => String(order.id).trim().toLowerCase()));
+  // Reconcile visibility only; canonical source status and cargo remain current.
+  const planningVisibleOrders = mergedPlanningOrders.filter((order) => visibleOrderRefs.has(String(order?.id || "").trim().toLowerCase()));
   const planningVisibleIds = new Set(planningVisibleOrders.map((order) => String(order?.id || "").trim().toLowerCase()));
   const completedSearchCandidatesById = new Map();
   if (revealCompletedScmSearch) {
@@ -5140,7 +5168,7 @@ function emitAppEvent(type, payload = {}) {
     const body = `id: ${event.id}\nevent: app-event\ndata: ${JSON.stringify(event)}\n\n`;
     for (const client of eventClients) {
       try {
-        client.res.write(body);
+        client.res.write(client.detailed ? body : `id: ${event.id}\nevent: app-event\ndata: ${JSON.stringify({ ...event, payload: {} })}\n\n`);
       } catch {
         eventClients.delete(client);
       }
@@ -5149,6 +5177,12 @@ function emitAppEvent(type, payload = {}) {
 }
 
 configureOperatorNetSuitePostingCompletionEvents(emitAppEvent);
+
+function closeOperatorEventStreams(id) {
+  for (const client of eventClients) {
+    if (client.operatorId === id) { client.res.end(); eventClients.delete(client); }
+  }
+}
 
 function updateFulfillmentJob(jobId, patch) {
   const current = fulfillmentJobs.get(jobId) || { id: jobId };
@@ -5767,6 +5801,7 @@ async function photoPreviewViewer(req) {
       username: operator.username,
       role: operator.role,
       roles: operator.roles,
+      operatorYardLocationIds: operator.operatorYardLocationIds,
       yardLocationIds: operator.yardLocationIds,
       source: operatorHasAnyRole(operator, ["dispatcher", "admin"]) ? "dispatch" : "operator"
     };
@@ -5807,9 +5842,6 @@ async function assertReturnPhotoPreviewAccess(viewer, value) {
   if (operatorHasAnyRole(viewer, ["admin"])) return;
 
   const roles = new Set(normalizedOperatorRoles(viewer));
-  if ((roles.has("operator") || roles.has("yard_manager")) && photoActorId === String(viewer.id || "")) {
-    return;
-  }
   if (viewer.role === "driver") {
     throw Object.assign(new Error("This return photo is outside your access."), { status: 403 });
   }
@@ -5849,6 +5881,16 @@ async function assertReturnPhotoPreviewAccess(viewer, value) {
         )`,
     [reference]
   );
+
+  if (photoActorId === String(viewer.id || "") && (roles.has("operator") || roles.has("yard_manager"))) {
+    const allowed = operatorYardLocationIds(viewer);
+    if (matches.rows.some((row) => row.operator_id === viewer.id && allowed.includes(Number(row.receiving_location_id)))) return;
+    if (!matches.rowCount) {
+      const yardSegment = String(value).replace(/^r2:\/\//, "").split("/")[6] || "";
+      const yard = yardSegment.match(/^yard-(\d+)$/)?.[1];
+      if (yard) { assertOperatorYard(viewer, yard); return; }
+    }
+  }
 
   if (roles.has("yard_manager")) {
     const allowed = new Set(returnControlYardLocationIds(viewer));
@@ -6145,11 +6187,7 @@ function assertReturnControlYard(operator, locationId) {
 }
 
 function assertReturnOperatorYard(operator, locationId) {
-  if (operatorHasAnyRole(operator, ["admin"]) || !operatorHasAnyRole(operator, ["yard_manager"])) return;
-  if (!locationId) {
-    throw Object.assign(new Error("Select an assigned receiving yard."), { status: 400 });
-  }
-  assertReturnControlYard(operator, locationId);
+  return assertOperatorYard(operator, locationId);
 }
 
 const OPERATOR_RETURN_PRIVATE_KEYS = new Set([
@@ -6470,7 +6508,7 @@ async function readDispatchSetup({ includeInactive = false } = {}) {
   return {
     drivers,
     trucks,
-    ownYards: Array.isArray(saved.ownYards) ? saved.ownYards : defaultDispatchSetup.ownYards,
+    ownYards: withVoyageDispatchYard(Array.isArray(saved.ownYards) ? saved.ownYards : defaultDispatchSetup.ownYards),
     sync: normalizeSyncSettings(saved.sync),
     samsara: {
       ...defaultDispatchSetup.samsara,
@@ -7844,13 +7882,15 @@ async function recoverInterruptedSyncState() {
 async function syncDispatchOrderFeed() {
   const deliveryResults = [];
   const receivingResults = [];
-  for (const locationId of deliveryLocations) {
+  for (const locationId of SALES_ORDER_SYNC_LOCATIONS) {
     assertDispatchSyncCanContinue(`location ${locationId} sales orders`);
     deliveryResults.push({
       locationId,
       orderType: "sales_order",
       synced: await syncDeliveryLocation(locationId, { orderType: "sales_order" })
     });
+  }
+  for (const locationId of deliveryLocations) {
     assertDispatchSyncCanContinue(`location ${locationId} transfer delivery orders`);
     deliveryResults.push({
       locationId,
@@ -8778,7 +8818,12 @@ app.post("/api/webhooks/netsuite/order", async (req, res, next) => {
   }
 });
 
-app.get("/api/events", (req, res) => {
+app.get("/api/events", async (req, res, next) => {
+  try {
+    const token = typeof req.query.token === "string" ? req.query.token : "";
+    const viewer = token ? await getOperatorByToken(token) : null;
+    const driver = token && !viewer ? await getDriverSession(token) : null;
+    const detailed = Boolean(driver || operatorHasAnyRole(viewer, ["admin", "dispatcher"]));
   res.setHeader("Content-Type", "text/event-stream");
   res.setHeader("Cache-Control", "no-cache, no-transform");
   res.setHeader("Connection", "keep-alive");
@@ -8788,6 +8833,8 @@ app.get("/api/events", (req, res) => {
   const client = {
     id: crypto.randomUUID(),
     client: req.query.client || "unknown",
+    operatorId: viewer?.id || null,
+    detailed,
     res
   };
   eventClients.add(client);
@@ -8807,6 +8854,7 @@ app.get("/api/events", (req, res) => {
     clearInterval(heartbeat);
     eventClients.delete(client);
   });
+  } catch (error) { next(error); }
 });
 
 app.use((req, res, next) => {
@@ -10519,6 +10567,9 @@ app.get("/api/delivery-instruction-media/:mediaId/content", requirePhotoPreviewV
       if (!await driverCanViewDeliverySalesOrder(viewer.login, media.orderRef)) {
         return res.status(403).json({ error: "This instruction media is outside your current confirmed route." });
       }
+    } else if (operatorHasAnyRole(viewer, ["operator", "yard_manager"]) && !operatorHasAnyRole(viewer, ["admin", "dispatcher", "sales"])) {
+      const result = await query("SELECT netsuite_id FROM sales_orders WHERE tranid=$1", [media.orderRef]);
+      await assertOperatorOrderYard(viewer, result.rows[0]?.netsuite_id || media.orderRef);
     } else if (operatorHasAnyRole(viewer, ["sales"])) {
       if (!operatorSalesYardLocationIds(viewer).includes(Number(media.orderingLocationId))) {
         return res.status(403).json({ error: "This instruction media belongs to a yard you cannot access." });
@@ -17976,11 +18027,14 @@ app.post("/api/auth/logout", requireOperator, async (req, res, next) => {
       action: "operator.logout"
     });
     await logoutToken(bearerToken(req));
+    closeOperatorEventStreams(req.operator.id);
     res.json({ ok: true });
   } catch (error) {
     next(error);
   }
 });
+
+app.use("/api/operator", requireOperator, requireOperatorAccess, requireOperatorYardRequest);
 
 app.get("/api/photo-upload/config", requireOperator, (req, res) => {
   res.json(publicPhotoUploadConfig());
@@ -17993,6 +18047,10 @@ app.get("/api/photo-upload/preview", requirePhotoPreviewViewer, async (req, res,
       return res.status(400).json({ error: "R2 photo reference is required." });
     }
     await assertReturnPhotoPreviewAccess(req.photoViewer, ref || req.query.key);
+    if (!returnPhotoActorId(ref || req.query.key) && operatorHasAnyRole(req.photoViewer, ["operator"])
+        && !operatorHasAnyRole(req.photoViewer, ["admin", "dispatcher", "yard_manager", "sales"])) {
+      await assertOperatorOrderPhotoYard(req.photoViewer, ref || req.query.key);
+    }
     const wantsThumbnail = String(req.query.variant || "").trim().toLowerCase() === "thumbnail";
     const thumbnailCacheKey = ref || String(req.query.key || "");
     const sendThumbnail = (thumbnail) => {
@@ -18065,6 +18123,8 @@ app.get("/api/photo-upload/preview", requirePhotoPreviewViewer, async (req, res,
 app.post("/api/photo-upload/token", requireOperator, async (req, res, next) => {
   try {
     const body = req.body || {};
+    const photoLocationId = String(body.recordType || "operator-load-photo").startsWith("operator-")
+      ? await assertOperatorUploadYard(req.operator, body) : null;
     const token = createPhotoUploadToken({
       actor: {
         id: req.operator.id,
@@ -18076,6 +18136,7 @@ app.post("/api/photo-upload/token", requireOperator, async (req, res, next) => {
       source: body.source || "operator",
       recordType: body.recordType || "operator-load-photo",
       metadata: {
+        locationId: photoLocationId,
         orderType: body.orderType,
         orderId: body.orderId,
         orderRef: body.orderRef,
@@ -18096,6 +18157,8 @@ app.post("/api/photo-upload/token", requireOperator, async (req, res, next) => {
 app.post("/api/operator/photo-upload-token", requireOperator, async (req, res, next) => {
   try {
     const body = req.body || {};
+    const photoLocationId = String(body.recordType || "operator-load-photo").startsWith("operator-")
+      ? await assertOperatorUploadYard(req.operator, body) : null;
     res.json(createPhotoUploadToken({
       actor: {
         id: req.operator.id,
@@ -18107,6 +18170,7 @@ app.post("/api/operator/photo-upload-token", requireOperator, async (req, res, n
       source: "operator",
       recordType: body.recordType || "operator-load-photo",
       metadata: {
+        locationId: photoLocationId,
         orderType: body.orderType,
         orderId: body.orderId,
         orderRef: body.orderRef,
@@ -20978,13 +21042,15 @@ app.post("/api/operators", requireOperator, requireAdmin, async (req, res, next)
       password: req.body?.password,
       role: req.body?.role || "operator",
       roles: req.body?.roles,
-      yardLocationIds: req.body?.yardLocationIds
+      yardLocationIds: req.body?.yardLocationIds,
+      operatorYardLocationIds: req.body?.operatorYardLocationIds
     });
     await writeAudit({
       actorOperatorId: req.operator.id,
       source: "control",
       action: "operator.create",
-      details: { operatorId: operator.id, username: operator.username, role: operator.role, roles: operator.roles, yardLocationIds: operator.yardLocationIds }
+      details: { operatorId: operator.id, username: operator.username, role: operator.role, roles: operator.roles, operatorYardLocationIds: operator.operatorYardLocationIds,
+      yardLocationIds: operator.yardLocationIds }
     });
     res.json(operator);
   } catch (error) {
@@ -20995,6 +21061,7 @@ app.post("/api/operators", requireOperator, requireAdmin, async (req, res, next)
 app.post("/api/operators/:id/active", requireOperator, requireAdmin, async (req, res, next) => {
   try {
     const operator = await setOperatorActive(req.params.id, req.body?.active);
+    closeOperatorEventStreams(req.params.id);
     await writeAudit({
       actorOperatorId: req.operator.id,
       source: "control",
@@ -21011,6 +21078,7 @@ app.post("/api/operators/:id/password", requireOperator, requireAdmin, async (re
   try {
     const operator = await updateOperatorPassword(req.params.id, req.body?.password);
     if (!operator) return res.status(404).json({ error: "Operator not found" });
+    closeOperatorEventStreams(operator.id);
     await writeAudit({
       actorOperatorId: req.operator.id,
       source: "control",
@@ -21028,7 +21096,8 @@ app.put("/api/operators/:id/roles", requireOperator, requireAdmin, async (req, r
     const operator = await updateOperatorRoles(req.params.id, {
       role: req.body?.role,
       roles: req.body?.roles,
-      yardLocationIds: req.body?.yardLocationIds
+      yardLocationIds: req.body?.yardLocationIds,
+      operatorYardLocationIds: req.body?.operatorYardLocationIds
     });
     if (!operator) return res.status(404).json({ error: "Operator not found" });
     await writeAudit({
@@ -21040,9 +21109,12 @@ app.put("/api/operators/:id/roles", requireOperator, requireAdmin, async (req, r
         username: operator.username,
         role: operator.role,
         roles: operator.roles,
+        operatorYardLocationIds: operator.operatorYardLocationIds,
         yardLocationIds: operator.yardLocationIds
       }
     });
+    closeOperatorEventStreams(operator.id);
+    emitAppEvent("operator.access.updated", {});
     res.json(operator);
   } catch (error) {
     next(error);
@@ -21051,7 +21123,7 @@ app.put("/api/operators/:id/roles", requireOperator, requireAdmin, async (req, r
 
 // Return workflow operator endpoints. These routes intentionally use explicit
 // staff middleware because /api/returns has no broader role middleware.
-app.get("/api/returns/reasons", requireOperator, requireOperatorAccess, async (req, res, next) => {
+app.get("/api/returns/reasons", requireOperator, requireOperatorAccess, requireOperatorYardRequest, async (req, res, next) => {
   try {
     res.setHeader("Cache-Control", "no-store");
     const [reasons, settings] = await Promise.all([
@@ -21060,7 +21132,7 @@ app.get("/api/returns/reasons", requireOperator, requireOperatorAccess, async (r
     ]);
     res.json({
       ...reasons,
-      yardSettings: settings.map((setting) => ({
+      yardSettings: settings.filter((setting) => operatorYardLocationIds(req.operator).includes(Number(setting.locationId))).map((setting) => ({
         locationId: setting.locationId,
         yardCode: setting.yardCode,
         allowCrossYardReturns: setting.allowCrossYardReturns
@@ -21071,7 +21143,7 @@ app.get("/api/returns/reasons", requireOperator, requireOperatorAccess, async (r
   }
 });
 
-app.post("/api/returns/orders/lookup", requireOperator, requireOperatorAccess, async (req, res, next) => {
+app.post("/api/returns/orders/lookup", requireOperator, requireOperatorAccess, requireOperatorYardRequest, async (req, res, next) => {
   try {
     assertReturnOperatorYard(req.operator, req.body?.receivingLocationId || req.body?.yardLocationId);
     const returnMode = String(req.body?.mode || req.body?.returnMode || "").trim().toLowerCase();
@@ -21088,7 +21160,7 @@ app.post("/api/returns/orders/lookup", requireOperator, requireOperatorAccess, a
   }
 });
 
-app.get("/api/returns/customers", requireOperator, requireOperatorAccess, async (req, res, next) => {
+app.get("/api/returns/customers", requireOperator, requireOperatorAccess, requireOperatorYardRequest, async (req, res, next) => {
   try {
     res.setHeader("Cache-Control", "no-store");
     res.json({
@@ -21099,7 +21171,7 @@ app.get("/api/returns/customers", requireOperator, requireOperatorAccess, async 
   }
 });
 
-app.get("/api/returns/customers/:customerId/pallet-balance", requireOperator, requireOperatorAccess, async (req, res, next) => {
+app.get("/api/returns/customers/:customerId/pallet-balance", requireOperator, requireOperatorAccess, requireOperatorYardRequest, async (req, res, next) => {
   try {
     res.setHeader("Cache-Control", "no-store");
     const result = await lookupReturnCustomerPalletBalance(req.params.customerId);
@@ -21109,7 +21181,7 @@ app.get("/api/returns/customers/:customerId/pallet-balance", requireOperator, re
   }
 });
 
-app.get("/api/returns/operator/drafts", requireOperator, requireOperatorAccess, async (req, res, next) => {
+app.get("/api/returns/operator/drafts", requireOperator, requireOperatorAccess, requireOperatorYardRequest, async (req, res, next) => {
   try {
     assertReturnOperatorYard(req.operator, req.query.receivingLocationId || req.query.yardLocationId);
     res.json(operatorSafeReturnPayload({
@@ -21123,9 +21195,10 @@ app.get("/api/returns/operator/drafts", requireOperator, requireOperatorAccess, 
   }
 });
 
-app.get("/api/returns/operator/history", requireOperator, requireOperatorAccess, async (req, res, next) => {
+app.get("/api/returns/operator/history", requireOperator, requireOperatorAccess, requireOperatorYardRequest, async (req, res, next) => {
   try {
     const result = await listReturnRecords(returnListFilters(req, {
+      receivingLocationIds: operatorYardLocationIds(req.operator),
       operatorId: req.operator.id
     }));
     const safe = operatorSafeReturnPayload(result);
@@ -21135,7 +21208,7 @@ app.get("/api/returns/operator/history", requireOperator, requireOperatorAccess,
   }
 });
 
-app.get("/api/returns/operator/history/:id", requireOperator, requireOperatorAccess, async (req, res, next) => {
+app.get("/api/returns/operator/history/:id", requireOperator, requireOperatorAccess, requireOperatorYardRequest, async (req, res, next) => {
   try {
     const record = await getReturnRecordDetail(req.params.id, { operatorId: req.operator.id });
     if (!record) return res.status(404).json({ error: "Return record was not found." });
@@ -21145,7 +21218,7 @@ app.get("/api/returns/operator/history/:id", requireOperator, requireOperatorAcc
   }
 });
 
-app.post("/api/returns/drafts", requireOperator, requireOperatorAccess, async (req, res, next) => {
+app.post("/api/returns/drafts", requireOperator, requireOperatorAccess, requireOperatorYardRequest, async (req, res, next) => {
   try {
     assertReturnOperatorYard(req.operator, req.body?.receivingLocationId || req.body?.yardLocationId);
     res.json(operatorSafeReturnPayload({
@@ -21156,7 +21229,7 @@ app.post("/api/returns/drafts", requireOperator, requireOperatorAccess, async (r
   }
 });
 
-app.delete("/api/returns/drafts/:draftId", requireOperator, requireOperatorAccess, async (req, res, next) => {
+app.delete("/api/returns/drafts/:draftId", requireOperator, requireOperatorAccess, requireOperatorYardRequest, async (req, res, next) => {
   try {
     const result = await deleteReturnDraft({
       draftId: req.params.draftId,
@@ -21169,10 +21242,11 @@ app.delete("/api/returns/drafts/:draftId", requireOperator, requireOperatorAcces
   }
 });
 
-app.post("/api/returns/submit", requireOperator, requireOperatorAccess, async (req, res, next) => {
+app.post("/api/returns/submit", requireOperator, requireOperatorAccess, requireOperatorYardRequest, async (req, res, next) => {
   try {
     assertReturnOperatorYard(req.operator, req.body?.receivingLocationId || req.body?.yardLocationId);
     const result = await submitReturnBatch({
+      operator: req.operator,
       operatorId: req.operator.id,
       input: req.body || {}
     });
@@ -22392,7 +22466,8 @@ app.get("/api/operator/history", requireOperator, requireOperatorAccess, async (
     res.json(await listOperatorHistory({
       operatorId: req.operator.id,
       date: req.query.date || "",
-      limit: req.query.limit || 100
+      limit: req.query.limit || 100,
+      yardLocationIds: operatorYardLocationIds(req.operator)
     }));
   } catch (error) {
     next(error);
@@ -22416,7 +22491,8 @@ app.post("/api/operator/history/report-error", requireOperator, requireOperatorA
     res.json(await reportOperatorRecordError({
       operatorId: req.operator.id,
       recordId: req.body?.recordId,
-      reason: req.body?.reason
+      reason: req.body?.reason,
+      yardLocationIds: operatorYardLocationIds(req.operator)
     }));
   } catch (error) {
     next(error);
@@ -22628,11 +22704,11 @@ app.post("/api/admin/sales-order-fulfillment/historical", requireOperator, requi
   }
 });
 
-app.use("/api/delivery", requireOperator, requireOperatorAccess);
-app.use("/api/customer-pickup", requireOperator, requireOperatorAccess);
-app.use("/api/receiving", requireOperator, requireOperatorAccess);
-app.use("/api/inventory", requireOperator, requireOperatorAccess);
-app.use("/api/cycle-count", requireOperator, requireOperatorAccess);
+app.use("/api/delivery", requireOperator, requireOperatorAccess, requireOperatorYardRequest);
+app.use("/api/customer-pickup", requireOperator, requireOperatorAccess, requireOperatorYardRequest);
+app.use("/api/receiving", requireOperator, requireOperatorAccess, requireOperatorYardRequest);
+app.use("/api/inventory", requireOperator, requireOperatorAccess, requireOperatorYardRequest);
+app.use("/api/cycle-count", requireOperator, requireOperatorAccess, requireOperatorYardRequest);
 
 app.use("/api/delivery/orders/:id", async (req, res, next) => {
   try {
@@ -22695,13 +22771,14 @@ app.post("/api/customer-pickup/lookup", async (req, res, next) => {
       if (isPendingApprovalStatus(order.status, order.status_text)) {
         return res.status(409).json({ error: "This pickup sales order is still pending approval in NetSuite." });
       }
+      assertOperatorYard(req.operator, order.outbound_location_id);
       await upsertSalesOrders([order]);
       const lines = await fetchDeliveryOrderDetailsFromNetSuite(order.id, locationId);
       await upsertSalesOrderLines(order.id, lines);
       await markMissingOutboundOrderLines(order.id, lines.map((line) => line.line_id));
       orderId = order.id;
     }
-    const detail = await getDeliveryOrder(orderId);
+    const detail = await assertOperatorOrderYard(req.operator, orderId);
     if (!detail || !isPickupDeliveryMethod(detail.delivery_method)) {
       return res.status(409).json({ error: "This sales order is not a customer pickup order." });
     }
@@ -22788,6 +22865,7 @@ app.post("/api/delivery/sync", async (req, res, next) => {
     const locationId = Number(req.body?.locationId || req.query.locationId || 1);
     const orderType = normalizeOrderType(req.body?.orderType || req.query.orderType);
     const orders = await listDeliveryOrders({
+      allowedOperatorYards: operatorYardLocationIds(req.operator),
       locationId,
       status: req.body?.status || req.query.status || null,
       orderType
@@ -22824,6 +22902,7 @@ app.post("/api/delivery/orders/:id/sync", async (req, res, next) => {
 app.get("/api/delivery/orders", async (req, res, next) => {
   try {
     res.json(await listDeliveryOrders({
+      allowedOperatorYards: operatorYardLocationIds(req.operator),
       locationId: req.query.locationId,
       status: req.query.status,
       orderType: normalizeOrderType(req.query.orderType)
@@ -22847,6 +22926,7 @@ app.get("/api/delivery/vrma-orders", async (req, res, next) => {
 app.get("/api/delivery/bootstrap", async (req, res, next) => {
   try {
     res.json(await getDeliveryBootstrap({
+      allowedOperatorYards: operatorYardLocationIds(req.operator),
       operatorId: operatorId(req),
       locationId: req.query.locationId
     }));
@@ -22869,6 +22949,7 @@ app.get("/api/delivery/load-trucks", async (req, res, next) => {
 app.get("/api/delivery/load-orders", async (req, res, next) => {
   try {
     res.json(await listDeliveryLoadOrders({
+      allowedOperatorYards: operatorYardLocationIds(req.operator),
       locationId: req.query.locationId,
       status: req.query.status,
       planDate: req.query.planDate,
@@ -22882,6 +22963,7 @@ app.get("/api/delivery/load-orders", async (req, res, next) => {
 app.get("/api/delivery/saved-orders", async (req, res, next) => {
   try {
     res.json(await listSavedDeliveryOrdersForOperator(operatorId(req), {
+      allowedOperatorYards: operatorYardLocationIds(req.operator),
       locationId: req.query.locationId
     }));
   } catch (error) {
@@ -22892,6 +22974,7 @@ app.get("/api/delivery/saved-orders", async (req, res, next) => {
 app.get("/api/delivery/saved-order-keys", async (req, res, next) => {
   try {
     res.json(await listSavedDeliveryOrderKeysForOperator(operatorId(req), {
+      allowedOperatorYards: operatorYardLocationIds(req.operator),
       locationId: req.query.locationId
     }));
   } catch (error) {
@@ -22927,6 +23010,7 @@ app.delete("/api/delivery/saved-orders/:id", async (req, res, next) => {
 app.get("/api/delivery/consolidation/queue", async (req, res, next) => {
   try {
     res.json(await getSavedConsolidationQueue(operatorId(req), {
+      allowedOperatorYards: operatorYardLocationIds(req.operator),
       locationId: req.query.locationId
     }));
   } catch (error) {
@@ -22947,6 +23031,7 @@ app.get("/api/delivery/consolidation/active", async (req, res, next) => {
 app.post("/api/delivery/consolidation/start", async (req, res, next) => {
   try {
     const result = await startSavedConsolidationBatch(operatorId(req), {
+      allowedOperatorYards: operatorYardLocationIds(req.operator),
       locationId: req.body?.locationId || req.query.locationId
     });
     emitAppEvent("delivery.consolidation.updated", {
@@ -23053,6 +23138,7 @@ app.post("/api/delivery/consolidation/release", async (req, res, next) => {
 app.get("/api/delivery/notifications", async (req, res, next) => {
   try {
     res.json(await getDeliveryPrepNotifications({
+      allowedOperatorYards: operatorYardLocationIds(req.operator),
       locationId: req.query.locationId
     }));
   } catch (error) {
@@ -23321,6 +23407,7 @@ app.post("/api/receiving/orders/:id/receive", async (req, res, next) => {
     const jobId = crypto.randomUUID();
     receivingJobs.set(jobId, {
       id: jobId,
+      operatorId: req.operator.id,
       status: "running",
       orderId: req.params.id,
       stage: "queued",
@@ -23759,7 +23846,7 @@ app.put("/api/inventory/classifications/:itemId", requireControlAccess, async (r
 
 app.get("/api/cycle-count/draft", async (req, res, next) => {
   try {
-    res.json(await getCycleCountDraft(req.operator.id));
+    res.json(await getCycleCountDraft(req.operator.id, { yardLocationIds: operatorYardLocationIds(req.operator) }));
   } catch (error) {
     next(error);
   }
@@ -23810,7 +23897,7 @@ app.post("/api/cycle-count/lines", async (req, res, next) => {
         });
       }
     }
-    res.json(await confirmCycleCountLine(req.operator.id, req.body || {}));
+    res.json(await confirmCycleCountLine(req.operator.id, req.body || {}, { yardLocationIds: operatorYardLocationIds(req.operator) }));
   } catch (error) {
     next(error);
   }

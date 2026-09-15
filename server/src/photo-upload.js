@@ -294,6 +294,7 @@ function buildKeyPrefix({ source, recordType, actor, metadata }) {
       mm,
       dd,
       safePathSegment(actor?.id || actor?.login || "unknown"),
+      ...(metadata.locationId ? [`yard-${Number(metadata.locationId)}`] : []),
       safePathSegment(subject)
     ].filter(Boolean).join("/");
   }

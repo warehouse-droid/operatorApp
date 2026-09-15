@@ -142,7 +142,8 @@ export const REQUIRED_MBT_P3_MIGRATIONS = Object.freeze([
   "195_dispatch_load_assignment_projection_invariant.sql",
   "196_scm_ir_split_reference.sql",
   "197_scm_vendor_completion.sql",
-  "198_google_maps_usage_control.sql"
+  "198_google_maps_usage_control.sql",
+  "199_operator_yard_access.sql"
 ]);
 
 export const REQUIRED_MBT_P3_FLAGS = Object.freeze([

@@ -265,6 +265,14 @@ export const P3_DEDICATED_MUTATION_RUNNERS = Object.freeze([
     ])
   }),
   Object.freeze({
+    runner: "run-google-map-redraw-mutations.mjs",
+    adminUrlEnvironment: null,
+    sourcePaths: Object.freeze([
+      "public/dispatch.js",
+      "src/google-maps-gateway.js"
+    ])
+  }),
+  Object.freeze({
     runner: "run-google-maps-usage-mutations.mjs",
     adminUrlEnvironment: null,
     sourcePaths: Object.freeze([

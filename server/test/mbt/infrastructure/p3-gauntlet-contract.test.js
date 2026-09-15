@@ -42,6 +42,7 @@ const P3_DEDICATED_MUTATION_RUNNERS = Object.freeze([
   "run-driver-pwa-site-reset-mutations.mjs",
   "run-frontdesk-mutations.mjs",
   "run-global-order-pool-dependency-preview-mutations.mjs",
+  "run-google-map-redraw-mutations.mjs",
   "run-google-maps-usage-mutations.mjs",
   "run-mbbs-cross-charge-v4-mutations.mjs",
   "run-mbbs-vendor-route-rate-mutations.mjs",

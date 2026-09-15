@@ -76,6 +76,8 @@ function refreshBoundary(full, stale, normalized) {
   const falseValue = () => false;
   return {
     orders: [stale], orderCatalog: [full], currentPlan: {}, appliedPlanStructure: {},
+    dispatchSessionPoolOrders: new Map(), dispatchOrderPoolScope: () => "live",
+    dispatchOrderRefKey: (ref) => String(ref || "").trim().toUpperCase(),
     selectedOrderId: "", selectedOrderIds: new Set(), selectedLoadId: "", trucks: [],
     lastAcknowledgedPlanState: null, lastSavedAt: "", lastServerSavedAt: "", lastSavedPlanHash: "",
     captureOperationalLoadSignatures: empty, activePhysicalOrderEvidence: () => ({ all: new Set() }),

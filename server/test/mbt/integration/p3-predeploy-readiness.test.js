@@ -174,7 +174,8 @@ test("P3.12: deployment readiness requires every Phase 3 migration and exactly n
     "195_dispatch_load_assignment_projection_invariant.sql",
     "196_scm_ir_split_reference.sql",
     "197_scm_vendor_completion.sql",
-    "198_google_maps_usage_control.sql"
+    "198_google_maps_usage_control.sql",
+    "199_operator_yard_access.sql"
   ]);
   assert.deepEqual(REQUIRED_MBT_P3_FLAGS, EXPECTED_FLAGS);
   const rows = EXPECTED_FLAGS.map((flag_key) => ({ flag_key, enabled: false }));

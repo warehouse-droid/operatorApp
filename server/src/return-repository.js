@@ -1,3 +1,4 @@
+import { assertOperatorYard } from "./operator-yard-access.js";
 import crypto from "node:crypto";
 import { query, withTransaction } from "./db.js";
 import { writeAudit } from "./auth-repository.js";
@@ -1047,15 +1048,16 @@ async function nextReference(sequence, prefix) {
   return `${prefix}-${String(result.rows[0].value).padStart(6, "0")}`;
 }
 
-async function existingBatchByIdempotency(idempotencyKey) {
+async function existingBatchByIdempotency(idempotencyKey, operator = null) {
   const result = await query(
-    `SELECT b.id
+    `SELECT b.id, b.receiving_location_id
        FROM return_batches b
       WHERE b.idempotency_key = $1
       LIMIT 1`,
     [idempotencyKey]
   );
   if (!result.rows[0]?.id) return null;
+  if (operator) assertOperatorYard(operator, result.rows[0].receiving_location_id);
   return listReturnRecords({ batchId: result.rows[0].id, limit: 10 });
 }
 
@@ -1354,6 +1356,7 @@ async function insertPalletReturn({
 
 export async function submitReturnBatch({
   operatorId,
+  operator = null,
   input = {},
   autoSync = true
 } = {}) {
@@ -1364,7 +1367,7 @@ export async function submitReturnBatch({
   );
   if (explicitRequestKey) {
     const earlyReplay = await existingBatchByIdempotency(
-      normalizedIdempotencyKey({ idempotencyKey: explicitRequestKey }, operatorId)
+      normalizedIdempotencyKey({ idempotencyKey: explicitRequestKey }, operatorId), operator
     );
     if (earlyReplay) {
       const records = earlyReplay.records || [];
@@ -1411,7 +1414,7 @@ export async function submitReturnBatch({
   }
   const receiving = yard(input.receivingLocationId);
   const idempotencyKey = normalizedIdempotencyKey(input, operatorId);
-  const prior = await existingBatchByIdempotency(idempotencyKey);
+  const prior = await existingBatchByIdempotency(idempotencyKey, operator);
   if (prior) {
     const records = prior.records || [];
     return {

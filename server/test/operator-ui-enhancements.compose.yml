@@ -1,0 +1,18 @@
+x-ui-code: &ui-code
+  - ./server/src:/app/src:ro
+  - ./server/public:/app/public:ro
+  - ./server/test:/app/test:ro
+  - ./server/tools:/app/tools:ro
+  - ./server/migrations:/app/migrations:ro
+  - ./server/package.json:/app/package.json:ro
+
+services:
+  test:
+    volumes: *ui-code
+  migrate:
+    volumes: *ui-code
+  e2e:
+    volumes: *ui-code
+  app:
+    image: mbbs-mbt-p1-test-test:latest
+    volumes: *ui-code

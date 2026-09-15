@@ -284,7 +284,6 @@ WHERE t.type = 'SalesOrd'
   AND tl.mainline = 'F'
   AND tl.taxline = 'F'
   AND ${outboundStatusFilterSql("t")}
-  AND ${openLineFilterSql("tl")}
   AND t.custbody3 = 2
 ORDER BY t.createddate DESC, t.tranid DESC
 `;
@@ -1420,7 +1419,6 @@ WHERE t.type = 'SalesOrd'
   AND tl.mainline = 'F'
   AND tl.taxline = 'F'
   AND ${outboundStatusFilterSql("t")}
-  AND ${openLineFilterSql("tl")}
   AND t.custbody3 = 2
 ORDER BY t.createddate DESC, t.tranid DESC
 `);
@@ -1514,7 +1512,6 @@ export async function fetchDeliveryOrderFromNetSuite(orderId, locationId = null)
       AND tl.mainline = 'F'
       AND tl.taxline = 'F'
       AND ${outboundStatusFilterSql("t")}
-      AND ${openLineFilterSql("tl")}
       ${locationFilter}
     ORDER BY t.trandate DESC
   `);
@@ -1559,7 +1556,6 @@ export async function fetchCustomerPickupOrderFromNetSuite(code, locationId = nu
       AND tl.taxline = 'F'
       ${locationFilter}
       AND BUILTIN.DF(t.custbody3) = 'Pick-Up'
-      AND ${openLineFilterSql("tl")}
     ORDER BY t.createddate DESC, t.tranid DESC
   `);
   return result.items?.[0] ? { ...result.items[0], order_type: "sales_order" } : null;
@@ -2503,7 +2499,6 @@ export async function fetchDeliveryOrderDetailsFromNetSuite(orderId, locationId 
       AND tl.item IS NOT NULL
       AND tl.mainline = 'F'
       AND tl.taxline = 'F'
-      AND ${openLineFilterSql("tl")}
       ${locationFilter}
     ORDER BY tl.uniquekey
   `;
@@ -2628,7 +2623,6 @@ export async function fetchDeliveryOrderDetailsBatchFromNetSuite(orderIds) {
         AND tl.item IS NOT NULL
         AND tl.mainline = 'F'
         AND tl.taxline = 'F'
-        AND ${openLineFilterSql("tl")}
       ORDER BY tl.transaction, tl.uniquekey
     `);
     for (const line of rows.map(normalizeOpenDeliveryLine)) {

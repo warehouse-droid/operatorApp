@@ -425,6 +425,7 @@ test("F06/F16: schema-101 upgrade preserves representative legacy records and is
     assert.match(firstRunner.stdout, /Applied 196_scm_ir_split_reference\.sql/);
     assert.match(firstRunner.stdout, /Applied 197_scm_vendor_completion\.sql/);
     assert.match(firstRunner.stdout, /Applied 198_google_maps_usage_control\.sql/);
+    assert.match(firstRunner.stdout, /Applied 199_operator_yard_access\.sql/);
 
     const after = await captureLegacyState(client, ids);
     assert.deepEqual(after, before, "Migrations 102-198 must not rewrite representative schema-101 field values.");
@@ -725,10 +726,10 @@ test("F06/F16: schema-101 upgrade preserves representative legacy records and is
       immutable_trigger: true
     }]);
 
-    assert.equal(receiptsBeforeNoOp.rowCount, 198);
+    assert.equal(receiptsBeforeNoOp.rowCount, 199);
     assert.equal(
       receiptsBeforeNoOp.rows.at(-1)?.filename,
-      "198_google_maps_usage_control.sql"
+      "199_operator_yard_access.sql"
     );
     assert.deepEqual(
       receiptsBeforeNoOp.rows

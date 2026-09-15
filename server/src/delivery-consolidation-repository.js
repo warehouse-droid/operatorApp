@@ -1,3 +1,4 @@
+import { deliveryOrderWithinYards } from "./operator-yard-access.js";
 import { query, withTransaction } from "./db.js";
 import { writeAudit } from "./auth-repository.js";
 import {
@@ -190,7 +191,7 @@ async function activeClaimsByCanonicalOrder() {
   return new Map(result.rows.map((row) => [Number(row.canonical_order_id), row]));
 }
 
-async function savedSalesQueue(operatorId, locationId) {
+async function savedSalesQueue(operatorId, locationId, allowedOperatorYards = null) {
   const savedResult = await query(
     `SELECT order_key, order_ref, order_type, created_at
        FROM operator_saved_delivery_orders
@@ -202,13 +203,14 @@ async function savedSalesQueue(operatorId, locationId) {
   );
   const orders = await getDeliveryOrdersBatch(savedResult.rows.map((row) => row.order_key));
   const orderByKey = new Map(orders.map((order) => [String(order.netsuite_id), order]));
-  return savedResult.rows.map((saved) => ({ saved, order: orderByKey.get(String(saved.order_key)) || null }));
+  return savedResult.rows.map((saved) => ({ saved, order: orderByKey.get(String(saved.order_key)) || null }))
+    .filter(({ order }) => !order || (deliveryOrderWithinYards(order, allowedOperatorYards) && Number(order.outbound_location_id ?? order.source_location_id) === Number(locationId)));
 }
 
-export async function getSavedConsolidationQueue(operatorId, { locationId } = {}) {
+export async function getSavedConsolidationQueue(operatorId, { locationId, allowedOperatorYards = null } = {}) {
   if (!operatorId) throw new Error("Operator login is required.");
   if (!locationId) throw new Error("Location is required.");
-  const queue = await savedSalesQueue(operatorId, locationId);
+  const queue = await savedSalesQueue(operatorId, locationId, allowedOperatorYards);
   const claims = await activeClaimsByCanonicalOrder();
   const rows = queue.map(({ saved, order }) => {
     const issue = orderAvailabilityIssue(order, locationId, claims, operatorId);
@@ -397,13 +399,13 @@ function conflictError(message, details = []) {
   return error;
 }
 
-export async function startSavedConsolidationBatch(operatorId, { locationId } = {}) {
+export async function startSavedConsolidationBatch(operatorId, { locationId, allowedOperatorYards = null } = {}) {
   if (!operatorId) throw new Error("Operator login is required.");
   if (!locationId) throw new Error("Location is required.");
   return withTransaction(async () => {
     const existing = await activeBatchRow(operatorId, locationId);
     if (existing) return getBatchState(existing);
-    const queue = await savedSalesQueue(operatorId, locationId);
+    const queue = await savedSalesQueue(operatorId, locationId, allowedOperatorYards);
     const claims = await activeClaimsByCanonicalOrder();
     if (!queue.length) throw conflictError("Save at least one Sales Order before starting consolidation.");
 

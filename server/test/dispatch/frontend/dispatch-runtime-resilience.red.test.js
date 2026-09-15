@@ -203,6 +203,9 @@ test("the Aug-14 assigned custom order survives a later feed that omits it", () 
     `"use strict";
       let orders = [initialOrder];
       let orderCatalog = [];
+      const dispatchSessionPoolOrders = new Map();
+      const dispatchOrderPoolScope = () => "live";
+      const dispatchOrderRefKey = (ref) => String(ref || "").trim().toUpperCase();
       let currentPlan = { id: "234", planDate: "2026-08-14" };
       let appliedPlanStructure = { planId: "234", planDate: "2026-08-14", orderIds: new Set([initialOrder.id]) };
       let selectedOrderId = initialOrder.id;

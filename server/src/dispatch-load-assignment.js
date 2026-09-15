@@ -4,14 +4,17 @@ import {
   dispatchLocationsShareYard,
   uniqueDispatchLocations
 } from "./dispatch-location.js";
+import { comparableAllocationPlans } from "./dispatch-allocation-item-identity.js";
+import { VOYAGE_DISPATCH_YARD } from "./dispatch-sales-order-locations.js";
 
 const DEFAULT_SWITCH_MINUTES = 10;
-const DEFAULT_OWN_YARDS = ["3445", "2967", "12441", "150"];
+const DEFAULT_OWN_YARDS = ["3445", "2967", "12441", "150", VOYAGE_DISPATCH_YARD.code];
 const DEFAULT_OWN_YARD_ADDRESSES = {
   "3445": "3445 Kennedy Road, Toronto, ON",
   "2967": "2967 Kennedy Road, Toronto, ON",
   "12441": "12441 Woodbine Avenue, Whitchurch-Stouffville, ON",
-  "150": "150 Clark Blvd, Brampton, ON L6T 4Y8, Canada"
+  "150": "150 Clark Blvd, Brampton, ON L6T 4Y8, Canada",
+  [VOYAGE_DISPATCH_YARD.code]: VOYAGE_DISPATCH_YARD.address
 };
 
 function text(value) {
@@ -1504,6 +1507,9 @@ function semanticOrderAllocation(order = {}) {
 }
 
 export function changedLockedLoadAssignments(previousPlan = {}, nextPlan = {}, lockedLoadIds = new Set()) {
+  const loadIds = [...(lockedLoadIds || [])];
+  if (!loadIds.length) return [];
+  [previousPlan, nextPlan] = comparableAllocationPlans(previousPlan, nextPlan);
   const before = new Map(flattenDispatchPlanLoads(previousPlan).map((row) => [text(row.load.id || row.load.loadId), row]));
   const after = new Map(flattenDispatchPlanLoads(nextPlan).map((row) => [text(row.load.id || row.load.loadId), row]));
   const allocationSignature = (plan, row) => {
@@ -1563,7 +1569,7 @@ export function changedLockedLoadAssignments(previousPlan = {}, nextPlan = {}, l
     allocations: allocationSignature(plan, row)
   }) : "";
   const changes = [];
-  for (const loadId of lockedLoadIds || []) {
+  for (const loadId of loadIds) {
     const previous = before.get(text(loadId));
     const current = after.get(text(loadId));
     const previousSignature = lockedSignature(previousPlan, previous);
@@ -1682,16 +1688,26 @@ function driverActivityOrderReferenceSet(order = {}) {
   return refs;
 }
 
-function driverActivityAllocationSignature(plan = {}, lockedOrderRefs = new Set()) {
+function driverActivityAllocationSignature(plan = {}, lockedOrderRefs = new Set(), load = {}) {
   const wanted = new Set([...(lockedOrderRefs || [])].map(text).filter(Boolean));
   if (!wanted.size) return "[]";
-  const allocations = (plan.orders || [])
-    .filter((order) => {
+  // Source-order overlap does not assign a CO to this load. Compare only
+  // orders named by its route, including explicit consolidated pickup refs.
+  const assigned = new Set((load.stops || []).flatMap((stop) => [
+    stop.orderId || stop.orderRef,
+    ...(Array.isArray(stop.orderRefs) ? stop.orderRefs : [])
+  ]).map(text).filter(Boolean));
+  const allocations = [];
+  const visit = (order) => {
+    if (assigned.has(text(order.id))) {
       const refs = driverActivityOrderReferenceSet(order);
-      return [...wanted].some((ref) => refs.has(ref));
-    })
-    .map(semanticOrderAllocation)
-    .sort((left, right) => left.id.localeCompare(right.id));
+      if ([...wanted].some((ref) => refs.has(ref))) allocations.push(semanticOrderAllocation(order));
+      return;
+    }
+    for (const child of order.childOrderDetails || []) visit(child);
+  };
+  for (const order of plan.orders || []) visit(order);
+  allocations.sort((left, right) => left.id.localeCompare(right.id));
   return JSON.stringify(allocations);
 }
 
@@ -1731,6 +1747,8 @@ export function changedDriverActivityAssignments(previousPlan = {}, nextPlan = {
     scopes.set(loadId, scope);
   }
   if (!scopes.size) return [];
+
+  [previousPlan, nextPlan] = comparableAllocationPlans(previousPlan, nextPlan);
 
   const before = new Map(flattenDispatchPlanLoads(previousPlan).map((row) => [text(row.load.id || row.load.loadId), row]));
   const after = new Map(flattenDispatchPlanLoads(nextPlan).map((row) => [text(row.load.id || row.load.loadId), row]));
@@ -1799,8 +1817,8 @@ export function changedDriverActivityAssignments(previousPlan = {}, nextPlan = {
       }
       if (changedStopIds.length) reasons.push("stop");
       if (
-        driverActivityAllocationSignature(previousPlan, scope.orderRefs)
-        !== driverActivityAllocationSignature(nextPlan, scope.orderRefs)
+        driverActivityAllocationSignature(previousPlan, scope.orderRefs, previous.load)
+        !== driverActivityAllocationSignature(nextPlan, scope.orderRefs, current.load)
       ) {
         changedOrderRefs.push(...scope.orderRefs);
         reasons.push("order_allocation");

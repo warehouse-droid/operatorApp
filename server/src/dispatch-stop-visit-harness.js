@@ -209,7 +209,7 @@ const mapInfoSource = sourceSlice("function mapMarkerInfoWindowHtml", "function 
 assert.match(mapInfoSource, /mapMarkerOrderEntries/);
 assert.match(mapInfoSource, /tooltipItemRowsForOrder/);
 assert.match(mapInfoSource, /includeOrderHeader:\s*true/);
-assert.match(source, /content:\s*mapMarkerInfoWindowHtml\(load, stop\)/,
+assert.match(source, /content:\s*mapMarkerInfoWindowHtml\(selected\.load, stop\)/,
   "Google InfoWindows must use the all-order consolidated detail renderer.");
 
 const dropIndexSource = sourceSlice("function insertIndexFromDrop", "function ensureSplitDraft");
@@ -231,11 +231,14 @@ assert.match(styles, /\.merged-visit-orders\s*\{[\s\S]*?grid-area:\s*details/);
 assert.match(styles, /@container load-preview \(max-width:\s*450px\)[\s\S]*?"main"\s*"timing"\s*"details"/);
 assert.match(styles, /\.preview-stop-basis\s*\{[\s\S]*?overflow-wrap:\s*anywhere/);
 
-const mapPreviewSource = sourceSlice("async function renderGoogleMapPreview", "function routeLoadsNeedingEstimate");
+// Overlay construction now lives in the reusable redraw helper. Keep the same
+// grouping/hover contracts and require the map entry point to call that helper.
+const mapPreviewSource = sourceSlice("function updateGoogleMapPreviewGeometry", "function routeLoadsNeedingEstimate");
 assert.match(
   mapPreviewSource,
-  /spreadOverlappingMarkers\(mergeConsecutiveExactDropMarkers\(markerStops\)\)/
+  /spreadOverlappingMarkers\(mergeConsecutiveExactDropMarkers\(data\.markerStops\)\)/
 );
+assert.match(sourceSlice("async function renderGoogleMapPreview", "function routeLoadsNeedingEstimate"), /updateGoogleMapPreviewGeometry\(canvas\)/);
 assert.match(mapPreviewSource, /marker\.addListener\("mouseover"/);
 assert.match(mapPreviewSource, /marker\.addListener\("mouseout"/);
 

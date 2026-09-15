@@ -17,7 +17,8 @@ const RELATIONSHIP_ORDER_FIELDS = Object.freeze([
   "dependencyHidden",
   "dependentSalesOrderRef",
   "dependencyLabels",
-  "poRouteProjection"
+  "poRouteProjection",
+  "po_route_projection"
 ]);
 
 const PO_ITEM_PROJECTION_FIELDS = Object.freeze([
@@ -264,7 +265,7 @@ function stopTouchesAffectedOrder(stop = {}, affectedRefs = new Set()) {
   ].map((value) => text(value).toLowerCase()).some((ref) => affectedRefs.has(ref));
 }
 
-function invalidateLoadRoute(load = {}) {
+export function invalidateLoadRoute(load = {}) {
   const next = { ...load, routeProjectionRefreshRequired: true };
   for (const field of INVALID_ROUTE_LOAD_FIELDS) delete next[field];
   next.stops = (Array.isArray(load.stops) ? load.stops : []).map((stop) => {
@@ -351,7 +352,9 @@ function clearResolvedRouteRefreshFlags(plan = {}) {
 export function reconcileAuthoritativeDispatchOrderProjection({
   plan = {},
   projectedOrders = [],
-  comparisonOrders = plan.orders || []
+  comparisonOrders = plan.orders || [],
+  preservedPoOrderRefs = new Set(),
+  activity = []
 } = {}) {
   const candidatePlan = clearResolvedRouteRefreshFlags(plan);
   const changedOrderRefs = changedProjectionOrderRefs(comparisonOrders, projectedOrders);
@@ -361,7 +364,9 @@ export function reconcileAuthoritativeDispatchOrderProjection({
   const reconciled = reconcileDependencyManagedPickups({
     plan: candidatePlan,
     enrichedOrders: projectedOrders,
-    affectedTargetRefs: allLogicalRefs(projectedOrders)
+    affectedTargetRefs: allLogicalRefs(projectedOrders),
+    preservedPoOrderRefs,
+    activity
   });
   const changedLoadKeys = changedRouteLoadKeys(candidatePlan, reconciled);
   return {

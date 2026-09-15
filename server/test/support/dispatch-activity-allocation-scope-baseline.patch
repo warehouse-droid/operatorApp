@@ -1,0 +1,47 @@
+--- fixed/dispatch-load-assignment.js
++++ baseline/dispatch-load-assignment.js
+@@ -1686,26 +1686,16 @@
+   return refs;
+ }
+ 
+-function driverActivityAllocationSignature(plan = {}, lockedOrderRefs = new Set(), load = {}) {
++function driverActivityAllocationSignature(plan = {}, lockedOrderRefs = new Set()) {
+   const wanted = new Set([...(lockedOrderRefs || [])].map(text).filter(Boolean));
+   if (!wanted.size) return "[]";
+-  // Source-order overlap does not assign a CO to this load. Compare only
+-  // orders named by its route, including explicit consolidated pickup refs.
+-  const assigned = new Set((load.stops || []).flatMap((stop) => [
+-    stop.orderId || stop.orderRef,
+-    ...(Array.isArray(stop.orderRefs) ? stop.orderRefs : [])
+-  ]).map(text).filter(Boolean));
+-  const allocations = [];
+-  const visit = (order) => {
+-    if (assigned.has(text(order.id))) {
++  const allocations = (plan.orders || [])
++    .filter((order) => {
+       const refs = driverActivityOrderReferenceSet(order);
+-      if ([...wanted].some((ref) => refs.has(ref))) allocations.push(semanticOrderAllocation(order));
+-      return;
+-    }
+-    for (const child of order.childOrderDetails || []) visit(child);
+-  };
+-  for (const order of plan.orders || []) visit(order);
+-  allocations.sort((left, right) => left.id.localeCompare(right.id));
++      return [...wanted].some((ref) => refs.has(ref));
++    })
++    .map(semanticOrderAllocation)
++    .sort((left, right) => left.id.localeCompare(right.id));
+   return JSON.stringify(allocations);
+ }
+ 
+@@ -1815,8 +1805,8 @@
+       }
+       if (changedStopIds.length) reasons.push("stop");
+       if (
+-        driverActivityAllocationSignature(previousPlan, scope.orderRefs, previous.load)
+-        !== driverActivityAllocationSignature(nextPlan, scope.orderRefs, current.load)
++        driverActivityAllocationSignature(previousPlan, scope.orderRefs)
++        !== driverActivityAllocationSignature(nextPlan, scope.orderRefs)
+       ) {
+         changedOrderRefs.push(...scope.orderRefs);
+         reasons.push("order_allocation");

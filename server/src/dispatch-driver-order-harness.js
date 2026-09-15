@@ -1068,7 +1068,7 @@ assert.equal((initDispatchSource.match(/loadDriverJobStatuses\(/g) || []).length
 assert(repository.includes("displayOrder: numberValue(row.display_order, 0)"), "Setup API does not expose persisted display order.");
 assert(repository.includes("cleanDriver(driver, index)"), "Driver request order is not explicitly persisted as display_order.");
 assert(setupHtml.includes("20260818-actual-stop-arrival-v1"), "Dispatch Setup browser asset version was not bumped.");
-assert(plannerHtml.includes('/dispatch.js?v=20260911-maps-usage-v1'), "Dispatch planner browser asset version was not bumped.");
+assert(plannerHtml.includes('/dispatch.js?v=20260911-map-geometry-v2'), "Dispatch planner browser asset version was not bumped.");
 
 const activityPositionSource = sourceRange(
   plannerUi,

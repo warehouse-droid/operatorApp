@@ -766,7 +766,9 @@ export function evaluateExecutedPrefixPolicy({ previousPlan = {}, nextPlan = {},
         const travelStopId = text(record.stopId || record.stop_id);
         index = physical.findIndex((stop) => travelStopId.endsWith(`-${stopIdentity(stop)}`));
       }
-      if (index < 0 && physical.length) {index = 0;}
+      // Travel has not started the destination pickup. Protect only stops
+      // preceding it; inter-load travel without a target has no physical prefix.
+      index = Math.max(-1, index - 1);
     } else if (type === "truck_switch") {
       index = -1;
     } else {

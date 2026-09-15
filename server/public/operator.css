@@ -503,7 +503,7 @@ label span {
 .receiving-toolbar {
   flex: 0 0 auto;
   display: grid;
-  grid-template-columns: auto auto minmax(0, 1fr) minmax(0, 1fr) auto;
+  grid-template-columns: auto minmax(0, 1fr) minmax(0, 1fr) auto;
   gap: 8px;
   align-items: end;
 }
@@ -511,6 +511,13 @@ label span {
 .receiving-search {
   display: grid;
   gap: 4px;
+}
+
+.receiving-main {
+  flex: 1 1 auto;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
 }
 
 .receiving-search-with-dropdown {
@@ -613,7 +620,7 @@ label span {
 .cycle-toolbar {
   flex: 0 0 auto;
   display: grid;
-  grid-template-columns: auto auto minmax(0, 1fr);
+  grid-template-columns: auto minmax(0, 1fr);
   gap: 8px;
   align-items: end;
 }
@@ -2037,6 +2044,24 @@ label span {
   color: #087443;
 }
 
+.confirmed-measure + .remaining-measure b {
+  color: var(--muted);
+  font-size: 0.8em;
+}
+
+.tablet-shell[data-module="customer-pickup"] .line-card {
+  height: auto;
+  min-height: 106px;
+}
+
+.tablet-shell[data-module="customer-pickup"] .compact-line-list .line-card {
+  min-height: 70px;
+}
+
+.tablet-shell[data-module="customer-pickup"] .line-list {
+  overflow-y: auto;
+}
+
 .selected-panel {
   min-height: 0;
   border: 2px solid var(--line);
@@ -2277,6 +2302,64 @@ label span {
 }
 
 @media (max-width: 700px) {
+  .tablet-shell[data-module="customer-pickup"] .delivery-grid {
+    display: block;
+    overflow-y: auto;
+    padding: 8px;
+  }
+
+  .tablet-shell[data-module="customer-pickup"] .detail-panel {
+    overflow: visible;
+  }
+
+  .tablet-shell[data-module="customer-pickup"] .detail-header {
+    grid-template-columns: minmax(0, 1fr);
+  }
+
+  .tablet-shell[data-module="customer-pickup"] .status-actions {
+    flex-wrap: wrap;
+  }
+
+  .tablet-shell[data-module="customer-pickup"] .work-area {
+    display: flex;
+    flex-direction: column;
+    flex: 0 0 auto;
+    overflow: visible;
+  }
+
+  .tablet-shell[data-module="customer-pickup"] .line-list {
+    flex: 0 0 auto;
+    overflow: visible;
+  }
+  .tablet-shell:is([data-module="receiving"], [data-module="cycle-count"], [data-module="customer-pickup"], [data-module="customer-pickup-load"]) .topbar {
+    grid-template-columns: minmax(0, 1fr) auto;
+    gap: 8px;
+    padding: 8px;
+  }
+
+  .tablet-shell:is([data-module="receiving"], [data-module="cycle-count"], [data-module="customer-pickup"], [data-module="customer-pickup-load"]) .topbar-actions {
+    grid-column: 2;
+    grid-row: 1;
+    flex-wrap: wrap;
+  }
+
+  .tablet-shell:is([data-module="receiving"], [data-module="cycle-count"], [data-module="customer-pickup"], [data-module="customer-pickup-load"]) .topbar-title {
+    grid-column: 1 / -1;
+    grid-row: 2;
+    min-width: 0;
+  }
+
+  .tablet-shell:is([data-module="receiving"], [data-module="cycle-count"], [data-module="customer-pickup"], [data-module="customer-pickup-load"]) .topbar-language {
+    position: static;
+    transform: none;
+    grid-column: 1 / -1;
+    grid-row: 3;
+    justify-self: end;
+  }
+
+  .receiving-main {
+    flex: 0 0 auto;
+  }
   .fulfillment-screen:not(.reload-fulfillment-screen) {
     grid-template-columns: minmax(0, 1fr);
     grid-template-rows: max-content;
@@ -2321,7 +2404,7 @@ label span {
   }
 
   .receiving-toolbar {
-    grid-template-columns: repeat(2, minmax(0, 1fr));
+    grid-template-columns: minmax(0, 1fr);
     align-items: stretch;
   }
 
@@ -3232,7 +3315,7 @@ label span {
 
 .return-balance-grid {
   display: grid;
-  grid-template-columns: repeat(4, minmax(0, 1fr));
+  grid-template-columns: minmax(0, 1fr);
   gap: 7px;
 }
 
@@ -3635,7 +3718,7 @@ label span {
 }
 
 .return-selected-editor .return-balance-grid {
-  grid-template-columns: repeat(2, minmax(0, 1fr));
+  grid-template-columns: minmax(0, 1fr);
   gap: 5px;
 }
 
@@ -4091,4 +4174,15 @@ label span {
   display: flex;
   flex-direction: column;
   gap: 10px;
+}
+
+/* Match the two delivery list controls to the Batch / Saved Orders row. */
+.delivery-list-title .order-panel-title {
+  flex: 1;
+}
+.delivery-list-title .order-panel-heading-actions:empty {
+  display: none;
+}
+.delivery-list-title .delivery-status-segment {
+  margin: 0;
 }

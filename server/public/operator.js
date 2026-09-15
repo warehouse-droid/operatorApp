@@ -113,13 +113,12 @@ function restorableModule(value) {
 const initialOperatorState = readOperatorState();
 let authToken = readOperatorToken();
 let operator = null;
+let operatorSessionKey = "";
+let operatorWorkspaceLeaving = false;
+let operatorAccessRequest = null;
+let operatorAccessRefreshQueued = false;
 
-let locationId = Number(initialOperatorState.locationId || localStorage.getItem("mbbs.operator.locationId") || localStorage.getItem("mbbs.delivery.locationId") || 0);
-if (locationId === 13) {
-  locationId = 28;
-  localStorage.setItem("mbbs.operator.locationId", "28");
-  localStorage.setItem("mbbs.delivery.locationId", "28");
-}
+let locationId = Number(initialOperatorState.locationId || 0);
 let currentModule = restorableModule(initialOperatorState.currentModule || "menu");
 let locationDropdownOpen = false;
 let viewMode = initialOperatorState.viewMode === "packed" ? "packed" : "active";
@@ -159,6 +158,7 @@ let selectedLineId = initialOperatorState.selectedLineId || null;
 let orderPage = Number(initialOperatorState.orderPage || 0);
 let linePage = Number(initialOperatorState.linePage || 0);
 let pageConfirming = false;
+let pickupConfirming = false;
 let installPromptEvent = null;
 let appInstalled = window.matchMedia("(display-mode: standalone)").matches || window.navigator.standalone === true;
 let fulfillmentOrder = null;
@@ -297,6 +297,10 @@ let receivingItemSuggestions = [];
 let receivingOrderPage = Number(initialOperatorState.receivingOrderPage || 0);
 let receivingLinePage = Number(initialOperatorState.receivingLinePage || 0);
 let receivingSelectedLineId = initialOperatorState.receivingSelectedLineId || null;
+let receivingRequestGeneration = 0;
+let receivingOrdersRequest = 0;
+let receivingDetailRequest = 0;
+let receivingSuggestionsRequest = 0;
 let receiptOrder = null;
 let receiptPhotoDataUrls = [];
 let receiptActivePhotoSlot = 0;
@@ -667,16 +671,19 @@ function renderReleaseDraftButton() {
 }
 
 async function api(path, options = {}) {
+  const requestToken = authToken;
+  const requestLocation = locationId;
   const response = await fetch(path, {
     headers: { "Content-Type": "application/json", ...(authToken ? { Authorization: `Bearer ${authToken}` } : {}) },
     cache: "no-store",
     ...options
   });
+  if (operatorWorkspaceLeaving || requestToken !== authToken || requestLocation !== locationId) throw new Error("Operator session changed.");
   if (response.status === 401) {
     clearOperatorSession();
     operator = null;
     localStorage.removeItem(STATE_KEY);
-    renderLogin("Login expired. Please login again.");
+    reloadOperatorWorkspace();
     throw new Error("Login required");
   }
   if (!response.ok) {
@@ -690,10 +697,15 @@ async function api(path, options = {}) {
     const error = new Error(payload?.error || text || "Request failed.");
     error.status = response.status;
     error.payload = payload;
+    if (response.status === 403 && payload?.code === "OPERATOR_YARD_FORBIDDEN") {
+      reloadOperatorWorkspace();
+    }
     if (response.status === 403 && payload?.redirect) window.location.replace(payload.redirect);
     throw error;
   }
-  return response.json();
+  const data = await response.json();
+  if (operatorWorkspaceLeaving || requestToken !== authToken || requestLocation !== locationId) throw new Error("Operator session changed.");
+  return data;
 }
 
 function dataUrlToFile(dataUrl, filename = "photo.jpg") {
@@ -800,7 +812,7 @@ async function uploadOperatorPhoto(photo, context = {}) {
   if (!String(photo).startsWith("data:image/")) return photo;
   const ticket = await api("/api/operator/photo-upload-token", {
     method: "POST",
-    body: JSON.stringify(context)
+    body: JSON.stringify({ ...context, locationId })
   });
   const file = dataUrlToFile(photo, context.filename || `${context.recordType || "operator-photo"}.jpg`);
   const formData = new FormData();
@@ -900,7 +912,11 @@ function connectEvents() {
       return;
     }
     const payload = event.payload || {};
-    if (event.type === "connected" || !operator || !locationId) return;
+    if (event.type === "operator.access.updated" || event.type === "connected") {
+      refreshOperatorAccess().catch(() => {});
+      return;
+    }
+    if (!operator || !locationId) return;
     const deliveryEvents = [
       "dispatch.plan.saved",
       "dispatch.plan.confirmed",
@@ -1822,6 +1838,7 @@ function activeDraftLimit(line, unit) {
 }
 
 function panelValue(line, unit) {
+  if (isCustomerPickupMode()) return hasPackedQty(line) ? packedValue(line, unit) : remainingValue(line, unit);
   if (isActiveDraftPackedLine(line)) return packedValue(line, unit);
   return viewMode === "packed" ? packedValue(line, unit) : remainingValue(line, unit);
 }
@@ -1920,22 +1937,109 @@ function renderLineDensityToggle() {
   `;
 }
 
+function allowedOperatorLocations() {
+  const roles = [...(Array.isArray(operator?.roles) ? operator.roles : []), operator?.role].map(normalizedStaffRole);
+  const ids = roles.includes("admin") ? LOCATIONS.map((yard) => yard.id) : operator?.operatorYardLocationIds || [];
+  return LOCATIONS.filter((yard) => ids.includes(yard.id));
+}
+
+function clearOperatorWorkspace() {
+  for (const key of [STATE_KEY, "mbbs.operator.locationId", "mbbs.delivery.locationId",
+    "mbbs.operator.deliveryOrderType", "mbbs.operator.deliveryBatchFilter", "mbbs.operator.deliveryPrepMode", "mbbs.operator.deliveryLoadViewDate"]) {
+    localStorage.removeItem(key);
+  }
+}
+
+function reloadOperatorWorkspace(nextLocation = 0) {
+  if (operatorWorkspaceLeaving) return;
+  operatorWorkspaceLeaving = true;
+  disconnectEvents();
+  stopFulfillmentCamera();
+  stopReceiptCamera();
+  stopPickupScannerCamera();
+  stopReturnCamera();
+  stopReturnScannerCamera();
+  releaseSecurePhotoImages(app);
+  clearOperatorWorkspace();
+  if (nextLocation && operator && operatorSessionKey) {
+    localStorage.setItem(STATE_KEY, JSON.stringify({ accountId: operator.id, sessionKey: operatorSessionKey, locationId: nextLocation, currentModule: "menu" }));
+  }
+  app.replaceChildren();
+  window.location.reload();
+}
+
+async function prepareOperatorWorkspace() {
+  const digest = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(authToken));
+  operatorSessionKey = [...new Uint8Array(digest)].map((byte) => byte.toString(16).padStart(2, "0")).join("");
+  const stored = readOperatorState();
+  if (Object.keys(stored).length && (stored.accountId !== operator.id || stored.sessionKey !== operatorSessionKey)) {
+    reloadOperatorWorkspace();
+    return false;
+  }
+  const yards = allowedOperatorLocations();
+  if (locationId && !yards.some((yard) => yard.id === locationId)) {
+    reloadOperatorWorkspace();
+    return false;
+  }
+  if (!locationId && yards.length === 1) locationId = yards[0].id;
+  return true;
+}
+
+async function refreshOperatorAccess() {
+  if (!operator || operatorWorkspaceLeaving) return;
+  if (readOperatorToken() !== authToken) return reloadOperatorWorkspace();
+  if (operatorAccessRequest) {
+    operatorAccessRefreshQueued = true;
+    return operatorAccessRequest;
+  }
+  operatorAccessRequest = (async () => {
+    const { operator: account } = await api("/api/auth/me");
+    if (account.id !== operator.id || !operatorRoleAllowed(account)) return reloadOperatorWorkspace();
+    const previous = JSON.stringify(allowedOperatorLocations());
+    operator = account;
+    if (previous !== JSON.stringify(allowedOperatorLocations())) {
+      if (!allowedOperatorLocations().some((yard) => yard.id === locationId)) return reloadOperatorWorkspace();
+      locationDropdownOpen = false;
+      const button = app.querySelector('[data-action="toggle-location-dropdown"]');
+      if (button) button.disabled = allowedOperatorLocations().length < 2 || (returnModuleActive() && (returnStage !== "lookup" || Boolean(returnDraftId)));
+      app.querySelector(".location-dropdown")?.remove();
+    }
+  })().finally(() => {
+    operatorAccessRequest = null;
+    if (operatorAccessRefreshQueued) {
+      operatorAccessRefreshQueued = false;
+      return refreshOperatorAccess();
+    }
+  });
+  return operatorAccessRequest;
+}
+
+function renderNoOperatorYards() {
+  app.innerHTML = `<section class="location-screen"><div class="location-panel">
+    <p>${t("app.operator", "MBBS Yard Operator Application")}</p>
+    <h1>${t("operator.yardAccess", "Operator yard access")}</h1>
+    <p>${t("operator.noYardAccess", "No Operator yard access assigned. Contact an administrator.")}</p>
+    ${languageToggle()}
+    <button class="primary-button" data-action="refresh-yard-access" type="button">${t("common.refresh", "Refresh")}</button>
+    <button class="secondary-button" data-action="logout" type="button">${t("common.logout", "Logout")}</button>
+  </div></section>`;
+}
+
 function locationOptions() {
-  return LOCATIONS.map((location) => `
+  return allowedOperatorLocations().map((location) => `
     <option value="${location.id}" ${Number(location.id) === Number(locationId) ? "selected" : ""}>${location.text}</option>
   `).join("");
 }
 
-function shell(title, subtitle, body, actions = "") {
+function renderTopbar(title, subtitle, actions = "") {
   const returnLocationLocked = returnModuleActive() && (returnStage !== "lookup" || Boolean(returnDraftId));
-  releaseSecurePhotoImages(app);
-  app.innerHTML = `
+  return `
     <header class="topbar">
       <div class="topbar-location">
-        <button class="secondary-button location-button" data-action="toggle-location-dropdown" ${returnLocationLocked ? "disabled" : ""} type="button">${t("common.location", "Location")} ${currentLocation()?.text || locationId || ""}${returnLocationLocked ? ` · ${t("operator.locked", "Locked")}` : ""}</button>
-        ${locationDropdownOpen ? `
+        <button class="secondary-button location-button" data-action="toggle-location-dropdown" ${returnLocationLocked || allowedOperatorLocations().length < 2 ? "disabled" : ""} type="button">${t("common.location", "Location")} ${currentLocation()?.text || locationId || ""}${returnLocationLocked ? ` · ${t("operator.locked", "Locked")}` : ""}</button>
+        ${locationDropdownOpen && allowedOperatorLocations().length > 1 ? `
           <div class="location-dropdown">
-            ${LOCATIONS.map((location) => `
+            ${allowedOperatorLocations().map((location) => `
               <button class="${Number(location.id) === Number(locationId) ? "active" : ""}" data-action="set-location-dropdown" data-location-id="${location.id}" type="button">${location.text}</button>
             `).join("")}
           </div>
@@ -1948,7 +2052,14 @@ function shell(title, subtitle, body, actions = "") {
       </div>
       <div class="topbar-language">${languageToggle()}</div>
       <div class="topbar-actions">${operator ? `${renderReleaseDraftButton()}${renderNotificationButton()}` : ""}${actions}</div>
-    </header>
+    </header>`;
+}
+
+function shell(title, subtitle, body, actions = "") {
+  releaseSecurePhotoImages(app);
+  app.dataset.module = currentModule;
+  app.innerHTML = `
+    ${renderTopbar(title, subtitle, actions)}
     ${renderUrgentDeliveryAlert()}
     ${body}
   `;
@@ -1987,9 +2098,11 @@ function renderLogin(message = "") {
 }
 
 function saveOperatorState() {
-  if (!operator) return;
+  if (!operator || operatorWorkspaceLeaving) return;
   const module = restorableModule(currentModule);
   localStorage.setItem(STATE_KEY, JSON.stringify({
+    accountId: operator.id,
+    sessionKey: operatorSessionKey,
     locationId,
     currentModule: module,
     viewMode,
@@ -2037,8 +2150,10 @@ function saveOperatorState() {
 }
 
 async function restoreOperatorView() {
+  if (operatorWorkspaceLeaving) return;
   if (!operator) return renderLogin();
-  if (!locationId) return renderLocationSelect();
+  if (!allowedOperatorLocations().length) return renderNoOperatorYards();
+  if (!allowedOperatorLocations().some((yard) => yard.id === locationId)) return renderLocationSelect();
   currentModule = restorableModule(currentModule);
   try {
     if (currentModule === "delivery") {
@@ -2116,6 +2231,7 @@ function renderLocationSelect() {
           <select id="locationSelect">${locationOptions()}</select>
         </label>
         <button class="primary-button" data-action="save-location" type="button">${t("common.continue", "Continue")}</button>
+        <button class="secondary-button" data-action="logout" type="button">${t("common.logout", "Logout")}</button>
       </div>
     </section>
   `;
@@ -2185,8 +2301,11 @@ function renderDeliveryPanels({ orderPanel = true, detailPanel = true } = {}) {
 }
 
 function render() {
+  if (currentModule !== "receiving") invalidateReceivingRequests();
+  if (operatorWorkspaceLeaving) return;
   if (!operator) return renderLogin();
-  if (!locationId) return renderLocationSelect();
+  if (!allowedOperatorLocations().length) return renderNoOperatorYards();
+  if (!allowedOperatorLocations().some((yard) => yard.id === locationId)) return renderLocationSelect();
   saveOperatorState();
   if (currentModule === "menu") return renderMenu();
   if (currentModule === "cycle-count") return renderCycleCount();
@@ -2383,9 +2502,6 @@ function renderReturnBalance(balance, { unit = "PALLET" } = {}) {
   const lookedUpAt = balance.lookedUpAt || balance.looked_up_at || balance.lookupTimestamp || balance.lookup_timestamp;
   return `
     <div class="return-balance-grid">
-      <div><span>${t("operator.fulfilled", "Fulfilled")}</span><strong>${displayReturnQty(returnBalanceValue(balance, "fulfilled", "fulfilled"))} ${escapeHtml(unit)}</strong></div>
-      <div><span>${t("operator.netsuiteReturned", "NetSuite returned")}</span><strong>${displayReturnQty(returnBalanceValue(balance, "netsuiteReturned", "netsuite_returned"))} ${escapeHtml(unit)}</strong></div>
-      <div><span>${t("operator.localReserved", "Local reserved")}</span><strong>${displayReturnQty(returnBalanceValue(balance, "localReserved", "local_reserved"))} ${escapeHtml(unit)}</strong></div>
       <div class="available"><span>${t("operator.availableToReturn", "Available to return")}</span><strong>${displayReturnQty(returnBalanceAvailable(balance))} ${escapeHtml(unit)}</strong></div>
     </div>
     ${lookedUpAt ? `<small class="return-lookup-time">${tf("operator.checkedAt", "Checked {time}", { time: formatDateTime(lookedUpAt) })}</small>` : ""}
@@ -3564,37 +3680,53 @@ function receivingTypeLabel() {
   return receivingOrderType === "transfer_order" ? t("operator.transferOrder", "Transfer Order") : t("operator.purchaseOrder", "Purchase Order");
 }
 
+function renderReceivingSuggestions() {
+  if (!receivingItemSuggestions.length) return "";
+  return `<div class="autocomplete-dropdown">
+    ${receivingItemSuggestions.map((item) => `
+      <button data-action="receiving-pick-item" data-item="${escapeHtml(item.item_name)}" type="button">
+        <strong>${escapeHtml(item.item_name)}</strong>
+        <span>${item.order_count} PO/TO</span>
+      </button>`).join("")}
+  </div>`;
+}
+
 function renderReceiving() {
-  shell(t("operator.receiving", "Receiving"), `${receivingTypeLabel()} | ${t("common.location", "Location")} ${currentLocation()?.text || locationId}`, `
+  const title = t("operator.receiving", "Receiving");
+  const subtitle = `${receivingTypeLabel()} | ${t("common.location", "Location")} ${currentLocation()?.text || locationId}`;
+  const actions = `
+    <button class="secondary-button" data-action="main-menu" type="button">${t("common.menu", "Menu")}</button>
+    <button class="secondary-button" data-action="logout" type="button">${operator.display_name}</button>`;
+  const content = app.querySelector("[data-receiving-main]");
+  if (content) {
+    saveOperatorState();
+    app.querySelector(".topbar").outerHTML = renderTopbar(title, subtitle, actions);
+    for (const [id, value] of [["receivingSearch", receivingSearch], ["receivingItemSearch", receivingItemSearch]]) {
+      const input = document.getElementById(id);
+      if (input.value !== value) input.value = value;
+    }
+    app.querySelector("[data-receiving-suggestions]").innerHTML = renderReceivingSuggestions();
+    content.innerHTML = renderReceivingMain();
+    return;
+  }
+  shell(title, subtitle, `
     <section class="receiving-shell">
       <div class="receiving-toolbar">
-        <button class="secondary-button" data-action="main-menu" type="button">${t("common.menu", "Menu")}</button>
         <button class="secondary-button" data-action="receiving-back" type="button">${t("common.back", "Back")}</button>
         <label class="receiving-search">
           <span>${t("operator.searchOrderNumber", "Search PO / TO number")}</span>
-          <input id="receivingSearch" value="${receivingSearch}" placeholder="${t("operator.scanOrType", "Scan or type and press Enter")}" />
+          <input id="receivingSearch" value="${escapeHtml(receivingSearch)}" placeholder="${t("operator.scanOrType", "Scan or type and press Enter")}" />
         </label>
         <label class="receiving-search receiving-search-with-dropdown">
           <span>${t("operator.searchProduct", "Search product")}</span>
-          <input id="receivingItemSearch" value="${receivingItemSearch}" placeholder="${t("operator.searchProduct", "Search product")}" />
-          ${receivingItemSuggestions.length ? `
-            <div class="autocomplete-dropdown">
-              ${receivingItemSuggestions.map((item) => `
-                <button data-action="receiving-pick-item" data-item="${item.item_name}" type="button">
-                  <strong>${item.item_name}</strong>
-                  <span>${item.order_count} PO/TO</span>
-                </button>
-              `).join("")}
-            </div>
-          ` : ""}
+          <input id="receivingItemSearch" value="${escapeHtml(receivingItemSearch)}" placeholder="${t("operator.searchProduct", "Search product")}" />
+          <div data-receiving-suggestions>${renderReceivingSuggestions()}</div>
         </label>
         <button class="secondary-button" data-action="refresh-receiving" type="button">${t("common.refreshOrders", "Refresh Orders")}</button>
       </div>
-      ${renderReceivingMain()}
+      <div class="receiving-main" data-receiving-main>${renderReceivingMain()}</div>
     </section>
-  `, `
-    <button class="secondary-button" data-action="logout" type="button">${operator.display_name}</button>
-  `);
+  `, actions);
 }
 
 function renderReceivingMain() {
@@ -3824,7 +3956,6 @@ function renderCycleCount() {
   shell(t("operator.cycleCount", "Cycle Count"), `${t("common.location", "Location")} ${currentLocation()?.text || locationId}`, `
     <section class="cycle-shell">
       <div class="cycle-toolbar">
-        <button class="secondary-button" data-action="main-menu" type="button">${t("common.menu", "Menu")}</button>
         <button class="secondary-button" data-action="cycle-back" type="button">${t("common.back", "Back")}</button>
         <label class="cycle-search">
           <span>${t("operator.searchSku", "Search SKU")}</span>
@@ -3850,6 +3981,7 @@ function renderCycleCount() {
       </div>
     </section>
   `, `
+    <button class="secondary-button" data-action="main-menu" type="button">${t("common.menu", "Menu")}</button>
     <button class="secondary-button" data-action="logout" type="button">${operator.display_name}</button>
   `);
 }
@@ -3862,13 +3994,6 @@ function focusCycleSearch() {
   input.setSelectionRange(end, end);
 }
 
-function focusReceivingInput(id) {
-  const input = document.getElementById(id);
-  if (!input) return;
-  input.focus();
-  const end = input.value.length;
-  input.setSelectionRange(end, end);
-}
 
 function currentCycleOptions() {
   if (cycleStep === "type") return cycleFacets.productTypes || [];
@@ -4084,10 +4209,10 @@ function renderOrderPanel() {
   const showActivePacked = deliveryPrepMode === "standard" || deliveryPrepMode === "load";
 
   return `
-    <div class="panel-title">
+    <div class="panel-title delivery-list-title">
       <div class="order-panel-title">
         ${showActivePacked ? `
-          <div class="panel-segment">
+          <div class="panel-segment delivery-mode-segment delivery-status-segment">
             <button class="${viewMode === "active" ? "active" : ""}" data-action="view-active" type="button">${t("operator.active", "Active")}</button>
             <button class="${viewMode === "packed" ? "active" : ""}" data-action="view-packed" type="button">${t("operator.packed", "Packed")}</button>
           </div>
@@ -4099,7 +4224,6 @@ function renderOrderPanel() {
             ${t("operator.consolidationPick", "Consolidation Pick")}
           </button>
         ` : ""}
-        <strong>${panelOrders.length}</strong>
       </div>
     </div>
     ${renderDeliveryLoadControls()}
@@ -4245,7 +4369,7 @@ function renderDetailPanel(order) {
         ${vrmaReferenceOnly
           ? `<span class="muted">${t("operator.referenceOnlyNoInventory", "Reference only · No inventory deduction")}</span>`
           : directPickupInfo ? "" : isCustomerPickupMode()
-            ? `<button class="primary-button" data-action="start-fulfill" type="button" ${hasCustomerPickupDraft(order) ? "" : "disabled"}>${t("common.load", "Load")}</button>`
+            ? `<button class="primary-button" data-action="start-fulfill" type="button" ${hasCustomerPickupDraft(order) && !pickupConfirming && !pageConfirming ? "" : "disabled"}>${t("common.load", "Load")}</button>`
             : loadAction.show
               ? `<button class="primary-button" data-action="start-fulfill" type="button">${loadAction.label}</button>`
               : `<button class="secondary-button" data-action="set-preparing" type="button">${t("operator.preparing", "Preparing")}</button>
@@ -4398,7 +4522,8 @@ function renderFulfillmentScreen() {
           ${packedLines.map((line) => `
             <div>
               <b>${line.sku || line.item_name}</b>
-              <span>${displayQty(line.packed_pallet_qty)} PLT / ${displayQty(line.packed_section_qty)} SEC / ${displayQty(line.packed_layer_qty)} LYR / ${displayQty(line.packed_piece_qty)} PCS</span>
+              <span>${isPickupLoad ? escapeHtml(pickupQuantityText(line)) : `${displayQty(line.packed_pallet_qty)} PLT / ${displayQty(line.packed_section_qty)} SEC / ${displayQty(line.packed_layer_qty)} LYR / ${displayQty(line.packed_piece_qty)} PCS`}</span>
+              ${isPickupLoad ? `<small>${t("operator.remaining", "Remaining")} ${escapeHtml(pickupQuantityText(line, remainingValue))}</small>` : ""}
             </div>
           `).join("") || `<p class="muted">${t("operator.noPackedQty", "No packed qty.")}</p>`}
         </div>
@@ -4419,26 +4544,39 @@ function renderFulfillmentScreen() {
 function renderLine(line) {
   const units = deliveryLineUnits(line);
   const notice = exceptionText(line);
-  const underPacked = isUnderPacked(line);
-  const draftConfirmed = isActiveDraftPackedLine(line);
+  const underPacked = !isCustomerPickupMode() && isUnderPacked(line);
+  const pickupConfirmed = isCustomerPickupMode() && hasPackedQty(line);
+  const draftConfirmed = pickupConfirmed || isActiveDraftPackedLine(line);
   const referenceOnly = line.vrma_reference_only === true || isVrmaReferenceOrder();
   const valueLabel = referenceOnly ? t("operator.reference", "Reference") : isActiveDraftPackedLine(line) ? t("operator.confirmed", "Confirmed") : viewMode === "packed" ? t("operator.packed", "Packed") : t("operator.open", "Open");
   return `
-    <button class="line-card ${String(selectedLineId) === String(line.id) ? "active" : ""} ${line.confirmed ? "confirmed" : ""} ${underPacked ? "underpacked" : ""} ${notice ? "exception" : ""}" data-line="${line.id}" type="button">
+    <button class="line-card ${String(selectedLineId) === String(line.id) ? "active" : ""} ${line.confirmed || pickupConfirmed ? "confirmed" : ""} ${underPacked ? "underpacked" : ""} ${notice ? "exception" : ""}" data-line="${line.id}" type="button">
       <div class="line-info">
         <strong>${line.sku || line.item_name}</strong>
         ${compactLineMode ? "" : `<span>${line.item_description || ""}</span>`}
-        ${draftConfirmed ? `<em class="confirmed-note">${t("operator.confirmedAdjust", "Confirmed - can still adjust before Packed")}</em>` : ""}
+        ${draftConfirmed ? `<em class="confirmed-note">${pickupConfirmed ? t("operator.pickupConfirmedAdjust", "Confirmed - can still adjust before Loaded") : t("operator.confirmedAdjust", "Confirmed - can still adjust before Packed")}</em>` : ""}
         ${line.no_yard_load_required ? `<em class="confirmed-note">${t("operator.noYardLoadDirectSupply", "No yard load required—direct supply")}</em>` : ""}
         ${line.linked_quantity_blocked ? `<em class="underpack-note">${t("operator.linkedQuantityBlocked", "Linked quantity exceeds Dispatch target")}</em>` : ""}
         ${notice ? `<em>${notice}</em>` : ""}
         ${underPacked ? `<em class="underpack-note">${t("operator.stillOpenQty", "Still has open qty")}</em>` : ""}
       </div>
       <div class="required-measures">
-        ${units.map((unit) => `<div class="measure"><span>${valueLabel} ${unit.label}</span><b>${displayQty(panelValue(line, unit.key))}</b></div>`).join("")}
+        ${isCustomerPickupMode() ? renderPickupMeasures(line, units) : units.map((unit) => `<div class="measure"><span>${valueLabel} ${unit.label}</span><b>${displayQty(panelValue(line, unit.key))}</b></div>`).join("")}
       </div>
     </button>
   `;
+}
+
+function renderPickupMeasures(line, units = deliveryLineUnits(line)) {
+  const confirmed = hasPackedQty(line);
+  return units.map((unit) => `
+    ${confirmed ? `<div class="measure confirmed-measure"><span>${t("operator.confirmed", "Confirmed")} ${escapeHtml(unit.label)}</span><b>${displayQty(packedValue(line, unit.key))}</b></div>` : ""}
+    <div class="measure remaining-measure"><span>${t("operator.remaining", "Remaining")} ${escapeHtml(unit.label)}</span><b>${displayQty(remainingValue(line, unit.key))}</b></div>
+  `).join("");
+}
+
+function pickupQuantityText(line, value = packedValue) {
+  return deliveryLineUnits(line).map((unit) => `${displayQty(value(line, unit.key))} ${unit.label}`).join(" / ");
 }
 
 function renderLinkedSupplyBreakdown(line) {
@@ -4502,7 +4640,7 @@ function renderSelectedLinePanel(line) {
   const units = deliveryLineUnits(line);
   const notice = exceptionText(line);
   const loadAction = deliveryLoadAction(selectedOrder, viewMode);
-  const packedReview = viewMode === "packed" || loadAction.reloadReady;
+  const packedReview = !isCustomerPickupMode() && (viewMode === "packed" || loadAction.reloadReady);
   const showConfirmPage = (currentModule === "delivery" || currentModule === "customer-pickup") && !packedReview;
   const packedActions = loadAction.allowPackedQuantityEdit
     ? notice
@@ -4515,7 +4653,7 @@ function renderSelectedLinePanel(line) {
     <aside class="selected-panel" data-selected-line="${line.id}">
       ${showConfirmPage ? `
         <div class="selected-page-actions">
-          <button class="secondary-button confirm-page-button" data-action="confirm-page" ${pageConfirming ? "disabled" : ""} type="button">${pageConfirming ? t("operator.confirming", "Confirming...") : t("operator.confirmPage", "Confirm page")}</button>
+          <button class="secondary-button confirm-page-button" data-action="confirm-page" ${pageConfirming || pickupConfirming ? "disabled" : ""} type="button">${pageConfirming ? t("operator.confirming", "Confirming...") : t("operator.confirmPage", "Confirm page")}</button>
         </div>
       ` : ""}
       <div class="selected-header">
@@ -4524,14 +4662,14 @@ function renderSelectedLinePanel(line) {
         <p>${line.item_description || ""}</p>
       </div>
       <div class="selected-measures">
-        ${units.map((unit) => `<div class="measure"><span>${isCustomerPickupMode() ? t("operator.remaining", "Remaining") : t("operator.required", "Required")} ${unit.label}</span><b>${displayQty(isCustomerPickupMode() ? Math.max(0, requiredValue(line, unit.key) - pickupLoadedValue(line, unit.key)) : requiredValue(line, unit.key))}</b></div>`).join("")}
+        ${isCustomerPickupMode() ? renderPickupMeasures(line, units) : units.map((unit) => `<div class="measure"><span>${t("operator.required", "Required")} ${unit.label}</span><b>${displayQty(requiredValue(line, unit.key))}</b></div>`).join("")}
       </div>
       ${qty(line.linked_allocated_sales_qty) > 0 ? renderLinkedSupplyBreakdown(line) : ""}
       ${notice ? `<div class="line-alert"><strong>${t("operator.repackNeeded", "Repack needed")}</strong><span>${notice}</span></div>` : ""}
       ${notice || !loadAction.allowPackedQuantityEdit ? "" : units.map((unit) => renderStepper(unit.key, `${packedReview ? t("operator.packed", "Packed") : t("operator.pack", "Pack")} ${unit.label}`, panelValue(line, unit.key))).join("")}
       ${packedReview
         ? `<div class="selected-actions">${packedActions}</div>`
-        : `<div class="selected-actions"><button class="primary-button" data-action="confirm-line" data-line="${line.id}" ${pageConfirming ? "disabled" : ""} type="button">${t("operator.confirmLine", "Confirm line")}</button></div>`}
+        : `<div class="selected-actions"><button class="primary-button" data-action="confirm-line" data-line="${line.id}" ${pageConfirming || pickupConfirming ? "disabled" : ""} type="button">${t("operator.confirmLine", "Confirm line")}</button></div>`}
     </aside>
   `;
 }
@@ -5435,39 +5573,111 @@ function receivingOrderUrl() {
   return url.pathname + url.search;
 }
 
+function invalidateReceivingRequests() {
+  receivingRequestGeneration += 1;
+  window.clearTimeout(app.receivingSearchTimer);
+}
+
+function receivingRequestContext() {
+  return {
+    generation: receivingRequestGeneration,
+    filters: JSON.stringify([locationId, receivingOrderType, receivingStep,
+      receivingSelectedVendor, receivingSelectedSourceId, receivingSearch, receivingItemSearch])
+  };
+}
+
+function receivingRequestIsCurrent(context) {
+  return currentModule === "receiving"
+    && context.generation === receivingRequestGeneration
+    && context.filters === receivingRequestContext().filters;
+}
+
 async function loadReceivingOrders(options = {}) {
   if (receivingSearch.trim() || receivingItemSearch.trim()) receivingStep = "orders";
-  receivingOrders = await api(receivingOrderUrl());
-  if (!options.keepSelection) receivingSelectedId = receivingOrders[0]?.netsuite_id || null;
-  if (receivingSelectedId && !receivingOrders.some((order) => String(order.netsuite_id) === String(receivingSelectedId))) {
-    receivingSelectedId = receivingOrders[0]?.netsuite_id || null;
+  const context = receivingRequestContext();
+  const request = ++receivingOrdersRequest;
+  try {
+    const nextOrders = await api(receivingOrderUrl());
+    if (!receivingRequestIsCurrent(context) || request !== receivingOrdersRequest) return false;
+    receivingOrders = nextOrders;
+    if (!options.keepSelection || !receivingOrders.some((order) => String(order.netsuite_id) === String(receivingSelectedId))) {
+      receivingSelectedId = receivingOrders[0]?.netsuite_id || null;
+    }
+    receivingSelectedOrder = null;
+    if (receivingSelectedId) await loadReceivingDetail(receivingSelectedId, { silentRender: true });
+    if (!receivingRequestIsCurrent(context) || request !== receivingOrdersRequest) return false;
+    render();
+    return true;
+  } catch (error) {
+    if (receivingRequestIsCurrent(context) && request === receivingOrdersRequest) throw error;
+    return false;
   }
-  receivingSelectedOrder = null;
-  if (receivingSelectedId) await loadReceivingDetail(receivingSelectedId, { silentRender: true });
-  render();
 }
 
 async function loadReceivingDetail(id, options = {}) {
+  if (!options.silentRender) invalidateReceivingRequests();
   receivingSelectedId = id;
+  const context = receivingRequestContext();
+  const request = ++receivingDetailRequest;
   const listOrder = receivingOrders.find((order) => String(order.netsuite_id) === String(id));
   const orderType = listOrder?.order_type || receivingOrderType;
-  receivingSelectedOrder = await api(`/api/receiving/orders/${encodeURIComponent(id)}?orderType=${encodeURIComponent(orderType)}`);
-  if (!options.silentRender) render();
+  try {
+    const order = await api(`/api/receiving/orders/${encodeURIComponent(id)}?orderType=${encodeURIComponent(orderType)}`);
+    if (!receivingRequestIsCurrent(context) || request !== receivingDetailRequest || String(receivingSelectedId) !== String(id)) return null;
+    receivingSelectedOrder = order;
+    if (!options.silentRender) render();
+    return order;
+  } catch (error) {
+    if (receivingRequestIsCurrent(context) && request === receivingDetailRequest) throw error;
+    return null;
+  }
 }
 
 async function loadReceivingItemSuggestions() {
-  if (receivingItemSearch.trim().length < 2) {
-    receivingItemSuggestions = [];
-    return;
-  }
-  const url = new URL("/api/receiving/items", window.location.origin);
-  url.searchParams.set("orderType", "all");
-  url.searchParams.set("search", receivingItemSearch.trim());
-  if (receivingOrderType === "transfer_order" || receivingOrderType === "co_order") {
+  const context = receivingRequestContext();
+  const request = ++receivingSuggestionsRequest;
+  try {
+    const url = new URL("/api/receiving/items", window.location.origin);
+    url.searchParams.set("orderType", "all");
+    url.searchParams.set("search", receivingItemSearch.trim());
     url.searchParams.set("destinationLocationId", locationId);
+    const suggestions = receivingItemSearch.trim().length < 2 ? [] : await api(url.pathname + url.search);
+    if (!receivingRequestIsCurrent(context) || request !== receivingSuggestionsRequest) return;
+    receivingItemSuggestions = suggestions;
+    const container = app.querySelector("[data-receiving-suggestions]");
+    if (container) container.innerHTML = renderReceivingSuggestions();
+  } catch (error) {
+    if (receivingRequestIsCurrent(context) && request === receivingSuggestionsRequest) throw error;
   }
-  if (receivingOrderType === "purchase_order") url.searchParams.set("destinationLocationId", locationId);
-  receivingItemSuggestions = await api(url.pathname + url.search);
+}
+
+function scheduleReceivingSearch({ immediate = false } = {}) {
+  invalidateReceivingRequests();
+  receivingOrderPage = 0;
+  const generation = receivingRequestGeneration;
+  saveOperatorState();
+  if (immediate) return searchReceiving(generation);
+  app.receivingSearchTimer = window.setTimeout(() => searchReceiving(generation), 250);
+}
+
+async function searchReceiving(generation) {
+  if (currentModule !== "receiving" || generation !== receivingRequestGeneration) return;
+  receivingSelectedVendor = "";
+  receivingSelectedSourceId = "";
+  if (!receivingSearch.trim() && !receivingItemSearch.trim()) {
+    receivingStep = "type";
+    receivingSelectedId = null;
+    receivingSelectedOrder = null;
+    receivingOrders = [];
+    receivingItemSuggestions = [];
+    return render();
+  }
+  receivingStep = "orders";
+  try {
+    await Promise.all([loadReceivingItemSuggestions(), loadReceivingOrders({ keepSelection: false })]);
+  } catch (error) {
+    if (currentModule === "receiving" && generation === receivingRequestGeneration) showToast(error.message);
+  }
 }
 
 async function refreshReceiving() {
@@ -5523,6 +5733,10 @@ async function lookupCustomerPickup() {
 }
 
 async function confirmDiscardCustomerPickupDraft() {
+  if (isCustomerPickupMode() && (pickupConfirming || pageConfirming)) {
+    showToast(t("operator.confirming", "Confirming..."));
+    return false;
+  }
   if (!isCustomerPickupMode() || !selectedId || !hasCustomerPickupDraft()) return true;
   if (!confirm(t("operator.discardPickupDraftConfirm", "All the confirmed lines for this order will be erased. Confirm?"))) return false;
   selectedOrder = await api(`/api/customer-pickup/orders/${selectedId}/clear-draft`, { method: "POST" });
@@ -5723,13 +5937,9 @@ function pressReceivingKey(key) {
   if (key === "Clear") receivingSearch = "";
   else if (key === "Back") receivingSearch = receivingSearch.slice(0, -1);
   else receivingSearch = `${receivingSearch}${key}`;
-  receivingOrderPage = 0;
-  if (receivingSearch.trim()) {
-    receivingStep = "orders";
-    receivingSelectedVendor = "";
-    receivingSelectedSourceId = "";
-  }
-  loadReceivingOrders().catch((error) => showToast(error.message));
+  const input = document.getElementById("receivingSearch");
+  if (input) input.value = receivingSearch;
+  return scheduleReceivingSearch({ immediate: true });
 }
 
 async function loadDetail(id, options = {}) {
@@ -5783,7 +5993,8 @@ async function setOrderStatus(status) {
 }
 
 async function confirmLine(lineId) {
-  if (pageConfirming) return;
+  if (pageConfirming || pickupConfirming) return;
+  const pickup = isCustomerPickupMode();
   const row = app.querySelector(`[data-selected-line="${lineId}"]`);
   if (!row) return;
   const line = selectedOrder?.lines?.find((item) => String(item.id) === String(lineId));
@@ -5792,6 +6003,7 @@ async function confirmLine(lineId) {
   const pieces = row.querySelector('[data-pack="pieces"]')?.value || 0;
   const salesQty = row.querySelector('[data-pack="sales"]')?.value || 0;
   const body = {
+    ...(pickup ? { quantityMode: "absolute" } : {}),
     pallets,
     layers,
     pieces: isIndependentManualLine(line) ? pieces : salesQty || pieces,
@@ -5804,20 +6016,27 @@ async function confirmLine(lineId) {
       ? `/api/delivery/orders/${encodeURIComponent(selectedId)}/lines/${encodeURIComponent(lineId)}/packed-quantity`
     : `/api/delivery/orders/${encodeURIComponent(selectedId)}/lines/${encodeURIComponent(lineId)}/confirm`;
   const mutationOrderId = selectedId;
-  if (!isCustomerPickupMode()) markLocalDeliveryMutation(mutationOrderId);
+  if (pickup) {
+    pickupConfirming = true;
+    updatePageConfirmControls();
+  } else markLocalDeliveryMutation(mutationOrderId);
   try {
     const result = await api(path, {
       method: "POST",
       body: JSON.stringify(body)
     });
     showToast("Line confirmed");
-    if (isCustomerPickupMode()) {
-      selectedOrder = await api(`/api/delivery/orders/${selectedId}`);
+    if (pickup) {
+      if (String(selectedId) !== String(mutationOrderId) || !isCustomerPickupMode()) return;
+      selectedOrder = result;
       return render();
     }
     if (!acceptRefreshedDeliveryOrder(result.order)) await loadDetail(selectedId);
   } finally {
-    if (!isCustomerPickupMode()) finishLocalDeliveryMutation(mutationOrderId);
+    if (pickup) {
+      pickupConfirming = false;
+      updatePageConfirmControls();
+    } else finishLocalDeliveryMutation(mutationOrderId);
   }
 }
 
@@ -5828,6 +6047,7 @@ function confirmPayloadForLine(line) {
   const pieces = fieldValue("pieces") ?? panelValue(line, "pieces");
   const salesQty = fieldValue("sales") ?? (isIndependentManualLine(line) || shouldUseSalesQuantity(line) ? panelValue(line, "sales") : 0);
   return {
+    ...(isCustomerPickupMode() ? { quantityMode: "absolute" } : {}),
     pallets: value("pallets") || 0,
     layers: value("layers") || 0,
     pieces: isIndependentManualLine(line) ? pieces || 0 : salesQty || pieces || 0,
@@ -5841,9 +6061,10 @@ function confirmPayloadHasQty(body) {
 }
 
 function updatePageConfirmControls() {
+  const busy = pageConfirming || pickupConfirming;
   const pageActions = new Set(["confirm-page", "confirm-receiving-page"]);
   for (const button of app.querySelectorAll('[data-action="confirm-page"], [data-action="confirm-receiving-page"], [data-action="confirm-line"], [data-action="confirm-receiving-line"]')) {
-    if (pageConfirming) button.setAttribute("disabled", "");
+    if (busy) button.setAttribute("disabled", "");
     else button.removeAttribute("disabled");
     if (pageActions.has(button.getAttribute("data-action") || "")) {
       button.textContent = pageConfirming
@@ -5851,10 +6072,14 @@ function updatePageConfirmControls() {
         : t("operator.confirmPage", "Confirm page");
     }
   }
+  if (currentModule === "customer-pickup") {
+    const load = app.querySelector('[data-action="start-fulfill"]');
+    if (load) load.disabled = busy || !hasCustomerPickupDraft();
+  }
 }
 
 async function confirmPage() {
-  if (pageConfirming) return;
+  if (pageConfirming || pickupConfirming) return;
   const customerPickupPage = currentModule === "customer-pickup";
   const deliveryPage = currentModule === "delivery" && viewMode !== "packed";
   if (!selectedOrder || (!customerPickupPage && !deliveryPage)) return;
@@ -5864,7 +6089,7 @@ async function confirmPage() {
   const packedLines = [];
   for (const line of pageLines) {
     const body = confirmPayloadForLine(line);
-    if (!confirmPayloadHasQty(body)) continue;
+    if (!confirmPayloadHasQty(body) && !(customerPickupPage && hasPackedQty(line))) continue;
     const payload = { lineId: line.id, values: body, label: line.sku || line.item_name || line.id };
     if (isActiveDraftPackedLine(line)) packedLines.push(payload);
     else lines.push(payload);
@@ -7933,7 +8158,7 @@ async function cycleBack() {
 async function syncInventory() {
   await api("/api/inventory/sync", {
     method: "POST",
-    body: JSON.stringify({ locationIds: LOCATIONS.map((location) => location.id) })
+    body: JSON.stringify({ locationIds: [locationId] })
   });
   showToast("Inventory synced");
   await loadCycleData();
@@ -8091,16 +8316,20 @@ app.addEventListener("click", async (event) => {
       await api("/api/auth/logout", { method: "POST" }).catch(() => ({}));
       operator = null;
       clearOperatorSession();
-      localStorage.removeItem(STATE_KEY);
-      disconnectEvents();
-      return renderLogin();
+      return reloadOperatorWorkspace();
+    }
+    if (button.dataset.action === "refresh-yard-access") {
+      await refreshOperatorAccess();
+      return render();
     }
     if (button.dataset.action === "toggle-location-dropdown") {
+      if (allowedOperatorLocations().length < 2) return;
       locationDropdownOpen = !locationDropdownOpen;
       return render();
     }
     if (button.dataset.action === "set-location-dropdown") {
       const value = Number(button.dataset.locationId || 0);
+      if (!allowedOperatorLocations().some((yard) => yard.id === value)) return;
       if (!value || Number(locationId) === value) {
         locationDropdownOpen = false;
         return render();
@@ -8117,17 +8346,7 @@ app.addEventListener("click", async (event) => {
       stopPickupScannerCamera();
       stopReturnCamera();
       stopReturnScannerCamera();
-      locationId = value;
-      locationDropdownOpen = false;
-      localStorage.setItem("mbbs.operator.locationId", String(value));
-      localStorage.removeItem(STATE_KEY);
-      deliveryOrderBuckets = { active: null, packed: null };
-      selectedId = null;
-      selectedOrder = null;
-      selectedLineId = null;
-      currentModule = "menu";
-      await loadDeliveryNotifications();
-      return render();
+      return reloadOperatorWorkspace(value);
     }
     if (button.dataset.action === "main-menu") {
       locationDropdownOpen = false;
@@ -8421,6 +8640,7 @@ app.addEventListener("click", async (event) => {
     if (button.dataset.action === "pack-consolidation-order") return packConsolidationBatchOrder(button.dataset.order);
     if (button.dataset.action === "release-consolidation") return releaseConsolidation();
     if (button.dataset.action === "select-receiving-type") {
+      invalidateReceivingRequests();
       receivingOrderType = button.dataset.orderType || "purchase_order";
       receivingStep = "vendor";
       receivingSelectedVendor = "";
@@ -8435,6 +8655,7 @@ app.addEventListener("click", async (event) => {
       return render();
     }
     if (button.dataset.action === "receiving-back") {
+      invalidateReceivingRequests();
       if (receivingStep === "orders") {
         receivingStep = receivingSearch.trim() || receivingItemSearch.trim() ? "type" : "vendor";
         receivingSearch = "";
@@ -8453,12 +8674,14 @@ app.addEventListener("click", async (event) => {
       return render();
     }
     if (button.dataset.action === "select-receiving-vendor") {
+      invalidateReceivingRequests();
       receivingSelectedVendor = button.dataset.value || "";
       receivingStep = "orders";
       receivingOrderPage = 0;
       return loadReceivingOrders();
     }
     if (button.dataset.action === "select-receiving-source") {
+      invalidateReceivingRequests();
       receivingSelectedSourceId = button.dataset.value || "";
       receivingStep = "orders";
       receivingOrderPage = 0;
@@ -8467,6 +8690,7 @@ app.addEventListener("click", async (event) => {
     if (button.dataset.action === "refresh-receiving") return refreshReceiving();
     if (button.dataset.action === "receiving-key") return pressReceivingKey(button.dataset.key);
     if (button.dataset.action === "receiving-pick-item") {
+      invalidateReceivingRequests();
       receivingItemSearch = button.dataset.item || "";
       receivingItemSuggestions = [];
       receivingStep = "orders";
@@ -8568,23 +8792,9 @@ app.addEventListener("click", async (event) => {
     if (button.dataset.action === "submit-cycle-count") return submitCycleCount();
     if (button.dataset.action === "save-location") {
       const value = Number(document.getElementById("locationSelect").value);
+      if (!allowedOperatorLocations().some((yard) => yard.id === value)) return;
       locationId = value;
-      locationDropdownOpen = false;
-      localStorage.setItem("mbbs.operator.locationId", String(value));
-      deliveryOrderBuckets = { active: null, packed: null };
-      orderPage = 0;
-      linePage = 0;
       currentModule = "menu";
-      return render();
-    }
-    if (button.dataset.action === "change-location") {
-      localStorage.removeItem("mbbs.operator.locationId");
-      localStorage.removeItem(STATE_KEY);
-      locationId = 0;
-      locationDropdownOpen = false;
-      deliveryOrderBuckets = { active: null, packed: null };
-      selectedId = null;
-      selectedOrder = null;
       return render();
     }
     if (button.dataset.action === "view-active") {
@@ -8775,7 +8985,7 @@ app.addEventListener("click", async (event) => {
       return loadPersonalHistory();
     }
     if (button.dataset.action === "confirm-page") return confirmPage();
-    if (button.dataset.action === "confirm-line") return confirmLine(button.dataset.line);
+    if (button.dataset.action === "confirm-line") return await confirmLine(button.dataset.line);
     if (button.dataset.action === "unpack-line") return unpackLine(button.dataset.line);
     if (button.dataset.action === "update-packed-line") return updatePackedLine(button.dataset.line);
     if (button.dataset.action === "unpack-order") {
@@ -8879,56 +9089,10 @@ app.addEventListener("input", async (event) => {
     historyReportReason = event.target.value;
     return;
   }
-  if (event.target?.id === "receivingSearch") {
-    receivingSearch = event.target.value;
-    receivingOrderPage = 0;
-    window.clearTimeout(app.receivingSearchTimer);
-    app.receivingSearchTimer = window.setTimeout(async () => {
-      try {
-        if (receivingSearch.trim()) {
-          receivingStep = "orders";
-          receivingSelectedVendor = "";
-          receivingSelectedSourceId = "";
-          await loadReceivingOrders({ keepSelection: false });
-          window.requestAnimationFrame(() => focusReceivingInput("receivingSearch"));
-        } else {
-          receivingSelectedId = null;
-          receivingSelectedOrder = null;
-          receivingOrders = [];
-          render();
-          window.requestAnimationFrame(() => focusReceivingInput("receivingSearch"));
-        }
-      } catch (error) {
-        showToast(error.message);
-      }
-    }, 250);
-    return;
-  }
-  if (event.target?.id === "receivingItemSearch") {
-    receivingItemSearch = event.target.value;
-    receivingOrderPage = 0;
-    window.clearTimeout(app.receivingItemTimer);
-    app.receivingItemTimer = window.setTimeout(async () => {
-      try {
-        await loadReceivingItemSuggestions();
-        if (receivingItemSearch.trim()) {
-          receivingStep = "orders";
-          receivingSelectedVendor = "";
-          receivingSelectedSourceId = "";
-          await loadReceivingOrders({ keepSelection: false });
-          window.requestAnimationFrame(() => focusReceivingInput("receivingItemSearch"));
-        } else {
-          receivingItemSuggestions = [];
-          receivingSelectedId = null;
-          receivingSelectedOrder = null;
-          receivingOrders = [];
-          render();
-          window.requestAnimationFrame(() => focusReceivingInput("receivingItemSearch"));
-        }
-      } catch (error) {
-        showToast(error.message);
-      }
-    }, 250);
+  if (event.target?.id === "receivingSearch" || event.target?.id === "receivingItemSearch") {
+    if (event.target.id === "receivingSearch") receivingSearch = event.target.value;
+    else receivingItemSearch = event.target.value;
+    scheduleReceivingSearch();
     return;
   }
   if (event.target?.id !== "cycleSearch") return;
@@ -8948,6 +9112,11 @@ app.addEventListener("input", async (event) => {
 });
 
 app.addEventListener("keydown", async (event) => {
+  if (["receivingSearch", "receivingItemSearch"].includes(event.target?.id) && event.key === "Enter") {
+    event.preventDefault();
+    await scheduleReceivingSearch({ immediate: true });
+    return;
+  }
   if (event.target?.id === "returnOrderLookup" && event.key === "Enter") {
     event.preventDefault();
     await lookupReturnOrder(event.target.value);
@@ -9016,9 +9185,7 @@ app.addEventListener("submit", async (event) => {
       window.location.replace(staffRoleHome(operator.role));
       return;
     }
-    connectEvents();
-    showToast(`Welcome ${operator.display_name}`);
-    await restoreOperatorView();
+    reloadOperatorWorkspace();
   } catch (error) {
     renderLogin("Invalid username or password.");
   }
@@ -9041,6 +9208,7 @@ async function boot() {
       window.location.replace(staffRoleHome(operator.role));
       return;
     }
+    if (!(await prepareOperatorWorkspace())) return;
     connectEvents();
     await restoreOperatorView();
   } catch (error) {
@@ -9048,6 +9216,14 @@ async function boot() {
     renderLogin("Please login to continue.");
   }
 }
+
+window.addEventListener("focus", () => { refreshOperatorAccess().catch(() => {}); });
+document.addEventListener("visibilitychange", () => {
+  if (document.visibilityState === "visible") refreshOperatorAccess().catch(() => {});
+});
+window.addEventListener("storage", (event) => {
+  if ([STAFF_TOKEN_KEY, TOKEN_KEY].includes(event.key) && readOperatorToken() !== authToken) reloadOperatorWorkspace();
+});
 
 boot();
 setInterval(() => {
@@ -9121,6 +9297,9 @@ window.addEventListener("appinstalled", () => {
 });
 
 window.addEventListener("mbbs-language-changed", () => {
+  if (currentModule === "receiving") {
+    app.querySelector("[data-receiving-main]")?.removeAttribute("data-receiving-main");
+  }
   if (returnScannerActive) {
     stopReturnScannerCamera();
     render();

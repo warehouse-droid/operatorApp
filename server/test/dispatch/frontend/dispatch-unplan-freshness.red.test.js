@@ -70,5 +70,5 @@ test("a full plan save commits assignment projections with its snapshot", () => 
 });
 
 test("Dispatch requests the unplan-freshness client generation", () => {
-  assert.match(dispatchPage, /dispatch\.js\?v=20260911-maps-usage-v1/);
+  assert.match(dispatchPage, /dispatch\.js\?v=20260911-map-geometry-v2/);
 });

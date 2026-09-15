@@ -1,5 +1,5 @@
 import { dispatchDependencyOrderRefs } from "./yard-dependency-structure.js";
-import { dispatchRequiredPickupVisitLocations } from "./dispatch-pickup-visits.js";
+import { dispatchLoadProtectedBoundary, dispatchRequiredPickupVisitLocations } from "./dispatch-pickup-visits.js";
 
 function text(value) {
   return String(value ?? "").trim();
@@ -175,11 +175,12 @@ function insertionIndexForTarget(load = {}, targetRefs = []) {
   return index >= 0 ? index + 1 : (load.stops || []).length;
 }
 
-function reconcilePurchaseOrderResidualDrops({ trucks = [], orders = [], affected = new Set() } = {}) {
+function reconcilePurchaseOrderResidualDrops({ trucks = [], orders = [], affected = new Set(), preservedPoOrderRefs = new Set() } = {}) {
   const nextTrucks = mutableLoads(trucks);
   const loads = flatLoads(nextTrucks);
   const uniqueOrders = [...new Map(orders.map((order) => [text(order.id).toLowerCase(), order])).values()];
   const projectedPurchaseOrders = uniqueOrders.filter((order) => {
+    if (preservedPoOrderRefs.has(text(order.id).toLowerCase())) {return false;}
     const projection = purchaseOrderRouteProjection(order);
     if (!projection) {return false;}
     const orderRefs = dispatchDependencyOrderRefs(order).map((value) => text(value).toLowerCase());
@@ -238,16 +239,20 @@ function reconcilePurchaseOrderResidualDrops({ trucks = [], orders = [], affecte
   return nextTrucks;
 }
 
-function reconcileLoad(load = {}, ordersByRef, affected, plan) {
+function reconcileLoad(load = {}, ordersByRef, affected, plan, activity) {
   let stops = Array.isArray(load.stops) ? load.stops.map((stop) => ({ ...stop })) : [];
+  const boundary = dispatchLoadProtectedBoundary(load, activity);
+  const protectedIds = new Set(stops.slice(0, boundary + 1).map(stop => text(stop.id)));
   const requirements = requirementsForStops(stops, ordersByRef);
 
   stops = stops.filter((stop) => {
+    if (protectedIds.has(text(stop.id))) {return true;}
     if (stop?.type !== "pick" || stop.dependencyManaged !== true) {return true;}
     const stillRequired = requirements.some((entry) => samePlace(entry.location, stop.location));
     if (stillRequired) {
       stop.dependencyTargetRefs = refs(requirements
-        .filter((entry) => samePlace(entry.location, stop.location))
+        .filter((entry) => samePlace(entry.location, stop.location)
+          && (!Array.isArray(stop.orderRefs) || refs(stop.orderRefs).includes(entry.targetRef)))
         .map((entry) => entry.targetRef));
       return true;
     }
@@ -259,15 +264,22 @@ function reconcileLoad(load = {}, ordersByRef, affected, plan) {
   for (let index = 0; index < stops.length; index += 1) {
     const drop = stops[index];
     if (drop?.type !== "drop" || !text(drop.orderId)) {continue;}
+    if (protectedIds.has(text(drop.id))) {continue;}
     const order = ordersByRef.get(text(drop.orderId).toLowerCase());
     if (!order) {continue;}
     const targetRef = targetRefForDrop(drop, order);
     if (!affected.has(targetRef.toLowerCase())
       && !dispatchDependencyOrderRefs(order).some((ref) => affected.has(ref.toLowerCase()))) {continue;}
     const locations = requiredPickupLocations(order, plan);
+    const isSov = dispatchDependencyOrderRefs(order).some(ref => /^SOV/iu.test(ref));
     for (const location of locations) {
-      const priorPickup = stops.slice(0, index).find((stop) => stop?.type === "pick" && samePlace(stop.location, location));
+      const priorPickup = stops.slice(0, index).find((stop) => stop?.type === "pick" && samePlace(stop.location, location)
+        && (!isSov || !protectedIds.has(text(stop.id)) || refs(stop.orderRefs || [stop.orderId]).includes(targetRef)));
       if (priorPickup) {
+        if (isSov && !protectedIds.has(text(priorPickup.id)) && Array.isArray(priorPickup.orderRefs)) {
+          priorPickup.orderRefs = refs([...priorPickup.orderRefs, targetRef]);
+        }
+        if (protectedIds.has(text(priorPickup.id))) {continue;}
         if (priorPickup.dependencyManaged === true) {
           priorPickup.dependencyTargetRefs = refs([...(priorPickup.dependencyTargetRefs || []), targetRef]);
         }
@@ -277,6 +289,7 @@ function reconcileLoad(load = {}, ordersByRef, affected, plan) {
         id: `scm-dependency-pick-${safeIdPart(targetRef)}-${safeIdPart(location)}-${index}`,
         type: "pick",
         orderId: targetRef,
+        ...(isSov ? { orderRefs: [targetRef] } : {}),
         location,
         dependencyManaged: true,
         dependencySource: "scm-dependency-management",
@@ -292,7 +305,9 @@ function reconcileLoad(load = {}, ordersByRef, affected, plan) {
 export function reconcileDependencyManagedPickups({
   plan = {},
   enrichedOrders = [],
-  affectedTargetRefs = []
+  affectedTargetRefs = [],
+  preservedPoOrderRefs = new Set(),
+  activity = []
 } = {}) {
   const enrichedByRef = orderIndex(enrichedOrders);
   const orders = (plan.orders || []).map((order) => {
@@ -311,14 +326,15 @@ export function reconcileDependencyManagedPickups({
   const residualTrucks = reconcilePurchaseOrderResidualDrops({
     trucks: plan.trucks || [],
     orders,
-    affected
+    affected,
+    preservedPoOrderRefs
   });
   return {
     ...plan,
     orders,
     trucks: residualTrucks.map((truck) => ({
       ...truck,
-      loads: (truck.loads || []).map((load) => reconcileLoad(load, ordersByRef, affected, plan))
+      loads: (truck.loads || []).map((load) => reconcileLoad(load, ordersByRef, affected, plan, activity))
     }))
   };
 }

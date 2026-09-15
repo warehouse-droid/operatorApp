@@ -154,11 +154,11 @@ test("DP-12: ordinary order events patch only the pool and preserve its scroll p
 
   const poolPatch = functionBody("renderDispatchOrderPoolPatch");
   assert.match(poolPatch, /previousScrollTop/u);
-  assert.match(poolPatch, /nextList\.scrollTop\s*=\s*previousScrollTop/u);
-  assert.match(poolPatch, /requestAnimationFrame/u,
-    "The browser must restore the pool offset again after layout settles.");
-  assert.match(poolPatch, /selectionEnd/u,
-    "An order update must retain the complete search selection, not collapse it.");
+  assert.match(poolPatch, /list\.scrollTop\s*=\s*previousScrollTop/u);
+  assert.doesNotMatch(poolPatch, /current\.outerHTML\s*=/u,
+    "A data refresh must preserve the mounted search input and order pool.");
+  assert.match(poolPatch, /patchDispatchPoolNode/u,
+    "Updates must reconcile the mounted pool without rebuilding its controls.");
 });
 
 test("DP-13: unchanged execution polling cannot rebuild the planner, preview, or map", () => {

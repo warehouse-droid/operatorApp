@@ -75,7 +75,7 @@ test("RP-08 sequence, timing, capacity, labels, and tooltips use visit-scoped or
   assert.match(dispatchSource, /Visit \$\{visitNumber\}\/\$\{visitCount\}/);
   assert.match(dispatchSource, /pickupOrdersForStop\(foundStop\.load, stop\)/);
   assert.match(dispatchHtml, /dispatch\.css\?v=20260903-repeat-pickup-visits-v1/);
-  assert.match(dispatchHtml, /dispatch\.js\?v=20260911-maps-usage-v1/);
+  assert.match(dispatchHtml, /dispatch\.js\?v=20260911-map-geometry-v2/);
 });
 
 test("RP-06 save paths preserve untouched legacy loads and validate opted-in loads", () => {

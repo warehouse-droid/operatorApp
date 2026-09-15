@@ -18,5 +18,5 @@ test("PO edit form exposes an optional delivery override and requests a targeted
     source,
     /isPurchaseOrderDeliveryOverride\s*\? `\/api\/dispatch\/orders\/\$\{encodeURIComponent\(order\.id\)\}\/details\?response=targeted`\s*:\s*`\/api\/dispatch\/orders\/\$\{encodeURIComponent\(order\.id\)\}\/details\?response=ack`/u
   );
-  assert.match(source, /if \(!isPurchaseOrderDeliveryOverride\) order\.address = data\.address;/u);
+  assert.match(source, /if \(!isPurchaseOrderDeliveryOverride\) \{[\s\S]*?order\.destinationAddress = address;/u);
 });

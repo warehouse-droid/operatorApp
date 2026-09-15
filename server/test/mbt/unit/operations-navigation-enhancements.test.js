@@ -122,13 +122,13 @@ test("operation cycle-count facets paginate independently from the SKU result li
 
 test("operator cache assets advance with the cycle-count pagination release", () => {
   for (const asset of [
-    "/operator.css?v=20260825-fulfillment-layout-v1",
-    "/operator.js?v=20260825-fulfillment-layout-v1"
+    "/operator.css?v=20260915-operator-yards-v1",
+    "/operator.js?v=20260915-operator-yards-v1"
   ]) {
     assert.ok(operatorHtml.includes(asset));
     assert.ok(serviceWorker.includes(asset));
   }
-  assert.ok(serviceWorker.includes("mbbs-yard-operator-v143-linked-quantity-i18n-v1"));
+  assert.ok(serviceWorker.includes("mbbs-yard-operator-v145-yard-access-v1"));
 });
 
 test("Dispatch and SCM card menus scroll within the fixed-height application shell", () => {

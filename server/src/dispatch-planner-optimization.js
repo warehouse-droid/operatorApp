@@ -52,7 +52,7 @@ export function normalizeDispatchPlannerMode(value) {
 
 function compactCardItem(item = {}) {
   const fields = [
-    "id", "lineId", "lineUniqueKey", "sku", "itemName", "description", "quantity",
+    "id", "itemId", "lineRowId", "lineId", "lineUniqueKey", "sku", "itemName", "description", "quantity",
     "pallets", "layers", "sections", "pieces", "salesQty", "unit", "uom", "location",
     "locationId", "sourceYard", "destinationYard"
   ];

@@ -7,6 +7,9 @@ import {
   DRIVER_PWA_MINIMUM_VERSION
 } from "./driver-client-version.js";
 import { selectDriverRouteCursor } from "./driver-route-cursor.js";
+import { DISPATCH_FLEET_PLANNING_LOCK } from "./dispatch-fleet-status.js";
+import { writeDispatchAudit } from "./dispatch-audit-repository.js";
+import { supersedeDriverOfflineManifests } from "./driver-offline-repository.js";
 import { createSamsaraDriverVehicleAssignment, createSamsaraMechanicDvir, findSamsaraDvirForVehicle, setSamsaraDriverDutyStatus } from "./samsara.js";
 import {
   dispatchLoadAssignment,
@@ -40,11 +43,14 @@ import {
   uniqueDriverPhotoReferences
 } from "./driver-completed-photo-evidence.js";
 
+import { VOYAGE_DISPATCH_YARD } from "./dispatch-sales-order-locations.js";
+
 const YARD_ADDRESSES = {
   "3445": "3445 Kennedy Road, Toronto, ON",
   "2967": "2967 Kennedy Road, Toronto, ON",
   "12441": "12441 Woodbine Avenue, Whitchurch-Stouffville, ON",
-  "150": "150 Clark Blvd, Brampton, ON L6T 4Y8, Canada"
+  "150": "150 Clark Blvd, Brampton, ON L6T 4Y8, Canada",
+  [VOYAGE_DISPATCH_YARD.code]: VOYAGE_DISPATCH_YARD.address
 };
 const SAMSARA_ACCOUNT_LIMIT_MS = 8 * 60 * 60 * 1000;
 
@@ -1016,8 +1022,8 @@ async function jobStatusMap(jobIds) {
 async function activeDriverJobRecords(planId, driverLogin) {
   if (!planId || !driverKey(driverLogin)) return [];
   const result = await query(
-    `SELECT job_id, status, started_at, completed_at, load_id, stop_id,
-            stop_type, job_details
+    `SELECT id, job_id, status, started_at, completed_at, load_id, stop_id,
+            stop_type, job_details, plan_id, plan_date, driver_login, truck_id, truck_plate
        FROM driver_job_records
       WHERE plan_id = $1
         AND lower(driver_login) = $2
@@ -1291,6 +1297,81 @@ function normalizedPlate(value) {
   return String(value || "").replace(/\s+/g, "").toUpperCase();
 }
 
+function removedActiveTravel(records, jobs) {
+  const currentIds = new Set(jobs.map((job) => String(job.jobId)));
+  return records.filter((record) =>
+    record.stop_type === "travel" && !currentIds.has(String(record.job_id))
+  );
+}
+
+async function closeRemovedDriverTravel(record, plan) {
+  const closedAt = new Date().toISOString();
+  const result = await query(
+    `UPDATE driver_job_records
+        SET status = 'superseded',
+            job_details = COALESCE(job_details, '{}'::jsonb) || $2::jsonb
+      WHERE id = $1 AND status = 'in_progress' AND stop_type = 'travel'
+      RETURNING *`,
+    [record.id, JSON.stringify({
+      travelSupersededAt: closedAt,
+      travelSupersededReason: "removed_from_confirmed_route",
+      travelSupersededPlanRevision: Number(plan.revision || 0)
+    })]
+  );
+  if (!result.rows.length) return;
+  await writeDispatchAudit({
+    action: "driver_travel_superseded",
+    entityType: "driver_job",
+    entityId: record.job_id,
+    loadId: record.load_id,
+    truckId: record.truck_id,
+    planId: record.plan_id,
+    planDate: plan.planDate,
+    operatorName: "system",
+    source: "driver_route_reconciliation",
+    before: record,
+    after: result.rows[0],
+    details: { reason: "removed_from_confirmed_route", planRevision: Number(plan.revision || 0) }
+  });
+  await query(
+    `UPDATE driver_offline_events
+        SET status = 'evidence_only', review_reason = '',
+            application_result = COALESCE(application_result, '{}'::jsonb) || $4::jsonb,
+            server_applied_at = COALESCE(server_applied_at, now()),
+            case_version = case_version + 1, updated_at = now()
+      WHERE lower(driver_login) = $1 AND plan_date = $2::date
+        AND original_job_id = $3
+        AND status IN ('registered', 'waiting_photos', 'pending', 'applying', 'review_required', 'blocked', 'resolution_pending')`,
+    [driverKey(record.driver_login), plan.planDate, record.job_id, JSON.stringify({
+      disposition: "evidence_only", reason: "travel_removed_from_confirmed_route", travelSupersededAt: closedAt
+    })]
+  );
+  await refreshProjectedLoadExecution({ planId: record.plan_id, loadId: record.load_id, driverLogin: record.driver_login });
+}
+
+async function driverAssignmentWithCurrentTravel(driverLogin, date, { allowBin = false } = {}) {
+  const assignment = await activeDriverAssignment(driverLogin, date);
+  if (!assignment) return null;
+  const jobs = planJobsForDriver(assignment.plan, driverLogin, { allowBin });
+  const active = await activeDriverJobRecords(assignment.plan.id, driverLogin);
+  if (!removedActiveTravel(active, jobs).length) return assignment;
+  return withTransaction(async () => {
+    await query("SELECT pg_advisory_xact_lock(hashtext($1))", [DISPATCH_FLEET_PLANNING_LOCK]);
+    await query("SELECT pg_advisory_xact_lock(hashtext($1), hashtext($2))", [driverKey(driverLogin), assignment.plan.planDate]);
+    // A save or Driver action may have committed while this refresh waited.
+    const current = await activeDriverAssignment(driverLogin, date);
+    if (!current) return null;
+    const currentJobs = planJobsForDriver(current.plan, driverLogin, { allowBin });
+    const currentActive = await activeDriverJobRecords(current.plan.id, driverLogin);
+    const removed = removedActiveTravel(currentActive, currentJobs);
+    for (const record of removed) await closeRemovedDriverTravel(record, current.plan);
+    if (removed.length) {
+      await supersedeDriverOfflineManifests({ driverLogin, planDate: current.plan.planDate });
+    }
+    return current;
+  });
+}
+
 function isSamsaraOnDutyConfirmed(row) {
   const response = row?.samsara_on_duty_response || {};
   const clock = response.clock || {};
@@ -1406,7 +1487,7 @@ export async function getDriverDayState(driverLogin, {
   const normalizedSamsaraAccounts = samsaraAccountsFromLegacy(samsaraUsername, samsaraAccounts);
   const samsaraEnabled = normalizedSamsaraAccounts.enabled === true;
   const requestedDate = planDateValue(date);
-  const assignment = await activeDriverAssignment(driverLogin, requestedDate);
+  const assignment = await driverAssignmentWithCurrentTravel(driverLogin, requestedDate, { allowBin });
   const plan = assignment?.plan || { id: null, planDate: requestedDate || todayLocalDate() };
   const initialTruck = assignment?.initialTruck || assignment?.truck || {};
   let row = await upsertDriverDayBase({ driverLogin, plan, truck: initialTruck, samsaraAccounts: normalizedSamsaraAccounts });
@@ -2251,6 +2332,7 @@ async function attachDriverDeliveryInstructions(materialized, preloadedInstructi
 }
 
 async function materializeDriverJob(plan, job, status = null, { deferDeliveryInstructions = false } = {}) {
+  if (job.stopType === "travel" && status?.status === "superseded") status = null;
   const materialized = {
     ...job,
     status: status?.status || "pending",
@@ -2372,11 +2454,8 @@ export async function getDriverDayJobs(driverLogin, {
 } = {}) {
   const planDate = planDateValue(date) || todayLocalDate();
   const login = driverKey(driverLogin);
-  const plans = await confirmedPlans({ startDate: planDate });
-  const plan = plans.find((candidate) =>
-    candidate.planDate === planDate
-    && driverLoadAssignments(candidate, login).length > 0
-  );
+  const assignment = await driverAssignmentWithCurrentTravel(login, planDate, { allowBin });
+  const plan = assignment?.plan;
   if (!plan) {
     return {
       planId: null,
@@ -2424,7 +2503,7 @@ export async function getDriverNextJobContext(driverLogin, {
   minimumClientVersion = DRIVER_PWA_MINIMUM_VERSION,
   date = ""
 } = {}) {
-  const assignment = await activeDriverAssignment(driverLogin, date);
+  const assignment = await driverAssignmentWithCurrentTravel(driverLogin, date, { allowBin });
   if (!assignment) {
     return {
       planId: null,
@@ -2576,7 +2655,10 @@ export async function startDriverJob(driverLogin, jobIdValue, {
      )
      ON CONFLICT (job_id) DO UPDATE SET
        status = CASE WHEN driver_job_records.status = 'complete' THEN driver_job_records.status ELSE 'in_progress' END,
-       started_at = COALESCE(driver_job_records.started_at, EXCLUDED.started_at, now()),
+       started_at = CASE
+         WHEN driver_job_records.status = 'superseded' AND driver_job_records.stop_type = 'travel'
+           THEN EXCLUDED.started_at
+         ELSE COALESCE(driver_job_records.started_at, EXCLUDED.started_at, now()) END,
        plan_id = EXCLUDED.plan_id,
        plan_date = EXCLUDED.plan_date,
        driver_login = EXCLUDED.driver_login,

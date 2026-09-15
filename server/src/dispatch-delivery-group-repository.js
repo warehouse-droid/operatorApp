@@ -868,6 +868,24 @@ export async function reconcileDispatchGlobalOrderTransitCos() {
   });
 }
 
+function groupedSalesOrderDeliveryFields(order = {}, children = []) {
+  if (text(order.type).toUpperCase() !== "SO" || !children.length) return {};
+  const previous = Array.isArray(order.childOrderDetails) ? order.childOrderDetails : [];
+  const representativeRef = text(order.groupKey || previous[0]?.id || children[0]?.id).toLowerCase();
+  const representative = children.find((child) => text(child.id).toLowerCase() === representativeRef) || children[0];
+  const prior = previous.find((child) => text(child.id).toLowerCase() === representativeRef);
+  const currentAddress = text(order.address);
+  // Grouping inherits the first selected member's address. Keep deliberate
+  // group-only edits while refreshing inherited addresses with their source.
+  const manuallyChanged = prior && currentAddress !== text(prior.address);
+  const address = manuallyChanged ? currentAddress : text(representative.address);
+  return {
+    address,
+    destinationAddress: address,
+    defaultDestinationAddress: text(representative.defaultDestinationAddress ?? representative.address)
+  };
+}
+
 function aggregateGlobalGroup(order = {}, childOrderDetails = [], { preserveTransitCo = false } = {}) {
   // A CO for a grouped SO/TO owns its persisted manifest. Source children are
   // informational and may be incomplete cards, not constituent CO cargo.
@@ -891,6 +909,7 @@ function aggregateGlobalGroup(order = {}, childOrderDetails = [], { preserveTran
       : pickupLocations[0] || existingSourceYard;
   return {
     ...order,
+    ...groupedSalesOrderDeliveryFields(order, childOrderDetails),
     childOrders: childOrderDetails.map((child) => text(child?.id)).filter(Boolean),
     childOrderDetails,
     items: childOrderDetails.flatMap((child) => Array.isArray(child.items) ? child.items : []),

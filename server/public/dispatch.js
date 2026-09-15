@@ -140,6 +140,7 @@ const HUBS = {
   "2967": { x: 62, y: 52, lat: 43.806119, lng: -79.2986377, address: "2967 Kennedy Road, Toronto, ON" },
   "12441": { x: 40, y: 66, lat: 43.948694, lng: -79.3727582, address: "12441 Woodbine Avenue, Whitchurch-Stouffville, ON" },
   "150": { x: 54, y: 58, address: "150 Clark Blvd, Brampton, ON L6T 4Y8, Canada" },
+  "195": { x: 58, y: 54, address: "195 Milner Ave Unit 5, Scarborough, ON M1S 4P4" },
   "Vendor": { x: 28, y: 22, lat: 43.857, lng: -79.521 }
 };
 
@@ -499,6 +500,12 @@ let dispatchOrderPoolNextCursor = "";
 let dispatchOrderPoolLoadingMore = false;
 let dispatchOrderPoolLoaded = false;
 let dispatchOrderPoolLoadPromise = null;
+let dispatchOrderPoolLoadKey = "";
+// Search and targeted discoveries live for this page session. A bounded browse
+// response cannot tell us that an order outside its window has disappeared.
+const dispatchSessionPoolOrders = new Map();
+const dispatchOrderSearchCache = new Map();
+const dispatchOrderBrowseCursors = new Map();
 const dispatchOrderHydrationPromises = new Map();
 let modalType = "";
 let modalOrderId = "";
@@ -552,6 +559,7 @@ let dispatchForecastRequestSequence = 0;
 let dispatchForecastInFlight = false;
 let dispatchForecastPollTimer = null;
 let googleMapsPromise = null;
+const googleMapPreviewStates = new WeakMap();
 let googleMapsScriptFailed = false;
 let googleMapsAutomaticDenied = false;
 let routeEstimates = {};
@@ -2801,6 +2809,25 @@ function splitBlockReason(order) {
   return "";
 }
 
+async function refreshDispatchSplitOrder(order) {
+  if (!order) throw new Error("Select an order to split.");
+  // Local groups retain their draft membership. Canonical SO/TO packing status
+  // must be read from the source feed, even when catalog details were hydrated.
+  if (!["SO", "TO"].includes(order.type) || order.childOrders?.length) return order;
+  const request = dispatchOrderFeedRequest({ search: order.id });
+  const response = await fetch(request.url, { headers: request.headers, cache: "no-store" });
+  if (!response.ok) throw new Error(await dispatchErrorMessage(response));
+  const feed = await response.json();
+  const fresh = (Array.isArray(feed) ? feed : []).find((candidate) =>
+    String(candidate.id || "").toUpperCase() === String(order.id).toUpperCase()
+  );
+  if (!fresh || typeof fresh.operatorStatus !== "string") {
+    throw new Error(`${order.id} current packing status could not be verified. Refresh Orders and try again.`);
+  }
+  mergeDispatchOrderSearchFeed([fresh]);
+  return orderById(order.id);
+}
+
 function normalizeText(value) {
   return String(value || "").toLowerCase().replace(/[^a-z0-9]+/g, " ").trim();
 }
@@ -4038,7 +4065,10 @@ function isAuthoritativelyRetiredOrderRef(ref) {
 function setAuthoritativeOrderRetirement(ref, retired = true) {
   const key = dispatchOrderRefKey(ref);
   if (!key) return;
-  if (retired) authoritativeRetiredOrderRefs.add(key);
+  if (retired) {
+    authoritativeRetiredOrderRefs.add(key);
+    for (const retained of dispatchSessionPoolOrders.values()) retained.delete(key);
+  }
   else authoritativeRetiredOrderRefs.delete(key);
 }
 
@@ -4241,7 +4271,15 @@ function applyRetiredStructuralLiveEvent(orderRefs = []) {
 function applyDispatchOrderFeed(feed) {
   const routeSignaturesBefore = captureOperationalLoadSignatures();
   const activityEvidence = activePhysicalOrderEvidence();
-  const normalizedFeed = withoutAuthoritativelyRetiredOrders(feed);
+  const retained = dispatchSessionPoolOrders.get(dispatchOrderPoolScope()) || new Map();
+  const currentCatalog = new Map(orderCatalog.map((order) => [dispatchOrderRefKey(order.id), order]));
+  const freshById = new Map((feed || []).map((order) => [dispatchOrderRefKey(order.id), order]));
+  for (const [key, order] of retained) {
+    if (isAuthoritativelyRetiredOrderRef(order.id)) retained.delete(key);
+    else if (freshById.has(key)) retained.set(key, freshById.get(key));
+    else freshById.set(key, currentCatalog.get(key) || order);
+  }
+  const normalizedFeed = withoutAuthoritativelyRetiredOrders([...freshById.values()]);
   const nextOrders = filterDispatchOrderFeedForAppliedPlan(normalizedFeed, currentPlan, appliedPlanStructure);
   orderCatalog = nextOrders;
   const byId = new Map(orders.map((order) => [order.id, order]));
@@ -4327,6 +4365,7 @@ function mergeDispatchOrderSearchFeed(feed) {
   const normalizedFeed = withoutAuthoritativelyRetiredOrders(feed);
   const candidates = filterDispatchOrderFeedForAppliedPlan(normalizedFeed, currentPlan, appliedPlanStructure);
   if (!candidates.length) return;
+  rememberDispatchPoolOrders(candidates);
   const routeSignaturesBefore = captureOperationalLoadSignatures();
   const activityEvidence = activePhysicalOrderEvidence();
   const evidenceBaselines = new Map(orders
@@ -4360,27 +4399,86 @@ function mergeTargetedDispatchMutationOrders(payload) {
   return candidates;
 }
 
+function dispatchOrderPoolScope() {
+  return isDispatchHistoryEditMode() ? `history:${currentPlanDate}` : "live";
+}
+
+function rememberDispatchPoolOrders(feed = []) {
+  const scope = dispatchOrderPoolScope();
+  if (!dispatchSessionPoolOrders.has(scope)) dispatchSessionPoolOrders.set(scope, new Map());
+  const retained = dispatchSessionPoolOrders.get(scope);
+  for (const order of withoutAuthoritativelyRetiredOrders(feed)) {
+    retained.set(dispatchOrderRefKey(order.id), order);
+  }
+}
+
+function dispatchPoolNodeKey(node) {
+  if (node.nodeType !== 1) return "";
+  return node.id || ["data-order", "data-action", "data-mbt-bin-card"]
+    .map((name) => node.hasAttribute(name) ? `${name}:${node.getAttribute(name)}` : "")
+    .find(Boolean) || "";
+}
+
+// Keep existing cards, controls and text nodes whenever possible, including
+// when a card's data changes while the dispatcher is interacting with it.
+function patchDispatchPoolNode(current, next) {
+  if (current.isEqualNode(next)) return;
+  if (current.nodeType !== next.nodeType || current.nodeName !== next.nodeName) {
+    current.replaceWith(next.cloneNode(true));
+    return;
+  }
+  if (current.nodeType !== 1) {
+    current.nodeValue = next.nodeValue;
+    return;
+  }
+  const editing = current === document.activeElement && current.matches("input, select, textarea");
+  for (const attribute of [...current.attributes]) {
+    if (!next.hasAttribute(attribute.name) && !(editing && attribute.name === "value")) current.removeAttribute(attribute.name);
+  }
+  for (const attribute of next.attributes) {
+    if (editing && attribute.name === "value") continue;
+    if (current.getAttribute(attribute.name) !== attribute.value) current.setAttribute(attribute.name, attribute.value);
+  }
+  if (editing) return;
+  const remaining = new Set(current.childNodes);
+  const keyed = new Map([...remaining].map((node) => [dispatchPoolNodeKey(node), node]).filter(([key]) => key));
+  let cursor = current.firstChild;
+  for (const child of next.childNodes) {
+    const key = dispatchPoolNodeKey(child);
+    const existing = key ? keyed.get(key) : cursor && !dispatchPoolNodeKey(cursor) ? cursor : null;
+    if (existing && existing.nodeType === child.nodeType && existing.nodeName === child.nodeName) {
+      if (existing !== cursor) current.insertBefore(existing, cursor);
+      patchDispatchPoolNode(existing, child);
+      remaining.delete(existing);
+      cursor = existing.nextSibling;
+    } else {
+      current.insertBefore(child.cloneNode(true), cursor);
+    }
+  }
+  for (const node of remaining) node.remove();
+}
+
 function renderDispatchOrderPoolPatch() {
   const current = app.querySelector("[data-dispatch-order-pool]");
   if (!current) return;
-  const active = document.activeElement;
-  const restoreSearchFocus = active?.id === "orderSearch";
-  const selectionStart = restoreSearchFocus ? active.selectionStart : null;
-  const selectionEnd = restoreSearchFocus ? active.selectionEnd : null;
-  const previousScrollTop = current.querySelector(".order-list")?.scrollTop ?? orderListScrollTop;
-  current.outerHTML = renderOrderPool();
-  const nextList = app.querySelector("[data-dispatch-order-pool] .order-list");
-  orderListScrollTop = previousScrollTop;
-  if (nextList) nextList.scrollTop = previousScrollTop;
-  if (restoreSearchFocus) {
-    const next = document.getElementById("orderSearch");
-    next?.focus({ preventScroll: true });
-    if (selectionStart !== null) next?.setSelectionRange(selectionStart, selectionEnd ?? selectionStart);
+  const list = current.querySelector(".order-list");
+  const previousScrollTop = list?.scrollTop ?? orderListScrollTop;
+  const anchor = list && [...list.children].find((card) => card.getBoundingClientRect().bottom > list.getBoundingClientRect().top);
+  const anchorTop = anchor?.getBoundingClientRect().top;
+  const template = document.createElement("template");
+  template.innerHTML = renderOrderPool();
+  const next = template.content.firstElementChild;
+  // The search and date inputs stay mounted, even during an IME composition.
+  for (const selector of [".panel-header p", "[data-dispatch-order-actions]", ".order-type-tabs", ".order-list"]) {
+    const target = current.querySelector(selector);
+    const candidate = next.querySelector(selector);
+    if (target && candidate) patchDispatchPoolNode(target, candidate);
   }
-  window.requestAnimationFrame(() => {
-    const settledList = app.querySelector("[data-dispatch-order-pool] .order-list");
-    if (settledList) settledList.scrollTop = previousScrollTop;
-  });
+  if (list) {
+    if (anchor?.isConnected) list.scrollTop += anchor.getBoundingClientRect().top - anchorTop;
+    else list.scrollTop = previousScrollTop;
+    orderListScrollTop = list.scrollTop;
+  }
 }
 
 async function applyTargetedDispatchOrderUpdate(orderId) {
@@ -4406,6 +4504,7 @@ function cancelDispatchOrderSearch() {
 }
 
 async function loadDispatchOrderSearch(term, sequence) {
+  const scope = dispatchOrderPoolScope();
   try {
     orderSearchAbortController?.abort();
     orderSearchAbortController = new AbortController();
@@ -4421,9 +4520,13 @@ async function loadDispatchOrderSearch(term, sequence) {
     if (!response.ok) throw new Error(await response.text());
     const payload = await response.json();
     const feed = versionedPool ? payload.orders : payload;
-    if (sequence !== orderSearchSequence || term !== searchText.trim()) return;
+    if (sequence !== orderSearchSequence || term !== searchText.trim() || scope !== dispatchOrderPoolScope()) return;
     dispatchOrderPoolNextCursor = versionedPool ? payload.nextCursor || "" : "";
     mergeDispatchOrderSearchFeed(feed);
+    if (feed?.length) dispatchOrderSearchCache.set(`${scope}:${term.toLowerCase()}`, {
+      refs: feed.map((order) => dispatchOrderRefKey(order.id)),
+      nextCursor: dispatchOrderPoolNextCursor
+    });
     orderSearchError = "";
   } catch (error) {
     if (error?.name === "AbortError") return;
@@ -4439,10 +4542,20 @@ async function loadDispatchOrderSearch(term, sequence) {
 function scheduleDispatchOrderSearch() {
   if (orderSearchTimer) clearTimeout(orderSearchTimer);
   orderSearchTimer = null;
+  orderSearchAbortController?.abort();
+  orderSearchAbortController = null;
   const term = searchText.trim();
   const sequence = ++orderSearchSequence;
   orderSearchError = "";
-  orderSearchLoading = term.length >= 2;
+  const scope = dispatchOrderPoolScope();
+  const cached = dispatchOrderSearchCache.get(`${scope}:${term.toLowerCase()}`);
+  const catalogRefs = new Set(orderCatalog.map((order) => dispatchOrderRefKey(order.id)));
+  const alreadyLoaded = cached?.refs.every((ref) => catalogRefs.has(ref));
+  dispatchOrderPoolNextCursor = term
+    ? alreadyLoaded ? cached.nextCursor : ""
+    : dispatchOrderBrowseCursors.get(`${scope}:${activeOrderType}`) || "";
+  orderSearchLoading = term.length >= 2 && !alreadyLoaded;
+  if (alreadyLoaded) return;
   if (term.length < 2) return;
   orderSearchTimer = setTimeout(() => {
     orderSearchTimer = null;
@@ -4513,14 +4626,17 @@ async function refreshPlannedAssignments() {
 }
 
 async function loadDispatchOrders({ sync = false, append = false } = {}) {
-  if (!sync && !append && dispatchOrderPoolLoadPromise) return dispatchOrderPoolLoadPromise;
+  const scope = dispatchOrderPoolScope();
+  const requestedType = activeOrderType === "BIN" ? "SO" : activeOrderType;
+  const browseKey = `${scope}:${requestedType}`;
+  if (!sync && !append && dispatchOrderPoolLoadPromise && dispatchOrderPoolLoadKey === browseKey) return dispatchOrderPoolLoadPromise;
   const requestPromise = (async () => {
     try {
       const optimizedPool = !sync && dispatchConfig.plannerOrderPoolMode === "on";
       const versionedPool = optimizedPool
         || (!sync && dispatchConfig.plannerOrderPoolMode === "shadow");
       const request = dispatchOrderFeedRequest({ sync });
-      const params = new URLSearchParams({ type: activeOrderType === "BIN" ? "SO" : activeOrderType, limit: "200" });
+      const params = new URLSearchParams({ type: requestedType, limit: "200" });
       if (append && dispatchOrderPoolNextCursor) params.set("cursor", dispatchOrderPoolNextCursor);
       if (isDispatchHistoryEditMode()) params.set("historyPlanDate", currentPlanDate);
       const response = await fetch(versionedPool ? `/api/dispatch/v2/order-pool?${params.toString()}` : request.url, {
@@ -4529,12 +4645,15 @@ async function loadDispatchOrders({ sync = false, append = false } = {}) {
       });
       if (!response.ok) throw new Error(await response.text());
       const payload = await response.json();
+      if (scope !== dispatchOrderPoolScope()) return false;
       if (versionedPool) {
-        dispatchOrderPoolNextCursor = payload.nextCursor || "";
-        if (append) mergeDispatchOrderSearchFeed(payload.orders || []);
+        dispatchOrderBrowseCursors.set(browseKey, payload.nextCursor || "");
+        if (!searchText.trim() && requestedType === activeOrderType) dispatchOrderPoolNextCursor = payload.nextCursor || "";
+        if (append || requestedType !== activeOrderType) mergeDispatchOrderSearchFeed(payload.orders || []);
         else applyDispatchOrderFeed(payload.orders || []);
       } else {
-        dispatchOrderPoolNextCursor = "";
+        dispatchOrderBrowseCursors.set(browseKey, "");
+        if (!searchText.trim()) dispatchOrderPoolNextCursor = "";
         applyDispatchOrderFeed(sync ? payload.orders : payload);
       }
       dispatchOrderPoolLoaded = true;
@@ -4548,6 +4667,7 @@ async function loadDispatchOrders({ sync = false, append = false } = {}) {
   })();
   if (sync || append) return requestPromise;
   dispatchOrderPoolLoadPromise = requestPromise;
+  dispatchOrderPoolLoadKey = browseKey;
   try {
     return await requestPromise;
   } finally {
@@ -4584,9 +4704,9 @@ async function loadMoreDispatchOrders() {
   }
 }
 
-async function hydrateDispatchOrder(orderId) {
+async function hydrateDispatchOrder(orderId, { force = false } = {}) {
   const order = orderById(orderId);
-  if (!order || order.catalogHydrated !== false) return order;
+  if (!order || (!force && order.catalogHydrated !== false)) return order;
   const key = String(order.id || orderId);
   if (dispatchOrderHydrationPromises.has(key)) return dispatchOrderHydrationPromises.get(key);
   const hydration = applyTargetedDispatchOrderUpdate(order.id)
@@ -4594,6 +4714,30 @@ async function hydrateDispatchOrder(orderId) {
     .finally(() => dispatchOrderHydrationPromises.delete(key));
   dispatchOrderHydrationPromises.set(key, hydration);
   return hydration;
+}
+
+function dispatchGroupOrderNeedsHydration(order) {
+  if (!order || order.catalogHydrated === false) return true;
+  if (Number(order.itemCount || 0) > (order.items || []).length) return true;
+  if (canonicalDispatchOrderType(order.type, order.id) === "CO" && !isAggregateDispatchCoGroup(order)) return false;
+  const children = order.childOrderDetails || [];
+  if ((order.childOrders || []).some((id) => !children.some((child) => child.id === id))) return true;
+  return children.some(dispatchGroupOrderNeedsHydration);
+}
+
+async function hydrateDispatchGroupSelection() {
+  const selected = selectedOrders();
+  const ids = selected.map((order) => order.id).sort();
+  await Promise.all(selected.filter(dispatchGroupOrderNeedsHydration)
+    .map((order) => hydrateDispatchOrder(order.id, { force: true })));
+  const current = selectedOrders();
+  if (JSON.stringify(current.map((order) => order.id).sort()) !== JSON.stringify(ids)) {
+    throw new Error("The order selection changed while details loaded. Review the selection and group again.");
+  }
+  if (current.some(dispatchGroupOrderNeedsHydration)) {
+    throw new Error("Complete item details could not be loaded for every selected order.");
+  }
+  return current;
 }
 
 async function loadMbtBinDispatchCapability() {
@@ -5644,15 +5788,16 @@ function planPayload(savedAt = new Date()) {
   const payloadTrucks = withoutAuthoritativelyRetiredStops(trucksWithTimingMetadata());
   const payloadOrders = withoutAuthoritativelyRetiredOrders(orders);
   const assignedIds = assignedOrderIdsForTrucks(payloadTrucks);
+  const ownedOrAssignedOrders = payloadOrders
+    .filter((order) => assignedIds.has(order.id) || isDispatchPlanOwnedOrder(order));
   const hiddenOrderIds = new Set([
-    ...groupedChildOrderIds(payloadOrders),
-    ...splitParentOrderIds(payloadOrders)
+    ...groupedChildOrderIds(ownedOrAssignedOrders),
+    ...splitParentOrderIds(ownedOrAssignedOrders)
   ]);
   const payloadPlanId = currentPlan?.id || null;
   const payloadPlanDate = currentPlan?.planDate || currentPlanDate;
-  const transmittedOrders = payloadOrders
+  const transmittedOrders = ownedOrAssignedOrders
     .filter((order) => !hiddenOrderIds.has(order.id))
-    .filter((order) => assignedIds.has(order.id) || isDispatchPlanOwnedOrder(order))
     .map((order) => ({
       ...order,
       localDispatchStatus: assignedIds.has(order.id) ? "planned" : "open"
@@ -5817,6 +5962,13 @@ function isDispatchPlanOwnedOrder(order = {}) {
       || (sourcePlanDate && sourcePlanDate !== currentDate)
     )) return false;
   }
+  const sourceRef = String(order.raw?.tranid || "").trim().toLowerCase();
+  const canonicalSource = ["sales_orders", "local_co_orders"].includes(order.sourceTable)
+    && (!sourceRef || sourceRef === String(order.id || "").trim().toLowerCase());
+  // Pool records belong to their source lifecycle. A suffix or CO type alone
+  // does not make them new work in the open plan. Legacy unsaved splits retain
+  // the parent's raw reference; new splits also carry explicit local ownership.
+  if (canonicalSource && !order.planOwned && !order.transitCo) return false;
   return ["CO", "CUSTOM", "GROUP"].includes(String(order.type || "").toUpperCase())
     || String(order.id || "").toUpperCase().startsWith("TO-DRAFT-")
     || Boolean(order.originalOrderId)
@@ -6187,7 +6339,9 @@ function assignedOrderIdsForTrucks(truckList = trucks) {
   for (const truck of truckList || []) {
     for (const load of truck.loads || []) {
       for (const stop of load.stops || []) {
-        if (stop.orderId) ids.add(stop.orderId);
+        for (const ref of [stop.orderId, stop.orderRef, ...(Array.isArray(stop.orderRefs) ? stop.orderRefs : [])]) {
+          if (ref) ids.add(ref);
+        }
       }
     }
   }
@@ -6197,6 +6351,7 @@ function assignedOrderIdsForTrucks(truckList = trucks) {
 function groupedChildOrderIds(orderList = orders) {
   const ids = new Set();
   for (const order of orderList || []) {
+    if (canonicalDispatchOrderType(order.type, order.id) === "CO" && !isAggregateDispatchCoGroup(order)) continue;
     for (const childId of [...(order.childOrders || []), ...(order.groupAliases || [])]) {
       if (childId) ids.add(childId);
     }
@@ -7310,6 +7465,10 @@ async function resetDispatchAfterOrderDataClear() {
   orderPoolRefreshTimer = null;
   orderPoolRefreshTrailing = false;
   orderPoolRefreshReason = "";
+  cancelDispatchOrderSearch();
+  dispatchSessionPoolOrders.clear();
+  dispatchOrderSearchCache.clear();
+  dispatchOrderBrowseCursors.clear();
   dispatchStorageRemove(DISPATCH_PLAN_KEY);
   currentPlan = null;
   lastSavedAt = "";
@@ -7503,8 +7662,13 @@ async function runQueuedDispatchOrderPoolRefresh() {
   }
   orderPoolRefreshInFlight = true;
   const reason = orderPoolRefreshReason;
+  const splitOrderTarget = modalType === "split" ? orderById(modalOrderId) : null;
   try {
     if (!await loadDispatchOrders()) throw new Error("the order feed request failed");
+    if (splitOrderTarget) {
+      await refreshDispatchSplitOrder(splitOrderTarget);
+      if (modalType === "split" && modalOrderId === splitOrderTarget.id) renderDispatchModalInPlace();
+    }
     if (reason) routeNotice = reason;
     renderDispatchNoticePatch();
     renderDispatchOrderPoolPatch();
@@ -7564,7 +7728,7 @@ function queueDispatchSetupRefresh(delay = 350) {
 
 function connectEvents() {
   if (eventSource) return;
-  eventSource = new EventSource(`/api/events?client=dispatch&sessionId=${encodeURIComponent(dispatchSessionId)}`);
+  eventSource = new EventSource(`/api/events?client=dispatch&sessionId=${encodeURIComponent(dispatchSessionId)}&token=${encodeURIComponent(typeof readDispatchAuthToken === "function" ? readDispatchAuthToken() : "")}`);
   eventSource.addEventListener("app-event", (message) => {
     let event;
     try {
@@ -7646,6 +7810,11 @@ function connectEvents() {
         renderDispatchOrderPoolPatch();
       } else {
         setAuthoritativeOrderRetirement(payload.coRef, false);
+        if (payload.coRef) {
+          // A newly created CO must enter this tab's pool even when the active
+          // browse request is for SOs or its recent window excludes the CO.
+          applyTargetedDispatchOrderUpdate(payload.coRef).catch(() => null);
+        }
       }
       queueDispatchOrderPoolRefresh("Order data updated.");
       return;
@@ -8119,6 +8288,7 @@ function serializableRouteEstimateForLoad(truck, load) {
     totalMinutes: Math.max(0, Number(estimate.totalMinutes || 0)),
     legMinutes: Array.isArray(estimate.legMinutes) ? estimate.legMinutes.map(Number) : [],
     rawLegMinutes: Array.isArray(estimate.rawLegMinutes) ? estimate.rawLegMinutes.map(Number) : [],
+    ...normalizedRouteMapGeometry(estimate, stops.length),
     allowTolls: Boolean(estimate.allowTolls),
     travelTimePercent: Number(estimate.travelTimePercent || 0),
     routeEstimateId: meta.id,
@@ -8804,7 +8974,7 @@ function dispatchEditableRouteBoundary(load) {
       const travelStopId = String(record.stop_id || record.stopId || "");
       targetIndex = stops.findIndex((stop) => travelStopId.endsWith(`-${String(stop.id || "")}`));
     }
-    boundary = Math.max(boundary, targetIndex);
+    boundary = Math.max(boundary, targetIndex >= 0 ? targetIndex : stops.length - 1);
   }
   return boundary;
 }
@@ -9035,6 +9205,7 @@ function syncPickupStops() {
       for (let index = 0; index < load.stops.length; index += 1) {
         const stop = load.stops[index];
         if (stop.type !== "drop") continue;
+        if (index <= dispatchEditableRouteBoundary(load)) continue;
         const order = stopOrder(stop);
         if (order) {
           const added = ensurePickupStops(load, order, index);
@@ -9050,6 +9221,7 @@ function collapseGroupedOrderStops() {
   const groupsByMemberRef = new Map();
   for (const order of orders || []) {
     if (!order?.childOrders?.length || isScmGroupedPoOrder(order)) continue;
+    if (canonicalDispatchOrderType(order.type, order.id) === "CO" && !isAggregateDispatchCoGroup(order)) continue;
     groupsById.set(String(order.id), order);
     for (const ref of dispatchGroupingRefs(order)) {
       if (ref !== String(order.id)) groupsByMemberRef.set(ref, order);
@@ -10197,6 +10369,7 @@ function cacheRouteEstimate(truck, load, stops, estimate) {
       totalMinutes: Number(estimate.totalMinutes || 0),
       legMinutes: Array.isArray(estimate.legMinutes) ? estimate.legMinutes.map(Number) : [],
       rawLegMinutes: Array.isArray(estimate.rawLegMinutes) ? estimate.rawLegMinutes.map(Number) : [],
+      ...normalizedRouteMapGeometry(estimate, stops.length),
       allowTolls: Boolean(estimate.allowTolls),
       travelTimePercent: Number(estimate.travelTimePercent || 0),
       routeEstimateId: meta.id,
@@ -10213,13 +10386,25 @@ function applyCachedRouteEstimate(truck, load, stops = mapStopsForLoad(load, tru
   if (!load?.id) return false;
   const meta = routeEstimateMeta(truck, load, stops);
   const currentEstimate = estimateForLoad(load);
-  if (routeEstimateMatchesMeta(currentEstimate, meta) && routeEstimateHasCompleteGoogleLegs(stops, currentEstimate)) return false;
   const cached = persistedRouteEstimateCache[meta.id];
   if (
     !cached?.estimate
     || cached.signature !== meta.signature
     || !routeEstimateHasCompleteGoogleLegs(stops, cached.estimate)
   ) return false;
+  if (routeEstimateMatchesMeta(currentEstimate, meta)
+    && ["google", "google_routes_v2"].includes(currentEstimate?.source)
+    && routeEstimateHasCompleteGoogleLegs(stops, currentEstimate)) {
+    const currentGeometry = normalizedRouteMapGeometry(currentEstimate, stops.length);
+    const cachedGeometry = normalizedRouteMapGeometry(cached.estimate, stops.length);
+    const addsPins = cachedGeometry.stopCoordinates.length && !currentGeometry.stopCoordinates.length;
+    const addsPath = cachedGeometry.stopCoordinates.length && cachedGeometry.routePath.length && !currentGeometry.routePath.length;
+    if (!addsPins && !addsPath) return false;
+    // Older saved plans have timing but no map geometry. Restore only the
+    // missing preview; preserve the plan's current travel and stay estimates.
+    routeEstimates[load.id] = { ...currentEstimate, ...cachedGeometry };
+    return true;
+  }
   const estimate = {
     ...cached.estimate,
     routeEstimateId: meta.id,
@@ -10233,12 +10418,14 @@ function applyCachedRouteEstimate(truck, load, stops = mapStopsForLoad(load, tru
 
 function hydrateCachedRouteEstimates() {
   let changed = false;
-  for (const truck of trucks) {
-    for (const load of truck.loads || []) {
-      const stops = mapStopsForLoad(load, truck);
-      if (stops.length <= 1) continue;
-      if (applyCachedRouteEstimate(truck, load, stops)) changed = true;
-    }
+  // Later loads inherit departure times from earlier loads, including when a
+  // driver changes trucks. Restore their estimates in that same sequence.
+  const entries = driverOrientedPlanningEnabled() ? driverLoadEntries()
+    : trucks.flatMap((truck) => (truck.loads || []).map((load) => ({ truck, load })));
+  for (const { truck, load } of entries) {
+    const stops = mapStopsForLoad(load, effectiveTruckForLoad(truck, load));
+    if (stops.length <= 1) continue;
+    if (applyCachedRouteEstimate(truck, load, stops)) changed = true;
   }
   return changed;
 }
@@ -10430,6 +10617,7 @@ function applyServerRouteEstimate(truck, load, stops, response = {}) {
   const meta = routeEstimateMeta(truck, load, stops);
   const estimate = {
     ...response,
+    ...normalizedRouteMapGeometry(response, stops.length),
     routeEstimateId: meta.id,
     routeSignature: meta.signature,
     allowTolls: Boolean(load?.allowTolls),
@@ -10449,6 +10637,7 @@ async function googleRouteForLoad(truck, load, { reason = "confirm" } = {}) {
     return { source: "persistent-cache", stops, estimate: estimateForLoad(load) };
   }
   const meta = routeEstimateMeta(truck, load, stops);
+  const requestPlanKey = `${currentPlanDate}:${currentPlan?.id || ""}`;
   if (backgroundRouteInFlight.has(meta.id)) return null;
   backgroundRouteInFlight.add(meta.id);
   try {
@@ -10474,11 +10663,18 @@ async function googleRouteForLoad(truck, load, { reason = "confirm" } = {}) {
     });
     if (!response.ok) throw new Error(await dispatchErrorMessage(response));
     const result = await response.json();
+    const latest = findLoad(load.id);
+    const latestTruck = latest.load && effectiveTruckForLoad(latest.truck, latest.load);
+    const latestStops = latest.load ? mapStopsForLoad(latest.load, latestTruck) : [];
+    if (!latest.load || requestPlanKey !== `${currentPlanDate}:${currentPlan?.id || ""}`
+      || routeEstimateMeta(latestTruck, latest.load, latestStops).signature !== meta.signature) {
+      return { source: "fallback", status: "ROUTE_CHANGED", stops, estimate: null };
+    }
     return {
       source: result.source || "fallback",
       status: result.fallbackReason || "OK",
       stops,
-      estimate: applyServerRouteEstimate(truck, load, stops, result)
+      estimate: applyServerRouteEstimate(latestTruck, latest.load, latestStops, result)
     };
   } catch (error) {
     return { source: "fallback", status: error?.message || "ERROR", stops, estimate: null };
@@ -10505,7 +10701,84 @@ function routeEstimateChangesVisibleTiming(previousEstimate, estimate) {
     || Number(previousEstimate.driveMinutes || 0) !== Number(estimate.driveMinutes || 0)
     || Number(previousEstimate.stayMinutes || 0) !== Number(estimate.stayMinutes || 0)
     || Number(previousEstimate.travelTimePercent || 0) !== Number(estimate.travelTimePercent || 0)
-    || Boolean(previousEstimate.allowTolls) !== Boolean(estimate.allowTolls);
+    || Boolean(previousEstimate.allowTolls) !== Boolean(estimate.allowTolls)
+    || JSON.stringify(previousEstimate.routePath || []) !== JSON.stringify(estimate.routePath || [])
+    || JSON.stringify(previousEstimate.stopCoordinates || []) !== JSON.stringify(estimate.stopCoordinates || []);
+}
+
+function validRouteMapCoordinate(point) {
+  return Number.isFinite(point?.lat) && point.lat >= -90 && point.lat <= 90
+    && Number.isFinite(point?.lng) && point.lng >= -180 && point.lng <= 180;
+}
+
+function normalizedRouteMapGeometry(estimate, stopCount) {
+  const path = estimate?.routePath;
+  const pins = estimate?.stopCoordinates;
+  const validPath = Array.isArray(path) && path.length >= 2 && path.length <= 5000 && path.every(validRouteMapCoordinate);
+  const validPins = Array.isArray(pins) && stopCount >= 2 && stopCount <= 25
+    && pins.length === stopCount && pins.every(validRouteMapCoordinate);
+  return {
+    routePath: validPath ? path.map(({ lat, lng }) => ({ lat, lng })) : [],
+    stopCoordinates: validPins ? pins.map(({ lat, lng }) => ({ lat, lng })) : []
+  };
+}
+
+function routeMapPreviewData(load, stops, meta) {
+  const estimate = estimateForLoad(load);
+  const geometry = routeEstimateMatchesMeta(estimate, meta) && ["google", "google_routes_v2"].includes(estimate?.source)
+    ? normalizedRouteMapGeometry(estimate, stops.length)
+    : { routePath: [], stopCoordinates: [] };
+  const googlePins = geometry.stopCoordinates.length === stops.length && stops.length > 1;
+  const googleRoute = googlePins && geometry.routePath.length > 1;
+  const markerStops = stops.map((stop, index) => ({ ...stop, ...(googlePins ? geometry.stopCoordinates[index] : {}) }))
+    .filter(validRouteMapCoordinate);
+  return {
+    markerStops,
+    path: googleRoute ? geometry.routePath : markerStops.map(({ lat, lng }) => ({ lat, lng })),
+    source: googleRoute ? "google_route" : googlePins ? "google_stops" : "local_approximate",
+    notice: googleRoute ? "Google road route and road-matched stop positions."
+      : googlePins ? "Road geometry unavailable. Google stop positions shown; connecting lines are approximate."
+        : "Approximate local pins and connecting lines. Refresh Google estimate for road route and stop positions."
+  };
+}
+
+function updateGoogleMapPreviewGeometry(canvas) {
+  const state = googleMapPreviewStates.get(canvas);
+  if (!state) return;
+  const selected = selectedLoad();
+  if (!selected.load) return;
+  const truck = effectiveTruckForLoad(selected.truck, selected.load);
+  const stops = mapStopsForLoad(selected.load, truck);
+  const meta = routeEstimateMeta(truck, selected.load, stops);
+  if (canvas.dataset.dispatchLoadId !== String(selected.load.id) || canvas.dataset.dispatchRouteSignature !== meta.signature) return;
+  const data = routeMapPreviewData(selected.load, stops, meta);
+  const status = document.getElementById("routeMapGeometryStatus");
+  if (status) status.textContent = data.notice;
+  canvas.dataset.dispatchGeometrySource = data.source;
+  const fingerprint = JSON.stringify(data);
+  if (state.fingerprint === fingerprint) return;
+  state.fingerprint = fingerprint;
+  for (const { marker, info } of state.markers) { info.close(); marker.setMap(null); }
+  state.polyline?.setMap(null);
+  state.markers = [];
+  const bounds = new google.maps.LatLngBounds();
+  spreadOverlappingMarkers(mergeConsecutiveExactDropMarkers(data.markerStops)).forEach((stop) => {
+    const marker = new google.maps.Marker({
+      position: { lat: stop.lat, lng: stop.lng }, map: state.map, icon: mapMarkerIcon(stop), title: stop.title
+    });
+    const info = new google.maps.InfoWindow({ content: mapMarkerInfoWindowHtml(selected.load, stop) });
+    marker.addListener("click", () => info.open({ anchor: marker, map: state.map }));
+    marker.addListener("mouseover", () => info.open({ anchor: marker, map: state.map }));
+    marker.addListener("mouseout", () => info.close());
+    state.markers.push({ marker, info });
+    bounds.extend(marker.getPosition());
+  });
+  state.polyline = data.path.length > 1 ? new google.maps.Polyline({
+    path: data.path, geodesic: data.source !== "google_route", strokeColor: "#006f6b",
+    strokeOpacity: data.source === "google_route" ? 0.85 : 0.45, strokeWeight: 4, map: state.map
+  }) : null;
+  for (const point of data.path) bounds.extend(point);
+  if (!bounds.isEmpty()) state.map.fitBounds(bounds, 36);
 }
 
 async function renderGoogleMapPreview() {
@@ -10522,44 +10795,18 @@ async function renderGoogleMapPreview() {
   const available = await loadGoogleMaps();
   if (canvas !== document.getElementById("googleMapPreview")) return;
   if (!available || !window.google?.maps) {
-    canvas.innerHTML = "Local route preview is active. Google map tiles are disabled by usage policy.";
+    canvas.textContent = "Google map unavailable under the current usage policy. The planned stop sequence and timing remain available below.";
     return;
   }
-  const markerStops = stops.filter((stop) => Number.isFinite(Number(stop.lat)) && Number.isFinite(Number(stop.lng)));
   const map = new google.maps.Map(canvas, {
-    center: markerStops[0] || MAP_CENTER,
+    center: MAP_CENTER,
     zoom: 9,
     mapTypeControl: false,
     streetViewControl: false,
     fullscreenControl: false
   });
-  const bounds = new google.maps.LatLngBounds();
-  spreadOverlappingMarkers(mergeConsecutiveExactDropMarkers(markerStops)).forEach((stop) => {
-    const marker = new google.maps.Marker({
-      position: { lat: Number(stop.lat), lng: Number(stop.lng) },
-      map,
-      icon: mapMarkerIcon(stop),
-      title: stop.title
-    });
-    const info = new google.maps.InfoWindow({
-      content: mapMarkerInfoWindowHtml(load, stop)
-    });
-    marker.addListener("click", () => info.open({ anchor: marker, map }));
-    marker.addListener("mouseover", () => info.open({ anchor: marker, map }));
-    marker.addListener("mouseout", () => info.close());
-    bounds.extend(marker.getPosition());
-  });
-  if (markerStops.length > 1) {
-    new google.maps.Polyline({
-      path: markerStops.map((stop) => ({ lat: Number(stop.lat), lng: Number(stop.lng) })),
-      geodesic: true,
-      strokeColor: "#006f6b",
-      strokeOpacity: 0.55,
-      strokeWeight: 4,
-      map
-    });
-  }
-  if (!bounds.isEmpty()) map.fitBounds(bounds, 36);
+  googleMapPreviewStates.set(canvas, { map, markers: [], polyline: null, fingerprint: "" });
+  updateGoogleMapPreviewGeometry(canvas);
 }
 
 function routeLoadsNeedingEstimate() {
@@ -10836,6 +11083,7 @@ function restoreGoogleMapPreviewState(state) {
   }
   if (current.loadId !== state.loadId || current.signature !== state.signature) return false;
   replacement.replaceWith(state.canvas);
+  updateGoogleMapPreviewGeometry(state.canvas);
   return true;
 }
 
@@ -10868,6 +11116,7 @@ function renderDispatchSaveStatePatch() {
 }
 
 function renderDispatchPlannerPatch() {
+  hydrateCachedRouteEstimates();
   const uiSequence = ++renderUiSequence;
   const uiState = captureRenderUiState();
   const mapState = captureGoogleMapPreviewState();
@@ -10897,6 +11146,7 @@ function render(options = {}) {
   const mapState = captureGoogleMapPreviewState();
   orderListScrollTop = app.querySelector(".order-list")?.scrollTop ?? orderListScrollTop;
   if (save) normalizePlanBeforeSave();
+  hydrateCachedRouteEstimates();
   const planChanged = (!historyReady || save) ? captureUndoPointIfNeeded(save) : false;
   if (save && planChanged) {
     markLocalPlanDirty();
@@ -10983,7 +11233,7 @@ function renderOrderPool() {
             <input id="dispatchDate" type="date" value="${escapeHtml(dispatchDateFilter)}" />
           </label>
         </div>
-        ${renderSelectedOrderActions()}
+        <div data-dispatch-order-actions>${renderSelectedOrderActions()}</div>
       </div>
       <div class="order-type-tabs">
         ${["SO", "PO", "TO", "CO"].map((type) => `<button class="${!searching && activeOrderType === type ? "active" : ""}" data-action="order-type-tab" data-type="${type}" type="button">${type}</button>`).join("")}
@@ -11103,25 +11353,7 @@ function renderMbtBinFrontLegList() {
 }
 
 function refreshOrderPoolForSearch() {
-  const active = document.activeElement;
-  const searchSelection = active?.id === "orderSearch" && typeof active.selectionStart === "number"
-    ? { start: active.selectionStart, end: active.selectionEnd ?? active.selectionStart }
-    : null;
-  const searching = Boolean(searchText.trim());
-  const pool = document.querySelector(".panel .panel-header h2")?.closest(".panel");
-  const subtitle = pool?.querySelector(".panel-header p");
-  const tabs = pool?.querySelectorAll(".order-type-tabs button");
-  const list = pool?.querySelector(".order-list");
-  if (subtitle) subtitle.textContent = orderPoolSubtitle();
-  tabs?.forEach((button) => button.classList.toggle("active", !searching && activeOrderType === button.dataset.type));
-  if (list) list.innerHTML = renderOrderList();
-  if (searchSelection) {
-    const input = document.getElementById("orderSearch");
-    if (input && typeof input.setSelectionRange === "function") {
-      input.focus({ preventScroll: true });
-      input.setSelectionRange(searchSelection.start, searchSelection.end);
-    }
-  }
+  renderDispatchOrderPoolPatch();
 }
 
 function dispatchCompletionOrderKind(order = {}) {
@@ -12186,6 +12418,7 @@ function renderLoadPreview() {
         <section class="preview-section">
           <div class="preview-section-title">
             <strong>Maps Preview</strong>
+            <button class="sequence-toggle" data-action="refresh-google-route" data-load="${escapeHtml(load.id)}" type="button">Refresh Google estimate</button>
             <span>Pickup yards and planned drop sequence.</span>
           </div>
           ${renderPreviewMap()}
@@ -12438,11 +12671,11 @@ function renderReturnPreviewStops(load, truck, stats) {
 
 function renderPreviewMap() {
   const { truck, load } = selectedLoad();
-  const pins = mapPins();
   const estimate = estimateForLoad(load);
   const allowTolls = Boolean(load?.allowTolls);
   return `
     <div class="google-map-preview" id="googleMapPreview">Loading map...</div>
+    <div class="route-estimate-summary" id="routeMapGeometryStatus" role="status">Road geometry unavailable until a Google route estimate is available.</div>
     <div class="route-estimate-summary" id="routeEstimateSummary">
       ${estimate ? routeEstimateSummaryHtml(estimate, truck) : `<strong>Local route timing active</strong><span>Google refinement runs only on confirmation or an explicit refresh.</span>`}
     </div>
@@ -12451,11 +12684,6 @@ function renderPreviewMap() {
         ${allowTolls ? "Tolls Allowed" : "Avoid Tolls"}
       </button>
       <span>${allowTolls ? "Google may use toll roads for faster ETA." : "Default: route avoids toll roads."}</span>
-      <button data-action="refresh-google-route" data-load="${escapeHtml(load?.id || "")}" type="button">Refresh Google estimate</button>
-    </div>
-    <div class="map-preview load-map-preview fallback-map-preview">
-      <div class="route-line"></div>
-      ${pins.map((pin) => `<div class="map-pin ${pin.className}" style="left:${pin.x}%;top:${pin.y}%">${pin.label}</div>`).join("")}
     </div>
   `;
 }
@@ -14080,6 +14308,7 @@ function splitOrder(orderId, parts = 2, startSuffix = 1) {
     return {
       ...order,
       id: `${order.id}-S${cleanStartSuffix + index}`,
+      planOwned: true,
       pallets: totals.pallets,
       layers: 0,
       items: totals.items,
@@ -14317,6 +14546,10 @@ function groupOrder(orderId) {
   const groupItems = selected.length > 1 ? selected : [];
   if (groupItems.length < 2) {
     routeNotice = "Select at least two orders before grouping.";
+    return false;
+  }
+  if (groupItems.some(dispatchGroupOrderNeedsHydration)) {
+    routeNotice = "Load complete item details for every selected order before grouping.";
     return false;
   }
   if (groupItems.some((item) => item.type === "CUSTOM")) {
@@ -14662,6 +14895,7 @@ async function saveTransitCoToServer(sourceOrder, coOrder) {
   if (!response.ok) throw new Error(await response.text());
   const payload = await response.json();
   setAuthoritativeOrderRetirement(coOrder.id, false);
+  mergeDispatchOrderSearchFeed([orderById(coOrder.id) || coOrder]);
   return payload;
 }
 
@@ -15400,7 +15634,7 @@ app.addEventListener("click", async (event) => {
     routeNotice = "Refreshing this load's Google estimate…";
     renderDispatchNoticePatch();
     const result = await googleRouteForLoad(found.truck, found.load, { reason: "manual_refresh" });
-    const usedGoogle = result?.source === "google_routes_v2";
+    const usedGoogle = result?.source === "google_routes_v2" && Boolean(result.estimate);
     routeNotice = usedGoogle
       ? "Google estimate refreshed for this load."
       : `Local estimate remains active (${result?.status || "Google budget unavailable"}); no request is queued for later.`;
@@ -15731,11 +15965,24 @@ app.addEventListener("click", async (event) => {
     return;
   }
   if (action === "open-split-modal") {
+    const requestedPlanDate = currentPlanDate;
+    const requestedSelection = selectedOrderId;
+    button.disabled = true;
+    let splitOrderTarget;
+    try {
+      splitOrderTarget = await refreshDispatchSplitOrder(orderById(actionOrderId));
+    } catch (error) {
+      routeNotice = `Split status check failed: ${error.message}`;
+      renderDispatchNoticePatch();
+      return;
+    } finally {
+      button.disabled = false;
+    }
+    if (currentPlanDate !== requestedPlanDate || selectedOrderId !== requestedSelection || !splitOrderTarget) return;
     modalType = "split";
     modalOrderId = actionOrderId;
-    const splitOrderTarget = orderById(actionOrderId);
     splitParts = Math.max(2, Math.ceil((orderFootprintPallets(splitOrderTarget) || 2) / 10));
-    ensureSplitDraft(orderById(actionOrderId), true);
+    ensureSplitDraft(splitOrderTarget, true);
     renderDispatchModalInPlace();
     return;
   }
@@ -15899,6 +16146,13 @@ app.addEventListener("click", async (event) => {
     return;
   }
   if (action === "confirm-group") {
+    try {
+      await hydrateDispatchGroupSelection();
+    } catch (error) {
+      routeNotice = `Grouping failed: ${error.message}`;
+      render({ save: false });
+      return;
+    }
     const selectedBefore = selectedOrders();
     const before = selectedBefore.map(summarizeOrder);
     const replacedGroupRefs = selectedBefore
@@ -17275,7 +17529,12 @@ app.addEventListener("submit", async (event) => {
         });
     saveDetails.then((payload) => {
       const pickupAddress = String(data.pickupAddress || "").trim();
-      if (!isPurchaseOrderDeliveryOverride) order.address = data.address;
+      if (!isPurchaseOrderDeliveryOverride) {
+        const address = String(payload.updated?.dispatch_address ?? data.address ?? "").trim();
+        order.address = address;
+        order.destinationAddress = address;
+        order.defaultDestinationAddress = address;
+      }
       order.pickupAddressOverride = pickupAddress;
       order.sourceAddress = pickupAddress || order.defaultSourceAddress || "";
       order.expectedDeliveryDate = data.expectedDeliveryDate || "";

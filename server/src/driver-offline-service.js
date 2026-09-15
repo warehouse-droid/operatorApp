@@ -143,6 +143,28 @@ async function supersedingDriverPwaCorrection(event, manifest) {
   return result.rows[0] || null;
 }
 
+async function supersededTravelEvidence(event, manifest) {
+  if (!event?.jobId || !manifest?.generatedAt) return null;
+  if (jobSnapshotForEvent(manifest, event)?.stopType !== "travel") return null;
+  const result = await query(
+    `SELECT job_details->>'travelSupersededAt' AS closed_at
+       FROM driver_job_records
+      WHERE job_id = $1 AND lower(driver_login) = lower($2)
+        AND plan_date = $3::date AND stop_type = 'travel'
+        AND (job_details->>'travelSupersededAt')::timestamptz > $4::timestamptz`,
+    [event.jobId, event.driverLogin, event.planDate, manifest.generatedAt]
+  );
+  if (!result.rows.length) return null;
+  return markDriverOfflineEventEvidenceOnly(event.eventId, {
+    reason: "This travel leg was removed from the confirmed route and closed automatically.",
+    result: {
+      code: "DRIVER_TRAVEL_SUPERSEDED",
+      travelSupersededAt: result.rows[0].closed_at,
+      disposition: "evidence_only"
+    }
+  });
+}
+
 function currentJobEntries(currentPlan, driverLogin) {
   if (!currentPlan?.jobs?.length) return [];
   return materializeDriverOfflineJobs(currentPlan.jobs, driverLogin).map((entry) => ({
@@ -409,6 +431,8 @@ export async function processDriverOfflineQueue({
       }
       const manifest = manifestCache.get(event.manifestId);
       if (!manifest) return null;
+      const closedTravel = await supersededTravelEvidence(event, manifest);
+      if (closedTravel) return closedTravel;
       if (manifest.supersededAt) {
         return markDriverOfflineEventReviewRequired(event.eventId, {
           reason: "Route superseded by an approved Dispatch or SCM change. The event was retained for Dispatch review and its operational effects are blocked.",
@@ -517,6 +541,8 @@ export async function processDriverOfflineQueue({
         } : {})
       });
       const currentEntries = currentJobEntries(currentPlan, driverLogin);
+      const closedTravel = await supersededTravelEvidence(event, manifest);
+      if (closedTravel) return closedTravel;
       const correction = await supersedingDriverPwaCorrection(event, manifest);
       if (correction) {
         return markDriverOfflineEventEvidenceOnly(event.eventId, {

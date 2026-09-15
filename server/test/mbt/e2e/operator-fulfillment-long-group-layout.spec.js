@@ -118,7 +118,7 @@ async function installSessionAndCamera(page) {
     localStorage.setItem("mbbs.operator.locationId", "15");
     localStorage.setItem("mbbs.operator.deliveryPrepMode", "load");
     localStorage.setItem("mbbs.operator.deliveryLoadViewDate", "2026-08-25");
-    localStorage.setItem("mbbs.operator.state", JSON.stringify({
+    localStorage.setItem("mbbs.operator.state", JSON.stringify({ accountId: "layout-operator", sessionKey: "b1e4a94950cc04c04036b72beefbdcd0e3fbab42e185375364cf62fd391cadaf",
       currentModule: "delivery",
       locationId: 15,
       viewMode: "packed",
@@ -143,7 +143,8 @@ async function installApi(page) {
           username: "layout-operator",
           display_name: "Layout Operator",
           role: "operator",
-          roles: ["operator"]
+          roles: ["operator"],
+          operatorYardLocationIds: [15]
         }
       });
     }

@@ -1,4 +1,6 @@
 import { query, withTransaction } from "./db.js";
+import { isDeepStrictEqual } from "node:util";
+import { freezeRecordedPurchaseOrderProjections } from "./dispatch-recorded-po-projection.js";
 import { canonicalizeDispatchCoGroupIdentities } from "./dispatch-co-group-identity.js";
 import { assertActiveDispatchCosForPlan, reconcileDispatchPlanLocalCos } from "./dispatch-co-lifecycle.js";
 import { canonicalizeDispatchCustomOrdersInPlan } from "./dispatch-custom-order-repository.js";
@@ -10,7 +12,8 @@ import {
 import {
   dispatchLoadAssignment,
   dispatchLoadAssignmentDefaults,
-  normalizeDispatchPlanLoadAssignments
+  normalizeDispatchPlanLoadAssignments,
+  overlayLockedLoadDerivedSchedule
 } from "./dispatch-load-assignment.js";
 import { materializeDispatchPickupVisits } from "./dispatch-pickup-visits.js";
 import {
@@ -46,6 +49,21 @@ const DISPATCH_PLAN_V2_VERSION = 2;
 const DISPATCH_PLAN_V2_BACKFILL_SOURCE = "dockerVer-backfill";
 const DISPATCH_PLAN_V2_SAVE_SOURCE = "dispatchV2-save";
 
+async function dispatchPickupActivity(planId) {
+  const activity = (await query(`SELECT status,load_id,stop_id,stop_type,order_refs,job_details
+    FROM driver_job_records WHERE plan_id=$1 AND status IN ('in_progress','complete')`, [planId])).rows;
+  const completed = (await query(`SELECT a.load_id,s.trucks FROM dispatch_plan_load_assignments a
+    JOIN dispatch_plan_snapshots s ON s.plan_id=a.plan_id
+    WHERE a.plan_id=$1 AND a.completed=true`, [planId])).rows;
+  for (const row of completed) {
+    const load = (row.trucks || []).flatMap(truck => truck.loads || []).find(entry => entry.id === row.load_id);
+    const stop = load?.stops?.at(-1);
+    if (stop) activity.push({ status: "complete", load_id: row.load_id,
+      stop_id: stop.id, stop_type: stop.type, order_refs: [stop.orderId], job_details: {} });
+  }
+  return activity;
+}
+
 async function reconcileDispatchPlanOrderAuthorities(plan, options = {}) {
   return reconcileDispatchPlanLocalCos(await reconcileDispatchPlanGlobalOrderDefinitions(plan, options));
 }
@@ -65,14 +83,26 @@ export async function refreshDispatchPlanAuthoritativeOrderProjection(plan, { co
     projectedOrders,
     projectionContext
   );
+  const activity = { rows: plan.id ? await dispatchPickupActivity(plan.id) : [] };
+  const recorded = activity.rows.length ? (await query(
+    "SELECT orders, trucks FROM dispatch_plan_snapshots WHERE plan_id = $1", [plan.id]
+  )).rows[0] : null;
+  const frozen = freezeRecordedPurchaseOrderProjections({
+    recordedPlan: recorded || {}, projectedOrders, activity: activity.rows
+  });
   const reconciled = reconcileAuthoritativeDispatchOrderProjection({
     // Omitted projection fields mean the relationship was removed. Do not
     // merge fresh orders into stale manifests and resurrect a cancelled link.
     plan: { ...plan, orders: strippedOrders },
-    projectedOrders,
-    comparisonOrders
+    projectedOrders: frozen.orders,
+    comparisonOrders,
+    preservedPoOrderRefs: frozen.preservedPoOrderRefs,
+    activity: activity.rows
   }).plan;
-  return reconciled;
+  // A route refresh may invalidate future estimates, but published timing for
+  // executed visits remains evidence. Structural/cargo changes still reach the
+  // existing executed-prefix validator unchanged.
+  return overlayLockedLoadDerivedSchedule(plan, reconciled, new Set(), { activityStatuses: activity.rows });
 }
 
 async function assertDispatchPlanAuthoritativeProjectionValid(plan = {}) {
@@ -1594,7 +1624,8 @@ export async function saveDispatchPlanSnapshot(planId, {
     );
     const pickupVisits = materializeDispatchPickupVisits(sanitizedPlan, {
       previousPlan,
-      allowLegacyPassthrough: true
+      allowLegacyPassthrough: true,
+      activity: await dispatchPickupActivity(planId)
     });
     if (pickupVisits.conflicts.length) {
       const first = pickupVisits.conflicts[0];
@@ -1756,11 +1787,20 @@ export async function saveDispatchPlanSnapshot(planId, {
       planDate: expectedPlanDate,
       revision: cleanPlan.revision
     });
+    // Completion is authoritative for an unchanged historical route even when
+    // older driver records are unavailable. New work still recomputes completion.
+    const completedLoads = (await query("SELECT load_id FROM dispatch_plan_load_assignments WHERE plan_id=$1 AND completed=true", [planId])).rows;
+    const priorLoads = new Map(previousPlan.trucks.flatMap(truck => truck.loads || []).map(load => [load.id, load]));
+    const savedLoads = new Map(storedPlan.trucks.flatMap(truck => truck.loads || []).map(load => [load.id, load]));
+    const retainedCompletedIds = completedLoads.filter(row => priorLoads.has(row.load_id) && savedLoads.has(row.load_id)
+      && isDeepStrictEqual(priorLoads.get(row.load_id).stops, savedLoads.get(row.load_id).stops)).map(row => row.load_id);
     await syncDispatchPlanLoadAssignments({
       ...storedPlan,
       id: planId,
       planDate: expectedPlanDate
     });
+    if (retainedCompletedIds.length) await query(`UPDATE dispatch_plan_load_assignments
+      SET started=true,completed=true WHERE plan_id=$1 AND load_id=ANY($2::text[])`, [planId, retainedCompletedIds]);
     return getDispatchPlan(planId);
   });
 }
@@ -1884,7 +1924,8 @@ export async function restoreDispatchPlanSnapshot(snapshotId, { sessionId = "" }
         orders: current.orders || [],
         trucks: current.trucks || []
       },
-      allowLegacyPassthrough: true
+      allowLegacyPassthrough: true,
+      activity: await dispatchPickupActivity(current.id)
     });
     if (pickupVisits.conflicts.length) {
       const first = pickupVisits.conflicts[0];

@@ -563,7 +563,7 @@ export async function getDraftCycleCount(operatorId) {
   return created.rows[0].id;
 }
 
-export async function confirmCycleCountLine(operatorId, values) {
+export async function confirmCycleCountLine(operatorId, values, { yardLocationIds = null } = {}) {
   const recordId = await getDraftCycleCount(operatorId);
   const itemId = Number(values.itemId);
   const locationId = Number(values.locationId);
@@ -640,10 +640,10 @@ export async function confirmCycleCountLine(operatorId, values) {
     action: "cycle_count.line.confirm",
     details: { recordId, itemId, locationId, pallets, layers, sections, pieces, countedTotal, variance }
   });
-  return getCycleCountDraft(operatorId);
+  return getCycleCountDraft(operatorId, { yardLocationIds });
 }
 
-export async function getCycleCountDraft(operatorId) {
+export async function getCycleCountDraft(operatorId, { yardLocationIds = null } = {}) {
   const recordId = await getDraftCycleCount(operatorId);
   const lines = await query(
     `SELECT l.*,
@@ -666,7 +666,7 @@ export async function getCycleCountDraft(operatorId) {
      ORDER BY l.confirmed_at DESC`,
     [recordId]
   );
-  return { id: recordId, lines: lines.rows };
+  return { id: recordId, lines: yardLocationIds === null ? lines.rows : lines.rows.filter((line) => yardLocationIds.includes(Number(line.location_id))) };
 }
 
 export async function submitCycleCount(operatorId) {

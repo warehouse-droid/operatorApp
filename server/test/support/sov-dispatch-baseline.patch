@@ -1,0 +1,626 @@
+--- a/src/dispatch-load-assignment.js
++++ b/src/dispatch-load-assignment.js
+@@ -5,14 +5,16 @@
+   uniqueDispatchLocations
+ } from "./dispatch-location.js";
+ import { comparableAllocationPlans } from "./dispatch-allocation-item-identity.js";
++import { VOYAGE_DISPATCH_YARD } from "./dispatch-sales-order-locations.js";
+ 
+ const DEFAULT_SWITCH_MINUTES = 10;
+-const DEFAULT_OWN_YARDS = ["3445", "2967", "12441", "150"];
++const DEFAULT_OWN_YARDS = ["3445", "2967", "12441", "150", VOYAGE_DISPATCH_YARD.code];
+ const DEFAULT_OWN_YARD_ADDRESSES = {
+   "3445": "3445 Kennedy Road, Toronto, ON",
+   "2967": "2967 Kennedy Road, Toronto, ON",
+   "12441": "12441 Woodbine Avenue, Whitchurch-Stouffville, ON",
+-  "150": "150 Clark Blvd, Brampton, ON L6T 4Y8, Canada"
++  "150": "150 Clark Blvd, Brampton, ON L6T 4Y8, Canada",
++  [VOYAGE_DISPATCH_YARD.code]: VOYAGE_DISPATCH_YARD.address
+ };
+ 
+ function text(value) {
+--- a/src/dispatch-pickup-visits.js
++++ b/src/dispatch-pickup-visits.js
+@@ -225,7 +225,22 @@
+   return conflicts;
+ }
+ 
+-function validateMaterializedPickupVisits(plan = {}, { allowLegacyPassthrough = false } = {}) {
++function retainedStartedVoyageGap(previousPlan, load, stop, order, location, activity) {
++  const sovRefs = [orderRef(order), ...(order.childOrders || []), ...(order.childOrderDetails || []).map(orderRef)];
++  if (locationKey(location) !== "195" || !sovRefs.some(ref => /^SOV/iu.test(ref))) return false;
++  const previousLoad = previousLoadFor(previousPlan, load);
++  if (!previousLoad) return false;
++  const index = previousLoad.stops.findIndex(entry => visitStopId(entry) === visitStopId(stop)
++    && directDeliveryRefs(entry).includes(orderRef(order)));
++  if (index < 0 || index > dispatchLoadProtectedBoundary(previousLoad, activity)) return false;
++  // Only preserve an existing historical omission. Removing a recorded pickup
++  // cannot obtain this compatibility treatment.
++  return !previousLoad.stops.slice(0, index).some(entry => pickupStop(entry)
++    && locationKey(entry.location || entry.yard) === locationKey(location)
++    && resolveDispatchPickupVisit({ plan: previousPlan, load: previousLoad, stop: entry }).orderRefs.includes(orderRef(order)));
++}
++
++function validateMaterializedPickupVisits(plan = {}, { allowLegacyPassthrough = false, previousPlan = {}, activity = [] } = {}) {
+   const conflicts = [];
+   for (const truck of Array.isArray(plan.trucks) ? plan.trucks : []) {
+     for (const load of Array.isArray(truck?.loads) ? truck.loads : []) {
+@@ -306,6 +321,8 @@
+         for (const location of dispatchRequiredPickupVisitLocations(order, plan)) {
+           const allocationKey = `${refKey}|${locationKey(location)}`;
+           if (allocations.has(allocationKey)) continue;
++          if (allowLegacyPassthrough && retainedStartedVoyageGap(previousPlan, load,
++            stops[firstDeliveryIndex], order, location, activity)) continue;
+           conflicts.push(conflict(
+             "DISPATCH_PICKUP_ORDER_MISSING",
+             `${orderRef(order)} requires pickup at ${location} before delivery.`,
+@@ -320,7 +337,7 @@
+ 
+ export function materializeDispatchPickupVisits(
+   plan = {},
+-  { previousPlan = null, allowLegacyPassthrough = false } = {}
++  { previousPlan = null, allowLegacyPassthrough = false, activity = [] } = {}
+ ) {
+   const next = clone(plan) || {};
+   const ambiguity = pickupAmbiguityConflicts(next, previousPlan, { allowLegacyPassthrough });
+@@ -352,7 +369,7 @@
+       }
+     }
+   }
+-  const conflicts = validateMaterializedPickupVisits(next, { allowLegacyPassthrough });
++  const conflicts = validateMaterializedPickupVisits(next, { allowLegacyPassthrough, previousPlan: previousPlan || {}, activity });
+   const fullyMaterialized = (next.trucks || []).every((truck) => (truck.loads || []).every((load) => {
+     if (load.returnOnly === true) return true;
+     const stops = Array.isArray(load.stops) ? load.stops : [];
+@@ -418,7 +435,10 @@
+   for (const record of activityForLoad(activity, load)) {
+     const type = stopType(record);
+     if (type === "travel") {
+-      if (recordStatus(record) === "in_progress") boundary = Math.max(boundary, travelTargetIndex(load, record));
++      if (recordStatus(record) === "in_progress") {
++        const target = travelTargetIndex(load, record);
++        boundary = Math.max(boundary, target >= 0 ? target : stops.length - 1);
++      }
+       continue;
+     }
+     if (!PICKUP_TYPES.has(type) && !DELIVERY_TYPES.has(type)) continue;
+--- a/src/dispatch-plan-order-projection.js
++++ b/src/dispatch-plan-order-projection.js
+@@ -265,7 +265,7 @@
+   ].map((value) => text(value).toLowerCase()).some((ref) => affectedRefs.has(ref));
+ }
+ 
+-function invalidateLoadRoute(load = {}) {
++export function invalidateLoadRoute(load = {}) {
+   const next = { ...load, routeProjectionRefreshRequired: true };
+   for (const field of INVALID_ROUTE_LOAD_FIELDS) delete next[field];
+   next.stops = (Array.isArray(load.stops) ? load.stops : []).map((stop) => {
+@@ -353,7 +353,8 @@
+   plan = {},
+   projectedOrders = [],
+   comparisonOrders = plan.orders || [],
+-  preservedPoOrderRefs = new Set()
++  preservedPoOrderRefs = new Set(),
++  activity = []
+ } = {}) {
+   const candidatePlan = clearResolvedRouteRefreshFlags(plan);
+   const changedOrderRefs = changedProjectionOrderRefs(comparisonOrders, projectedOrders);
+@@ -364,7 +365,8 @@
+     plan: candidatePlan,
+     enrichedOrders: projectedOrders,
+     affectedTargetRefs: allLogicalRefs(projectedOrders),
+-    preservedPoOrderRefs
++    preservedPoOrderRefs,
++    activity
+   });
+   const changedLoadKeys = changedRouteLoadKeys(candidatePlan, reconciled);
+   return {
+--- a/src/dispatch-plan-repository.js
++++ b/src/dispatch-plan-repository.js
+@@ -1,4 +1,5 @@
+ import { query, withTransaction } from "./db.js";
++import { isDeepStrictEqual } from "node:util";
+ import { freezeRecordedPurchaseOrderProjections } from "./dispatch-recorded-po-projection.js";
+ import { canonicalizeDispatchCoGroupIdentities } from "./dispatch-co-group-identity.js";
+ import { assertActiveDispatchCosForPlan, reconcileDispatchPlanLocalCos } from "./dispatch-co-lifecycle.js";
+@@ -48,6 +49,21 @@
+ const DISPATCH_PLAN_V2_BACKFILL_SOURCE = "dockerVer-backfill";
+ const DISPATCH_PLAN_V2_SAVE_SOURCE = "dispatchV2-save";
+ 
++async function dispatchPickupActivity(planId) {
++  const activity = (await query(`SELECT status,load_id,stop_id,stop_type,order_refs,job_details
++    FROM driver_job_records WHERE plan_id=$1 AND status IN ('in_progress','complete')`, [planId])).rows;
++  const completed = (await query(`SELECT a.load_id,s.trucks FROM dispatch_plan_load_assignments a
++    JOIN dispatch_plan_snapshots s ON s.plan_id=a.plan_id
++    WHERE a.plan_id=$1 AND a.completed=true`, [planId])).rows;
++  for (const row of completed) {
++    const load = (row.trucks || []).flatMap(truck => truck.loads || []).find(entry => entry.id === row.load_id);
++    const stop = load?.stops?.at(-1);
++    if (stop) activity.push({ status: "complete", load_id: row.load_id,
++      stop_id: stop.id, stop_type: stop.type, order_refs: [stop.orderId], job_details: {} });
++  }
++  return activity;
++}
++
+ async function reconcileDispatchPlanOrderAuthorities(plan, options = {}) {
+   return reconcileDispatchPlanLocalCos(await reconcileDispatchPlanGlobalOrderDefinitions(plan, options));
+ }
+@@ -67,12 +83,7 @@
+     projectedOrders,
+     projectionContext
+   );
+-  const activity = plan.id ? await query(
+-    `SELECT status, load_id, stop_id, stop_type, order_refs, job_details
+-       FROM driver_job_records
+-      WHERE plan_id = $1 AND status IN ('in_progress', 'complete')`,
+-    [plan.id]
+-  ) : { rows: [] };
++  const activity = { rows: plan.id ? await dispatchPickupActivity(plan.id) : [] };
+   const recorded = activity.rows.length ? (await query(
+     "SELECT orders, trucks FROM dispatch_plan_snapshots WHERE plan_id = $1", [plan.id]
+   )).rows[0] : null;
+@@ -85,7 +96,8 @@
+     plan: { ...plan, orders: strippedOrders },
+     projectedOrders: frozen.orders,
+     comparisonOrders,
+-    preservedPoOrderRefs: frozen.preservedPoOrderRefs
++    preservedPoOrderRefs: frozen.preservedPoOrderRefs,
++    activity: activity.rows
+   }).plan;
+   // A route refresh may invalidate future estimates, but published timing for
+   // executed visits remains evidence. Structural/cargo changes still reach the
+@@ -1612,7 +1624,8 @@
+     );
+     const pickupVisits = materializeDispatchPickupVisits(sanitizedPlan, {
+       previousPlan,
+-      allowLegacyPassthrough: true
++      allowLegacyPassthrough: true,
++      activity: await dispatchPickupActivity(planId)
+     });
+     if (pickupVisits.conflicts.length) {
+       const first = pickupVisits.conflicts[0];
+@@ -1774,11 +1787,20 @@
+       planDate: expectedPlanDate,
+       revision: cleanPlan.revision
+     });
++    // Completion is authoritative for an unchanged historical route even when
++    // older driver records are unavailable. New work still recomputes completion.
++    const completedLoads = (await query("SELECT load_id FROM dispatch_plan_load_assignments WHERE plan_id=$1 AND completed=true", [planId])).rows;
++    const priorLoads = new Map(previousPlan.trucks.flatMap(truck => truck.loads || []).map(load => [load.id, load]));
++    const savedLoads = new Map(storedPlan.trucks.flatMap(truck => truck.loads || []).map(load => [load.id, load]));
++    const retainedCompletedIds = completedLoads.filter(row => priorLoads.has(row.load_id) && savedLoads.has(row.load_id)
++      && isDeepStrictEqual(priorLoads.get(row.load_id).stops, savedLoads.get(row.load_id).stops)).map(row => row.load_id);
+     await syncDispatchPlanLoadAssignments({
+       ...storedPlan,
+       id: planId,
+       planDate: expectedPlanDate
+     });
++    if (retainedCompletedIds.length) await query(`UPDATE dispatch_plan_load_assignments
++      SET started=true,completed=true WHERE plan_id=$1 AND load_id=ANY($2::text[])`, [planId, retainedCompletedIds]);
+     return getDispatchPlan(planId);
+   });
+ }
+@@ -1902,7 +1924,8 @@
+         orders: current.orders || [],
+         trucks: current.trucks || []
+       },
+-      allowLegacyPassthrough: true
++      allowLegacyPassthrough: true,
++      activity: await dispatchPickupActivity(current.id)
+     });
+     if (pickupVisits.conflicts.length) {
+       const first = pickupVisits.conflicts[0];
+--- a/src/dispatch-repository.js
++++ b/src/dispatch-repository.js
+@@ -1,4 +1,5 @@
+ import crypto from "node:crypto";
++import { VOYAGE_DISPATCH_YARD } from "./dispatch-sales-order-locations.js";
+ import { pool, query, withTransaction } from "./db.js";
+ import { dispatchLoadAssignment } from "./dispatch-load-assignment.js";
+ import { DISPATCH_FLEET_PLANNING_LOCK } from "./dispatch-fleet-status.js";
+@@ -422,6 +423,7 @@
+   if (text === "2967") return 28;
+   if (text === "12441") return 15;
+   if (text === "150") return 26;
++  if (text === "195") return 4;
+   return null;
+ }
+ 
+@@ -431,6 +433,7 @@
+   if (text === "13" || text === "28") return "2967";
+   if (text === "15") return "12441";
+   if (text === "26") return "150";
++  if (text === "4") return "195";
+   return String(value || "").trim();
+ }
+ 
+@@ -467,6 +470,7 @@
+     WHEN ${field} = '2967' THEN '2967 Kennedy Road, Toronto, ON'
+     WHEN ${field} = '12441' THEN '12441 Woodbine Avenue, Whitchurch-Stouffville, ON'
+     WHEN ${field} = '150' THEN '150 Clark Blvd, Brampton, ON L6T 4Y8, Canada'
++    WHEN ${field} = '195' THEN '${VOYAGE_DISPATCH_YARD.address}'
+     ELSE ''
+   END`;
+ }
+@@ -1019,7 +1023,7 @@
+         o.expected_delivery_date,
+         o.outbound_location AS pickup_location,
+         o.dispatch_pickup_address AS pickup_address_override,
+-        NULL::text AS source_address,
++        CASE WHEN o.outbound_location = '195' THEN '${VOYAGE_DISPATCH_YARD.address}' ELSE NULL END AS source_address,
+         o.destination_location,
+         o.destination_location_id,
+         CASE
+--- /dev/null
++++ b/src/dispatch-sales-order-locations.js
+@@ -0,0 +1,16 @@
++// "195" is the location's display code, not its NetSuite internal ID.
++export const VOYAGE_DISPATCH_YARD = Object.freeze({
++  code: "195",
++  name: "195",
++  locationId: 4,
++  address: "195 Milner Ave Unit 5, Scarborough, ON M1S 4P4"
++});
++export const SALES_ORDER_SYNC_LOCATIONS = Object.freeze([1, 28, 15, 26, 4]);
++
++export function withVoyageDispatchYard(yards = []) {
++  const existing = Array.isArray(yards) ? yards : [];
++  if (existing.some(yard => String(yard?.code || "").trim() === VOYAGE_DISPATCH_YARD.code)) {
++    return existing;
++  }
++  return [...existing, { ...VOYAGE_DISPATCH_YARD }];
++}
+--- a/src/driver-repository.js
++++ b/src/driver-repository.js
+@@ -43,11 +43,14 @@
+   uniqueDriverPhotoReferences
+ } from "./driver-completed-photo-evidence.js";
+ 
++import { VOYAGE_DISPATCH_YARD } from "./dispatch-sales-order-locations.js";
++
+ const YARD_ADDRESSES = {
+   "3445": "3445 Kennedy Road, Toronto, ON",
+   "2967": "2967 Kennedy Road, Toronto, ON",
+   "12441": "12441 Woodbine Avenue, Whitchurch-Stouffville, ON",
+-  "150": "150 Clark Blvd, Brampton, ON L6T 4Y8, Canada"
++  "150": "150 Clark Blvd, Brampton, ON L6T 4Y8, Canada",
++  [VOYAGE_DISPATCH_YARD.code]: VOYAGE_DISPATCH_YARD.address
+ };
+ const SAMSARA_ACCOUNT_LIMIT_MS = 8 * 60 * 60 * 1000;
+ 
+--- a/src/scm-dependency-plan-reconciler.js
++++ b/src/scm-dependency-plan-reconciler.js
+@@ -1,5 +1,5 @@
+ import { dispatchDependencyOrderRefs } from "./yard-dependency-structure.js";
+-import { dispatchRequiredPickupVisitLocations } from "./dispatch-pickup-visits.js";
++import { dispatchLoadProtectedBoundary, dispatchRequiredPickupVisitLocations } from "./dispatch-pickup-visits.js";
+ 
+ function text(value) {
+   return String(value ?? "").trim();
+@@ -239,16 +239,20 @@
+   return nextTrucks;
+ }
+ 
+-function reconcileLoad(load = {}, ordersByRef, affected, plan) {
++function reconcileLoad(load = {}, ordersByRef, affected, plan, activity) {
+   let stops = Array.isArray(load.stops) ? load.stops.map((stop) => ({ ...stop })) : [];
++  const boundary = dispatchLoadProtectedBoundary(load, activity);
++  const protectedIds = new Set(stops.slice(0, boundary + 1).map(stop => text(stop.id)));
+   const requirements = requirementsForStops(stops, ordersByRef);
+ 
+   stops = stops.filter((stop) => {
++    if (protectedIds.has(text(stop.id))) {return true;}
+     if (stop?.type !== "pick" || stop.dependencyManaged !== true) {return true;}
+     const stillRequired = requirements.some((entry) => samePlace(entry.location, stop.location));
+     if (stillRequired) {
+       stop.dependencyTargetRefs = refs(requirements
+-        .filter((entry) => samePlace(entry.location, stop.location))
++        .filter((entry) => samePlace(entry.location, stop.location)
++          && (!Array.isArray(stop.orderRefs) || refs(stop.orderRefs).includes(entry.targetRef)))
+         .map((entry) => entry.targetRef));
+       return true;
+     }
+@@ -260,15 +264,22 @@
+   for (let index = 0; index < stops.length; index += 1) {
+     const drop = stops[index];
+     if (drop?.type !== "drop" || !text(drop.orderId)) {continue;}
++    if (protectedIds.has(text(drop.id))) {continue;}
+     const order = ordersByRef.get(text(drop.orderId).toLowerCase());
+     if (!order) {continue;}
+     const targetRef = targetRefForDrop(drop, order);
+     if (!affected.has(targetRef.toLowerCase())
+       && !dispatchDependencyOrderRefs(order).some((ref) => affected.has(ref.toLowerCase()))) {continue;}
+     const locations = requiredPickupLocations(order, plan);
++    const isSov = dispatchDependencyOrderRefs(order).some(ref => /^SOV/iu.test(ref));
+     for (const location of locations) {
+-      const priorPickup = stops.slice(0, index).find((stop) => stop?.type === "pick" && samePlace(stop.location, location));
++      const priorPickup = stops.slice(0, index).find((stop) => stop?.type === "pick" && samePlace(stop.location, location)
++        && (!isSov || !protectedIds.has(text(stop.id)) || refs(stop.orderRefs || [stop.orderId]).includes(targetRef)));
+       if (priorPickup) {
++        if (isSov && !protectedIds.has(text(priorPickup.id)) && Array.isArray(priorPickup.orderRefs)) {
++          priorPickup.orderRefs = refs([...priorPickup.orderRefs, targetRef]);
++        }
++        if (protectedIds.has(text(priorPickup.id))) {continue;}
+         if (priorPickup.dependencyManaged === true) {
+           priorPickup.dependencyTargetRefs = refs([...(priorPickup.dependencyTargetRefs || []), targetRef]);
+         }
+@@ -278,6 +289,7 @@
+         id: `scm-dependency-pick-${safeIdPart(targetRef)}-${safeIdPart(location)}-${index}`,
+         type: "pick",
+         orderId: targetRef,
++        ...(isSov ? { orderRefs: [targetRef] } : {}),
+         location,
+         dependencyManaged: true,
+         dependencySource: "scm-dependency-management",
+@@ -294,7 +306,8 @@
+   plan = {},
+   enrichedOrders = [],
+   affectedTargetRefs = [],
+-  preservedPoOrderRefs = new Set()
++  preservedPoOrderRefs = new Set(),
++  activity = []
+ } = {}) {
+   const enrichedByRef = orderIndex(enrichedOrders);
+   const orders = (plan.orders || []).map((order) => {
+@@ -321,7 +334,7 @@
+     orders,
+     trucks: residualTrucks.map((truck) => ({
+       ...truck,
+-      loads: (truck.loads || []).map((load) => reconcileLoad(load, ordersByRef, affected, plan))
++      loads: (truck.loads || []).map((load) => reconcileLoad(load, ordersByRef, affected, plan, activity))
+     }))
+   };
+ }
+--- a/src/server.js
++++ b/src/server.js
+@@ -1,4 +1,5 @@
+ import express from "express";
++import { SALES_ORDER_SYNC_LOCATIONS, withVoyageDispatchYard } from "./dispatch-sales-order-locations.js";
+ import { completeScmVendorOrder } from "./scm-vendor-completion.js";
+ import crypto from "node:crypto";
+ import fs from "node:fs/promises";
+@@ -567,12 +568,12 @@
+     { plate: "MBBS-205", capacityLbs: 44000, travelTimePercent: 0 },
+     { plate: "MBBS-318", capacityLbs: 52000, travelTimePercent: 0 }
+   ],
+-  ownYards: [
++  ownYards: withVoyageDispatchYard([
+     { code: "3445", name: "3445", locationId: 1, address: "3445 Kennedy Road, Toronto, ON", lat: 43.8204306, lng: -79.3053423 },
+     { code: "2967", name: "2967", locationId: 28, address: "2967 Kennedy Road, Toronto, ON", lat: 43.806119, lng: -79.2986377 },
+     { code: "12441", name: "12441", locationId: 15, address: "12441 Woodbine Avenue, Whitchurch-Stouffville, ON", lat: 43.948694, lng: -79.3727582 },
+     { code: "150", name: "150", locationId: 26, address: "150 Clark Blvd, Brampton, ON L6T 4Y8, Canada" }
+-  ],
++  ]),
+   sync: {
+     mode: "manual",
+     intervalSeconds: 60,
+@@ -6494,7 +6495,7 @@
+   return {
+     drivers,
+     trucks,
+-    ownYards: Array.isArray(saved.ownYards) ? saved.ownYards : defaultDispatchSetup.ownYards,
++    ownYards: withVoyageDispatchYard(Array.isArray(saved.ownYards) ? saved.ownYards : defaultDispatchSetup.ownYards),
+     sync: normalizeSyncSettings(saved.sync),
+     samsara: {
+       ...defaultDispatchSetup.samsara,
+@@ -7868,13 +7869,15 @@
+ async function syncDispatchOrderFeed() {
+   const deliveryResults = [];
+   const receivingResults = [];
+-  for (const locationId of deliveryLocations) {
++  for (const locationId of SALES_ORDER_SYNC_LOCATIONS) {
+     assertDispatchSyncCanContinue(`location ${locationId} sales orders`);
+     deliveryResults.push({
+       locationId,
+       orderType: "sales_order",
+       synced: await syncDeliveryLocation(locationId, { orderType: "sales_order" })
+     });
++  }
++  for (const locationId of deliveryLocations) {
+     assertDispatchSyncCanContinue(`location ${locationId} transfer delivery orders`);
+     deliveryResults.push({
+       locationId,
+--- /dev/null
++++ b/src/sov-dispatch-repair.js
+@@ -0,0 +1,164 @@
++import assert from "node:assert/strict";
++import crypto from "node:crypto";
++import fs from "node:fs/promises";
++import path from "node:path";
++import { query, withTransaction } from "./db.js";
++import { DISPATCH_FLEET_PLANNING_LOCK } from "./dispatch-fleet-status.js";
++import { saveDispatchPlanSnapshot } from "./dispatch-plan-repository.js";
++import { invalidateLoadRoute } from "./dispatch-plan-order-projection.js";
++import { reconcileDependencyManagedPickups } from "./scm-dependency-plan-reconciler.js";
++import { dispatchDependencyOrderRefs } from "./yard-dependency-structure.js";
++import { dispatchLoadProtectedBoundary } from "./dispatch-pickup-visits.js";
++import { overlayLockedLoadDerivedSchedule } from "./dispatch-load-assignment.js";
++import { writeDispatchAudit } from "./dispatch-audit-repository.js";
++
++const text = value => String(value ?? "").trim();
++export const sovDispatchSourceRefs = order => [...new Set(dispatchDependencyOrderRefs(order)
++  .filter(ref => /^SOV/iu.test(ref)).map(ref => ref.replace(/-S\d+$/iu, "")))];
++const sovRefs = sovDispatchSourceRefs;
++const loads = plan => (plan.trucks || []).flatMap(truck => truck.loads || []);
++const hash = value => crypto.createHash("sha256").update(JSON.stringify(value)).digest("hex");
++
++async function lockedState(planId) {
++  await query("SET LOCAL lock_timeout='5s'");
++  await query("SET LOCAL statement_timeout='60s'");
++  await query("SELECT pg_advisory_xact_lock(hashtext($1))", [DISPATCH_FLEET_PLANNING_LOCK]);
++  const row = (await query(`SELECT p.id,p.plan_date::text,p.status,p.revision,s.orders,s.trucks,s.summary
++    FROM dispatch_plans p JOIN dispatch_plan_snapshots s ON s.plan_id=p.id
++    WHERE p.id=$1 FOR UPDATE OF p,s`, [planId])).rows[0];
++  if (!row) {
++    throw new Error("SOV repair plan was not found.");
++  }
++  const plan = { id: String(row.id), planDate: row.plan_date, status: row.status, revision: Number(row.revision),
++    orders: row.orders, trucks: row.trucks, summary: row.summary };
++  const activity = (await query("SELECT * FROM driver_job_records WHERE plan_id=$1 ORDER BY id FOR UPDATE", [planId])).rows;
++  const completed = (await query("SELECT load_id FROM dispatch_plan_load_assignments WHERE plan_id=$1 AND completed=true FOR UPDATE", [planId])).rows;
++  const refs = [...new Set(plan.orders.flatMap(sovRefs).map(ref => ref.toUpperCase()))];
++  const sources = (await query(`SELECT netsuite_id,tranid,status,sales_order_type,netsuite_active FROM sales_orders
++    WHERE upper(tranid)=ANY($1::text[]) ORDER BY netsuite_id FOR SHARE`, [refs])).rows;
++  return { plan, activity, completedLoadIds: completed.map(row => row.load_id), sources };
++}
++
++function eligibleTargets(state) {
++  const eligible = new Set(state.sources.filter(row => row.netsuite_active === true
++    && ["B", "D", "E"].includes(row.status) && row.sales_order_type === "Delivery")
++    .map(row => row.tranid.toUpperCase()));
++  return state.plan.orders.filter(order => {
++    const refs = sovRefs(order);
++    return text(order.type).toUpperCase() === "SO" && refs.length > 0
++      && refs.every(ref => eligible.has(ref.toUpperCase()));
++  }).map(order => order.id);
++}
++
++function protectedTargets(state, targets) {
++  const wanted = new Set(targets);
++  return [...new Set(loads(state.plan).flatMap(load => {
++    const boundary = state.completedLoadIds.includes(load.id)
++      ? (load.stops || []).length - 1
++      : dispatchLoadProtectedBoundary(load, state.activity);
++    return (load.stops || []).slice(0, boundary + 1)
++      .filter(stop => stop.type === "drop" && wanted.has(stop.orderId)).map(stop => stop.orderId);
++  }))];
++}
++
++function proposeRepair(state, targets) {
++  const plan = state.plan;
++  const candidate = reconcileDependencyManagedPickups({ plan, affectedTargetRefs: targets, activity: state.activity,
++    preservedPoOrderRefs: new Set(plan.orders.filter(order => order.type === "PO").map(order => order.id)) });
++  const previousLoads = new Map(loads(plan).map(load => [load.id, load]));
++  const changedLoadIds = [];
++  candidate.trucks = candidate.trucks.map(truck => ({ ...truck, loads: truck.loads.map(load => {
++    const before = previousLoads.get(load.id);
++    if (state.completedLoadIds.includes(load.id) || hash(load.stops) === hash(before.stops)) {
++      return before;
++    }
++    changedLoadIds.push(load.id);
++    return invalidateLoadRoute(load);
++  }) }));
++  const next = overlayLockedLoadDerivedSchedule(plan, candidate, new Set(), { activityStatuses: state.activity });
++  return { next, changedLoadIds };
++}
++
++function comparableOrders(orders) {
++  // The normal save strips empty relationship projections; absent and zero
++  // allocations describe identical cargo. Nonzero allocations remain protected.
++  return JSON.parse(JSON.stringify(orders, (key, value) =>
++    /^poAllocated(?:Layers|Pallets|Pieces|SalesQty|Sections)$/u.test(key) && value === 0 ? undefined : value));
++}
++
++function assertRepairScope(before, after, targets) {
++  assert.deepEqual(comparableOrders(after.orders), comparableOrders(before.orders), "Pickup repair changed order cargo");
++  const targetSet = new Set(targets);
++  const nextLoads = new Map(loads(after).map(load => [load.id, load]));
++  for (const load of loads(before)) {
++    const next = nextLoads.get(load.id);
++    assert.ok(next, "Pickup repair removed a load");
++    const originalIds = new Set((load.stops || []).map(stop => stop.id));
++    assert.deepEqual(next.stops.filter(stop => originalIds.has(stop.id)).map(stop => stop.id),
++      load.stops.map(stop => stop.id), "Pickup repair removed or reordered an existing stop");
++    for (const stop of next.stops.filter(stop => !originalIds.has(stop.id))) {
++      assert.ok(stop.type === "pick" && targetSet.has(stop.orderId), "Pickup repair added unrelated work");
++    }
++  }
++}
++
++async function backupState(backupPath, state) {
++  assert.ok(backupPath, "Applying a repair requires a private backup path");
++  await fs.mkdir(path.dirname(backupPath), { recursive: true, mode: 0o700 });
++  await fs.writeFile(backupPath, JSON.stringify(state), { flag: "wx", mode: 0o600 });
++}
++
++/** Real transactional rehearsal by default. The driver command's fleet lock covers the entire operation. */
++export async function repairSovDispatchPlan({ planId, apply = false, expectedFingerprint = "", backupPath = "", eligibleOrderRefs = null } = {}) {
++  if (!/^[1-9]\d*$/u.test(text(planId))) {
++    throw new Error("A positive dispatch plan ID is required.");
++  }
++  return withTransaction(async () => {
++    const state = await lockedState(planId);
++    state.eligibleOrderRefs = eligibleOrderRefs === null ? null : [...new Set(eligibleOrderRefs.map(ref => text(ref).toUpperCase()))].sort();
++    const liveEligible = state.eligibleOrderRefs === null ? null : new Set(state.eligibleOrderRefs);
++    const targets = ["draft", "confirmed"].includes(state.plan.status) ? eligibleTargets(state).filter(ref =>
++      !liveEligible || sovRefs(state.plan.orders.find(order => order.id === ref)).every(child => liveEligible.has(child.toUpperCase()))) : [];
++    const fingerprint = hash(state);
++    const protectedOrderRefs = protectedTargets(state, targets);
++    if (!targets.length) {
++      return { planId, changed: false, fingerprint, protectedOrderRefs };
++    }
++    const { next, changedLoadIds } = proposeRepair(state, targets);
++    if (!changedLoadIds.length) {
++      return { planId, changed: false, fingerprint, protectedOrderRefs };
++    }
++    assertRepairScope(state.plan, next, targets);
++    if (apply && expectedFingerprint !== fingerprint) {
++      throw Object.assign(new Error("Plan or driver activity changed; rehearse the SOV repair again."), { code: "SOV_REPAIR_STALE" });
++    }
++    if (apply) {
++      await backupState(backupPath, state);
++    }
++    const summary = { ...next.summary, ownYardCodes: [...new Set([...(next.summary?.ownYardCodes || ["3445", "2967", "12441", "150"]), "195"])] };
++    const saved = await saveDispatchPlanSnapshot(planId, { orders: next.orders, trucks: next.trucks, summary,
++      planDate: state.plan.planDate, baseRevision: state.plan.revision, sessionId: "sov-pickup-repair" });
++    assertRepairScope(state.plan, saved, targets);
++    for (const before of loads(state.plan)) {
++      const after = loads(saved).find(load => load.id === before.id);
++      if (!changedLoadIds.includes(before.id)) {
++        assert.deepEqual(after.stops, before.stops, "Pickup repair changed unrelated or completed stops");
++      }
++      const boundary = dispatchLoadProtectedBoundary(before, state.activity);
++      assert.deepEqual(after.stops.slice(0, boundary + 1), before.stops.slice(0, boundary + 1),
++        "Pickup repair changed started work");
++    }
++    assert.deepEqual((await query("SELECT * FROM driver_job_records WHERE plan_id=$1 ORDER BY id", [planId])).rows,
++      state.activity, "Pickup repair changed driver activity");
++    const completedAfter = new Set((await query("SELECT load_id FROM dispatch_plan_load_assignments WHERE plan_id=$1 AND completed=true", [planId])).rows.map(row => row.load_id));
++    assert.ok(state.completedLoadIds.every(id => completedAfter.has(id)), "Pickup repair reopened a completed load");
++    const addedPickupCount = loads(saved).reduce((sum, load) => sum + load.stops.filter(stop => stop.type === "pick").length, 0)
++      - loads(state.plan).reduce((sum, load) => sum + load.stops.filter(stop => stop.type === "pick").length, 0);
++    await writeDispatchAudit({ action: "dispatch.sov_pending_pickups_repaired", entityType: "plan", entityId: String(planId),
++      planId, planDate: state.plan.planDate, source: "sov-pickup-repair", operatorName: "system:authorized-dispatch-repair",
++      before: { revision: state.plan.revision }, after: { revision: saved.revision },
++      details: { fingerprint, changedLoadIds, addedPickupCount, protectedOrderRefs, backupPath: apply ? backupPath : "rollback rehearsal" } });
++    return { planId, changed: true, applied: apply, rolledBack: !apply, fingerprint, changedLoadIds, addedPickupCount,
++      protectedOrderRefs, previousRevision: state.plan.revision, revision: saved.revision };
++  }, { rollback: !apply });
++}
+--- a/public/dispatch.html
++++ b/public/dispatch.html
+@@ -14,6 +14,6 @@
+     <script src="/app-sidebar.js?v=20260728-custom-orders-v1"></script>
+     <script src="/dispatch-auth.js?v=20260724-sales-auth-v2"></script>
+     <script src="/delivery-instruction-upload.js?v=20260812-delivery-image-720p-v1"></script>
+-    <script src="/dispatch.js?v=20260911-map-geometry-v2&amp;cargo=20260911-v1&amp;preview=20260911-v1&amp;address=20260911-v1&amp;split=20260914-v1&amp;lifecycle=20260914-v1"></script>
++    <script src="/dispatch.js?v=20260911-map-geometry-v2&amp;cargo=20260911-v1&amp;preview=20260911-v1&amp;address=20260911-v1&amp;split=20260914-v1&amp;lifecycle=20260914-v1&amp;sov=20260914-v1"></script>
+   </body>
+ </html>
+--- a/public/dispatch.js
++++ b/public/dispatch.js
+@@ -140,6 +140,7 @@
+   "2967": { x: 62, y: 52, lat: 43.806119, lng: -79.2986377, address: "2967 Kennedy Road, Toronto, ON" },
+   "12441": { x: 40, y: 66, lat: 43.948694, lng: -79.3727582, address: "12441 Woodbine Avenue, Whitchurch-Stouffville, ON" },
+   "150": { x: 54, y: 58, address: "150 Clark Blvd, Brampton, ON L6T 4Y8, Canada" },
++  "195": { x: 58, y: 54, address: "195 Milner Ave Unit 5, Scarborough, ON M1S 4P4" },
+   "Vendor": { x: 28, y: 22, lat: 43.857, lng: -79.521 }
+ };
+ 
+@@ -8865,7 +8866,7 @@
+       const travelStopId = String(record.stop_id || record.stopId || "");
+       targetIndex = stops.findIndex((stop) => travelStopId.endsWith(`-${String(stop.id || "")}`));
+     }
+-    boundary = Math.max(boundary, targetIndex);
++    boundary = Math.max(boundary, targetIndex >= 0 ? targetIndex : stops.length - 1);
+   }
+   return boundary;
+ }
+@@ -9096,6 +9097,7 @@
+       for (let index = 0; index < load.stops.length; index += 1) {
+         const stop = load.stops[index];
+         if (stop.type !== "drop") continue;
++        if (index <= dispatchEditableRouteBoundary(load)) continue;
+         const order = stopOrder(stop);
+         if (order) {
+           const added = ensurePickupStops(load, order, index);

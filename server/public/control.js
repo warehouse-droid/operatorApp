@@ -4294,6 +4294,11 @@ function renderNewOperatorDetail() {
         <p class="muted">${t("control.salesYardsHelp", "Sales schedule, Sales Orders, printers, and print jobs are limited to these yards.")}</p>
         <div class="authority-choice-grid">${renderSalesYardChoices([], "data-new-sales-yard")}</div>
       </fieldset>
+      <fieldset class="authority-picker">
+        <legend>${t("control.operatorYards", "Operator yard access")}</legend>
+        <p class="muted">${t("control.operatorYardsHelp", "Assign yards for Operator work. No yards means no Operator access. Administrators can use all yards.")}</p>
+        <div class="authority-choice-grid">${renderSalesYardChoices([], "data-new-operator-yard")}</div>
+      </fieldset>
       <div class="account-detail-actions">
         <button class="primary" type="submit">${t("control.createAccount", "Create account")}</button>
       </div>
@@ -4344,6 +4349,11 @@ function renderOperatorDetail(item) {
           <span class="field-label">${t("control.salesYards", "Sales yard access")}</span>
           <p class="muted">${t("control.salesYardsHelp", "Sales schedule, Sales Orders, printers, and print jobs are limited to these yards.")}</p>
           <div class="authority-choice-grid">${renderSalesYardChoices(item.yardLocationIds, "data-account-sales-yard")}</div>
+        </div>
+        <div>
+          <span class="field-label">${t("control.operatorYards", "Operator yard access")}</span>
+          <p class="muted">${t("control.operatorYardsHelp", "Assign yards for Operator work. No yards means no Operator access. Administrators can use all yards.")}</p>
+          <div class="authority-choice-grid">${renderSalesYardChoices(item.operatorYardLocationIds, "data-account-operator-yard")}</div>
         </div>
         <div class="account-detail-actions">
           <button class="primary" data-action="save-account-roles" data-id="${escapeHtml(item.id)}" type="button">${t("control.saveAccess", "Save access")}</button>
@@ -4846,7 +4856,8 @@ app.addEventListener("submit", async (event) => {
           password: document.getElementById("newPassword").value,
           role: primaryRole,
           roles,
-          yardLocationIds
+          yardLocationIds,
+          operatorYardLocationIds: [...document.querySelectorAll("[data-new-operator-yard]:checked")].map((input) => Number(input.value))
         })
       });
       selectedOperatorId = created.id;
@@ -5634,7 +5645,9 @@ app.addEventListener("click", async (event) => {
       if (!roles.includes(role)) roles.push(role);
       await request(`/api/operators/${button.dataset.id}/roles`, {
         method: "PUT",
-        body: JSON.stringify({ role, roles, yardLocationIds })
+        body: JSON.stringify({ role, roles, yardLocationIds,
+          operatorYardLocationIds: [...(row?.querySelectorAll("[data-account-operator-yard]:checked") || [])].map((input) => Number(input.value))
+        })
       });
       alert(t("control.accessSaved", "Account access updated."));
       return loadControlData();

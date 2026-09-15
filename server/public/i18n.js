@@ -4,6 +4,10 @@
   const ZH = "zh-CN";
 
   const dictionary = {
+    "operator.yardAccess": "操作员场地权限",
+    "operator.noYardAccess": "尚未分配操作员场地权限。请联系管理员。",
+    "control.operatorYards": "操作员场地权限",
+    "control.operatorYardsHelp": "分配操作员可工作的场地。未分配场地则无法使用操作员功能。管理员可使用所有场地。",
     "dispatch.drivers": "\u53f8\u673a",
     "dispatch.unassigned": "\u672a\u5206\u914d",
     "dispatch.noTruck": "\u672a\u5206\u914d\u8f66\u8f86",
@@ -504,6 +508,7 @@
     "operator.netsuiteChangedRepack": "NetSuite 在打包后有变更。请拆除受影响行，然后按最新需求重新打包。",
     "operator.packedRequiredNow": "已打包：{packed} | 当前需求：{required}",
     "operator.confirmedAdjust": "已确认 - 打包前仍可调整",
+    "operator.pickupConfirmedAdjust": "已确认 - 装载前仍可调整",
     "operator.stillOpenQty": "仍有未完成数量",
     "operator.normal": "标准",
     "operator.compact": "简洁",

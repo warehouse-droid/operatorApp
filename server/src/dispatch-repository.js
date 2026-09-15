@@ -1,4 +1,5 @@
 import crypto from "node:crypto";
+import { VOYAGE_DISPATCH_YARD } from "./dispatch-sales-order-locations.js";
 import { pool, query, withTransaction } from "./db.js";
 import { dispatchLoadAssignment } from "./dispatch-load-assignment.js";
 import { DISPATCH_FLEET_PLANNING_LOCK } from "./dispatch-fleet-status.js";
@@ -325,6 +326,10 @@ function rowToDispatchOrder(row) {
     netsuiteId: row.netsuite_id,
     type: row.dispatch_type,
     sourceTable: row.source_table,
+    ...(row.dispatch_type === "CO" ? {
+      createdAt: row.local_order_created_at,
+      updatedAt: row.local_order_updated_at || row.local_order_created_at
+    } : {}),
     isBlanket: row.is_blanket_po === true,
     isScmSplit: row.scm_is_split === true,
     sourceOrderId: row.dispatch_type === "CO"
@@ -422,6 +427,7 @@ function locationIdFromText(value) {
   if (text === "2967") return 28;
   if (text === "12441") return 15;
   if (text === "150") return 26;
+  if (text === "195") return 4;
   return null;
 }
 
@@ -431,6 +437,7 @@ function locationTextFromId(value) {
   if (text === "13" || text === "28") return "2967";
   if (text === "15") return "12441";
   if (text === "26") return "150";
+  if (text === "4") return "195";
   return String(value || "").trim();
 }
 
@@ -467,6 +474,7 @@ function yardAddressSql(field) {
     WHEN ${field} = '2967' THEN '2967 Kennedy Road, Toronto, ON'
     WHEN ${field} = '12441' THEN '12441 Woodbine Avenue, Whitchurch-Stouffville, ON'
     WHEN ${field} = '150' THEN '150 Clark Blvd, Brampton, ON L6T 4Y8, Canada'
+    WHEN ${field} = '195' THEN '${VOYAGE_DISPATCH_YARD.address}'
     ELSE ''
   END`;
 }
@@ -1019,7 +1027,7 @@ export async function listDispatchOrders({
         o.expected_delivery_date,
         o.outbound_location AS pickup_location,
         o.dispatch_pickup_address AS pickup_address_override,
-        NULL::text AS source_address,
+        CASE WHEN o.outbound_location = '195' THEN '${VOYAGE_DISPATCH_YARD.address}' ELSE NULL END AS source_address,
         o.destination_location,
         o.destination_location_id,
         CASE
@@ -1365,7 +1373,7 @@ export async function listDispatchOrders({
         co.delivery_order_id AS netsuite_id,
         co.co_ref AS tranid,
         NULL::text AS dispatch_ref,
-        co.created_at::date AS source_order_date,
+        co.created_at AS source_order_date,
         'CO' AS dispatch_type,
         'local_co_orders' AS source_table,
         COALESCE(co.details->>'customer', 'Transit Depot') AS party,
@@ -1646,6 +1654,8 @@ export async function listDispatchOrders({
          )
     )
     SELECT orders.*,
+           pool_co.created_at AS local_order_created_at,
+           pool_co.updated_at AS local_order_updated_at,
            COALESCE(split_lookup.is_split, false) AS scm_is_split,
            COALESCE(split_lookup.source_po_refs, '[]'::jsonb)
              || COALESCE(group_ref_lookup.source_po_refs, '[]'::jsonb) AS scm_source_po_refs,
@@ -1670,6 +1680,9 @@ export async function listDispatchOrders({
              ELSE '{}'::jsonb
            END AS local_order_details
     FROM ranked_orders orders
+    LEFT JOIN co_orders pool_co
+      ON orders.dispatch_type = 'CO'
+     AND pool_co.co_ref = orders.tranid
     LEFT JOIN active_po_split_lookup split_lookup
       ON orders.dispatch_type = 'PO'
      AND split_lookup.po_id = orders.netsuite_id

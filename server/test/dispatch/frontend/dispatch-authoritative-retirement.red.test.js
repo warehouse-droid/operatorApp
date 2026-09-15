@@ -57,6 +57,8 @@ const extractedFunctions = [
   "applyCancelledCoLiveEvent",
   "applyRetiredStructuralLiveEvent",
   "applyDispatchOrderFeed",
+  "dispatchOrderPoolScope",
+  "rememberDispatchPoolOrders",
   "preserveDispatchPlanningFields",
   "mergeFreshDispatchOperationalOrder",
   "mergeDispatchOrderSearchFeed",
@@ -87,6 +89,8 @@ function createHarness(seed = {}) {
     "use strict";
     const deepClone = (value) => value === undefined ? undefined : JSON.parse(JSON.stringify(value));
     let authoritativeRetiredOrderRefs = new Set();
+    const dispatchSessionPoolOrders = new Map();
+    const isDispatchHistoryEditMode = () => false;
     let pendingRemoteStructuralLifecycleByRef = new Map();
     let pendingGlobalOrderRetireRefs = new Set();
     let pendingGlobalOrderReactivateRefs = new Set();

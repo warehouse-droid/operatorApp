@@ -9,6 +9,7 @@ const GEOCODING_URL = "https://maps.googleapis.com/maps/api/geocode/json";
 const DEFAULT_TIMEOUT_MS = 15_000;
 const DEFAULT_RECENT_ROUTE_LIMIT = 500;
 const MAX_STANDARD_ROUTE_STOPS = 12;
+const MAX_ROUTE_PATH_POINTS = 5000;
 
 function durationSeconds(value) {
   const match = String(value || "").match(/^([0-9]+(?:\.[0-9]+)?)s$/u);
@@ -22,6 +23,21 @@ function validCoordinate(latitude, longitude) {
     && Number.isFinite(longitude)
     && longitude >= -180
     && longitude <= 180;
+}
+
+function routeMapGeometry(route, legs) {
+  const line = route?.polyline?.geoJsonLinestring;
+  const coordinates = line?.coordinates;
+  const validPath = line?.type === "LineString"
+    && Array.isArray(coordinates)
+    && coordinates.length >= 2 && coordinates.length <= MAX_ROUTE_PATH_POINTS
+    && coordinates.every((point) => Array.isArray(point) && point.length === 2 && validCoordinate(point[1], point[0]));
+  const locations = [legs[0]?.startLocation, ...legs.map((leg) => leg.endLocation)];
+  const validPins = locations.every((point) => validCoordinate(point?.latLng?.latitude, point?.latLng?.longitude));
+  return {
+    routePath: validPath ? coordinates.map(([lng, lat]) => ({ lat, lng })) : [],
+    stopCoordinates: validPins ? locations.map(({ latLng }) => ({ lat: latLng.latitude, lng: latLng.longitude })) : []
+  };
 }
 
 function routeWaypoint(stop = {}) {
@@ -154,13 +170,15 @@ export function createGoogleMapsGateway({
         headers: {
           "Content-Type": "application/json",
           "X-Goog-Api-Key": requestApiKey,
-          "X-Goog-FieldMask": "routes.duration,routes.distanceMeters,routes.legs.duration,routes.legs.distanceMeters"
+          "X-Goog-FieldMask": "routes.duration,routes.distanceMeters,routes.legs.duration,routes.legs.distanceMeters,routes.polyline.geoJsonLinestring,routes.legs.startLocation,routes.legs.endLocation"
         },
         body: JSON.stringify({
           origin: waypoints[0],
           destination: waypoints[waypoints.length - 1],
           intermediates: waypoints.slice(1, -1),
           travelMode: "DRIVE",
+          polylineEncoding: "GEO_JSON_LINESTRING",
+          polylineQuality: "OVERVIEW",
           routingPreference: input.trafficAware ? "TRAFFIC_AWARE" : "TRAFFIC_UNAWARE",
           ...(input.trafficAware ? { departureTime: futureDepartureTime(input.departureTime, now()) } : {}),
           routeModifiers: { avoidTolls: !Boolean(input.allowTolls) },
@@ -194,6 +212,7 @@ export function createGoogleMapsGateway({
         .reduce((sum, minutes) => sum + Math.max(0, Number(minutes) || 0), 0);
       const result = {
         source: "google_routes_v2",
+        ...routeMapGeometry(route, legs),
         rawDriveMinutes,
         driveMinutes,
         stayMinutes,

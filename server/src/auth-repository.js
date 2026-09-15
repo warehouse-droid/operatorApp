@@ -1,3 +1,4 @@
+import { normalizeOperatorYardLocationIds } from "./operator-yard-access.js";
 import crypto from "node:crypto";
 import { promisify } from "node:util";
 import { query } from "./db.js";
@@ -69,6 +70,7 @@ function publicOperator(row) {
     roles: authority.roles,
     homeRoute: operatorHomeRoute(authority),
     yardLocationIds: normalizeYardLocationIds(row.yard_location_ids),
+    operatorYardLocationIds: normalizeOperatorYardLocationIds(row.operator_yard_location_ids),
     active: row.active,
     created_at: row.created_at,
     updated_at: row.updated_at
@@ -96,7 +98,7 @@ export async function hasOperators() {
   return result.rowCount > 0;
 }
 
-export async function createOperator({ username, displayName, password, role = "operator", roles = null, yardLocationIds = [] }) {
+export async function createOperator({ username, displayName, password, role = "operator", roles = null, yardLocationIds = [], operatorYardLocationIds = [] }) {
   const cleanUsername = String(username || "").trim().toLowerCase();
   const cleanDisplayName = String(displayName || username || "").trim();
   if (!cleanUsername) throw new Error("Username is required.");
@@ -104,21 +106,22 @@ export async function createOperator({ username, displayName, password, role = "
   if (!password || String(password).length < 6) throw new Error("Password must be at least 6 characters.");
   const authority = normalizeAuthorities(roles, role);
   const yards = normalizeYardLocationIds(yardLocationIds);
+  const operatorYards = normalizeOperatorYardLocationIds(operatorYardLocationIds);
 
   const { salt, hash } = await hashPassword(String(password));
   const id = crypto.randomUUID();
   const result = await query(
-    `INSERT INTO operators (id, username, display_name, password_hash, password_salt, role, roles, yard_location_ids)
-     VALUES ($1, $2, $3, $4, $5, $6, $7::text[], $8::integer[])
-     RETURNING id, username, display_name, role, roles, yard_location_ids, active, created_at, updated_at`,
-    [id, cleanUsername, cleanDisplayName, hash, salt, authority.role, authority.roles, yards]
+    `INSERT INTO operators (id, username, display_name, password_hash, password_salt, role, roles, yard_location_ids, operator_yard_location_ids)
+     VALUES ($1, $2, $3, $4, $5, $6, $7::text[], $8::integer[], $9::integer[])
+     RETURNING id, username, display_name, role, roles, yard_location_ids, operator_yard_location_ids, active, created_at, updated_at`,
+    [id, cleanUsername, cleanDisplayName, hash, salt, authority.role, authority.roles, yards, operatorYards]
   );
   return publicOperator(result.rows[0]);
 }
 
 export async function listOperators() {
   const result = await query(
-    `SELECT id, username, display_name, role, roles, yard_location_ids, active, created_at, updated_at
+    `SELECT id, username, display_name, role, roles, yard_location_ids, operator_yard_location_ids, active, created_at, updated_at
      FROM operators
      ORDER BY active DESC, display_name ASC`
   );
@@ -131,7 +134,7 @@ export async function setOperatorActive(id, active) {
      SET active = $2,
          updated_at = now()
      WHERE id = $1
-     RETURNING id, username, display_name, role, roles, yard_location_ids, active, created_at, updated_at`,
+     RETURNING id, username, display_name, role, roles, yard_location_ids, operator_yard_location_ids, active, created_at, updated_at`,
     [id, Boolean(active)]
   );
   return publicOperator(result.rows[0]);
@@ -146,29 +149,32 @@ export async function updateOperatorPassword(id, password) {
          password_salt = $3,
          updated_at = now()
      WHERE id = $1
-     RETURNING id, username, display_name, role, roles, yard_location_ids, active, created_at, updated_at`,
+     RETURNING id, username, display_name, role, roles, yard_location_ids, operator_yard_location_ids, active, created_at, updated_at`,
     [id, hash, salt]
   );
   await query("DELETE FROM operator_sessions WHERE operator_id = $1", [id]);
   return publicOperator(result.rows[0]);
 }
 
-export async function updateOperatorRoles(id, { role, roles, yardLocationIds } = {}) {
-  const current = await query("SELECT id, role, roles, yard_location_ids FROM operators WHERE id = $1", [id]);
+export async function updateOperatorRoles(id, { role, roles, yardLocationIds, operatorYardLocationIds } = {}) {
+  const current = await query("SELECT id, role, roles, yard_location_ids, operator_yard_location_ids FROM operators WHERE id = $1", [id]);
   if (!current.rowCount) return null;
   const authority = normalizeAuthorities(roles, role || current.rows[0].role);
   const yards = yardLocationIds === undefined
     ? normalizeYardLocationIds(current.rows[0].yard_location_ids)
     : normalizeYardLocationIds(yardLocationIds);
+  const operatorYards = normalizeOperatorYardLocationIds(operatorYardLocationIds === undefined
+    ? current.rows[0].operator_yard_location_ids : operatorYardLocationIds);
   const result = await query(
     `UPDATE operators
      SET role = $2,
          roles = $3::text[],
          yard_location_ids = $4::integer[],
+         operator_yard_location_ids = $5::integer[],
          updated_at = now()
      WHERE id = $1
-     RETURNING id, username, display_name, role, roles, yard_location_ids, active, created_at, updated_at`,
-    [id, authority.role, authority.roles, yards]
+     RETURNING id, username, display_name, role, roles, yard_location_ids, operator_yard_location_ids, active, created_at, updated_at`,
+    [id, authority.role, authority.roles, yards, operatorYards]
   );
   return publicOperator(result.rows[0]);
 }
@@ -198,7 +204,7 @@ export async function loginOperator(username, password) {
 export async function getOperatorByToken(token) {
   if (!token) return null;
   const result = await query(
-    `SELECT o.id, o.username, o.display_name, o.role, o.roles, o.yard_location_ids, o.active, o.created_at, o.updated_at
+    `SELECT o.id, o.username, o.display_name, o.role, o.roles, o.yard_location_ids, o.operator_yard_location_ids, o.active, o.created_at, o.updated_at
      FROM operator_sessions s
      INNER JOIN operators o ON o.id = s.operator_id
      WHERE s.token_hash = $1
