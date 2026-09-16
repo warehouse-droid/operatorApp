@@ -5,6 +5,7 @@ let smartVendorEmailModalWorkflowId = null;
 let smartVendorEmailModalDraft = null;
 let smartVendorPoPreview = null;
 let smartVendorPoPreviewRequestSequence = 0;
+let smartVendorPoSyncRunning = false;
 
 function smartVendorWorkflowId(proposal = {}) {
   return Number(proposal.workflowId || proposal.id);
@@ -336,6 +337,7 @@ function smartVendorConfirmedPallets(line, decision, proposal = null) {
 }
 
 function smartVendorLineSalesQuantity(line, confirmedPallets) {
+  if (line.currentPurchaseOrder) return line.salesQuantity;
   return Number(confirmedPallets || 0) * Number(line.toPlt || 0);
 }
 
@@ -348,6 +350,7 @@ function smartVendorMoney(value) {
 }
 
 function smartVendorLinePurchaseAmount(line = {}, salesQuantity = 0) {
+  if (line.currentPurchaseOrder) return line.purchaseAmount;
   if (line.purchaseUnitMismatch === true) return null;
   if (line.unitPriceSource === "netsuite_po_rate"
     && line.purchaseAmount !== null
@@ -433,7 +436,9 @@ function smartVendorLoadCard(proposal) {
   const overCapacity = Number(proposal.utilization) > 1.000001;
   const originalLines = (proposal.lines || []).filter((line) => !line.isAlternative);
   const disabled = editable ? "" : "disabled";
-  const route = typeof smartProposalRoute === "function"
+  const route = proposal.currentPurchaseOrder
+    ? `${proposal.vendor || "Vendor"} → ${proposal.destinationName || "Destination not set"}`
+    : typeof smartProposalRoute === "function"
     ? smartProposalRoute(proposal)
     : `${proposal.vendor || proposal.sourceName || "Vendor"} → ${proposal.destinationName}`;
   const createAction = smartCanWrite() && (proposal.canCreatePurchaseOrder ?? (!isBlanket && editable))
@@ -443,7 +448,7 @@ function smartVendorLoadCard(proposal) {
       : "";
   const purchaseRef = proposal.netsuitePurchaseOrderRef || proposal.splitPurchaseOrderRef || "";
   const completedActions = !isBlanket && Number(proposal.netsuitePurchaseOrderId) > 0 && purchaseRef
-    ? `<button class="smart-button" data-smart-action="preview-vendor-po" data-workflow-id="${workflowId}" type="button">Preview PO</button>${proposal.canMoveToHistory ? `<button class="smart-button blue" data-smart-action="archive-vendor-workflow" data-workflow-id="${workflowId}" type="button">Move to PO history</button>` : ""}`
+    ? `<button class="smart-button" data-smart-action="preview-vendor-po" data-workflow-id="${workflowId}" type="button">Preview PO</button>${proposal.purchaseOrderHistoryId ? `<a class="smart-button blue" href="/scm/netsuite-po?historyId=${Number(proposal.purchaseOrderHistoryId)}">View / Edit PO</a><button class="smart-button" data-smart-action="refresh-vendor-po" data-history-id="${Number(proposal.purchaseOrderHistoryId)}" type="button">Sync from NetSuite</button>` : ""}${proposal.canMoveToHistory ? `<button class="smart-button blue" data-smart-action="archive-vendor-workflow" data-workflow-id="${workflowId}" type="button">Move to PO history</button>` : ""}`
     : "";
   const saveDraftAction = editable
     ? `<button class="smart-button blue" data-smart-action="save-vendor-load" data-proposal-id="${proposal.id}" type="button">${isBlanket ? "Save Blanket draft" : "Save draft"}</button>`
@@ -451,7 +456,7 @@ function smartVendorLoadCard(proposal) {
   return `<article class="smart-proposal smart-vendor-load" data-vendor-load="${proposal.id}" data-vendor-workflow="${workflowId}" data-vendor-kind="${isBlanket ? "blanket_po" : "regular_po"}">
     <div class="smart-vendor-card-header">
       <div class="smart-vendor-card-primary">
-        <div class="smart-vendor-identity"><strong>${isBlanket ? "Blanket PO" : "PO"}</strong>${smartPill(proposal.workflowStatus || proposal.status)}${smartPill(proposal.vendorResponseStatus || "awaiting")}${overCapacity ? smartPill("attention", "Over capacity · manual") : ""}</div>
+        <div class="smart-vendor-identity"><strong>${isBlanket ? "Blanket PO" : "PO"}</strong>${smartPill(proposal.workflowStatus || proposal.status)}${proposal.currentPurchaseOrder ? smartPill("po_created", proposal.netsuiteStatus || "Created") : smartPill(proposal.vendorResponseStatus || "awaiting")}${overCapacity ? smartPill("attention", "Over capacity · manual") : ""}</div>
         <div class="smart-vendor-route" title="${smartEscape(route)}"><strong>${smartEscape(route)}</strong></div>
         <div class="smart-vendor-head-actions">${saveDraftAction}<button class="smart-button" data-smart-action="toggle-vendor-email" data-workflow-id="${workflowId}" type="button">Draft email</button>${createAction}${completedActions}</div>
       </div>
@@ -477,7 +482,7 @@ function smartVendorLoadCard(proposal) {
       <label class="smart-field smart-vendor-remarks"><span>Load remarks</span><input data-vendor-load-field="remarks" data-smart-focus-key="vendor-workflow:${workflowId}:load:remarks" value="${smartEscape(proposal.vendorRemarks || "")}" ${disabled} /></label>
       ${isBlanket ? `<label class="smart-field"><span>Split PO reference</span><input data-vendor-load-field="splitPoRef" data-smart-focus-key="vendor-workflow:${workflowId}:load:split-po-ref" value="${smartEscape(proposal.splitPurchaseOrderRef || "")}" placeholder="Enter after vendor reply" ${editable ? "" : "disabled"} /></label>` : ""}
     </div>
-    <div class="smart-proposal-lines smart-table-wrap"><table class="smart-table smart-vendor-lines"><thead><tr><th>Item</th><th>Location</th><th>Decision</th><th class="numeric">Requested</th><th class="numeric">Decision qty</th><th class="numeric">Decision sales qty</th><th class="numeric">Unit price</th><th class="numeric">Decision amount</th><th class="numeric">Requested weight</th><th></th></tr></thead><tbody>
+    <div class="smart-proposal-lines smart-table-wrap"><table class="smart-table smart-vendor-lines"><thead><tr><th>Item</th><th>Location</th><th>Decision</th><th class="numeric">${proposal.currentPurchaseOrder ? "PO pallets" : "Requested"}</th><th class="numeric">${proposal.currentPurchaseOrder ? "PO pallets" : "Decision qty"}</th><th class="numeric">${proposal.currentPurchaseOrder ? "PO quantity" : "Decision sales qty"}</th><th class="numeric">Unit price</th><th class="numeric">${proposal.currentPurchaseOrder ? "PO amount" : "Decision amount"}</th><th class="numeric">${proposal.currentPurchaseOrder ? "PO weight" : "Requested weight"}</th><th></th></tr></thead><tbody>
       ${(proposal.lines || []).map((line) => {
         const decision = smartVendorReplyDecision(line, proposal);
         const requestedPallets = smartVendorPendingPallets(line, proposal);
@@ -642,7 +647,33 @@ async function smartReloadVendorLoads() {
   if (requestSequence !== smartVendorLoadRequestSequence) return smartState.vendorReplyLoads;
   smartState.vendorReplyLoads = loads;
   if (smartState.data) smartState.data.vendorReplyLoads = loads;
+  void smartReconcileCreatedPurchaseOrders();
   return smartState.vendorReplyLoads;
+}
+
+async function smartReconcileCreatedPurchaseOrders() {
+  if (smartVendorPoSyncRunning || smartState.tab !== "vendors" || smartState.busy
+    || document.visibilityState !== "visible" || smartVendorEmailModalWorkflowId
+    || /^(INPUT|TEXTAREA|SELECT)$/.test(document.activeElement?.tagName || "")) return;
+  const oldest = (smartState.vendorReplyLoads || [])
+    .filter((load) => load.purchaseOrderHistoryId && Date.now() - new Date(load.purchaseOrderSyncedAt || 0).getTime() > 55000)
+    .sort((a, b) => new Date(a.purchaseOrderSyncedAt || 0) - new Date(b.purchaseOrderSyncedAt || 0))[0];
+  if (!oldest) return;
+  smartVendorPoSyncRunning = true;
+  try {
+    await smartApi(`/api/scm/netsuite-po-history/${oldest.purchaseOrderHistoryId}/refresh`, { method: "POST", body: {} });
+    await smartReloadVendorLoads();
+    smartRender();
+  } catch (error) {
+    smartState.error = `NetSuite PO refresh delayed: ${error.message}`;
+    smartRender();
+  } finally {
+    smartVendorPoSyncRunning = false;
+  }
+}
+
+if (typeof setInterval === "function") {
+  setInterval(() => { void smartReconcileCreatedPurchaseOrders(); }, 60000);
 }
 
 function smartVendorAlternativeMarkup(proposalId, items = [], { isBlanket = false } = {}) {
@@ -683,7 +714,7 @@ smartScmApp.addEventListener("click", async (event) => {
   const button = event.target.closest("[data-smart-action]");
   if (!button || smartState.busy) return;
   const action = button.dataset.smartAction;
-  if (!["open-vendor-load", "refresh-vendor-loads", "save-vendor-load", "confirm-vendor-load", "remove-vendor-load", "suggest-vendor-alternatives", "add-vendor-alternative", "remove-vendor-alternative", "toggle-vendor-email", "close-vendor-email", "save-vendor-email", "copy-vendor-email-rich", "copy-vendor-email-plain", "open-vendor-gmail", "create-vendor-po", "create-blanket-split", "archive-vendor-workflow", "preview-vendor-po", "retry-vendor-po-preview", "close-vendor-po-preview"].includes(action)) return;
+  if (!["open-vendor-load", "refresh-vendor-loads", "save-vendor-load", "confirm-vendor-load", "remove-vendor-load", "suggest-vendor-alternatives", "add-vendor-alternative", "remove-vendor-alternative", "toggle-vendor-email", "close-vendor-email", "save-vendor-email", "copy-vendor-email-rich", "copy-vendor-email-plain", "open-vendor-gmail", "create-vendor-po", "create-blanket-split", "archive-vendor-workflow", "preview-vendor-po", "refresh-vendor-po", "retry-vendor-po-preview", "close-vendor-po-preview"].includes(action)) return;
   try {
     if (action === "close-vendor-po-preview") {
       smartVendorClosePoPreview();
@@ -782,6 +813,11 @@ smartScmApp.addEventListener("click", async (event) => {
       }), "Purchase order moved to history");
       await smartReloadVendorLoads();
       smartRender();
+    } else if (action === "refresh-vendor-po") {
+      await smartWork("Syncing purchase order from NetSuite", () => smartApi(`/api/scm/netsuite-po-history/${Number(button.dataset.historyId)}/refresh`, {
+        method: "POST", body: {}
+      }), "Purchase order refreshed from NetSuite");
+      await smartReloadVendorLoads();
     } else if (action === "preview-vendor-po") {
       const card = button.closest("[data-vendor-load]");
       smartVendorEmailModalWorkflowId = null;

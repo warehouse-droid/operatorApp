@@ -1,0 +1,69 @@
+--- a/server/src/operator-netsuite-posting-domain.js
++++ b/server/src/operator-netsuite-posting-domain.js
+@@ -274,12 +274,14 @@
+     assertKindForTransaction(sourceOrderKind, transactionType);
+     const sourceNetSuiteId = positiveInteger(rawTarget.sourceNetSuiteId, "Source NetSuite ID");
+     const sourceOrderRef = requiredText(rawTarget.sourceOrderRef, "Source order reference");
++    const memo = transactionType === "IR" ? optionalText(rawTarget.memo) : null;
+     const key = `${sourceOrderKind}:${sourceNetSuiteId}`;
+     if (!grouped.has(key)) {
+       grouped.set(key, {
+         sourceOrderKind,
+         sourceNetSuiteId,
+         sourceOrderRef,
++        memo,
+         selectedByLine: new Map(),
+         availableByLine: new Map(),
+         lineSnapshot: []
+@@ -289,6 +291,10 @@
+     if (group.sourceOrderRef !== sourceOrderRef) {
+       throw inputError("One NetSuite source ID cannot use conflicting order references.");
+     }
++    if (group.memo && memo && group.memo !== memo) {
++      throw inputError("One NetSuite receipt cannot use conflicting memo references.");
++    }
++    group.memo ||= memo;
+     const availableLines = Array.isArray(rawTarget.availableLines) ? rawTarget.availableLines : [];
+     const selectedLines = Array.isArray(rawTarget.selectedLines) ? rawTarget.selectedLines : [];
+     if (!availableLines.length || !selectedLines.length) {
+@@ -393,6 +399,9 @@
+       });
+     }
+     const payloadLines = [...group.availableByLine.values()]
++      // Completed receipt lines are absent from the transform's static item sublist.
++      // Keep them in reconciliation evidence, but never send a deselection for them.
++      .filter((available) => transactionType !== "IR" || available.remainingQuantity !== 0)
+       .sort((left, right) => left.orderLine - right.orderLine)
+       .map((available) => {
+         const selected = group.selectedByLine.get(available.orderLine);
+@@ -424,7 +433,7 @@
+     const { group, payloadLines, lineSnapshot } = plan;
+     const stepIndex = index + 1;
+     const externalId = operatorNetSuiteExternalId(requestId, stepIndex);
+-    const payload = { externalId, item: { items: payloadLines } };
++    const payload = { externalId, ...(group.memo ? { memo: group.memo } : {}), item: { items: payloadLines } };
+     return {
+       stepIndex,
+       sourceOrderKind: group.sourceOrderKind,
+--- a/server/src/operator-netsuite-posting-targets.js
++++ b/server/src/operator-netsuite-posting-targets.js
+@@ -311,6 +311,11 @@
+   return line;
+ }
+ 
++/** @param {Record<string, any>} order @param {string} functionKey */
++function receivingMemo(order, functionKey) {
++  return functionKey === "receiving" ? { memo: String(order.tranid || "").trim() } : {};
++}
++
+ /**
+  * @param {Record<string, any>} order
+  * @param {string} functionKey
+@@ -343,6 +348,7 @@
+     sourceOrderKind: source.sourceOrderKind,
+     sourceNetSuiteId: Number(source.sourceNetSuiteId),
+     sourceOrderRef: String(source.sourceOrderRef || ""),
++    ...receivingMemo(order, functionKey),
+     selectedLines: selectedItems.map((/** @type {Record<string, any>} */ item) => {
+       const localLine = localLineForPayload(order, functionKey, Number(item.orderLine));
+       const sourceLineKey = String(localLine.line_id);

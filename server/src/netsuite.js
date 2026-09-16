@@ -1,4 +1,7 @@
 import crypto from "node:crypto";
+import { withNetSuiteOrderLines } from "./netsuite-order-line.js";
+import { operatorPostingTelemetry } from "./operator-netsuite-posting-telemetry.js";
+import { scmNetSuitePoVersion } from "./scm-netsuite-po-version.js";
 import { config, requireConfig } from "./config.js";
 import { query } from "./db.js";
 import { assertSandboxNetSuiteEnvironment } from "./mbt/netsuite-readonly-adapter.js";
@@ -28,6 +31,29 @@ export function assertNetSuiteDirectAccessEnabled() {
   throw error;
 }
 
+export function mapNetSuiteTransferSourceLines(rows) {
+  const logical = normalizePoToReconciliationLines(rows.map(row => ({
+    sourceLineKey: String(row.line_id),
+    orderLine: Number(row.order_line_number),
+    lineSequenceNumber: Number(row.line_sequence_number),
+    doNotPrintLine: row.do_not_print_line,
+    signedQuantity: Number(String(row.quantity || 0).replaceAll(",", "")),
+    quantity: toNumber(row.quantity),
+    stage: Number(String(row.quantity || 0).replaceAll(",", "")) < 0 ? "outbound" : "receiving",
+    itemId: row.item_id,
+    unit: row.unit,
+    locationId: row.location_id,
+    raw: row
+  })), "TO");
+  const byKey = new Map();
+  for (const line of withNetSuiteOrderLines(logical, "TO")) {
+    for (const alias of line.sourceLineAliases || [line.sourceLineKey]) {
+      byKey.set(String(alias), line.netsuite_order_line);
+    }
+  }
+  return rows.map(row => ({ ...row, netsuite_order_line: byKey.get(String(row.line_id)) ?? null }));
+}
+
 async function netsuiteFetch(url, options = {}) {
   const timeoutMs = Number(config.netsuite.requestTimeoutMs || 120000);
   const signal = options.signal || (AbortSignal.timeout ? AbortSignal.timeout(timeoutMs) : undefined);
@@ -46,6 +72,14 @@ async function netsuiteFetch(url, options = {}) {
     }
     throw error;
   }
+}
+
+async function timedNetSuiteTextRequest(url, options, attempt) {
+  return operatorPostingTelemetry.time({ operation: "netsuite.http", method: options.method || "GET",
+    path: new URL(url).pathname, attempt }, async () => {
+    const response = await netsuiteFetch(url, options);
+    return { response, text: await response.text() };
+  });
 }
 
 const MBT_NETSUITE_READ_RESPONSE_LIMIT = 1024 * 1024;
@@ -474,14 +508,15 @@ function normalizeOpenDeliveryLine(line) {
 function normalizeTransferDetailLines(lines, { sourceLocationId = null, destinationLocationId = null } = {}) {
   const filtered = lines.filter((line) => {
     const quantity = Number(String(line.quantity || 0).replaceAll(",", ""));
-    if (sourceLocationId && String(line.location_id) === String(sourceLocationId)) return quantity < 0;
-    if (destinationLocationId && String(line.location_id) === String(destinationLocationId)) return quantity > 0;
+    if (sourceLocationId) return String(line.location_id) === String(sourceLocationId) && quantity < 0;
+    if (destinationLocationId) return String(line.location_id) === String(destinationLocationId) && quantity > 0;
     return true;
   });
 
   const bestByDuplicateKey = new Map();
   for (const line of filtered) {
     const key = [
+      line.netsuite_order_line ?? "",
       line.item_id,
       line.location_id,
       toNumber(line.quantity),
@@ -620,8 +655,8 @@ async function netsuiteRest(path, { method = "GET", body = null, headers = {} } 
   let lastError;
   let m2mAuthRetry = false;
   for (let attempt = 0; attempt < 4; attempt += 1) {
-    const accessToken = await getAccessToken();
-    const response = await netsuiteFetch(`${config.netsuite.restBaseUrl}${path}`, {
+    const accessToken = await operatorPostingTelemetry.time({ operation: "netsuite.auth" }, getAccessToken);
+    const { response, text } = await timedNetSuiteTextRequest(`${config.netsuite.restBaseUrl}${path}`, {
       method,
       headers: {
         "Authorization": `Bearer ${accessToken}`,
@@ -629,9 +664,7 @@ async function netsuiteRest(path, { method = "GET", body = null, headers = {} } 
         ...headers
       },
       body: body ? JSON.stringify(body) : undefined
-    });
-
-    const text = await response.text();
+    }, attempt + 1);
     const contentType = response.headers.get("content-type") || "";
     let data = text;
     if (text && (contentType.includes("application/json") || /^[\s\r\n]*[\[{]/.test(text))) {
@@ -668,7 +701,7 @@ export async function transformSalesOrderToItemFulfillment(orderId, payload) {
     method: "POST",
     body: payload
   });
-  const result = restMutationQueue.then(run, run);
+  const result = operatorPostingTelemetry.queued("rest_mutation", restMutationQueue, run);
   restMutationQueue = result.catch(() => {});
   return result;
 }
@@ -682,7 +715,7 @@ export async function transformTransferOrderToItemFulfillment(orderId, payload) 
     method: "POST",
     body: payload
   });
-  const result = restMutationQueue.then(run, run);
+  const result = operatorPostingTelemetry.queued("rest_mutation", restMutationQueue, run);
   restMutationQueue = result.catch(() => {});
   return result;
 }
@@ -696,7 +729,7 @@ export async function transformPurchaseOrderToItemReceipt(orderId, payload) {
     method: "POST",
     body: payload
   });
-  const result = restMutationQueue.then(run, run);
+  const result = operatorPostingTelemetry.queued("rest_mutation", restMutationQueue, run);
   restMutationQueue = result.catch(() => {});
   return result;
 }
@@ -710,7 +743,7 @@ export async function transformTransferOrderToItemReceipt(orderId, payload) {
     method: "POST",
     body: payload
   });
-  const result = restMutationQueue.then(run, run);
+  const result = operatorPostingTelemetry.queued("rest_mutation", restMutationQueue, run);
   restMutationQueue = result.catch(() => {});
   return result;
 }
@@ -1115,6 +1148,7 @@ function comparableNetSuiteDate(value) {
 
 export async function updatePurchaseOrderHistoryInNetSuite(orderId, {
   expectedLastModifiedAt,
+  expectedVersion,
   header = {},
   lines = []
 } = {}) {
@@ -1142,6 +1176,14 @@ export async function updatePurchaseOrderHistoryInNetSuite(orderId, {
         const error = new Error(`Item identity on purchase-order line ${requested.lineId || requested.restLineId} changed in NetSuite.`);
         error.status = 409;
         throw error;
+      }
+    }
+    if (expectedVersion) {
+      const snapshot = await fetchPurchaseOrderHistorySnapshotFromNetSuite(id);
+      if (!snapshot || scmNetSuitePoVersion(snapshot) !== expectedVersion) {
+        throw Object.assign(new Error("This purchase order changed in NetSuite. Refresh and review the latest values before saving."), {
+          code: "MBBS_PO_VERSION_CONFLICT", status: 409
+        });
       }
     }
     const payload = buildPurchaseOrderHistoryRestPayload({ header, lines });
@@ -1309,7 +1351,7 @@ export async function findOperatorNetSuitePostingTransactionByExternalId(
 
 export async function suiteql(q, params = [], options = {}) {
   const run = () => runSuiteql(q, params, options);
-  const result = suiteqlQueue.then(run, run);
+  const result = operatorPostingTelemetry.queued("suiteql", suiteqlQueue, run);
   suiteqlQueue = result.catch(() => {});
   return result;
 }
@@ -1321,10 +1363,11 @@ async function runSuiteql(q, params = [], options = {}) {
   if (options.limit) url.searchParams.set("limit", String(options.limit));
   if (options.offset) url.searchParams.set("offset", String(options.offset));
   let response;
+  let text;
   let m2mAuthRetry = false;
   for (let attempt = 0; attempt < 4; attempt += 1) {
-    const accessToken = await getAccessToken();
-    response = await netsuiteFetch(url, {
+    const accessToken = await operatorPostingTelemetry.time({ operation: "netsuite.auth" }, getAccessToken);
+    ({ response, text } = await timedNetSuiteTextRequest(url, {
       method: "POST",
       headers: {
         "Authorization": `Bearer ${accessToken}`,
@@ -1332,7 +1375,7 @@ async function runSuiteql(q, params = [], options = {}) {
         "Prefer": "transient"
       },
       body: JSON.stringify(body)
-    });
+    }, attempt + 1));
     if (response.status === 401 && !m2mAuthRetry && await isNetSuiteM2mActive()) {
       invalidateNetSuiteM2mAccessToken();
       m2mAuthRetry = true;
@@ -1344,10 +1387,10 @@ async function runSuiteql(q, params = [], options = {}) {
   }
 
   if (!response.ok) {
-    throw new Error(`NetSuite SuiteQL failed: ${response.status} ${await response.text()}`);
+    throw new Error(`NetSuite SuiteQL failed: ${response.status} ${text}`);
   }
 
-  return response.json();
+  return JSON.parse(text);
 }
 
 export async function suiteqlAll(q, params = [], { pageSize = 1000 } = {}) {
@@ -1650,6 +1693,10 @@ export async function fetchTransactionProgressFromNetSuite(orderId, recordType =
       t.transferlocation AS destination_location_id,
       BUILTIN.DF(t.transferlocation) AS destination_location,
       tl.uniquekey AS line_id,
+      tl.id AS order_line_number,
+      tl.id AS netsuite_order_line,
+      tl.donotprintline AS do_not_print_line,
+      tl.linesequencenumber AS line_sequence_number,
       tl.item AS item_id,
       BUILTIN.DF(tl.item) AS item_name,
       i.itemtype AS item_type,
@@ -1696,7 +1743,8 @@ export async function fetchTransactionProgressFromNetSuite(orderId, recordType =
     destination_location_id: first.destination_location_id,
     destination_location: first.destination_location,
     record_type: type,
-    lines: rows.map((line) => deriveQuantitiesFromSalesQuantity(line, toNumber(line.quantity)))
+    lines: (type === "TrnfrOrd" ? mapNetSuiteTransferSourceLines(rows) : rows)
+      .map((line) => deriveQuantitiesFromSalesQuantity(line, toNumber(line.quantity)))
   };
 }
 
@@ -2229,7 +2277,7 @@ async function fetchScmReconciliationOrdersBatch(options = {}) {
   }
   return [...orders.values()].map((order) => ({
     ...order,
-    lines: normalizePoToReconciliationLines(order.lines, order.kind)
+    lines: withNetSuiteOrderLines(normalizePoToReconciliationLines(order.lines, order.kind), order.kind)
   }));
 }
 
@@ -2465,6 +2513,7 @@ export async function fetchDeliveryOrderDetailsFromNetSuite(orderId, locationId 
   const detailQuery = `
     SELECT
       tl.uniquekey AS line_id,
+      tl.id AS netsuite_order_line,
       tl.item AS item_id,
       BUILTIN.DF(tl.item) AS item_name,
       i.itemtype AS item_type,
@@ -2589,6 +2638,7 @@ export async function fetchDeliveryOrderDetailsBatchFromNetSuite(orderIds) {
       SELECT
         tl.transaction AS transaction_id,
         tl.uniquekey AS line_id,
+      tl.id AS netsuite_order_line,
         tl.item AS item_id,
         BUILTIN.DF(tl.item) AS item_name,
         i.itemtype AS item_type,
@@ -2639,11 +2689,14 @@ export async function fetchTransferOrderDetailsFromNetSuite(orderId, locationId 
   if (!Number.isInteger(id) || id <= 0) {
     throw new Error("A valid numeric NetSuite transfer order ID is required.");
   }
-  const locationFilter = locationId ? `AND tl.location = ${Number(locationId)}` : "";
 
   const result = await suiteql(`
     SELECT
       tl.uniquekey AS line_id,
+      tl.id AS order_line_number,
+      tl.id AS netsuite_order_line,
+      tl.donotprintline AS do_not_print_line,
+      tl.linesequencenumber AS line_sequence_number,
       tl.item AS item_id,
       BUILTIN.DF(tl.item) AS item_name,
       i.itemtype AS item_type,
@@ -2669,10 +2722,9 @@ export async function fetchTransferOrderDetailsFromNetSuite(orderId, locationId 
       AND tl.item IS NOT NULL
       AND tl.mainline = 'F'
       AND tl.taxline = 'F'
-      ${locationFilter}
     ORDER BY tl.uniquekey
   `);
-  return normalizeTransferDetailLines(result.items || [], direction === "destination"
+  return normalizeTransferDetailLines(mapNetSuiteTransferSourceLines(result.items || []), direction === "destination"
     ? { destinationLocationId: locationId }
     : { sourceLocationId: locationId });
 }
@@ -2791,6 +2843,7 @@ export async function fetchPurchaseOrderDetailsFromNetSuite(orderId, locationId 
   const result = await suiteql(`
     SELECT
       tl.uniquekey AS line_id,
+      tl.id AS netsuite_order_line,
       tl.id AS order_line,
       tl.linesequencenumber AS line_sequence_number,
       tl.item AS item_id,

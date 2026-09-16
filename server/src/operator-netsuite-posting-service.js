@@ -1,4 +1,5 @@
 // @ts-check
+import { operatorPostingTelemetry as telemetry } from "./operator-netsuite-posting-telemetry.js";
 
 /** @param {unknown} error */
 function failureDetails(error) {
@@ -89,8 +90,8 @@ export function createOperatorNetSuitePostingProcessor({ repository, adapter, fi
     }
   }
 
-  async function verifiedExternalRecord(/** @type {Record<string, any>} */ step) {
-    const record = await adapter.findByExternalId(step);
+  async function verifiedExternalRecord(/** @type {Record<string, any>} */ step, stage = "duplicate_check") {
+    const record = await telemetry.context({ stage }, () => telemetry.time({ operation: `posting.${stage}` }, () => adapter.findByExternalId(step)));
     if (!record) {return null;}
     const verified = adapter.verify(step, record);
     return { record, verified };
@@ -114,10 +115,10 @@ export function createOperatorNetSuitePostingProcessor({ repository, adapter, fi
         ({ record, verified } = existing);
         recovered = true;
       } else {
-        const transformed = await adapter.transform(step);
+        const transformed = await telemetry.context({ stage: "transform" }, () => telemetry.time({ operation: "posting.transform" }, () => adapter.transform(step)));
         const transactionId = Number(transformed?.id);
         if (Number.isSafeInteger(transactionId) && transactionId > 0) {
-          record = await adapter.fetchById(step, transactionId);
+          record = await telemetry.context({ stage: "verification" }, () => telemetry.time({ operation: "posting.verification" }, () => adapter.fetchById(step, transactionId)));
           if (!record) {
             throw Object.assign(new Error("NetSuite transform succeeded but the created record could not be read."), {
               code: "OPERATOR_NETSUITE_POSTING_RESULT_UNVERIFIED",
@@ -126,7 +127,7 @@ export function createOperatorNetSuitePostingProcessor({ repository, adapter, fi
           }
           verified = adapter.verify(step, record);
         } else {
-          const afterTransform = await verifiedExternalRecord(step);
+          const afterTransform = await verifiedExternalRecord(step, "recovery");
           if (!afterTransform) {
             throw Object.assign(new Error("NetSuite transform returned no verifiable transaction identity."), {
               code: "OPERATOR_NETSUITE_POSTING_RESULT_UNVERIFIED",
@@ -141,7 +142,7 @@ export function createOperatorNetSuitePostingProcessor({ repository, adapter, fi
       const ambiguous = isAmbiguousOperatorNetSuiteFailure(error);
       if (ambiguous) {
         try {
-          const recovery = await verifiedExternalRecord(step);
+          const recovery = await verifiedExternalRecord(step, "recovery");
           if (recovery) {
             ({ record, verified } = recovery);
             recovered = true;
@@ -176,6 +177,13 @@ export function createOperatorNetSuitePostingProcessor({ repository, adapter, fi
     replaceStep(command, updated);
   }
 
+  /** @param {Record<string, any>} command @param {unknown} error */
+  function requiresAttention(command, error) {
+    return command.inputSnapshot?.localOperation?.kind === "delivery_consolidation_load"
+      || command.steps.some((/** @type {Record<string, any>} */ step) => ["posted", "uncertain"].includes(step.status))
+      || isAmbiguousOperatorNetSuiteFailure(error);
+  }
+
   async function process(/** @type {string} */ commandId) {
     let command = await repository.claim({
       commandId,
@@ -186,13 +194,12 @@ export function createOperatorNetSuitePostingProcessor({ repository, adapter, fi
     for (const step of command.steps || []) {
       if (step.status === "posted") {continue;}
       try {
-        await withLeaseHeartbeat(command, () => postStep(command, step));
+        await telemetry.context({ commandId: command.id, functionKey: command.functionKey,
+          transactionType: step.transactionType, sourceOrderKind: step.sourceOrderKind,
+          sourceNetSuiteId: step.sourceNetSuiteId, stepIndex: step.stepIndex, stage: "posting" },
+        () => telemetry.time({ operation: "posting.step" }, () => withLeaseHeartbeat(command, () => postStep(command, step))));
       } catch (error) {
-        const anyPosted = command.steps.some((/** @type {Record<string, any>} */ candidate) => candidate.status === "posted");
-        const needsAttention = anyPosted
-          || command.steps.some((/** @type {Record<string, any>} */ candidate) => candidate.status === "uncertain")
-          || isAmbiguousOperatorNetSuiteFailure(error);
-        command = needsAttention
+        command = requiresAttention(command, error)
           ? await repository.attention({
               commandId: command.id,
               leaseToken: command.leaseToken,
@@ -216,7 +223,8 @@ export function createOperatorNetSuitePostingProcessor({ repository, adapter, fi
         commandId: command.id,
         leaseToken: command.leaseToken,
         result: completionResult(command),
-        finalize: () => finalize(command)
+        finalize: () => telemetry.context({ commandId: command.id, transactionType: command.transactionType,
+          functionKey: command.functionKey, stage: "finalization" }, () => telemetry.time({ operation: "posting.finalization" }, () => finalize(command)))
       });
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);

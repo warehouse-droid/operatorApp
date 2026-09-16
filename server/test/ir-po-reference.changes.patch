@@ -1,0 +1,12 @@
+--- a/src/operator-netsuite-posting-domain.js
++++ b/src/operator-netsuite-posting-domain.js
+@@ -434,7 +434,8 @@
+     const { group, payloadLines, lineSnapshot } = plan;
+     const stepIndex = index + 1;
+     const externalId = operatorNetSuiteExternalId(requestId, stepIndex);
+-    const payload = { externalId, ...(group.memo ? { memo: group.memo } : {}), item: { items: payloadLines } };
++    // custbody9 is the account's Item Receipt "Ref No" field.
++    const payload = { externalId, ...(group.memo ? { memo: group.memo, custbody9: group.memo } : {}), item: { items: payloadLines } };
+     return {
+       stepIndex,
+       sourceOrderKind: group.sourceOrderKind,

@@ -1,0 +1,13 @@
+--- before/src/operator-netsuite-posting-targets.js
++++ after/src/operator-netsuite-posting-targets.js
+@@ -613,8 +613,9 @@
+             WHERE ledger.source_line_id = line.id
+               AND split.source_po_id = line.purchase_order_id
+               AND split.split_po_id = $2 AND split.status = 'active'
+-         ) mapped ON true
++        ) mapped ON true
+         WHERE line.purchase_order_id = $1
++          AND COALESCE(line.netsuite_active, true) = true
+           AND line.item_type IN ('InvtPart', 'NonInvtPart')
+           AND line.line_id IS NOT NULL
+         ORDER BY line.line_id, line.id`,

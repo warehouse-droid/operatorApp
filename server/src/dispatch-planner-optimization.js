@@ -77,7 +77,7 @@ export function compactDispatchOrderCard(order = {}) {
   const fields = [
     "id", "orderId", "orderRef", "tranid", "refNumber", "type", "orderKind", "sourceTable",
     "customer", "customerName", "address", "dropAddress", "destinationAddress", "pickupAddress",
-    "pickupAddressOverride", "sourceAddress", "dropoffLocation", "pickupLocation", "pickupLocations",
+    "pickupAddressOverride", "dispatchDetailsOverride", "sourceAddress", "dropoffLocation", "pickupLocation", "pickupLocations",
     "sourceYard", "destinationYard", "destinationLocationId", "expectedDeliveryDate", "windowStart",
     "windowEnd", "pallets", "layers", "salesQty", "weight", "totalWeightLbs", "status", "statusText",
     "localDispatchStatus", "dispatchRef", "originalPoRef", "sourcePoRef", "sourcePoRefs",

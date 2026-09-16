@@ -17,7 +17,16 @@ const packedItems = [
   ["UNI-SIES-COP383-GN", 0, 6],
   ["UNI-SIES-COR375-GN", 1, 2],
   ["UNI-SIES-STD375-GN", 1, 5],
-  ["UNI-WIN70S-RDM-SAFARI", 3, 0]
+  ["UNI-WIN70S-RDM-SAFARI", 3, 0],
+  ["Paver Grey 60mm", 2, 0],
+  ["Paver Charcoal 80mm", 1, 5],
+  ["Coping Sandstone", 0, 18],
+  ["Wall Block Granite", 1, 2],
+  ["Wall Cap Granite", 0, 12],
+  ["Step Tread Grey", 0, 4],
+  ["Polymeric Sand Tan", 0, 10],
+  ["Edging Stone Black", 0, 7],
+  ["Patio Slab Beige", 1, 3]
 ];
 
 const groupedOrder = Object.freeze({
@@ -202,7 +211,6 @@ async function openLongGroupLoad(page, viewport) {
 
 test("long grouped load keeps its packed-line list scrollable and outside the photo workspace", async ({ page }) => {
   const unexpected = await openLongGroupLoad(page, { width: 1024, height: 700 });
-  await page.getByRole("button", { name: "Open camera", exact: true }).click();
   await expect(page.locator("#fulfillmentCamera")).toBeVisible();
 
   const layout = await page.evaluate(() => {

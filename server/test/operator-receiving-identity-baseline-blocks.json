@@ -1,0 +1,144 @@
+[
+  {
+    "file": "src/operator-yard-authorization.js",
+    "beforeSha256": "9ea57f7846825b2af3dba0cd7f8729a7237949acb2b45fbef5e44cdd4ab063fe",
+    "afterSha256": "cca9d4bdcf82e1194b8e0b671aef96184263af47f9208aa04099d90258b96752",
+    "groups": [
+      {
+        "before": "export async function assertOperatorOrderYard(operator, id, { receiving = false, orderType = \"\" } = {}) {\n  let order;\n  if (receiving) {\n    const local = orderType === \"co_order\" || String(id).startsWith(\"CO-\") || Number(id) < 0;\n    order = local ? await getLocalCoReceivingOrder(id) : await getReceivingOrder(id, { includeNetSuiteClosed: true });\n  } else {\n    order = await getDeliveryOrder(id, { includeNetSuiteClosed: true });\n  }\n",
+        "after": "export async function assertOperatorOrderYard(operator, id, { receiving = false, orderType = \"\" } = {}) {\n  let order;\n  if (receiving) {\n    const local = orderType === \"co_order\" || String(id).startsWith(\"CO-\");\n    order = local ? await getLocalCoReceivingOrder(id) : await getReceivingOrder(id, { includeNetSuiteClosed: true });\n    // SCM split POs and TOs also use negative IDs. Resolve those before the\n    // legacy local CO fallback, matching the receiving detail route.\n    if (!order && !local && Number(id) < 0) {\n      order = await getLocalCoReceivingOrder(id);\n    }\n  } else {\n    order = await getDeliveryOrder(id, { includeNetSuiteClosed: true });\n  }\n"
+      }
+    ],
+    "changedLines": [
+      19,
+      23,
+      24,
+      25
+    ]
+  },
+  {
+    "file": "src/receiving-repository.js",
+    "beforeSha256": "2876b513b8e667d7f2896bc320b811314d3f66b3a84f359906d5eddcbcae0318",
+    "afterSha256": "18771546becbd20aac4734619c654d9b8dc26bf4e9ee8fcae70c4810b3ce15fa",
+    "groups": [
+      {
+        "before": "    so_allocated_section_qty: allocatedSections,\n    so_allocated_piece_qty: allocatedPieces,\n    so_allocated_sales_qty: allocatedSalesQty,\n    pallet_qty: Math.max(remaining.pallet_qty - allocatedPallets, 0),\n    layer_qty: Math.max(remaining.layer_qty - allocatedLayers, 0),\n    section_qty: Math.max(remaining.section_qty - allocatedSections, 0),\n    piece_qty: Math.max(remaining.piece_qty - allocatedPieces, 0),\n    quantity: Math.max(remaining.quantity - allocatedSalesQty, 0)\n  };\n}\n\n",
+        "after": "    so_allocated_section_qty: allocatedSections,\n    so_allocated_piece_qty: allocatedPieces,\n    so_allocated_sales_qty: allocatedSalesQty,\n    // SO allocations reserve incoming goods; only receipts reduce receiving.\n    pallet_qty: remaining.pallet_qty,\n    layer_qty: remaining.layer_qty,\n    section_qty: remaining.section_qty,\n    piece_qty: remaining.piece_qty,\n    quantity: remaining.quantity\n  };\n}\n\n"
+      }
+    ],
+    "changedLines": [
+      250,
+      251,
+      252,
+      253,
+      254
+    ]
+  },
+  {
+    "file": "src/operator-netsuite-posting-targets.js",
+    "beforeSha256": "0b490c1b6068a14662465cc21b363c1618a7f42078afe30f472bb72a9003b8ab",
+    "afterSha256": "cc88282bff32fa7e6efce7728d0593db045e3fee6add6422a3111255401a5f0c",
+    "groups": [
+      {
+        "before": "            LIMIT 1`,\n          [order?.netsuite_id]\n        )\n      : await runQuery(\n          `SELECT source_so_id AS source_id, source_so_ref AS source_ref\n             FROM dispatch_scm_so_splits\n            WHERE split_so_id = $1\n",
+        "after": "            LIMIT 1`,\n          [order?.netsuite_id]\n        )\n      : orderType === \"purchase_order\" ? await runQuery(\n          `SELECT source_po_id AS source_id, source_po_ref AS source_ref\n             FROM dispatch_scm_po_splits\n            WHERE split_po_id = $1\n              AND status = 'active'\n            LIMIT 1`,\n          [order?.netsuite_id]\n        ) : await runQuery(\n          `SELECT source_so_id AS source_id, source_so_ref AS source_ref\n             FROM dispatch_scm_so_splits\n            WHERE split_so_id = $1\n"
+      },
+      {
+        "before": "    if (!split.rows[0]) {return null;}\n    sourceNetSuiteId = Number(split.rows[0].source_id);\n    sourceOrderRef = String(split.rows[0].source_ref || \"\");\n    sourceOrderKind = orderType === \"transfer_order\" ? \"TO\" : \"SO\";\n  }\n  if (!Number.isSafeInteger(sourceNetSuiteId) || sourceNetSuiteId <= 0) {return null;}\n\n",
+        "after": "    if (!split.rows[0]) {return null;}\n    sourceNetSuiteId = Number(split.rows[0].source_id);\n    sourceOrderRef = String(split.rows[0].source_ref || \"\");\n    sourceOrderKind = orderType === \"transfer_order\" ? \"TO\" : orderType === \"purchase_order\" ? \"PO\" : \"SO\";\n  }\n  if (!Number.isSafeInteger(sourceNetSuiteId) || sourceNetSuiteId <= 0) {return null;}\n\n"
+      },
+      {
+        "before": "  } else if (sourceOrderKind === \"PO\") {\n    rows = await runQuery(\n      `SELECT line.line_id AS source_line_key,\n              COALESCE(line.location_id, parent.destination_location_id) AS location_id\n         FROM purchase_order_lines line\n         JOIN purchase_orders parent ON parent.netsuite_id = line.purchase_order_id\n        WHERE line.purchase_order_id = $1\n          AND line.item_type IN ('InvtPart', 'NonInvtPart')\n          AND line.line_id IS NOT NULL\n        ORDER BY line.line_id, line.id`,\n      [sourceNetSuiteId]\n    );\n  } else {\n    const lineStage = functionKey === \"receiving\" ? \"receiving\" : \"outbound\";\n    rows = await runQuery(\n",
+        "after": "  } else if (sourceOrderKind === \"PO\") {\n    rows = await runQuery(\n      `SELECT line.line_id AS source_line_key,\n              COALESCE(line.location_id, parent.destination_location_id) AS location_id,\n              mapped.local_line_key, mapped.local_line_id\n         FROM purchase_order_lines line\n         JOIN purchase_orders parent ON parent.netsuite_id = line.purchase_order_id\n         LEFT JOIN LATERAL (\n           SELECT child.line_id AS local_line_key, child.id AS local_line_id\n             FROM dispatch_scm_po_split_lines ledger\n             JOIN dispatch_scm_po_splits split ON split.id = ledger.split_id\n             JOIN purchase_order_lines child ON child.id = ledger.split_line_id\n              AND child.purchase_order_id = split.split_po_id\n            WHERE ledger.source_line_id = line.id\n              AND split.source_po_id = line.purchase_order_id\n              AND split.split_po_id = $2 AND split.status = 'active'\n         ) mapped ON true\n        WHERE line.purchase_order_id = $1\n          AND line.item_type IN ('InvtPart', 'NonInvtPart')\n          AND line.line_id IS NOT NULL\n        ORDER BY line.line_id, line.id`,\n      [sourceNetSuiteId, order.netsuite_id]\n    );\n    if (Number(order.netsuite_id) < 0) {\n      for (const child of (order.receivableLines || order.lines || []).filter(eligibleLine)) {\n        const mapped = rows.rows.filter((/** @type {Record<string, any>} */ row) =>\n          String(row.local_line_id) === String(child.id) && String(row.local_line_key) === String(child.line_id));\n        if (mapped.length !== 1) {\n          throw resolutionError(\"OPERATOR_NETSUITE_POSTING_LINE_MAPPING_UNRESOLVED\",\n            `Split PO line ${child.line_id} has no unique active source-line mapping.`);\n        }\n      }\n    }\n  } else {\n    const lineStage = functionKey === \"receiving\" ? \"receiving\" : \"outbound\";\n    rows = await runQuery(\n"
+      },
+      {
+        "before": "        .includes(String(row.source_line_key || \"\")));\n      return {\n        sourceLineKey: String(line.sourceLineKey || reconciliationSourceLineAliases(line)[0]),\n        sourceLineAliases: reconciliationSourceLineAliases(line),\n        orderLine: Number(line.restOrderLine),\n        location: line.location === null || line.location === undefined\n          ? matchingLocal?.location_id === null || matchingLocal?.location_id === undefined\n",
+        "after": "        .includes(String(row.source_line_key || \"\")));\n      return {\n        sourceLineKey: String(line.sourceLineKey || reconciliationSourceLineAliases(line)[0]),\n        sourceLineAliases: lineAliases([reconciliationSourceLineAliases(line),\n          ...(rows.rows || []).filter((/** @type {Record<string, any>} */ row) => reconciliationSourceLineAliases(line)\n            .includes(String(row.source_line_key || \"\"))).map((/** @type {Record<string, any>} */ row) => row.local_line_key)]),\n        orderLine: Number(line.restOrderLine),\n        location: line.location === null || line.location === undefined\n          ? matchingLocal?.location_id === null || matchingLocal?.location_id === undefined\n"
+      }
+    ],
+    "changedLines": [
+      558,
+      559,
+      560,
+      561,
+      562,
+      563,
+      564,
+      565,
+      576,
+      596,
+      597,
+      600,
+      601,
+      602,
+      603,
+      604,
+      605,
+      606,
+      607,
+      608,
+      609,
+      614,
+      616,
+      617,
+      618,
+      619,
+      620,
+      621,
+      622,
+      623,
+      624,
+      625,
+      691,
+      692,
+      693
+    ]
+  },
+  {
+    "file": "public/operator.js",
+    "beforeSha256": "c7aa1af406b5c98cbad39be3b0da1dd81d7fbb2bebaeeb2f7920c818bbcfd50d",
+    "afterSha256": "507a1b153ba0816c41554f45e02e5f1436ec000df38e11733ba70219b1342938",
+    "groups": [
+      {
+        "before": "}\n\nfunction receivingRemainingSalesQty(line) {\n  return Math.max(0, qty(line.quantity) - qty(line.netsuite_received_qty));\n}\n\n",
+        "after": "}\n\nfunction receivingRemainingSalesQty(line) {\n  if (Object.hasOwn(line || {}, \"original_quantity\")) { return Math.max(0, qty(line.quantity)); }\n  return Math.max(0, qty(line.quantity) - qty(line.netsuite_received_qty));\n}\n\n"
+      }
+    ],
+    "changedLines": [
+      1865
+    ]
+  },
+  {
+    "file": "public/operator.html",
+    "beforeSha256": "0a9ef838d594260d1c1bcd7a91a00df5e2178fbcb6ddf47620b55862eae4a895",
+    "afterSha256": "18eea94c5652f3b70cca0ec85faf1271e377a15bee6cfbf80852274716da83d5",
+    "groups": [
+      {
+        "before": "    <script src=\"/vendor/quagga2/quagga.min.js?v=1.12.1\"></script>\n    <script src=\"/i18n.js?v=20260915-operator-display-v1\"></script>\n    <script src=\"/operator-load-summary.js?v=20260915-operator-display-v1\"></script>\n    <script src=\"/operator.js?v=20260915-operator-display-v1\"></script>\n  </body>\n</html>\n",
+        "after": "    <script src=\"/vendor/quagga2/quagga.min.js?v=1.12.1\"></script>\n    <script src=\"/i18n.js?v=20260915-operator-display-v1\"></script>\n    <script src=\"/operator-load-summary.js?v=20260915-operator-display-v1\"></script>\n    <script src=\"/operator.js?v=20260915-operator-receiving-v1\"></script>\n  </body>\n</html>\n"
+      }
+    ],
+    "changedLines": [
+      24
+    ]
+  },
+  {
+    "file": "public/service-worker.js",
+    "beforeSha256": "04d186cabb9787a17eadf4669b49b5448188d5276d696b1713860eb69349cbef",
+    "afterSha256": "5ba16fa1323b5022292aaf7df0646da6df40d9d8f7cf8fbf7864dee0a76fd9c6",
+    "groups": [
+      {
+        "before": "const CACHE_NAME = \"mbbs-yard-operator-v147-display-v1\";\nconst OPERATOR_CACHE_PREFIX = \"mbbs-yard-operator-\";\nconst APP_SHELL = [\n  \"/operator\",\n",
+        "after": "const CACHE_NAME = \"mbbs-yard-operator-v148-receiving-v1\";\nconst OPERATOR_CACHE_PREFIX = \"mbbs-yard-operator-\";\nconst APP_SHELL = [\n  \"/operator\",\n"
+      },
+      {
+        "before": "  \"/vendor/quagga2/quagga.min.js?v=1.12.1\",\n  \"/i18n.js?v=20260915-operator-display-v1\",\n  \"/operator-load-summary.js?v=20260915-operator-display-v1\",\n  \"/operator.js?v=20260915-operator-display-v1\",\n  \"/manifest.webmanifest\",\n  \"/icons/mbbs-yard-192.png\",\n  \"/icons/mbbs-yard-512.png\",\n",
+        "after": "  \"/vendor/quagga2/quagga.min.js?v=1.12.1\",\n  \"/i18n.js?v=20260915-operator-display-v1\",\n  \"/operator-load-summary.js?v=20260915-operator-display-v1\",\n  \"/operator.js?v=20260915-operator-receiving-v1\",\n  \"/manifest.webmanifest\",\n  \"/icons/mbbs-yard-192.png\",\n  \"/icons/mbbs-yard-512.png\",\n"
+      }
+    ],
+    "changedLines": [
+      1,
+      11
+    ]
+  }
+]

@@ -2,6 +2,7 @@ import { writeAudit } from "./auth-repository.js";
 import { query, withTransaction } from "./db.js";
 import { resolveScmVendorReference } from "./scm-po-vendor-reference.js";
 import { describePurchaseOrderLinePallets } from "./scm-netsuite-po-unit-conversion.js";
+import { scmNetSuitePoVersion } from "./scm-netsuite-po-version.js";
 
 export { resolveScmVendorReference } from "./scm-po-vendor-reference.js";
 
@@ -281,7 +282,10 @@ export async function listScmNetSuitePoHistory(filters = {}) {
   const lineMap = await loadLines(result.rows.map((row) => Number(row.netsuite_purchase_order_id)));
   const total = Number(count.rows[0]?.count || 0);
   return {
-    records: result.rows.map((row) => historyRow(row, lineMap.get(Number(row.netsuite_purchase_order_id)) || [])),
+    records: result.rows.map((row) => {
+      const history = historyRow(row, lineMap.get(Number(row.netsuite_purchase_order_id)) || []);
+      return { ...history, version: scmNetSuitePoVersion(history) };
+    }),
     page,
     pageSize,
     total,
@@ -296,7 +300,8 @@ export async function getScmNetSuitePoHistory(historyId, { includeUnarchived = t
   if (!result.rowCount) throw Object.assign(new Error("The app-created purchase order was not found."), { status: 404 });
   const row = result.rows[0];
   const lines = await loadLines([Number(row.netsuite_purchase_order_id)]);
-  return historyRow(row, lines.get(Number(row.netsuite_purchase_order_id)) || []);
+  const history = historyRow(row, lines.get(Number(row.netsuite_purchase_order_id)) || []);
+  return { ...history, version: scmNetSuitePoVersion(history) };
 }
 
 async function proposalCreationSnapshot(proposalId, purchaseOrderId, purchaseOrderRef) {
@@ -390,10 +395,12 @@ export async function persistScmNetSuitePoSnapshot(historyId, snapshot, { source
     for (const line of snapshot.lines || []) {
       await query(
         `UPDATE purchase_order_lines
-            SET rate = $3, amount = $4, netsuite_closed = $5,
+            SET rate = CASE WHEN $7 THEN COALESCE($3, rate) ELSE $3 END,
+                amount = CASE WHEN $7 THEN COALESCE($4, amount) ELSE $4 END,
+                netsuite_closed = $5,
                 raw = COALESCE(raw, '{}'::jsonb) || $6::jsonb, synced_at = now()
           WHERE purchase_order_id = $1 AND line_id = $2`,
-        [current.purchaseOrderId, positiveInt(line.lineId), line.rate ?? null, line.amount ?? null, line.closed === true, JSON.stringify({ rate: line.rate ?? null, amount: line.amount ?? null, closed: line.closed === true })]
+        [current.purchaseOrderId, positiveInt(line.lineId), line.rate ?? null, line.amount ?? null, line.closed === true, JSON.stringify({ rate: line.rate ?? null, amount: line.amount ?? null, closed: line.closed === true }), allowedSource === "netsuite_webhook"]
       );
     }
     const isReconciliationHeartbeat = allowedSource === "reconciliation"
@@ -473,7 +480,7 @@ export async function listScmNetSuitePoHistoryReconciliationCandidates({
     `SELECT id, netsuite_purchase_order_id
        FROM scm_netsuite_po_history
       WHERE ($1::bigint IS NOT NULL AND id = $1)
-         OR (archived_at IS NOT NULL AND COALESCE(last_synced_at, '-infinity'::timestamptz) < $2::timestamptz)
+         OR (COALESCE(last_synced_at, '-infinity'::timestamptz) < $2::timestamptz)
       ORDER BY CASE WHEN id = $1 THEN 0 ELSE 1 END,
                COALESCE(last_synced_at, '-infinity'::timestamptz), id
       LIMIT $3`,

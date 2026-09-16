@@ -24,9 +24,10 @@ test("Operator service worker precaches the exact new page assets, preserves Dri
   const waits = [];
   events.get("install")({ waitUntil: (promise) => waits.push(promise) });
   await Promise.all(waits);
-  assert.equal(installed[0].name, "mbbs-yard-operator-v145-yard-access-v1");
-  for (const asset of ["operator.js", "operator.css", "i18n.js"]) {
-    const url = `/${asset}?v=20260915-operator-yards-v1`;
+  assert.equal(installed[0].name, "mbbs-yard-operator-v153-auto-camera-v1");
+  for (const asset of ["operator.js", "operator-load-summary.js", "operator.css", "i18n.js"]) {
+    const version = asset === "operator-load-summary.js" ? "20260915-operator-display-v1" : "20260916-operator-auto-camera-v1";
+    const url = `/${asset}?v=${version}`;
     assert.ok(html.includes(url));
     assert.ok(installed[0].assets.includes(`https://yard.invalid${url}`));
   }

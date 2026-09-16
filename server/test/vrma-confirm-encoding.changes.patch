@@ -1,0 +1,81 @@
+--- baseline/src/operator-yard-authorization.js
++++ release/src/operator-yard-authorization.js
+@@ -5,6 +5,7 @@
+ import { getReceivingOrder, getLocalCoReceivingOrder } from "./receiving-repository.js";
+ import { getPublicOperatorNetSuitePostingCommand } from "./operator-netsuite-posting-controller.js";
+ import { assertOperatorYard, deliveryOrderWithinYards, operatorYardLocationIds, requireAssignedOperatorYards, operatorYardForbidden } from "./operator-yard-access.js";
++import { operatorRequestPath, operatorRouteId } from "./operator-yard-route.js";
+ 
+ /** @param {any} row */
+ function found(row) {
+@@ -148,10 +149,10 @@
+     await assertOperatorReturnDraftYard(req.operator, req.body?.draftId || req.body?.draft_id || (pathname === "/api/returns/drafts" ? req.body?.id : null), { allowNew: pathname === "/api/returns/drafts" || pathname === "/api/returns/submit" });
+   }
+   const draft = pathname.match(/^\/api\/returns\/drafts\/([^/]+)$/);
+-  if (draft) await assertOperatorReturnDraftYard(req.operator, draft[1]);
++  if (draft) await assertOperatorReturnDraftYard(req.operator, operatorRouteId(draft[1]));
+   const record = pathname.match(/^\/api\/returns\/operator\/history\/([^/]+)$/);
+   if (record) {
+-    const result = await query("SELECT receiving_location_id FROM return_records WHERE id=$1 AND operator_id=$2", [record[1], req.operator.id]);
++    const result = await query("SELECT receiving_location_id FROM return_records WHERE id=$1 AND operator_id=$2", [operatorRouteId(record[1]), req.operator.id]);
+     assertOperatorYard(req.operator, found(result.rows[0]).receiving_location_id);
+   }
+ }
+@@ -187,7 +188,8 @@
+     const batches = await query("SELECT id FROM operator_consolidation_batches WHERE operator_id=$1 AND location_id=$2 AND status='active'", [req.operator.id, selectedYard(req)]);
+     for (const batch of batches.rows) await assertConsolidationOrderYards(req.operator, batch.id);
+   }
+-  const savedId = req.body?.orderId || pathname.match(/^\/api\/delivery\/saved-orders\/([^/]+)$/)?.[1];
++  const savedPathId = pathname.match(/^\/api\/delivery\/saved-orders\/([^/]+)$/)?.[1];
++  const savedId = req.body?.orderId || (savedPathId ? operatorRouteId(savedPathId) : "");
+   if (savedId) await assertOperatorOrderYard(req.operator, savedId);
+ }
+ 
+@@ -211,7 +213,7 @@
+ /** @param {any} req @param {RegExpMatchArray} job @param {{receivingJobs: Map<string, any>, fulfillmentJobs: Map<string, any>}} jobs */
+ async function authorizeJobRequest(req, job, { receivingJobs, fulfillmentJobs }) {
+   const kind = job[1] || "";
+-  const id = job[2] || "";
++  const id = operatorRouteId(job[2]);
+   if (kind.startsWith("operator/")) {
+     return assertOperatorPostingJobYard(req.operator, await getPublicOperatorNetSuitePostingCommand(id));
+   }
+@@ -224,10 +226,10 @@
+   if (pathname.startsWith("/api/returns/")) return authorizeReturnRequest(req, pathname);
+   const order = pathname.match(/^\/api\/(delivery|receiving|customer-pickup)\/orders\/([^/]+)/);
+   if (order) {
+-    return assertOperatorOrderYard(req.operator, order[2], { receiving: order[1] === "receiving", orderType: req.body?.orderType || req.query.orderType });
++    return assertOperatorOrderYard(req.operator, operatorRouteId(order[2]), { receiving: order[1] === "receiving", orderType: req.body?.orderType || req.query.orderType });
+   }
+   const consolidation = pathname.match(/^\/api\/delivery\/consolidation\/(orders|batches)\/([^/]+)/);
+-  if (consolidation) return assertConsolidationYard(req, consolidation[1] || "", consolidation[2] || "");
++  if (consolidation) return assertConsolidationYard(req, consolidation[1] || "", operatorRouteId(consolidation[2]));
+   const job = pathname.match(/^\/api\/(delivery\/fulfillment-jobs|receiving\/receipt-jobs|operator\/netsuite-posting-jobs)\/([^/]+)/);
+   if (job) return authorizeJobRequest(req, job, jobs);
+   return authorizeListRequest(req, pathname);
+@@ -237,7 +239,7 @@
+   /** @param {any} req @param {any} _res @param {(error?: any) => void} next */
+   return async function requireOperatorYardRequest(req, _res, next) {
+     try {
+-      const pathname = decodeURI(req.originalUrl.split("?")[0]).replace(/\/$/, "");
++      const pathname = operatorRequestPath(req.originalUrl);
+       if (/^\/api\/inventory\/classifications(?:\/|$)/.test(pathname) || pathname === "/api/cycle-count/records") return next();
+       if (controlInventorySync(req, pathname)) return next();
+       requireAssignedOperatorYards(req.operator);
+--- baseline/src/operator-yard-route.js
++++ release/src/operator-yard-route.js
+@@ -0,0 +1,14 @@
++// @ts-check
++/** @param {string} originalUrl */
++export function operatorRequestPath(originalUrl) {
++  // Keep route boundaries encoded; Express decodes each captured parameter.
++  return (originalUrl.split("?")[0] || "").replace(/\/$/, "");
++}
++/** @param {string} [encodedId] */
++export function operatorRouteId(encodedId = "") {
++  try {
++    return decodeURIComponent(encodedId);
++  } catch {
++    throw Object.assign(new Error("Invalid URL identifier encoding."), { status: 400 });
++  }
++}

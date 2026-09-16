@@ -1,0 +1,108 @@
+--- a/server/src/smart-scm-split-inbound-sql.js
++++ b/server/src/smart-scm-split-inbound-sql.js
+@@ -0,0 +1,29 @@
++// These aliases are supplied only by repository SQL, never by request values.
++// The baseline predates local tracking; current NetSuite and local receipts overlap.
++export function smartScmSplitRemainingSql(line = "child_line", po = "child_po") {
++  const physical = [
++    ["received_pallet_qty", "to_plt"], ["received_layer_qty", "to_lyr"],
++    ["received_section_qty", "to_sec"], ["received_piece_qty", "to_pcs"]
++  ].map(([quantity, conversion]) =>
++    `(GREATEST(COALESCE(${line}.${quantity}, 0), 0) * GREATEST(COALESCE(${line}.${conversion}, 0), 0))`
++  ).join(" + ");
++  return `CASE
++    WHEN lower(btrim(COALESCE(${po}.receipt_status, ''))) = 'received'
++      OR EXISTS (
++        SELECT 1 FROM dispatch_order_completion_status completion
++         WHERE completion.order_kind = 'PO'
++           AND completion.dispatch_completion_status = 'completed'
++           AND lower(btrim(completion.order_ref)) = lower(btrim(split.split_po_ref))
++      ) THEN 0
++    ELSE GREATEST(COALESCE(${line}.quantity, 0) - GREATEST(
++      COALESCE(${line}.netsuite_received_qty, 0),
++      GREATEST(COALESCE(${line}.netsuite_received_baseline_qty, 0), 0)
++        + CASE WHEN ${line}.confirmed_at IS NOT NULL
++                 AND ${line}.confirmed_at <= ${po}.received_at
++                 AND lower(btrim(COALESCE(${po}.receipt_status, ''))) = 'partial_received'
++          THEN GREATEST(COALESCE(${line}.received_sales_qty, 0), ${physical}, 0)
++          ELSE 0 END,
++      0
++    ), 0)
++  END`;
++}
+--- a/server/src/smart-scm-planning-repository.js
++++ b/server/src/smart-scm-planning-repository.js
+@@ -1,4 +1,5 @@
+ import { hasActiveTransaction, query, withTransaction } from "./db.js";
++import { smartScmSplitRemainingSql } from "./smart-scm-split-inbound-sql.js";
+ import { writeAudit } from "./auth-repository.js";
+ import { latestSmartScmForecastRunId, smartScmForecastMap } from "./smart-scm-forecast-repository.js";
+ import { calculateSmartScmOrderRequirement, calculateSmartScmPolicyLevels } from "./smart-scm-policy-calculation.js";
+@@ -458,7 +459,7 @@
+               COALESCE(source_line.location_id, source_po.destination_location_id) AS source_location_id,
+               COALESCE(child_line.location_id, child_po.destination_location_id) AS destination_location_id,
+               child_line.quantity,
+-              COALESCE(child_line.netsuite_received_baseline_qty, child_line.netsuite_received_qty, 0) AS received_quantity,
++              ${smartScmSplitRemainingSql()} AS remaining_quantity,
+               split.status = 'active' AND child_po.netsuite_active = true AND child_line.netsuite_active = true AS active,
+               COALESCE(child_line.netsuite_closed, false) AS closed,
+               child_po.status_text AS order_status,
+@@ -1766,12 +1767,13 @@
+             line.id AS line_id,
+             line.item_id,
+             COALESCE(line.location_id, po.destination_location_id) AS location_id,
+-            GREATEST(
++            CASE WHEN split.id IS NOT NULL THEN ${smartScmSplitRemainingSql("line", "po")}
++            ELSE GREATEST(
+               COALESCE(line.quantity, 0)
+                 - COALESCE(line.netsuite_received_baseline_qty, line.netsuite_received_qty, 0)
+                 - CASE WHEN split.id IS NULL THEN COALESCE(relocated.relocated_remaining, 0) ELSE 0 END,
+               0
+-            ) AS remaining_quantity,
++            ) END AS remaining_quantity,
+             line.netsuite_active AS line_active,
+             COALESCE(line.netsuite_closed, false) AS closed,
+             split.id AS split_id,
+--- a/server/src/smart-scm-proposal-editor.js
++++ b/server/src/smart-scm-proposal-editor.js
+@@ -1,5 +1,6 @@
+ import { randomUUID } from "node:crypto";
+ import { query, withTransaction } from "./db.js";
++import { smartScmSplitRemainingSql } from "./smart-scm-split-inbound-sql.js";
+ import { writeAudit } from "./auth-repository.js";
+ import { getSmartScmPlanningRun, getSmartScmProposal, smartScmPackWholePalletLines,
+   smartScmLineOverridesSourceStockFloor, smartScmNormalizePalletQuantityOverrides,
+@@ -900,11 +901,7 @@
+                  )
+             ), 0) AS blanket_excluded,
+             COALESCE((
+-              SELECT SUM(GREATEST(
+-                       COALESCE(child_line.quantity, 0)
+-                       - COALESCE(child_line.netsuite_received_baseline_qty, child_line.netsuite_received_qty, 0),
+-                       0
+-                     ))
++              SELECT SUM(${smartScmSplitRemainingSql()})
+                 FROM dispatch_scm_po_split_lines ledger
+                 JOIN dispatch_scm_po_splits split ON split.id = ledger.split_id
+                 JOIN purchase_order_lines child_line ON child_line.id = ledger.split_line_id
+--- a/server/src/smart-scm-vendor-repository.js
++++ b/server/src/smart-scm-vendor-repository.js
+@@ -1,4 +1,5 @@
+ import { query, withTransaction } from "./db.js";
++import { smartScmSplitRemainingSql } from "./smart-scm-split-inbound-sql.js";
+ import { writeAudit } from "./auth-repository.js";
+ import {
+   getSmartScmProposal,
+@@ -1132,11 +1133,7 @@
+                  )
+             ), 0) AS blanket_excluded,
+             COALESCE((
+-              SELECT SUM(GREATEST(
+-                       COALESCE(child_line.quantity, 0)
+-                       - COALESCE(child_line.netsuite_received_baseline_qty, child_line.netsuite_received_qty, 0),
+-                       0
+-                     ))
++              SELECT SUM(${smartScmSplitRemainingSql()})
+                 FROM dispatch_scm_po_split_lines ledger
+                 JOIN dispatch_scm_po_splits split ON split.id = ledger.split_id
+                 JOIN purchase_order_lines child_line ON child_line.id = ledger.split_line_id

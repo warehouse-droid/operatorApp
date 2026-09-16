@@ -3,7 +3,7 @@ import { writeAudit } from "./auth-repository.js";
 import { getSmartScmProposal } from "./smart-scm-planning-repository.js";
 import { resolveSmartScmVendorItemCodes } from "./smart-scm-vendor-code-service.js";
 import { smartScmVendorFinancialLine } from "./smart-scm-vendor-financials.js";
-import { overlaySmartScmVendorPoFinancials } from "./smart-scm-vendor-po-financials.js";
+import { projectSmartScmCreatedPo } from "./smart-scm-created-po.js";
 
 const WORKFLOW_KINDS = new Set(["regular_po", "blanket_po"]);
 const EMAIL_TO_LIMIT = 1000;
@@ -408,14 +408,18 @@ async function itemMetadataForLines(lines = [], { vendorId = null } = {}) {
 async function purchaseOrderFinancialLinesByOrderIds(orderIds = []) {
   const ids = [...new Set((orderIds || []).map(Number)
     .filter((id) => Number.isInteger(id) && id > 0))];
-  const byOrderId = new Map(ids.map((id) => [id, []]));
+  const byOrderId = new Map();
   if (!ids.length) return byOrderId;
+  const headers = await query(
+    `SELECT po.*, history.id AS history_id, history.last_synced_at, history.last_sync_error,
+            (SELECT truck_capacity_lbs FROM scm_smart_settings WHERE id = 1) AS truck_capacity_lbs
+       FROM purchase_orders po
+       LEFT JOIN scm_netsuite_po_history history ON history.netsuite_purchase_order_id = po.netsuite_id
+      WHERE po.netsuite_id = ANY($1::bigint[])`, [ids]
+  );
+  for (const header of headers.rows) byOrderId.set(Number(header.netsuite_id), { header, lines: [] });
   const result = await query(
-    `SELECT purchase_order_id AS "purchaseOrderId",
-            id, line_id AS "lineId", item_id AS "itemId",
-            location_id AS "locationId", quantity, unit, rate, amount,
-            netsuite_active AS "netsuiteActive",
-            netsuite_closed AS "netsuiteClosed", synced_at AS "syncedAt"
+    `SELECT *
        FROM purchase_order_lines
       WHERE purchase_order_id = ANY($1::bigint[])
         AND netsuite_active IS DISTINCT FROM false
@@ -423,9 +427,7 @@ async function purchaseOrderFinancialLinesByOrderIds(orderIds = []) {
     [ids]
   );
   for (const line of result.rows) {
-    const orderId = Number(line.purchaseOrderId);
-    if (!byOrderId.has(orderId)) byOrderId.set(orderId, []);
-    byOrderId.get(orderId).push(line);
+    byOrderId.get(Number(line.purchase_order_id))?.lines.push(line);
   }
   return byOrderId;
 }
@@ -476,21 +478,14 @@ async function enrichWorkflow(row, { purchaseOrderFinancialsByOrderId = null } =
     && linkedPurchaseOrderId > 0;
   const purchaseOrderFinancials = hasLinkedPurchaseOrder
     ? purchaseOrderFinancialsByOrderId instanceof Map
-      ? purchaseOrderFinancialsByOrderId.get(linkedPurchaseOrderId) || []
-      : (await purchaseOrderFinancialLinesByOrderIds([linkedPurchaseOrderId])).get(linkedPurchaseOrderId) || []
-    : [];
-  const financialLines = hasLinkedPurchaseOrder
-    ? overlaySmartScmVendorPoFinancials({
-        lines: snapshotFinancialLines,
-        purchaseOrderLines: purchaseOrderFinancials
-      })
-    : snapshotFinancialLines;
-  const financialPalletLines = hasLinkedPurchaseOrder
-    ? overlaySmartScmVendorPoFinancials({
-        lines: snapshotFinancialPalletLines,
-        purchaseOrderLines: purchaseOrderFinancials
-      })
-    : snapshotFinancialPalletLines;
+      ? purchaseOrderFinancialsByOrderId.get(linkedPurchaseOrderId)
+      : (await purchaseOrderFinancialLinesByOrderIds([linkedPurchaseOrderId])).get(linkedPurchaseOrderId)
+    : null;
+  const currentDisplay = projectSmartScmCreatedPo({
+    ...display, lines: snapshotFinancialLines, physicalPalletLines: snapshotFinancialPalletLines
+  }, purchaseOrderFinancials);
+  const financialLines = currentDisplay.lines;
+  const financialPalletLines = currentDisplay.physicalPalletLines;
   const emailRows = groupSmartScmVendorEmailRows(
     financialLines,
     metadata,
@@ -501,7 +496,7 @@ async function enrichWorkflow(row, { purchaseOrderFinancialsByOrderId = null } =
   const activeSource = !workflow.reviewProposalId
     && ["order_requested", "vendor_replied"].includes(source.status);
   return {
-    ...display,
+    ...currentDisplay,
     lines: financialLines,
     physicalPalletLines: financialPalletLines,
     id: workflow.sourceProposalId,

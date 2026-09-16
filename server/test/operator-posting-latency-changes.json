@@ -1,0 +1,2481 @@
+[
+  {
+    "file": "src/consolidation-load-repository.js",
+    "beforeSha256": "f371b1a8f8eb30d930721fe826f2dbec7a2fdab0f3053798873df2770aa5583d",
+    "afterSha256": "8ecbcf5401610ebda3d60fdfe95e9bc5ebcbb4175ae52096202f3ede1d815001",
+    "edits": [
+      {
+        "start": 10,
+        "end": 11,
+        "before": []
+      },
+      {
+        "start": 19,
+        "end": 20,
+        "before": [
+          "    status: row.status, photoRefs: row.photo_refs, commandId: row.command_id, result: row.result,\n"
+        ]
+      },
+      {
+        "start": 168,
+        "end": 169,
+        "before": []
+      }
+    ],
+    "changedLines": [
+      11,
+      20,
+      169
+    ]
+  },
+  {
+    "file": "src/consolidation-load-service.js",
+    "beforeSha256": "2689a15f7b89dd483f41c02caacef0682251d414474a4616d77a3c61a06138da",
+    "afterSha256": "e11159b9152dcbcc824e68a2ea958ff9062ed1adf65b857b6d67028816006aed",
+    "edits": [
+      {
+        "start": 13,
+        "end": 16,
+        "before": []
+      },
+      {
+        "start": 20,
+        "end": 23,
+        "before": [
+          "      || values.some((ref) => typeof ref !== \"string\" || !/^r2:\\/\\/operator\\/operator-consolidation-load-photo\\/\\d{4}\\/\\d{2}\\/\\d{2}\\//.test(ref)\n",
+          "        || ref.split(\"/\")[7] !== batchId || ref.includes(\"..\"))) {\n"
+        ]
+      },
+      {
+        "start": 25,
+        "end": 27,
+        "before": []
+      },
+      {
+        "start": 45,
+        "end": 50,
+        "before": []
+      },
+      {
+        "start": 53,
+        "end": 54,
+        "before": []
+      },
+      {
+        "start": 55,
+        "end": 56,
+        "before": [
+          "      if (JSON.stringify(photos) !== JSON.stringify(batch.photoRefs)) throw consolidationError(\"The accepted batch already has its loading photos.\");\n"
+        ]
+      },
+      {
+        "start": 65,
+        "end": 66,
+        "before": [
+          "    await query(\"UPDATE operator_consolidated_loads SET photo_refs=$2,status='pending',submitted_at=now(),updated_at=now() WHERE id=$1\", [id, JSON.stringify(photos)]);\n"
+        ]
+      }
+    ],
+    "changedLines": [
+      14,
+      15,
+      16,
+      21,
+      22,
+      23,
+      26,
+      27,
+      46,
+      47,
+      48,
+      49,
+      50,
+      54,
+      56,
+      66
+    ]
+  },
+  {
+    "file": "src/netsuite.js",
+    "beforeSha256": "76b5d6817669fbc2f642bf180adf0326698eeaee9b044a7153c56a215f610369",
+    "afterSha256": "4ea744583d53f09a7e60e6a1d026d963f0325d5260cd9ca030c06335a0f01f25",
+    "edits": [
+      {
+        "start": 1,
+        "end": 2,
+        "before": []
+      },
+      {
+        "start": 50,
+        "end": 58,
+        "before": []
+      },
+      {
+        "start": 632,
+        "end": 634,
+        "before": [
+          "    const accessToken = await getAccessToken();\n",
+          "    const response = await netsuiteFetch(`${config.netsuite.restBaseUrl}${path}`, {\n"
+        ]
+      },
+      {
+        "start": 641,
+        "end": 642,
+        "before": [
+          "    });\n",
+          "\n",
+          "    const text = await response.text();\n"
+        ]
+      },
+      {
+        "start": 678,
+        "end": 679,
+        "before": [
+          "  const result = restMutationQueue.then(run, run);\n"
+        ]
+      },
+      {
+        "start": 692,
+        "end": 693,
+        "before": [
+          "  const result = restMutationQueue.then(run, run);\n"
+        ]
+      },
+      {
+        "start": 706,
+        "end": 707,
+        "before": [
+          "  const result = restMutationQueue.then(run, run);\n"
+        ]
+      },
+      {
+        "start": 720,
+        "end": 721,
+        "before": [
+          "  const result = restMutationQueue.then(run, run);\n"
+        ]
+      },
+      {
+        "start": 1328,
+        "end": 1329,
+        "before": [
+          "  const result = suiteqlQueue.then(run, run);\n"
+        ]
+      },
+      {
+        "start": 1340,
+        "end": 1341,
+        "before": []
+      },
+      {
+        "start": 1343,
+        "end": 1345,
+        "before": [
+          "    const accessToken = await getAccessToken();\n",
+          "    response = await netsuiteFetch(url, {\n"
+        ]
+      },
+      {
+        "start": 1352,
+        "end": 1353,
+        "before": [
+          "    });\n"
+        ]
+      },
+      {
+        "start": 1364,
+        "end": 1365,
+        "before": [
+          "    throw new Error(`NetSuite SuiteQL failed: ${response.status} ${await response.text()}`);\n"
+        ]
+      },
+      {
+        "start": 1367,
+        "end": 1368,
+        "before": [
+          "  return response.json();\n"
+        ]
+      }
+    ],
+    "changedLines": [
+      2,
+      51,
+      52,
+      53,
+      54,
+      55,
+      56,
+      57,
+      58,
+      633,
+      634,
+      642,
+      679,
+      693,
+      707,
+      721,
+      1329,
+      1341,
+      1344,
+      1345,
+      1353,
+      1365,
+      1368
+    ]
+  },
+  {
+    "file": "src/operator-netsuite-posting-admission.js",
+    "beforeSha256": "1f58fc1023bdab85b4e3f88ebe947fb74e506ef448cac6e411f2add88beac874",
+    "afterSha256": "0a3db59433e8ff948a2ba466c21c8d3ecca6b8504b749f370ed5c38fb919988c",
+    "edits": [
+      {
+        "start": 4,
+        "end": 5,
+        "before": []
+      },
+      {
+        "start": 23,
+        "end": 25,
+        "before": [
+          "  return async function admitOperatorNetSuitePosting(/** @type {Record<string, any>} */ input = {}) {\n",
+          "    const resolution = await resolveTargets({\n"
+        ]
+      },
+      {
+        "start": 30,
+        "end": 31,
+        "before": [
+          "    });\n"
+        ]
+      },
+      {
+        "start": 68,
+        "end": 69,
+        "before": [
+          "      ? await resolution.materializeTargets()\n"
+        ]
+      },
+      {
+        "start": 79,
+        "end": 80,
+        "before": [
+          "    await preflight(input, actionableResolution);\n"
+        ]
+      },
+      {
+        "start": 92,
+        "end": 93,
+        "before": [
+          "    const created = await createCommand(draft);\n"
+        ]
+      },
+      {
+        "start": 100,
+        "end": 104,
+        "before": [
+          "  };\n"
+        ]
+      }
+    ],
+    "changedLines": [
+      5,
+      24,
+      25,
+      31,
+      69,
+      80,
+      93,
+      101,
+      102,
+      103,
+      104
+    ]
+  },
+  {
+    "file": "src/operator-netsuite-posting-domain.js",
+    "beforeSha256": "c119f275d29626e13c0ebd1b48a043413f64cef6deebbe159051ad0ec1cd3279",
+    "afterSha256": "8b535d0fbf7435b2a3b2f79fd034360c820b28686f8debd59cd2ddbe1e54908d",
+    "edits": [
+      {
+        "start": 3,
+        "end": 4,
+        "before": []
+      },
+      {
+        "start": 473,
+        "end": 474,
+        "before": []
+      },
+      {
+        "start": 480,
+        "end": 481,
+        "before": [
+          "    photoRefs,\n"
+        ]
+      }
+    ],
+    "changedLines": [
+      4,
+      474,
+      481
+    ]
+  },
+  {
+    "file": "src/operator-netsuite-posting-photo-queue.js",
+    "beforeSha256": null,
+    "afterSha256": "094cf32189f56048c8428ff84c13831674ba5c51a39aa85e48fe502cdc100c2e",
+    "edits": [
+      {
+        "start": 0,
+        "end": 104,
+        "before": []
+      }
+    ],
+    "changedLines": [
+      1,
+      2,
+      3,
+      4,
+      5,
+      6,
+      7,
+      8,
+      9,
+      10,
+      11,
+      12,
+      13,
+      14,
+      15,
+      16,
+      17,
+      18,
+      19,
+      20,
+      21,
+      22,
+      23,
+      24,
+      25,
+      26,
+      27,
+      28,
+      29,
+      30,
+      31,
+      32,
+      33,
+      34,
+      35,
+      36,
+      37,
+      38,
+      39,
+      40,
+      41,
+      42,
+      43,
+      44,
+      45,
+      46,
+      47,
+      48,
+      49,
+      50,
+      51,
+      52,
+      53,
+      54,
+      55,
+      56,
+      57,
+      58,
+      59,
+      60,
+      61,
+      62,
+      63,
+      64,
+      65,
+      66,
+      67,
+      68,
+      69,
+      70,
+      71,
+      72,
+      73,
+      74,
+      75,
+      76,
+      77,
+      78,
+      79,
+      80,
+      81,
+      82,
+      83,
+      84,
+      85,
+      86,
+      87,
+      88,
+      89,
+      90,
+      91,
+      92,
+      93,
+      94,
+      95,
+      96,
+      97,
+      98,
+      99,
+      100,
+      101,
+      102,
+      103,
+      104
+    ]
+  },
+  {
+    "file": "src/operator-netsuite-posting-photo-worker.js",
+    "beforeSha256": null,
+    "afterSha256": "ebbc7f69be7155c6f7bdaf7ac927d1938d9e1b8c37819ba7bd3d59f23717898f",
+    "edits": [
+      {
+        "start": 0,
+        "end": 42,
+        "before": []
+      }
+    ],
+    "changedLines": [
+      1,
+      2,
+      3,
+      4,
+      5,
+      6,
+      7,
+      8,
+      9,
+      10,
+      11,
+      12,
+      13,
+      14,
+      15,
+      16,
+      17,
+      18,
+      19,
+      20,
+      21,
+      22,
+      23,
+      24,
+      25,
+      26,
+      27,
+      28,
+      29,
+      30,
+      31,
+      32,
+      33,
+      34,
+      35,
+      36,
+      37,
+      38,
+      39,
+      40,
+      41,
+      42
+    ]
+  },
+  {
+    "file": "src/operator-netsuite-posting-photos.js",
+    "beforeSha256": null,
+    "afterSha256": "3589dd6dfb18505e1ac7eb73d02e51547bf209d3fcb64fad7293ee5dd47addd6",
+    "edits": [
+      {
+        "start": 0,
+        "end": 82,
+        "before": []
+      }
+    ],
+    "changedLines": [
+      1,
+      2,
+      3,
+      4,
+      5,
+      6,
+      7,
+      8,
+      9,
+      10,
+      11,
+      12,
+      13,
+      14,
+      15,
+      16,
+      17,
+      18,
+      19,
+      20,
+      21,
+      22,
+      23,
+      24,
+      25,
+      26,
+      27,
+      28,
+      29,
+      30,
+      31,
+      32,
+      33,
+      34,
+      35,
+      36,
+      37,
+      38,
+      39,
+      40,
+      41,
+      42,
+      43,
+      44,
+      45,
+      46,
+      47,
+      48,
+      49,
+      50,
+      51,
+      52,
+      53,
+      54,
+      55,
+      56,
+      57,
+      58,
+      59,
+      60,
+      61,
+      62,
+      63,
+      64,
+      65,
+      66,
+      67,
+      68,
+      69,
+      70,
+      71,
+      72,
+      73,
+      74,
+      75,
+      76,
+      77,
+      78,
+      79,
+      80,
+      81,
+      82
+    ]
+  },
+  {
+    "file": "src/operator-netsuite-posting-repository.js",
+    "beforeSha256": "dcc247bfcee36b23bb0a298bf131d2f6f9f0c930b519ac4b1445f60cd7d913ae",
+    "afterSha256": "641a9ecfdb3b9f324235f7f16d61cd30d8a94eec613f30a23e3f3a1362769626",
+    "edits": [
+      {
+        "start": 5,
+        "end": 6,
+        "before": []
+      },
+      {
+        "start": 805,
+        "end": 806,
+        "before": []
+      }
+    ],
+    "changedLines": [
+      6,
+      806
+    ]
+  },
+  {
+    "file": "src/operator-netsuite-posting-service.js",
+    "beforeSha256": "295a59832b3a6eddf11318b7ac1eb1c603690a03c906d97ab171c34e4d6d55cc",
+    "afterSha256": "8f73507f59205c92f950b2aee922fb417a89d3727986c66d954c9ebe6078234e",
+    "edits": [
+      {
+        "start": 1,
+        "end": 2,
+        "before": []
+      },
+      {
+        "start": 92,
+        "end": 94,
+        "before": [
+          "  async function verifiedExternalRecord(/** @type {Record<string, any>} */ step) {\n",
+          "    const record = await adapter.findByExternalId(step);\n"
+        ]
+      },
+      {
+        "start": 117,
+        "end": 118,
+        "before": [
+          "        const transformed = await adapter.transform(step);\n"
+        ]
+      },
+      {
+        "start": 120,
+        "end": 121,
+        "before": [
+          "          record = await adapter.fetchById(step, transactionId);\n"
+        ]
+      },
+      {
+        "start": 129,
+        "end": 130,
+        "before": [
+          "          const afterTransform = await verifiedExternalRecord(step);\n"
+        ]
+      },
+      {
+        "start": 144,
+        "end": 145,
+        "before": [
+          "          const recovery = await verifiedExternalRecord(step);\n"
+        ]
+      },
+      {
+        "start": 196,
+        "end": 200,
+        "before": [
+          "        await withLeaseHeartbeat(command, () => postStep(command, step));\n"
+        ]
+      },
+      {
+        "start": 225,
+        "end": 227,
+        "before": [
+          "        finalize: () => finalize(command)\n"
+        ]
+      }
+    ],
+    "changedLines": [
+      2,
+      93,
+      94,
+      118,
+      121,
+      130,
+      145,
+      197,
+      198,
+      199,
+      200,
+      226,
+      227
+    ]
+  },
+  {
+    "file": "src/operator-netsuite-posting-targets.js",
+    "beforeSha256": "2eb8f6904d55487e2a3ea58c8d3d43b4ac9b4cb2f9dd4e444744f5df26034a82",
+    "afterSha256": "ec677135b7c521ef4b83d4db7a95e141141363b2516f97f3fe9112f6148ba579",
+    "edits": [
+      {
+        "start": 3,
+        "end": 4,
+        "before": []
+      },
+      {
+        "start": 170,
+        "end": 175,
+        "before": [
+          "    const [orders, sourceItems, linkedRows] = await Promise.all([\n",
+          "      fetchReconciliationOrders({ orderIds: [id], kind, includeOpen: false, targetOnly: true }),\n",
+          "      fetchSourceItemLines(kind, id),\n",
+          "      fetchLinkedTransactions([id])\n",
+          "    ]);\n"
+        ]
+      }
+    ],
+    "changedLines": [
+      4,
+      171,
+      172,
+      173,
+      174,
+      175
+    ]
+  },
+  {
+    "file": "src/operator-netsuite-posting-telemetry.js",
+    "beforeSha256": null,
+    "afterSha256": "b3605453da0950a727407d6a135f8c134755ea2ce5386e5a399817711321854f",
+    "edits": [
+      {
+        "start": 0,
+        "end": 70,
+        "before": []
+      }
+    ],
+    "changedLines": [
+      1,
+      2,
+      3,
+      4,
+      5,
+      6,
+      7,
+      8,
+      9,
+      10,
+      11,
+      12,
+      13,
+      14,
+      15,
+      16,
+      17,
+      18,
+      19,
+      20,
+      21,
+      22,
+      23,
+      24,
+      25,
+      26,
+      27,
+      28,
+      29,
+      30,
+      31,
+      32,
+      33,
+      34,
+      35,
+      36,
+      37,
+      38,
+      39,
+      40,
+      41,
+      42,
+      43,
+      44,
+      45,
+      46,
+      47,
+      48,
+      49,
+      50,
+      51,
+      52,
+      53,
+      54,
+      55,
+      56,
+      57,
+      58,
+      59,
+      60,
+      61,
+      62,
+      63,
+      64,
+      65,
+      66,
+      67,
+      68,
+      69,
+      70
+    ]
+  },
+  {
+    "file": "src/receiving-repository.js",
+    "beforeSha256": "9c4f98d391554b6a3733f11898773274babf9ea9981789d0702147426cb06551",
+    "afterSha256": "45f1783588f3e2d4d7cb848299e9256df655b2b6812457b96c1964c57edacd99",
+    "edits": [
+      {
+        "start": 288,
+        "end": 289,
+        "before": []
+      },
+      {
+        "start": 338,
+        "end": 339,
+        "before": [
+          "  const clauses = [\"ro.order_type = $1\", \"ro.netsuite_active = true\", \"(ro.status_text ILIKE '%Pending Receipt%' OR ro.status_text ILIKE '%Partially Received%')\"];\n"
+        ]
+      },
+      {
+        "start": 772,
+        "end": 777,
+        "before": []
+      },
+      {
+        "start": 1646,
+        "end": 1648,
+        "before": [
+          "\t       WHERE NOT ${netSuiteClosedOrderFamilySql(\"po\", \"PO\")}\n"
+        ]
+      }
+    ],
+    "changedLines": [
+      289,
+      339,
+      773,
+      774,
+      775,
+      776,
+      777,
+      1647,
+      1648
+    ]
+  },
+  {
+    "file": "src/server.js",
+    "beforeSha256": "9b8f108a6361b794f12a436ce58abb2e610303849042da61e7e456147c3c9d1f",
+    "afterSha256": "4b8b96b06fdc180fded9fffa07a83942ecd26564c7eb5c28bc46effd48875c81",
+    "edits": [
+      {
+        "start": 154,
+        "end": 155,
+        "before": []
+      },
+      {
+        "start": 24450,
+        "end": 24451,
+        "before": []
+      }
+    ],
+    "changedLines": [
+      155,
+      24451
+    ]
+  },
+  {
+    "file": "public/operator.css",
+    "beforeSha256": "05ed423647e8c28a2cf78de2345a72d57e3fa6971d7bee0a522638c7c516e1ba",
+    "afterSha256": "70bd80e16a25d02e56d95e1a3b959015daa6e13cbd3f6cbe107dd9fe79a92f62",
+    "edits": [
+      {
+        "start": 2328,
+        "end": 2359,
+        "before": []
+      }
+    ],
+    "changedLines": [
+      2329,
+      2330,
+      2331,
+      2332,
+      2333,
+      2334,
+      2335,
+      2336,
+      2337,
+      2338,
+      2339,
+      2340,
+      2341,
+      2342,
+      2343,
+      2344,
+      2345,
+      2346,
+      2347,
+      2348,
+      2349,
+      2350,
+      2351,
+      2352,
+      2353,
+      2354,
+      2355,
+      2356,
+      2357,
+      2358,
+      2359
+    ]
+  },
+  {
+    "file": "public/operator.html",
+    "beforeSha256": "7e66101a1079893bf385398695102997859a2987f27a074810b81dbfa75dc476",
+    "afterSha256": "e9c85a0da054a707b5b7b8331ab3ecf093c4c53bc8bc633f88d7ba976fa1d6d4",
+    "edits": [
+      {
+        "start": 14,
+        "end": 15,
+        "before": [
+          "    <link rel=\"stylesheet\" href=\"/operator.css?v=20260915-operator-display-v1\" />\n"
+        ]
+      },
+      {
+        "start": 23,
+        "end": 24,
+        "before": [
+          "    <script src=\"/operator.js?v=20260915-packing-rounding-v1\"></script>\n"
+        ]
+      }
+    ],
+    "changedLines": [
+      15,
+      24
+    ]
+  },
+  {
+    "file": "public/operator.js",
+    "beforeSha256": "73c3acd2ac94c08b11c4cbc30820fb47541754affefaffd5dca2fdf20eec2737",
+    "afterSha256": "a6dbbf15beb07b77346a0622a1e7962000b7482339fa51692c9b3b80489a280b",
+    "edits": [
+      {
+        "start": 5430,
+        "end": 5431,
+        "before": [
+          "  const batchId = state.batch.id, uploads = state.uploads;\n"
+        ]
+      },
+      {
+        "start": 5437,
+        "end": 5438,
+        "before": [
+          "    const photoRefs = pending ? state.photoRefs : await mapWithConcurrency(photos, 2, async (photo, index) => {\n",
+          "      const key = `${index}:${photo}`;\n",
+          "      if (!uploads.has(key)) {\n",
+          "        const ref = await uploadOperatorPhoto(photo, { recordType: \"operator-consolidation-load-photo\", orderId: batchId,\n",
+          "          orderRef: batchId, orderType: \"consolidation_load\", filename: `consolidation-load-${index + 1}.jpg` });\n",
+          "        uploads.set(key, ref);\n",
+          "      }\n",
+          "      return uploads.get(key);\n",
+          "    });\n"
+        ]
+      },
+      {
+        "start": 6457,
+        "end": 6463,
+        "before": [
+          "  return order.order_type === \"co_order\"\n",
+          "    || order.order_type === \"vrma_order\"\n",
+          "    || order.reload_authorized === true\n",
+          "    || order.sales_order_reattempt === true;\n"
+        ]
+      },
+      {
+        "start": 6480,
+        "end": 6481,
+        "before": [
+          "    return `<div class=\"sync-alert operator-posting-mode\" data-posting-mode=\"local\"><strong>Local only</strong><span>This order type never creates a NetSuite transaction from Operator.</span></div>`;\n"
+        ]
+      },
+      {
+        "start": 6486,
+        "end": 6487,
+        "before": [
+          "    return `<div class=\"sync-alert operator-posting-mode\" data-posting-mode=\"netsuite\"><strong>Creates NetSuite ${escapeHtml(policy.transactionType)}</strong><span>Local completion is saved only after NetSuite creates and verifies the exact transaction.</span></div>`;\n"
+        ]
+      },
+      {
+        "start": 6488,
+        "end": 6489,
+        "before": [
+          "  const detail = policy.configured && !policy.environmentAllowed\n",
+          "    ? \"This yard gate is configured on, but the server deployment ceiling is closed.\"\n",
+          "    : \"This yard and function gate is off.\";\n",
+          "  return `<div class=\"sync-alert operator-posting-mode\" data-posting-mode=\"local\"><strong>Local only</strong><span>${escapeHtml(detail)} No NetSuite transaction will be created.</span></div>`;\n"
+        ]
+      },
+      {
+        "start": 6767,
+        "end": 6769,
+        "before": [
+          "    fulfillmentStatusText = photos.length ? \"Uploading photo proof to R2...\" : \"Saving local loaded status...\";\n"
+        ]
+      },
+      {
+        "start": 6771,
+        "end": 6772,
+        "before": [
+          "      ? await uploadOperatorPhotos(photos, {\n"
+        ]
+      },
+      {
+        "start": 6899,
+        "end": 6900,
+        "before": [
+          "    <section class=\"fulfillment-screen\">\n"
+        ]
+      },
+      {
+        "start": 7138,
+        "end": 7140,
+        "before": [
+          "    receiptStatusText = \"Uploading receiving photos to R2...\";\n"
+        ]
+      },
+      {
+        "start": 7141,
+        "end": 7142,
+        "before": [
+          "    const uploadedPhotoRefs = await uploadOperatorPhotos(receiptPhotoDataUrls.filter(Boolean), {\n"
+        ]
+      },
+      {
+        "start": 7210,
+        "end": 7211,
+        "before": []
+      },
+      {
+        "start": 7222,
+        "end": 7230,
+        "before": []
+      }
+    ],
+    "changedLines": [
+      5431,
+      5438,
+      6458,
+      6459,
+      6460,
+      6461,
+      6462,
+      6463,
+      6481,
+      6487,
+      6489,
+      6768,
+      6769,
+      6772,
+      6900,
+      7139,
+      7140,
+      7142,
+      7211,
+      7223,
+      7224,
+      7225,
+      7226,
+      7227,
+      7228,
+      7229,
+      7230
+    ]
+  },
+  {
+    "file": "public/service-worker.js",
+    "beforeSha256": "33bf819a09f4ee67f39db6cf9b15c1fbec6e46527374261aff3c7f423d3206ef",
+    "afterSha256": "ef2cb9946384a9437dffd8a6e13cca9c113980377951c9cfb82a3c576e8dcc94",
+    "edits": [
+      {
+        "start": 0,
+        "end": 1,
+        "before": [
+          "const CACHE_NAME = \"mbbs-yard-operator-v149-packing-rounding-v1\";\n"
+        ]
+      },
+      {
+        "start": 5,
+        "end": 6,
+        "before": [
+          "  \"/operator.css?v=20260915-operator-display-v1\",\n"
+        ]
+      },
+      {
+        "start": 10,
+        "end": 11,
+        "before": [
+          "  \"/operator.js?v=20260915-packing-rounding-v1\",\n"
+        ]
+      }
+    ],
+    "changedLines": [
+      1,
+      6,
+      11
+    ]
+  },
+  {
+    "file": "migrations/201_operator_posting_photo_uploads.sql",
+    "beforeSha256": null,
+    "afterSha256": "d5232ebf0f0d4a82e02643615960886a3ef95d0f07cb49b9d7d1d55b9ff5b9a2",
+    "edits": [
+      {
+        "start": 0,
+        "end": 24,
+        "before": []
+      }
+    ],
+    "changedLines": [
+      1,
+      2,
+      3,
+      4,
+      5,
+      6,
+      7,
+      8,
+      9,
+      10,
+      11,
+      12,
+      13,
+      14,
+      15,
+      16,
+      17,
+      18,
+      19,
+      20,
+      21,
+      22,
+      23,
+      24
+    ]
+  },
+  {
+    "file": "test/mbt/integration/consolidation-load.test.js",
+    "beforeSha256": "4f20a2ccf299cc21c6d51ebc395ecd87eca20034745e51805e8530905dbd0fe6",
+    "afterSha256": "92a3cc4aeff74898a8373bf56b8f9f947e8b11f880eec571409e68782e30f610",
+    "edits": [
+      {
+        "start": 20,
+        "end": 21,
+        "before": []
+      },
+      {
+        "start": 458,
+        "end": 459,
+        "before": []
+      },
+      {
+        "start": 462,
+        "end": 463,
+        "before": []
+      },
+      {
+        "start": 466,
+        "end": 467,
+        "before": []
+      },
+      {
+        "start": 470,
+        "end": 471,
+        "before": []
+      },
+      {
+        "start": 472,
+        "end": 492,
+        "before": []
+      }
+    ],
+    "changedLines": [
+      21,
+      459,
+      463,
+      467,
+      471,
+      473,
+      474,
+      475,
+      476,
+      477,
+      478,
+      479,
+      480,
+      481,
+      482,
+      483,
+      484,
+      485,
+      486,
+      487,
+      488,
+      489,
+      490,
+      491,
+      492
+    ]
+  },
+  {
+    "file": "test/mbt/integration/migration-upgrade.test.js",
+    "beforeSha256": "52350e4b694263e37c9f6034c647d893eca6d01bf288dd937082e7b54f10e013",
+    "afterSha256": "3b199a58060b86f1c8e76300912f64b0a7fc7e78048cd35a20e33a1d9e81f97d",
+    "edits": [
+      {
+        "start": 728,
+        "end": 729,
+        "before": [
+          "    assert.equal(receiptsBeforeNoOp.rowCount, 200);\n"
+        ]
+      },
+      {
+        "start": 731,
+        "end": 732,
+        "before": [
+          "      \"200_operator_consolidated_loads.sql\"\n"
+        ]
+      }
+    ],
+    "changedLines": [
+      729,
+      732
+    ]
+  },
+  {
+    "file": "test/mbt/integration/operator-posting-http-timing.test.js",
+    "beforeSha256": null,
+    "afterSha256": "91ab4faf856d6ca73c40895ebf46ac84721be19fd8d2ac57d61e82d1ba541974",
+    "edits": [
+      {
+        "start": 0,
+        "end": 85,
+        "before": []
+      }
+    ],
+    "changedLines": [
+      1,
+      2,
+      3,
+      4,
+      5,
+      6,
+      7,
+      8,
+      9,
+      10,
+      11,
+      12,
+      13,
+      14,
+      15,
+      16,
+      17,
+      18,
+      19,
+      20,
+      21,
+      22,
+      23,
+      24,
+      25,
+      26,
+      27,
+      28,
+      29,
+      30,
+      31,
+      32,
+      33,
+      34,
+      35,
+      36,
+      37,
+      38,
+      39,
+      40,
+      41,
+      42,
+      43,
+      44,
+      45,
+      46,
+      47,
+      48,
+      49,
+      50,
+      51,
+      52,
+      53,
+      54,
+      55,
+      56,
+      57,
+      58,
+      59,
+      60,
+      61,
+      62,
+      63,
+      64,
+      65,
+      66,
+      67,
+      68,
+      69,
+      70,
+      71,
+      72,
+      73,
+      74,
+      75,
+      76,
+      77,
+      78,
+      79,
+      80,
+      81,
+      82,
+      83,
+      84,
+      85
+    ]
+  },
+  {
+    "file": "test/mbt/integration/operator-posting-photos.test.js",
+    "beforeSha256": null,
+    "afterSha256": "81244c4aaede34cbc68a232b947d3db90d594ba6315f58061b176e97c57bac2a",
+    "edits": [
+      {
+        "start": 0,
+        "end": 148,
+        "before": []
+      }
+    ],
+    "changedLines": [
+      1,
+      2,
+      3,
+      4,
+      5,
+      6,
+      7,
+      8,
+      9,
+      10,
+      11,
+      12,
+      13,
+      14,
+      15,
+      16,
+      17,
+      18,
+      19,
+      20,
+      21,
+      22,
+      23,
+      24,
+      25,
+      26,
+      27,
+      28,
+      29,
+      30,
+      31,
+      32,
+      33,
+      34,
+      35,
+      36,
+      37,
+      38,
+      39,
+      40,
+      41,
+      42,
+      43,
+      44,
+      45,
+      46,
+      47,
+      48,
+      49,
+      50,
+      51,
+      52,
+      53,
+      54,
+      55,
+      56,
+      57,
+      58,
+      59,
+      60,
+      61,
+      62,
+      63,
+      64,
+      65,
+      66,
+      67,
+      68,
+      69,
+      70,
+      71,
+      72,
+      73,
+      74,
+      75,
+      76,
+      77,
+      78,
+      79,
+      80,
+      81,
+      82,
+      83,
+      84,
+      85,
+      86,
+      87,
+      88,
+      89,
+      90,
+      91,
+      92,
+      93,
+      94,
+      95,
+      96,
+      97,
+      98,
+      99,
+      100,
+      101,
+      102,
+      103,
+      104,
+      105,
+      106,
+      107,
+      108,
+      109,
+      110,
+      111,
+      112,
+      113,
+      114,
+      115,
+      116,
+      117,
+      118,
+      119,
+      120,
+      121,
+      122,
+      123,
+      124,
+      125,
+      126,
+      127,
+      128,
+      129,
+      130,
+      131,
+      132,
+      133,
+      134,
+      135,
+      136,
+      137,
+      138,
+      139,
+      140,
+      141,
+      142,
+      143,
+      144,
+      145,
+      146,
+      147,
+      148
+    ]
+  },
+  {
+    "file": "test/mbt/integration/operator-receiving-completed.test.js",
+    "beforeSha256": null,
+    "afterSha256": "f748d1bfea94c0832134740fa88e1477d05f1978e5d4eee2711c68f2b495012f",
+    "edits": [
+      {
+        "start": 0,
+        "end": 28,
+        "before": []
+      }
+    ],
+    "changedLines": [
+      1,
+      2,
+      3,
+      4,
+      5,
+      6,
+      7,
+      8,
+      9,
+      10,
+      11,
+      12,
+      13,
+      14,
+      15,
+      16,
+      17,
+      18,
+      19,
+      20,
+      21,
+      22,
+      23,
+      24,
+      25,
+      26,
+      27,
+      28
+    ]
+  },
+  {
+    "file": "test/mbt/integration/p3-predeploy-readiness.test.js",
+    "beforeSha256": "f93165ebadf3ae1146fa436ec15c8bc12bf0f6c0c15583a1876a4b5d7f571aca",
+    "afterSha256": "b2df817684b73abe78b340c88c050a4fa707927c24b9b738aab99065a52b415d",
+    "edits": [
+      {
+        "start": 178,
+        "end": 180,
+        "before": [
+          "    \"200_operator_consolidated_loads.sql\"\n"
+        ]
+      }
+    ],
+    "changedLines": [
+      179,
+      180
+    ]
+  },
+  {
+    "file": "test/mbt/unit/operations-navigation-enhancements.test.js",
+    "beforeSha256": "745858863a394914a7465877f0dc6a1cbb8f5de650321ce59480b53e99bef40a",
+    "afterSha256": "ff2180a35bb6a1d6f62efb969b5bf82df80dc3159d95e501ffb3b608eb29b621",
+    "edits": [
+      {
+        "start": 124,
+        "end": 126,
+        "before": [
+          "    \"/operator.css?v=20260915-operator-display-v1\",\n",
+          "    \"/operator.js?v=20260915-packing-rounding-v1\"\n"
+        ]
+      },
+      {
+        "start": 130,
+        "end": 131,
+        "before": [
+          "  assert.ok(serviceWorker.includes(\"mbbs-yard-operator-v149-packing-rounding-v1\"));\n"
+        ]
+      }
+    ],
+    "changedLines": [
+      125,
+      126,
+      131
+    ]
+  },
+  {
+    "file": "test/mbt/unit/operator-customer-pickup-photo-gate-ui.contract.test.js",
+    "beforeSha256": "6c20480346af0fc12b60152c0e984c45774520c2ad5ccd2f88e284247a661e0a",
+    "afterSha256": "be1faf17b31f4a1ccb2cdd433fda3884b13574d64fa6e6a0f548eb3c0858e135",
+    "edits": [
+      {
+        "start": 92,
+        "end": 95,
+        "before": [
+          "  assert.match(html, /operator\\.js\\?v=20260915-packing-rounding-v1/u);\n",
+          "  assert.match(serviceWorker, /mbbs-yard-operator-v149-packing-rounding-v1/u);\n",
+          "  assert.match(serviceWorker, /operator\\.js\\?v=20260915-packing-rounding-v1/u);\n"
+        ]
+      }
+    ],
+    "changedLines": [
+      93,
+      94,
+      95
+    ]
+  },
+  {
+    "file": "test/mbt/unit/operator-page-confirm-ui.contract.test.js",
+    "beforeSha256": "5f914090f6b59f39b84e9bf8dc19b7a034bd56291e081f84745ad48439d909d7",
+    "afterSha256": "eef08947b366df4bdc0e9249e8fcd594766ca4ebd1c4d8f539a2422c6703ba02",
+    "edits": [
+      {
+        "start": 60,
+        "end": 65,
+        "before": [
+          "  assert.match(html, /operator\\.css\\?v=20260915-operator-display-v1/u);\n",
+          "  assert.match(html, /operator\\.js\\?v=20260915-packing-rounding-v1/u);\n",
+          "  assert.match(serviceWorker, /mbbs-yard-operator-v149-packing-rounding-v1/u);\n",
+          "  assert.match(serviceWorker, /operator\\.css\\?v=20260915-operator-display-v1/u);\n",
+          "  assert.match(serviceWorker, /operator\\.js\\?v=20260915-packing-rounding-v1/u);\n"
+        ]
+      }
+    ],
+    "changedLines": [
+      61,
+      62,
+      63,
+      64,
+      65
+    ]
+  },
+  {
+    "file": "test/mbt/unit/operator-posting-latency.test.js",
+    "beforeSha256": null,
+    "afterSha256": "960188f03d8b9749e8c11809ce4424b8e23c04cea054ecb8f2bc9e4c9fa4b002",
+    "edits": [
+      {
+        "start": 0,
+        "end": 154,
+        "before": []
+      }
+    ],
+    "changedLines": [
+      1,
+      2,
+      3,
+      4,
+      5,
+      6,
+      7,
+      8,
+      9,
+      10,
+      11,
+      12,
+      13,
+      14,
+      15,
+      16,
+      17,
+      18,
+      19,
+      20,
+      21,
+      22,
+      23,
+      24,
+      25,
+      26,
+      27,
+      28,
+      29,
+      30,
+      31,
+      32,
+      33,
+      34,
+      35,
+      36,
+      37,
+      38,
+      39,
+      40,
+      41,
+      42,
+      43,
+      44,
+      45,
+      46,
+      47,
+      48,
+      49,
+      50,
+      51,
+      52,
+      53,
+      54,
+      55,
+      56,
+      57,
+      58,
+      59,
+      60,
+      61,
+      62,
+      63,
+      64,
+      65,
+      66,
+      67,
+      68,
+      69,
+      70,
+      71,
+      72,
+      73,
+      74,
+      75,
+      76,
+      77,
+      78,
+      79,
+      80,
+      81,
+      82,
+      83,
+      84,
+      85,
+      86,
+      87,
+      88,
+      89,
+      90,
+      91,
+      92,
+      93,
+      94,
+      95,
+      96,
+      97,
+      98,
+      99,
+      100,
+      101,
+      102,
+      103,
+      104,
+      105,
+      106,
+      107,
+      108,
+      109,
+      110,
+      111,
+      112,
+      113,
+      114,
+      115,
+      116,
+      117,
+      118,
+      119,
+      120,
+      121,
+      122,
+      123,
+      124,
+      125,
+      126,
+      127,
+      128,
+      129,
+      130,
+      131,
+      132,
+      133,
+      134,
+      135,
+      136,
+      137,
+      138,
+      139,
+      140,
+      141,
+      142,
+      143,
+      144,
+      145,
+      146,
+      147,
+      148,
+      149,
+      150,
+      151,
+      152,
+      153,
+      154
+    ]
+  },
+  {
+    "file": "test/mbt/unit/operator-posting-photo-client.test.js",
+    "beforeSha256": null,
+    "afterSha256": "51be48a223fea451ca5a777ed3a464c4f00843003bea7756ba4a3c1fe2b594cb",
+    "edits": [
+      {
+        "start": 0,
+        "end": 55,
+        "before": []
+      }
+    ],
+    "changedLines": [
+      1,
+      2,
+      3,
+      4,
+      5,
+      6,
+      7,
+      8,
+      9,
+      10,
+      11,
+      12,
+      13,
+      14,
+      15,
+      16,
+      17,
+      18,
+      19,
+      20,
+      21,
+      22,
+      23,
+      24,
+      25,
+      26,
+      27,
+      28,
+      29,
+      30,
+      31,
+      32,
+      33,
+      34,
+      35,
+      36,
+      37,
+      38,
+      39,
+      40,
+      41,
+      42,
+      43,
+      44,
+      45,
+      46,
+      47,
+      48,
+      49,
+      50,
+      51,
+      52,
+      53,
+      54,
+      55
+    ]
+  },
+  {
+    "file": "test/mbt/unit/operator-receiving-return.test.js",
+    "beforeSha256": null,
+    "afterSha256": "53201e56bdbe184a436636408cbac72a3cb469e1835fa28397e33c639d881706",
+    "edits": [
+      {
+        "start": 0,
+        "end": 28,
+        "before": []
+      }
+    ],
+    "changedLines": [
+      1,
+      2,
+      3,
+      4,
+      5,
+      6,
+      7,
+      8,
+      9,
+      10,
+      11,
+      12,
+      13,
+      14,
+      15,
+      16,
+      17,
+      18,
+      19,
+      20,
+      21,
+      22,
+      23,
+      24,
+      25,
+      26,
+      27,
+      28
+    ]
+  },
+  {
+    "file": "test/mbt/unit/operator-yard-assets.test.js",
+    "beforeSha256": "33807d2767dd8cd7412dd167906849ac463181c30c65d38911fe6c3c3cef2e0e",
+    "afterSha256": "12a3b22df9fc06c6fe9afbc9d111b170f441d509b66b1e941c1faa1fbe1df747",
+    "edits": [
+      {
+        "start": 26,
+        "end": 27,
+        "before": [
+          "  assert.equal(installed[0].name, \"mbbs-yard-operator-v149-packing-rounding-v1\");\n"
+        ]
+      },
+      {
+        "start": 28,
+        "end": 29,
+        "before": [
+          "    const version = asset === \"operator.js\" ? \"20260915-packing-rounding-v1\" : \"20260915-operator-display-v1\";\n"
+        ]
+      }
+    ],
+    "changedLines": [
+      27,
+      29
+    ]
+  },
+  {
+    "file": "test/dispatch/frontend/consolidation-load.browser.test.mjs",
+    "beforeSha256": "500da8478ddcaab9bbb3004768923d3b9ef30fd0d2c1e57183eb6b4f820ffa79",
+    "afterSha256": "4572c0726109bb671f573af84118bf1ef4c46e041f80e50f61e30de04f37b157",
+    "edits": [
+      {
+        "start": 145,
+        "end": 146,
+        "before": [
+          "test(\"camera captures survive updates; upload retry reuses successful photos and a pending load resumes after refresh\", async () => {\n"
+        ]
+      },
+      {
+        "start": 153,
+        "end": 154,
+        "before": [
+          "  let failUpload = true, ticket = 0;\n"
+        ]
+      },
+      {
+        "start": 189,
+        "end": 190,
+        "before": []
+      },
+      {
+        "start": 214,
+        "end": 216,
+        "before": [
+          "    assert.equal(submits.length, 0);\n"
+        ]
+      },
+      {
+        "start": 218,
+        "end": 221,
+        "before": [
+          "    assert.equal(uploads.length, 3, \"Only the failed photo is uploaded again\");\n",
+          "    assert.deepEqual(submits[0].photoRefs, [1, 3].map((n) => `r2://operator/operator-consolidation-load-photo/2026/09/15/${id}/photo-${n}.jpg`));\n"
+        ]
+      },
+      {
+        "start": 230,
+        "end": 232,
+        "before": [
+          "    assert.equal(uploads.length, 3);\n",
+          "    assert.equal(submits.length, 1);\n"
+        ]
+      }
+    ],
+    "changedLines": [
+      146,
+      154,
+      190,
+      215,
+      216,
+      219,
+      220,
+      221,
+      231,
+      232
+    ]
+  },
+  {
+    "file": "tools/mbt-predeploy-readiness.mjs",
+    "beforeSha256": "27a15863ec68137baba351ac810a8d7d6bcbffe5698de862c76f1e9ee04b3972",
+    "afterSha256": "1f333370960db3273ddd8780347ee53c0f2cce3ff842258007ab25112fd2eb17",
+    "edits": [
+      {
+        "start": 146,
+        "end": 148,
+        "before": [
+          "  \"200_operator_consolidated_loads.sql\"\n"
+        ]
+      }
+    ],
+    "changedLines": [
+      147,
+      148
+    ]
+  },
+  {
+    "file": "tools/operator-posting-latency-browser.mjs",
+    "beforeSha256": null,
+    "afterSha256": "b14e438172945cd9e54b4777a4d1bf039fad546335516a05b604484d67d00ca0",
+    "edits": [
+      {
+        "start": 0,
+        "end": 37,
+        "before": []
+      }
+    ],
+    "changedLines": [
+      1,
+      2,
+      3,
+      4,
+      5,
+      6,
+      7,
+      8,
+      9,
+      10,
+      11,
+      12,
+      13,
+      14,
+      15,
+      16,
+      17,
+      18,
+      19,
+      20,
+      21,
+      22,
+      23,
+      24,
+      25,
+      26,
+      27,
+      28,
+      29,
+      30,
+      31,
+      32,
+      33,
+      34,
+      35,
+      36,
+      37
+    ]
+  },
+  {
+    "file": "tools/operator-posting-latency-checks.mjs",
+    "beforeSha256": null,
+    "afterSha256": "65fc5e566259ab22a9165bef93dd07bc269c0ad370c265a3cefdbbce63482289",
+    "edits": [
+      {
+        "start": 0,
+        "end": 86,
+        "before": []
+      }
+    ],
+    "changedLines": [
+      1,
+      2,
+      3,
+      4,
+      5,
+      6,
+      7,
+      8,
+      9,
+      10,
+      11,
+      12,
+      13,
+      14,
+      15,
+      16,
+      17,
+      18,
+      19,
+      20,
+      21,
+      22,
+      23,
+      24,
+      25,
+      26,
+      27,
+      28,
+      29,
+      30,
+      31,
+      32,
+      33,
+      34,
+      35,
+      36,
+      37,
+      38,
+      39,
+      40,
+      41,
+      42,
+      43,
+      44,
+      45,
+      46,
+      47,
+      48,
+      49,
+      50,
+      51,
+      52,
+      53,
+      54,
+      55,
+      56,
+      57,
+      58,
+      59,
+      60,
+      61,
+      62,
+      63,
+      64,
+      65,
+      66,
+      67,
+      68,
+      69,
+      70,
+      71,
+      72,
+      73,
+      74,
+      75,
+      76,
+      77,
+      78,
+      79,
+      80,
+      81,
+      82,
+      83,
+      84,
+      85,
+      86
+    ]
+  },
+  {
+    "file": "tools/operator-posting-latency-evidence.py",
+    "beforeSha256": null,
+    "afterSha256": "54d3aed201b08e83aefb3713ef08fbd2773b9fff187dacc26a2bdb93c1ba7d6b",
+    "edits": [
+      {
+        "start": 0,
+        "end": 58,
+        "before": []
+      }
+    ],
+    "changedLines": [
+      1,
+      2,
+      3,
+      4,
+      5,
+      6,
+      7,
+      8,
+      9,
+      10,
+      11,
+      12,
+      13,
+      14,
+      15,
+      16,
+      17,
+      18,
+      19,
+      20,
+      21,
+      22,
+      23,
+      24,
+      25,
+      26,
+      27,
+      28,
+      29,
+      30,
+      31,
+      32,
+      33,
+      34,
+      35,
+      36,
+      37,
+      38,
+      39,
+      40,
+      41,
+      42,
+      43,
+      44,
+      45,
+      46,
+      47,
+      48,
+      49,
+      50,
+      51,
+      52,
+      53,
+      54,
+      55,
+      56,
+      57,
+      58
+    ]
+  },
+  {
+    "file": "tools/operator-posting-latency-gauntlet.sh",
+    "beforeSha256": null,
+    "afterSha256": "74c070e584f6409845b7a9776937d187a3355204f87cad33ff03703f4a72f2c9",
+    "edits": [
+      {
+        "start": 0,
+        "end": 25,
+        "before": []
+      }
+    ],
+    "changedLines": [
+      1,
+      2,
+      3,
+      4,
+      5,
+      6,
+      7,
+      8,
+      9,
+      10,
+      11,
+      12,
+      13,
+      14,
+      15,
+      16,
+      17,
+      18,
+      19,
+      20,
+      21,
+      22,
+      23,
+      24,
+      25
+    ]
+  },
+  {
+    "file": "tools/operator-posting-latency-live.py",
+    "beforeSha256": null,
+    "afterSha256": "b72705f2ce8ce1f397b0050cfddfcecb685d90730db916e22b202bd76b3e11a8",
+    "edits": [
+      {
+        "start": 0,
+        "end": 30,
+        "before": []
+      }
+    ],
+    "changedLines": [
+      1,
+      2,
+      3,
+      4,
+      5,
+      6,
+      7,
+      8,
+      9,
+      10,
+      11,
+      12,
+      13,
+      14,
+      15,
+      16,
+      17,
+      18,
+      19,
+      20,
+      21,
+      22,
+      23,
+      24,
+      25,
+      26,
+      27,
+      28,
+      29,
+      30
+    ]
+  },
+  {
+    "file": "tools/operator-posting-latency-mutations.mjs",
+    "beforeSha256": null,
+    "afterSha256": "7e62ead2c6800442c0181262a3507c11e3105cfadd0e9206e7d6c2b2581f71bc",
+    "edits": [
+      {
+        "start": 0,
+        "end": 57,
+        "before": []
+      }
+    ],
+    "changedLines": [
+      1,
+      2,
+      3,
+      4,
+      5,
+      6,
+      7,
+      8,
+      9,
+      10,
+      11,
+      12,
+      13,
+      14,
+      15,
+      16,
+      17,
+      18,
+      19,
+      20,
+      21,
+      22,
+      23,
+      24,
+      25,
+      26,
+      27,
+      28,
+      29,
+      30,
+      31,
+      32,
+      33,
+      34,
+      35,
+      36,
+      37,
+      38,
+      39,
+      40,
+      41,
+      42,
+      43,
+      44,
+      45,
+      46,
+      47,
+      48,
+      49,
+      50,
+      51,
+      52,
+      53,
+      54,
+      55,
+      56,
+      57
+    ]
+  },
+  {
+    "file": "tools/operator-posting-latency-smoke.mjs",
+    "beforeSha256": null,
+    "afterSha256": "50c6a1eb934086a3a22539bc22108d07df6e905bcc7e64c2bc07d58a82fc5623",
+    "edits": [
+      {
+        "start": 0,
+        "end": 29,
+        "before": []
+      }
+    ],
+    "changedLines": [
+      1,
+      2,
+      3,
+      4,
+      5,
+      6,
+      7,
+      8,
+      9,
+      10,
+      11,
+      12,
+      13,
+      14,
+      15,
+      16,
+      17,
+      18,
+      19,
+      20,
+      21,
+      22,
+      23,
+      24,
+      25,
+      26,
+      27,
+      28,
+      29
+    ]
+  },
+  {
+    "file": "tools/operator-posting-latency-state.py",
+    "beforeSha256": null,
+    "afterSha256": "ca81f0b623e234d905ab53296597914b4900b7b45fe375dafaba4cda18718fcf",
+    "edits": [
+      {
+        "start": 0,
+        "end": 34,
+        "before": []
+      }
+    ],
+    "changedLines": [
+      1,
+      2,
+      3,
+      4,
+      5,
+      6,
+      7,
+      8,
+      9,
+      10,
+      11,
+      12,
+      13,
+      14,
+      15,
+      16,
+      17,
+      18,
+      19,
+      20,
+      21,
+      22,
+      23,
+      24,
+      25,
+      26,
+      27,
+      28,
+      29,
+      30,
+      31,
+      32,
+      33,
+      34
+    ]
+  }
+]

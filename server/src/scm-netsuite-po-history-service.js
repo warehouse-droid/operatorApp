@@ -1,4 +1,6 @@
 import { writeAudit } from "./auth-repository.js";
+import { withTransaction } from "./db.js";
+import { scmNetSuitePoVersion } from "./scm-netsuite-po-version.js";
 import {
   fetchPurchaseOrderHistorySnapshotFromNetSuite,
   fetchPurchaseOrderHistorySnapshotsFromNetSuite,
@@ -137,6 +139,7 @@ function canonicalOrder(snapshot) {
 function canonicalLines(snapshot) {
   return (snapshot.lines || []).map((line) => ({
     line_id: line.lineId,
+    restLineId: line.restLineId,
     item_id: line.itemId,
     item_name: line.itemName,
     item_type: line.itemType || null,
@@ -165,11 +168,13 @@ function canonicalLines(snapshot) {
 }
 
 async function persistCanonicalSnapshot(history, snapshot, { source, operatorId = null, requestedChanges = {} } = {}) {
-  await upsertPurchaseOrders([canonicalOrder(snapshot)]);
-  const lines = canonicalLines(snapshot);
-  await upsertPurchaseOrderLines(history.purchaseOrderId, lines);
-  await markMissingInboundOrderLines(history.purchaseOrderId, lines.map((line) => line.line_id));
-  return persistScmNetSuitePoSnapshot(history.id, snapshot, { source, operatorId, requestedChanges });
+  return withTransaction(async () => {
+    await upsertPurchaseOrders([canonicalOrder(snapshot)]);
+    const lines = canonicalLines(snapshot);
+    await upsertPurchaseOrderLines(history.purchaseOrderId, lines);
+    await markMissingInboundOrderLines(history.purchaseOrderId, lines.map((line) => line.line_id));
+    return persistScmNetSuitePoSnapshot(history.id, snapshot, { source, operatorId, requestedChanges });
+  });
 }
 
 export async function refreshScmNetSuitePoHistory(historyId, { source = "reconciliation", operatorId = null } = {}) {
@@ -228,7 +233,7 @@ export async function registerScmNetSuitePoHistoryCreation(creation, operatorId 
 }
 
 export async function updateScmNetSuitePoHistory(historyId, body = {}, operatorId = null) {
-  const history = await getScmNetSuitePoHistory(historyId, { includeUnarchived: false });
+  const history = await getScmNetSuitePoHistory(historyId, { includeUnarchived: true });
   const remote = await fetchPurchaseOrderHistorySnapshotFromNetSuite(history.purchaseOrderId);
   if (!remote) throw Object.assign(new Error("The purchase order no longer exists in NetSuite."), { status: 404 });
   const terminal = /closed|cancelled|canceled|fully received|fully billed/i.test(`${remote.status || ""} ${remote.statusText || ""}`);
@@ -237,7 +242,8 @@ export async function updateScmNetSuitePoHistory(historyId, body = {}, operatorI
     throw Object.assign(new Error("This purchase order is received, closed, cancelled, or inactive and is read-only."), { status: 409 });
   }
   const expected = text(body.expectedLastModifiedAt, 100);
-  if (!expected || !sameInstant(expected, remote.lastModifiedAt)) {
+  if (!expected || !sameInstant(expected, remote.lastModifiedAt)
+      || !body.expectedVersion || body.expectedVersion !== scmNetSuitePoVersion(remote)) {
     const conflict = Object.assign(new Error("This purchase order changed in NetSuite. Refresh and review the latest values before saving."), { status: 409 });
     conflict.current = remote;
     throw conflict;
@@ -289,6 +295,7 @@ export async function updateScmNetSuitePoHistory(historyId, body = {}, operatorI
   try {
     await updatePurchaseOrderHistoryInNetSuite(history.purchaseOrderId, {
       expectedLastModifiedAt: remote.lastModifiedAt,
+      expectedVersion: body.expectedVersion,
       header,
       lines
     });

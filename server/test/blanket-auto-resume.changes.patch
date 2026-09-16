@@ -1,0 +1,219 @@
+--- a/server/src/smart-scm-planning-exclusion-repository.js
++++ b/server/src/smart-scm-planning-exclusion-repository.js
+@@ -1,5 +1,6 @@
+ import { query, withTransaction } from "./db.js";
+ import { writeAudit } from "./auth-repository.js";
++import { listSmartScmBlanketPoolRows } from "./smart-scm-blanket-pool-repository.js";
+ 
+ const MAX_REASON_LENGTH = 1000;
+ const MAX_NOTE_LENGTH = 1000;
+@@ -213,9 +214,79 @@
+       action: "smart_scm.planning_exclusion.add",
+       details: { exclusionId: result.id, itemId, reason, expiresAt }
+     });
+-    return result;
++    await resumeSmartScmBlanketCoveredPlanningExclusions({ itemId, operatorId });
++    const reconciled = await query(`${EXCLUSION_SELECT} WHERE exclusion.id = $1`, [result.id]);
++    return publicExclusion(reconciled.rows[0]);
+   });
+   return exclusion;
++}
++
++// Blanket supply supersedes item holds, including holds entered after flagging.
++// Keep retirement and its evidence atomic; never delete the original decision.
++/** @param {{sourcePoId?: number | string | null, itemId?: number | null, operatorId?: string | null}} [options] */
++export async function resumeSmartScmBlanketCoveredPlanningExclusions({
++  sourcePoId = null, itemId = null, operatorId = null
++} = {}) {
++  return withTransaction(async () => {
++    const pending = await query(
++      `SELECT 1 FROM scm_smart_planning_exclusions exclusion
++        WHERE exclusion.deactivated_at IS NULL
++          AND (exclusion.expires_at IS NULL OR exclusion.expires_at > now())
++          AND ($1::bigint IS NULL OR exclusion.item_id = $1)
++          AND EXISTS (
++            SELECT 1 FROM purchase_order_lines line
++            JOIN purchase_orders po ON po.netsuite_id = line.purchase_order_id
++            WHERE line.item_id = exclusion.item_id AND po.is_blanket_po = true
++              AND ($2::bigint IS NULL OR po.netsuite_id = $2)
++          ) LIMIT 1`,
++      [itemId, sourcePoId]
++    );
++    if (!pending.rowCount) return [];
++    const poolRows = await listSmartScmBlanketPoolRows({ isBlanket: true, sourcePoId, limit: 20000 });
++    const resumed = await query(
++      `WITH covered AS (
++         SELECT exclusion.id,
++                array_agg(DISTINCT source.source_po_ref ORDER BY source.source_po_ref) AS source_po_refs,
++                array_agg(DISTINCT source.source_line_id ORDER BY source.source_line_id) AS source_line_ids
++           FROM jsonb_to_recordset($1::jsonb) AS source(
++             item_id bigint, source_line_id bigint, source_po_ref text,
++             to_plt numeric, remaining_pallets numeric
++           )
++           JOIN purchase_order_lines line ON line.id = source.source_line_id
++           JOIN inventory_items item ON item.item_id = source.item_id
++           JOIN scm_smart_item_policies policy ON policy.item_id = source.item_id
++           JOIN scm_smart_planning_exclusions exclusion ON exclusion.item_id = source.item_id
++          WHERE exclusion.deactivated_at IS NULL
++            AND (exclusion.expires_at IS NULL OR exclusion.expires_at > now())
++            AND ($2::bigint IS NULL OR exclusion.item_id = $2)
++            AND NOT COALESCE(line.netsuite_closed, false)
++            AND source.remaining_pallets >= 1
++            AND ABS(source.to_plt - COALESCE(item.to_plt, policy.to_plt)) <= 0.000001
++          GROUP BY exclusion.id
++       )
++       UPDATE scm_smart_planning_exclusions exclusion
++          SET deactivated_at = now(), deactivated_by = $3,
++              deactivation_note = LEFT('Automatically resumed by Blanket PO coverage: '
++                || array_to_string(covered.source_po_refs, ', '), 1000)
++         FROM covered
++        WHERE exclusion.id = covered.id AND exclusion.deactivated_at IS NULL
++        RETURNING exclusion.id, exclusion.item_id, covered.source_po_refs, covered.source_line_ids`,
++      [JSON.stringify(poolRows), itemId, operatorId || null]
++    );
++    /** @type {Array<{id: string, item_id: string, source_po_refs: string[], source_line_ids: string[]}>} */
++    const rows = resumed.rows;
++    const results = rows.map(row => ({
++      exclusionId: Number(row.id), itemId: Number(row.item_id),
++      sourcePoRefs: row.source_po_refs, sourceLineIds: row.source_line_ids.map(Number)
++    }));
++    for (const details of results) {
++      await writeAudit({
++        actorType: "system",
++        source: "smart_scm", action: "smart_scm.planning_exclusion.auto_resume_blanket", details
++      });
++    }
++    return results;
++  });
+ }
+ 
+ export async function deactivateSmartScmPlanningExclusion(exclusionId, values = {}, operatorId = null) {
+--- a/server/src/smart-scm-planning-repository.js
++++ b/server/src/smart-scm-planning-repository.js
+@@ -3,7 +3,7 @@
+ import { latestSmartScmForecastRunId, smartScmForecastMap } from "./smart-scm-forecast-repository.js";
+ import { calculateSmartScmOrderRequirement, calculateSmartScmPolicyLevels } from "./smart-scm-policy-calculation.js";
+ import { smartScmBuiltInRouteRule, smartScmIsGormleySource, smartScmRouteRuleKey, smartScmRouteRuleMap } from "./smart-scm-route-repository.js";
+-import { listSmartScmActivePlanningExclusionItemIds } from "./smart-scm-planning-exclusion-repository.js";
++import { listSmartScmActivePlanningExclusionItemIds, resumeSmartScmBlanketCoveredPlanningExclusions } from "./smart-scm-planning-exclusion-repository.js";
+ import {
+   smartScmAllocateBlanketCoverage,
+   smartScmBlanketCoverageSnapshot
+@@ -2155,6 +2155,7 @@
+ }
+ 
+ export async function runSmartScmPlan({ triggerSource = "manual", operatorId = null, forecastRunId = null } = {}) {
++  await resumeSmartScmBlanketCoveredPlanningExclusions({ operatorId });
+   const planning = await loadSmartScmPlanningDemandStates({
+     forecastRunId,
+     includeTemporarilyExcluded: true
+--- a/server/src/smart-scm-blanket-repository.js
++++ b/server/src/smart-scm-blanket-repository.js
+@@ -24,6 +24,7 @@
+ import { applySmartScmVendorPalletUnitPrice } from "./smart-scm-vendor-unit-price-repository.js";
+ import { listSmartScmBlanketPoolRows } from "./smart-scm-blanket-pool-repository.js";
+ import { smartScmBlanketCoverageSnapshot } from "./smart-scm-blanket-coverage.js";
++import { resumeSmartScmBlanketCoveredPlanningExclusions } from "./smart-scm-planning-exclusion-repository.js";
+ 
+ const EPSILON = 0.000001;
+ const BLANKET_PENDING_ALLOCATION_STATUSES = Object.freeze(["reserved", "held"]);
+@@ -679,6 +680,7 @@
+     // transaction-scoped advisory lock through the ready/failed transition
+     // prevents two concurrent requests from exposing overlapping current plans.
+     await query("SELECT pg_advisory_xact_lock(hashtext('smart-scm-blanket-plan-build'))");
++    await resumeSmartScmBlanketCoveredPlanningExclusions({ operatorId });
+     const planning = await loadSmartScmPlanningDemandStates({ includeTemporarilyExcluded: false });
+     const poolRows = planning.blanketPoolRows || [];
+     const coverageSnapshot = smartScmBlanketCoverageSnapshot(planning.states);
+--- a/server/src/smart-scm-blanket-pool-repository.js
++++ b/server/src/smart-scm-blanket-pool-repository.js
+@@ -36,6 +36,10 @@
+   return balances;
+ }
+ 
++/**
++ * @param {{search?: string, isBlanket?: boolean | null, sourcePoId?: number | string | null,
++ *   limit?: number, offset?: number}} [options]
++ */
+ export async function listSmartScmBlanketPoolRows({
+   search = "",
+   isBlanket = null,
+--- a/server/src/dispatch-repository.js
++++ b/server/src/dispatch-repository.js
+@@ -1,6 +1,7 @@
+ import crypto from "node:crypto";
+ import { VOYAGE_DISPATCH_YARD } from "./dispatch-sales-order-locations.js";
+ import { pool, query, withTransaction } from "./db.js";
++import { resumeSmartScmBlanketCoveredPlanningExclusions } from "./smart-scm-planning-exclusion-repository.js";
+ import { dispatchLoadAssignment } from "./dispatch-load-assignment.js";
+ import { DISPATCH_FLEET_PLANNING_LOCK } from "./dispatch-fleet-status.js";
+ import { updateDispatchSalesSplitDetails } from "./dispatch-delivery-group-repository.js";
+@@ -2783,6 +2784,9 @@
+       [source.netsuite_id, flagged, String(updatedBy || "").trim()]
+     );
+     const row = result.rows[0];
++    if (flagged) {
++      await resumeSmartScmBlanketCoveredPlanningExclusions({ sourcePoId: row.netsuite_id });
++    }
+     return {
+       netsuiteId: row.netsuite_id,
+       orderRef: row.tranid || ref,
+--- a/server/src/order-sync-repository.js
++++ b/server/src/order-sync-repository.js
+@@ -3,6 +3,7 @@
+ import { enrichPurchaseOrderDispatch, enrichSalesOrderDispatch, enrichTransferDispatch } from "./dispatch-enrichment.js";
+ import { syncOrderDependenciesForTransferOrder } from "./order-dependency-repository.js";
+ import { enqueueNetSuiteMirrorOrderEvent } from "./netsuite-mirror-repository.js";
++import { resumeSmartScmBlanketCoveredPlanningExclusions } from "./smart-scm-planning-exclusion-repository.js";
+ 
+ function normalizeNetSuiteDate(value) {
+   const text = String(value ?? "").trim();
+@@ -1415,6 +1416,7 @@
+       detailsKey: "line"
+     });
+   }
++  await resumeSmartScmBlanketCoveredPlanningExclusions({ sourcePoId: orderId });
+   await enqueueNetSuiteMirrorOrderEvent("purchase_order", orderId);
+ }
+ 
+--- a/server/public/scm-smart-exclusions.js
++++ b/server/public/scm-smart-exclusions.js
+@@ -104,7 +104,7 @@
+   if (!smartPlanningExclusionState.open) return "";
+   return `<section class="smart-planning-exclusions" aria-label="Planning coverage and pauses">
+     <div class="smart-planning-exclusion-head">
+-      <div><h3>Coverage &amp; pauses</h3><p>Blanket balances offset matching demand by quantity; uncovered demand remains eligible for PO/TO planning. Manual pauses exclude an item only from new vendor PO planning, while generated and manually added TO loads remain available.</p></div>
++      <div><h3>Coverage &amp; pauses</h3><p>Blanket balances offset matching demand by quantity; uncovered demand remains eligible for PO/TO planning. Usable Blanket coverage automatically resumes all item holds, including newly entered holds. Manual pauses exclude an item only from new vendor PO planning, while generated and manually added TO loads remain available.</p></div>
+       <button class="smart-button" data-smart-action="toggle-planning-exclusions" type="button">Close</button>
+     </div>
+     ${smartCanWrite() ? `<div class="smart-planning-exclusion-form">
+@@ -176,14 +176,17 @@
+       smartPlanningExclusionState.expiresAt = expiryInput?.value || smartPlanningExclusionState.expiresAt;
+       if (!smartPlanningExclusionState.reason) throw new Error("Enter why this item is being paused.");
+       const item = smartPlanningExclusionState.candidates.find((candidate) => Number(candidate.itemId) === Number(button.dataset.itemId));
+-      await smartWork("Pausing vendor PO planning", () => smartApi("/api/scm/smart/planning-exclusions", {
++      const exclusion = await smartWork("Updating vendor PO planning", () => smartApi("/api/scm/smart/planning-exclusions", {
+         method: "POST",
+         body: {
+           itemId: Number(button.dataset.itemId),
+           reason: smartPlanningExclusionState.reason,
+           expiresAt: smartPlanningExclusionState.expiresAt || null
+         }
+-      }), `${item?.itemName || "Item"} paused for new vendor POs; TO remains available`);
++      }), "");
++      smartState.notice = exclusion?.active === false
++        ? `${item?.itemName || "Item"} automatically resumed by Blanket coverage`
++        : `${item?.itemName || "Item"} paused for new vendor POs; TO remains available`;
+       await smartRefreshPlanningExclusions();
+       smartPlanningExclusionState.error = "";
+       smartRender();
+--- a/server/public/scm-smart.html
++++ b/server/public/scm-smart.html
+@@ -21,6 +21,6 @@
+     <script src="/scm-smart-blanket.js?v=20260812-blanket-source-items-v1"></script>
+     <script src="/scm-smart-vendor.js?v=20260915-created-po-sync-v1"></script>
+     <script src="/scm-smart-proposals.js?v=20260826-phased-planning-v1"></script>
+-    <script src="/scm-smart-exclusions.js?v=20260801-po-only-pauses-v1"></script>
++    <script src="/scm-smart-exclusions.js?v=20260915-blanket-auto-resume-v1"></script>
+   </body>
+ </html>

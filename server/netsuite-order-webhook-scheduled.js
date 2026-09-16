@@ -127,6 +127,11 @@ define(["N/https", "N/log", "N/record", "N/runtime", "N/search"], (https, log, r
     return type;
   }
 
+  function sourceOrderLine(rec, line) {
+    const value = Number(getLineValueSafe(rec, line, "line"));
+    return Number.isSafeInteger(value) && value > 0 ? value : null;
+  }
+
   function buildLines(rec) {
     const count = rec.getLineCount({ sublistId: "item" }) || 0;
     const cache = {};
@@ -146,6 +151,7 @@ define(["N/https", "N/log", "N/record", "N/runtime", "N/search"], (https, log, r
         || item.description
         || "";
       lines.push({
+        orderLine: sourceOrderLine(rec, line),
         lineId,
         lineUniqueKey: lineId,
         itemId,

@@ -1,0 +1,151 @@
+--- a/src/operator-yard-authorization.js
++++ b/src/operator-yard-authorization.js
+@@ -16,8 +16,13 @@
+ export async function assertOperatorOrderYard(operator, id, { receiving = false, orderType = "" } = {}) {
+   let order;
+   if (receiving) {
+-    const local = orderType === "co_order" || String(id).startsWith("CO-") || Number(id) < 0;
++    const local = orderType === "co_order" || String(id).startsWith("CO-");
+     order = local ? await getLocalCoReceivingOrder(id) : await getReceivingOrder(id, { includeNetSuiteClosed: true });
++    // SCM split POs and TOs also use negative IDs. Resolve those before the
++    // legacy local CO fallback, matching the receiving detail route.
++    if (!order && !local && Number(id) < 0) {
++      order = await getLocalCoReceivingOrder(id);
++    }
+   } else {
+     order = await getDeliveryOrder(id, { includeNetSuiteClosed: true });
+   }
+--- a/src/receiving-repository.js
++++ b/src/receiving-repository.js
+@@ -246,11 +246,12 @@
+     so_allocated_section_qty: allocatedSections,
+     so_allocated_piece_qty: allocatedPieces,
+     so_allocated_sales_qty: allocatedSalesQty,
+-    pallet_qty: Math.max(remaining.pallet_qty - allocatedPallets, 0),
+-    layer_qty: Math.max(remaining.layer_qty - allocatedLayers, 0),
+-    section_qty: Math.max(remaining.section_qty - allocatedSections, 0),
+-    piece_qty: Math.max(remaining.piece_qty - allocatedPieces, 0),
+-    quantity: Math.max(remaining.quantity - allocatedSalesQty, 0)
++    // SO allocations reserve incoming goods; only receipts reduce receiving.
++    pallet_qty: remaining.pallet_qty,
++    layer_qty: remaining.layer_qty,
++    section_qty: remaining.section_qty,
++    piece_qty: remaining.piece_qty,
++    quantity: remaining.quantity
+   };
+ }
+ 
+--- a/src/operator-netsuite-posting-targets.js
++++ b/src/operator-netsuite-posting-targets.js
+@@ -555,7 +555,14 @@
+             LIMIT 1`,
+           [order?.netsuite_id]
+         )
+-      : await runQuery(
++      : orderType === "purchase_order" ? await runQuery(
++          `SELECT source_po_id AS source_id, source_po_ref AS source_ref
++             FROM dispatch_scm_po_splits
++            WHERE split_po_id = $1
++              AND status = 'active'
++            LIMIT 1`,
++          [order?.netsuite_id]
++        ) : await runQuery(
+           `SELECT source_so_id AS source_id, source_so_ref AS source_ref
+              FROM dispatch_scm_so_splits
+             WHERE split_so_id = $1
+@@ -566,7 +573,7 @@
+     if (!split.rows[0]) {return null;}
+     sourceNetSuiteId = Number(split.rows[0].source_id);
+     sourceOrderRef = String(split.rows[0].source_ref || "");
+-    sourceOrderKind = orderType === "transfer_order" ? "TO" : "SO";
++    sourceOrderKind = orderType === "transfer_order" ? "TO" : orderType === "purchase_order" ? "PO" : "SO";
+   }
+   if (!Number.isSafeInteger(sourceNetSuiteId) || sourceNetSuiteId <= 0) {return null;}
+ 
+@@ -586,15 +593,36 @@
+   } else if (sourceOrderKind === "PO") {
+     rows = await runQuery(
+       `SELECT line.line_id AS source_line_key,
+-              COALESCE(line.location_id, parent.destination_location_id) AS location_id
++              COALESCE(line.location_id, parent.destination_location_id) AS location_id,
++              mapped.local_line_key, mapped.local_line_id
+          FROM purchase_order_lines line
+          JOIN purchase_orders parent ON parent.netsuite_id = line.purchase_order_id
++         LEFT JOIN LATERAL (
++           SELECT child.line_id AS local_line_key, child.id AS local_line_id
++             FROM dispatch_scm_po_split_lines ledger
++             JOIN dispatch_scm_po_splits split ON split.id = ledger.split_id
++             JOIN purchase_order_lines child ON child.id = ledger.split_line_id
++              AND child.purchase_order_id = split.split_po_id
++            WHERE ledger.source_line_id = line.id
++              AND split.source_po_id = line.purchase_order_id
++              AND split.split_po_id = $2 AND split.status = 'active'
++         ) mapped ON true
+         WHERE line.purchase_order_id = $1
+           AND line.item_type IN ('InvtPart', 'NonInvtPart')
+           AND line.line_id IS NOT NULL
+         ORDER BY line.line_id, line.id`,
+-      [sourceNetSuiteId]
++      [sourceNetSuiteId, order.netsuite_id]
+     );
++    if (Number(order.netsuite_id) < 0) {
++      for (const child of (order.receivableLines || order.lines || []).filter(eligibleLine)) {
++        const mapped = rows.rows.filter((/** @type {Record<string, any>} */ row) =>
++          String(row.local_line_id) === String(child.id) && String(row.local_line_key) === String(child.line_id));
++        if (mapped.length !== 1) {
++          throw resolutionError("OPERATOR_NETSUITE_POSTING_LINE_MAPPING_UNRESOLVED",
++            `Split PO line ${child.line_id} has no unique active source-line mapping.`);
++        }
++      }
++    }
+   } else {
+     const lineStage = functionKey === "receiving" ? "receiving" : "outbound";
+     rows = await runQuery(
+@@ -660,7 +688,9 @@
+         .includes(String(row.source_line_key || "")));
+       return {
+         sourceLineKey: String(line.sourceLineKey || reconciliationSourceLineAliases(line)[0]),
+-        sourceLineAliases: reconciliationSourceLineAliases(line),
++        sourceLineAliases: lineAliases([reconciliationSourceLineAliases(line),
++          ...(rows.rows || []).filter((/** @type {Record<string, any>} */ row) => reconciliationSourceLineAliases(line)
++            .includes(String(row.source_line_key || ""))).map((/** @type {Record<string, any>} */ row) => row.local_line_key)]),
+         orderLine: Number(line.restOrderLine),
+         location: line.location === null || line.location === undefined
+           ? matchingLocal?.location_id === null || matchingLocal?.location_id === undefined
+--- a/public/operator.js
++++ b/public/operator.js
+@@ -1862,6 +1862,7 @@
+ }
+ 
+ function receivingRemainingSalesQty(line) {
++  if (Object.hasOwn(line || {}, "original_quantity")) { return Math.max(0, qty(line.quantity)); }
+   return Math.max(0, qty(line.quantity) - qty(line.netsuite_received_qty));
+ }
+ 
+--- a/public/operator.html
++++ b/public/operator.html
+@@ -21,6 +21,6 @@
+     <script src="/vendor/quagga2/quagga.min.js?v=1.12.1"></script>
+     <script src="/i18n.js?v=20260915-operator-display-v1"></script>
+     <script src="/operator-load-summary.js?v=20260915-operator-display-v1"></script>
+-    <script src="/operator.js?v=20260915-operator-display-v1"></script>
++    <script src="/operator.js?v=20260915-operator-receiving-v1"></script>
+   </body>
+ </html>
+--- a/public/service-worker.js
++++ b/public/service-worker.js
+@@ -1,4 +1,4 @@
+-const CACHE_NAME = "mbbs-yard-operator-v147-display-v1";
++const CACHE_NAME = "mbbs-yard-operator-v148-receiving-v1";
+ const OPERATOR_CACHE_PREFIX = "mbbs-yard-operator-";
+ const APP_SHELL = [
+   "/operator",
+@@ -8,7 +8,7 @@
+   "/vendor/quagga2/quagga.min.js?v=1.12.1",
+   "/i18n.js?v=20260915-operator-display-v1",
+   "/operator-load-summary.js?v=20260915-operator-display-v1",
+-  "/operator.js?v=20260915-operator-display-v1",
++  "/operator.js?v=20260915-operator-receiving-v1",
+   "/manifest.webmanifest",
+   "/icons/mbbs-yard-192.png",
+   "/icons/mbbs-yard-512.png",

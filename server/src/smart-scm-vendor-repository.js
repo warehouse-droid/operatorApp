@@ -1,4 +1,5 @@
 import { query, withTransaction } from "./db.js";
+import { smartScmSplitRemainingSql } from "./smart-scm-split-inbound-sql.js";
 import { writeAudit } from "./auth-repository.js";
 import {
   getSmartScmProposal,
@@ -1132,11 +1133,7 @@ async function smartScmAlternativeEvidence(rows = [], destinationLocationId) {
                  )
             ), 0) AS blanket_excluded,
             COALESCE((
-              SELECT SUM(GREATEST(
-                       COALESCE(child_line.quantity, 0)
-                       - COALESCE(child_line.netsuite_received_baseline_qty, child_line.netsuite_received_qty, 0),
-                       0
-                     ))
+              SELECT SUM(${smartScmSplitRemainingSql()})
                 FROM dispatch_scm_po_split_lines ledger
                 JOIN dispatch_scm_po_splits split ON split.id = ledger.split_id
                 JOIN purchase_order_lines child_line ON child_line.id = ledger.split_line_id

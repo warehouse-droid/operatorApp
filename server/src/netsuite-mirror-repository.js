@@ -182,6 +182,7 @@ export async function pruneNetSuiteMirrorEvents() {
 function mapOrderLine(row) {
   return {
     line_id: row.line_id,
+    netsuite_order_line: row.netsuite_order_line,
     item_id: row.item_id,
     item_name: row.item_name,
     sku: row.sku,
@@ -225,7 +226,7 @@ export async function getNetSuiteMirrorOrderSnapshot(entityType, entityId) {
         [orderId]
       ),
       query(
-        `SELECT line_id, item_id, item_name, sku, item_description, item_type, item_type_text,
+        `SELECT line_id, netsuite_order_line, item_id, item_name, sku, item_description, item_type, item_type_text,
                 quantity, unit, item_weight, location_id, location, pallet_qty, layer_qty,
                 section_qty, piece_qty, to_plt, to_lyr, to_sec, to_pcs,
                 netsuite_committed_qty, netsuite_backordered_qty, null::numeric AS netsuite_received_qty,
@@ -259,7 +260,7 @@ export async function getNetSuiteMirrorOrderSnapshot(entityType, entityId) {
         [orderId]
       ),
       query(
-        `SELECT line_id, item_id, item_name, sku, item_description, item_type, item_type_text,
+        `SELECT line_id, netsuite_order_line, item_id, item_name, sku, item_description, item_type, item_type_text,
                 quantity, unit, item_weight, location_id, location, pallet_qty, layer_qty,
                 section_qty, piece_qty, to_plt, to_lyr, to_sec, to_pcs,
                 null::numeric AS netsuite_committed_qty, null::numeric AS netsuite_backordered_qty,
@@ -299,7 +300,7 @@ export async function getNetSuiteMirrorOrderSnapshot(entityType, entityId) {
       [orderId]
     ),
     query(
-      `SELECT line_stage, line_id, item_id, item_name, sku, item_description, item_type, item_type_text,
+      `SELECT line_stage, line_id, netsuite_order_line, item_id, item_name, sku, item_description, item_type, item_type_text,
               quantity, unit, item_weight, location_id, location, pallet_qty, layer_qty,
               section_qty, piece_qty, to_plt, to_lyr, to_sec, to_pcs,
               null::numeric AS netsuite_committed_qty, null::numeric AS netsuite_backordered_qty,

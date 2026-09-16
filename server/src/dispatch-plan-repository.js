@@ -1,3 +1,4 @@
+import { fulfilledSalesDeliveryPlanningRefs, overlayFulfilledSalesDeliveryPlanning, assertSalesDeliveryPlanningAllowed } from "./dispatch-fulfilled-so-repository.js";
 import { query, withTransaction } from "./db.js";
 import { isDeepStrictEqual } from "node:util";
 import { freezeRecordedPurchaseOrderProjections } from "./dispatch-recorded-po-projection.js";
@@ -763,6 +764,7 @@ async function scrubBilledSalesOrderFamiliesFromPlan(plan = {}) {
     const scrubbed = scrubBilledSalesOrderFamilyFromPlan(cleanPlan, {
       canonicalRef: family.canonicalRef,
       familyRefs: family.familyRefs,
+      preservedOrderRefs: await fulfilledSalesDeliveryPlanningRefs(family.familyRefs),
       inProgressOrderRefs: activeJobs.length ? family.familyRefs : []
     });
     cleanPlan = scrubbed.plan;
@@ -881,8 +883,9 @@ async function sanitizeDispatchPlan(plan) {
   };
   const billedSanitizedPlan = await scrubBilledSalesOrderFamiliesFromPlan(pickupSanitizedPlan);
   const groupedRefs = groupedSalesOrderChildRefs(billedSanitizedPlan);
-  if (!groupedRefs.length) return billedSanitizedPlan;
-  return refreshGroupedSalesOrderReconciliationInPlan(billedSanitizedPlan, {
+  const annotatedPlan = { ...billedSanitizedPlan, orders: await overlayFulfilledSalesDeliveryPlanning(billedSanitizedPlan.orders || [], { preserveUnchanged: true }) };
+  if (!groupedRefs.length) return annotatedPlan;
+  return refreshGroupedSalesOrderReconciliationInPlan(annotatedPlan, {
     childSnapshots: await groupedSalesOrderChildSnapshots(billedSanitizedPlan),
     targetRefs: groupedRefs
   }).plan;
@@ -1202,6 +1205,7 @@ export async function reconcileSalesOrderFamilyInDispatchPlans({
         FOR UPDATE OF p, s`,
       [refs]
     );
+    const preservedOrderRefs = billed && !closed ? await fulfilledSalesDeliveryPlanningRefs(refs) : [];
     const changedPlans = [];
     const deferredPlans = [];
     for (const row of snapshots.rows) {
@@ -1224,7 +1228,8 @@ export async function reconcileSalesOrderFamilyInDispatchPlans({
       const scrubbed = billed || closed
         ? scrubBilledSalesOrderFamilyFromPlan(refreshed.plan, {
             canonicalRef,
-            familyRefs: refs
+            familyRefs: refs,
+            preservedOrderRefs
           })
         : {
             plan: refreshed.plan,
@@ -1612,6 +1617,11 @@ export async function saveDispatchPlanSnapshot(planId, {
       reactivatedGlobalOrderRefs,
       rejectRetiredGlobalOrderRefs: true
     });
+    // Driver completion uses this same fleet lock. Recheck after acquiring it,
+    // before billed cleanup or persistence can accept a stale browser decision.
+    const previousRefs = new Set([...dispatchPlannedOrderRefs(previousPlan)].map(ref => ref.toLowerCase()));
+    await assertSalesDeliveryPlanningAllowed([...dispatchPlannedOrderRefs(canonicalPlan)]
+      .filter(ref => !previousRefs.has(ref.toLowerCase())), "save this plan");
     let sanitizedPlan = await refreshDispatchPlanAuthoritativeOrderProjection(
       await sanitizeDispatchPlan({
         id: String(planId),

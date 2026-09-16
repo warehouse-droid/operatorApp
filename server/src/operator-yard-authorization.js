@@ -1,9 +1,11 @@
 // @ts-check
 import { query } from "./db.js";
+import { getConsolidatedLoad } from "./consolidation-load-repository.js";
 import { getDeliveryOrder } from "./delivery-repository.js";
 import { getReceivingOrder, getLocalCoReceivingOrder } from "./receiving-repository.js";
 import { getPublicOperatorNetSuitePostingCommand } from "./operator-netsuite-posting-controller.js";
 import { assertOperatorYard, deliveryOrderWithinYards, operatorYardLocationIds, requireAssignedOperatorYards, operatorYardForbidden } from "./operator-yard-access.js";
+import { operatorRequestPath, operatorRouteId } from "./operator-yard-route.js";
 
 /** @param {any} row */
 function found(row) {
@@ -15,8 +17,13 @@ function found(row) {
 export async function assertOperatorOrderYard(operator, id, { receiving = false, orderType = "" } = {}) {
   let order;
   if (receiving) {
-    const local = orderType === "co_order" || String(id).startsWith("CO-") || Number(id) < 0;
+    const local = orderType === "co_order" || String(id).startsWith("CO-");
     order = local ? await getLocalCoReceivingOrder(id) : await getReceivingOrder(id, { includeNetSuiteClosed: true });
+    // SCM split POs and TOs also use negative IDs. Resolve those before the
+    // legacy local CO fallback, matching the receiving detail route.
+    if (!order && !local && Number(id) < 0) {
+      order = await getLocalCoReceivingOrder(id);
+    }
   } else {
     order = await getDeliveryOrder(id, { includeNetSuiteClosed: true });
   }
@@ -34,6 +41,14 @@ function assertOperatorChildOrderYards(operator, order) {
 /** @param {import("./operator-yard-access.js").OperatorYardAccount} operator @param {Record<string, any>} [body] */
 export async function assertOperatorUploadYard(operator, body = {}) {
   requireAssignedOperatorYards(operator);
+  if (body.recordType === "operator-consolidation-load-photo") {
+    const batch = await getConsolidatedLoad(operator, body.orderId);
+    if (batch.status !== "draft") throw Object.assign(new Error("This load already has its photo evidence."), { status: 409 });
+    for (const order of batch.snapshot.orders) await assertOperatorOrderYard(operator, order.netsuite_id);
+    body.orderRef = batch.id;
+    body.source = "operator";
+    return batch.locationId;
+  }
   if (body.recordType === "operator-return-photo") return assertOperatorYard(operator, body.locationId);
   if (!body.orderId) throw Object.assign(new Error("An order is required for this photo."), { status: 400 });
   const order = await assertOperatorOrderYard(operator, body.orderId, {
@@ -46,6 +61,11 @@ export async function assertOperatorUploadYard(operator, body = {}) {
 export async function assertOperatorOrderPhotoYard(operator, reference) {
   requireAssignedOperatorYards(operator);
   const parts = String(reference).replace(/^r2:\/\//, "").split("/");
+  if (parts[0] === "operator" && parts[1] === "operator-consolidation-load-photo") {
+    const batch = await getConsolidatedLoad(operator, parts[5]);
+    for (const order of batch.snapshot.orders) await assertOperatorOrderYard(operator, order.netsuite_id);
+    return;
+  }
   const receiving = String(parts[1]).includes("receiving");
   if (parts[0] !== "operator" || !/^operator-(?:load|customer-pickup|(?:co-)?receiving)-photo$/.test(parts[1] || "")) throw operatorYardForbidden();
   const ref = parts[5];
@@ -129,10 +149,10 @@ async function authorizeReturnRequest(req, pathname) {
     await assertOperatorReturnDraftYard(req.operator, req.body?.draftId || req.body?.draft_id || (pathname === "/api/returns/drafts" ? req.body?.id : null), { allowNew: pathname === "/api/returns/drafts" || pathname === "/api/returns/submit" });
   }
   const draft = pathname.match(/^\/api\/returns\/drafts\/([^/]+)$/);
-  if (draft) await assertOperatorReturnDraftYard(req.operator, draft[1]);
+  if (draft) await assertOperatorReturnDraftYard(req.operator, operatorRouteId(draft[1]));
   const record = pathname.match(/^\/api\/returns\/operator\/history\/([^/]+)$/);
   if (record) {
-    const result = await query("SELECT receiving_location_id FROM return_records WHERE id=$1 AND operator_id=$2", [record[1], req.operator.id]);
+    const result = await query("SELECT receiving_location_id FROM return_records WHERE id=$1 AND operator_id=$2", [operatorRouteId(record[1]), req.operator.id]);
     assertOperatorYard(req.operator, found(result.rows[0]).receiving_location_id);
   }
 }
@@ -168,7 +188,8 @@ async function authorizeDeliveryRequest(req, pathname) {
     const batches = await query("SELECT id FROM operator_consolidation_batches WHERE operator_id=$1 AND location_id=$2 AND status='active'", [req.operator.id, selectedYard(req)]);
     for (const batch of batches.rows) await assertConsolidationOrderYards(req.operator, batch.id);
   }
-  const savedId = req.body?.orderId || pathname.match(/^\/api\/delivery\/saved-orders\/([^/]+)$/)?.[1];
+  const savedPathId = pathname.match(/^\/api\/delivery\/saved-orders\/([^/]+)$/)?.[1];
+  const savedId = req.body?.orderId || (savedPathId ? operatorRouteId(savedPathId) : "");
   if (savedId) await assertOperatorOrderYard(req.operator, savedId);
 }
 
@@ -192,7 +213,7 @@ async function authorizeListRequest(req, pathname) {
 /** @param {any} req @param {RegExpMatchArray} job @param {{receivingJobs: Map<string, any>, fulfillmentJobs: Map<string, any>}} jobs */
 async function authorizeJobRequest(req, job, { receivingJobs, fulfillmentJobs }) {
   const kind = job[1] || "";
-  const id = job[2] || "";
+  const id = operatorRouteId(job[2]);
   if (kind.startsWith("operator/")) {
     return assertOperatorPostingJobYard(req.operator, await getPublicOperatorNetSuitePostingCommand(id));
   }
@@ -205,10 +226,10 @@ async function authorizeOperatorRequest(req, pathname, jobs) {
   if (pathname.startsWith("/api/returns/")) return authorizeReturnRequest(req, pathname);
   const order = pathname.match(/^\/api\/(delivery|receiving|customer-pickup)\/orders\/([^/]+)/);
   if (order) {
-    return assertOperatorOrderYard(req.operator, order[2], { receiving: order[1] === "receiving", orderType: req.body?.orderType || req.query.orderType });
+    return assertOperatorOrderYard(req.operator, operatorRouteId(order[2]), { receiving: order[1] === "receiving", orderType: req.body?.orderType || req.query.orderType });
   }
   const consolidation = pathname.match(/^\/api\/delivery\/consolidation\/(orders|batches)\/([^/]+)/);
-  if (consolidation) return assertConsolidationYard(req, consolidation[1] || "", consolidation[2] || "");
+  if (consolidation) return assertConsolidationYard(req, consolidation[1] || "", operatorRouteId(consolidation[2]));
   const job = pathname.match(/^\/api\/(delivery\/fulfillment-jobs|receiving\/receipt-jobs|operator\/netsuite-posting-jobs)\/([^/]+)/);
   if (job) return authorizeJobRequest(req, job, jobs);
   return authorizeListRequest(req, pathname);
@@ -218,7 +239,7 @@ export function createOperatorYardGuard({ receivingJobs = new Map(), fulfillment
   /** @param {any} req @param {any} _res @param {(error?: any) => void} next */
   return async function requireOperatorYardRequest(req, _res, next) {
     try {
-      const pathname = decodeURI(req.originalUrl.split("?")[0]).replace(/\/$/, "");
+      const pathname = operatorRequestPath(req.originalUrl);
       if (/^\/api\/inventory\/classifications(?:\/|$)/.test(pathname) || pathname === "/api/cycle-count/records") return next();
       if (controlInventorySync(req, pathname)) return next();
       requireAssignedOperatorYards(req.operator);

@@ -1,8 +1,10 @@
 import { writeAudit } from "./auth-repository.js";
 import { query } from "./db.js";
+import { readNetSuiteOrderLine } from "./netsuite-order-line.js";
 import { enrichPurchaseOrderDispatch, enrichSalesOrderDispatch, enrichTransferDispatch } from "./dispatch-enrichment.js";
 import { syncOrderDependenciesForTransferOrder } from "./order-dependency-repository.js";
 import { enqueueNetSuiteMirrorOrderEvent } from "./netsuite-mirror-repository.js";
+import { resumeSmartScmBlanketCoveredPlanningExclusions } from "./smart-scm-planning-exclusion-repository.js";
 
 function normalizeNetSuiteDate(value) {
   const text = String(value ?? "").trim();
@@ -112,6 +114,7 @@ function normalizeLine(line) {
     : null;
   return {
     line_id: normalizeBigintId(line.uniquekey ?? line.line_unique_key ?? line.lineUniqueKey ?? line.line_id),
+    netsuite_order_line: readNetSuiteOrderLine(line),
     item_id: normalizeBigintId(line.item_id),
     item_name: line.item_name,
     item_type: line.item_type,
@@ -387,6 +390,8 @@ async function rekeyLineIfSingleCandidate({ table, orderColumn, orderId, normali
   const updated = await query(
     `UPDATE ${table}
         SET line_id = $2,
+            netsuite_order_line = NULL,
+            netsuite_order_line_synced_at = NULL,
             synced_at = now()
       WHERE id = $1
       RETURNING *`,
@@ -740,14 +745,16 @@ export async function upsertSalesOrderLines(orderId, lines = []) {
          location, pallet_qty, layer_qty, piece_qty, section_qty, to_plt,
          to_lyr, to_sec, to_pcs, loaded_qty, loaded_uom, netsuite_active, sync_exception, pack_quantity_source,
          netsuite_committed_qty, netsuite_backordered_qty,
-         sync_exception_at, synced_at
+         sync_exception_at, synced_at, netsuite_order_line, netsuite_order_line_synced_at
        ) VALUES (
          $1, $2, $3, $4, $5, $6, $7, $8, $9, $10,
          $11, $12, $13, $14, $15, $16, $17, $18, $19,
          $20, $21, COALESCE($22::numeric, 0), $23, true, $26, $27,
-         COALESCE($24::numeric, 0), COALESCE($25::numeric, 0), CASE WHEN $26::text IS NULL THEN null ELSE now() END, now()
+         COALESCE($24::numeric, 0), COALESCE($25::numeric, 0), CASE WHEN $26::text IS NULL THEN null ELSE now() END, now(), $28, CASE WHEN $28::bigint IS NULL THEN NULL ELSE clock_timestamp() END
        )
        ON CONFLICT (sales_order_id, line_id) DO UPDATE SET
+         netsuite_order_line = COALESCE(EXCLUDED.netsuite_order_line, sales_order_lines.netsuite_order_line),
+         netsuite_order_line_synced_at = COALESCE(EXCLUDED.netsuite_order_line_synced_at, sales_order_lines.netsuite_order_line_synced_at),
          item_id = EXCLUDED.item_id,
          item_name = EXCLUDED.item_name,
          item_type = EXCLUDED.item_type,
@@ -830,7 +837,8 @@ export async function upsertSalesOrderLines(orderId, lines = []) {
         normalized.netsuite_committed_qty,
         normalized.netsuite_backordered_qty,
         normalized.sync_exception,
-        normalized.pack_quantity_source
+        normalized.pack_quantity_source,
+        normalized.netsuite_order_line
       ]
     );
     await upsertInventoryItemFromLine(normalized);
@@ -841,7 +849,7 @@ export async function upsertSalesOrderLines(orderId, lines = []) {
       existing: existing.rows[0] || null,
       normalized,
       fields: [
-        "line_id", "item_id", "item_name", "item_type", "item_type_text",
+        "line_id", "netsuite_order_line", "item_id", "item_name", "item_type", "item_type_text",
         "item_description", "sku", "quantity", "unit", "item_weight",
         "location_id", "location", "pallet_qty", "layer_qty", "piece_qty",
         "section_qty", "to_plt", "to_lyr", "to_sec", "to_pcs",
@@ -887,17 +895,19 @@ async function upsertTransferOrderLines(orderId, lines = [], stage) {
          location, pallet_qty, layer_qty, piece_qty, section_qty, to_plt,
          to_lyr, to_sec, to_pcs, loaded_qty, loaded_uom, netsuite_active,
          sync_exception, sync_exception_at, raw, synced_at, item_type,
-         item_type_text, netsuite_received_qty, pack_quantity_source
+         item_type_text, netsuite_received_qty, pack_quantity_source, netsuite_order_line, netsuite_order_line_synced_at
        ) VALUES (
          $1, COALESCE($2::bigint, nextval('canonical_order_line_id_seq')),
          $3, $4, $5, $6, $7, $8, $9, $10,
          $11, $12, $13, $14, $15, $16, $17, $18,
          $19, $20, $21, COALESCE($22::numeric, 0), $23, true,
-         $28, CASE WHEN $28::text IS NULL THEN null ELSE now() END, $24::jsonb, now(), $25, $26, COALESCE($27::numeric, 0), $29
+         $28, CASE WHEN $28::text IS NULL THEN null ELSE now() END, $24::jsonb, now(), $25, $26, COALESCE($27::numeric, 0), $29, $30, CASE WHEN $30::bigint IS NULL THEN NULL ELSE clock_timestamp() END
        )
        ON CONFLICT (line_stage, id) DO UPDATE SET
          transfer_order_id = EXCLUDED.transfer_order_id,
          line_id = EXCLUDED.line_id,
+         netsuite_order_line = COALESCE(EXCLUDED.netsuite_order_line, transfer_order_lines.netsuite_order_line),
+         netsuite_order_line_synced_at = COALESCE(EXCLUDED.netsuite_order_line_synced_at, transfer_order_lines.netsuite_order_line_synced_at),
          item_id = EXCLUDED.item_id,
          item_name = EXCLUDED.item_name,
          sku = EXCLUDED.sku,
@@ -980,7 +990,8 @@ async function upsertTransferOrderLines(orderId, lines = [], stage) {
         normalized.item_type_text,
         normalized.netsuite_received_qty,
         normalized.sync_exception,
-        normalized.pack_quantity_source
+        normalized.pack_quantity_source,
+        normalized.netsuite_order_line
       ]
     );
     await upsertInventoryItemFromLine(normalized);
@@ -991,7 +1002,7 @@ async function upsertTransferOrderLines(orderId, lines = [], stage) {
       existing: existing.rows[0] || null,
       normalized,
       fields: [
-        "line_id", "item_id", "item_name", "item_type", "item_type_text",
+        "line_id", "netsuite_order_line", "item_id", "item_name", "item_type", "item_type_text",
         "item_description", "sku", "quantity", "netsuite_received_qty", "unit",
         "item_weight", "location_id", "location", "pallet_qty", "layer_qty",
         "piece_qty", "section_qty", "to_plt", "to_lyr", "to_sec", "to_pcs",
@@ -1324,15 +1335,17 @@ export async function upsertPurchaseOrderLines(orderId, lines = []) {
          pallet_qty, layer_qty, piece_qty, section_qty, to_plt, to_lyr,
          to_sec, to_pcs, rate, amount, netsuite_closed,
          netsuite_active, sync_exception, pack_quantity_source,
-         sync_exception_at, raw, synced_at
+         sync_exception_at, raw, synced_at, netsuite_order_line, netsuite_order_line_synced_at
        ) VALUES (
          $1, $2, $3, $4, $5, $6, $7, $8,
          $9, COALESCE($10::numeric, 0), COALESCE($10::numeric, 0), $11, $12, $13, $14, $15,
          $16, $17, $18, $19, $20, $21, $22, $26, $27, COALESCE($28::boolean, false),
          true, $24, $25,
-         CASE WHEN $24::text IS NULL THEN null ELSE now() END, $23::jsonb, now()
+         CASE WHEN $24::text IS NULL THEN null ELSE now() END, $23::jsonb, now(), $29, CASE WHEN $29::bigint IS NULL THEN NULL ELSE clock_timestamp() END
        )
        ON CONFLICT (purchase_order_id, line_id) WHERE line_id IS NOT NULL DO UPDATE SET
+         netsuite_order_line = COALESCE(EXCLUDED.netsuite_order_line, purchase_order_lines.netsuite_order_line),
+         netsuite_order_line_synced_at = COALESCE(EXCLUDED.netsuite_order_line_synced_at, purchase_order_lines.netsuite_order_line_synced_at),
          item_id = EXCLUDED.item_id,
          item_name = EXCLUDED.item_name,
          item_type = EXCLUDED.item_type,
@@ -1393,7 +1406,8 @@ export async function upsertPurchaseOrderLines(orderId, lines = []) {
         normalized.pack_quantity_source,
         normalized.rate,
         normalized.amount,
-        normalized.netsuite_closed
+        normalized.netsuite_closed,
+        normalized.netsuite_order_line
       ]
     );
     await upsertInventoryItemFromLine(normalized);
@@ -1405,7 +1419,7 @@ export async function upsertPurchaseOrderLines(orderId, lines = []) {
       existing: existing.rows[0] || null,
       normalized,
       fields: [
-        "line_id", "item_id", "item_name", "item_type", "item_type_text",
+        "line_id", "netsuite_order_line", "item_id", "item_name", "item_type", "item_type_text",
         "item_description", "sku", "quantity", "netsuite_received_qty", "unit",
         "item_weight", "location_id", "location", "pallet_qty", "layer_qty",
         "piece_qty", "section_qty", "to_plt", "to_lyr", "to_sec", "to_pcs",
@@ -1415,6 +1429,7 @@ export async function upsertPurchaseOrderLines(orderId, lines = []) {
       detailsKey: "line"
     });
   }
+  await resumeSmartScmBlanketCoveredPlanningExclusions({ sourcePoId: orderId });
   await enqueueNetSuiteMirrorOrderEvent("purchase_order", orderId);
 }
 

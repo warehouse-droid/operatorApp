@@ -1,3 +1,4 @@
+import { readNetSuiteOrderLine, withNetSuiteOrderLines } from "./netsuite-order-line.js";
 import { query, withTransaction } from "./db.js";
 import {
   fetchPoToLinkedTransactionsFromNetSuite,
@@ -467,6 +468,7 @@ function mappedOrderLine(line) {
     uniquekey: lineKey,
     line_unique_key: lineKey,
     line_id: lineKey,
+    netsuite_order_line: readNetSuiteOrderLine({ netsuite_order_line: line.netsuite_order_line }),
     item_id: positiveId(line.itemId),
     item_name: text(line.itemName),
     item_type: text(line.itemType),
@@ -515,7 +517,7 @@ function normalizeFetchedOrder(order = {}) {
     id,
     kind,
     tranid: text(order.tranid).toUpperCase(),
-    lines: (Array.isArray(order.lines) ? order.lines : []).map((line) => ({
+    lines: withNetSuiteOrderLines((Array.isArray(order.lines) ? order.lines : []).map((line) => ({
       ...line,
       sourceLineKey: text(line.sourceLineKey),
       sourceLineAliases: Array.isArray(line.sourceLineAliases)
@@ -533,7 +535,7 @@ function normalizeFetchedOrder(order = {}) {
         : text(line.stage).toLowerCase() === "receiving"
           ? "receiving"
           : "outbound"
-    }))
+    })), kind)
   };
 }
 
@@ -557,7 +559,8 @@ function legacyProgressOrder(progress, kind) {
     headerOnlyFallback: !(progress.lines || []).length,
     lines: (progress.lines || []).map((line) => ({
       sourceLineKey: text(line.line_id),
-      orderLine: line.order_line ?? line.line_id,
+      orderLine: line.netsuite_order_line ?? line.order_line,
+      netsuite_order_line: line.netsuite_order_line,
       stage: cleanKind === "PO"
         ? "receiving"
         : cleanKind === "SO"

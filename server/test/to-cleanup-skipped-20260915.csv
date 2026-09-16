@@ -1,0 +1,34 @@
+Transfer order,Reason
+TOB00025,Duplicate local order reference; identity cannot be resolved safely
+TOB00569,Receiving line has a synchronization exception
+TOB00766,Receiving line has a synchronization exception
+TOB00784,Cancelled source family; cleanup skipped for the source and its splits
+TOB00784-S1,Cancelled source family; cleanup skipped for the source and its splits
+TOB00784-S2,Cancelled source family; cleanup skipped for the source and its splits
+TOB00793,Packed line is not safe to reconcile automatically
+TOB00800,Receiving line has a synchronization exception
+TOB00838,Receiving line has a synchronization exception
+TOB00896,Receiving line has a synchronization exception
+TOB00903,Receiving line has a synchronization exception
+TOB00906,Cancelled source family; cleanup skipped for the source and its splits
+TOB00906-S1,Cancelled source family; cleanup skipped for the source and its splits
+TOB00906-S2,Cancelled source family; cleanup skipped for the source and its splits
+TOB00942,Receiving line has a synchronization exception
+TOB00956,Receiving line has a synchronization exception
+TOB00965,Receiving line has a synchronization exception
+TOB00973,Receiving line has a synchronization exception
+TOB00974,Receiving line has a synchronization exception
+TOB00975,Receiving line has a synchronization exception
+TOB00982,Receiving line has a synchronization exception
+TOB00983,Receiving line has a synchronization exception
+TOB00984,Receiving line has a synchronization exception
+TOB00987,Receiving line has a synchronization exception
+TOB00989,Receiving line has a synchronization exception
+TOB00994,Receiving line has a synchronization exception
+TOB00995,Receiving line has a synchronization exception
+TOB01001,Receiving line has a synchronization exception
+TOB01022,Receiving line has a synchronization exception
+TOB01023,Receiving line has a synchronization exception
+TOB01025,Receiving line has a synchronization exception
+TOB01027,Receiving line has a synchronization exception
+TOB01083,Receiving line has a synchronization exception

@@ -1,6 +1,7 @@
 // @ts-check
 
 import { query } from "./db.js";
+import { completeConsolidatedLoad } from "./consolidation-load-repository.js";
 import { recordCustomerPickupLoad, recordDeliveryLoad } from "./delivery-repository.js";
 import { recordReceivingReceipt } from "./receiving-repository.js";
 import {
@@ -196,6 +197,11 @@ export function createOperatorNetSuitePostingFinalizer({
   }
 
   const handlers = {
+    delivery_consolidation_load: async (/** @type {Record<string,any>} */ command, /** @type {Record<string,any>} */ operation) => {
+      const result = await completeConsolidatedLoad(operation.orderId, { allowNetSuiteCompleted: true });
+      await persistLoadEvidence(result, command);
+      return result;
+    },
     customer_pickup_load: customerPickupFinalization,
     delivery_prep_load: deliveryPrepFinalization,
     receiving_receipt: receivingFinalization

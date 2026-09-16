@@ -1,0 +1,4 @@
+[
+  "P3.12: browser specs share one worker-owned database-pool lifecycle",
+  "quality non-regression: the gauntlet builds and validates the omit-dev runtime"
+]

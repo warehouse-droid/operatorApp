@@ -1,0 +1,454 @@
+[
+  {
+    "file": "public/i18n.js",
+    "beforeSha256": "3d8fa59e5365f3f6124d5442693989f4dda49bb35748d9840fae07c32454d8f4",
+    "afterSha256": "72993e94ba94f1d99057d621cd52458439103cdc3a96dd98d4060f755dc869fa",
+    "edits": [
+      {
+        "start": 6,
+        "end": 7,
+        "before": []
+      }
+    ]
+  },
+  {
+    "file": "public/operator.css",
+    "beforeSha256": "cecf27e64b84ed4a4cc4e706fb2e7c7893296696c1e68052062e2689fa49cff8",
+    "afterSha256": "66532e99cfebbf2583fe258d357aaa87d25c11cd4c8b3d97d5f0e6607f72dfb2",
+    "edits": [
+      {
+        "start": 3060,
+        "end": 3061,
+        "before": []
+      }
+    ]
+  },
+  {
+    "file": "public/operator.html",
+    "beforeSha256": "f4c80e149e60d734f6a4372e599bb280a6a8779b559a1f7a36bb313a60123013",
+    "afterSha256": "33fe9e499af54923f0ce11311b0f09fe5db8cbf1a8967bb57c84b5c73f57f853",
+    "edits": [
+      {
+        "start": 14,
+        "end": 15,
+        "before": [
+          "    <link rel=\"stylesheet\" href=\"/operator.css?v=20260916-consolidation-date-row-v1\" />\n"
+        ]
+      },
+      {
+        "start": 21,
+        "end": 22,
+        "before": [
+          "    <script src=\"/i18n.js?v=20260916-consolidation-date-row-v1\"></script>\n"
+        ]
+      },
+      {
+        "start": 23,
+        "end": 24,
+        "before": [
+          "    <script src=\"/operator.js?v=20260916-consolidation-date-row-v1\"></script>\n"
+        ]
+      }
+    ]
+  },
+  {
+    "file": "public/operator.js",
+    "beforeSha256": "8a6866c543172af8019380658611f28f47c0b8afd89692acd8633815e808ea41",
+    "afterSha256": "eee256b838480153db48dead7a5b2e59d41badf4cb533f5e51196b96f0b4b888",
+    "edits": [
+      {
+        "start": 354,
+        "end": 423,
+        "before": []
+      },
+      {
+        "start": 517,
+        "end": 522,
+        "before": [
+          "async function prepareCameraStream(stream) {\n"
+        ]
+      },
+      {
+        "start": 523,
+        "end": 527,
+        "before": []
+      },
+      {
+        "start": 531,
+        "end": 532,
+        "before": [
+          "async function openCameraStream() {\n"
+        ]
+      },
+      {
+        "start": 538,
+        "end": 541,
+        "before": [
+          "    return prepareCameraStream(stream);\n",
+          "  } catch {\n"
+        ]
+      },
+      {
+        "start": 544,
+        "end": 545,
+        "before": []
+      },
+      {
+        "start": 551,
+        "end": 554,
+        "before": [
+          "      return prepareCameraStream(stream);\n",
+          "    } catch {\n"
+        ]
+      },
+      {
+        "start": 559,
+        "end": 560,
+        "before": [
+          "    return prepareCameraStream(stream);\n"
+        ]
+      },
+      {
+        "start": 561,
+        "end": 562,
+        "before": []
+      },
+      {
+        "start": 564,
+        "end": 565,
+        "before": [
+          "      return prepareCameraStream(stream);\n"
+        ]
+      },
+      {
+        "start": 2165,
+        "end": 2166,
+        "before": []
+      },
+      {
+        "start": 2416,
+        "end": 2417,
+        "before": []
+      },
+      {
+        "start": 2925,
+        "end": 2926,
+        "before": [
+          "        <button class=\"primary-button\" data-action=\"return-start-camera\" type=\"button\">${returnCameraActive ? t(\"common.restartCamera\", \"Restart camera\") : t(\"common.openCamera\", \"Open camera\")}</button>\n"
+        ]
+      },
+      {
+        "start": 2927,
+        "end": 2928,
+        "before": [
+          "        ${returnCameraActive ? `<button class=\"secondary-button\" data-action=\"return-close-camera\" type=\"button\">${t(\"common.closeCamera\", \"Close camera\")}</button>` : \"\"}\n"
+        ]
+      },
+      {
+        "start": 4610,
+        "end": 4612,
+        "before": [
+          "            : `<button class=\"primary-button\" data-action=\"start-camera\" type=\"button\">${t(\"common.openCamera\", \"Open camera\")}</button>`}\n"
+        ]
+      },
+      {
+        "start": 6859,
+        "end": 6859,
+        "before": [
+          "  if (order.reload_authorized) await startFulfillmentCamera();\n"
+        ]
+      },
+      {
+        "start": 6862,
+        "end": 6863,
+        "before": []
+      },
+      {
+        "start": 6878,
+        "end": 6879,
+        "before": [
+          "  if (!navigator.mediaDevices?.getUserMedia) {\n",
+          "    showToast(t(\"operator.cameraUnavailable\", \"Camera is not available in this browser.\"));\n",
+          "    return;\n",
+          "  }\n",
+          "  stopFulfillmentCamera();\n",
+          "  try {\n",
+          "    fulfillmentCameraStream = await openCameraStream();\n",
+          "    fulfillmentCameraActive = true;\n",
+          "    render();\n",
+          "  } catch (error) {\n",
+          "    stopFulfillmentCamera();\n",
+          "    showToast(cameraErrorMessage(error));\n",
+          "    render();\n",
+          "  }\n"
+        ]
+      },
+      {
+        "start": 6882,
+        "end": 6883,
+        "before": [
+          "  const wasActive = fulfillmentCameraActive;\n"
+        ]
+      },
+      {
+        "start": 6884,
+        "end": 6885,
+        "before": [
+          "  if (wasActive) return startFulfillmentCamera();\n"
+        ]
+      },
+      {
+        "start": 7152,
+        "end": 7154,
+        "before": [
+          "            : `<button class=\"primary-button\" data-action=\"start-receipt-camera\" type=\"button\">${t(\"common.openCamera\", \"Open camera\")}</button>`}\n"
+        ]
+      },
+      {
+        "start": 7310,
+        "end": 7311,
+        "before": []
+      },
+      {
+        "start": 7324,
+        "end": 7325,
+        "before": [
+          "  if (!navigator.mediaDevices?.getUserMedia) return showToast(t(\"operator.cameraUnavailable\", \"Camera is not available in this browser.\"));\n",
+          "  stopReceiptCamera();\n",
+          "  try {\n",
+          "    receiptCameraStream = await openCameraStream();\n",
+          "    receiptCameraActive = true;\n",
+          "    render();\n",
+          "  } catch (error) {\n",
+          "    stopReceiptCamera();\n",
+          "    showToast(cameraErrorMessage(error));\n",
+          "    render();\n",
+          "  }\n"
+        ]
+      },
+      {
+        "start": 7328,
+        "end": 7329,
+        "before": [
+          "  const wasActive = receiptCameraActive;\n"
+        ]
+      },
+      {
+        "start": 7330,
+        "end": 7331,
+        "before": [
+          "  if (wasActive) return startReceiptCamera();\n"
+        ]
+      },
+      {
+        "start": 8057,
+        "end": 8058,
+        "before": []
+      },
+      {
+        "start": 8071,
+        "end": 8072,
+        "before": [
+          "  if (!navigator.mediaDevices?.getUserMedia) return showToast(t(\"operator.cameraUnavailable\", \"Camera is not available in this browser.\"));\n",
+          "  stopReturnScannerCamera();\n",
+          "  stopReturnCamera();\n",
+          "  try {\n",
+          "    returnCameraStream = await openCameraStream();\n",
+          "    returnCameraActive = true;\n",
+          "    returnPhotoTarget.open = true;\n",
+          "    render();\n",
+          "  } catch (error) {\n",
+          "    stopReturnCamera();\n",
+          "    showToast(cameraErrorMessage(error));\n",
+          "    render();\n",
+          "  }\n"
+        ]
+      },
+      {
+        "start": 8075,
+        "end": 8076,
+        "before": [
+          "  const wasActive = returnCameraActive;\n"
+        ]
+      },
+      {
+        "start": 8077,
+        "end": 8078,
+        "before": [
+          "  if (wasActive) return startReturnCamera();\n"
+        ]
+      },
+      {
+        "start": 8126,
+        "end": 8127,
+        "before": []
+      }
+    ]
+  },
+  {
+    "file": "public/service-worker.js",
+    "beforeSha256": "dd86e1bcbe219506c72531bb1342d1284989629f708e91c26e88307d1a47deb8",
+    "afterSha256": "65dc75d60287952d90a79afe7aeded807854186838f03695db24e41c9d3f9a2a",
+    "edits": [
+      {
+        "start": 0,
+        "end": 1,
+        "before": [
+          "const CACHE_NAME = \"mbbs-yard-operator-v152-consolidation-date-row-v1\";\n"
+        ]
+      },
+      {
+        "start": 5,
+        "end": 6,
+        "before": [
+          "  \"/operator.css?v=20260916-consolidation-date-row-v1\",\n"
+        ]
+      },
+      {
+        "start": 8,
+        "end": 9,
+        "before": [
+          "  \"/i18n.js?v=20260916-consolidation-date-row-v1\",\n"
+        ]
+      },
+      {
+        "start": 10,
+        "end": 11,
+        "before": [
+          "  \"/operator.js?v=20260916-consolidation-date-row-v1\",\n"
+        ]
+      }
+    ]
+  },
+  {
+    "file": "test/dispatch/frontend/consolidation-load.browser.test.mjs",
+    "beforeSha256": "2e9edf4c0294836d091e4853d2987c00562e16af84d98e2f4b377a04be41edf4",
+    "afterSha256": "0ae2f5bed432ccec8fce453945e9efcaeb16f06c4191378fda03b597dda4be48",
+    "edits": [
+      {
+        "start": 205,
+        "end": 206,
+        "before": [
+          "    await page.locator('[data-action=\"start-camera\"]').click();\n"
+        ]
+      }
+    ]
+  },
+  {
+    "file": "test/mbt/e2e/operator-fulfillment-long-group-layout.spec.js",
+    "beforeSha256": "a633e147e39e510d1777125ecc5565e391076aa3a604177485958106638a32ed",
+    "afterSha256": "1068bab0f048246f4be3aa335ffac47b27acb536fddfcdbb7373b25eef9bb634",
+    "edits": [
+      {
+        "start": 213,
+        "end": 213,
+        "before": [
+          "  await page.getByRole(\"button\", { name: \"Open camera\", exact: true }).click();\n"
+        ]
+      }
+    ]
+  },
+  {
+    "file": "test/mbt/unit/operations-navigation-enhancements.test.js",
+    "beforeSha256": "25cd74eab1f53fe273a0ef96d9b1aacd19d1f031bee38188fbec238b0ff97c01",
+    "afterSha256": "22c4b9ae907d7cf3e21ad9d921129b7ae64fbfb5536b7c145b299eab29639943",
+    "edits": [
+      {
+        "start": 124,
+        "end": 126,
+        "before": [
+          "    \"/operator.css?v=20260916-consolidation-date-row-v1\",\n",
+          "    \"/operator.js?v=20260916-consolidation-date-row-v1\"\n"
+        ]
+      },
+      {
+        "start": 130,
+        "end": 131,
+        "before": [
+          "  assert.ok(serviceWorker.includes(\"mbbs-yard-operator-v152-consolidation-date-row-v1\"));\n"
+        ]
+      }
+    ]
+  },
+  {
+    "file": "test/mbt/unit/operator-customer-pickup-photo-gate-ui.contract.test.js",
+    "beforeSha256": "79eab65c795df6ac935e81583e726a7b1c8ba82df21aefec0a2a06ff91ef70a0",
+    "afterSha256": "7a78e8c7a82698786a5829ba77b6a724f14d05d18d5d894ac59701ea67078164",
+    "edits": [
+      {
+        "start": 92,
+        "end": 95,
+        "before": [
+          "  assert.match(html, /operator\\.js\\?v=20260916-consolidation-date-row-v1/u);\n",
+          "  assert.match(serviceWorker, /mbbs-yard-operator-v152-consolidation-date-row-v1/u);\n",
+          "  assert.match(serviceWorker, /operator\\.js\\?v=20260916-consolidation-date-row-v1/u);\n"
+        ]
+      }
+    ]
+  },
+  {
+    "file": "test/mbt/unit/operator-page-confirm-ui.contract.test.js",
+    "beforeSha256": "337671fa0840450a2d4ca774cf6a2cad82ebf017a4de69cecd458e1a83c42b31",
+    "afterSha256": "38c3664ccfb86a5df0fad0c1e69b27063eb4add3fb2b50abead4956ecbb1b6d1",
+    "edits": [
+      {
+        "start": 60,
+        "end": 65,
+        "before": [
+          "  assert.match(html, /operator\\.css\\?v=20260916-consolidation-date-row-v1/u);\n",
+          "  assert.match(html, /operator\\.js\\?v=20260916-consolidation-date-row-v1/u);\n",
+          "  assert.match(serviceWorker, /mbbs-yard-operator-v152-consolidation-date-row-v1/u);\n",
+          "  assert.match(serviceWorker, /operator\\.css\\?v=20260916-consolidation-date-row-v1/u);\n",
+          "  assert.match(serviceWorker, /operator\\.js\\?v=20260916-consolidation-date-row-v1/u);\n"
+        ]
+      }
+    ]
+  },
+  {
+    "file": "test/mbt/unit/operator-yard-assets.test.js",
+    "beforeSha256": "605d83059826eeb152983fab86cb593959abe4204db43ef7d613aaad24e04fb6",
+    "afterSha256": "79b366847680d46a01fd28dad58ba57d2ac7991636202646aeea886b4a2a3d35",
+    "edits": [
+      {
+        "start": 26,
+        "end": 27,
+        "before": [
+          "  assert.equal(installed[0].name, \"mbbs-yard-operator-v152-consolidation-date-row-v1\");\n"
+        ]
+      },
+      {
+        "start": 28,
+        "end": 29,
+        "before": [
+          "    const version = asset === \"operator-load-summary.js\" ? \"20260915-operator-display-v1\" : \"20260916-consolidation-date-row-v1\";\n"
+        ]
+      }
+    ]
+  },
+  {
+    "file": "test/mbt/unit/sales-order-reload-photo-entry.test.js",
+    "beforeSha256": "90cf68ad9e1820eb32caceb74f7c0b8269991893b05903624cf18357ba123d4b",
+    "afterSha256": "60ec98ee745bf57c0c22172beb5013b2845bfdc18bac946448c5ea4ed3a60377",
+    "edits": [
+      {
+        "start": 74,
+        "end": 76,
+        "before": [
+          "  assert.match(startSource, /if \\(order\\.reload_authorized\\) await startFulfillmentCamera\\(\\)/u);\n"
+        ]
+      }
+    ]
+  },
+  {
+    "file": "test/dispatch/frontend/operator-auto-camera.browser.test.mjs",
+    "beforeSha256": null,
+    "afterSha256": "7614997383a1cd0bb0ba958cd57db17224e77aa1846cafd871acd9905a909272",
+    "edits": [
+      {
+        "start": 0,
+        "end": 213,
+        "before": []
+      }
+    ]
+  }
+]

@@ -224,7 +224,7 @@ assert.match(ui, /Archived application-created POs/);
 assert.match(ui, /setInterval\(\(\) => \{[\s\S]*60000\)/);
 assert.match(ui, /new EventSource\("\/api\/events\?client=scm-netsuite-po-history"\)/);
 assert.match(ui, /Preview PDF/);
-assert.match(html, /scm-netsuite-po\.js\?v=20260811-oauth-reference-v2/,
+assert.match(html, /scm-netsuite-po\.js\?v=20260915-created-po-sync-v1/,
   "PO History must cache-bust the authenticated preview implementation.");
 assert.match(ui, /Return to Vendor Replies/);
 assert.match(ui, /expectedLastModifiedAt/);

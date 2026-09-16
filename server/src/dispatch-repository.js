@@ -1,8 +1,10 @@
 import crypto from "node:crypto";
 import { VOYAGE_DISPATCH_YARD } from "./dispatch-sales-order-locations.js";
 import { pool, query, withTransaction } from "./db.js";
+import { resumeSmartScmBlanketCoveredPlanningExclusions } from "./smart-scm-planning-exclusion-repository.js";
 import { dispatchLoadAssignment } from "./dispatch-load-assignment.js";
 import { DISPATCH_FLEET_PLANNING_LOCK } from "./dispatch-fleet-status.js";
+import { updateDispatchSalesSplitDetails } from "./dispatch-delivery-group-repository.js";
 import { assertDispatchExecutedPrefixPreserved } from "./dispatch-executed-prefix-repository.js";
 import {
   syncDispatchPlanOrderAssignments,
@@ -485,6 +487,7 @@ export async function listDispatchOrders({
   includeAllDiscoverableScmPurchaseOrders = false,
   unboundedPerType = false,
   includeInactiveSalesOrderSearchCandidates = false,
+  includeFulfilledSalesDeliveries = false,
   includeScmLinkedSearchRefs = false,
   search = "",
   perTypeLimit = DEFAULT_DISPATCH_ORDERS_PER_TYPE,
@@ -507,7 +510,8 @@ export async function listDispatchOrders({
     Boolean(includeScmLinkedSearchRefs && searchTerm),
     normalizedExactOrderRefs,
     Boolean(includeAllDiscoverableScmPurchaseOrders),
-    Boolean(unboundedPerType)
+    Boolean(unboundedPerType),
+    Boolean(includeFulfilledSalesDeliveries && (searchTerm || normalizedExactOrderRefs.length))
   ];
   const result = await query(
     `
@@ -733,7 +737,7 @@ export async function listDispatchOrders({
         CASE WHEN $2::boolean AND COALESCE(is_test_fixture, false) THEN true ELSE netsuite_active END AS netsuite_active
       FROM sales_orders
       WHERE sales_order_type <> '${CUSTOMER_PICKUP_DELIVERY_METHOD.replaceAll("'", "''")}'
-        AND NOT ${billedSalesOrderFamilySql("sales_orders")}
+        AND ($11::boolean OR NOT ${billedSalesOrderFamilySql("sales_orders")})
         AND NOT ${netSuiteClosedOrderFamilySql("sales_orders", "SO")}
         AND (COALESCE(is_test_fixture, false) = false OR $2::boolean)
         AND (
@@ -1112,7 +1116,8 @@ export async function listDispatchOrders({
           'toPcs', l.to_pcs
         ) ORDER BY l.line_id NULLS LAST, l.id) FILTER (WHERE l.id IS NOT NULL) AS items
       FROM delivery_order_source o
-      LEFT JOIN delivery_line_source l ON l.order_id = o.netsuite_id AND l.netsuite_active = true
+      LEFT JOIN delivery_line_source l ON l.order_id = o.netsuite_id
+        AND (l.netsuite_active = true OR ($11::boolean AND o.order_type = 'sales_order'))
       LEFT JOIN so_alloc sa ON sa.sales_line_id = l.id
       LEFT JOIN LATERAL (
         SELECT co_ref, from_location, to_location, status
@@ -1126,7 +1131,7 @@ export async function listDispatchOrders({
       WHERE (
         o.netsuite_active = true
         OR co.co_ref IS NOT NULL
-        OR ($6::boolean AND o.order_type = 'sales_order')
+        OR (($6::boolean OR $11::boolean) AND o.order_type = 'sales_order')
       )
         AND (
           o.dispatch_planned = true
@@ -2119,6 +2124,8 @@ export async function setPurchaseOrderVendorYard(orderRef, vendorYardId) {
 
 export async function updateDispatchOrderDetails(orderRef, patch = {}) {
   await assertNoClosedNetSuiteOrders([orderRef], "change Dispatch details");
+  const split = await updateDispatchSalesSplitDetails(orderRef, patch);
+  if (split) return split;
   const address = String(patch.address || "").trim();
   const pickupAddressProvided = patch.pickupAddress !== undefined
     || patch.pickup_address !== undefined;
@@ -2777,6 +2784,9 @@ export async function setPurchaseOrderBlanketFlag(orderRef, {
       [source.netsuite_id, flagged, String(updatedBy || "").trim()]
     );
     const row = result.rows[0];
+    if (flagged) {
+      await resumeSmartScmBlanketCoveredPlanningExclusions({ sourcePoId: row.netsuite_id });
+    }
     return {
       netsuiteId: row.netsuite_id,
       orderRef: row.tranid || ref,

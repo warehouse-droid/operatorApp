@@ -1,0 +1,450 @@
+--- src/consolidation-load-repository.js
++++ src/consolidation-load-repository.js
+@@ -67,6 +67,25 @@
+   }
+ }
+ /** @param {any[]} orders */
++async function ordersWithGroupDates(orders) {
++  const missing = orders.filter((order) => !consolidationDate(order.dispatch_plan_date));
++  if (!missing.length) return orders;
++  // Group planning may leave original orders' dispatch fields empty, including on preview reload.
++  /** @type {Array<{ref: string, type: string, dates: string[]}>} */
++  const rows = (await query(`SELECT source.ref,source.type,array_agg(DISTINCT p.plan_date::text) AS dates
++    FROM jsonb_to_recordset($1::jsonb) AS source(ref text,type text)
++    JOIN dispatch_delivery_group_members m ON m.member_order_ref=source.ref
++    JOIN dispatch_delivery_groups g ON g.group_ref=m.group_ref AND g.active=true AND g.order_type=source.type
++    JOIN dispatch_plans p ON p.id=g.plan_id AND p.status<>'cancelled'
++    GROUP BY source.ref,source.type`, [JSON.stringify(missing.map((order) => ({ ref: order.tranid, type: order.order_type })))])).rows;
++  const datesByOrder = new Map(rows.map((row) => [`${row.type}:${row.ref}`, row.dates]));
++  return orders.map((order) => {
++    if (consolidationDate(order.dispatch_plan_date)) return order;
++    const dates = datesByOrder.get(`${order.order_type}:${order.tranid}`);
++    return dates?.length === 1 ? { ...order, dispatch_plan_date: dates[0] } : order;
++  });
++}
++/** @param {any[]} orders */
+ async function assignmentsForOrders(orders) {
+   const dates = [...new Set(orders.map((order) => consolidationDate(order.dispatch_plan_date)).filter(Boolean))];
+   if (!dates.length) return new Map();
+@@ -99,7 +118,8 @@
+ export async function readConsolidationOrders(operator, locationId, selectedIds) {
+   const yard = assertOperatorYard(operator, locationId);
+   const sources = await consolidationSources(operator, yard, selectedIds);
+-  const orders = originalConsolidationOrders(sources, yard, Boolean(selectedIds)), assignments = await assignmentsForOrders(orders);
++  const orders = await ordersWithGroupDates(originalConsolidationOrders(sources, yard, Boolean(selectedIds)));
++  const assignments = await assignmentsForOrders(orders);
+   const eligible = orders.map((order) => ({ ...order, assignment: assignments.get(`${consolidationDate(order.dispatch_plan_date)}:${order.tranid}`) }))
+     .filter((order) => order.assignment?.loadId && order.assignment.truckPlate && order.operator_status === "packed"
+       && !order.vrma_reference_only && (order.lines || []).some(consolidationPackedLine));
+--- test/mbt/integration/consolidation-group-planning.test.js
++++ test/mbt/integration/consolidation-group-planning.test.js
+@@ -0,0 +1,102 @@
++import assert from "node:assert/strict";
++import crypto from "node:crypto";
++import test, { after } from "node:test";
++import fc from "fast-check";
++import { query, closeDb } from "../../../src/db.js";
++import { seedOperatorPickup } from "../../support/operator-ui-enhancements-fixture.mjs";
++import { syncDispatchDeliveryGroupsFromPlan } from "../../../src/dispatch-delivery-group-repository.js";
++import { getDeliveryOrder } from "../../../src/delivery-repository.js";
++import { listConsolidationLoadOrders, readConsolidationOrders, createConsolidationLoadPreview, revalidateConsolidationLoad } from "../../../src/consolidation-load-repository.js";
++import { submitConsolidatedLoad } from "../../../src/consolidation-load-service.js";
++
++after(closeDb);
++async function plan() {
++  return (await query(`INSERT INTO dispatch_plans(plan_date,status)
++    SELECT day::date,'confirmed' FROM generate_series(DATE '2098-01-01',DATE '2098-12-31',INTERVAL '1 day') day
++    WHERE NOT EXISTS(SELECT 1 FROM dispatch_plans p WHERE p.plan_date=day::date) ORDER BY day LIMIT 1 RETURNING id,plan_date::text`)).rows[0];
++}
++async function fixture() {
++  const first = await seedOperatorPickup(), second = await seedOperatorPickup(), schedule = await plan();
++  const groupId = `GOA-GROUP-PLAN-${crypto.randomUUID()}`;
++  const orders = [first, second], ids = orders.map((order) => order.orderId);
++  const group = { id: groupId, type: "SO", childOrders: orders.map((order) => order.tranid),
++    childOrderDetails: orders.map((order) => ({ id: order.tranid, type: "SO" })) };
++  const truck = { id: "GROUP-TRUCK", plate: "GROUP-TRUCK", loads: [{ id: `load-${schedule.id}`, name: "Load 1", stops: [{ type: "drop", orderId: groupId }] }] };
++  await query("INSERT INTO dispatch_plan_snapshots(plan_id,orders,trucks,summary) VALUES($1,$2,$3,'{}')", [schedule.id, JSON.stringify([group]), JSON.stringify([truck])]);
++  await syncDispatchDeliveryGroupsFromPlan({ id: schedule.id, planDate: schedule.plan_date, status: "confirmed", orders: [group], trucks: [truck] });
++  await query(`UPDATE sales_orders SET sales_order_type='Delivery',operator_status='packed',dispatch_planned=false,
++    dispatch_plan_date=NULL,dispatch_truck_plate=NULL,dispatch_load_name=NULL WHERE netsuite_id=ANY($1::bigint[])`, [ids]);
++  await query("UPDATE sales_order_lines SET packed_piece_qty=20,confirmed=true WHERE sales_order_id=ANY($1::bigint[])", [ids]);
++  return { operator: first.operator, orders, ids, plan: schedule, group, groupId, truck };
++}
++async function listed(f) {
++  return listConsolidationLoadOrders(f.operator, { locationId: 1, planDate: f.plan.plan_date });
++}
++async function updateTruck(f, trucks = [f.truck]) {
++  await query("UPDATE dispatch_plan_snapshots SET trucks=$2 WHERE plan_id=$1", [f.plan.id, JSON.stringify(trucks)]);
++}
++
++test("group-only packed orders with blank child dispatch fields appear and resolve their current load", async () => {
++  const f = await fixture();
++  const result = await listed(f);
++  assert.deepEqual(result.orders.map((order) => order.netsuite_id).sort(), [...f.ids].sort());
++  for (const order of result.orders) {
++    assert.equal(order.assignment.planDate, f.plan.plan_date);
++    assert.equal(order.assignment.truckPlate, "GROUP-TRUCK");
++    assert.equal(order.assignment.loadId, f.truck.loads[0].id);
++  }
++  const original = await getDeliveryOrder(f.ids[0]);
++  assert.equal(original.dispatch_plan_date, null, "Listing must not change the source order's projection");
++  assert.equal(Number(original.lines[0].packed_piece_qty), 20);
++});
++
++test("listed child IDs and group IDs preview identically; submit revalidates blank children and replays once", async () => {
++  const f = await fixture();
++  const children = await createConsolidationLoadPreview(f.operator, { locationId: 1, orderIds: f.ids });
++  const group = await createConsolidationLoadPreview(f.operator, { locationId: 1, orderIds: [f.groupId] });
++  assert.deepEqual(children.snapshot, group.snapshot);
++  await revalidateConsolidationLoad(f.operator, children);
++  const photos = [1, 2].map((n) => `r2://operator/operator-consolidation-load-photo/2026/09/16/${children.id}/${n}.jpg`);
++  const complete = await submitConsolidatedLoad(f.operator, children.id, photos);
++  assert.equal(complete.status, "completed");
++  assert.equal((await submitConsolidatedLoad(f.operator, children.id, photos)).status, "completed");
++  assert.equal((await query("SELECT count(*)::int AS n FROM operator_load_records WHERE order_id=ANY($1::bigint[])", [f.ids])).rows[0].n, 2);
++  assert.equal((await query("SELECT 1 FROM operator_netsuite_posting_commands WHERE actor_operator_id=$1", [f.operator.id])).rowCount, 0);
++});
++
++test("group inheritance still rejects missing, return-only, ambiguous and changed loads", async () => {
++  const f = await fixture();
++  const batch = await createConsolidationLoadPreview(f.operator, { locationId: 1, orderIds: f.ids });
++  for (const loads of [[], [{ ...f.truck.loads[0], returnOnly: true }], [f.truck.loads[0], { ...f.truck.loads[0], id: "competing-load" }]]) {
++    await updateTruck(f, [{ ...f.truck, loads }]);
++    assert.deepEqual((await listed(f)).orders, []);
++    await assert.rejects(revalidateConsolidationLoad(f.operator, batch), { code: "CONSOLIDATION_LOAD_STALE" });
++  }
++  await updateTruck(f, [{ ...f.truck, plate: "DIFFERENT-TRUCK" }]);
++  await assert.rejects(revalidateConsolidationLoad(f.operator, batch), { code: "CONSOLIDATION_LOAD_STALE" });
++  assert.equal((await query("SELECT 1 FROM operator_load_records WHERE order_id=ANY($1::bigint[])", [f.ids])).rowCount, 0);
++  await updateTruck(f);
++  await query("UPDATE sales_orders SET outbound_location_id=28 WHERE netsuite_id=$1", [f.ids[1]]);
++  assert.deepEqual((await listed(f)).orders.map((order) => order.netsuite_id), [f.ids[0]]);
++  await assert.rejects(createConsolidationLoadPreview(f.operator, { locationId: 1, orderIds: [f.groupId] }), { code: "OPERATOR_YARD_FORBIDDEN" });
++});
++
++test("properties: group date fallback is family-scoped, active, unique and never overrides an existing date", async () => {
++  const f = await fixture(), otherPlan = await plan(), otherGroup = `GOA-OTHER-${crypto.randomUUID()}`;
++  await query(`INSERT INTO dispatch_delivery_groups(group_ref,plan_id,plan_date,order_type,active) VALUES($1,$2,$3,'sales_order',false)`, [otherGroup, otherPlan.id, otherPlan.plan_date]);
++  await query("INSERT INTO dispatch_delivery_group_members(group_ref,member_order_ref,position) VALUES($1,$2,0)", [otherGroup, f.orders[0].tranid]);
++  await fc.assert(fc.asyncProperty(fc.record({ ownDate: fc.boolean(), active: fc.boolean(), sameFamily: fc.boolean(), canceled: fc.boolean(), conflict: fc.boolean() }), async (state) => {
++    await query("UPDATE sales_orders SET dispatch_plan_date=$2 WHERE netsuite_id=$1", [f.ids[0], state.ownDate ? f.plan.plan_date : null]);
++    await query("UPDATE dispatch_delivery_groups SET active=$2,order_type=$3 WHERE group_ref=$1", [f.groupId, state.active, state.sameFamily ? "sales_order" : "transfer_order"]);
++    await query("UPDATE dispatch_delivery_groups SET active=$2 WHERE group_ref=$1", [otherGroup, state.conflict]);
++    await query("UPDATE dispatch_plans SET status=$2 WHERE id=$1", [f.plan.id, state.canceled ? "cancelled" : "confirmed"]);
++    const eligible = !state.canceled && (state.ownDate || (state.active && state.sameFamily && !state.conflict));
++    if (eligible) {
++      const [order] = await readConsolidationOrders(f.operator, 1, [f.ids[0]]);
++      assert.equal(order.assignment.planDate, f.plan.plan_date);
++      assert.equal(order.assignment.loadId, f.truck.loads[0].id);
++    } else {
++      await assert.rejects(readConsolidationOrders(f.operator, 1, [f.ids[0]]), { code: "CONSOLIDATION_LOAD_STALE" });
++    }
++  }), { seed: 16092027, numRuns: 80 });
++});
+--- tools/consolidation-group-planning-checks.mjs
++++ tools/consolidation-group-planning-checks.mjs
+@@ -0,0 +1,80 @@
++import assert from "node:assert/strict";
++import crypto from "node:crypto";
++import { cpSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
++import { tmpdir } from "node:os";
++import path from "node:path";
++import { spawnSync } from "node:child_process";
++
++const folder = "test-artifacts/consolidation-group-planning";
++mkdirSync(folder, { recursive: true });
++const manifest = JSON.parse(readFileSync("test/consolidation-group-planning-changes.json", "utf8"));
++const hash = (value) => crypto.createHash("sha256").update(value).digest("hex");
++for (const entry of manifest) {assert.equal(hash(readFileSync(entry.file)), entry.afterSha256, `${entry.file} changed since evidence capture`);}
++const ownTests = ["test/mbt/integration/consolidation-group-planning.test.js"];
++const tests = [...ownTests, "test/mbt/integration/consolidation-load.test.js", "test/mbt/unit/consolidation-load.test.js", "test/mbt/unit/consolidation-load-posting.test.js"];
++const records = [];
++function run(name, command, args, { cwd = process.cwd(), accept = (result) => result.status === 0 } = {}) {
++  const result = spawnSync(command, args, { cwd, encoding: "utf8", maxBuffer: 100e6 });
++  assert.ifError(result.error);
++  const output = `${result.stdout}${result.stderr}`;
++  writeFileSync(`${folder}/${name}.log`, output);
++  const accepted = accept(result, output);
++  records.push({ name, exitCode: result.status, accepted });
++  console.log(JSON.stringify(records.at(-1)));
++  const suffix = process.argv.includes("--full") ? "-full" : process.argv.includes("--baseline-full") ? "-baseline" : "";
++  writeFileSync(`${folder}/checks${suffix}.json`, JSON.stringify(records, null, 2));
++  assert.ok(accepted, `${name} failed; see ${folder}/${name}.log`);
++  return output;
++}
++function baselineCopy() {
++  const target = mkdtempSync(path.join(tmpdir(), "posting-baseline-"));
++  for (const name of ["src", "public", "migrations", "test", "tools"]) {cpSync(name, path.join(target, name), { recursive: true });}
++  for (const name of ["package.json", "tsconfig.mbt.json", "eslint.mbt.config.js"]) {cpSync(name, path.join(target, name));}
++  symlinkSync(path.resolve("node_modules"), path.join(target, "node_modules"));
++  for (const entry of manifest) {
++    const file = path.join(target, entry.file);
++    if (!entry.beforeSha256) {rmSync(file); continue;}
++    const lines = readFileSync(file, "utf8").match(/[^\n]*\n|[^\n]+$/g) || [];
++    for (const edit of [...entry.edits].reverse()) {lines.splice(edit.start, edit.end - edit.start, ...edit.before);}
++    const text = lines.join("");
++    assert.equal(hash(text), entry.beforeSha256);
++    writeFileSync(file, text);
++  }
++  return target;
++}
++const failNames = (output) => [...new Set([...output.matchAll(/^(?:not ok \d+ - |✖ )(.+?)(?: \([\d.]+ms\))?$/gm)].map((match) => match[1]).filter((name) => name !== "failing tests:"))].sort();
++const typeErrors = (output) => output.split("\n").filter((line) => /error TS\d+/.test(line)).map((line) => line.replace(/\(\d+,\d+\)/, "")).sort();
++const lintErrors = (output) => JSON.parse(output).flatMap((file) => file.messages.map((message) =>
++  `${file.filePath.replace(/^.*\/(src|test|tools)\//, "$1/")}:${message.ruleId}:${message.severity}:${message.message}`)).sort();
++
++if (process.argv.includes("--baseline-full")) {
++  const copy = baselineCopy();
++  try {run("baseline-full", "npm", ["test"], { cwd: copy, accept: (result) => result.status <= 1 });}
++  finally {rmSync(copy, { recursive: true, force: true });}
++} else if (process.argv.includes("--full")) {
++  assert.ok(existsSync(`${folder}/baseline-full.log`));
++  const expected = failNames(readFileSync(`${folder}/baseline-full.log`, "utf8"));
++  assert.equal(expected.length, 2, "Expected the two recorded infrastructure failures only");
++  run("full-final", "npm", ["test"], { accept: (result, output) => {
++    assert.equal(result.status, 1); assert.deepEqual(failNames(output), expected);
++    assert.match(output, /Isolated MBT main run failed in 2\/\d+ file\(s\):/); return true;
++  } });
++} else {
++  run("tool-versions", process.execPath, ["--input-type=module", "-e", 'import {readFileSync} from "node:fs"; console.log(JSON.stringify({node:process.version,...Object.fromEntries(["typescript","eslint","c8","fast-check","playwright"].map(name=>[name,JSON.parse(readFileSync(`node_modules/${name}/package.json`)).version]))}));']);
++  run("focused-final", process.execPath, ["--test", "--test-concurrency=1", ...tests]);
++  const shuffled = [...tests].sort((a, b) => hash(`16092026:${a}`).localeCompare(hash(`16092026:${b}`)));
++  for (const [index, file] of shuffled.entries()) {run(`shuffled-${index}`, process.execPath, ["--test", file]);}
++  const includes = manifest.filter((entry) => entry.file.startsWith("src/") && entry.file !== "src/server.js").map((entry) => `--include=${entry.file}`);
++  run("coverage", "node_modules/.bin/c8", ["--all=false", "--check-coverage=false", ...includes,
++    `--temp-directory=${folder}/c8`, `--report-dir=${folder}/coverage`, "--reporter=json", "--reporter=text", process.execPath, "--test", "--test-concurrency=1", ...tests]);
++  const baseline = baselineCopy();
++  try {
++    const before = run("types-baseline-final", path.resolve("node_modules/.bin/tsc"), ["--project", "tsconfig.mbt.json", "--noEmit", "--pretty", "false"], { cwd: baseline, accept: (result) => result.status <= 2 });
++    run("types-final", "node_modules/.bin/tsc", ["--project", "tsconfig.mbt.json", "--noEmit", "--pretty", "false"], { accept: (_result, output) => { assert.deepEqual(typeErrors(output), typeErrors(before)); return true; } });
++    const lintFiles = manifest.map((entry) => entry.file).filter((file) => file.endsWith(".mjs") || (file.endsWith(".js") && (file.startsWith("src/") || file.startsWith("test/mbt/"))));
++    const lintArgs = ["--config", "tools/consolidation-load-eslint.config.mjs", "--format=json", "--max-warnings=0"];
++    const previous = run("lint-baseline-final", path.resolve("node_modules/.bin/eslint"), [...lintArgs, ...lintFiles.filter((file) => existsSync(path.join(baseline, file)))], { cwd: baseline, accept: (result) => result.status <= 1 });
++    run("lint-final", "node_modules/.bin/eslint", [...lintArgs, ...lintFiles], { accept: (_result, output) => { assert.deepEqual(lintErrors(output), lintErrors(previous)); return true; } });
++  } finally {rmSync(baseline, { recursive: true, force: true });}
++  for (const entry of manifest.filter((item) => /^(?:src|public)\/.*\.js$/.test(item.file))) {run(`syntax-${path.basename(entry.file)}`, process.execPath, ["--check", entry.file]);}
++}
+--- tools/consolidation-group-planning-evidence.py
++++ tools/consolidation-group-planning-evidence.py
+@@ -0,0 +1,57 @@
++"""Validate task integrity, coverage and final results; summarize reproducible evidence."""
++import hashlib
++import json
++import re
++from pathlib import Path
++
++root = Path(__file__).resolve().parents[1]
++folder = root / 'test-artifacts/consolidation-group-planning'
++manifest = json.loads((root / 'test/consolidation-group-planning-changes.json').read_text())
++for entry in manifest:
++    assert hashlib.sha256((root / entry['file']).read_bytes()).hexdigest() == entry['afterSha256'], entry['file']
++runtime = [entry for entry in manifest if entry['file'].startswith(('src/', 'public/', 'migrations/'))]
++assert [entry['file'] for entry in runtime] == ['src/consolidation-load-repository.js']
++coverage = json.loads((folder / 'coverage/coverage-final.json').read_text())
++coverage_rows = []
++for entry in runtime:
++    data = next(value for key, value in coverage.items() if key.endswith('/' + entry['file']))
++    lines = {}
++    for key, span in data['statementMap'].items():
++        for line in range(span['start']['line'], span['end']['line'] + 1):
++            lines[line] = max(lines.get(line, 0), data['s'][key])
++    changed = [line for line in entry['changedLines'] if line in lines]
++    missing = [line for line in changed if not lines[line]]
++    coverage_rows.append({'file': entry['file'], 'covered': len(changed) - len(missing), 'total': len(changed), 'missing': missing})
++    assert not missing, missing
++
++def totals(name):
++    text = (folder / name).read_text()
++    result = {key: sum(map(int, re.findall(r'^(?:ℹ|#) ' + key + r' (\d+)$', text, re.M))) for key in ['tests', 'pass', 'fail', 'skipped']}
++    assert result['tests'] > 0, name
++    return result
++
++def failures(name):
++    return sorted(set(re.findall(r'^(?:not ok \d+ - |✖ )(.+?)(?: \([\d.]+ms\))?$', (folder / name).read_text(), re.M)) - {'failing tests:'})
++
++baseline, current = totals('baseline-full.log'), totals('full-final.log')
++assert current['fail'] == baseline['fail'] == 2
++assert failures('full-final.log') == failures('baseline-full.log')
++assert current['tests'] == baseline['tests'] + 4
++assert totals('focused-final.log')['fail'] == totals('browser-final.log')['fail'] == 0
++assert all(row['accepted'] for row in json.loads((folder / 'checks.json').read_text()))
++mutants = json.loads((folder / 'mutations/results.json').read_text())
++assert len(mutants) == 8 and all(row['killed'] for row in mutants)
++additions = '\n'.join(line[1:] for line in (root / 'test/consolidation-group-planning.changes.patch').read_text().splitlines() if line.startswith('+') and not line.startswith('+++'))
++assert not re.search(r'(?:AKIA[0-9A-Z]{16}|-----BEGIN (?:RSA |EC |OPENSSH )?PRIVATE KEY-----|(?:gh[pousr]_|sk-proj-)[A-Za-z0-9]{25,})', additions)
++assert not any(entry['file'] in ['package.json', 'package-lock.json'] for entry in manifest)
++summary = {
++    'sourceState': hashlib.sha256(json.dumps([(row['file'], row['afterSha256']) for row in manifest]).encode()).hexdigest(),
++    'baseline': baseline, 'full': current, 'knownFailures': failures('full-final.log'), 'focused': totals('focused-final.log'),
++    'types': sum('error TS' in line for line in (folder / 'types-final.log').read_text().splitlines()),
++    'lint': sum(len(row['messages']) for row in json.loads((folder / 'lint-final.log').read_text())),
++    'coverage': coverage_rows, 'mutantsKilled': 4, 'propertyMutantsKilled': 4,
++    'browser': totals('browser-final.log'), 'versions': json.loads((folder / 'tool-versions.log').read_text()),
++    'newDependencies': 0, 'diffSecretScan': 'pass', 'live': json.loads((folder / 'live.json').read_text())
++}
++(folder / 'summary.json').write_text(json.dumps(summary, indent=2) + '\n')
++print(json.dumps(summary, indent=2))
+--- tools/consolidation-group-planning-gauntlet.sh
++++ tools/consolidation-group-planning-gauntlet.sh
+@@ -0,0 +1,20 @@
++#!/usr/bin/env bash
++set -Eeuo pipefail
++cd "$(dirname "${BASH_SOURCE[0]}")/.."
++runner=(bash tools/operator-receiving-identity-test.sh)
++artifact=test-artifacts/consolidation-group-planning
++mkdir -p "$artifact"
++# Preserve RED; reuse the recorded baseline only when explicitly requested.
++rm -rf "$artifact/coverage" "$artifact/c8" "$artifact/mutations"
++rm -f "$artifact/summary.json" "$artifact/full-final.log" "$artifact/live.json"
++if [[ "${CONSOLIDATION_GROUP_REDO_BASELINE:-1}" == 1 ]]; then
++  "${runner[@]}" node tools/consolidation-group-planning-checks.mjs --baseline-full
++fi
++"${runner[@]}" node tools/consolidation-group-planning-checks.mjs
++"${runner[@]}" node tools/consolidation-group-planning-mutations.mjs
++"${runner[@]}" node tools/consolidation-group-planning-checks.mjs --full
++docker run --rm --network none --ipc=host -v "$PWD/public:/app/public:ro" -v "$PWD/test:/app/test:ro" \
++  -v "$PWD/test-artifacts:/app/test-artifacts" --entrypoint node mbbs-mbt-p1-test-e2e:latest \
++  --test test/dispatch/frontend/consolidation-load.browser.test.mjs > "$artifact/browser-final.log" 2>&1
++python3 tools/consolidation-group-planning-live.py
++python3 tools/consolidation-group-planning-evidence.py
+--- tools/consolidation-group-planning-live.py
++++ tools/consolidation-group-planning-live.py
+@@ -0,0 +1,49 @@
++"""Compare production and candidate consolidation reads without changing production state."""
++import base64
++import json
++import subprocess
++from pathlib import Path
++
++root = Path(__file__).resolve().parents[1]
++source = (root / 'src/consolidation-load-repository.js').read_text()
++# Production does not yet contain the pending photo worker. This write boundary must never run.
++source = source.replace('import { enqueuePostingPhotos } from "./operator-netsuite-posting-photo-queue.js";',
++                        'const enqueuePostingPhotos = () => { throw new Error("Read-only replay cannot enqueue photos"); };')
++source = source.replace('from "./', 'from "file:///app/src/')
++module = 'data:text/javascript;base64,' + base64.b64encode(source.encode()).decode()
++script = '''
++import assert from 'node:assert/strict';
++import {query,withTransaction,pool} from './src/db.js';
++import * as current from './src/consolidation-load-repository.js';
++import {buildConsolidationSnapshot} from './src/consolidation-load-domain.js';
++const candidate = await import(MODULE);
++const operator={id:'diagnostic-read-only',role:'admin',roles:['admin'],operatorYardLocationIds:[1,15,28,26]};
++const expected=['SOA08600','SOA08648','SOB120124','SOB120358','SOB120251','SOB120252','SOB120300','SOB120301','SOB120385','RP-UNI-GORMLEY-3445-0915-1'];
++try {
++ await withTransaction(async()=>{
++  await query('SET TRANSACTION ISOLATION LEVEL REPEATABLE READ, READ ONLY');
++  const options={locationId:1,planDate:'2026-09-16'};
++  const before=await current.listConsolidationLoadOrders(operator,options);
++  const after=await candidate.listConsolidationLoadOrders(operator,options);
++  assert.deepEqual(after.orders.map(order=>order.tranid).sort(),expected.sort());
++  const selections=[['SOA08600','SOA08648','SOB120124','SOB120358'],['SOB120251','SOB120252'],['SOB120300','SOB120301']];
++  const previews=[];
++  for(const refs of selections){
++   const ids=after.orders.filter(order=>refs.includes(order.tranid)).map(order=>order.netsuite_id);
++   const rows=await candidate.readConsolidationOrders(operator,1,ids);
++   const snapshot=buildConsolidationSnapshot(rows);
++   assert.equal(snapshot.orders.length,refs.length);
++   previews.push({orders:refs,assignment:rows[0].assignment});
++  }
++  console.log(JSON.stringify({checkedAt:new Date().toISOString(),mode:'READ ONLY transaction; candidate module in memory; photo writes disabled',date:options.planDate,locationId:1,
++   before:before.orders.map(({tranid})=>tranid),after:after.orders.map(({tranid,assignment})=>({tranid,assignment})),previews}));
++ });
++} finally {await pool.end();}
++'''.replace('MODULE', json.dumps(module))
++result = subprocess.run(['docker', 'exec', '-i', 'mbbs-operator-app-app-1', 'node', '--input-type=module'], input=script, text=True, capture_output=True)
++if result.returncode:
++    # Do not echo the data URL or a possible full module in a Node import error.
++    raise RuntimeError('Read-only live replay failed: ' + '\n'.join(line for line in result.stderr.splitlines() if 'data:text/javascript' not in line)[-2000:])
++report = json.loads(result.stdout)
++(root / 'test-artifacts/consolidation-group-planning/live.json').write_text(json.dumps(report, indent=2) + '\n')
++print(json.dumps(report))
+--- tools/consolidation-group-planning-mutations.mjs
++++ tools/consolidation-group-planning-mutations.mjs
+@@ -0,0 +1,49 @@
++import assert from "node:assert/strict";
++import { cpSync, mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
++import { tmpdir } from "node:os";
++import path from "node:path";
++import { spawnSync } from "node:child_process";
++
++const folder = path.resolve("test-artifacts/consolidation-group-planning/mutations");
++mkdirSync(folder, { recursive: true });
++const target = mkdtempSync(path.join(tmpdir(), "group-planning-mutations-"));
++const testFile = "test/mbt/integration/consolidation-group-planning.test.js";
++const sourceFile = "src/consolidation-load-repository.js";
++const mutants = [
++  { name: "ignore-group-date", from: "if (!missing.length) return orders;", to: "if (orders.length) return orders;" },
++  { name: "accept-inactive-membership", from: "AND g.active=true AND g.order_type=source.type", to: "AND g.order_type=source.type" },
++  { name: "accept-other-order-family", from: "AND g.order_type=source.type", to: "" },
++  { name: "choose-conflicting-date", from: "dates?.length === 1", to: "dates?.length >= 1" }
++];
++const results = [];
++function exercise(mutant, propertyOnly) {
++  const run = spawnSync(process.execPath, ["--test", ...(propertyOnly ? ["--test-name-pattern=properties:"] : []), testFile], { cwd: target, encoding: "utf8", timeout: 90000 });
++  assert.ifError(run.error);
++  const output = `${run.stdout}${run.stderr}`;
++  writeFileSync(path.join(folder, `${mutant.name}${propertyOnly ? "-property" : ""}.log`), output);
++  assert.doesNotMatch(output, /SyntaxError|ERR_MODULE_NOT_FOUND|violates not-null constraint/, "Setup failures are not mutation kills");
++  assert.ok(run.status === 1 && /not ok \d+ -/.test(output), `${mutant.name} survived`);
++  results.push({ name: mutant.name, propertyOnly, killed: true });
++}
++try {
++  for (const name of ["src", "public", "test", "migrations", "tools", "package.json"]) {cpSync(name, path.join(target, name), { recursive: true });}
++  symlinkSync(path.resolve("node_modules"), path.join(target, "node_modules"));
++  const file = path.join(target, sourceFile), original = readFileSync(file, "utf8");
++  for (const mutant of mutants) {
++    assert.equal(original.split(mutant.from).length, 2, `${mutant.name} needs a unique mutation point`);
++    try {
++      writeFileSync(file, original.replace(mutant.from, mutant.to));
++      exercise(mutant, false);
++      exercise(mutant, true);
++    } finally {writeFileSync(file, original);}
++    assert.equal(readFileSync(file, "utf8"), readFileSync(sourceFile, "utf8"));
++  }
++  const restored = spawnSync(process.execPath, ["--test", testFile], { cwd: target, encoding: "utf8", timeout: 90000 });
++  assert.ifError(restored.error);
++  writeFileSync(path.join(folder, "restored.log"), `${restored.stdout}${restored.stderr}`);
++  assert.equal(restored.status, 0, "Restored sources must pass");
++} finally {
++  rmSync(target, { recursive: true, force: true });
++  writeFileSync(path.join(folder, "results.json"), JSON.stringify(results, null, 2));
++}
++console.log(JSON.stringify({ killed: results.filter((entry) => !entry.propertyOnly).length, propertyKilled: results.filter((entry) => entry.propertyOnly).length }));
+--- tools/consolidation-group-planning-state.py
++++ tools/consolidation-group-planning-state.py
+@@ -0,0 +1,34 @@
++"""Capture this task's diff against the preserved pre-task source, without git reset."""
++import difflib
++import hashlib
++import json
++from pathlib import Path
++
++root = Path(__file__).resolve().parents[1]
++baseline = Path('/tmp/consolidation-group-planning-baseline')
++records = []
++patches = []
++for folder in ['src', 'public', 'migrations', 'test/mbt', 'test/dispatch/frontend', 'tools', 'package.json', 'package-lock.json']:
++    for target in sorted([(root / folder)] if (root / folder).is_file() else (root / folder).rglob('*')):
++        if not target.is_file() or '__pycache__' in target.parts:
++            continue
++        relative = target.relative_to(root)
++        prior = baseline / relative
++        old = prior.read_bytes() if prior.exists() else b''
++        new = target.read_bytes()
++        if old == new:
++            continue
++        before = old.decode().splitlines(keepends=True)
++        after = new.decode().splitlines(keepends=True)
++        edits = []
++        changed = []
++        for tag, a, b, c, d in difflib.SequenceMatcher(None, before, after, autojunk=False).get_opcodes():
++            if tag != 'equal':
++                edits.append({'start': c, 'end': d, 'before': before[a:b]})
++                changed.extend(range(c + 1, d + 1))
++        records.append({'file': str(relative), 'beforeSha256': hashlib.sha256(old).hexdigest() if prior.exists() else None,
++                        'afterSha256': hashlib.sha256(new).hexdigest(), 'edits': edits, 'changedLines': changed})
++        patches.extend(difflib.unified_diff(before, after, fromfile=str(relative), tofile=str(relative)))
++(root / 'test/consolidation-group-planning-changes.json').write_text(json.dumps(records, indent=2) + '\n')
++(root / 'test/consolidation-group-planning.changes.patch').write_text(''.join(patches))
++print(json.dumps({'files': len(records), 'runtimeFiles': [r['file'] for r in records if r['file'].startswith(('src/', 'public/', 'migrations/'))]}))

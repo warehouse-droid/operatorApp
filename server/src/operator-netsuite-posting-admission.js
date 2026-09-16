@@ -2,6 +2,7 @@
 
 import { buildOperatorNetSuitePostingDraft } from "./operator-netsuite-posting-domain.js";
 import { assertExpectedOperatorNetSuitePostingPolicy } from "./operator-netsuite-posting-policy.js";
+import { operatorPostingTelemetry as telemetry } from "./operator-netsuite-posting-telemetry.js";
 
 /**
  * @param {object} dependencies
@@ -20,14 +21,14 @@ export function createOperatorNetSuitePostingAdmission({
   preflight = async () => {},
   assertLocalCompletionAllowed = async () => {}
 }) {
-  return async function admitOperatorNetSuitePosting(/** @type {Record<string, any>} */ input = {}) {
-    const resolution = await resolveTargets({
+  async function admit(/** @type {Record<string, any>} */ input) {
+    const resolution = await telemetry.time({ operation: "posting.resolve" }, () => resolveTargets({
       functionKey: input.functionKey,
       orderId: input.orderId,
       orderType: input.orderType,
       clientLocationId: input.clientLocationId,
       deferTargets: true
-    });
+    }));
     if (resolution.netSuitePostingOwner === "driver_completion") {
       await assertLocalCompletionAllowed(resolution);
       return {
@@ -65,7 +66,7 @@ export function createOperatorNetSuitePostingAdmission({
       actual: policy
     });
     const actionableResolution = typeof resolution.materializeTargets === "function"
-      ? await resolution.materializeTargets()
+      ? await telemetry.context({ stage: "source_validation" }, () => telemetry.time({ operation: "posting.source_validation" }, () => resolution.materializeTargets()))
       : resolution;
     if (actionableResolution.localOnly) {
       await assertLocalCompletionAllowed(actionableResolution);
@@ -76,7 +77,7 @@ export function createOperatorNetSuitePostingAdmission({
         resolution: actionableResolution
       };
     }
-    await preflight(input, actionableResolution);
+    await telemetry.time({ operation: "posting.preflight" }, () => preflight(input, actionableResolution));
     const draft = buildOperatorNetSuitePostingDraft({
       requestId: input.requestId,
       actorOperatorId: input.actorOperatorId,
@@ -89,7 +90,7 @@ export function createOperatorNetSuitePostingAdmission({
       localPayload: actionableResolution.localPayload,
       targets: actionableResolution.targets
     });
-    const created = await createCommand(draft);
+    const created = await telemetry.time({ operation: "posting.persist" }, () => createCommand(draft));
     await onAccepted(created.command);
     return {
       mode: "netsuite",
@@ -97,5 +98,8 @@ export function createOperatorNetSuitePostingAdmission({
       replayed: created.replayed,
       command: created.command
     };
-  };
+  }
+  return (/** @type {Record<string, any>} */ input = {}) => telemetry.context({ commandId: input.requestId,
+    functionKey: input.functionKey, transactionType: input.functionKey === "receiving" ? "IR" : "IF", stage: "admission" },
+  () => telemetry.time({ operation: "posting.admission" }, () => admit(input)));
 }

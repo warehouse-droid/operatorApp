@@ -3,6 +3,7 @@
 import crypto from "node:crypto";
 
 import { query, withTransaction } from "./db.js";
+import { enqueuePostingPhotos } from "./operator-netsuite-posting-photo-queue.js";
 
 /** @param {string} code @param {string} message @param {number} [status] */
 function repositoryError(code, message, status = 409) {
@@ -802,6 +803,7 @@ export async function completeOperatorNetSuitePostingCommand(input) {
       [commandId]
     );
     const localFinalization = await input.finalize();
+    await enqueuePostingPhotos({ commandId, photos: current.rows[0].photo_refs || [] });
     await query(
       `UPDATE operator_netsuite_posting_order_claims
           SET active = false,

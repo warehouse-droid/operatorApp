@@ -1,7 +1,8 @@
 // @ts-check
 
 import { afterTransactionCommit, withTransaction } from "./db.js";
-import { recordCustomerPickupLoad, recordDeliveryLoad } from "./delivery-repository.js";
+import { getDeliveryOrder, recordCustomerPickupLoad, recordDeliveryLoad } from "./delivery-repository.js";
+import { withConsolidatedLoadMutation } from "./consolidation-load-locks.js";
 import {
   buildItemReceiptPayload,
   getReceivableReceivingOrder,
@@ -79,6 +80,9 @@ const admit = createOperatorNetSuitePostingAdmission({
 
 /** @param {Record<string, any>} input */
 export async function submitOperatorNetSuitePostingAction(input) {
+  if (input.functionKey === "delivery_prep") {
+    return withConsolidatedLoadMutation(() => getDeliveryOrder(input.orderId, { includeNetSuiteClosed: true }), () => admit(input));
+  }
   return withTransaction(() => admit(input));
 }
 

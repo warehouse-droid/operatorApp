@@ -1,4 +1,10 @@
+import { listFulfilledTransferStates, fulfilledTransferPlanningRefs } from "./dispatch-fulfilled-to-repository.js";
+import { annotateFulfilledTransferOrders } from "./dispatch-fulfilled-to-policy.js";
+import { listFulfilledSalesDeliveryStates, overlayFulfilledSalesDeliveryPlanning, assertSalesDeliveryPlanningAllowed, fulfilledSalesDeliveryPlanningRefs } from "./dispatch-fulfilled-so-repository.js";
+import { fulfilledSalesOrderState } from "./dispatch-fulfilled-so-policy.js";
 import { createOperatorYardGuard, assertOperatorOrderYard, assertOperatorUploadYard, assertOperatorOrderPhotoYard } from "./operator-yard-authorization.js";
+import { configureConsolidationLoadEvents, listConsolidationLoadOrders, createConsolidationLoadPreview, getConsolidatedLoad, listPendingConsolidatedLoads } from "./consolidation-load-repository.js";
+import { submitConsolidatedLoad, resumeConsolidatedLoad } from "./consolidation-load-service.js";
 import { assertOperatorYard, operatorYardLocationIds } from "./operator-yard-access.js";
 import express from "express";
 import { SALES_ORDER_SYNC_LOCATIONS, withVoyageDispatchYard } from "./dispatch-sales-order-locations.js";
@@ -16,6 +22,7 @@ import {
   googleMapsGateway,
   googleMapsUsageRepository
 } from "./google-maps-service.js";
+import { readNetSuiteOrderLine } from "./netsuite-order-line.js";
 import { netSuiteOrderWebhookLineFinancials } from "./netsuite-order-webhook-financials.js";
 import { createMbtRouter } from "./mbt/router.js";
 import { createFrontdeskPricingAdapter } from "./mbt/frontdesk-pricing-adapter.js";
@@ -146,6 +153,7 @@ import {
   submitOperatorNetSuitePostingAction
 } from "./operator-netsuite-posting-controller.js";
 import { startOperatorNetSuitePostingRuntime } from "./operator-netsuite-posting-runtime.js";
+import { startPostingPhotoWorker } from "./operator-netsuite-posting-photo-worker.js";
 import {
   enqueueSalesOrderAutoFulfillmentCandidate,
   startSalesOrderAutoFulfillmentRuntime
@@ -736,16 +744,18 @@ export async function assertNoRestrictedScmDispatchOrders(orderRefs = [], action
     .map((ref) => String(ref || "").trim())
     .filter(Boolean))];
   if (!requestedRefs.length) return;
-  const [restrictedRefs, historicalAllowance, reconciliationPendingAllowance] = await Promise.all([
+  const [restrictedRefs, historicalAllowance, reconciliationPendingAllowance, fulfilledTransferAllowance] = await Promise.all([
     listRestrictedScmDispatchOrderRefs({ exactOrderRefs: requestedRefs }),
     historicalReconciliationDispatchAllowance({ planDate, orderRefs: requestedRefs }),
-    listReconciliationCompletedOperationallyPendingDispatchRefs({ candidateRefs: requestedRefs })
+    listReconciliationCompletedOperationallyPendingDispatchRefs({ candidateRefs: requestedRefs }),
+    fulfilledTransferPlanningRefs(requestedRefs).then(refs => new Set(refs.map(ref => String(ref).trim().toLowerCase())))
   ]);
   const conflicts = requestedRefs
     .filter((ref) => (
       restrictedRefs.has(ref.toLowerCase())
       && !historicalAllowance.has(ref.toLowerCase())
       && !reconciliationPendingAllowance.has(ref.toLowerCase())
+      && !fulfilledTransferAllowance.has(ref.toLowerCase())
     ))
     .map((orderRef) => ({
       orderRef,
@@ -775,9 +785,10 @@ async function assertNewHistoricalInactiveSalesOrdersReconciled(previousPlan = {
   const newlyPlannedRefs = [...dispatchPlannedOrderRefs(nextPlan)]
     .map((ref) => String(ref || "").trim())
     .filter((ref) => ref && !previousRefs.has(ref.toLowerCase()));
+  const fulfilledRefs = new Set((await fulfilledSalesDeliveryPlanningRefs(newlyPlannedRefs)).map(ref => String(ref).trim().toLowerCase()));
   return assertHistoricalInactiveSalesOrdersReconciled({
     planDate: nextPlan.planDate,
-    orderRefs: newlyPlannedRefs,
+    orderRefs: newlyPlannedRefs.filter(ref => !fulfilledRefs.has(ref.toLowerCase())),
     action
   });
 }
@@ -788,6 +799,9 @@ async function assertNewDispatchOrdersCanBePlanned(previousPlan = {}, nextPlan =
     `remain in Dispatch when you ${action}`
   );
   await assertNoNewDriverPwaCompletedDispatchOrders(previousPlan, nextPlan, action);
+  const previousRefs = new Set([...dispatchPlannedOrderRefs(previousPlan)].map(ref => String(ref).trim().toLowerCase()));
+  const addedRefs = [...dispatchPlannedOrderRefs(nextPlan)].filter(ref => !previousRefs.has(String(ref).trim().toLowerCase()));
+  await assertSalesDeliveryPlanningAllowed(addedRefs, action);
   return assertNewHistoricalInactiveSalesOrdersReconciled(previousPlan, nextPlan, action);
 }
 
@@ -1548,7 +1562,7 @@ function dispatchOrderScmRestrictionRefs(order = {}) {
 }
 
 async function enrichDispatchOrdersWithCompletionStatus(orders = []) {
-  return overlayDispatchOrderCompletionStatuses(orders);
+  return overlayFulfilledSalesDeliveryPlanning(await overlayDispatchOrderCompletionStatuses(orders));
 }
 
 function snapshotDerivedGroupBelongsToPlan(order = {}, plan = {}) {
@@ -1789,6 +1803,7 @@ function dispatchOrderMatchesSearch(order = {}, search = "") {
 function filterDispatchPlanningVisibleOrders(orders = [], { includeCompletedScmSearch = false } = {}) {
   return (orders || []).filter((order) => (
     order?.historicalReconciliationComplete === true
+    || order?.dispatchFulfilledTransferPlanningEligible === true
     || (includeCompletedScmSearch
       ? isDispatchExplicitSearchVisibleScmOrder(order)
       : !isRestrictedScmOrder(order))
@@ -1873,6 +1888,7 @@ export async function loadDispatchOrdersForResponse({
       type,
       search: searchTerm,
       includeScmLinkedSearchRefs: Boolean(searchTerm),
+      includeFulfilledSalesDeliveries: true,
       exactOrderRefs
     }),
     includeCustom
@@ -1893,6 +1909,7 @@ export async function loadDispatchOrdersForResponse({
           search: searchTerm,
           includeHiddenScm: true,
           includeInactiveSalesOrderSearchCandidates: true,
+          includeFulfilledSalesDeliveries: true,
           includeScmLinkedSearchRefs: true,
           exactOrderRefs
         })
@@ -1902,6 +1919,16 @@ export async function loadDispatchOrdersForResponse({
       : Promise.resolve(new Set())
   ]);
   const exactCandidateOrders = [...orders, ...snapshotOrders];
+  const transferStates = await listFulfilledTransferStates(
+    [...orders, ...snapshotOrders, ...hiddenScmOrders].filter(order => order.type === "TO")
+      .flatMap(order => [order.id, ...(order.childOrders || [])])
+  );
+  const decorateTransfer = order => (searchTerm || exactIdentityRequest)
+    ? annotateFulfilledTransferOrders([order], transferStates)[0] : order;
+  const fulfilledSalesStates = await listFulfilledSalesDeliveryStates(
+    [...orders, ...snapshotOrders, ...hiddenScmOrders].filter(order => order.type === "SO")
+      .flatMap(order => [order.id, ...(order.childOrders || [])])
+  );
   const restrictedScmRefs = exactIdentityRequest
     ? await listRestrictedScmDispatchOrderRefs({
         exactOrderRefs: [
@@ -1933,14 +1960,19 @@ export async function loadDispatchOrdersForResponse({
   const isBilledSalesOrderFamily = (order) => {
     const type = String(order?.type || "").trim().toUpperCase();
     if (type !== "SO" && !Array.isArray(order?.childOrders)) return false;
+    const state = fulfilledSalesOrderState(order, fulfilledSalesStates);
+    if (state?.eligible || ((searchTerm || exactIdentityRequest) && state?.fulfilled && state?.locallyCompleted)) return false;
     return dispatchOrderLogicalRefs(order).some((ref) => billedSalesOrderRefs.has(ref));
   };
   const currentOrders = filterDispatchPlanningVisibleOrders([
-    ...orders,
+    ...orders.map(decorateTransfer),
     ...customOrders.map(dispatchOrderFromCustomOrder),
     ...historicalOrders
-  ]).filter((order) => !isBilledSalesOrderFamily(order)).filter((order) => {
-    if (order.historicalReconciliationComplete === true) return true;
+  ]).filter(order => order.type !== "SO" || order.netsuiteActive !== false
+    || order.historicalReconciliationComplete === true
+    || fulfilledSalesOrderState(order, fulfilledSalesStates)?.fulfilled)
+    .filter((order) => !isBilledSalesOrderFamily(order)).filter((order) => {
+    if (order.historicalReconciliationComplete === true || order.dispatchFulfilledTransferPlanningEligible === true) return true;
     if (!["PO", "TO", "VRMA"].includes(String(order?.type || "").trim().toUpperCase())) return true;
     return !dispatchOrderScmRestrictionRefs(order).some((ref) => restrictedScmRefs.has(ref));
   });
@@ -1950,9 +1982,9 @@ export async function loadDispatchOrdersForResponse({
     ? snapshotOrders.filter((order) => dispatchOrderMatchesSearch(order, searchTerm))
     : snapshotOrders;
   const derivedOrders = filterDispatchPlanningVisibleOrders(derivedCandidates.map((order) => (
-    decorateHistoricalOrder(order) || order
+    decorateTransfer(decorateHistoricalOrder(order) || order)
   ))).filter((order) => !isBilledSalesOrderFamily(order)).filter((order) => {
-    if (order.historicalReconciliationComplete === true) return true;
+    if (order.historicalReconciliationComplete === true || order.dispatchFulfilledTransferPlanningEligible === true) return true;
     if (!["PO", "TO", "VRMA"].includes(String(order?.type || "").trim().toUpperCase())) return true;
     return !dispatchOrderScmRestrictionRefs(order).some((ref) => restrictedScmRefs.has(ref));
   });
@@ -1969,7 +2001,8 @@ export async function loadDispatchOrdersForResponse({
   const planningVisibleIds = new Set(planningVisibleOrders.map((order) => String(order?.id || "").trim().toLowerCase()));
   const completedSearchCandidatesById = new Map();
   if (revealCompletedScmSearch) {
-    for (const order of hiddenScmOrders) {
+    for (const hiddenOrder of hiddenScmOrders) {
+      const order = decorateTransfer(hiddenOrder);
       if (!["PO", "TO"].includes(String(order?.type || "").trim().toUpperCase())) continue;
       const key = String(order?.id || "").trim().toLowerCase();
       if (!key || planningVisibleIds.has(key)) continue;
@@ -2041,7 +2074,7 @@ export async function loadDispatchOrdersForResponse({
     includeCompletedScmSearch: revealCompletedScmSearch
   })
     .filter((order) => !isBilledSalesOrderFamily(order)).filter((order) => {
-    if (order.historicalReconciliationComplete === true) return true;
+    if (order.historicalReconciliationComplete === true || order.dispatchFulfilledTransferPlanningEligible === true) return true;
     if (!["PO", "TO", "VRMA"].includes(String(order?.type || "").trim().toUpperCase())) return true;
     const restricted = dispatchOrderScmRestrictionRefs(order).some((ref) => restrictedScmRefs.has(ref));
     return !restricted || (revealCompletedScmSearch && isCompletedScmOrder(order));
@@ -2052,7 +2085,7 @@ export async function loadDispatchOrdersForResponse({
     ? visibleOrders.filter((order) => dispatchOrderMatchesSearch(order, searchTerm))
     : visibleOrders;
   const planningAnnotatedOrders = searchedOrders.map((order) => {
-    if (!revealCompletedScmSearch || !isCompletedScmOrder(order)) return order;
+    if (order.dispatchFulfilledTransferPlanningEligible === true || !revealCompletedScmSearch || !isCompletedScmOrder(order)) return order;
     if (dispatchOrderReconciliationCompletedButOperationallyPending(order, reconciliationPendingRefs)) {
       return {
         ...order,
@@ -8164,6 +8197,7 @@ function webhookLineSignedQuantity(line) {
 
 function webhookLineDuplicateKey(line, fallbackLocationId = null) {
   return [
+    readNetSuiteOrderLine(line),
     line.item_id ?? line.itemId ?? "",
     webhookLineLocationId(line, fallbackLocationId),
     webhookNumber(line.quantity),
@@ -8227,6 +8261,7 @@ function normalizeWebhookLine(line, { locationId = null, locationText = "", proc
 
   return {
     line_id: line.uniquekey ?? line.uniqueKey ?? line.lineUniqueKey ?? line.line_unique_key ?? line.line_id ?? line.lineId ?? line.id,
+    netsuite_order_line: readNetSuiteOrderLine(line),
     item_id: line.item_id ?? line.itemId,
     item_name: line.item_name ?? line.itemName ?? line.sku,
     item_type: line.item_type ?? line.itemType,
@@ -9641,7 +9676,7 @@ app.get("/api/scm/netsuite-po-history", async (req, res, next) => {
 
 app.get("/api/scm/netsuite-po-history/:id", async (req, res, next) => {
   try {
-    res.json(await getScmNetSuitePoHistory(req.params.id, { includeUnarchived: false }));
+    res.json(await getScmNetSuitePoHistory(req.params.id, { includeUnarchived: true }));
   } catch (error) {
     next(error);
   }
@@ -22960,6 +22995,26 @@ app.get("/api/delivery/load-orders", async (req, res, next) => {
   }
 });
 
+configureConsolidationLoadEvents(emitAppEvent);
+app.get("/api/delivery/consolidation-loads/orders", async (req, res, next) => {
+  try { res.json(await listConsolidationLoadOrders(req.operator, req.query)); } catch (error) { next(error); }
+});
+app.get("/api/delivery/consolidation-loads/pending", async (req, res, next) => {
+  try { res.json(await listPendingConsolidatedLoads(req.operator, req.query.locationId)); } catch (error) { next(error); }
+});
+app.post("/api/delivery/consolidation-loads/preview", async (req, res, next) => {
+  try { res.json(await createConsolidationLoadPreview(req.operator, req.body || {})); } catch (error) { next(error); }
+});
+app.get("/api/delivery/consolidation-loads/:id", async (req, res, next) => {
+  try { res.json(await getConsolidatedLoad(req.operator, req.params.id)); } catch (error) { next(error); }
+});
+app.post("/api/delivery/consolidation-loads/:id/submit", async (req, res, next) => {
+  try { res.json(await submitConsolidatedLoad(req.operator, req.params.id, req.body?.photoRefs)); } catch (error) { next(error); }
+});
+app.post("/api/delivery/consolidation-loads/:id/resume", async (req, res, next) => {
+  try { res.json(await resumeConsolidatedLoad(req.operator, req.params.id)); } catch (error) { next(error); }
+});
+
 app.get("/api/delivery/saved-orders", async (req, res, next) => {
   try {
     res.json(await listSavedDeliveryOrdersForOperator(operatorId(req), {
@@ -24396,6 +24451,7 @@ export async function startServer() {
     console.log(`MBBS Yard Server listening on ${config.appBaseUrl}`);
     startNetSuiteMirrorWorkers();
     startOperatorNetSuitePostingRuntime();
+    startPostingPhotoWorker();
     startSalesOrderAutoFulfillmentRuntime();
     void delayedStatusRefreshTick();
     setTimeout(() => void scmScheduleStatusRefreshTick(), 60_000);

@@ -7,6 +7,7 @@ const LOCATIONS = [
 
 const ORDER_PAGE_SIZE = 4;
 const DELIVERY_ORDER_PAGE_SIZE = 3;
+const CONSOLIDATION_LOAD_PAGE_SIZE = 5;
 const LINE_PAGE_SIZE = 3;
 const CYCLE_OPTION_PAGE_SIZE = 6;
 const COMPACT_LINE_PAGE_SIZE = 6;
@@ -40,6 +41,8 @@ const RESTORABLE_MODULES = new Set([
   "delivery-select",
   "delivery",
   "delivery-consolidation",
+  "delivery-consolidation-load",
+  "delivery-consolidation-load-proof",
   "receiving",
   "return-select",
   "pallet-return",
@@ -142,6 +145,14 @@ let consolidationReviewLinePage = Number(initialOperatorState.consolidationRevie
 let consolidationDrafts = new Map();
 let consolidationBusy = false;
 let consolidationNotice = "";
+const consolidationLoadState = {
+  orders: [], pending: [], selected: new Map((initialOperatorState.consolidationLoadSelection || []).map((order) => [String(order.netsuite_id), order])),
+  date: initialOperatorState.consolidationLoadDate || "", truck: initialOperatorState.consolidationLoadTruck || "",
+  datePreset: ["today", "tomorrow", "both", "custom"].includes(initialOperatorState.consolidationLoadDatePreset)
+    ? initialOperatorState.consolidationLoadDatePreset : initialOperatorState.consolidationLoadDate ? "custom" : "both",
+  page: Number.isInteger(initialOperatorState.consolidationLoadPage) ? Math.max(0, initialOperatorState.consolidationLoadPage) : 0,
+  batchId: initialOperatorState.consolidationLoadBatchId || "", batch: null, busy: false, error: "", photoRefs: [], uploads: new Map(), request: 0, poll: null
+};
 let compactLineMode = localStorage.getItem("mbbs.operator.compactLineList") === "true";
 let orders = [];
 let deliveryOrderBuckets = { active: null, packed: null };
@@ -341,6 +352,75 @@ let pickupFocusTimer = null;
 const OPERATOR_CAMERA_IDEAL_WIDTH = 4096;
 const OPERATOR_CAMERA_IDEAL_HEIGHT = 3072;
 const OPERATOR_CAMERA_JPEG_QUALITY = 0.92;
+const operatorPhotoCamera = { key: "", opening: "", request: 0 };
+
+function operatorPhotoCameraContext() {
+  if (!operator || operatorWorkspaceLeaving) return null;
+  if (["delivery-fulfill", "customer-pickup-load", "delivery-consolidation-load-proof"].includes(currentModule)
+      && fulfillmentOrder && !fulfillmentSubmitting && !fulfillmentResult
+      && app.querySelector('[data-action="start-camera"], #fulfillmentCamera')) {
+    return { kind: "fulfillment", key: `${currentModule}:${fulfillmentOrder.netsuite_id}:${fulfillmentLoadRequestId}`,
+      automatic: fulfillmentRequiredPhotoCount() > 0 };
+  }
+  if (currentModule === "receiving-receipt" && receiptOrder && !receiptSubmitting && !receiptResult
+      && app.querySelector('[data-action="start-receipt-camera"], #receiptCamera')) {
+    return { kind: "receipt", key: `${currentModule}:${receiptOrder.netsuite_id}:${receiptRequestId}`, automatic: true };
+  }
+  if (returnModuleActive() && returnView === "workflow" && returnStage === "review" && !returnBusy
+      && app.querySelector('[data-action="return-start-camera"]')) {
+    return { kind: "return", key: `${currentModule}:${returnIdempotencyKey}`, automatic: true };
+  }
+  return null;
+}
+
+function cancelOperatorPhotoCameraOpening(kind) {
+  if (operatorPhotoCamera.opening !== kind) return;
+  operatorPhotoCamera.request += 1;
+  operatorPhotoCamera.opening = "";
+}
+
+function stopOperatorPhotoCameras() {
+  operatorPhotoCamera.key = "";
+  stopFulfillmentCamera(); stopReceiptCamera(); stopReturnCamera();
+}
+
+function syncOperatorPhotoCamera() {
+  const context = operatorPhotoCameraContext();
+  if (operatorPhotoCamera.key === (context?.key || "")) return;
+  stopOperatorPhotoCameras();
+  operatorPhotoCamera.key = context?.key || "";
+  if (context?.automatic) void startOperatorPhotoCamera(context.kind);
+}
+
+async function startOperatorPhotoCamera(kind) {
+  const context = operatorPhotoCameraContext();
+  if (context?.kind !== kind || operatorPhotoCamera.opening === kind) return;
+  if (!navigator.mediaDevices?.getUserMedia) return showToast(t("operator.cameraUnavailable", "Camera is not available in this browser."));
+  if (kind === "fulfillment") stopFulfillmentCamera();
+  else if (kind === "receipt") stopReceiptCamera();
+  else { stopReturnScannerCamera(); stopReturnCamera(); }
+  const request = ++operatorPhotoCamera.request;
+  operatorPhotoCamera.key = context.key;
+  operatorPhotoCamera.opening = kind;
+  render();
+  try {
+    const stream = await openCameraStream(() => request === operatorPhotoCamera.request && operatorPhotoCameraContext()?.key === context.key);
+    if (request !== operatorPhotoCamera.request || operatorPhotoCameraContext()?.key !== context.key) {
+      stream.getTracks().forEach((track) => track.stop());
+      return;
+    }
+    operatorPhotoCamera.opening = "";
+    if (kind === "fulfillment") { fulfillmentCameraStream = stream; fulfillmentCameraActive = true; }
+    else if (kind === "receipt") { receiptCameraStream = stream; receiptCameraActive = true; }
+    else { returnCameraStream = stream; returnCameraActive = true; returnPhotoTarget.open = true; }
+    render();
+  } catch (error) {
+    if (request !== operatorPhotoCamera.request || operatorPhotoCameraContext()?.key !== context.key) return;
+    operatorPhotoCamera.opening = "";
+    showToast(cameraErrorMessage(error));
+    render();
+  }
+}
 
 function cameraFacingLabel() {
   return cameraFacingMode === "user"
@@ -435,42 +515,54 @@ async function maximizeCameraStreamResolution(stream) {
   return stream;
 }
 
-async function prepareCameraStream(stream) {
+async function prepareCameraStream(stream, isCurrent = () => true) {
+  if (!isCurrent()) {
+    stream.getTracks().forEach((track) => track.stop());
+    throw new Error("Camera request cancelled.");
+  }
   await maximizeCameraStreamResolution(stream);
+  if (!isCurrent()) {
+    stream.getTracks().forEach((track) => track.stop());
+    throw new Error("Camera request cancelled.");
+  }
   rememberCameraStream(stream);
   return stream;
 }
 
-async function openCameraStream() {
+async function openCameraStream(isCurrent = () => true) {
   const facing = cameraCaptureMode();
   try {
     const stream = await navigator.mediaDevices.getUserMedia({
       video: cameraVideoConstraints({ facingMode: { exact: facing } }),
       audio: false
     });
-    return prepareCameraStream(stream);
-  } catch {
+    return prepareCameraStream(stream, isCurrent);
+  } catch (error) {
+    if (!isCurrent() || ["NotAllowedError", "SecurityError"].includes(error?.name)) throw error;
     // Some browsers reject exact facingMode even when the camera exists.
   }
   const deviceId = pickCameraDevice(await listVideoInputDevices(), facing, lastCameraDeviceId);
+  if (!isCurrent()) throw new Error("Camera request cancelled.");
   if (deviceId) {
     try {
       const stream = await navigator.mediaDevices.getUserMedia({
         video: cameraVideoConstraints({ deviceId: { exact: deviceId } }),
         audio: false
       });
-      return prepareCameraStream(stream);
-    } catch {
+      return prepareCameraStream(stream, isCurrent);
+    } catch (error) {
+      if (!isCurrent() || ["NotAllowedError", "SecurityError"].includes(error?.name)) throw error;
       // Fall through to facingMode / generic camera fallback.
     }
   }
   try {
     const stream = await navigator.mediaDevices.getUserMedia(cameraMediaConstraints());
-    return prepareCameraStream(stream);
+    return prepareCameraStream(stream, isCurrent);
   } catch (error) {
+    if (!isCurrent()) throw error;
     if (error?.name === "NotFoundError" || error?.name === "OverconstrainedError") {
       const stream = await navigator.mediaDevices.getUserMedia({ video: cameraVideoConstraints(), audio: false });
-      return prepareCameraStream(stream);
+      return prepareCameraStream(stream, isCurrent);
     }
     throw error;
   }
@@ -965,6 +1057,14 @@ function connectEvents() {
         pendingDeliveryEventRefresh = false;
         pendingReceivingEventRefresh = false;
         pendingOperatorRequestAlert = false;
+        if (refreshDelivery && currentModule === "delivery-consolidation-load") {
+          await loadConsolidationLoadOrders({ background: true });
+          return;
+        }
+        if (refreshDelivery && currentModule === "delivery-consolidation-load-proof") {
+          await refreshConsolidationLoadBatch();
+          return;
+        }
         if (refreshDelivery && currentModule === "delivery-consolidation" && !consolidationBusy) {
           await loadConsolidation({ keepItem: true });
           return;
@@ -1067,7 +1167,7 @@ function orderStatusClass(order) {
 
 function formatDate(value) {
   if (!value) return "";
-  return window.MBBS_I18N?.displayDate(value) || "";
+  return window.MBBS_I18N?.displayDate(localDateKey(value)) || "";
 }
 
 function formatDateTime(value) {
@@ -1529,10 +1629,6 @@ function lineHasConversion(line) {
   return qty(line.to_plt) > 0 || qty(line.to_lyr) > 0 || qty(line.to_sec) > 0 || qty(line.to_pcs) > 0;
 }
 
-function isPalletSalesItem(line) {
-  return String(line?.sku || line?.item_name || "").trim().toUpperCase() === "PALLET";
-}
-
 function isIndependentManualLine(line) {
   return !lineHasConversion(line) && !shouldUseSalesQuantity(line) && hasCustomPackQty(line);
 }
@@ -1542,7 +1638,7 @@ function shouldUseSalesQuantity(line) {
 }
 
 function salesQuantityLabel(line, fallback = "Qty") {
-  return isPalletSalesItem(line) ? "PALLET" : line?.unit || fallback;
+  return line?.unit || fallback;
 }
 
 function lineUnitsToSalesQty(line, values) {
@@ -1571,7 +1667,7 @@ function wholeUnitsFromSalesQty(salesQuantity, conversion) {
   const rawUnits = sales / unitSize;
   const floorUnits = Math.floor(rawUnits + 0.000001);
   const ceilUnits = Math.ceil(rawUnits - 0.000001);
-  if (ceilUnits > floorUnits && Math.abs((ceilUnits * unitSize) - sales) <= LOAD_SALES_QTY_TOLERANCE) {
+  if (ceilUnits > floorUnits && Number(Math.abs((ceilUnits * unitSize) - sales).toFixed(6)) <= LOAD_SALES_QTY_TOLERANCE) {
     return ceilUnits;
   }
   return floorUnits;
@@ -1851,6 +1947,7 @@ function panelLimit(line, unit) {
 }
 
 function receivingRemainingSalesQty(line) {
+  if (Object.hasOwn(line || {}, "original_quantity")) { return Math.max(0, qty(line.quantity)); }
   return Math.max(0, qty(line.quantity) - qty(line.netsuite_received_qty));
 }
 
@@ -2066,6 +2163,7 @@ function shell(title, subtitle, body, actions = "") {
   if (fulfillmentCameraActive) window.requestAnimationFrame(attachFulfillmentCamera);
   if (receiptCameraActive) window.requestAnimationFrame(attachReceiptCamera);
   if (returnCameraActive) window.requestAnimationFrame(attachReturnCamera);
+  syncOperatorPhotoCamera();
   hydrateSecurePhotoImages(app);
 }
 
@@ -2116,6 +2214,12 @@ function saveOperatorState() {
     consolidationReviewOrderId,
     consolidationReviewLineKey,
     consolidationReviewLinePage,
+    consolidationLoadSelection: [...consolidationLoadState.selected.values()],
+    consolidationLoadDate: consolidationLoadState.date,
+    consolidationLoadDatePreset: consolidationLoadState.datePreset,
+    consolidationLoadPage: consolidationLoadState.page,
+    consolidationLoadTruck: consolidationLoadState.truck,
+    consolidationLoadBatchId: consolidationLoadState.batchId,
     selectedId,
     selectedLineId,
     orderPage,
@@ -2156,6 +2260,14 @@ async function restoreOperatorView() {
   if (!allowedOperatorLocations().some((yard) => yard.id === locationId)) return renderLocationSelect();
   currentModule = restorableModule(currentModule);
   try {
+    if (currentModule === "delivery-consolidation-load-proof" && consolidationLoadState.batchId) {
+      await openConsolidationLoadBatch(consolidationLoadState.batchId);
+      return;
+    }
+    if (currentModule === "delivery-consolidation-load") {
+      await loadConsolidationLoadOrders();
+      return;
+    }
     if (currentModule === "delivery") {
       await loadOrders({ keepSelection: true, alertRecent: true });
       return;
@@ -2302,6 +2414,7 @@ function renderDeliveryPanels({ orderPanel = true, detailPanel = true } = {}) {
 
 function render() {
   if (currentModule !== "receiving") invalidateReceivingRequests();
+  if (operatorWorkspaceLeaving || !operator || !allowedOperatorLocations().some((yard) => yard.id === locationId)) stopOperatorPhotoCameras();
   if (operatorWorkspaceLeaving) return;
   if (!operator) return renderLogin();
   if (!allowedOperatorLocations().length) return renderNoOperatorYards();
@@ -2313,6 +2426,8 @@ function render() {
   if (currentModule === "customer-pickup") return renderCustomerPickupOrder();
   if (currentModule === "delivery-select") return renderDeliverySelect();
   if (currentModule === "delivery-consolidation") return renderConsolidationPick();
+  if (currentModule === "delivery-consolidation-load") return renderConsolidationLoadSelection();
+  if (currentModule === "delivery-consolidation-load-proof") return renderFulfillmentScreen();
   if (currentModule === "receiving") return renderReceiving();
   if (currentModule === "receiving-receipt") return renderReceiptScreen();
   if (currentModule === "return-select") return renderReturnSelect();
@@ -2808,9 +2923,9 @@ function renderReturnPhotoWorkspace() {
         }).join("")}
       </div>
       <div class="camera-actions">
-        <button class="primary-button" data-action="return-start-camera" type="button">${returnCameraActive ? t("common.restartCamera", "Restart camera") : t("common.openCamera", "Open camera")}</button>
+        <button class="primary-button" data-action="return-start-camera" ${operatorPhotoCamera.opening === "return" ? "disabled" : ""} type="button">${operatorPhotoCamera.opening === "return" ? t("operator.openingCamera", "Opening camera...") : returnCameraActive ? t("common.restartCamera", "Restart camera") : t("common.openCamera", "Open camera")}</button>
         ${renderCameraSwitchButton("return-switch-camera")}
-        ${returnCameraActive ? `<button class="secondary-button" data-action="return-close-camera" type="button">${t("common.closeCamera", "Close camera")}</button>` : ""}
+        ${returnCameraActive || operatorPhotoCamera.opening === "return" ? `<button class="secondary-button" data-action="return-close-camera" type="button">${t("common.closeCamera", "Close camera")}</button>` : ""}
       </div>
       <div class="photo-slot-row return-photo-slots">
         ${Array.from({ length: Math.max(1, photos.length) }, (_, index) => `
@@ -3600,9 +3715,9 @@ function renderDeliverySelect() {
         <strong>${t("operator.batchView", "Batch")}</strong>
         <span>${t("operator.batchViewDesc", "Planned, Batch A, Batch B and TO in one panel.")}</span>
       </button>
-      <button class="module-tile" data-action="select-delivery-pool" data-mode="saved" type="button">
-        <strong>${t("operator.savedOrders", "Saved Orders")}</strong>
-        <span>${t("operator.savedOrdersDesc", "Pick saved SO and TO in one pool.")}</span>
+      <button class="module-tile" data-action="open-consolidation-load" type="button">
+        <strong>${t("operator.consolidationLoad", "Consolidation Load")}</strong>
+        <span>${t("operator.consolidationLoadDesc", "Select packed orders from one truck load and take shared photos.")}</span>
       </button>
       <button class="module-tile" data-action="select-delivery-pool" data-mode="load" type="button">
         <strong>${t("operator.perLoadView", "Per Load View")}</strong>
@@ -4128,7 +4243,7 @@ function renderDeliveryPrepModeControls() {
   return `
     <div class="delivery-mode-segment">
       <button class="${deliveryPrepMode === "standard" ? "active" : ""}" data-action="delivery-prep-mode" data-mode="standard" type="button">${t("operator.batchView", "Batch")}</button>
-      <button class="${deliveryPrepMode === "saved" ? "active" : ""}" data-action="delivery-prep-mode" data-mode="saved" type="button">${t("operator.savedOrders", "Saved Orders")}</button>
+      <button data-action="open-consolidation-load" type="button">${t("operator.consolidationLoad", "Consolidation Load")}</button>
     </div>
   `;
 }
@@ -4445,6 +4560,8 @@ function renderFulfillmentScreen() {
     currentModule = "delivery";
     return render();
   }
+  const isConsolidated = Boolean(order.is_consolidation_load);
+  if (isConsolidated && consolidationLoadState.batch?.status === "pending") return renderPendingConsolidationLoad();
   const packedLines = visibleLines(order).filter((line) => hasPackedQty(line));
   const isPickupLoad = currentModule === "customer-pickup-load";
   const requiredPhotoCount = isPickupLoad ? customerPickupRequiredPhotoCount() : fulfillmentRequiredPhotoCount();
@@ -4452,7 +4569,7 @@ function renderFulfillmentScreen() {
   const fulfillmentPhotoCount = fulfillmentPhotoDataUrls.filter(Boolean).length;
   const isReloadLoad = Boolean(order.reload_authorized);
   const postingFunction = isPickupLoad ? "customer_pickup" : "delivery_prep";
-  const localOnlyPosting = operatorNetSuitePostingIsLocalOnly(order, postingFunction);
+  const localOnlyPosting = isConsolidated || operatorNetSuitePostingIsLocalOnly(order, postingFunction);
   const postingModeReady = operatorNetSuitePostingReady(fulfillmentNetSuitePolicy, {
     localOnly: localOnlyPosting,
     error: fulfillmentNetSuitePolicyError
@@ -4463,7 +4580,7 @@ function renderFulfillmentScreen() {
         <div class="fulfillment-card success">
           <span>${isPickupLoad ? t("operator.pickupStatus", "Pickup Status") : t("operator.localYardStatus", "Local Yard Status")}</span>
           <strong>${isPickupLoad ? (fulfillmentResult.pickupStatus === "partial_loaded" ? t("operator.partialLoaded", "Partial Loaded") : t("common.loaded", "Loaded")) : isReloadLoad ? (fulfillmentResult.completed ? "Re-load Complete" : "Re-load Partially Loaded") : (fulfillmentResult.localYardOrderStatus || t("common.loaded", "Loaded"))}</strong>
-          <p>${isPickupLoad ? (fulfillmentResult.photoEvidenceCount > 0
+          <p>${isConsolidated ? t("operator.consolidationLoadSaved", "Selected packed quantities loaded. Shared photo proof saved on each order.") : isPickupLoad ? (fulfillmentResult.photoEvidenceCount > 0
             ? tf("operator.photoSavedRemaining", "Photo proof saved. Remaining line count: {count}.", { count: fulfillmentResult.remainingLines || 0 })
             : tf("operator.pickupSavedNoPhotoRemaining", "Customer Pickup load saved without photo evidence. Remaining line count: {count}.", { count: fulfillmentResult.remainingLines || 0 })) : isReloadLoad ? "This re-load attempt was saved locally. NetSuite fulfillment and Dispatch were not changed." : t("operator.photoSavedHidden", "Photo proof saved. This order is hidden from the operator list.")}</p>
         </div>
@@ -4477,7 +4594,7 @@ function renderFulfillmentScreen() {
   return shell(t("operator.loadOrder", "Load Order"), `${order.tranid} | ${t("common.location", "Location")} ${currentLocation()?.text || ""}`, `
     <section class="fulfillment-screen fulfillment-form-screen ${isReloadLoad ? "reload-fulfillment-screen" : ""}">
       ${isReloadLoad ? `<div class="sync-alert reload-notice"><strong>Local-only re-load</strong><span>${escapeHtml(order.reload_reason || order.reload_cycle?.reason || "")}</span></div>` : ""}
-      ${renderOperatorNetSuitePostingMode(fulfillmentNetSuitePolicy, {
+      ${isConsolidated ? "" : renderOperatorNetSuitePostingMode(fulfillmentNetSuitePolicy, {
         localOnly: localOnlyPosting,
         error: fulfillmentNetSuitePolicyError
       })}
@@ -4491,7 +4608,8 @@ function renderFulfillmentScreen() {
         <div class="camera-actions">
           ${fulfillmentCameraActive
             ? `<button class="secondary-button" data-action="stop-camera" type="button">${t("common.closeCamera", "Close camera")}</button>`
-            : `<button class="primary-button" data-action="start-camera" type="button">${t("common.openCamera", "Open camera")}</button>`}
+            : `<button class="primary-button" data-action="start-camera" ${operatorPhotoCamera.opening === "fulfillment" ? "disabled" : ""} type="button">${operatorPhotoCamera.opening === "fulfillment" ? t("operator.openingCamera", "Opening camera...") : t("common.openCamera", "Open camera")}</button>`}
+          ${operatorPhotoCamera.opening === "fulfillment" ? `<button class="secondary-button" data-action="stop-camera" type="button">${t("common.closeCamera", "Close camera")}</button>` : ""}
           ${renderCameraSwitchButton("switch-fulfillment-camera")}
         </div>
         <div class="photo-slot-row">
@@ -4509,25 +4627,13 @@ function renderFulfillmentScreen() {
         ${fulfillmentCameraActive ? `
           <video class="camera-preview ${cameraCaptureMode() === "user" ? "mirrored" : ""}" id="fulfillmentCamera" autoplay muted playsinline></video>
           <button class="primary-button" data-action="capture-photo" type="button">${t("operator.capturePhoto", "Capture photo")} ${fulfillmentActivePhotoSlot + 1}</button>
-        ` : fulfillmentPhotoDataUrls[fulfillmentActivePhotoSlot] ? `<img class="photo-preview" src="${fulfillmentPhotoDataUrls[fulfillmentActivePhotoSlot]}" alt="${t("operator.photoProof", "Truck loading proof")} ${fulfillmentActivePhotoSlot + 1}" />` : `<div class="photo-placeholder">${isPickupLoad && requiredPhotoCount === 0
+        ` : fulfillmentPhotoDataUrls[fulfillmentActivePhotoSlot] ? `<img class="photo-preview" ${photoImgAttributes(fulfillmentPhotoDataUrls[fulfillmentActivePhotoSlot])} alt="${t("operator.photoProof", "Truck loading proof")} ${fulfillmentActivePhotoSlot + 1}" />` : `<div class="photo-placeholder">${isPickupLoad && requiredPhotoCount === 0
           ? t("operator.pickupPhotoOptionalHelp", "Photo evidence is off. You can complete this Customer Pickup load without taking a photo.")
           : isPickupLoad
             ? t("operator.takeOnePickupPhoto", "Take at least 1 Customer Pickup photo before confirming load. You can add more photos if needed.")
             : t("operator.takeTwoLoadPhotos", "Take at least 2 photos before confirming load. You can add more photos if needed.")}</div>`}
       </div>
-      <div class="fulfillment-card fulfillment-summary-card">
-        <span>${t("operator.packedQtyToLoad", "Packed qty to load")}</span>
-        <strong>${tf("operator.lineCount", "{count} line(s)", { count: packedLines.length })}</strong>
-        <div class="fulfillment-lines">
-          ${packedLines.map((line) => `
-            <div>
-              <b>${line.sku || line.item_name}</b>
-              <span>${isPickupLoad ? escapeHtml(pickupQuantityText(line)) : `${displayQty(line.packed_pallet_qty)} PLT / ${displayQty(line.packed_section_qty)} SEC / ${displayQty(line.packed_layer_qty)} LYR / ${displayQty(line.packed_piece_qty)} PCS`}</span>
-              ${isPickupLoad ? `<small>${t("operator.remaining", "Remaining")} ${escapeHtml(pickupQuantityText(line, remainingValue))}</small>` : ""}
-            </div>
-          `).join("") || `<p class="muted">${t("operator.noPackedQty", "No packed qty.")}</p>`}
-        </div>
-      </div>
+      ${renderCompactLoadSummary(isConsolidated ? consolidationLoadState.batch.snapshot.orders : [{ tranid: order.tranid, lines: packedLines }], isConsolidated)}
       <div class="selected-actions">
         ${fulfillmentSubmitting ? `<div class="sync-alert"><strong>${localizeMessage(fulfillmentJobStage || t("operator.savingLoadProof", "Saving load proof"))}</strong><span>${localizeMessage(fulfillmentStatusText || t("operator.savingLocalYardStatus", "Saving local yard status..."))}<span data-fulfillment-upload-elapsed>${fulfillmentStartedAt ? ` (${Math.max(1, Math.round((Date.now() - fulfillmentStartedAt) / 1000))}s)` : ""}</span></span></div>` : ""}
         ${!fulfillmentSubmitting && fulfillmentJobStage === "Load failed" ? `<div class="sync-alert danger"><strong>${t("operator.loadFailed", "Load failed")}</strong><span>${escapeHtml(localizeMessage(fulfillmentStatusText))}</span></div>` : ""}
@@ -4573,10 +4679,6 @@ function renderPickupMeasures(line, units = deliveryLineUnits(line)) {
     ${confirmed ? `<div class="measure confirmed-measure"><span>${t("operator.confirmed", "Confirmed")} ${escapeHtml(unit.label)}</span><b>${displayQty(packedValue(line, unit.key))}</b></div>` : ""}
     <div class="measure remaining-measure"><span>${t("operator.remaining", "Remaining")} ${escapeHtml(unit.label)}</span><b>${displayQty(remainingValue(line, unit.key))}</b></div>
   `).join("");
-}
-
-function pickupQuantityText(line, value = packedValue) {
-  return deliveryLineUnits(line).map((unit) => `${displayQty(value(line, unit.key))} ${unit.label}`).join(" / ");
 }
 
 function renderLinkedSupplyBreakdown(line) {
@@ -5246,6 +5348,369 @@ function renderConsolidationReviewStage() {
       </section>
     </div>
   `;
+}
+
+function renderCompactLoadSummary(sourceOrders, consolidated = false) {
+  const entries = sourceOrders.map((order) => ({ ...order, rows: window.MBBS_LOAD_SUMMARY.rows(order.lines || []) }));
+  const content = consolidated ? `<table class="consolidation-load-summary"><thead><tr><th>${t("common.order", "Order")}</th><th>${t("common.item", "Item")}</th><th>${t("common.quantity", "Quantity")}</th></tr></thead><tbody>
+    ${entries.map((order) => order.rows.map((row, index) => `<tr>${index === 0 ? `<th scope="rowgroup" rowspan="${order.rows.length}">${escapeHtml(order.tranid)}</th>` : ""}<td>${escapeHtml(row.itemName)}</td><td>${escapeHtml(row.quantity)}</td></tr>`).join("")).join("")}
+    </tbody></table>` : `<div class="fulfillment-lines compact-load-summary">${entries.flatMap((order) => order.rows).map((row) => `<div class="fulfillment-summary-row"><b>${escapeHtml(row.itemName)}</b><span>${escapeHtml(row.quantity)}</span></div>`).join("") || `<p class="muted">${t("operator.noPackedQty", "No packed qty.")}</p>`}</div>`;
+  return `<div class="fulfillment-card fulfillment-summary-card"><span>${t("operator.packedQtyToLoad", "Packed qty to load")}</span>${content}</div>`;
+}
+
+function consolidationLoadIdentity(order) {
+  const assignment = order?.assignment || {};
+  return `${assignment.planId}:${assignment.loadId}:${assignment.planDate}:${assignment.truckPlate}`;
+}
+
+function consolidationLoadRelativeDate(offset = 0, now = new Date()) {
+  const parts = Object.fromEntries(new Intl.DateTimeFormat("en-CA", { timeZone: "America/Toronto", year: "numeric", month: "2-digit", day: "2-digit" })
+    .formatToParts(now).map((part) => [part.type, part.value]));
+  const date = new Date(`${parts.year}-${parts.month}-${parts.day}T12:00:00Z`);
+  date.setUTCDate(date.getUTCDate() + offset);
+  return date.toISOString().slice(0, 10);
+}
+
+function consolidationLoadDateRange() {
+  const state = consolidationLoadState;
+  if (state.datePreset === "custom" && state.date) return [state.date, state.date];
+  const today = consolidationLoadRelativeDate(), tomorrow = consolidationLoadRelativeDate(1);
+  return [state.datePreset === "tomorrow" ? tomorrow : today, state.datePreset === "today" ? today : tomorrow];
+}
+
+function consolidationLoadPage() {
+  const state = consolidationLoadState, [start, end] = consolidationLoadDateRange();
+  const rows = state.orders.filter((order) => order.assignment.planDate >= start && order.assignment.planDate <= end
+    && (!state.truck || order.assignment.truckPlate === state.truck));
+  const count = pageCount(rows, CONSOLIDATION_LOAD_PAGE_SIZE);
+  state.page = Math.max(0, Math.min(state.page, count - 1));
+  return { rows, count, visible: pageItems(rows, state.page, CONSOLIDATION_LOAD_PAGE_SIZE) };
+}
+
+function renderConsolidationLoadPagination() {
+  const { rows, count } = consolidationLoadPage(), state = consolidationLoadState;
+  return `<button class="secondary-button" data-action="consolidation-load-prev" ${state.page === 0 ? "disabled" : ""} type="button">${t("common.previous", "Previous")}</button>
+    <span aria-live="polite"><strong>${rows.length ? state.page + 1 : 0} / ${rows.length ? count : 0}</strong><small>${rows.length} ${t("operator.orders", "Orders")}</small></span>
+    <button class="secondary-button" data-action="consolidation-load-next" ${state.page >= count - 1 ? "disabled" : ""} type="button">${t("common.next", "Next")}</button>`;
+}
+
+function renderConsolidationLoadDateFields() {
+  const values = consolidationLoadDateRange()[0].split("-");
+  return `<div class="consolidation-date-parts">${["year", "month", "day"].map((part, index) => `
+    <div class="consolidation-date-field">
+      <label for="consolidation-date-${part}">${t(`common.${part}`, ["Year", "Month", "Date"][index])}</label>
+      <div class="consolidation-date-box"><input id="consolidation-date-${part}" data-consolidation-date-part="${part}" type="text"
+        inputmode="numeric" pattern="[0-9]*" maxlength="${index ? 2 : 4}" enterkeyhint="done" autocomplete="off" readonly
+        role="combobox" aria-expanded="false" aria-haspopup="listbox" aria-controls="consolidation-date-${part}-options"
+        aria-describedby="consolidation-date-hint consolidation-date-error" value="${escapeHtml(values[index])}" /><span aria-hidden="true">▾</span></div>
+      <div id="consolidation-date-${part}-options" class="consolidation-date-options" role="listbox" aria-label="${t(`common.${part}`, ["Year", "Month", "Date"][index])}" hidden></div>
+    </div>`).join("")}</div>`;
+}
+
+function closeConsolidationDateMenus() {
+  for (const input of app.querySelectorAll("[data-consolidation-date-part]")) {
+    input.setAttribute("aria-expanded", "false");
+    input.removeAttribute("aria-activedescendant");
+    document.getElementById(input.getAttribute("aria-controls")).hidden = true;
+  }
+}
+
+function consolidationDateOptions(input) {
+  const part = input.dataset.consolidationDatePart;
+  const [year, month] = consolidationLoadDateRange()[0].split("-").map(Number);
+  if (part === "year") {
+    const current = Number(consolidationLoadRelativeDate().slice(0, 4));
+    return [...new Set([...Array.from({ length: 11 }, (_, i) => current - 5 + i), year,
+      ...consolidationLoadState.orders.map((order) => Number(order.assignment.planDate.slice(0, 4)))])].sort((a, b) => a - b);
+  }
+  return Array.from({ length: part === "month" ? 12 : new Date(Date.UTC(year, month, 0)).getUTCDate() }, (_, i) => i + 1);
+}
+
+function openConsolidationDateMenu(input) {
+  closeConsolidationDateMenus();
+  const menu = document.getElementById(input.getAttribute("aria-controls"));
+  menu.innerHTML = consolidationDateOptions(input).map((value) => `<button type="button" role="option" tabindex="-1"
+    id="${input.id}-option-${value}" data-consolidation-date-option="${value}" data-date-part="${input.dataset.consolidationDatePart}"
+    aria-selected="${Number(input.value) === value}">${String(value).padStart(2, "0")}</button>`).join("");
+  menu.hidden = false;
+  input.setAttribute("aria-expanded", "true");
+  const selected = menu.querySelector('[aria-selected="true"]');
+  if (selected) {
+    input.setAttribute("aria-activedescendant", selected.id);
+    menu.scrollTop = Math.max(0, selected.offsetTop - menu.clientHeight / 2);
+  }
+}
+
+function typeConsolidationDate(input) {
+  closeConsolidationDateMenus();
+  input.blur();
+  input.readOnly = false;
+  input.focus({ preventScroll: true });
+  input.select();
+}
+
+function updateConsolidationDateFilters({ resetFields = false } = {}) {
+  const range = consolidationLoadDateRange();
+  for (const button of app.querySelectorAll('[data-action="consolidation-load-date-preset"]')) {
+    button.setAttribute("aria-pressed", String(button.dataset.preset === consolidationLoadState.datePreset));
+  }
+  const label = app.querySelector(".consolidation-load-date-range");
+  if (label) label.textContent = range[0] === range[1] ? range[0] : `${range[0]} – ${range[1]}`;
+  if (!resetFields) return;
+  closeConsolidationDateMenus();
+  const values = range[0].split("-");
+  [...app.querySelectorAll("[data-consolidation-date-part]")].forEach((input, index) => {
+    input.value = values[index]; input.readOnly = true; input.removeAttribute("aria-invalid"); input.setCustomValidity("");
+  });
+  const error = app.querySelector("[data-consolidation-date-error]");
+  if (error) error.textContent = "";
+}
+
+function commitConsolidationDate(input, value = input.value) {
+  input.value = value;
+  const inputs = [...app.querySelectorAll("[data-consolidation-date-part]")];
+  const [year, month, rawDay] = inputs.map((field) => Number(field.value));
+  const limit = new Date(Date.UTC(year, month, 0)).getUTCDate();
+  const day = input.dataset.consolidationDatePart === "day" ? rawDay : Math.min(rawDay, limit);
+  if (![year, month, day].every(Number.isInteger) || !/^\d{4}$/.test(inputs[0].value) || year < 1000 || year > 9999 || month < 1 || month > 12 || day < 1 || day > limit) {
+    const message = t("operator.validPlannedDate", "Enter a valid date.");
+    input.setAttribute("aria-invalid", "true"); input.setCustomValidity(message);
+    app.querySelector("[data-consolidation-date-error]").textContent = message;
+    return false;
+  }
+  consolidationLoadState.date = [year, month, day].map((part) => String(part).padStart(2, "0")).join("-");
+  consolidationLoadState.datePreset = "custom"; consolidationLoadState.page = 0;
+  updateConsolidationDateFilters({ resetFields: true });
+  updateConsolidationLoadSelection();
+  return true;
+}
+
+function consolidationDateKeydown(event, input) {
+  const menu = document.getElementById(input.getAttribute("aria-controls"));
+  if (event.key === "Escape") {
+    event.preventDefault(); updateConsolidationDateFilters({ resetFields: true }); return;
+  }
+  if (event.key === "ArrowDown" || event.key === "ArrowUp") {
+    event.preventDefault();
+    if (!input.readOnly && !commitConsolidationDate(input)) return;
+    if (menu.hidden) { openConsolidationDateMenu(input); return; }
+    const options = [...menu.querySelectorAll('[role="option"]')];
+    const current = options.findIndex((option) => option.id === input.getAttribute("aria-activedescendant"));
+    const next = options[Math.max(0, Math.min(options.length - 1, current + (event.key === "ArrowDown" ? 1 : -1)))];
+    for (const option of options) option.setAttribute("aria-selected", String(option === next));
+    input.setAttribute("aria-activedescendant", next.id); next.scrollIntoView({ block: "nearest" }); return;
+  }
+  if (event.key === "Enter") {
+    event.preventDefault();
+    const selected = menu.hidden ? null : document.getElementById(input.getAttribute("aria-activedescendant"));
+    if (commitConsolidationDate(input, selected?.dataset.consolidationDateOption || input.value)) input.blur();
+    return;
+  }
+  if (input.readOnly && /^\d$/.test(event.key)) typeConsolidationDate(input);
+}
+
+function renderConsolidationLoadRows() {
+  const state = consolidationLoadState;
+  const selectedLoad = state.selected.size ? consolidationLoadIdentity(state.selected.values().next().value) : "";
+  return consolidationLoadPage().visible.map((order) => {
+    const checked = state.selected.has(String(order.netsuite_id));
+    const disabled = state.busy || (selectedLoad && selectedLoad !== consolidationLoadIdentity(order));
+    return `<label class="consolidation-load-order ${checked ? "selected" : ""} ${disabled ? "unavailable" : ""}">
+      <input type="checkbox" data-consolidation-order="${escapeHtml(order.netsuite_id)}" ${checked ? "checked" : ""} ${disabled ? "disabled" : ""} />
+      <span><strong>${escapeHtml(order.tranid)}</strong><span>${escapeHtml(order.customer || "")}</span><small>${escapeHtml(order.assignment.planDate)} · ${escapeHtml(order.assignment.truckPlate)} · ${escapeHtml(order.assignment.loadName)}</small></span>
+    </label>`;
+  }).join("") || `<p class="empty-state">${t("operator.noPackedLoadOrders", "No packed orders match these filters.")}</p>`;
+}
+
+function renderConsolidationLoadTray() {
+  const state = consolidationLoadState;
+  const stale = [...state.selected.keys()].some((id) => !state.orders.some((order) => String(order.netsuite_id) === id
+    && consolidationLoadIdentity(order) === consolidationLoadIdentity(state.selected.get(id))));
+  return `<div class="consolidation-load-selected"><strong>${state.selected.size} ${t("operator.selected", "selected")}</strong>
+    <span>${[...state.selected.values()].map((order) => escapeHtml(order.tranid)).join(", ")}</span>
+    <button class="secondary-button" data-action="clear-consolidation-load" ${state.busy || !state.selected.size ? "disabled" : ""} type="button">${t("common.clear", "Clear")}</button></div>
+    ${stale ? `<p class="sync-alert danger">${t("operator.consolidationLoadStale", "A selected order changed. Clear the selection and review the packed orders.")}</p>` : ""}
+    ${state.error ? `<p class="sync-alert danger">${escapeHtml(state.error)}</p>` : ""}
+    <button class="primary-button" data-action="preview-consolidation-load" ${state.busy || !state.selected.size || stale ? "disabled" : ""} type="button">${state.busy ? t("common.loading", "Loading...") : t("operator.previewLoad", "Preview load")}</button>`;
+}
+
+function renderConsolidationLoadPendingList() {
+  return consolidationLoadState.pending.map((batch) => `<button class="secondary-button" data-action="resume-consolidation-load" data-batch="${escapeHtml(batch.id)}" type="button">${t("operator.pendingLoad", "Pending load")} · ${escapeHtml(batch.snapshot.assignment.planDate)} · ${escapeHtml(batch.snapshot.assignment.truckPlate)} · ${escapeHtml(batch.snapshot.assignment.loadName)}</button>`).join("");
+}
+
+function consolidationLoadTruckOptions() {
+  const state = consolidationLoadState;
+  const trucks = [...new Set([...state.orders.map((order) => order.assignment.truckPlate), state.truck].filter(Boolean))].sort();
+  return `<option value="">${t("operator.allTrucks", "All trucks")}</option>${trucks.map((truck) => `<option value="${escapeHtml(truck)}" ${truck === state.truck ? "selected" : ""}>${escapeHtml(truck)}</option>`).join("")}`;
+}
+
+function renderConsolidationLoadSelection() {
+  const state = consolidationLoadState;
+  shell(t("operator.consolidationLoad", "Consolidation Load"), `${t("common.location", "Location")} ${currentLocation()?.text || ""}`, `
+    <section class="consolidation-load-screen">
+      <p>${t("operator.consolidationLoadHelp", "Select packed orders from the same planned date, truck and load. Photos will be shared with every selected order.")}</p>
+      <div class="consolidation-load-filters">
+        <div class="consolidation-load-date-filter">
+          <div class="consolidation-load-date-controls">
+            <fieldset><legend>${t("operator.plannedDate", "Planned date")}</legend>
+              <div class="consolidation-load-date-presets" role="group" aria-label="${t("operator.plannedDate", "Planned date")}">
+                ${[["today", "Today"], ["tomorrow", "Tmr"], ["both", "Today and tmr"]].map(([preset, label]) => `<button class="secondary-button" type="button" data-action="consolidation-load-date-preset" data-preset="${preset}" aria-pressed="${state.datePreset === preset}">${t(`operator.loadDate.${preset}`, label)}</button>`).join("")}
+              </div>
+            </fieldset>
+            <fieldset><legend>${t("operator.specificDate", "Specific date")}</legend>
+              ${renderConsolidationLoadDateFields()}
+            </fieldset>
+          </div>
+          <div class="consolidation-load-date-details">
+            <span class="consolidation-load-date-range">${consolidationLoadDateRange().filter((date, index, dates) => index === 0 || date !== dates[0]).join(" – ")}</span>
+            <small id="consolidation-date-hint">${t("operator.dateTapToType", "Tap once to choose, tap again to type.")}</small>
+          </div>
+          <small id="consolidation-date-error" data-consolidation-date-error role="status"></small>
+        </div>
+        <label>${t("common.truck", "Truck")}<select data-input="consolidation-load-truck">${consolidationLoadTruckOptions()}</select></label>
+        <button class="secondary-button" data-action="reset-consolidation-load-filters" type="button">${t("common.reset", "Reset")}</button>
+      </div>
+      <div class="consolidation-load-pending">${renderConsolidationLoadPendingList()}</div>
+      <div class="consolidation-load-orders">${renderConsolidationLoadRows()}</div>
+      <div class="consolidation-load-footer">
+        <nav class="pagination-row consolidation-load-pagination" aria-label="${t("operator.orderPages", "Order pages")}">${renderConsolidationLoadPagination()}</nav>
+        <div class="consolidation-load-tray">${renderConsolidationLoadTray()}</div>
+      </div>
+    </section>`, `<button class="secondary-button" data-action="consolidation-load-back" type="button">${t("operator.deliveryPrep", "Delivery Prep")}</button>`);
+}
+
+function updateConsolidationLoadSelection() {
+  if (currentModule !== "delivery-consolidation-load") return;
+  const focused = document.activeElement;
+  const orderId = focused?.dataset?.consolidationOrder;
+  const action = focused?.dataset?.action;
+  const scroll = { x: window.scrollX, y: window.scrollY };
+  for (const [selector, html] of [[".consolidation-load-orders", renderConsolidationLoadRows()], [".consolidation-load-pagination", renderConsolidationLoadPagination()], [".consolidation-load-tray", renderConsolidationLoadTray()], [".consolidation-load-pending", renderConsolidationLoadPendingList()]]) {
+    const element = app.querySelector(selector);
+    if (element && element.innerHTML !== html) { const scroll = element.scrollTop; element.innerHTML = html; element.scrollTop = scroll; }
+  }
+  updateConsolidationDateFilters();
+  const truck = app.querySelector('[data-input="consolidation-load-truck"]');
+  if (truck && truck !== focused) {
+    const options = consolidationLoadTruckOptions();
+    if (truck.innerHTML !== options) truck.innerHTML = options;
+  }
+  if (focused && !focused.isConnected) {
+    const replacement = [...app.querySelectorAll('[data-consolidation-order], [data-action]')]
+      .find((element) => orderId ? element.dataset.consolidationOrder === orderId : action && element.dataset.action === action);
+    replacement?.focus({ preventScroll: true });
+  }
+  window.scrollTo(scroll.x, scroll.y);
+  saveOperatorState();
+}
+
+async function loadConsolidationLoadOrders({ background = false } = {}) {
+  const state = consolidationLoadState, generation = ++state.request;
+  try {
+    const [result, pending] = await Promise.all([api(`/api/delivery/consolidation-loads/orders?locationId=${locationId}`), api(`/api/delivery/consolidation-loads/pending?locationId=${locationId}`)]);
+    if (generation !== state.request || currentModule !== "delivery-consolidation-load") return;
+    state.orders = result.orders || [];
+    state.pending = pending;
+    state.error = "";
+  } catch (error) { state.error = error.message; }
+  if (currentModule !== "delivery-consolidation-load") return;
+  if (background && app.querySelector(".consolidation-load-orders")) updateConsolidationLoadSelection();
+  else render();
+}
+
+function prepareConsolidationLoadProof(batch) {
+  const state = consolidationLoadState;
+  if (state.batchId !== batch.id) state.uploads = new Map();
+  state.batch = batch; state.batchId = batch.id; state.photoRefs = batch.photoRefs || [];
+  fulfillmentOrder = { is_consolidation_load: true, netsuite_id: batch.id, tranid: t("operator.consolidationLoad", "Consolidation Load"),
+    order_type: "consolidation_load", lines: batch.snapshot.orders.flatMap((order) => order.lines) };
+  fulfillmentReturnModule = "delivery-consolidation-load";
+  fulfillmentPhotoDataUrls = [...state.photoRefs]; fulfillmentActivePhotoSlot = 0;
+  fulfillmentSubmitting = false; fulfillmentResult = batch.status === "completed" ? batch.result : null;
+  fulfillmentStatusText = ""; fulfillmentJobStage = ""; fulfillmentValidation = null; fulfillmentStartedAt = 0;
+  fulfillmentNetSuitePolicy = null; fulfillmentNetSuitePolicyError = ""; fulfillmentLoadRequestId = batch.id;
+  currentModule = "delivery-consolidation-load-proof";
+  selectRearCamera(); render(); scheduleConsolidationLoadPoll();
+}
+
+async function previewConsolidationLoad() {
+  const state = consolidationLoadState;
+  if (state.busy || !state.selected.size) return;
+  state.busy = true; state.error = ""; updateConsolidationLoadSelection();
+  try {
+    const batch = await api("/api/delivery/consolidation-loads/preview", { method: "POST", body: JSON.stringify({ locationId, orderIds: [...state.selected.keys()] }) });
+    prepareConsolidationLoadProof(batch);
+  } catch (error) { state.error = error.message; }
+  finally { state.busy = false; updateConsolidationLoadSelection(); }
+}
+
+async function openConsolidationLoadBatch(id) {
+  const batch = await api(`/api/delivery/consolidation-loads/${encodeURIComponent(id)}`);
+  prepareConsolidationLoadProof(batch);
+}
+
+function scheduleConsolidationLoadPoll() {
+  window.clearTimeout(consolidationLoadState.poll);
+  if (currentModule === "delivery-consolidation-load-proof" && consolidationLoadState.batch?.status === "pending") {
+    consolidationLoadState.poll = window.setTimeout(() => refreshConsolidationLoadBatch().catch(() => {}), 3000);
+  }
+}
+
+async function refreshConsolidationLoadBatch() {
+  const state = consolidationLoadState;
+  if (currentModule !== "delivery-consolidation-load-proof" || state.batch?.status !== "pending" || fulfillmentSubmitting) return;
+  try {
+    const batch = await api(`/api/delivery/consolidation-loads/${encodeURIComponent(state.batchId)}`);
+    if (currentModule !== "delivery-consolidation-load-proof" || state.batchId !== batch.id) return;
+    const changed = batch.status !== state.batch.status || batch.error !== state.batch.error;
+    state.batch = batch;
+    if (batch.status === "completed") fulfillmentResult = batch.result;
+    if (changed) render();
+  } finally { scheduleConsolidationLoadPoll(); }
+}
+
+function renderPendingConsolidationLoad() {
+  const batch = consolidationLoadState.batch;
+  shell(t("operator.pendingLoad", "Pending load"), `${batch.snapshot.assignment.planDate} · ${batch.snapshot.assignment.truckPlate} · ${batch.snapshot.assignment.loadName}`, `
+    <section class="consolidation-load-screen">
+      <div class="sync-alert ${batch.error ? "danger" : ""}"><strong>${t("operator.consolidationLoadPending", "All selected orders are held together until loading finishes.")}</strong><span>${escapeHtml(batch.error || t("operator.savingLoadProof", "Saving load proof"))}</span></div>
+      ${renderCompactLoadSummary(batch.snapshot.orders, true)}
+      <div class="consolidation-load-photos">${batch.photoRefs.map((ref) => `<img ${photoImgAttributes(ref)} alt="${t("operator.photoProof", "Photo proof")}" />`).join("")}</div>
+      <button class="primary-button" data-action="retry-consolidation-load" ${fulfillmentSubmitting ? "disabled" : ""} type="button">${t("operator.retryLoad", "Retry load")}</button>
+    </section>`, `<button class="secondary-button" data-action="consolidation-load-back-to-list" type="button">${t("common.back", "Back")}</button>`);
+}
+
+async function confirmConsolidationLoad() {
+  const state = consolidationLoadState;
+  if (fulfillmentSubmitting || !state.batch) return;
+  const batchId = state.batch.id;
+  const pending = state.batch.status === "pending";
+  const photos = fulfillmentPhotoDataUrls.filter(Boolean);
+  if (!pending && photos.length < 2) { showToast(t("operator.takeTwoLoadPhotos", "Take at least 2 photos before confirming load.")); return; }
+  fulfillmentSubmitting = true; fulfillmentJobStage = "Saving proof"; fulfillmentStatusText = "Saving the selected load...";
+  stopFulfillmentCamera(); render();
+  try {
+    const photoRefs = pending ? state.photoRefs : photos;
+    if (state.batchId !== batchId) return;
+    state.photoRefs = photoRefs;
+    const batch = await api(`/api/delivery/consolidation-loads/${batchId}/${pending ? "resume" : "submit"}`, { method: "POST", body: JSON.stringify(pending ? {} : { photoRefs }) });
+    if (state.batchId !== batchId) return;
+    state.batch = batch;
+    if (batch.status === "completed") fulfillmentResult = batch.result;
+  } catch (error) {
+    if (state.batchId !== batchId) return;
+    fulfillmentJobStage = "Load failed"; fulfillmentStatusText = error.message; showToast(error.message);
+  } finally {
+    if (state.batchId === batchId) { fulfillmentSubmitting = false; render(); scheduleConsolidationLoadPoll(); }
+  }
+}
+
+async function finishConsolidationLoad() {
+  stopFulfillmentCamera(); window.clearTimeout(consolidationLoadState.poll);
+  consolidationLoadState.selected.clear(); consolidationLoadState.batch = null; consolidationLoadState.batchId = ""; consolidationLoadState.photoRefs = [];
+  consolidationLoadState.uploads.clear();
+  fulfillmentOrder = null; fulfillmentPhotoDataUrls = []; fulfillmentResult = null;
+  currentModule = "delivery-consolidation-load"; await loadConsolidationLoadOrders();
 }
 
 function renderConsolidationPick() {
@@ -6245,10 +6710,12 @@ function operatorNetSuitePostingIsLocalOnly(order, functionKey) {
   if (!order) return true;
   if (functionKey === "receiving") return order.order_type === "co_order";
   if (functionKey !== "delivery_prep") return false;
-  return order.order_type === "co_order"
-    || order.order_type === "vrma_order"
-    || order.reload_authorized === true
-    || order.sales_order_reattempt === true;
+  const children = order.is_dispatch_group ? order.child_orders || [] : [order];
+  return children.length > 0 && children.every((child) => child.order_type === "sales_order"
+    || child.order_type === "co_order"
+    || child.order_type === "vrma_order"
+    || child.reload_authorized === true
+    || child.sales_order_reattempt === true);
 }
 
 async function loadOperatorNetSuitePostingPolicy(functionKey) {
@@ -6266,18 +6733,15 @@ function operatorNetSuitePolicyToken(policy) {
 
 function renderOperatorNetSuitePostingMode(policy, { localOnly = false, error = "" } = {}) {
   if (localOnly) {
-    return `<div class="sync-alert operator-posting-mode" data-posting-mode="local"><strong>Local only</strong><span>This order type never creates a NetSuite transaction from Operator.</span></div>`;
+    return `<div class="sync-alert operator-posting-mode" data-posting-mode="local"><strong>Local only</strong><span>Saved in this app.</span></div>`;
   }
   if (error || !policy) {
     return `<div class="sync-alert danger operator-posting-mode" data-posting-mode="unavailable"><strong>Posting mode unavailable</strong><span>${escapeHtml(error || "Refresh this screen before completing the order.")}</span></div>`;
   }
   if (policy.effective) {
-    return `<div class="sync-alert operator-posting-mode" data-posting-mode="netsuite"><strong>Creates NetSuite ${escapeHtml(policy.transactionType)}</strong><span>Local completion is saved only after NetSuite creates and verifies the exact transaction.</span></div>`;
+    return `<div class="sync-alert operator-posting-mode" data-posting-mode="netsuite"><strong>Creates NetSuite ${escapeHtml(policy.transactionType)}</strong><span>Completion waits for verification.</span></div>`;
   }
-  const detail = policy.configured && !policy.environmentAllowed
-    ? "This yard gate is configured on, but the server deployment ceiling is closed."
-    : "This yard and function gate is off.";
-  return `<div class="sync-alert operator-posting-mode" data-posting-mode="local"><strong>Local only</strong><span>${escapeHtml(detail)} No NetSuite transaction will be created.</span></div>`;
+  return `<div class="sync-alert operator-posting-mode" data-posting-mode="local"><strong>Local only</strong><span>NetSuite posting is off.</span></div>`;
 }
 
 function operatorNetSuitePostingReady(policy, { localOnly = false, error = "" } = {}) {
@@ -6393,10 +6857,10 @@ async function startFulfillment() {
   selectRearCamera();
   currentModule = customerPickupLoad ? "customer-pickup-load" : "delivery-fulfill";
   render();
-  if (order.reload_authorized) await startFulfillmentCamera();
 }
 
 function stopFulfillmentCamera() {
+  cancelOperatorPhotoCameraOpening("fulfillment");
   if (fulfillmentCameraStream) {
     fulfillmentCameraStream.getTracks().forEach((track) => track.stop());
   }
@@ -6412,26 +6876,13 @@ function attachFulfillmentCamera() {
 }
 
 async function startFulfillmentCamera() {
-  if (!navigator.mediaDevices?.getUserMedia) {
-    showToast(t("operator.cameraUnavailable", "Camera is not available in this browser."));
-    return;
-  }
-  stopFulfillmentCamera();
-  try {
-    fulfillmentCameraStream = await openCameraStream();
-    fulfillmentCameraActive = true;
-    render();
-  } catch (error) {
-    stopFulfillmentCamera();
-    showToast(cameraErrorMessage(error));
-    render();
-  }
+  return startOperatorPhotoCamera("fulfillment");
 }
 
 async function switchFulfillmentCamera() {
-  const wasActive = fulfillmentCameraActive;
+  const wasActive = fulfillmentCameraActive || operatorPhotoCamera.opening === "fulfillment";
   switchCameraFacing();
-  if (wasActive) return startFulfillmentCamera();
+  if (wasActive) { stopFulfillmentCamera(); return startFulfillmentCamera(); }
   render();
 }
 
@@ -6509,6 +6960,7 @@ function readPhotoFile(file) {
 }
 
 async function confirmFulfillment() {
+  if (fulfillmentOrder?.is_consolidation_load) return confirmConsolidationLoad();
   if (!fulfillmentOrder || fulfillmentSubmitting) return;
   fulfillmentSubmitting = true;
   const isPickupLoad = currentModule === "customer-pickup-load";
@@ -6555,10 +7007,11 @@ async function confirmFulfillment() {
   }, 1000);
   render();
   try {
-    fulfillmentStatusText = photos.length ? "Uploading photo proof to R2..." : "Saving local loaded status...";
+    const deferPhotos = !localOnlyPosting && fulfillmentNetSuitePolicy?.effective;
+    fulfillmentStatusText = photos.length ? "Saving photo proof..." : "Saving local loaded status...";
     render();
     const uploadedPhotoRefs = photos.length
-      ? await uploadOperatorPhotos(photos, {
+      ? deferPhotos ? photos : await uploadOperatorPhotos(photos, {
           recordType: isPickupLoad ? "operator-customer-pickup-photo" : "operator-load-photo",
           orderType: fulfillmentOrder.order_type || deliveryOrderType,
           orderId: fulfillmentOrder.netsuite_id,
@@ -6627,6 +7080,7 @@ async function pollFulfillmentJob(jobId) {
 }
 
 async function finishFulfillment() {
+  if (fulfillmentOrder?.is_consolidation_load) return finishConsolidationLoad();
   stopFulfillmentCamera();
   const wasPickup = fulfillmentOrder && currentModule === "customer-pickup-load";
   const returnModule = fulfillmentReturnModule || "delivery";
@@ -6685,7 +7139,7 @@ function renderReceiptScreen() {
     `, `<button class="secondary-button" data-action="finish-receive" type="button">${t("operator.receiving", "Receiving")}</button>`);
   }
   return shell(t("operator.receiveOrder", "Receive Order"), `${order.tranid} | ${t("common.location", "Location")} ${currentLocation()?.text || ""}`, `
-    <section class="fulfillment-screen">
+    <section class="fulfillment-screen fulfillment-form-screen">
       ${renderOperatorNetSuitePostingMode(receiptNetSuitePolicy, {
         localOnly: localOnlyPosting,
         error: receiptNetSuitePolicyError
@@ -6696,7 +7150,8 @@ function renderReceiptScreen() {
         <div class="camera-actions">
           ${receiptCameraActive
             ? `<button class="secondary-button" data-action="stop-receipt-camera" type="button">${t("common.closeCamera", "Close camera")}</button>`
-            : `<button class="primary-button" data-action="start-receipt-camera" type="button">${t("common.openCamera", "Open camera")}</button>`}
+            : `<button class="primary-button" data-action="start-receipt-camera" ${operatorPhotoCamera.opening === "receipt" ? "disabled" : ""} type="button">${operatorPhotoCamera.opening === "receipt" ? t("operator.openingCamera", "Opening camera...") : t("common.openCamera", "Open camera")}</button>`}
+          ${operatorPhotoCamera.opening === "receipt" ? `<button class="secondary-button" data-action="stop-receipt-camera" type="button">${t("common.closeCamera", "Close camera")}</button>` : ""}
           ${renderCameraSwitchButton("switch-receipt-camera")}
         </div>
         <div class="photo-slot-row">
@@ -6853,6 +7308,7 @@ async function startReceipt() {
 }
 
 function stopReceiptCamera() {
+  cancelOperatorPhotoCameraOpening("receipt");
   if (receiptCameraStream) receiptCameraStream.getTracks().forEach((track) => track.stop());
   receiptCameraStream = null;
   receiptCameraActive = false;
@@ -6866,23 +7322,13 @@ function attachReceiptCamera() {
 }
 
 async function startReceiptCamera() {
-  if (!navigator.mediaDevices?.getUserMedia) return showToast(t("operator.cameraUnavailable", "Camera is not available in this browser."));
-  stopReceiptCamera();
-  try {
-    receiptCameraStream = await openCameraStream();
-    receiptCameraActive = true;
-    render();
-  } catch (error) {
-    stopReceiptCamera();
-    showToast(cameraErrorMessage(error));
-    render();
-  }
+  return startOperatorPhotoCamera("receipt");
 }
 
 async function switchReceiptCamera() {
-  const wasActive = receiptCameraActive;
+  const wasActive = receiptCameraActive || operatorPhotoCamera.opening === "receipt";
   switchCameraFacing();
-  if (wasActive) return startReceiptCamera();
+  if (wasActive) { stopReceiptCamera(); return startReceiptCamera(); }
   render();
 }
 
@@ -6924,9 +7370,10 @@ async function confirmReceipt() {
   }, 1000);
   render();
   try {
-    receiptStatusText = "Uploading receiving photos to R2...";
+    const deferPhotos = !localOnlyPosting && receiptNetSuitePolicy?.effective;
+    receiptStatusText = "Saving receiving photos...";
     render();
-    const uploadedPhotoRefs = await uploadOperatorPhotos(receiptPhotoDataUrls.filter(Boolean), {
+    const uploadedPhotoRefs = deferPhotos ? receiptPhotoDataUrls.filter(Boolean) : await uploadOperatorPhotos(receiptPhotoDataUrls.filter(Boolean), {
       recordType: (receiptOrder.order_type || receivingOrderType) === "co_order" ? "operator-co-receiving-photo" : "operator-receiving-photo",
       orderType: receiptOrder.order_type || receivingOrderType,
       orderId: receiptOrder.netsuite_id,
@@ -6995,6 +7442,7 @@ async function pollReceiptJob(jobId) {
 
 async function finishReceipt() {
   stopReceiptCamera();
+  invalidateReceivingRequests();
   const wasLocalCo = (receiptOrder?.order_type || receivingOrderType) === "co_order";
   currentModule = "receiving";
   receiptOrder = null;
@@ -7006,6 +7454,14 @@ async function finishReceipt() {
   receiptRequestId = "";
   receiptNetSuitePolicy = null;
   receiptNetSuitePolicyError = "";
+  receivingSearch = "";
+  receivingItemSearch = "";
+  receivingSelectedId = null;
+  receivingSelectedOrder = null;
+  receivingOrders = [];
+  receivingItemSuggestions = [];
+  receivingOrderPage = 0;
+  saveOperatorState();
   if (wasLocalCo) {
     currentModule = "delivery";
     deliveryOrderType = "transfer_order";
@@ -7599,6 +8055,7 @@ async function deleteReturnDraft(id) {
 }
 
 function stopReturnCamera() {
+  cancelOperatorPhotoCameraOpening("return");
   if (returnCameraStream) returnCameraStream.getTracks().forEach((track) => track.stop());
   returnCameraStream = null;
   returnCameraActive = false;
@@ -7612,25 +8069,13 @@ function attachReturnCamera() {
 }
 
 async function startReturnCamera() {
-  if (!navigator.mediaDevices?.getUserMedia) return showToast(t("operator.cameraUnavailable", "Camera is not available in this browser."));
-  stopReturnScannerCamera();
-  stopReturnCamera();
-  try {
-    returnCameraStream = await openCameraStream();
-    returnCameraActive = true;
-    returnPhotoTarget.open = true;
-    render();
-  } catch (error) {
-    stopReturnCamera();
-    showToast(cameraErrorMessage(error));
-    render();
-  }
+  return startOperatorPhotoCamera("return");
 }
 
 async function switchReturnCamera() {
-  const wasActive = returnCameraActive;
+  const wasActive = returnCameraActive || operatorPhotoCamera.opening === "return";
   switchCameraFacing();
-  if (wasActive) return startReturnCamera();
+  if (wasActive) { stopReturnCamera(); return startReturnCamera(); }
   render();
 }
 
@@ -7679,6 +8124,7 @@ function openReturnPhotoTarget(kind, lineId = "") {
   returnPhotoSlot = Math.max(0, photos.findIndex((photo) => !photo));
   if (returnPhotoSlot < 0) returnPhotoSlot = 0;
   render();
+  void startReturnCamera();
 }
 
 function addReturnPhotoSlot() {
@@ -8295,7 +8741,27 @@ function updateCycleVariancePreview() {
   values[1].className = "";
 }
 
+document.addEventListener("pointerdown", (event) => {
+  if (!event.target.closest(".consolidation-date-field")) closeConsolidationDateMenus();
+  // Keep mouse focus on the combobox; cancelling touch pointerdown suppresses WebKit's click.
+  if (event.pointerType === "mouse" && event.target.closest("[data-consolidation-date-option]")) event.preventDefault();
+});
+
 app.addEventListener("click", async (event) => {
+  const dateInput = event.target.closest("[data-consolidation-date-part]");
+  if (dateInput) {
+    if (dateInput.readOnly) {
+      if (dateInput.getAttribute("aria-expanded") === "true") typeConsolidationDate(dateInput);
+      else openConsolidationDateMenu(dateInput);
+    }
+    return;
+  }
+  const dateOption = event.target.closest("[data-consolidation-date-option]");
+  if (dateOption) {
+    const input = app.querySelector(`[data-consolidation-date-part="${dateOption.dataset.datePart}"]`);
+    commitConsolidationDate(input, dateOption.dataset.consolidationDateOption);
+    input.focus({ preventScroll: true }); return;
+  }
   const button = event.target.closest("button");
   if (!button) return;
 
@@ -8586,6 +9052,36 @@ app.addEventListener("click", async (event) => {
       if (deliveryPrepMode === "load") deliveryLoadViewTruck = "";
       localStorage.setItem("mbbs.operator.deliveryPrepMode", deliveryPrepMode);
       return openModule("delivery-run");
+    }
+    if (button.dataset.action === "open-consolidation-load") {
+      currentModule = "delivery-consolidation-load";
+      render();
+      return loadConsolidationLoadOrders();
+    }
+    if (button.dataset.action === "preview-consolidation-load") return previewConsolidationLoad();
+    if (button.dataset.action === "resume-consolidation-load") return openConsolidationLoadBatch(button.dataset.batch);
+    if (button.dataset.action === "retry-consolidation-load") return confirmConsolidationLoad();
+    if (button.dataset.action === "clear-consolidation-load") {
+      consolidationLoadState.selected.clear(); consolidationLoadState.error = "";
+      return updateConsolidationLoadSelection();
+    }
+    if (["consolidation-load-prev", "consolidation-load-next"].includes(button.dataset.action)) {
+      consolidationLoadState.page += button.dataset.action === "consolidation-load-next" ? 1 : -1;
+      return updateConsolidationLoadSelection();
+    }
+    if (button.dataset.action === "consolidation-load-date-preset") {
+      consolidationLoadState.datePreset = button.dataset.preset; consolidationLoadState.date = ""; consolidationLoadState.page = 0;
+      updateConsolidationDateFilters({ resetFields: true });
+      return updateConsolidationLoadSelection();
+    }
+    if (button.dataset.action === "reset-consolidation-load-filters") {
+      consolidationLoadState.date = ""; consolidationLoadState.datePreset = "both"; consolidationLoadState.truck = ""; consolidationLoadState.page = 0;
+      return render();
+    }
+    if (button.dataset.action === "consolidation-load-back") { currentModule = "delivery-select"; return render(); }
+    if (button.dataset.action === "consolidation-load-back-to-list") {
+      window.clearTimeout(consolidationLoadState.poll); currentModule = "delivery-consolidation-load";
+      return loadConsolidationLoadOrders();
     }
     if (button.dataset.action === "open-consolidation") {
       currentModule = "delivery-consolidation";
@@ -9015,6 +9511,12 @@ app.addEventListener("click", async (event) => {
 });
 
 app.addEventListener("input", async (event) => {
+  if (event.target?.matches("[data-consolidation-date-part]")) {
+    event.target.value = event.target.value.replace(/\D/g, "").slice(0, event.target.maxLength);
+    event.target.removeAttribute("aria-invalid"); event.target.setCustomValidity("");
+    app.querySelector("[data-consolidation-date-error]").textContent = "";
+    return;
+  }
   if (event.target?.id === "returnOrderLookup") {
     returnLookupCode = event.target.value;
     returnLookupMessage = "";
@@ -9112,6 +9614,7 @@ app.addEventListener("input", async (event) => {
 });
 
 app.addEventListener("keydown", async (event) => {
+  if (event.target?.matches("[data-consolidation-date-part]")) return consolidationDateKeydown(event, event.target);
   if (["receivingSearch", "receivingItemSearch"].includes(event.target?.id) && event.key === "Enter") {
     event.preventDefault();
     await scheduleReceivingSearch({ immediate: true });
@@ -9140,6 +9643,21 @@ window.addEventListener("keydown", async (event) => {
 }, true);
 
 app.addEventListener("change", async (event) => {
+  if (event.target?.matches("[data-consolidation-date-part]")) {
+    if (!event.target.readOnly) commitConsolidationDate(event.target);
+    return;
+  }
+  if (event.target?.matches("[data-consolidation-order]")) {
+    const id = event.target.dataset.consolidationOrder;
+    const order = consolidationLoadState.orders.find((entry) => String(entry.netsuite_id) === id);
+    if (event.target.checked && order) consolidationLoadState.selected.set(id, order);
+    else consolidationLoadState.selected.delete(id);
+    return updateConsolidationLoadSelection();
+  }
+  if (event.target?.dataset?.input === "consolidation-load-truck") {
+    consolidationLoadState.truck = event.target.value; consolidationLoadState.page = 0;
+    return updateConsolidationLoadSelection();
+  }
   if (event.target?.dataset?.returnInput || event.target?.dataset?.returnLineInput) {
     return render();
   }

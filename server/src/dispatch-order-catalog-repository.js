@@ -2,6 +2,7 @@ import crypto from "node:crypto";
 
 import { query, withTransaction } from "./db.js";
 import { overlayDispatchOrderCompletionStatuses } from "./dispatch-completion-repository.js";
+import { overlayFulfilledSalesDeliveryPlanning } from "./dispatch-fulfilled-so-repository.js";
 import { reconcileDispatchPlanLocalCos } from "./dispatch-co-lifecycle.js";
 import { reconcileDispatchGlobalOrderSources } from "./dispatch-delivery-group-repository.js";
 import {
@@ -245,7 +246,7 @@ export async function getDispatchOrderCatalogOrder(ref) {
   const canonical = order.type === "CO"
     ? (await reconcileDispatchPlanLocalCos({ orders: [order], trucks: [] })).orders
     : [order];
-  return (await overlayDispatchOrderCompletionStatuses(canonical))[0] || null;
+  return (await overlayFulfilledSalesDeliveryPlanning(await overlayDispatchOrderCompletionStatuses(canonical)))[0] || null;
 }
 
 export async function removeDispatchOrderCatalogOrder(ref) {
@@ -471,7 +472,7 @@ export async function listDispatchOrderPool({
   const [orders, state] = await Promise.all([
     overlayDispatchOrderCompletionStatuses(
       page.map((row) => ({ ...row.card, ...assignmentFields(row) }))
-    ),
+    ).then(overlayFulfilledSalesDeliveryPlanning),
     getDispatchOrderCatalogState()
   ]);
   return {

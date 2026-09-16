@@ -1,9 +1,10 @@
 import { hasActiveTransaction, query, withTransaction } from "./db.js";
+import { smartScmSplitRemainingSql } from "./smart-scm-split-inbound-sql.js";
 import { writeAudit } from "./auth-repository.js";
 import { latestSmartScmForecastRunId, smartScmForecastMap } from "./smart-scm-forecast-repository.js";
 import { calculateSmartScmOrderRequirement, calculateSmartScmPolicyLevels } from "./smart-scm-policy-calculation.js";
 import { smartScmBuiltInRouteRule, smartScmIsGormleySource, smartScmRouteRuleKey, smartScmRouteRuleMap } from "./smart-scm-route-repository.js";
-import { listSmartScmActivePlanningExclusionItemIds } from "./smart-scm-planning-exclusion-repository.js";
+import { listSmartScmActivePlanningExclusionItemIds, resumeSmartScmBlanketCoveredPlanningExclusions } from "./smart-scm-planning-exclusion-repository.js";
 import {
   smartScmAllocateBlanketCoverage,
   smartScmBlanketCoverageSnapshot
@@ -458,7 +459,7 @@ async function inventoryState({ excludeTransferOrderIds = [], applySplitOverlay 
               COALESCE(source_line.location_id, source_po.destination_location_id) AS source_location_id,
               COALESCE(child_line.location_id, child_po.destination_location_id) AS destination_location_id,
               child_line.quantity,
-              COALESCE(child_line.netsuite_received_baseline_qty, child_line.netsuite_received_qty, 0) AS received_quantity,
+              ${smartScmSplitRemainingSql()} AS remaining_quantity,
               split.status = 'active' AND child_po.netsuite_active = true AND child_line.netsuite_active = true AS active,
               COALESCE(child_line.netsuite_closed, false) AS closed,
               child_po.status_text AS order_status,
@@ -1766,12 +1767,13 @@ async function smartScmExpectedPoEvidence() {
             line.id AS line_id,
             line.item_id,
             COALESCE(line.location_id, po.destination_location_id) AS location_id,
-            GREATEST(
+            CASE WHEN split.id IS NOT NULL THEN ${smartScmSplitRemainingSql("line", "po")}
+            ELSE GREATEST(
               COALESCE(line.quantity, 0)
                 - COALESCE(line.netsuite_received_baseline_qty, line.netsuite_received_qty, 0)
                 - CASE WHEN split.id IS NULL THEN COALESCE(relocated.relocated_remaining, 0) ELSE 0 END,
               0
-            ) AS remaining_quantity,
+            ) END AS remaining_quantity,
             line.netsuite_active AS line_active,
             COALESCE(line.netsuite_closed, false) AS closed,
             split.id AS split_id,
@@ -2155,6 +2157,7 @@ export async function loadSmartScmPlanningDemandStates({
 }
 
 export async function runSmartScmPlan({ triggerSource = "manual", operatorId = null, forecastRunId = null } = {}) {
+  await resumeSmartScmBlanketCoveredPlanningExclusions({ operatorId });
   const planning = await loadSmartScmPlanningDemandStates({
     forecastRunId,
     includeTemporarilyExcluded: true

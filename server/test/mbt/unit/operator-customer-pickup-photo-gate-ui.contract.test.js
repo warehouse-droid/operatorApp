@@ -90,7 +90,7 @@ test("S7: Operator cache revision ships the live-policy client once; later toggl
     source("public/operator.html"),
     source("public/service-worker.js")
   ]);
-  assert.match(html, /operator\.js\?v=20260915-operator-yards-v1/u);
-  assert.match(serviceWorker, /mbbs-yard-operator-v145-yard-access-v1/u);
-  assert.match(serviceWorker, /operator\.js\?v=20260915-operator-yards-v1/u);
+  assert.match(html, /operator\.js\?v=20260916-operator-auto-camera-v1/u);
+  assert.match(serviceWorker, /mbbs-yard-operator-v153-auto-camera-v1/u);
+  assert.match(serviceWorker, /operator\.js\?v=20260916-operator-auto-camera-v1/u);
 });

@@ -20,6 +20,7 @@ const SUPPORTED_UPLOAD_TYPES = [
 const ABSOLUTE_MAX_UPLOAD_BYTES = 50 * 1024 * 1024;
 
 const RECORD_TYPES = new Set([
+  "operator-consolidation-load-photo",
   "operator-load-photo",
   "operator-receiving-photo",
   "operator-co-receiving-photo",

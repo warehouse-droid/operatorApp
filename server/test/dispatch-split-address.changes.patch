@@ -1,0 +1,280 @@
+--- a/src/dispatch-delivery-group-repository.js
++++ b/src/dispatch-delivery-group-repository.js
+@@ -1,4 +1,5 @@
+ import { query, withTransaction } from "./db.js";
++import { DISPATCH_FLEET_PLANNING_LOCK } from "./dispatch-fleet-status.js";
+ import { dispatchLoadAssignment } from "./dispatch-load-assignment.js";
+ import {
+   compactDispatchOrderCard,
+@@ -24,6 +25,7 @@
+ ]);
+ const PLAN_LIVE_DEFINITION_FIELDS = Object.freeze([
+   ...SPLIT_LIVE_SOURCE_FIELDS,
++  "dispatchDetailsOverride",
+   "customer", "customerName", "childOrders", "groupAliases", "isGrouped", "isSplit",
+   "items", "pallets", "layers", "sections", "pieces", "salesQty",
+   "salesQuantities", "packed", "weight", "totalWeightLbs", "unloadMinutes",
+@@ -949,6 +951,80 @@
+   return clearCancelledTransitCoMetadata(order, overlays);
+ }
+ 
++function applySplitDispatchDetails(order = {}) {
++  const details = order.dispatchDetailsOverride;
++  if (!details || typeof details !== "object" || Array.isArray(details)) return order;
++  const next = { ...order };
++  if (Object.hasOwn(details, "address")) {
++    next.address = text(details.address);
++    next.destinationAddress = next.address;
++    next.defaultDestinationAddress = next.address;
++  }
++  if (Object.hasOwn(details, "pickupAddress")) {
++    next.pickupAddressOverride = text(details.pickupAddress);
++    next.sourceAddress = next.pickupAddressOverride || next.defaultSourceAddress || "";
++  }
++  for (const field of ["expectedDeliveryDate", "windowStart", "windowEnd"]) {
++    if (Object.hasOwn(details, field)) next[field] = text(details[field]);
++  }
++  return next;
++}
++
++export async function updateDispatchSalesSplitDetails(orderRef, patch = {}) {
++  return withTransaction(async () => {
++    // Plan saves read the global definition before writing their snapshot. Share
++    // their lock so a save already in flight cannot overwrite this explicit edit.
++    await query("SELECT pg_advisory_xact_lock(hashtext($1))", [DISPATCH_FLEET_PLANNING_LOCK]);
++    const row = (await query(
++      `SELECT split_ref, full_order, active FROM dispatch_global_order_splits
++        WHERE lower(split_ref) = lower($1) AND order_type = 'SO' AND definition_kind = 'split'
++        FOR UPDATE`, [orderRef]
++    )).rows[0];
++    if (!row) return null;
++    if (!row.active) throw Object.assign(new Error("This split was retired. Reload Dispatch before editing it."), {
++      status: 409, code: "DISPATCH_DERIVED_ORDER_RETIRED"
++    });
++    const details = {
++      ...row.full_order.dispatchDetailsOverride,
++      address: text(patch.address),
++      expectedDeliveryDate: text(patch.expectedDeliveryDate ?? patch.expected_delivery_date),
++      windowStart: text(patch.windowStart ?? patch.window_start),
++      windowEnd: text(patch.windowEnd ?? patch.window_end)
++    };
++    if (patch.pickupAddress !== undefined || patch.pickup_address !== undefined) {
++      details.pickupAddress = text(patch.pickupAddress ?? patch.pickup_address);
++    }
++    // Validate even when this split has not yet been materialized for delivery.
++    const expectedDeliveryDate = details.expectedDeliveryDate || null;
++    await query("SELECT $1::date", [expectedDeliveryDate]);
++    const next = applySplitDispatchDetails({ ...row.full_order, dispatchDetailsOverride: details });
++    const pickupAddress = next.pickupAddressOverride || "";
++    await query(
++      `UPDATE dispatch_global_order_splits
++          SET full_order = $2::jsonb, card = $3::jsonb, search_text = $4, updated_at = now()
++        WHERE split_ref = $1`,
++      [row.split_ref, JSON.stringify(next), JSON.stringify(compactDispatchOrderCard(next)), dispatchOrderSearchText(next)]
++    );
++    await query(
++      `UPDATE sales_orders SET dispatch_address = $2, dispatch_pickup_address = $3,
++          expected_delivery_date = $4::date, dispatch_window_start = $5, dispatch_window_end = $6,
++          dispatch_parse_source = 'manual-dispatch-details', dispatch_parsed_at = now()
++        WHERE tranid = $1`,
++      [row.split_ref, next.address, pickupAddress, expectedDeliveryDate,
++        next.windowStart, next.windowEnd]
++    );
++    await query("DELETE FROM dispatch_order_catalog_entries WHERE lower(order_ref) = lower($1)", [row.split_ref]);
++    await query(`UPDATE dispatch_order_catalog_state SET generation = generation + 1,
++      catalog_count = (SELECT count(*)::int FROM dispatch_order_catalog_entries), updated_at = now()
++      WHERE singleton = true`);
++    await reconcileDispatchGlobalOrderSources({ orders: [next] });
++    return { tranid: row.split_ref, dispatch_address: next.address,
++      dispatch_pickup_address: pickupAddress, expected_delivery_date: expectedDeliveryDate,
++      dispatch_window_start: next.windowStart, dispatch_window_end: next.windowEnd,
++      source_table: "sales_orders", order_type: "sales_order", dispatch_details_override: details };
++  });
++}
++
+ function splitWithFreshSource(split = {}, source = {}, { activeBySource, allByRef } = {}) {
+   const next = cloneOrder(stripTransitOverlays(split, allByRef));
+   for (const field of SPLIT_LIVE_SOURCE_FIELDS) {
+@@ -959,7 +1035,7 @@
+   next.originalOrderId = splitParentRef(split);
+   next.globalOrderDefinition = true;
+   next.globalOrderDefinitionKind = text(split.globalOrderDefinitionKind || "split");
+-  return applyActiveTransitCoMetadata(next, activeBySource);
++  return applyActiveTransitCoMetadata(applySplitDispatchDetails(next), activeBySource);
+ }
+ 
+ function groupWithFreshSources(group = {}, freshByRef = new Map(), { activeBySource, allByRef } = {}) {
+@@ -1250,7 +1326,7 @@
+         if (Object.prototype.hasOwnProperty.call(current, field)) {
+           reconciled[field] = cloneValue(current[field]);
+         } else if ([
+-          "transitCo", "transitOriginalPickupLocations", "transitOriginalSourceYard"
++          "transitCo", "transitOriginalPickupLocations", "transitOriginalSourceYard", "dispatchDetailsOverride"
+         ].includes(field)) {
+           delete reconciled[field];
+         }
+--- a/src/dispatch-repository.js
++++ b/src/dispatch-repository.js
+@@ -3,6 +3,7 @@
+ import { pool, query, withTransaction } from "./db.js";
+ import { dispatchLoadAssignment } from "./dispatch-load-assignment.js";
+ import { DISPATCH_FLEET_PLANNING_LOCK } from "./dispatch-fleet-status.js";
++import { updateDispatchSalesSplitDetails } from "./dispatch-delivery-group-repository.js";
+ import { assertDispatchExecutedPrefixPreserved } from "./dispatch-executed-prefix-repository.js";
+ import {
+   syncDispatchPlanOrderAssignments,
+@@ -2122,6 +2123,8 @@
+ 
+ export async function updateDispatchOrderDetails(orderRef, patch = {}) {
+   await assertNoClosedNetSuiteOrders([orderRef], "change Dispatch details");
++  const split = await updateDispatchSalesSplitDetails(orderRef, patch);
++  if (split) return split;
+   const address = String(patch.address || "").trim();
+   const pickupAddressProvided = patch.pickupAddress !== undefined
+     || patch.pickup_address !== undefined;
+--- a/src/delivery-repository.js
++++ b/src/delivery-repository.js
+@@ -2582,6 +2582,11 @@
+ async function materializeSalesSplitOrder(order, parent) {
+   const splitId = syntheticOrderId(`sales:${order.id}`);
+   const splitItems = Array.isArray(order.items) ? order.items.filter(Boolean) : [];
++  const savedDetails = (await query(
++    `SELECT full_order->'dispatchDetailsOverride' AS details FROM dispatch_global_order_splits
++      WHERE split_ref = $1 AND active = true`, [order.id]
++  )).rows[0]?.details;
++  const details = savedDetails || order.dispatchDetailsOverride || {};
+   await query(
+     `INSERT INTO sales_orders (
+        netsuite_id, tranid, trandate, customer_id, customer, status, status_text,
+@@ -2590,15 +2595,20 @@
+        expected_delivery_date, dispatch_address, dispatch_window_start,
+        dispatch_window_end, dispatch_instructions, operator_status,
+        local_yard_order_status, netsuite_active, synced_at, dispatch_parse_source,
+-       dispatch_note_hash, dispatch_parsed_at, fulfillment_status
++       dispatch_note_hash, dispatch_parsed_at, fulfillment_status, dispatch_pickup_address
+      )
+      SELECT $1, $2, trandate, customer_id, customer, status, status_text,
+             foreign_total, order_location_id, order_location, outbound_location_id,
+             outbound_location, delivery_method_id, sales_order_type, $3,
+-            COALESCE($4::date, expected_delivery_date), dispatch_address, dispatch_window_start,
+-            dispatch_window_end, dispatch_instructions, 'open',
++            CASE WHEN $6::jsonb ? 'expectedDeliveryDate' THEN NULLIF($6::jsonb->>'expectedDeliveryDate', '')::date
++              ELSE COALESCE($4::date, expected_delivery_date) END,
++            CASE WHEN $6::jsonb ? 'address' THEN $6::jsonb->>'address' ELSE dispatch_address END,
++            CASE WHEN $6::jsonb ? 'windowStart' THEN $6::jsonb->>'windowStart' ELSE dispatch_window_start END,
++            CASE WHEN $6::jsonb ? 'windowEnd' THEN $6::jsonb->>'windowEnd' ELSE dispatch_window_end END,
++            dispatch_instructions, 'open',
+             'Open', true, now(), 'dispatch-split',
+-            dispatch_note_hash, now(), 'not_fulfilled'
++            dispatch_note_hash, now(), 'not_fulfilled',
++            CASE WHEN $6::jsonb ? 'pickupAddress' THEN $6::jsonb->>'pickupAddress' ELSE dispatch_pickup_address END
+        FROM sales_orders
+       WHERE netsuite_id = $5
+      ON CONFLICT (netsuite_id) DO UPDATE
+@@ -2606,12 +2616,13 @@
+            memo = EXCLUDED.memo,
+            expected_delivery_date = EXCLUDED.expected_delivery_date,
+            dispatch_address = EXCLUDED.dispatch_address,
++           dispatch_pickup_address = EXCLUDED.dispatch_pickup_address,
+            dispatch_window_start = EXCLUDED.dispatch_window_start,
+            dispatch_window_end = EXCLUDED.dispatch_window_end,
+            dispatch_instructions = EXCLUDED.dispatch_instructions,
+            netsuite_active = true,
+            synced_at = now()`,
+-    [splitId, order.id, order.notes || `Split from ${order.originalOrderId}`, dateOnly(order.expectedDeliveryDate || order.expected_delivery_date), parent.netsuite_id]
++    [splitId, order.id, order.notes || `Split from ${order.originalOrderId}`, dateOnly(order.expectedDeliveryDate || order.expected_delivery_date), parent.netsuite_id, JSON.stringify(details)]
+   );
+   await query(
+     `INSERT INTO dispatch_scm_so_splits (
+--- a/src/dispatch-planner-optimization.js
++++ b/src/dispatch-planner-optimization.js
+@@ -77,7 +77,7 @@
+   const fields = [
+     "id", "orderId", "orderRef", "tranid", "refNumber", "type", "orderKind", "sourceTable",
+     "customer", "customerName", "address", "dropAddress", "destinationAddress", "pickupAddress",
+-    "pickupAddressOverride", "sourceAddress", "dropoffLocation", "pickupLocation", "pickupLocations",
++    "pickupAddressOverride", "dispatchDetailsOverride", "sourceAddress", "dropoffLocation", "pickupLocation", "pickupLocations",
+     "sourceYard", "destinationYard", "destinationLocationId", "expectedDeliveryDate", "windowStart",
+     "windowEnd", "pallets", "layers", "salesQty", "weight", "totalWeightLbs", "status", "statusText",
+     "localDispatchStatus", "dispatchRef", "originalPoRef", "sourcePoRef", "sourcePoRefs",
+--- a/public/dispatch.js
++++ b/public/dispatch.js
+@@ -17454,7 +17454,7 @@
+     return;
+   }
+   if (form.dataset.form === "edit-order-details") {
+-    const order = orderById(modalOrderId);
++    let order = orderById(modalOrderId);
+     if (!order) return;
+     const isPurchaseOrderDeliveryOverride = order.type === "PO" && order.sourceTable === "purchase_orders";
+     const windowStart = modalTimeValue(data.windowStart);
+@@ -17507,30 +17507,42 @@
+     const detailsEndpoint = isPurchaseOrderDeliveryOverride
+       ? `/api/dispatch/orders/${encodeURIComponent(order.id)}/details?response=targeted`
+       : `/api/dispatch/orders/${encodeURIComponent(order.id)}/details?response=ack`;
+-    const saveDetails = isLocalDispatchOrder(order)
++    const persistentSalesSplit = order.type === "SO" && Boolean(splitParentOrderId(order));
++    const saveDetails = isLocalDispatchOrder(order) && !persistentSalesSplit
+       ? Promise.resolve({ orders: null })
+-      : fetch(detailsEndpoint, {
+-          method: "PUT",
+-          headers: { "Content-Type": "application/json" },
+-          body: JSON.stringify(dispatchLeaseRequestPayload({
+-            type: order.type,
+-            sourceTable: order.sourceTable,
+-            address: data.address,
+-            pickupAddress: String(data.pickupAddress || "").trim(),
+-            expectedDeliveryDate: data.expectedDeliveryDate,
+-            windowStart,
+-            windowEnd,
+-            audit: {
+-              sessionId: dispatchSessionId,
+-              before: summarizeOrder(order)
+-            }
+-          }))
++      : Promise.resolve().then(async () => {
++          if (persistentSalesSplit) {
++            const orderId = order.id;
++            await saveCurrentPlanNow();
++            order = orderById(orderId);
++            if (!order) throw new Error("The split is no longer available. Reload Dispatch before editing it.");
++          }
++          return fetch(detailsEndpoint, {
++            method: "PUT",
++            headers: { "Content-Type": "application/json" },
++            body: JSON.stringify(dispatchLeaseRequestPayload({
++              type: order.type,
++              sourceTable: order.sourceTable,
++              address: data.address,
++              pickupAddress: String(data.pickupAddress || "").trim(),
++              expectedDeliveryDate: data.expectedDeliveryDate,
++              windowStart,
++              windowEnd,
++              audit: {
++                sessionId: dispatchSessionId,
++                before: summarizeOrder(order)
++              }
++            }))
++          });
+         }).then((response) => {
+           if (!response.ok) return response.text().then((text) => Promise.reject(new Error(text)));
+           return response.json();
+         });
+     saveDetails.then((payload) => {
+       const pickupAddress = String(data.pickupAddress || "").trim();
++      if (payload.updated?.dispatch_details_override) {
++        order.dispatchDetailsOverride = payload.updated.dispatch_details_override;
++      }
+       if (!isPurchaseOrderDeliveryOverride) {
+         const address = String(payload.updated?.dispatch_address ?? data.address ?? "").trim();
+         order.address = address;
+--- a/public/dispatch.html
++++ b/public/dispatch.html
+@@ -14,6 +14,6 @@
+     <script src="/app-sidebar.js?v=20260728-custom-orders-v1"></script>
+     <script src="/dispatch-auth.js?v=20260724-sales-auth-v2"></script>
+     <script src="/delivery-instruction-upload.js?v=20260812-delivery-image-720p-v1"></script>
+-    <script src="/dispatch.js?v=20260911-map-geometry-v2&amp;cargo=20260911-v1&amp;preview=20260911-v1&amp;address=20260911-v1&amp;split=20260914-v1&amp;lifecycle=20260914-v1&amp;sov=20260914-v1&amp;pool=20260915-v1&amp;fulfilled-so=20260915-v1&amp;split-target=20260915-v1"></script>
++    <script src="/dispatch.js?v=20260911-map-geometry-v2&amp;cargo=20260911-v1&amp;preview=20260911-v1&amp;address=20260911-v1&amp;split=20260914-v1&amp;lifecycle=20260914-v1&amp;sov=20260914-v1&amp;pool=20260915-v1&amp;fulfilled-so=20260915-v1&amp;split-target=20260915-v1&amp;split-address=20260915-v1"></script>
+   </body>
+ </html>

@@ -36,6 +36,10 @@ export function smartScmBlanketBalanceByItem(poolRows = []) {
   return balances;
 }
 
+/**
+ * @param {{search?: string, isBlanket?: boolean | null, sourcePoId?: number | string | null,
+ *   limit?: number, offset?: number}} [options]
+ */
 export async function listSmartScmBlanketPoolRows({
   search = "",
   isBlanket = null,

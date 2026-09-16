@@ -1,0 +1,27 @@
+order,netsuite_status,operator_status,receiving_status,locally_completed,dispatch_planning,quantity_corrections,new_lines,applied_at_utc
+TOB00569,Received,Loaded,Received,False,Allowed,,,2026-09-15T19:37:13.384Z
+TOB00766,Received,Loaded,Received,True,Blocked,,,2026-09-15T19:37:13.384Z
+TOB00793,Received,Loaded,Received,False,Allowed,,,2026-09-15T19:37:13.384Z
+TOB00800,Received,Loaded,Received,False,Allowed,,,2026-09-15T19:37:13.384Z
+TOB00838,Received,Loaded,Received,False,Allowed,,,2026-09-15T19:37:13.384Z
+TOB00896,Received,Loaded,Received,True,Blocked,,,2026-09-15T19:37:13.384Z
+TOB00903,Received,Loaded,Received,True,Blocked,,,2026-09-15T19:37:13.384Z
+TOB00942,Received,Loaded,Received,False,Allowed,,,2026-09-15T19:37:13.384Z
+TOB00956,Received,Loaded,Received,True,Blocked,receiving Alliance Supersand Grey: 1120 -> 840 EACH,,2026-09-15T19:37:13.384Z
+TOB00965,Received,Loaded,Received,True,Blocked,receiving UNI-SIES-COP383-CEL-GN: 16 -> 13 PC,,2026-09-15T19:37:13.384Z
+TOB00973,Received,Loaded,Received,True,Blocked,,,2026-09-15T19:37:13.384Z
+TOB00974,Received,Loaded,Received,True,Blocked,,,2026-09-15T19:37:13.384Z
+TOB00975,Received,Loaded,Received,True,Blocked,receiving BC-AZ70S-RDM-NIP: 499.26 -> 308.06 SQFT; receiving PALLET: 36 -> 34 EACH,,2026-09-15T19:37:13.384Z
+TOB00982,Received,Loaded,Received,True,Blocked,,outbound UNI-WIN60S-1530-SAFARI: 218 SQFT; receiving UNI-WIN60S-1530-SAFARI: 218 SQFT,2026-09-15T19:37:13.384Z
+TOB00983,Received,Loaded,Received,True,Blocked,,,2026-09-15T19:37:13.384Z
+TOB00984,Received,Loaded,Received,True,Blocked,,,2026-09-15T19:37:13.384Z
+TOB00987,Received,Loaded,Received,False,Allowed,,,2026-09-15T19:37:13.384Z
+TOB00989,Received,Loaded,Received,True,Blocked,,,2026-09-15T19:37:13.384Z
+TOB00994,Received,Loaded,Received,True,Blocked,,,2026-09-15T19:37:13.384Z
+TOB00995,Received,Loaded,Received,True,Blocked,,,2026-09-15T19:37:13.384Z
+TOB01001,Received,Loaded,Received,True,Blocked,,,2026-09-15T19:37:13.384Z
+TOB01022,Received,Loaded,Received,True,Blocked,,,2026-09-15T19:37:13.384Z
+TOB01023,Received,Loaded,Received,False,Allowed,,,2026-09-15T19:37:13.384Z
+TOB01025,Received,Loaded,Received,True,Blocked,,,2026-09-15T19:37:13.384Z
+TOB01027,Received,Loaded,Received,True,Blocked,,,2026-09-15T19:37:13.384Z
+TOB01083,Received,Loaded,Received,True,Blocked,,,2026-09-15T19:37:13.384Z

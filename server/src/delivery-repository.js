@@ -1,3 +1,6 @@
+import { isLocalCoLoaded, projectLoadedCoLine } from "./local-co-loaded-policy.js";
+import { deliveryPackingRemainder, deliveryPackingRemainderSql, DELIVERY_PACK_ROUNDING_TOLERANCE as LOAD_SALES_QTY_TOLERANCE } from "./delivery-packing-progress.js";
+import { withConsolidatedLoadMutation } from "./consolidation-load-locks.js";
 import { deliveryOrderWithinYards } from "./operator-yard-access.js";
 import crypto from "node:crypto";
 import { query, withTransaction } from "./db.js";
@@ -168,7 +171,6 @@ async function decorateActiveSalesOrderReload(order) {
   return decorateSalesOrderReload(order, cycle);
 }
 
-const LOAD_SALES_QTY_TOLERANCE = 0.1;
 
 function exactBilledSalesOrderSql(alias) {
   return `(
@@ -352,7 +354,7 @@ function lineLoadSalesQuantity(line) {
   const packedSalesQty = roundQuantity(linePackedSalesQuantity(line));
   if (packedSalesQty <= 0) return 0;
   const remainingSalesQty = roundQuantity(Math.max(0, lineRequiredSalesQuantity(line) - lineLoadedSalesQuantity(line)));
-  if (remainingSalesQty > 0 && Math.abs(remainingSalesQty - packedSalesQty) <= LOAD_SALES_QTY_TOLERANCE) {
+  if (remainingSalesQty > 0 && roundQuantity(Math.abs(remainingSalesQty - packedSalesQty)) <= LOAD_SALES_QTY_TOLERANCE) {
     return remainingSalesQty;
   }
   return packedSalesQty;
@@ -365,7 +367,7 @@ function wholeUnitsFromSalesQuantity(salesQuantity, conversion) {
   const rawUnits = sales / unitSize;
   const floorUnits = Math.floor(rawUnits + 0.000001);
   const ceilUnits = Math.ceil(rawUnits - 0.000001);
-  if (ceilUnits > floorUnits && Math.abs((ceilUnits * unitSize) - sales) <= LOAD_SALES_QTY_TOLERANCE) {
+  if (ceilUnits > floorUnits && roundQuantity(Math.abs((ceilUnits * unitSize) - sales)) <= LOAD_SALES_QTY_TOLERANCE) {
     return ceilUnits;
   }
   return floorUnits;
@@ -672,7 +674,7 @@ function buildDeliveryLoadValidation(order, { allowNetSuiteCompleted = false } =
       continue;
     }
 
-    if (packedSalesQty > remainingSalesQty + LOAD_SALES_QTY_TOLERANCE) {
+    if (roundQuantity(packedSalesQty - remainingSalesQty) > LOAD_SALES_QTY_TOLERANCE) {
       issues.push({
         ...issue,
         code: line.sync_exception || "overpacked",
@@ -849,8 +851,8 @@ function linePackedSalesSql(alias) {
 }
 
 function lineOpenSalesSql(alias) {
-  const remaining = `((${lineRequiredSalesSql(alias)}) - COALESCE(${alias}.loaded_qty, 0) - (${linePackedSalesSql(alias)}))`;
-  return `CASE WHEN ${remaining} <= 0.000001 THEN 0 ELSE ${remaining} END`;
+  return deliveryPackingRemainderSql(lineRequiredSalesSql(alias), `COALESCE(${alias}.loaded_qty, 0)`, linePackedSalesSql(alias),
+    ["to_plt", "to_lyr", "to_sec", "to_pcs"].map(field => `${alias}.${field}`));
 }
 
 function isDispatchGroupOrderId(value) {
@@ -876,7 +878,8 @@ function lineHasPackedQuantity(line) {
 
 function lineHasOpenQuantity(line) {
   return isDeliveryPickableLine(line)
-    && lineRequiredSalesQuantity(line) > lineLoadedSalesQuantity(line) + linePackedSalesQuantity(line) + 0.000001;
+    && deliveryPackingRemainder(lineRequiredSalesQuantity(line), lineLoadedSalesQuantity(line), linePackedSalesQuantity(line),
+      [line.to_plt, line.to_lyr, line.to_sec, line.to_pcs].map(positiveQuantity)) > 0;
 }
 
 function groupLineKey(line) {
@@ -1321,9 +1324,7 @@ async function refreshDeliveryProgressStatus(orderId, { clearPreparing = false }
   });
   const hasPacked = pickableLines.some((line) => linePackedSalesQuantity(line) > 0);
   const hasLoaded = pickableLines.some((line) => lineLoadedSalesQuantity(line) > 0);
-  const hasOpen = pickableLines.some((line) => {
-    return lineRequiredSalesQuantity(line) > lineLoadedSalesQuantity(line) + linePackedSalesQuantity(line) + 0.000001;
-  });
+  const hasOpen = pickableLines.some(lineHasOpenQuantity);
 
   let status = "open";
   let localYardOrderStatus = "Open";
@@ -1414,7 +1415,8 @@ function mapLocalCoLineForDelivery(line = {}) {
 function mapLocalCoOrderForDelivery(co = {}, lines = []) {
   const details = co.details && typeof co.details === "object" ? co.details : {};
   const status = String(co.status || "pending_load");
-  const operatorStatus = status === "packed" ? "packed" : status === "preparing" ? "preparing" : "open";
+  const loaded = isLocalCoLoaded(co);
+  const operatorStatus = loaded ? "loaded" : status === "packed" ? "packed" : status === "preparing" ? "preparing" : "open";
   return {
     local_co_id: co.id,
     netsuite_id: co.delivery_order_id || -Number(co.id),
@@ -1432,7 +1434,7 @@ function mapLocalCoOrderForDelivery(co = {}, lines = []) {
     delivery_method_id: null,
     delivery_method: "Transit CO",
     operator_status: operatorStatus,
-    local_yard_order_status: "Open",
+    local_yard_order_status: loaded ? "Loaded" : "Open",
     preparing_operator_id: co.preparing_operator_id || null,
     preparing_started_at: co.preparing_started_at || null,
     status_updated_at: co.updated_at || co.created_at,
@@ -1459,7 +1461,7 @@ function mapLocalCoOrderForDelivery(co = {}, lines = []) {
     destination_location: co.to_location,
     warning_count: 0,
     underpack_count: 0,
-    lines: lines.map(mapLocalCoLineForDelivery).filter(hasDeliveryDisplayQuantity)
+    lines: lines.map(mapLocalCoLineForDelivery).map(line => loaded ? projectLoadedCoLine(line, lineRequiredSalesQuantity(line)) : line).filter(hasDeliveryDisplayQuantity)
   };
 }
 
@@ -1654,6 +1656,7 @@ function mapVrmaOrderForDelivery(row = {}, lines = []) {
   return { ...order, lines: lines.map((line) => mapVrmaLineForDelivery(line, order)) };
 }
 
+/** @param {{locationId?: number|string|null, ref?: string, status?: string}} [options] */
 export async function listVrmaDeliveryPrepOrders({ locationId = null, ref = "", status = "active" } = {}) {
   const normalizedStatus = String(status || "").trim().toLowerCase();
   const params = [];
@@ -1771,6 +1774,7 @@ async function getVrmaDeliveryPrepOrder(ref) {
   }, lines.rows);
 }
 
+/** @param {{locationId?: number|string|null, status?: string, orderType?: string, planDate?: string|null, truckPlate?: string|null, allowedOperatorYards?: number[]|null}} [options] */
 export async function listDeliveryOrders({ locationId = null, status = "active", orderType = "sales_order", planDate = null, truckPlate = null, allowedOperatorYards = null } = {}) {
   const sandboxFixtures = isNetSuiteSandboxEnvironment();
   const sandboxSql = sandboxFixtures ? "true" : "false";
@@ -2577,6 +2581,11 @@ export async function findCustomerPickupOrder(code, { locationId = null } = {}) 
 async function materializeSalesSplitOrder(order, parent) {
   const splitId = syntheticOrderId(`sales:${order.id}`);
   const splitItems = Array.isArray(order.items) ? order.items.filter(Boolean) : [];
+  const savedDetails = (await query(
+    `SELECT full_order->'dispatchDetailsOverride' AS details FROM dispatch_global_order_splits
+      WHERE split_ref = $1 AND active = true`, [order.id]
+  )).rows[0]?.details;
+  const details = savedDetails || order.dispatchDetailsOverride || {};
   await query(
     `INSERT INTO sales_orders (
        netsuite_id, tranid, trandate, customer_id, customer, status, status_text,
@@ -2585,15 +2594,20 @@ async function materializeSalesSplitOrder(order, parent) {
        expected_delivery_date, dispatch_address, dispatch_window_start,
        dispatch_window_end, dispatch_instructions, operator_status,
        local_yard_order_status, netsuite_active, synced_at, dispatch_parse_source,
-       dispatch_note_hash, dispatch_parsed_at, fulfillment_status
+       dispatch_note_hash, dispatch_parsed_at, fulfillment_status, dispatch_pickup_address
      )
      SELECT $1, $2, trandate, customer_id, customer, status, status_text,
             foreign_total, order_location_id, order_location, outbound_location_id,
             outbound_location, delivery_method_id, sales_order_type, $3,
-            COALESCE($4::date, expected_delivery_date), dispatch_address, dispatch_window_start,
-            dispatch_window_end, dispatch_instructions, 'open',
+            CASE WHEN $6::jsonb ? 'expectedDeliveryDate' THEN NULLIF($6::jsonb->>'expectedDeliveryDate', '')::date
+              ELSE COALESCE($4::date, expected_delivery_date) END,
+            CASE WHEN $6::jsonb ? 'address' THEN $6::jsonb->>'address' ELSE dispatch_address END,
+            CASE WHEN $6::jsonb ? 'windowStart' THEN $6::jsonb->>'windowStart' ELSE dispatch_window_start END,
+            CASE WHEN $6::jsonb ? 'windowEnd' THEN $6::jsonb->>'windowEnd' ELSE dispatch_window_end END,
+            dispatch_instructions, 'open',
             'Open', true, now(), 'dispatch-split',
-            dispatch_note_hash, now(), 'not_fulfilled'
+            dispatch_note_hash, now(), 'not_fulfilled',
+            CASE WHEN $6::jsonb ? 'pickupAddress' THEN $6::jsonb->>'pickupAddress' ELSE dispatch_pickup_address END
        FROM sales_orders
       WHERE netsuite_id = $5
      ON CONFLICT (netsuite_id) DO UPDATE
@@ -2601,12 +2615,13 @@ async function materializeSalesSplitOrder(order, parent) {
            memo = EXCLUDED.memo,
            expected_delivery_date = EXCLUDED.expected_delivery_date,
            dispatch_address = EXCLUDED.dispatch_address,
+           dispatch_pickup_address = EXCLUDED.dispatch_pickup_address,
            dispatch_window_start = EXCLUDED.dispatch_window_start,
            dispatch_window_end = EXCLUDED.dispatch_window_end,
            dispatch_instructions = EXCLUDED.dispatch_instructions,
            netsuite_active = true,
            synced_at = now()`,
-    [splitId, order.id, order.notes || `Split from ${order.originalOrderId}`, dateOnly(order.expectedDeliveryDate || order.expected_delivery_date), parent.netsuite_id]
+    [splitId, order.id, order.notes || `Split from ${order.originalOrderId}`, dateOnly(order.expectedDeliveryDate || order.expected_delivery_date), parent.netsuite_id, JSON.stringify(details)]
   );
   await query(
     `INSERT INTO dispatch_scm_so_splits (
@@ -3929,7 +3944,7 @@ async function recordVrmaDeliveryLoad(order, operatorId, { photoDataUrls }) {
  * @param {any} operatorId
  * @param {{photoDataUrls?: any[], requestId?: any, allowNetSuiteCompleted?: boolean}} [options]
  */
-export async function recordDeliveryLoad(orderId, operatorId, {
+async function recordDeliveryLoadUnlocked(orderId, operatorId, {
   photoDataUrls,
   requestId,
   allowNetSuiteCompleted = false
@@ -5259,7 +5274,7 @@ async function applyGroupedLinePackedQuantity(groupId, lineId, values, operatorI
   });
 }
 
-export async function setConsolidationDeliveryLinePackedQuantity(orderId, lineId, values, operatorId) {
+async function setConsolidationDeliveryLinePackedQuantityUnlocked(orderId, lineId, values, operatorId) {
   if (!operatorId) throw new Error("Operator ID is required.");
   if (!isDispatchGroupOrderId(orderId)) {
     await setDeliveryLinePackedQuantity(orderId, lineId, values, operatorId, { allowConsolidation: true });
@@ -5479,7 +5494,7 @@ async function claimPreparingOrder(orderId, operatorId) {
   return getDeliveryOrder(orderId);
 }
 
-export async function releaseCurrentDeliveryDraft(orderId, operatorId) {
+async function releaseCurrentDeliveryDraftUnlocked(orderId, operatorId) {
   if (!operatorId) throw new Error("Operator ID is required.");
   if (isDispatchGroupOrderId(orderId)) {
     const groupOrder = await getDispatchGroupDeliveryOrder(orderId);
@@ -5624,7 +5639,7 @@ export async function releaseCurrentDeliveryDraft(orderId, operatorId) {
   return refreshed;
 }
 
-export async function confirmDeliveryLine(orderId, lineId, values, operatorId) {
+async function confirmDeliveryLineUnlocked(orderId, lineId, values, operatorId) {
   await assertNoClosedNetSuiteOrders([orderId], "confirm a Delivery line");
   if (!operatorId) throw new Error("Operator ID is required.");
   if (isDispatchGroupOrderId(orderId)) {
@@ -5702,7 +5717,7 @@ export async function confirmDeliveryLine(orderId, lineId, values, operatorId) {
   });
 }
 
-export async function confirmDeliveryLines(orderId, lines = [], operatorId) {
+async function confirmDeliveryLinesUnlocked(orderId, lines = [], operatorId) {
   await assertNoClosedNetSuiteOrders([orderId], "confirm Delivery lines");
   if (!operatorId) throw new Error("Operator ID is required.");
   const requestedLines = Array.isArray(lines) ? lines : [];
@@ -5891,7 +5906,7 @@ export async function clearCustomerPickupDraft(orderId, operatorId) {
   return getDeliveryOrder(orderId);
 }
 
-export async function setDeliveryLinePackedQuantity(orderId, lineId, values, operatorId, { allowConsolidation = false } = {}) {
+async function setDeliveryLinePackedQuantityUnlocked(orderId, lineId, values, operatorId, { allowConsolidation = false } = {}) {
   await assertNoClosedNetSuiteOrders([orderId], "change a Delivery packed quantity");
   if (!operatorId) throw new Error("Operator ID is required.");
   if (isDispatchGroupOrderId(orderId)) {
@@ -5967,7 +5982,7 @@ export async function setDeliveryLinePackedQuantity(orderId, lineId, values, ope
   });
 }
 
-export async function unpackDeliveryLine(orderId, lineId, values, operatorId) {
+async function unpackDeliveryLineUnlocked(orderId, lineId, values, operatorId) {
   await assertNoClosedNetSuiteOrders([orderId], "unpack a Delivery line");
   if (!operatorId) throw new Error("Operator ID is required.");
   if (isDispatchGroupOrderId(orderId)) {
@@ -6129,7 +6144,7 @@ export async function unpackDeliveryLine(orderId, lineId, values, operatorId) {
   });
 }
 
-export async function unpackDeliveryOrder(orderId, operatorId) {
+async function unpackDeliveryOrderUnlocked(orderId, operatorId) {
   await assertNoClosedNetSuiteOrders([orderId], "unpack a Delivery order");
   if (!operatorId) throw new Error("Operator ID is required.");
   if (isDispatchGroupOrderId(orderId)) {
@@ -6238,7 +6253,7 @@ export async function unpackDeliveryOrder(orderId, operatorId) {
   });
 }
 
-export async function updateDeliveryStatus(id, status, operatorId) {
+async function updateDeliveryStatusUnlocked(id, status, operatorId) {
   await assertNoClosedNetSuiteOrders([id], "change Operator Delivery status");
   if (!operatorId) throw new Error("Operator ID is required.");
   const allowed = new Set(["open", "preparing", "packed"]);
@@ -6400,7 +6415,7 @@ export async function updateDeliveryStatus(id, status, operatorId) {
   });
 }
 
-export async function markConsolidationDeliveryOrderPacked(id, operatorId) {
+async function markConsolidationDeliveryOrderPackedUnlocked(id, operatorId) {
   if (!operatorId) throw new Error("Operator ID is required.");
   return withTransaction(async () => {
     if (isDispatchGroupOrderId(id)) {
@@ -6456,7 +6471,7 @@ export async function markConsolidationDeliveryOrderPacked(id, operatorId) {
   });
 }
 
-export async function releaseConsolidationDeliveryOrder(id, operatorId) {
+async function releaseConsolidationDeliveryOrderUnlocked(id, operatorId) {
   if (!operatorId) throw new Error("Operator ID is required.");
   return withTransaction(async () => {
     if (isDispatchGroupOrderId(id)) {
@@ -6485,3 +6500,50 @@ export async function markDeliveryPrepared(id, { operatorName, photoPath, notes 
     [id, operatorName || null, photoPath || null, notes || null]
   );
 }
+
+// Individual, grouped and consolidated operations share the same quantity locks.
+export async function recordDeliveryLoad(...args) {
+  return withConsolidatedLoadMutation(() => getDeliveryOrder(args[0], { includeNetSuiteClosed: true }), () => recordDeliveryLoadUnlocked(...args));
+}
+
+export async function setConsolidationDeliveryLinePackedQuantity(...args) {
+  return withConsolidatedLoadMutation(() => getDeliveryOrder(args[0], { includeNetSuiteClosed: true }), () => setConsolidationDeliveryLinePackedQuantityUnlocked(...args));
+}
+
+export async function releaseCurrentDeliveryDraft(...args) {
+  return withConsolidatedLoadMutation(() => getDeliveryOrder(args[0], { includeNetSuiteClosed: true }), () => releaseCurrentDeliveryDraftUnlocked(...args));
+}
+
+export async function confirmDeliveryLine(...args) {
+  return withConsolidatedLoadMutation(() => getDeliveryOrder(args[0], { includeNetSuiteClosed: true }), () => confirmDeliveryLineUnlocked(...args));
+}
+
+export async function confirmDeliveryLines(...args) {
+  return withConsolidatedLoadMutation(() => getDeliveryOrder(args[0], { includeNetSuiteClosed: true }), () => confirmDeliveryLinesUnlocked(...args));
+}
+
+export async function setDeliveryLinePackedQuantity(...args) {
+  return withConsolidatedLoadMutation(() => getDeliveryOrder(args[0], { includeNetSuiteClosed: true }), () => setDeliveryLinePackedQuantityUnlocked(...args));
+}
+
+export async function unpackDeliveryLine(...args) {
+  return withConsolidatedLoadMutation(() => getDeliveryOrder(args[0], { includeNetSuiteClosed: true }), () => unpackDeliveryLineUnlocked(...args));
+}
+
+export async function unpackDeliveryOrder(...args) {
+  return withConsolidatedLoadMutation(() => getDeliveryOrder(args[0], { includeNetSuiteClosed: true }), () => unpackDeliveryOrderUnlocked(...args));
+}
+
+export async function updateDeliveryStatus(...args) {
+  return withConsolidatedLoadMutation(() => getDeliveryOrder(args[0], { includeNetSuiteClosed: true }), () => updateDeliveryStatusUnlocked(...args));
+}
+
+export async function markConsolidationDeliveryOrderPacked(...args) {
+  return withConsolidatedLoadMutation(() => getDeliveryOrder(args[0], { includeNetSuiteClosed: true }), () => markConsolidationDeliveryOrderPackedUnlocked(...args));
+}
+
+export async function releaseConsolidationDeliveryOrder(...args) {
+  return withConsolidatedLoadMutation(() => getDeliveryOrder(args[0], { includeNetSuiteClosed: true }), () => releaseConsolidationDeliveryOrderUnlocked(...args));
+}
+
+export { buildDeliveryLoadValidation as validateConsolidatedDeliveryOrder };

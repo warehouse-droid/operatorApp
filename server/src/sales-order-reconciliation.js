@@ -1,3 +1,4 @@
+import { readNetSuiteOrderLine } from "./netsuite-order-line.js";
 import { rollupReconciliationGroup } from "./scm-reconciliation.js";
 import { isNetSuiteOrderClosed } from "./netsuite-closed-order-policy.js";
 
@@ -170,6 +171,7 @@ export function mapNetSuiteSalesOrderLine(line = {}) {
     uniquekey: lineKey,
     line_unique_key: lineKey,
     line_id: lineKey,
+    netsuite_order_line: readNetSuiteOrderLine(line),
     item_id: positiveId(line.itemId ?? line.item_id),
     item_name: text(line.itemName ?? line.item_name),
     item_type: text(line.itemType ?? line.item_type),
@@ -247,7 +249,8 @@ function referencesFamily(value, family) {
   return valueRefs(value).some((ref) => family.has(ref));
 }
 
-function directlyReferencesFamily(value, family) {
+function directlyReferencesFamily(value, family, preserved = new Set()) {
+  if (preserved.has(normalizedRef(value?.id || value?.orderId || value?.order_id))) return false;
   return directValueRefs(value).some((ref) => family.has(ref));
 }
 
@@ -442,15 +445,15 @@ function dissolvedGroupedSalesOrder(order, child) {
   };
 }
 
-function pruneFamilyFromOrder(order, family) {
+function pruneFamilyFromOrder(order, family, preserved) {
   if (typeof order === "string" || typeof order === "number") {
     return family.has(normalizedRef(order)) ? null : order;
   }
   if (!order || typeof order !== "object") return order;
   if (!Array.isArray(order.childOrders) || !order.childOrders.length) {
-    return directlyReferencesFamily(order, family) ? null : order;
+    return directlyReferencesFamily(order, family, preserved) ? null : order;
   }
-  if (directlyReferencesFamily(order, family)) return null;
+  if (directlyReferencesFamily(order, family, preserved)) return null;
   const detailById = new Map((order.childOrderDetails || [])
     .map((child) => [text(child?.id), child])
     .filter(([id]) => id));
@@ -458,7 +461,7 @@ function pruneFamilyFromOrder(order, family) {
     const ref = text(childRef);
     const detail = detailById.get(ref);
     return family.has(normalizedRef(ref))
-      || directlyReferencesFamily(detail || {}, family)
+      || directlyReferencesFamily(detail || {}, family, preserved)
       || (detail?.childOrders?.length && referencesFamily(detail, family));
   });
   if (!containsFamily) return order;
@@ -466,8 +469,8 @@ function pruneFamilyFromOrder(order, family) {
   for (const childRef of order.childOrders) {
     const ref = text(childRef);
     const detail = detailById.get(ref) || { id: ref, type: order.type || "SO" };
-    if (family.has(normalizedRef(ref)) || directlyReferencesFamily(detail, family)) continue;
-    const pruned = pruneFamilyFromOrder(detail, family);
+    if (family.has(normalizedRef(ref)) || directlyReferencesFamily(detail, family, preserved)) continue;
+    const pruned = pruneFamilyFromOrder(detail, family, preserved);
     if (pruned && typeof pruned === "object" && pruned.id) children.push(pruned);
   }
   if (!children.length) return null;
@@ -475,7 +478,7 @@ function pruneFamilyFromOrder(order, family) {
   return rollupGroupedSalesOrderReconciliation(order, children);
 }
 
-function stripFamilyFromLoadOrder(value, family, orderReplacements) {
+function stripFamilyFromLoadOrder(value, family, orderReplacements, preserved) {
   if (typeof value === "string" || typeof value === "number") {
     const ref = normalizedRef(value);
     if (family.has(ref)) return null;
@@ -485,7 +488,7 @@ function stripFamilyFromLoadOrder(value, family, orderReplacements) {
   if (!value || typeof value !== "object") return value;
   const id = normalizedRef(value.id || value.orderId || value.order_id);
   if (id && orderReplacements.has(id)) return orderReplacements.get(id);
-  return pruneFamilyFromOrder(value, family);
+  return pruneFamilyFromOrder(value, family, preserved);
 }
 
 function rewrittenStop(stop, family, orderReplacements) {
@@ -517,9 +520,9 @@ function rewrittenStop(stop, family, orderReplacements) {
   };
 }
 
-function scrubLoad(load = {}, family, orderReplacements) {
+function scrubLoad(load = {}, family, orderReplacements, preserved) {
   const nextOrders = Array.isArray(load.orders)
-    ? load.orders.map((order) => stripFamilyFromLoadOrder(order, family, orderReplacements)).filter(Boolean)
+    ? load.orders.map((order) => stripFamilyFromLoadOrder(order, family, orderReplacements, preserved)).filter(Boolean)
     : load.orders;
   const nextStops = Array.isArray(load.stops)
     ? load.stops
@@ -536,9 +539,11 @@ function scrubLoad(load = {}, family, orderReplacements) {
 export function scrubBilledSalesOrderFamilyFromPlan(plan = {}, {
   canonicalRef = "",
   familyRefs = [],
-  inProgressOrderRefs = []
+  inProgressOrderRefs = [],
+  preservedOrderRefs = []
 } = {}) {
-  const family = new Set([canonicalRef, ...(familyRefs || [])].map(normalizedRef).filter(Boolean));
+  const preserved = new Set(preservedOrderRefs.map(normalizedRef));
+  const family = new Set([canonicalRef, ...(familyRefs || [])].map(normalizedRef).filter(ref => ref && !preserved.has(ref)));
   const active = new Set((inProgressOrderRefs || []).map(normalizedRef).filter(Boolean));
   if ([...family].some((ref) => active.has(ref))) {
     return { plan, changed: false, deferred: true, removedOrderRefs: [] };
@@ -548,7 +553,7 @@ export function scrubBilledSalesOrderFamilyFromPlan(plan = {}, {
   const orderReplacements = new Map();
   const orders = [];
   for (const order of Array.isArray(plan.orders) ? plan.orders : []) {
-    const pruned = pruneFamilyFromOrder(order, family);
+    const pruned = pruneFamilyFromOrder(order, family, preserved);
     const originalId = normalizedRef(order?.id || order?.orderId || order?.order_id);
     if (originalId && order?.childOrders?.length && pruned !== order) {
       orderReplacements.set(originalId, pruned && typeof pruned === "object" ? pruned : null);
@@ -557,7 +562,7 @@ export function scrubBilledSalesOrderFamilyFromPlan(plan = {}, {
   }
   const trucks = (Array.isArray(plan.trucks) ? plan.trucks : []).map((truck) => ({
     ...truck,
-    loads: (Array.isArray(truck.loads) ? truck.loads : []).map((load) => scrubLoad(load, family, orderReplacements))
+    loads: (Array.isArray(truck.loads) ? truck.loads : []).map((load) => scrubLoad(load, family, orderReplacements, preserved))
   }));
   const changed = JSON.stringify(orders) !== JSON.stringify(plan.orders || [])
     || JSON.stringify(trucks) !== JSON.stringify(plan.trucks || []);

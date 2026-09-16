@@ -1,5 +1,6 @@
 import { query, withTransaction } from "./db.js";
 import { writeAudit } from "./auth-repository.js";
+import { listSmartScmBlanketPoolRows } from "./smart-scm-blanket-pool-repository.js";
 
 const MAX_REASON_LENGTH = 1000;
 const MAX_NOTE_LENGTH = 1000;
@@ -213,9 +214,79 @@ export async function addSmartScmPlanningExclusion(values = {}, operatorId = nul
       action: "smart_scm.planning_exclusion.add",
       details: { exclusionId: result.id, itemId, reason, expiresAt }
     });
-    return result;
+    await resumeSmartScmBlanketCoveredPlanningExclusions({ itemId, operatorId });
+    const reconciled = await query(`${EXCLUSION_SELECT} WHERE exclusion.id = $1`, [result.id]);
+    return publicExclusion(reconciled.rows[0]);
   });
   return exclusion;
+}
+
+// Blanket supply supersedes item holds, including holds entered after flagging.
+// Keep retirement and its evidence atomic; never delete the original decision.
+/** @param {{sourcePoId?: number | string | null, itemId?: number | null, operatorId?: string | null}} [options] */
+export async function resumeSmartScmBlanketCoveredPlanningExclusions({
+  sourcePoId = null, itemId = null, operatorId = null
+} = {}) {
+  return withTransaction(async () => {
+    const pending = await query(
+      `SELECT 1 FROM scm_smart_planning_exclusions exclusion
+        WHERE exclusion.deactivated_at IS NULL
+          AND (exclusion.expires_at IS NULL OR exclusion.expires_at > now())
+          AND ($1::bigint IS NULL OR exclusion.item_id = $1)
+          AND EXISTS (
+            SELECT 1 FROM purchase_order_lines line
+            JOIN purchase_orders po ON po.netsuite_id = line.purchase_order_id
+            WHERE line.item_id = exclusion.item_id AND po.is_blanket_po = true
+              AND ($2::bigint IS NULL OR po.netsuite_id = $2)
+          ) LIMIT 1`,
+      [itemId, sourcePoId]
+    );
+    if (!pending.rowCount) return [];
+    const poolRows = await listSmartScmBlanketPoolRows({ isBlanket: true, sourcePoId, limit: 20000 });
+    const resumed = await query(
+      `WITH covered AS (
+         SELECT exclusion.id,
+                array_agg(DISTINCT source.source_po_ref ORDER BY source.source_po_ref) AS source_po_refs,
+                array_agg(DISTINCT source.source_line_id ORDER BY source.source_line_id) AS source_line_ids
+           FROM jsonb_to_recordset($1::jsonb) AS source(
+             item_id bigint, source_line_id bigint, source_po_ref text,
+             to_plt numeric, remaining_pallets numeric
+           )
+           JOIN purchase_order_lines line ON line.id = source.source_line_id
+           JOIN inventory_items item ON item.item_id = source.item_id
+           JOIN scm_smart_item_policies policy ON policy.item_id = source.item_id
+           JOIN scm_smart_planning_exclusions exclusion ON exclusion.item_id = source.item_id
+          WHERE exclusion.deactivated_at IS NULL
+            AND (exclusion.expires_at IS NULL OR exclusion.expires_at > now())
+            AND ($2::bigint IS NULL OR exclusion.item_id = $2)
+            AND NOT COALESCE(line.netsuite_closed, false)
+            AND source.remaining_pallets >= 1
+            AND ABS(source.to_plt - COALESCE(item.to_plt, policy.to_plt)) <= 0.000001
+          GROUP BY exclusion.id
+       )
+       UPDATE scm_smart_planning_exclusions exclusion
+          SET deactivated_at = now(), deactivated_by = $3,
+              deactivation_note = LEFT('Automatically resumed by Blanket PO coverage: '
+                || array_to_string(covered.source_po_refs, ', '), 1000)
+         FROM covered
+        WHERE exclusion.id = covered.id AND exclusion.deactivated_at IS NULL
+        RETURNING exclusion.id, exclusion.item_id, covered.source_po_refs, covered.source_line_ids`,
+      [JSON.stringify(poolRows), itemId, operatorId || null]
+    );
+    /** @type {Array<{id: string, item_id: string, source_po_refs: string[], source_line_ids: string[]}>} */
+    const rows = resumed.rows;
+    const results = rows.map(row => ({
+      exclusionId: Number(row.id), itemId: Number(row.item_id),
+      sourcePoRefs: row.source_po_refs, sourceLineIds: row.source_line_ids.map(Number)
+    }));
+    for (const details of results) {
+      await writeAudit({
+        actorType: "system",
+        source: "smart_scm", action: "smart_scm.planning_exclusion.auto_resume_blanket", details
+      });
+    }
+    return results;
+  });
 }
 
 export async function deactivateSmartScmPlanningExclusion(exclusionId, values = {}, operatorId = null) {

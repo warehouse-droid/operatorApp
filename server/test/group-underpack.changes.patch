@@ -1,0 +1,139 @@
+--- a/server/src/delivery-repository.js
++++ b/server/src/delivery-repository.js
+@@ -1,4 +1,5 @@
+ import { isLocalCoLoaded, projectLoadedCoLine } from "./local-co-loaded-policy.js";
++import { deliveryPackingRemainder, deliveryPackingRemainderSql, DELIVERY_PACK_ROUNDING_TOLERANCE as LOAD_SALES_QTY_TOLERANCE } from "./delivery-packing-progress.js";
+ import { withConsolidatedLoadMutation } from "./consolidation-load-locks.js";
+ import { deliveryOrderWithinYards } from "./operator-yard-access.js";
+ import crypto from "node:crypto";
+@@ -170,7 +171,6 @@
+   return decorateSalesOrderReload(order, cycle);
+ }
+ 
+-const LOAD_SALES_QTY_TOLERANCE = 0.1;
+ 
+ function exactBilledSalesOrderSql(alias) {
+   return `(
+@@ -354,7 +354,7 @@
+   const packedSalesQty = roundQuantity(linePackedSalesQuantity(line));
+   if (packedSalesQty <= 0) return 0;
+   const remainingSalesQty = roundQuantity(Math.max(0, lineRequiredSalesQuantity(line) - lineLoadedSalesQuantity(line)));
+-  if (remainingSalesQty > 0 && Math.abs(remainingSalesQty - packedSalesQty) <= LOAD_SALES_QTY_TOLERANCE) {
++  if (remainingSalesQty > 0 && roundQuantity(Math.abs(remainingSalesQty - packedSalesQty)) <= LOAD_SALES_QTY_TOLERANCE) {
+     return remainingSalesQty;
+   }
+   return packedSalesQty;
+@@ -367,7 +367,7 @@
+   const rawUnits = sales / unitSize;
+   const floorUnits = Math.floor(rawUnits + 0.000001);
+   const ceilUnits = Math.ceil(rawUnits - 0.000001);
+-  if (ceilUnits > floorUnits && Math.abs((ceilUnits * unitSize) - sales) <= LOAD_SALES_QTY_TOLERANCE) {
++  if (ceilUnits > floorUnits && roundQuantity(Math.abs((ceilUnits * unitSize) - sales)) <= LOAD_SALES_QTY_TOLERANCE) {
+     return ceilUnits;
+   }
+   return floorUnits;
+@@ -674,7 +674,7 @@
+       continue;
+     }
+ 
+-    if (packedSalesQty > remainingSalesQty + LOAD_SALES_QTY_TOLERANCE) {
++    if (roundQuantity(packedSalesQty - remainingSalesQty) > LOAD_SALES_QTY_TOLERANCE) {
+       issues.push({
+         ...issue,
+         code: line.sync_exception || "overpacked",
+@@ -851,8 +851,8 @@
+ }
+ 
+ function lineOpenSalesSql(alias) {
+-  const remaining = `((${lineRequiredSalesSql(alias)}) - COALESCE(${alias}.loaded_qty, 0) - (${linePackedSalesSql(alias)}))`;
+-  return `CASE WHEN ${remaining} <= 0.000001 THEN 0 ELSE ${remaining} END`;
++  return deliveryPackingRemainderSql(lineRequiredSalesSql(alias), `COALESCE(${alias}.loaded_qty, 0)`, linePackedSalesSql(alias),
++    ["to_plt", "to_lyr", "to_sec", "to_pcs"].map(field => `${alias}.${field}`));
+ }
+ 
+ function isDispatchGroupOrderId(value) {
+@@ -878,7 +878,8 @@
+ 
+ function lineHasOpenQuantity(line) {
+   return isDeliveryPickableLine(line)
+-    && lineRequiredSalesQuantity(line) > lineLoadedSalesQuantity(line) + linePackedSalesQuantity(line) + 0.000001;
++    && deliveryPackingRemainder(lineRequiredSalesQuantity(line), lineLoadedSalesQuantity(line), linePackedSalesQuantity(line),
++      [line.to_plt, line.to_lyr, line.to_sec, line.to_pcs].map(positiveQuantity)) > 0;
+ }
+ 
+ function groupLineKey(line) {
+@@ -1323,9 +1324,7 @@
+   });
+   const hasPacked = pickableLines.some((line) => linePackedSalesQuantity(line) > 0);
+   const hasLoaded = pickableLines.some((line) => lineLoadedSalesQuantity(line) > 0);
+-  const hasOpen = pickableLines.some((line) => {
+-    return lineRequiredSalesQuantity(line) > lineLoadedSalesQuantity(line) + linePackedSalesQuantity(line) + 0.000001;
+-  });
++  const hasOpen = pickableLines.some(lineHasOpenQuantity);
+ 
+   let status = "open";
+   let localYardOrderStatus = "Open";
+--- a/server/src/delivery-packing-progress.js
++++ b/server/src/delivery-packing-progress.js
+@@ -0,0 +1,23 @@
++// @ts-check
++
++export const DELIVERY_PACK_ROUNDING_TOLERANCE = 0.1;
++
++/** @param {number} required @param {number} loaded @param {number} packed @param {number[]} conversions */
++export function deliveryPackingRemainder(required, loaded, packed, conversions) {
++  const remaining = Number((required - loaded - packed).toFixed(6));
++  const smallestUnit = Math.min(...conversions.filter(value => value > 0));
++  // Converted packages can differ slightly from the rounded sales quantity.
++  // Never dismiss an unpacked line, sales-only shortage, or whole missing unit.
++  const roundingOnly = packed > 0 && Number.isFinite(smallestUnit)
++    && remaining <= DELIVERY_PACK_ROUNDING_TOLERANCE && remaining < smallestUnit;
++  return remaining <= 0.000001 || roundingOnly ? 0 : remaining;
++}
++
++/** @param {string} required @param {string} loaded @param {string} packed @param {string[]} conversions */
++export function deliveryPackingRemainderSql(required, loaded, packed, conversions) {
++  const remaining = `ROUND(((${required}) - (${loaded}) - (${packed}))::numeric, 6)`;
++  const smallestUnit = `LEAST(${conversions.map(value => `CASE WHEN ${value} > 0 THEN ${value} END`).join(", ")})`;
++  return `CASE WHEN ${remaining} <= 0.000001
++    OR ((${packed}) > 0 AND ${remaining} <= ${DELIVERY_PACK_ROUNDING_TOLERANCE} AND ${remaining} < ${smallestUnit})
++    THEN 0 ELSE ${remaining} END`;
++}
+--- a/server/public/operator.js
++++ b/server/public/operator.js
+@@ -1582,7 +1582,7 @@
+   const rawUnits = sales / unitSize;
+   const floorUnits = Math.floor(rawUnits + 0.000001);
+   const ceilUnits = Math.ceil(rawUnits - 0.000001);
+-  if (ceilUnits > floorUnits && Math.abs((ceilUnits * unitSize) - sales) <= LOAD_SALES_QTY_TOLERANCE) {
++  if (ceilUnits > floorUnits && Number(Math.abs((ceilUnits * unitSize) - sales).toFixed(6)) <= LOAD_SALES_QTY_TOLERANCE) {
+     return ceilUnits;
+   }
+   return floorUnits;
+--- a/server/public/operator.html
++++ b/server/public/operator.html
+@@ -21,6 +21,6 @@
+     <script src="/vendor/quagga2/quagga.min.js?v=1.12.1"></script>
+     <script src="/i18n.js?v=20260915-operator-display-v1"></script>
+     <script src="/operator-load-summary.js?v=20260915-operator-display-v1"></script>
+-    <script src="/operator.js?v=20260915-operator-receiving-v1"></script>
++    <script src="/operator.js?v=20260915-packing-rounding-v1"></script>
+   </body>
+ </html>
+--- a/server/public/service-worker.js
++++ b/server/public/service-worker.js
+@@ -1,4 +1,4 @@
+-const CACHE_NAME = "mbbs-yard-operator-v148-receiving-v1";
++const CACHE_NAME = "mbbs-yard-operator-v149-packing-rounding-v1";
+ const OPERATOR_CACHE_PREFIX = "mbbs-yard-operator-";
+ const APP_SHELL = [
+   "/operator",
+@@ -8,7 +8,7 @@
+   "/vendor/quagga2/quagga.min.js?v=1.12.1",
+   "/i18n.js?v=20260915-operator-display-v1",
+   "/operator-load-summary.js?v=20260915-operator-display-v1",
+-  "/operator.js?v=20260915-operator-receiving-v1",
++  "/operator.js?v=20260915-packing-rounding-v1",
+   "/manifest.webmanifest",
+   "/icons/mbbs-yard-192.png",
+   "/icons/mbbs-yard-512.png",

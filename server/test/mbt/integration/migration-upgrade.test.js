@@ -726,10 +726,10 @@ test("F06/F16: schema-101 upgrade preserves representative legacy records and is
       immutable_trigger: true
     }]);
 
-    assert.equal(receiptsBeforeNoOp.rowCount, 199);
+    assert.equal(receiptsBeforeNoOp.rowCount, 202);
     assert.equal(
       receiptsBeforeNoOp.rows.at(-1)?.filename,
-      "199_operator_yard_access.sql"
+      "202_netsuite_order_line.sql"
     );
     assert.deepEqual(
       receiptsBeforeNoOp.rows

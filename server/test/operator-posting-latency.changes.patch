@@ -1,0 +1,2122 @@
+--- src/consolidation-load-repository.js
++++ src/consolidation-load-repository.js
+@@ -8,6 +8,7 @@
+ import { lockConsolidatedLoadOrders, withConsolidatedLoadContext } from "./consolidation-load-locks.js";
+ import { syncDirectDependencyOperatorProgress } from "./order-dependency-repository.js";
+ import { writeAudit } from "./auth-repository.js";
++import { enqueuePostingPhotos } from "./operator-netsuite-posting-photo-queue.js";
+ 
+ /** @type {(type: string, payload: Record<string,any>) => void} */
+ let emitCompletion = (_type, _payload) => {};
+@@ -16,7 +17,7 @@
+ /** @param {any} row */
+ function publicBatch(row) {
+   return { id: row.id, operatorId: row.operator_id, locationId: Number(row.location_id), snapshot: /** @type {ReturnType<typeof buildConsolidationSnapshot>} */ (row.snapshot),
+-    status: row.status, photoRefs: row.photo_refs, commandId: row.command_id, result: row.result,
++    status: row.status, photoRefs: row.photo_refs, photoInputHash: row.photo_input_hash, commandId: row.command_id, result: row.result,
+     error: row.last_error || row.posting_error || "", updatedAt: row.updated_at };
+ }
+ /** @param {unknown} id */
+@@ -165,6 +166,7 @@
+     }
+     const result = { consolidationLoadId: id, sourceLoadRecords: results, localYardOrderStatus: "Loaded" };
+     await query("UPDATE operator_consolidated_loads SET status='completed',completed_at=now(),updated_at=now(),last_error=NULL,result=$2 WHERE id=$1", [id, JSON.stringify(result)]);
++    if (!preflight && !row.command_id) {await enqueuePostingPhotos({ batchId: id, photos: row.photo_refs });}
+     await query("UPDATE operator_consolidated_load_claims SET active=false WHERE batch_id=$1", [id]);
+     await writeAudit({ actorOperatorId: row.operator_id, action: "delivery.consolidation.loaded", details: { batchId: id, orderIds: snapshot.orders.map((order) => order.netsuite_id) } });
+     if (!preflight) afterTransactionCommit(() => publishLoadCompletion(id, row.operator_id, results));
+--- src/consolidation-load-service.js
++++ src/consolidation-load-service.js
+@@ -11,14 +11,20 @@
+ import { resumePublicOperatorNetSuitePostingCommand } from "./operator-netsuite-posting-controller.js";
+ import { operatorNetSuitePostingRuntime } from "./operator-netsuite-posting-runtime.js";
+ import { validateConsolidatedDeliveryOrder } from "./delivery-repository.js";
++import crypto from "node:crypto";
++import { parsePostingPhoto, postingPhotoIdentity, validatePostingPhotos } from "./operator-netsuite-posting-photos.js";
++import { operatorPostingTelemetry } from "./operator-netsuite-posting-telemetry.js";
+ 
+ /** @param {unknown} values @param {string} batchId */
+ export function validatedConsolidationPhotos(values, batchId) {
+   if (!Array.isArray(values) || values.length < 2 || new Set(values).size !== values.length
+-      || values.some((ref) => typeof ref !== "string" || !/^r2:\/\/operator\/operator-consolidation-load-photo\/\d{4}\/\d{2}\/\d{2}\//.test(ref)
+-        || ref.split("/")[7] !== batchId || ref.includes(".."))) {
++      || values.some((ref) => typeof ref !== "string" || (!ref.startsWith("data:image/")
++        && (!/^r2:\/\/operator\/operator-consolidation-load-photo\/\d{4}\/\d{2}\/\d{2}\//.test(ref)
++        || ref.split("/")[7] !== batchId || ref.includes(".."))))) {
+     throw consolidationError("Take at least two photos for this Consolidation Load.", "CONSOLIDATION_LOAD_PHOTOS_INVALID", 400);
+   }
++  for (const ref of values) {if (ref.startsWith("data:")) {parsePostingPhoto(ref);}}
++  validatePostingPhotos(values);
+   return values;
+ }
+ const prepareNativePosting = createConsolidationPostingPreparation({
+@@ -37,11 +43,17 @@
+ }
+ /** @param {any} operator @param {string} id @param {unknown} photoRefs */
+ export async function submitConsolidatedLoad(operator, id, photoRefs) {
++  return operatorPostingTelemetry.context({ commandId: id, transactionType: "IF", functionKey: "delivery_prep", stage: "admission" },
++    () => operatorPostingTelemetry.time({ operation: "posting.admission" }, () => submit(operator, id, photoRefs)));
++}
++/** @param {any} operator @param {string} id @param {unknown} photoRefs */
++async function submit(operator, id, photoRefs) {
+   const admitted = await withConsolidatedLoadContext(id, () => withTransaction(async () => {
+     const batch = await getConsolidatedLoad(operator, id, { lock: true });
+     const photos = validatedConsolidationPhotos(photoRefs, batch.id);
++    const photoInputHash = crypto.createHash("sha256").update(JSON.stringify(photos.map(postingPhotoIdentity))).digest("hex");
+     if (batch.status !== "draft") {
+-      if (JSON.stringify(photos) !== JSON.stringify(batch.photoRefs)) throw consolidationError("The accepted batch already has its loading photos.");
++      if (batch.photoInputHash ? photoInputHash !== batch.photoInputHash : JSON.stringify(photos) !== JSON.stringify(batch.photoRefs)) throw consolidationError("The accepted batch already has its loading photos.");
+       return batch;
+     }
+     await lockConsolidatedLoadOrders(batch.snapshot.orders.map((order) => order.netsuite_id));
+@@ -51,7 +63,7 @@
+       if (!validation.ok) throw consolidationError(`${order.tranid}: correct packed quantities before loading.`, "CONSOLIDATION_LOAD_STALE");
+     }
+     batch.photoRefs = photos;
+-    await query("UPDATE operator_consolidated_loads SET photo_refs=$2,status='pending',submitted_at=now(),updated_at=now() WHERE id=$1", [id, JSON.stringify(photos)]);
++    await query("UPDATE operator_consolidated_loads SET photo_refs=$2,photo_input_hash=$3,status='pending',submitted_at=now(),updated_at=now() WHERE id=$1", [id, JSON.stringify(photos), photoInputHash]);
+     for (const order of batch.snapshot.orders) await query("INSERT INTO operator_consolidated_load_claims(batch_id,order_id) VALUES($1,$2)", [id, order.netsuite_id]);
+     const command = await prepareNativePosting(operator, batch, orders);
+     if (command) {
+--- src/netsuite.js
++++ src/netsuite.js
+@@ -1,4 +1,5 @@
+ import crypto from "node:crypto";
++import { operatorPostingTelemetry } from "./operator-netsuite-posting-telemetry.js";
+ import { scmNetSuitePoVersion } from "./scm-netsuite-po-version.js";
+ import { config, requireConfig } from "./config.js";
+ import { query } from "./db.js";
+@@ -47,6 +48,14 @@
+     }
+     throw error;
+   }
++}
++
++async function timedNetSuiteTextRequest(url, options, attempt) {
++  return operatorPostingTelemetry.time({ operation: "netsuite.http", method: options.method || "GET",
++    path: new URL(url).pathname, attempt }, async () => {
++    const response = await netsuiteFetch(url, options);
++    return { response, text: await response.text() };
++  });
+ }
+ 
+ const MBT_NETSUITE_READ_RESPONSE_LIMIT = 1024 * 1024;
+@@ -621,8 +630,8 @@
+   let lastError;
+   let m2mAuthRetry = false;
+   for (let attempt = 0; attempt < 4; attempt += 1) {
+-    const accessToken = await getAccessToken();
+-    const response = await netsuiteFetch(`${config.netsuite.restBaseUrl}${path}`, {
++    const accessToken = await operatorPostingTelemetry.time({ operation: "netsuite.auth" }, getAccessToken);
++    const { response, text } = await timedNetSuiteTextRequest(`${config.netsuite.restBaseUrl}${path}`, {
+       method,
+       headers: {
+         "Authorization": `Bearer ${accessToken}`,
+@@ -630,9 +639,7 @@
+         ...headers
+       },
+       body: body ? JSON.stringify(body) : undefined
+-    });
+-
+-    const text = await response.text();
++    }, attempt + 1);
+     const contentType = response.headers.get("content-type") || "";
+     let data = text;
+     if (text && (contentType.includes("application/json") || /^[\s\r\n]*[\[{]/.test(text))) {
+@@ -669,7 +676,7 @@
+     method: "POST",
+     body: payload
+   });
+-  const result = restMutationQueue.then(run, run);
++  const result = operatorPostingTelemetry.queued("rest_mutation", restMutationQueue, run);
+   restMutationQueue = result.catch(() => {});
+   return result;
+ }
+@@ -683,7 +690,7 @@
+     method: "POST",
+     body: payload
+   });
+-  const result = restMutationQueue.then(run, run);
++  const result = operatorPostingTelemetry.queued("rest_mutation", restMutationQueue, run);
+   restMutationQueue = result.catch(() => {});
+   return result;
+ }
+@@ -697,7 +704,7 @@
+     method: "POST",
+     body: payload
+   });
+-  const result = restMutationQueue.then(run, run);
++  const result = operatorPostingTelemetry.queued("rest_mutation", restMutationQueue, run);
+   restMutationQueue = result.catch(() => {});
+   return result;
+ }
+@@ -711,7 +718,7 @@
+     method: "POST",
+     body: payload
+   });
+-  const result = restMutationQueue.then(run, run);
++  const result = operatorPostingTelemetry.queued("rest_mutation", restMutationQueue, run);
+   restMutationQueue = result.catch(() => {});
+   return result;
+ }
+@@ -1319,7 +1326,7 @@
+ 
+ export async function suiteql(q, params = [], options = {}) {
+   const run = () => runSuiteql(q, params, options);
+-  const result = suiteqlQueue.then(run, run);
++  const result = operatorPostingTelemetry.queued("suiteql", suiteqlQueue, run);
+   suiteqlQueue = result.catch(() => {});
+   return result;
+ }
+@@ -1331,10 +1338,11 @@
+   if (options.limit) url.searchParams.set("limit", String(options.limit));
+   if (options.offset) url.searchParams.set("offset", String(options.offset));
+   let response;
++  let text;
+   let m2mAuthRetry = false;
+   for (let attempt = 0; attempt < 4; attempt += 1) {
+-    const accessToken = await getAccessToken();
+-    response = await netsuiteFetch(url, {
++    const accessToken = await operatorPostingTelemetry.time({ operation: "netsuite.auth" }, getAccessToken);
++    ({ response, text } = await timedNetSuiteTextRequest(url, {
+       method: "POST",
+       headers: {
+         "Authorization": `Bearer ${accessToken}`,
+@@ -1342,7 +1350,7 @@
+         "Prefer": "transient"
+       },
+       body: JSON.stringify(body)
+-    });
++    }, attempt + 1));
+     if (response.status === 401 && !m2mAuthRetry && await isNetSuiteM2mActive()) {
+       invalidateNetSuiteM2mAccessToken();
+       m2mAuthRetry = true;
+@@ -1354,10 +1362,10 @@
+   }
+ 
+   if (!response.ok) {
+-    throw new Error(`NetSuite SuiteQL failed: ${response.status} ${await response.text()}`);
+-  }
+-
+-  return response.json();
++    throw new Error(`NetSuite SuiteQL failed: ${response.status} ${text}`);
++  }
++
++  return JSON.parse(text);
+ }
+ 
+ export async function suiteqlAll(q, params = [], { pageSize = 1000 } = {}) {
+--- src/operator-netsuite-posting-admission.js
++++ src/operator-netsuite-posting-admission.js
+@@ -2,6 +2,7 @@
+ 
+ import { buildOperatorNetSuitePostingDraft } from "./operator-netsuite-posting-domain.js";
+ import { assertExpectedOperatorNetSuitePostingPolicy } from "./operator-netsuite-posting-policy.js";
++import { operatorPostingTelemetry as telemetry } from "./operator-netsuite-posting-telemetry.js";
+ 
+ /**
+  * @param {object} dependencies
+@@ -20,14 +21,14 @@
+   preflight = async () => {},
+   assertLocalCompletionAllowed = async () => {}
+ }) {
+-  return async function admitOperatorNetSuitePosting(/** @type {Record<string, any>} */ input = {}) {
+-    const resolution = await resolveTargets({
++  async function admit(/** @type {Record<string, any>} */ input) {
++    const resolution = await telemetry.time({ operation: "posting.resolve" }, () => resolveTargets({
+       functionKey: input.functionKey,
+       orderId: input.orderId,
+       orderType: input.orderType,
+       clientLocationId: input.clientLocationId,
+       deferTargets: true
+-    });
++    }));
+     if (resolution.netSuitePostingOwner === "driver_completion") {
+       await assertLocalCompletionAllowed(resolution);
+       return {
+@@ -65,7 +66,7 @@
+       actual: policy
+     });
+     const actionableResolution = typeof resolution.materializeTargets === "function"
+-      ? await resolution.materializeTargets()
++      ? await telemetry.context({ stage: "source_validation" }, () => telemetry.time({ operation: "posting.source_validation" }, () => resolution.materializeTargets()))
+       : resolution;
+     if (actionableResolution.localOnly) {
+       await assertLocalCompletionAllowed(actionableResolution);
+@@ -76,7 +77,7 @@
+         resolution: actionableResolution
+       };
+     }
+-    await preflight(input, actionableResolution);
++    await telemetry.time({ operation: "posting.preflight" }, () => preflight(input, actionableResolution));
+     const draft = buildOperatorNetSuitePostingDraft({
+       requestId: input.requestId,
+       actorOperatorId: input.actorOperatorId,
+@@ -89,7 +90,7 @@
+       localPayload: actionableResolution.localPayload,
+       targets: actionableResolution.targets
+     });
+-    const created = await createCommand(draft);
++    const created = await telemetry.time({ operation: "posting.persist" }, () => createCommand(draft));
+     await onAccepted(created.command);
+     return {
+       mode: "netsuite",
+@@ -97,5 +98,8 @@
+       replayed: created.replayed,
+       command: created.command
+     };
+-  };
++  }
++  return (/** @type {Record<string, any>} */ input = {}) => telemetry.context({ commandId: input.requestId,
++    functionKey: input.functionKey, transactionType: input.functionKey === "receiving" ? "IR" : "IF", stage: "admission" },
++  () => telemetry.time({ operation: "posting.admission" }, () => admit(input)));
+ }
+--- src/operator-netsuite-posting-domain.js
++++ src/operator-netsuite-posting-domain.js
+@@ -1,6 +1,7 @@
+ // @ts-check
+ 
+ import crypto from "node:crypto";
++import { postingPhotoIdentity, validatePostingPhotos } from "./operator-netsuite-posting-photos.js";
+ 
+ const REQUEST_ID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/iu;
+ const SOURCE_ORDER_KINDS = new Set(["SO", "PO", "TO"]);
+@@ -470,13 +471,14 @@
+     locationId: positiveInteger(policy.locationId, "Canonical posting location"),
+     yardCode: requiredText(policy.yardCode, "Canonical yard code")
+   };
++  validatePostingPhotos(photoRefs);
+   const inputSnapshot = {
+     requestId,
+     actorOperatorId,
+     functionKey,
+     transactionType,
+     policy: normalizedPolicy,
+-    photoRefs,
++    photoRefs: photoRefs.map(postingPhotoIdentity),
+     claims,
+     localOperation,
+     localPayload,
+--- src/operator-netsuite-posting-photo-queue.js
++++ src/operator-netsuite-posting-photo-queue.js
+@@ -0,0 +1,104 @@
++// @ts-check
++import crypto from "node:crypto";
++import { query, withTransaction } from "./db.js";
++import { postingPhotoIdentity, replacePostingPhoto } from "./operator-netsuite-posting-photos.js";
++import { normalizeR2Key } from "./photo-upload.js";
++
++/** @param {{commandId?: string, batchId?: string, photos: string[]}} input */
++export async function enqueuePostingPhotos({ commandId, batchId, photos }) {
++  for (const [index, ref] of photos.entries()) {
++    if (!ref.startsWith("data:")) {continue;}
++    await query(`INSERT INTO operator_posting_photo_uploads(command_id,batch_id,photo_index,photo_identity)
++      VALUES($1,$2,$3,$4) ON CONFLICT DO NOTHING`, [commandId || null, batchId || null, index, postingPhotoIdentity(ref)]);
++  }
++}
++
++/** @param {{ownerId?: string}} [options] */
++export async function claimPostingPhoto({ ownerId } = {}) {
++  return withTransaction(async () => {
++    const result = await query(`SELECT p.*,coalesce(c.actor_operator_id,b.operator_id) AS actor,
++        coalesce(c.function_key,'delivery_prep') AS function_key,coalesce(c.transaction_type,'IF') AS transaction_type,
++        coalesce(c.photo_refs,b.photo_refs)->>p.photo_index AS photo_ref,
++        coalesce(c.input_snapshot->'localOperation',jsonb_build_object('kind','delivery_consolidation_load','orderId',b.id,'orderType','consolidation_load')) AS operation,
++        coalesce(c.result->'localFinalization',b.result) AS local_result
++      FROM operator_posting_photo_uploads p
++      LEFT JOIN operator_netsuite_posting_commands c ON c.id=p.command_id
++      LEFT JOIN operator_consolidated_loads b ON b.id=p.batch_id
++      WHERE ((p.status='pending' AND p.next_attempt_at<=now()) OR (p.status='uploading' AND p.lease_expires_at<=now()))
++        AND coalesce(c.status,b.status)='completed'
++        AND ($1::uuid IS NULL OR coalesce(p.command_id,p.batch_id)=$1)
++      ORDER BY p.next_attempt_at,p.id LIMIT 1 FOR UPDATE OF p SKIP LOCKED`, [ownerId || null]);
++    const row = result.rows[0];
++    if (!row) {return null;}
++    const leaseToken = crypto.randomUUID();
++    await query(`UPDATE operator_posting_photo_uploads SET status='uploading',lease_token=$2,
++      lease_expires_at=now()+interval '120 seconds',attempt_count=attempt_count+1 WHERE id=$1`, [row.id, leaseToken]);
++    return { id: String(row.id), commandId: row.command_id, batchId: row.batch_id,
++      photoIndex: row.photo_index, photoRef: row.photo_ref, photoIdentity: row.photo_identity,
++      actorOperatorId: row.actor, functionKey: row.function_key, transactionType: row.transaction_type,
++      operation: row.operation, localResult: row.local_result, leaseToken, attemptCount: row.attempt_count + 1 };
++  });
++}
++
++/** @param {any} value @returns {string[]} */
++function loadIds(value) {
++  const own = /^\d+$/.test(String(value?.id)) ? [String(value.id)] : [];
++  return [...new Set([...own, ...(value?.sourceLoadRecords || []).flatMap(loadIds)])];
++}
++
++/** @param {Record<string,any>} job @param {string} ref */
++async function replaceLocalProof(job, ref) {
++  const records = await query(`SELECT id,photo_data_url,photo_data_urls FROM operator_load_records
++    WHERE id=ANY($1::bigint[]) OR ($2::text IS NOT NULL AND response->'operatorNetSuitePosting'->>'commandId'=$2)
++    FOR UPDATE`, [job.transactionType === "IF" ? loadIds(job.localResult) : [], job.commandId]);
++  for (const row of records.rows) {
++    await query("UPDATE operator_load_records SET photo_data_url=$2,photo_data_urls=$3 WHERE id=$1", [row.id,
++      row.photo_data_url === job.photoRef ? ref : row.photo_data_url,
++      JSON.stringify(replacePostingPhoto(row.photo_data_urls, job.photoRef, ref))]);
++  }
++  if (job.commandId) {
++    const receipts = await query(`SELECT id,photo_data_urls FROM receiving_receipt_records
++      WHERE response->'operatorNetSuitePosting'->>'commandId'=$1 FOR UPDATE`, [job.commandId]);
++    for (const row of receipts.rows) {
++      await query("UPDATE receiving_receipt_records SET photo_data_urls=$2 WHERE id=$1", [row.id, JSON.stringify(replacePostingPhoto(row.photo_data_urls, job.photoRef, ref))]);
++    }
++  }
++  const batches = await query("SELECT id,photo_refs FROM operator_consolidated_loads WHERE id=$1 OR command_id=$2 FOR UPDATE", [job.batchId, job.commandId]);
++  for (const row of batches.rows) {
++    await query("UPDATE operator_consolidated_loads SET photo_refs=$2 WHERE id=$1", [row.id, JSON.stringify(replacePostingPhoto(row.photo_refs, job.photoRef, ref))]);
++  }
++}
++
++/** @param {Record<string,any>} job @param {string} ref */
++export async function completePostingPhoto(job, ref) {
++  if (!ref.startsWith("r2://") || !normalizeR2Key(ref)) {throw new Error("A valid uploaded photo reference is required.");}
++  return withTransaction(async () => {
++    const active = await query(`SELECT id FROM operator_posting_photo_uploads
++      WHERE id=$1 AND status='uploading' AND lease_token=$2 AND lease_expires_at>now() FOR UPDATE`, [job.id, job.leaseToken]);
++    if (!active.rowCount) {return false;}
++    if (postingPhotoIdentity(job.photoRef) !== job.photoIdentity) {throw new Error("Staged photo identity changed.");}
++    if (job.commandId) {
++      const command = (await query("SELECT photo_refs FROM operator_netsuite_posting_commands WHERE id=$1 AND status='completed' FOR UPDATE", [job.commandId])).rows[0];
++      if (!command || command.photo_refs[job.photoIndex] !== job.photoRef) {throw new Error("Staged photo reference changed.");}
++      await query("UPDATE operator_netsuite_posting_commands SET photo_refs=$2 WHERE id=$1", [job.commandId, JSON.stringify(replacePostingPhoto(command.photo_refs, job.photoRef, ref))]);
++    }
++    if (job.batchId) {
++      const batch = (await query("SELECT photo_refs FROM operator_consolidated_loads WHERE id=$1 AND status='completed' FOR UPDATE", [job.batchId])).rows[0];
++      if (!batch || batch.photo_refs[job.photoIndex] !== job.photoRef) {throw new Error("Staged photo reference changed.");}
++    }
++    await replaceLocalProof(job, ref);
++    await query(`UPDATE operator_posting_photo_uploads SET status='uploaded',r2_ref=$3,uploaded_at=now(),
++      lease_token=NULL,lease_expires_at=NULL,last_error=NULL WHERE id=$1 AND lease_token=$2`, [job.id, job.leaseToken, ref]);
++    return true;
++  });
++}
++
++/** @param {Record<string,any>} job @param {any} error */
++export async function failPostingPhoto(job, error) {
++  const code = String(error?.code || "PHOTO_UPLOAD_FAILED");
++  const delaySeconds = Math.min(3600, 10 * 2 ** Math.min(job.attemptCount, 9));
++  await query(`UPDATE operator_posting_photo_uploads SET status='pending',lease_token=NULL,lease_expires_at=NULL,
++    next_attempt_at=now()+($3::integer*interval '1 second'),last_error=$4
++    WHERE id=$1 AND status='uploading' AND lease_token=$2`, [job.id, job.leaseToken, delaySeconds,
++    /^[A-Z0-9_]{1,80}$/.test(code) ? code : "PHOTO_UPLOAD_FAILED"]);
++}
+--- src/operator-netsuite-posting-photo-worker.js
++++ src/operator-netsuite-posting-photo-worker.js
+@@ -0,0 +1,42 @@
++// @ts-check
++import { claimPostingPhoto, completePostingPhoto, failPostingPhoto } from "./operator-netsuite-posting-photo-queue.js";
++import { uploadPostingPhoto } from "./operator-netsuite-posting-photos.js";
++import { operatorPostingTelemetry } from "./operator-netsuite-posting-telemetry.js";
++
++/** @param {{claim: Function, upload: Function, complete: Function, fail: Function}} dependencies */
++export function createPostingPhotoWorker({ claim, upload, complete, fail }) {
++  let running = false;
++  async function tick() {
++    if (running) {return;}
++    running = true;
++    try {
++      // A bounded batch keeps background I/O from monopolizing the application.
++      for (let index = 0; index < 2; index += 1) {
++        const job = await claim();
++        if (!job) {break;}
++        await operatorPostingTelemetry.context({ commandId: job.commandId || job.batchId, transactionType: job.transactionType, functionKey: job.functionKey, stage: "photo_upload" }, async () => {
++          try {
++            await operatorPostingTelemetry.time({ operation: "photo.background", attempt: job.attemptCount, photoId: String(job.id) }, async () => {
++              const ref = await upload(job);
++              if (!await complete(job, ref)) {
++                throw Object.assign(new Error("Photo upload lease expired."), { code: "PHOTO_LEASE_LOST" });
++              }
++            });
++          } catch (error) {await fail(job, error);}
++        });
++      }
++    } finally {running = false;}
++  }
++  return { tick };
++}
++
++export const postingPhotoWorker = createPostingPhotoWorker({ claim: claimPostingPhoto, upload: uploadPostingPhoto, complete: completePostingPhoto, fail: failPostingPhoto });
++/** @type {ReturnType<typeof setInterval> | undefined} */
++let timer;
++export function startPostingPhotoWorker() {
++  if (timer) {return;}
++  const tick = () => void postingPhotoWorker.tick().catch(() => console.error(JSON.stringify({ event: "operator_photo_worker_error", errorCode: "PHOTO_WORKER_FAILED" })));
++  timer = setInterval(tick, 5000);
++  timer.unref();
++  tick();
++}
+--- src/operator-netsuite-posting-photos.js
++++ src/operator-netsuite-posting-photos.js
+@@ -0,0 +1,82 @@
++// @ts-check
++import crypto from "node:crypto";
++import { createPhotoUploadToken, normalizeR2Key } from "./photo-upload.js";
++import { operatorPostingTelemetry } from "./operator-netsuite-posting-telemetry.js";
++
++const MAX_PHOTO_BYTES = 10 * 1024 * 1024;
++/** @param {string} message */
++function invalid(message) {
++  return Object.assign(new Error(message), { status: 400, code: "OPERATOR_PHOTO_INVALID" });
++}
++/** @param {unknown} value @param {{maxBytes?: number}} [options] */
++export function parsePostingPhoto(value, { maxBytes = MAX_PHOTO_BYTES } = {}) {
++  const ref = String(value || "");
++  if (ref.startsWith("r2://")) {return null;}
++  if (ref.length > Math.ceil(maxBytes / 3) * 4 + 80) {throw invalid("Photo is too large.");}
++  const match = /^data:(image\/(?:jpeg|png|webp|heic|heif));base64,([A-Za-z0-9+/]+={0,2})$/.exec(ref);
++  if (!match) {throw invalid("Photo must contain supported base64 image data.");}
++  const encoded = /** @type {string} */ (match[2]);
++  const bytes = Buffer.from(encoded, "base64");
++  if (!bytes.length || bytes.toString("base64") !== encoded) {throw invalid("Photo base64 data is invalid.");}
++  if (bytes.length > maxBytes) {throw invalid("Photo is too large.");}
++  return { bytes, mimeType: /** @type {string} */ (match[1]), sha256: crypto.createHash("sha256").update(bytes).digest("hex") };
++}
++/** @param {string} ref */
++export function postingPhotoIdentity(ref) {
++  if (!ref.startsWith("data:")) {return ref;}
++  parsePostingPhoto(ref);
++  return `sha256:${crypto.createHash("sha256").update(ref).digest("hex")}`;
++}
++/** @param {string[]} photos */
++export function validatePostingPhotos(photos) {
++  let total = 0;
++  for (const ref of photos) {
++    if (ref.startsWith("data:")) {total += parsePostingPhoto(ref)?.bytes.length || 0;}
++  }
++  if (total > 16 * 1024 * 1024 || photos.length > 20) {throw invalid("Photos are too large. Retake fewer or smaller photos.");}
++}
++/** @param {string[]} photos @param {string} original @param {string} replacement */
++export function replacePostingPhoto(photos, original, replacement) {
++  return photos.map((ref) => ref === original ? replacement : ref);
++}
++
++/** @param {Record<string, any>} job */
++function photoRecordType(job) {
++  if (job.operation?.kind === "delivery_consolidation_load" || job.batchId) {return "operator-consolidation-load-photo";}
++  if (job.functionKey === "receiving") {return "operator-receiving-photo";}
++  return job.functionKey === "customer_pickup" ? "operator-customer-pickup-photo" : "operator-load-photo";
++}
++/** @param {Record<string, any>} job @param {NonNullable<ReturnType<typeof parsePostingPhoto>>} image */
++function ticketInput(job, image) {
++  return { actor: { id: job.actorOperatorId, role: "operator" }, source: "operator", recordType: photoRecordType(job),
++    metadata: { orderId: job.operation?.orderId || job.batchId, orderType: job.operation?.orderType,
++      jobId: job.commandId || job.batchId, photoId: String(job.id), sha256: image.sha256, byteSize: image.bytes.length, mimeType: image.mimeType } };
++}
++/** @param {string} text @param {string | undefined} prefix */
++function uploadedPhotoKey(text, prefix) {
++  let key;
++  try {key = JSON.parse(text)?.key;} catch {throw invalid("Photo upload returned no valid object key.");}
++  if (typeof key !== "string" || normalizeR2Key(key) !== key || !key || (prefix && !key.startsWith(`${prefix}/`))) {
++    throw invalid("Photo upload returned an invalid object key.");
++  }
++  return `r2://${key}`;
++}
++
++/** @param {Record<string, any>} job @param {{ticket?: Function, fetch?: typeof fetch}} [dependencies] */
++export async function uploadPostingPhoto(job, { ticket = createPhotoUploadToken, fetch: transport = fetch } = {}) {
++  const image = parsePostingPhoto(job.photoRef);
++  if (!image) {return job.photoRef;}
++  const credentials = ticket(ticketInput(job, image));
++  const body = new FormData();
++  body.append("file", new Blob([new Uint8Array(image.bytes)], { type: image.mimeType }), `photo-${job.id}.${image.mimeType.split("/")[1]}`);
++  const result = await operatorPostingTelemetry.time({ operation: "photo.r2", method: "POST", path: "/upload", attempt: job.attemptCount, photoId: String(job.id) }, async () => {
++    const response = await transport(credentials.uploadUrl, {
++      method: "POST", headers: { Authorization: `Bearer ${credentials.token}` }, body, signal: AbortSignal.timeout(60000)
++    });
++    return { response, text: await response.text() };
++  });
++  if (!result.response.ok) {
++    throw Object.assign(new Error(`Photo upload failed (HTTP ${result.response.status}).`), { status: result.response.status, code: "PHOTO_UPLOAD_FAILED" });
++  }
++  return uploadedPhotoKey(result.text, credentials.metadata?.keyPrefix);
++}
+--- src/operator-netsuite-posting-repository.js
++++ src/operator-netsuite-posting-repository.js
+@@ -3,6 +3,7 @@
+ import crypto from "node:crypto";
+ 
+ import { query, withTransaction } from "./db.js";
++import { enqueuePostingPhotos } from "./operator-netsuite-posting-photo-queue.js";
+ 
+ /** @param {string} code @param {string} message @param {number} [status] */
+ function repositoryError(code, message, status = 409) {
+@@ -802,6 +803,7 @@
+       [commandId]
+     );
+     const localFinalization = await input.finalize();
++    await enqueuePostingPhotos({ commandId, photos: current.rows[0].photo_refs || [] });
+     await query(
+       `UPDATE operator_netsuite_posting_order_claims
+           SET active = false,
+--- src/operator-netsuite-posting-service.js
++++ src/operator-netsuite-posting-service.js
+@@ -1,4 +1,5 @@
+ // @ts-check
++import { operatorPostingTelemetry as telemetry } from "./operator-netsuite-posting-telemetry.js";
+ 
+ /** @param {unknown} error */
+ function failureDetails(error) {
+@@ -89,8 +90,8 @@
+     }
+   }
+ 
+-  async function verifiedExternalRecord(/** @type {Record<string, any>} */ step) {
+-    const record = await adapter.findByExternalId(step);
++  async function verifiedExternalRecord(/** @type {Record<string, any>} */ step, stage = "duplicate_check") {
++    const record = await telemetry.context({ stage }, () => telemetry.time({ operation: `posting.${stage}` }, () => adapter.findByExternalId(step)));
+     if (!record) {return null;}
+     const verified = adapter.verify(step, record);
+     return { record, verified };
+@@ -114,10 +115,10 @@
+         ({ record, verified } = existing);
+         recovered = true;
+       } else {
+-        const transformed = await adapter.transform(step);
++        const transformed = await telemetry.context({ stage: "transform" }, () => telemetry.time({ operation: "posting.transform" }, () => adapter.transform(step)));
+         const transactionId = Number(transformed?.id);
+         if (Number.isSafeInteger(transactionId) && transactionId > 0) {
+-          record = await adapter.fetchById(step, transactionId);
++          record = await telemetry.context({ stage: "verification" }, () => telemetry.time({ operation: "posting.verification" }, () => adapter.fetchById(step, transactionId)));
+           if (!record) {
+             throw Object.assign(new Error("NetSuite transform succeeded but the created record could not be read."), {
+               code: "OPERATOR_NETSUITE_POSTING_RESULT_UNVERIFIED",
+@@ -126,7 +127,7 @@
+           }
+           verified = adapter.verify(step, record);
+         } else {
+-          const afterTransform = await verifiedExternalRecord(step);
++          const afterTransform = await verifiedExternalRecord(step, "recovery");
+           if (!afterTransform) {
+             throw Object.assign(new Error("NetSuite transform returned no verifiable transaction identity."), {
+               code: "OPERATOR_NETSUITE_POSTING_RESULT_UNVERIFIED",
+@@ -141,7 +142,7 @@
+       const ambiguous = isAmbiguousOperatorNetSuiteFailure(error);
+       if (ambiguous) {
+         try {
+-          const recovery = await verifiedExternalRecord(step);
++          const recovery = await verifiedExternalRecord(step, "recovery");
+           if (recovery) {
+             ({ record, verified } = recovery);
+             recovered = true;
+@@ -193,7 +194,10 @@
+     for (const step of command.steps || []) {
+       if (step.status === "posted") {continue;}
+       try {
+-        await withLeaseHeartbeat(command, () => postStep(command, step));
++        await telemetry.context({ commandId: command.id, functionKey: command.functionKey,
++          transactionType: step.transactionType, sourceOrderKind: step.sourceOrderKind,
++          sourceNetSuiteId: step.sourceNetSuiteId, stepIndex: step.stepIndex, stage: "posting" },
++        () => telemetry.time({ operation: "posting.step" }, () => withLeaseHeartbeat(command, () => postStep(command, step))));
+       } catch (error) {
+         command = requiresAttention(command, error)
+           ? await repository.attention({
+@@ -219,7 +223,8 @@
+         commandId: command.id,
+         leaseToken: command.leaseToken,
+         result: completionResult(command),
+-        finalize: () => finalize(command)
++        finalize: () => telemetry.context({ commandId: command.id, transactionType: command.transactionType,
++          functionKey: command.functionKey, stage: "finalization" }, () => telemetry.time({ operation: "posting.finalization" }, () => finalize(command)))
+       });
+     } catch (error) {
+       const message = error instanceof Error ? error.message : String(error);
+--- src/operator-netsuite-posting-targets.js
++++ src/operator-netsuite-posting-targets.js
+@@ -1,6 +1,7 @@
+ // @ts-check
+ 
+ import { query } from "./db.js";
++import { operatorPostingTelemetry as telemetry } from "./operator-netsuite-posting-telemetry.js";
+ import {
+   buildItemFulfillmentPayload,
+   getDeliveryOrder,
+@@ -167,11 +168,11 @@
+         "A valid NetSuite source is required for authoritative line mapping."
+       );
+     }
+-    const [orders, sourceItems, linkedRows] = await Promise.all([
+-      fetchReconciliationOrders({ orderIds: [id], kind, includeOpen: false, targetOnly: true }),
+-      fetchSourceItemLines(kind, id),
+-      fetchLinkedTransactions([id])
+-    ]);
++    const [orders, sourceItems, linkedRows] = await telemetry.context({ sourceOrderKind: kind, sourceNetSuiteId: id, stage: "source_validation" }, () => Promise.all([
++      telemetry.time({ operation: "source.reconciliation" }, () => fetchReconciliationOrders({ orderIds: [id], kind, includeOpen: false, targetOnly: true })),
++      telemetry.time({ operation: "source.lines" }, () => fetchSourceItemLines(kind, id)),
++      telemetry.time({ operation: "source.linked_transactions" }, () => fetchLinkedTransactions([id]))
++    ]));
+     const order = (orders || []).find((/** @type {Record<string, any>} */ candidate) => (
+       Number(candidate?.id) === id && String(candidate?.kind) === kind
+     ));
+--- src/operator-netsuite-posting-telemetry.js
++++ src/operator-netsuite-posting-telemetry.js
+@@ -0,0 +1,70 @@
++// @ts-check
++import { AsyncLocalStorage } from "node:async_hooks";
++
++const fields = ["commandId", "transactionType", "functionKey", "sourceOrderKind", "sourceNetSuiteId", "stepIndex", "stage", "operation", "method", "attempt", "photoId", "queue"];
++
++/** @param {Record<string, any>} value */
++function safeFields(value) {
++  const result = /** @type {Record<string, any>} */ ({});
++  for (const key of fields) {
++    const item = value[key];
++    if (typeof item === "number" && Number.isFinite(item)) {result[key] = item;}
++    else if (typeof item === "string" && /^[A-Za-z0-9_.:-]{1,180}$/.test(item)) {result[key] = item;}
++  }
++  if (typeof value.path === "string") {result.path = new URL(value.path, "https://netsuite.invalid").pathname;}
++  return result;
++}
++
++/** @param {any} value @param {any} error */
++function outcomeFields(value, error) {
++  const status = Number(error?.status ?? value?.response?.status ?? value?.status);
++  return { outcome: error || status >= 400 ? "error" : "ok",
++    ...(Number.isInteger(status) && status >= 100 && status <= 599 ? { status } : {}) };
++}
++/** @param {any} error */
++function errorFields(error) {
++  if (!error) {return {};}
++  const errorCode = String(error.code || "REQUEST_FAILED");
++  return { errorCode: /^[A-Z0-9_]{1,80}$/.test(errorCode) ? errorCode : "REQUEST_FAILED" };
++}
++
++/** @param {{now?: () => number, log?: (entry: Record<string, any>) => void}} [options] */
++export function createOperatorPostingTelemetry({ now = () => performance.now(), log = (entry) => console.info(JSON.stringify(entry)) } = {}) {
++  const storage = new AsyncLocalStorage();
++  /** @template T @param {Record<string, any>} details @param {() => T} work @returns {T} */
++  function context(details, work) {
++    return storage.run({ ...storage.getStore(), ...safeFields(details) }, work);
++  }
++  /** @param {Record<string, any>} details @param {number} started @param {unknown} [value] @param {unknown} [error] */
++  function emit(details, started, value, error) {
++    const current = storage.getStore();
++    if (!current?.commandId) {return;}
++    try {
++      log({ event: "operator_posting_timing", at: new Date().toISOString(), ...current, ...safeFields(details),
++        durationMs: Math.max(0, Math.round((now() - started) * 100) / 100),
++        ...outcomeFields(value, error), ...errorFields(error) });
++    } catch { /* Diagnostics must never change the result of posting. */ }
++  }
++  /** @template T @param {Record<string, any>} details @param {() => Promise<T>} work @returns {Promise<T>} */
++  async function time(details, work) {
++    const started = now();
++    let value;
++    try {
++      value = await work();
++    } catch (error) {
++      emit(details, started, undefined, error);
++      throw error;
++    }
++    emit(details, started, value);
++    return value;
++  }
++  /** @template T @param {string} name @param {Promise<unknown>} queue @param {() => Promise<T>} work @returns {Promise<T>} */
++  function queued(name, queue, work) {
++    const started = now();
++    const run = () => { emit({ operation: "netsuite.queue", queue: name }, started); return work(); };
++    return queue.then(run, run);
++  }
++  return { context, time, queued };
++}
++
++export const operatorPostingTelemetry = createOperatorPostingTelemetry();
+--- src/receiving-repository.js
++++ src/receiving-repository.js
+@@ -286,6 +286,7 @@
+          ON schedule.order_kind = 'PO'
+         AND lower(schedule.order_ref) = lower(COALESCE(NULLIF(po.dispatch_ref, ''), po.tranid))
+ 	     WHERE po.netsuite_active = true
++       AND po.receipt_status IS DISTINCT FROM 'received'
+ 	       AND NOT ${netSuiteClosedOrderFamilySql("po", "PO")}
+        AND (status_text ILIKE '%Pending Receipt%' OR status_text ILIKE '%Partially Received%')
+        ${destinationClause}
+@@ -335,7 +336,7 @@
+ 
+ export async function listReceivingOrders({ orderType, vendor = null, sourceLocationId = null, destinationLocationId = null, search = null, itemSearch = null } = {}) {
+   const params = [orderType];
+-  const clauses = ["ro.order_type = $1", "ro.netsuite_active = true", "(ro.status_text ILIKE '%Pending Receipt%' OR ro.status_text ILIKE '%Partially Received%')"];
++  const clauses = ["ro.order_type = $1", "ro.netsuite_active = true", "ro.receipt_status IS DISTINCT FROM 'received'", "(ro.status_text ILIKE '%Pending Receipt%' OR ro.status_text ILIKE '%Partially Received%')"];
+   if (vendor) {
+     params.push(vendor);
+     clauses.push(`ro.vendor = $${params.length}`);
+@@ -769,6 +770,11 @@
+ export async function getReceivableReceivingOrder(orderId, { includeNetSuiteClosed = false } = {}) {
+   const order = await getReceivingOrder(orderId, { includeNetSuiteClosed });
+   if (!order) throw new Error("Receiving order not found.");
++  if (order.receipt_status === "received") {
++    throw Object.assign(new Error("This order has already been received. Return to Receiving for open orders."), {
++      status: 409, code: "RECEIVING_ALREADY_COMPLETED"
++    });
++  }
+   const receivableLines = (order.lines || []).filter((line) => {
+     const physicalTotal = positiveQuantity(line.received_pallet_qty)
+       + positiveQuantity(line.received_layer_qty)
+@@ -1638,7 +1644,8 @@
+          LEFT JOIN scm_transport_schedule schedule
+            ON schedule.order_kind = 'PO'
+           AND lower(schedule.order_ref) = lower(COALESCE(NULLIF(po.dispatch_ref, ''), po.tranid))
+-	       WHERE NOT ${netSuiteClosedOrderFamilySql("po", "PO")}
++	       WHERE po.receipt_status IS DISTINCT FROM 'received'
++           AND NOT ${netSuiteClosedOrderFamilySql("po", "PO")}
+ 	       UNION ALL
+        SELECT netsuite_id, 'transfer_order'::text AS order_type, NULL::text AS vendor,
+               from_location_id AS source_location_id, to_location_id AS destination_location_id,
+--- src/server.js
++++ src/server.js
+@@ -152,6 +152,7 @@
+   submitOperatorNetSuitePostingAction
+ } from "./operator-netsuite-posting-controller.js";
+ import { startOperatorNetSuitePostingRuntime } from "./operator-netsuite-posting-runtime.js";
++import { startPostingPhotoWorker } from "./operator-netsuite-posting-photo-worker.js";
+ import {
+   enqueueSalesOrderAutoFulfillmentCandidate,
+   startSalesOrderAutoFulfillmentRuntime
+@@ -24447,6 +24448,7 @@
+     console.log(`MBBS Yard Server listening on ${config.appBaseUrl}`);
+     startNetSuiteMirrorWorkers();
+     startOperatorNetSuitePostingRuntime();
++    startPostingPhotoWorker();
+     startSalesOrderAutoFulfillmentRuntime();
+     void delayedStatusRefreshTick();
+     setTimeout(() => void scmScheduleStatusRefreshTick(), 60_000);
+--- public/operator.css
++++ public/operator.css
+@@ -2326,6 +2326,37 @@
+ 
+ .fulfillment-screen > .operator-posting-mode {
+   grid-column: 1 / -1;
++  align-self: start;
++}
++
++.sync-alert.operator-posting-mode {
++  min-height: 0;
++  padding: 6px 10px;
++  display: flex;
++  flex-wrap: wrap;
++  align-items: baseline;
++  gap: 3px 12px;
++  border: 1px solid #b9d6d2;
++  background: #eef7f5;
++  color: #24534e;
++  line-height: 1.4;
++}
++
++.sync-alert.operator-posting-mode strong {
++  font-size: 14px;
++}
++
++.sync-alert.operator-posting-mode span {
++  color: inherit;
++  font-size: 13px;
++  font-weight: 500;
++  overflow-wrap: anywhere;
++}
++
++.sync-alert.operator-posting-mode.danger {
++  border-color: var(--danger);
++  background: #fff1f1;
++  color: var(--danger);
+ }
+ 
+ .reload-fulfillment-screen {
+--- public/operator.html
++++ public/operator.html
+@@ -12,7 +12,7 @@
+     <link rel="manifest" href="/manifest.webmanifest" />
+     <link rel="icon" href="/icons/mbbs-yard.svg" type="image/svg+xml" />
+     <link rel="apple-touch-icon" href="/icons/mbbs-yard-192.png" />
+-    <link rel="stylesheet" href="/operator.css?v=20260915-operator-display-v1" />
++    <link rel="stylesheet" href="/operator.css?v=20260916-posting-photos-v1" />
+     <link rel="stylesheet" href="/i18n.css?v=20260701-i18n-v2" />
+   </head>
+   <body>
+@@ -21,6 +21,6 @@
+     <script src="/vendor/quagga2/quagga.min.js?v=1.12.1"></script>
+     <script src="/i18n.js?v=20260915-operator-display-v1"></script>
+     <script src="/operator-load-summary.js?v=20260915-operator-display-v1"></script>
+-    <script src="/operator.js?v=20260915-packing-rounding-v1"></script>
++    <script src="/operator.js?v=20260916-posting-photos-v1"></script>
+   </body>
+ </html>
+--- public/operator.js
++++ public/operator.js
+@@ -5428,22 +5428,14 @@
+ async function confirmConsolidationLoad() {
+   const state = consolidationLoadState;
+   if (fulfillmentSubmitting || !state.batch) return;
+-  const batchId = state.batch.id, uploads = state.uploads;
++  const batchId = state.batch.id;
+   const pending = state.batch.status === "pending";
+   const photos = fulfillmentPhotoDataUrls.filter(Boolean);
+   if (!pending && photos.length < 2) { showToast(t("operator.takeTwoLoadPhotos", "Take at least 2 photos before confirming load.")); return; }
+   fulfillmentSubmitting = true; fulfillmentJobStage = "Saving proof"; fulfillmentStatusText = "Saving the selected load...";
+   stopFulfillmentCamera(); render();
+   try {
+-    const photoRefs = pending ? state.photoRefs : await mapWithConcurrency(photos, 2, async (photo, index) => {
+-      const key = `${index}:${photo}`;
+-      if (!uploads.has(key)) {
+-        const ref = await uploadOperatorPhoto(photo, { recordType: "operator-consolidation-load-photo", orderId: batchId,
+-          orderRef: batchId, orderType: "consolidation_load", filename: `consolidation-load-${index + 1}.jpg` });
+-        uploads.set(key, ref);
+-      }
+-      return uploads.get(key);
+-    });
++    const photoRefs = pending ? state.photoRefs : photos;
+     if (state.batchId !== batchId) return;
+     state.photoRefs = photoRefs;
+     const batch = await api(`/api/delivery/consolidation-loads/${batchId}/${pending ? "resume" : "submit"}`, { method: "POST", body: JSON.stringify(pending ? {} : { photoRefs }) });
+@@ -6463,10 +6455,12 @@
+   if (!order) return true;
+   if (functionKey === "receiving") return order.order_type === "co_order";
+   if (functionKey !== "delivery_prep") return false;
+-  return order.order_type === "co_order"
+-    || order.order_type === "vrma_order"
+-    || order.reload_authorized === true
+-    || order.sales_order_reattempt === true;
++  const children = order.is_dispatch_group ? order.child_orders || [] : [order];
++  return children.length > 0 && children.every((child) => child.order_type === "sales_order"
++    || child.order_type === "co_order"
++    || child.order_type === "vrma_order"
++    || child.reload_authorized === true
++    || child.sales_order_reattempt === true);
+ }
+ 
+ async function loadOperatorNetSuitePostingPolicy(functionKey) {
+@@ -6484,18 +6478,15 @@
+ 
+ function renderOperatorNetSuitePostingMode(policy, { localOnly = false, error = "" } = {}) {
+   if (localOnly) {
+-    return `<div class="sync-alert operator-posting-mode" data-posting-mode="local"><strong>Local only</strong><span>This order type never creates a NetSuite transaction from Operator.</span></div>`;
++    return `<div class="sync-alert operator-posting-mode" data-posting-mode="local"><strong>Local only</strong><span>Saved in this app.</span></div>`;
+   }
+   if (error || !policy) {
+     return `<div class="sync-alert danger operator-posting-mode" data-posting-mode="unavailable"><strong>Posting mode unavailable</strong><span>${escapeHtml(error || "Refresh this screen before completing the order.")}</span></div>`;
+   }
+   if (policy.effective) {
+-    return `<div class="sync-alert operator-posting-mode" data-posting-mode="netsuite"><strong>Creates NetSuite ${escapeHtml(policy.transactionType)}</strong><span>Local completion is saved only after NetSuite creates and verifies the exact transaction.</span></div>`;
+-  }
+-  const detail = policy.configured && !policy.environmentAllowed
+-    ? "This yard gate is configured on, but the server deployment ceiling is closed."
+-    : "This yard and function gate is off.";
+-  return `<div class="sync-alert operator-posting-mode" data-posting-mode="local"><strong>Local only</strong><span>${escapeHtml(detail)} No NetSuite transaction will be created.</span></div>`;
++    return `<div class="sync-alert operator-posting-mode" data-posting-mode="netsuite"><strong>Creates NetSuite ${escapeHtml(policy.transactionType)}</strong><span>Completion waits for verification.</span></div>`;
++  }
++  return `<div class="sync-alert operator-posting-mode" data-posting-mode="local"><strong>Local only</strong><span>NetSuite posting is off.</span></div>`;
+ }
+ 
+ function operatorNetSuitePostingReady(policy, { localOnly = false, error = "" } = {}) {
+@@ -6774,10 +6765,11 @@
+   }, 1000);
+   render();
+   try {
+-    fulfillmentStatusText = photos.length ? "Uploading photo proof to R2..." : "Saving local loaded status...";
++    const deferPhotos = !localOnlyPosting && fulfillmentNetSuitePolicy?.effective;
++    fulfillmentStatusText = photos.length ? "Saving photo proof..." : "Saving local loaded status...";
+     render();
+     const uploadedPhotoRefs = photos.length
+-      ? await uploadOperatorPhotos(photos, {
++      ? deferPhotos ? photos : await uploadOperatorPhotos(photos, {
+           recordType: isPickupLoad ? "operator-customer-pickup-photo" : "operator-load-photo",
+           orderType: fulfillmentOrder.order_type || deliveryOrderType,
+           orderId: fulfillmentOrder.netsuite_id,
+@@ -6905,7 +6897,7 @@
+     `, `<button class="secondary-button" data-action="finish-receive" type="button">${t("operator.receiving", "Receiving")}</button>`);
+   }
+   return shell(t("operator.receiveOrder", "Receive Order"), `${order.tranid} | ${t("common.location", "Location")} ${currentLocation()?.text || ""}`, `
+-    <section class="fulfillment-screen">
++    <section class="fulfillment-screen fulfillment-form-screen">
+       ${renderOperatorNetSuitePostingMode(receiptNetSuitePolicy, {
+         localOnly: localOnlyPosting,
+         error: receiptNetSuitePolicyError
+@@ -7144,9 +7136,10 @@
+   }, 1000);
+   render();
+   try {
+-    receiptStatusText = "Uploading receiving photos to R2...";
++    const deferPhotos = !localOnlyPosting && receiptNetSuitePolicy?.effective;
++    receiptStatusText = "Saving receiving photos...";
+     render();
+-    const uploadedPhotoRefs = await uploadOperatorPhotos(receiptPhotoDataUrls.filter(Boolean), {
++    const uploadedPhotoRefs = deferPhotos ? receiptPhotoDataUrls.filter(Boolean) : await uploadOperatorPhotos(receiptPhotoDataUrls.filter(Boolean), {
+       recordType: (receiptOrder.order_type || receivingOrderType) === "co_order" ? "operator-co-receiving-photo" : "operator-receiving-photo",
+       orderType: receiptOrder.order_type || receivingOrderType,
+       orderId: receiptOrder.netsuite_id,
+@@ -7215,6 +7208,7 @@
+ 
+ async function finishReceipt() {
+   stopReceiptCamera();
++  invalidateReceivingRequests();
+   const wasLocalCo = (receiptOrder?.order_type || receivingOrderType) === "co_order";
+   currentModule = "receiving";
+   receiptOrder = null;
+@@ -7226,6 +7220,14 @@
+   receiptRequestId = "";
+   receiptNetSuitePolicy = null;
+   receiptNetSuitePolicyError = "";
++  receivingSearch = "";
++  receivingItemSearch = "";
++  receivingSelectedId = null;
++  receivingSelectedOrder = null;
++  receivingOrders = [];
++  receivingItemSuggestions = [];
++  receivingOrderPage = 0;
++  saveOperatorState();
+   if (wasLocalCo) {
+     currentModule = "delivery";
+     deliveryOrderType = "transfer_order";
+--- public/service-worker.js
++++ public/service-worker.js
+@@ -1,14 +1,14 @@
+-const CACHE_NAME = "mbbs-yard-operator-v149-packing-rounding-v1";
++const CACHE_NAME = "mbbs-yard-operator-v150-posting-photos-v1";
+ const OPERATOR_CACHE_PREFIX = "mbbs-yard-operator-";
+ const APP_SHELL = [
+   "/operator",
+   "/operator.html",
+-  "/operator.css?v=20260915-operator-display-v1",
++  "/operator.css?v=20260916-posting-photos-v1",
+   "/i18n.css?v=20260701-i18n-v2",
+   "/vendor/quagga2/quagga.min.js?v=1.12.1",
+   "/i18n.js?v=20260915-operator-display-v1",
+   "/operator-load-summary.js?v=20260915-operator-display-v1",
+-  "/operator.js?v=20260915-packing-rounding-v1",
++  "/operator.js?v=20260916-posting-photos-v1",
+   "/manifest.webmanifest",
+   "/icons/mbbs-yard-192.png",
+   "/icons/mbbs-yard-512.png",
+--- migrations/201_operator_posting_photo_uploads.sql
++++ migrations/201_operator_posting_photo_uploads.sql
+@@ -0,0 +1,24 @@
++CREATE TABLE operator_posting_photo_uploads (
++  id bigserial PRIMARY KEY,
++  command_id uuid REFERENCES operator_netsuite_posting_commands(id) ON DELETE CASCADE,
++  batch_id uuid REFERENCES operator_consolidated_loads(id) ON DELETE CASCADE,
++  photo_index integer NOT NULL CHECK (photo_index >= 0),
++  photo_identity text NOT NULL,
++  status text NOT NULL DEFAULT 'pending' CHECK (status IN ('pending','uploading','uploaded')),
++  attempt_count integer NOT NULL DEFAULT 0,
++  next_attempt_at timestamptz NOT NULL DEFAULT now(),
++  lease_token uuid,
++  lease_expires_at timestamptz,
++  r2_ref text,
++  last_error text,
++  created_at timestamptz NOT NULL DEFAULT now(),
++  uploaded_at timestamptz,
++  CHECK (num_nonnulls(command_id,batch_id)=1),
++  CHECK ((status='uploading') = (lease_token IS NOT NULL AND lease_expires_at IS NOT NULL)),
++  CHECK ((status='uploaded') = (r2_ref IS NOT NULL AND uploaded_at IS NOT NULL)),
++  UNIQUE (command_id,photo_index),
++  UNIQUE (batch_id,photo_index)
++);
++CREATE INDEX operator_posting_photo_uploads_pending_idx
++  ON operator_posting_photo_uploads(next_attempt_at,id) WHERE status<>'uploaded';
++ALTER TABLE operator_consolidated_loads ADD COLUMN photo_input_hash text;
+--- test/mbt/integration/consolidation-load.test.js
++++ test/mbt/integration/consolidation-load.test.js
+@@ -18,6 +18,7 @@
+ import { config } from "../../../src/config.js";
+ import { operatorNetSuitePostingRuntime } from "../../../src/operator-netsuite-posting-runtime.js";
+ import * as delivery from "../../../src/delivery-repository.js";
++import { claimPostingPhoto, completePostingPhoto } from "../../../src/operator-netsuite-posting-photo-queue.js";
+ 
+ let server, base;
+ before(async () => {
+@@ -455,13 +456,37 @@
+ 
+ test("additive batch migration can be rolled back without losing existing saved work", async () => {
+   const before = (await query("SELECT count(*)::int AS count FROM operator_consolidated_loads")).rows[0].count;
++  const photosBefore = (await query("SELECT count(*)::int AS count FROM operator_posting_photo_uploads")).rows[0].count;
+   assert.ok(before > 0);
+   const migration = await readFile(new URL("../../../migrations/200_operator_consolidated_loads.sql", import.meta.url), "utf8");
+   await withTransaction(async () => {
++    await query("DROP TABLE operator_posting_photo_uploads");
+     await query("DROP TABLE operator_consolidated_load_claims");
+     await query("DROP TABLE operator_consolidated_loads");
+     await query(migration);
++    await query(await readFile(new URL("../../../migrations/201_operator_posting_photo_uploads.sql", import.meta.url), "utf8"));
+     assert.equal((await query("SELECT count(*)::int AS count FROM operator_consolidated_loads")).rows[0].count, 0);
+   }, { rollback: true });
+   assert.equal((await query("SELECT count(*)::int AS count FROM operator_consolidated_loads")).rows[0].count, before);
+-});
++  assert.equal((await query("SELECT count(*)::int AS count FROM operator_posting_photo_uploads")).rows[0].count, photosBefore);
++});
++
++test("consolidation accepts durable photo data and uploads after completion without changing replay identity", async () => {
++  const f = await fixture(), batch = await preview(f);
++  const refs = ["proof-one", "proof-two"].map((value) => `data:image/jpeg;base64,${Buffer.from(value).toString("base64")}`);
++  const submitted = await request(f.first, `/${batch.id}/submit`, "POST", { photoRefs: refs });
++  assert.equal(submitted.status, 200, JSON.stringify(submitted.data));
++  assert.equal(submitted.data.status, "completed");
++  for (let i = 0; i < 2; i += 1) {
++    const job = await claimPostingPhoto({ ownerId: batch.id });
++    assert.equal(job.batchId, batch.id);
++    assert.equal(await completePostingPhoto(job, photos(batch.id)[i]), true);
++  }
++  const completed = (await request(f.first, `/${batch.id}`)).data;
++  assert.deepEqual(completed.photoRefs, photos(batch.id));
++  const saved = (await query("SELECT photo_data_urls FROM operator_load_records WHERE order_id::text=ANY($1::text[])", [f.orders.map((order) => order.orderId)])).rows;
++  assert.equal(saved.length, 2);
++  for (const row of saved) {assert.deepEqual(row.photo_data_urls, photos(batch.id));}
++  assert.equal((await request(f.first, `/${batch.id}/submit`, "POST", { photoRefs: refs })).status, 200);
++  assert.equal((await request(f.first, `/${batch.id}/submit`, "POST", { photoRefs: refs.map((ref) => ref.replace("cHJvb2Y", "YXhvb2Y")) })).status, 409);
++});
+--- test/mbt/integration/migration-upgrade.test.js
++++ test/mbt/integration/migration-upgrade.test.js
+@@ -726,10 +726,10 @@
+       immutable_trigger: true
+     }]);
+ 
+-    assert.equal(receiptsBeforeNoOp.rowCount, 200);
++    assert.equal(receiptsBeforeNoOp.rowCount, 201);
+     assert.equal(
+       receiptsBeforeNoOp.rows.at(-1)?.filename,
+-      "200_operator_consolidated_loads.sql"
++      "201_operator_posting_photo_uploads.sql"
+     );
+     assert.deepEqual(
+       receiptsBeforeNoOp.rows
+--- test/mbt/integration/operator-posting-http-timing.test.js
++++ test/mbt/integration/operator-posting-http-timing.test.js
+@@ -0,0 +1,85 @@
++import assert from "node:assert/strict";
++import test, { before, after } from "node:test";
++import { config } from "../../../src/config.js";
++import { query, closeDb } from "../../../src/db.js";
++import { operatorPostingTelemetry } from "../../../src/operator-netsuite-posting-telemetry.js";
++import { transformSalesOrderToItemFulfillment, transformTransferOrderToItemFulfillment, transformPurchaseOrderToItemReceipt, transformTransferOrderToItemReceipt, fetchItemReceiptFromNetSuite, fetchItemFulfillmentFromNetSuite, suiteql } from "../../../src/netsuite.js";
++
++const previous = { ...config.netsuite };
++const nativeFetch = globalThis.fetch, nativeInfo = console.info;
++const events = [];
++before(async () => {
++  assert.equal(process.env.MBT_TEST_ISOLATED, "1");
++  config.netsuite.directAccessEnabled = true;
++  config.netsuite.restBaseUrl = "https://netsuite.invalid/services/rest";
++  await query("INSERT INTO netsuite_tokens(id,access_token,expires_at) VALUES(1,'private-test-token',now()+interval '1 hour') ON CONFLICT(id) DO UPDATE SET access_token=EXCLUDED.access_token,expires_at=EXCLUDED.expires_at");
++  console.info = (value) => events.push(JSON.parse(value));
++});
++after(async () => { Object.assign(config.netsuite, previous); globalThis.fetch = nativeFetch; console.info = nativeInfo; await closeDb(); });
++const context = (type, stage, work) => operatorPostingTelemetry.context({ commandId: `test-${type}`, transactionType: type, stage }, work);
++
++test("all four IF/IR transforms and receipt/fulfillment reads log actual HTTP body duration", async () => {
++  globalThis.fetch = async (input) => {
++    assert.equal(new URL(input).hostname, "netsuite.invalid");
++    const response = new Response('{"id":123,"private":"private-body"}', { status: 200, headers: { "content-type": "application/json", location: "https://netsuite.invalid/record/v1/itemReceipt/123" } });
++    const read = response.text.bind(response);
++    response.text = async () => { await new Promise((resolve) => setTimeout(resolve, 20)); return read(); };
++    return response;
++  };
++  for (const [type, call] of [["IF", transformSalesOrderToItemFulfillment], ["IF", transformTransferOrderToItemFulfillment], ["IR", transformPurchaseOrderToItemReceipt], ["IR", transformTransferOrderToItemReceipt]]) {
++    const beforeCount = events.length;
++    await context(type, "transform", () => call(999, { memo: "private-memo" }));
++    const http = events.slice(beforeCount).find((entry) => entry.operation === "netsuite.http");
++    assert.ok(http, "Every transform emits its HTTP timing");
++    assert.equal(http.method, "POST");
++    assert.equal(http.attempt, 1);
++    assert.equal(http.status, 200);
++    assert.equal(http.commandId, `test-${type}`);
++    assert.equal(http.transactionType, type);
++    assert.equal(http.stage, "transform");
++    assert.ok(http.durationMs >= 15, "Timing includes delayed response body, not just headers");
++  }
++  await context("IR", "verification", () => fetchItemReceiptFromNetSuite(123));
++  await context("IF", "verification", () => fetchItemFulfillmentFromNetSuite(123));
++  assert.equal(events.filter((entry) => entry.operation === "netsuite.http" && entry.method === "GET").length, 2);
++  assert.doesNotMatch(JSON.stringify(events), /private|expandSubResources/);
++});
++
++test("REST and SuiteQL retries record each attempt, HTTP errors, and queue wait", async () => {
++  let restCalls = 0, sqlCalls = 0;
++  const start = events.length;
++  globalThis.fetch = async (input) => {
++    const sql = new URL(input).pathname.endsWith("/suiteql");
++    const attempt = sql ? ++sqlCalls : ++restCalls;
++    return new Response(sql ? '{"items":[],"hasMore":false}' : "{}", {
++      status: attempt === 1 ? 429 : 200, headers: { "content-type": "application/json", "retry-after": "0.001" }
++    });
++  };
++  await context("IR", "transform", () => transformPurchaseOrderToItemReceipt(999, {}));
++  await context("IF", "duplicate_check", () => suiteql("SELECT private_value FROM private_table"));
++  const http = events.slice(start).filter((entry) => entry.operation === "netsuite.http");
++  assert.deepEqual(http.map((entry) => [entry.attempt, entry.status]), [[1, 429], [2, 200], [1, 429], [2, 200]]);
++  assert.equal(http[0].outcome, "error");
++  assert.ok(events.slice(start).some((entry) => entry.operation === "netsuite.queue"));
++  assert.doesNotMatch(JSON.stringify(events), /private/);
++  globalThis.fetch = async () => { throw Object.assign(new Error("private-secret"), { code: "ECONNRESET" }); };
++  await assert.rejects(context("IR", "verification", () => fetchItemReceiptFromNetSuite(123)), { code: "ECONNRESET" });
++  assert.equal(events.at(-1).errorCode, "ECONNRESET");
++  globalThis.fetch = async () => new Response("private body", { status: 400 });
++  await assert.rejects(context("IR", "source_validation", () => suiteql("SELECT private_value")), /SuiteQL failed: 400/);
++  assert.equal(events.at(-1).status, 400);
++  assert.equal(events.at(-1).outcome, "error");
++  assert.doesNotMatch(JSON.stringify(events), /private/);
++});
++
++test("simultaneous IF/IR requests keep queue and HTTP timings attached to their command", async () => {
++  const start = events.length;
++  globalThis.fetch = async () => { await new Promise((resolve) => setTimeout(resolve, 30)); return new Response("{}", { status: 200 }); };
++  await Promise.all([
++    context("IF", "transform", () => transformSalesOrderToItemFulfillment(999, {})),
++    context("IR", "transform", () => transformPurchaseOrderToItemReceipt(999, {}))
++  ]);
++  const entries = events.slice(start);
++  assert.ok(entries.find((entry) => entry.operation === "netsuite.queue" && entry.commandId === "test-IR").durationMs >= 20);
++  for (const entry of entries) { assert.equal(entry.commandId, `test-${entry.transactionType}`); }
++});
+--- test/mbt/integration/operator-posting-photos.test.js
++++ test/mbt/integration/operator-posting-photos.test.js
+@@ -0,0 +1,148 @@
++import assert from "node:assert/strict";
++import crypto from "node:crypto";
++import test, { before, after } from "node:test";
++import { createOperator } from "../../../src/auth-repository.js";
++import { query, withTransaction, closeDb } from "../../../src/db.js";
++import { buildOperatorNetSuitePostingDraft } from "../../../src/operator-netsuite-posting-domain.js";
++import { createOrReplayOperatorNetSuitePostingCommand, claimOperatorNetSuitePostingCommand, startOperatorNetSuitePostingAttempt, recordOperatorNetSuitePostingStepSuccess, completeOperatorNetSuitePostingCommand } from "../../../src/operator-netsuite-posting-repository.js";
++import { enqueuePostingPhotos, claimPostingPhoto, completePostingPhoto, failPostingPhoto } from "../../../src/operator-netsuite-posting-photo-queue.js";
++
++let actor;
++const photos = ["first-proof", "second-proof"].map((value) => `data:image/jpeg;base64,${Buffer.from(value).toString("base64")}`);
++before(async () => { actor = await createOperator({ username: `photo-${crypto.randomUUID()}`, displayName: "Photo queue test", password: crypto.randomUUID(), role: "operator", operatorYardLocationIds: [1] }); });
++after(closeDb);
++
++async function fixture(type = "IF") {
++  const id = crypto.randomUUID(), functionKey = type === "IR" ? "receiving" : "delivery_prep";
++  const input = { requestId: id, actorOperatorId: actor.id, functionKey, transactionType: type,
++    policy: { gateKey: `operator_netsuite_${functionKey}_${type.toLowerCase()}_3445`, revision: 1, effective: true, functionKey, transactionType: type, locationId: 1, yardCode: "3445" },
++    photoRefs: photos, localOrderKeys: [id], localOperation: { kind: type === "IR" ? "receiving_receipt" : "delivery_prep_load", orderId: "900001", orderType: type === "IR" ? "purchase_order" : "sales_order" },
++    targets: [{ sourceOrderKind: type === "IR" ? "PO" : "SO", sourceNetSuiteId: 900001, sourceOrderRef: "PHOTO-TEST", selectedLines: [{ orderLine: 1, quantity: 2, location: 1, localOrderKey: id, localLineId: "1" }], availableLines: [{ orderLine: 1, location: 1 }] }] };
++  const draft = buildOperatorNetSuitePostingDraft(input);
++  const created = await createOrReplayOperatorNetSuitePostingCommand(draft);
++  const claimed = await claimOperatorNetSuitePostingCommand({ commandId: id, workerId: "test", leaseSeconds: 180 });
++  const stepId = created.command.steps[0].id;
++  const attempt = await startOperatorNetSuitePostingAttempt({ commandId: id, stepId, leaseToken: claimed.leaseToken });
++  await recordOperatorNetSuitePostingStepSuccess({ commandId: id, stepId, leaseToken: claimed.leaseToken, attemptNumber: attempt.attemptNumber, transactionId: 123, transactionRef: `${type}123` });
++  return { id, input, draft, leaseToken: claimed.leaseToken };
++}
++
++async function finish(f, { load = true, fail = false } = {}) {
++  return completeOperatorNetSuitePostingCommand({ commandId: f.id, leaseToken: f.leaseToken, finalize: async () => {
++    if (fail) {throw new Error("finalization failed");}
++    if (!load) {return {};}
++    const record = await query("INSERT INTO operator_load_records(load_type,order_family,operator_id,photo_data_url,photo_data_urls,response) VALUES('sales_order_delivery_load','sales_order',$1,$2,$3,$4) RETURNING id", [actor.id, photos[0], JSON.stringify(photos), JSON.stringify({ operatorNetSuitePosting: { commandId: f.id } })]);
++    return { id: record.rows[0].id };
++  } });
++}
++
++test("IF and IR commit durable photos before posting and enqueue only on successful completion", async () => {
++  for (const type of ["IF", "IR"]) {
++    const f = await fixture(type);
++    assert.deepEqual(f.draft.photoRefs, [...photos].sort());
++    assert.ok(f.draft.inputSnapshot.photoRefs.every((ref) => ref.startsWith("sha256:")));
++    assert.equal(await claimPostingPhoto({ ownerId: f.id }), null);
++    await assert.rejects(finish(f, { fail: true }), /finalization failed/);
++    assert.equal(await claimPostingPhoto({ ownerId: f.id }), null);
++    await finish(f);
++    const job = await claimPostingPhoto({ ownerId: f.id });
++    assert.equal(job.commandId, f.id);
++    assert.equal(job.transactionType, type);
++    assert.ok(photos.includes(job.photoRef));
++    assert.equal(job.attemptCount, 1);
++    const beforeRow = (await query("SELECT input_hash,input_snapshot FROM operator_netsuite_posting_commands WHERE id=$1", [f.id])).rows[0];
++    assert.equal(await completePostingPhoto(job, `r2://operator/${job.id}.jpg`), true);
++    const afterRow = (await query("SELECT input_hash,input_snapshot,photo_refs,status FROM operator_netsuite_posting_commands WHERE id=$1", [f.id])).rows[0];
++    assert.equal(afterRow.status, "completed");
++    assert.equal(afterRow.input_hash, beforeRow.input_hash);
++    assert.deepEqual(afterRow.input_snapshot, beforeRow.input_snapshot);
++    assert.equal(afterRow.photo_refs[job.photoIndex], `r2://operator/${job.id}.jpg`);
++    const replay = await createOrReplayOperatorNetSuitePostingCommand(buildOperatorNetSuitePostingDraft(f.input));
++    assert.equal(replay.replayed, true);
++  }
++});
++
++test("upload retries survive worker restart and cannot alter IF/IR posting state", async () => {
++  const f = await fixture(); await finish(f);
++  const job = await claimPostingPhoto({ ownerId: f.id });
++  await failPostingPhoto(job, Object.assign(new Error("private-image-data"), { code: "PHOTO_UPLOAD_FAILED" }));
++  const row = (await query("SELECT * FROM operator_posting_photo_uploads WHERE id=$1", [job.id])).rows[0];
++  assert.equal(row.status, "pending");
++  assert.equal(row.last_error, "PHOTO_UPLOAD_FAILED");
++  assert.ok(new Date(row.next_attempt_at) > new Date());
++  await query("UPDATE operator_posting_photo_uploads SET next_attempt_at=now()-interval '1 second' WHERE id=$1", [job.id]);
++  const retry = await claimPostingPhoto({ ownerId: f.id });
++  assert.equal(retry.id, job.id);
++  assert.equal(retry.attemptCount, 2);
++  assert.notEqual(retry.leaseToken, job.leaseToken);
++  assert.equal(await completePostingPhoto(job, "r2://stale.jpg"), false);
++  assert.equal(await completePostingPhoto(retry, "r2://operator/retried.jpg"), true);
++  const posting = (await query("SELECT c.status,s.attempt_count FROM operator_netsuite_posting_commands c JOIN operator_netsuite_posting_steps s ON s.command_id=c.id WHERE c.id=$1", [f.id])).rows[0];
++  assert.deepEqual(posting, { status: "completed", attempt_count: 1 });
++});
++
++test("concurrent workers claim distinct photos and expired leases are recoverable", async () => {
++  const f = await fixture(); await finish(f);
++  const claims = await Promise.all(Array.from({ length: 6 }, () => claimPostingPhoto({ ownerId: f.id })));
++  const active = claims.filter(Boolean);
++  assert.equal(active.length, 2);
++  assert.equal(new Set(active.map((job) => job.id)).size, 2);
++  const old = active[0];
++  await query("UPDATE operator_posting_photo_uploads SET lease_expires_at=now()-interval '1 second' WHERE id=$1", [old.id]);
++  const recovered = await claimPostingPhoto({ ownerId: f.id });
++  assert.equal(recovered.id, old.id);
++  assert.equal(await completePostingPhoto(old, "r2://stale.jpg"), false);
++  assert.equal(await completePostingPhoto(recovered, "r2://operator/recovered.jpg"), true);
++});
++
++test("replacement is atomic, scoped to associated proof, and preserves photo order", async () => {
++  const f = await fixture(), other = await fixture(); await finish(f); await finish(other);
++  const job = await claimPostingPhoto({ ownerId: f.id });
++  await assert.rejects(withTransaction(async () => {
++    await completePostingPhoto(job, "r2://operator/new.jpg");
++    throw new Error("rollback");
++  }), /rollback/);
++  const read = async (id) => (await query("SELECT photo_data_url,photo_data_urls FROM operator_load_records WHERE response->'operatorNetSuitePosting'->>'commandId'=$1", [id])).rows[0];
++  assert.deepEqual((await read(f.id)).photo_data_urls, photos);
++  assert.equal(await completePostingPhoto(job, "r2://operator/new.jpg"), true);
++  assert.deepEqual((await read(f.id)).photo_data_urls, photos.map((ref) => ref === job.photoRef ? "r2://operator/new.jpg" : ref));
++  assert.deepEqual((await read(other.id)).photo_data_urls, photos);
++});
++
++test("queued work cannot run before its owner completes and enqueue is idempotent", async () => {
++  const f = await fixture();
++  await enqueuePostingPhotos({ commandId: f.id, photos: [...photos].sort() });
++  await enqueuePostingPhotos({ commandId: f.id, photos: [...photos].sort() });
++  assert.equal(await claimPostingPhoto({ ownerId: f.id }), null);
++  await finish(f);
++  assert.equal((await query("SELECT count(*)::int AS n FROM operator_posting_photo_uploads WHERE command_id=$1", [f.id])).rows[0].n, 2);
++  assert.ok(await claimPostingPhoto({ ownerId: f.id }));
++});
++
++test("IR proof and a native consolidated batch keep their associations after background upload", async () => {
++  const f = await fixture("IR");
++  await query("INSERT INTO purchase_orders(netsuite_id,tranid) VALUES(900001,'PHOTO-TEST') ON CONFLICT DO NOTHING");
++  const proof = (await query("INSERT INTO receiving_receipt_records(order_id,operator_id,photo_data_urls,response) VALUES(900001,$1,$2,$3) RETURNING id", [actor.id, JSON.stringify(photos), JSON.stringify({ operatorNetSuitePosting: { commandId: f.id } })])).rows[0];
++  await finish(f, { load: false });
++  const job = await claimPostingPhoto({ ownerId: f.id });
++  await completePostingPhoto(job, "r2://operator/ir.jpg");
++  assert.deepEqual((await query("SELECT photo_data_urls FROM receiving_receipt_records WHERE id=$1", [proof.id])).rows[0].photo_data_urls, photos.map((ref) => ref === job.photoRef ? "r2://operator/ir.jpg" : ref));
++  const native = await fixture(), batchId = crypto.randomUUID();
++  await query("INSERT INTO operator_consolidated_loads(id,operator_id,location_id,snapshot,snapshot_hash,photo_refs,status,command_id) VALUES($1,$2,1,'{}','test',$3,'completed',$4)", [batchId, actor.id, JSON.stringify(photos), native.id]);
++  await finish(native);
++  const batchJob = await claimPostingPhoto({ ownerId: native.id });
++  await completePostingPhoto(batchJob, "r2://operator/native.jpg");
++  assert.deepEqual((await query("SELECT photo_refs FROM operator_consolidated_loads WHERE id=$1", [batchId])).rows[0].photo_refs, photos.map((ref) => ref === batchJob.photoRef ? "r2://operator/native.jpg" : ref));
++});
++
++test("changed photo identities and expired leases cannot overwrite durable proof", async () => {
++  const f = await fixture(); await finish(f);
++  const job = await claimPostingPhoto({ ownerId: f.id });
++  await assert.rejects(completePostingPhoto(job, "../unsafe"), /valid uploaded photo/);
++  await assert.rejects(completePostingPhoto({ ...job, photoIdentity: "wrong" }, "r2://operator/new.jpg"), /identity changed/);
++  await assert.rejects(completePostingPhoto({ ...job, photoIndex: 99 }, "r2://operator/new.jpg"), /reference changed/);
++  await query("UPDATE operator_posting_photo_uploads SET lease_expires_at=now()-interval '1 second' WHERE id=$1", [job.id]);
++  assert.equal(await completePostingPhoto(job, "r2://operator/new.jpg"), false);
++  const row = (await query("SELECT photo_refs FROM operator_netsuite_posting_commands WHERE id=$1", [f.id])).rows[0];
++  assert.deepEqual(row.photo_refs, [...photos].sort());
++});
+--- test/mbt/integration/operator-receiving-completed.test.js
++++ test/mbt/integration/operator-receiving-completed.test.js
+@@ -0,0 +1,28 @@
++import assert from "node:assert/strict";
++import crypto from "node:crypto";
++import test, { after } from "node:test";
++import { query, closeDb } from "../../../src/db.js";
++import { listReceivingOrders, listReceivingVendors, searchReceivingItems, getReceivableReceivingOrder } from "../../../src/receiving-repository.js";
++import { submitOperatorNetSuitePostingAction } from "../../../src/operator-netsuite-posting-controller.js";
++
++after(closeDb);
++test("received split and ordinary POs stay hidden despite stale NetSuite statuses", async () => {
++  const vendor = `completed-${crypto.randomUUID()}`;
++  const ids = [-(870000000 + crypto.randomInt(1000000)), 871000000 + crypto.randomInt(1000000), 872000000 + crypto.randomInt(1000000)];
++  for (const [index, id] of ids.entries()) {
++    await query(`INSERT INTO purchase_orders(netsuite_id,tranid,vendor,destination_location_id,netsuite_active,status,status_text,receipt_status)
++      VALUES($1,$2,$3,1,true,'E','Purchase Order : Pending Billing/Partially Received',$4)`, [id, `DONE-${id}`, vendor, index < 2 ? "received" : "partial_received"]);
++    await query(`INSERT INTO purchase_order_lines(purchase_order_id,line_id,item_id,item_name,item_type,quantity,unit,piece_qty,to_pcs,received_piece_qty,netsuite_active,confirmed_at)
++      VALUES($1,1,$2,$3,'InvtPart',10,'EACH',10,1,10,true,now())`, [id, Math.abs(id), `ITEM-${id}`]);
++  }
++  const list = await listReceivingOrders({ orderType: "purchase_order", destinationLocationId: 1, vendor });
++  assert.deepEqual(list.map((row) => Number(row.netsuite_id)), [ids[2]]);
++  for (const id of ids.slice(0, 2)) {
++    assert.deepEqual(await listReceivingOrders({ orderType: "purchase_order", search: `DONE-${id}` }), []);
++    assert.deepEqual(await searchReceivingItems({ orderType: "purchase_order", search: `ITEM-${id}` }), []);
++    await assert.rejects(getReceivableReceivingOrder(id, { includeNetSuiteClosed: true }), { code: "RECEIVING_ALREADY_COMPLETED", status: 409 });
++    await assert.rejects(submitOperatorNetSuitePostingAction({ requestId: crypto.randomUUID(), functionKey: "receiving", orderId: id, orderType: "purchase_order", clientLocationId: 1 }), { code: "RECEIVING_ALREADY_COMPLETED" });
++  }
++  assert.equal((await listReceivingVendors({ destinationLocationId: 1 })).find((row) => row.vendor === vendor).order_count, 1);
++  assert.ok(await getReceivableReceivingOrder(ids[2]));
++});
+--- test/mbt/integration/p3-predeploy-readiness.test.js
++++ test/mbt/integration/p3-predeploy-readiness.test.js
+@@ -176,7 +176,8 @@
+     "197_scm_vendor_completion.sql",
+     "198_google_maps_usage_control.sql",
+     "199_operator_yard_access.sql",
+-    "200_operator_consolidated_loads.sql"
++    "200_operator_consolidated_loads.sql",
++    "201_operator_posting_photo_uploads.sql"
+   ]);
+   assert.deepEqual(REQUIRED_MBT_P3_FLAGS, EXPECTED_FLAGS);
+   const rows = EXPECTED_FLAGS.map((flag_key) => ({ flag_key, enabled: false }));
+--- test/mbt/unit/operations-navigation-enhancements.test.js
++++ test/mbt/unit/operations-navigation-enhancements.test.js
+@@ -122,13 +122,13 @@
+ 
+ test("operator cache assets advance with the cycle-count pagination release", () => {
+   for (const asset of [
+-    "/operator.css?v=20260915-operator-display-v1",
+-    "/operator.js?v=20260915-packing-rounding-v1"
++    "/operator.css?v=20260916-posting-photos-v1",
++    "/operator.js?v=20260916-posting-photos-v1"
+   ]) {
+     assert.ok(operatorHtml.includes(asset));
+     assert.ok(serviceWorker.includes(asset));
+   }
+-  assert.ok(serviceWorker.includes("mbbs-yard-operator-v149-packing-rounding-v1"));
++  assert.ok(serviceWorker.includes("mbbs-yard-operator-v150-posting-photos-v1"));
+ });
+ 
+ test("Dispatch and SCM card menus scroll within the fixed-height application shell", () => {
+--- test/mbt/unit/operator-customer-pickup-photo-gate-ui.contract.test.js
++++ test/mbt/unit/operator-customer-pickup-photo-gate-ui.contract.test.js
+@@ -90,7 +90,7 @@
+     source("public/operator.html"),
+     source("public/service-worker.js")
+   ]);
+-  assert.match(html, /operator\.js\?v=20260915-packing-rounding-v1/u);
+-  assert.match(serviceWorker, /mbbs-yard-operator-v149-packing-rounding-v1/u);
+-  assert.match(serviceWorker, /operator\.js\?v=20260915-packing-rounding-v1/u);
++  assert.match(html, /operator\.js\?v=20260916-posting-photos-v1/u);
++  assert.match(serviceWorker, /mbbs-yard-operator-v150-posting-photos-v1/u);
++  assert.match(serviceWorker, /operator\.js\?v=20260916-posting-photos-v1/u);
+ });
+--- test/mbt/unit/operator-page-confirm-ui.contract.test.js
++++ test/mbt/unit/operator-page-confirm-ui.contract.test.js
+@@ -58,11 +58,11 @@
+   assert.match(operator, /pageConfirming = true;/u);
+   assert.match(operator, /pageConfirming = false;/u);
+   assert.match(css, /@media \(max-width: 700px\)[\s\S]*?\.receiving-grid\s*\{[\s\S]*?grid-template-columns:\s*minmax\(0, 1fr\)/u);
+-  assert.match(html, /operator\.css\?v=20260915-operator-display-v1/u);
+-  assert.match(html, /operator\.js\?v=20260915-packing-rounding-v1/u);
+-  assert.match(serviceWorker, /mbbs-yard-operator-v149-packing-rounding-v1/u);
+-  assert.match(serviceWorker, /operator\.css\?v=20260915-operator-display-v1/u);
+-  assert.match(serviceWorker, /operator\.js\?v=20260915-packing-rounding-v1/u);
++  assert.match(html, /operator\.css\?v=20260916-posting-photos-v1/u);
++  assert.match(html, /operator\.js\?v=20260916-posting-photos-v1/u);
++  assert.match(serviceWorker, /mbbs-yard-operator-v150-posting-photos-v1/u);
++  assert.match(serviceWorker, /operator\.css\?v=20260916-posting-photos-v1/u);
++  assert.match(serviceWorker, /operator\.js\?v=20260916-posting-photos-v1/u);
+ });
+ 
+ test("server exposes separate Customer Pickup and PO-only batch endpoints", async () => {
+--- test/mbt/unit/operator-posting-latency.test.js
++++ test/mbt/unit/operator-posting-latency.test.js
+@@ -0,0 +1,154 @@
++import assert from "node:assert/strict";
++import test from "node:test";
++import fc from "fast-check";
++import { createOperatorPostingTelemetry } from "../../../src/operator-netsuite-posting-telemetry.js";
++import { parsePostingPhoto, postingPhotoIdentity, replacePostingPhoto, uploadPostingPhoto, validatePostingPhotos } from "../../../src/operator-netsuite-posting-photos.js";
++import { createPostingPhotoWorker, postingPhotoWorker, startPostingPhotoWorker } from "../../../src/operator-netsuite-posting-photo-worker.js";
++
++const photo = (body = "photo-one") => `data:image/jpeg;base64,${Buffer.from(body).toString("base64")}`;
++
++test("timings include response bodies, HTTP failures, and safe correlation fields", async () => {
++  const events = [];
++  let clock = 10;
++  const telemetry = createOperatorPostingTelemetry({ now: () => clock, log: (entry) => events.push(entry) });
++  const value = await telemetry.context({ commandId: "command-one", transactionType: "IR", token: "secret-token" }, () =>
++    telemetry.time({ operation: "netsuite.http", method: "POST", path: "/record/v1/purchaseorder/9/!transform/itemreceipt?token=secret", attempt: 1 }, async () => {
++      clock += 15;
++      return { response: { status: 204 }, text: "private-body" };
++    }));
++  assert.equal(value.text, "private-body");
++  assert.equal(events[0].durationMs, 15);
++  assert.equal(events[0].status, 204);
++  assert.equal(events[0].commandId, "command-one");
++  assert.equal(events[0].transactionType, "IR");
++  assert.equal(events[0].path, "/record/v1/purchaseorder/9/!transform/itemreceipt");
++  const failure = Object.assign(new Error("private body and secret-token"), { code: "ECONNRESET" });
++  await assert.rejects(telemetry.context({ commandId: "command-two", transactionType: "IF" }, () =>
++    telemetry.time({ operation: "netsuite.http" }, async () => { clock += 7; throw failure; })), (error) => error === failure);
++  assert.equal(events[1].durationMs, 7);
++  assert.equal(events[1].outcome, "error");
++  assert.equal(events[1].errorCode, "ECONNRESET");
++  assert.doesNotMatch(JSON.stringify(events), /secret|private/);
++});
++
++test("concurrent IF/IR stages retain their own context and logging cannot fail posting", async () => {
++  const events = [];
++  const telemetry = createOperatorPostingTelemetry({ log: (entry) => events.push(entry) });
++  await Promise.all(["IF", "IR"].map((transactionType) => telemetry.context({ commandId: transactionType, transactionType }, async () => {
++    await new Promise((resolve) => setImmediate(resolve));
++    await telemetry.context({ stage: "verify" }, () => telemetry.time({ operation: "netsuite.http" }, async () => ({ response: { status: 400 } })));
++  })));
++  assert.equal(events.length, 2);
++  for (const entry of events) {
++    assert.equal(entry.commandId, entry.transactionType);
++    assert.equal(entry.stage, "verify");
++    assert.equal(entry.outcome, "error");
++    assert.equal(entry.status, 400);
++  }
++  const brokenLog = createOperatorPostingTelemetry({ log: () => { throw new Error("logging failed"); } });
++  assert.equal(await brokenLog.context({ commandId: "one" }, () => brokenLog.time({ operation: "post" }, async () => 123)), 123);
++  await telemetry.time({ operation: "outside-context" }, async () => null);
++  assert.equal(events.length, 2);
++});
++
++test("photo data is bounded and invalid images are rejected without echoing data", () => {
++  const parsed = parsePostingPhoto(photo());
++  assert.equal(parsed.mimeType, "image/jpeg");
++  assert.equal(parsed.bytes.toString(), "photo-one");
++  assert.equal(parsed.sha256.length, 64);
++  for (const value of ["data:image/svg+xml;base64,PHN2Zz4=", "data:image/jpeg;base64,@@private@@", "data:image/jpeg;base64,", "data:image/jpeg,private"]) {
++    assert.throws(() => parsePostingPhoto(value), (error) => error.code === "OPERATOR_PHOTO_INVALID" && !error.message.includes("private"));
++  }
++  assert.throws(() => parsePostingPhoto(photo(), { maxBytes: 2 }), /too large/i);
++  assert.throws(() => parsePostingPhoto("data:image/jpeg;base64,YQ"), /base64 data is invalid/);
++  assert.throws(() => validatePostingPhotos(Array(21).fill("r2://operator/existing.jpg")), /too large/i);
++  const large = `data:image/jpeg;base64,${Buffer.alloc(9 * 1024 * 1024).toString("base64")}`;
++  assert.throws(() => validatePostingPhotos([large, large]), /too large/i);
++  assert.equal(parsePostingPhoto("r2://operator/existing.jpg"), null);
++});
++
++test("photo identity is stable, content sensitive, and does not retain image bodies", () => {
++  assert.match(postingPhotoIdentity(photo()), /^sha256:[a-f0-9]{64}$/);
++  assert.equal(postingPhotoIdentity(photo()), postingPhotoIdentity(photo()));
++  assert.notEqual(postingPhotoIdentity(photo()), postingPhotoIdentity(photo("photo-two")));
++  assert.equal(postingPhotoIdentity("r2://operator/existing.jpg"), "r2://operator/existing.jpg");
++});
++
++test("photo replacement preserves order and unrelated values across generated cases", () => {
++  fc.assert(fc.property(fc.uint8Array({ minLength: 1, maxLength: 2048 }), (bytes) => {
++    const ref = `data:image/png;base64,${Buffer.from(bytes).toString("base64")}`;
++    assert.deepEqual(parsePostingPhoto(ref).bytes, Buffer.from(bytes));
++    const original = ["r2://a", ref, "r2://b", ref];
++    assert.deepEqual(replacePostingPhoto(original, ref, "r2://new"), ["r2://a", "r2://new", "r2://b", "r2://new"]);
++    assert.equal(original[1], ref);
++    assert.equal(postingPhotoIdentity(ref), postingPhotoIdentity(ref));
++  }), { seed: 16092026, numRuns: 160 });
++});
++
++test("R2 upload verifies response, uses fresh credentials, and omits remote bodies from errors", async () => {
++  const calls = [];
++  const job = { id: "1", commandId: "command", actorOperatorId: "operator", functionKey: "receiving", photoRef: photo(), attemptCount: 1, operation: { orderId: "9", orderType: "purchase_order" } };
++  const dependencies = {
++    ticket: (input) => { calls.push(input); return { uploadUrl: "https://upload.invalid/upload", token: "secret" }; },
++    fetch: async (url, options) => { assert.equal(url, "https://upload.invalid/upload"); assert.equal(options.headers.Authorization, "Bearer secret"); assert.equal(options.body.get("file").size, 9); return new Response(JSON.stringify({ key: "operator/receipt.jpg" }), { status: 200 }); }
++  };
++  assert.equal(await uploadPostingPhoto(job, dependencies), "r2://operator/receipt.jpg");
++  assert.equal(calls[0].recordType, "operator-receiving-photo");
++  await assert.rejects(uploadPostingPhoto(job, { ...dependencies, fetch: async () => new Response("private-image-token", { status: 503 }) }), (error) => error.status === 503 && !error.message.includes("private"));
++  await assert.rejects(uploadPostingPhoto(job, { ...dependencies, fetch: async () => new Response(JSON.stringify({ key: "../foreign" }), { status: 200 }) }), /key/i);
++  await assert.rejects(uploadPostingPhoto(job, { ...dependencies, fetch: async () => new Response("invalid JSON", { status: 200 }) }), /key/i);
++  await assert.rejects(uploadPostingPhoto(job, { ...dependencies,
++    ticket: () => ({ token: "secret", metadata: { keyPrefix: "operator/owned" } }),
++    fetch: async () => new Response(JSON.stringify({ key: "operator/foreign.jpg" }), { status: 200 }) }), /key/i);
++  assert.equal(await uploadPostingPhoto({ photoRef: "r2://existing.jpg" }, { ticket: () => { throw new Error("Existing upload needs no ticket"); } }), "r2://existing.jpg");
++});
++
++test("background worker does not overlap ticks and persists upload failures for retry", async () => {
++  let release, claims = 0, completed = 0, failed = 0;
++  const barrier = new Promise((resolve) => { release = resolve; });
++  const worker = createPostingPhotoWorker({
++    claim: async () => ++claims === 1 ? { id: "1" } : null,
++    upload: async () => { await barrier; return "r2://done.jpg"; },
++    complete: async () => { completed += 1; return true; }, fail: async () => { failed += 1; }
++  });
++  const first = worker.tick();
++  await new Promise((resolve) => setImmediate(resolve));
++  await worker.tick();
++  assert.equal(claims, 1);
++  release(); await first;
++  assert.equal(completed, 1); assert.equal(failed, 0);
++  let pending = true;
++  const failing = createPostingPhotoWorker({
++    claim: async () => { if (!pending) {return null;} pending = false; return { id: "2" }; },
++    upload: async () => { throw new Error("R2 unavailable"); },
++    complete: async () => { throw new Error("Must not complete failed upload"); },
++    fail: async (_job, error) => { assert.equal(error.message, "R2 unavailable"); failed += 1; }
++  });
++  await failing.tick(); assert.equal(failed, 1);
++});
++
++test("photo worker reports a lost lease and resumes polling once after startup", async (t) => {
++  const errors = [];
++  let available = true;
++  const worker = createPostingPhotoWorker({
++    claim: async () => { if (!available) {return null;} available = false; return { id: "lost" }; },
++    upload: async () => "r2://uploaded.jpg", complete: async () => false,
++    fail: async (_job, error) => errors.push(error.code)
++  });
++  await worker.tick();
++  assert.deepEqual(errors, ["PHOTO_LEASE_LOST"]);
++  let scheduled, polls = 0, unref = 0;
++  const log = [];
++  t.mock.method(globalThis, "setInterval", (callback, delay) => {
++    assert.equal(delay, 5000); assert.equal(scheduled, undefined); scheduled = callback;
++    return { unref: () => { unref += 1; } };
++  });
++  t.mock.method(postingPhotoWorker, "tick", async () => { polls += 1; throw new Error("private database details"); });
++  t.mock.method(console, "error", (entry) => log.push(JSON.parse(entry)));
++  startPostingPhotoWorker(); startPostingPhotoWorker();
++  await new Promise((resolve) => setImmediate(resolve));
++  scheduled();
++  await new Promise((resolve) => setImmediate(resolve));
++  assert.equal(polls, 2); assert.equal(unref, 1);
++  assert.deepEqual(log, Array(2).fill({ event: "operator_photo_worker_error", errorCode: "PHOTO_WORKER_FAILED" }));
++});
+--- test/mbt/unit/operator-posting-photo-client.test.js
++++ test/mbt/unit/operator-posting-photo-client.test.js
+@@ -0,0 +1,55 @@
++import assert from "node:assert/strict";
++import { readFileSync } from "node:fs";
++import vm from "node:vm";
++import test from "node:test";
++
++const source = readFileSync(new URL("../../../public/operator.js", import.meta.url), "utf8");
++function functionText(name, next) {
++  const start = source.indexOf(`async function ${name}(`);
++  return source.slice(start, source.indexOf(`async function ${next}(`, start));
++}
++const photos = ["data:image/jpeg;base64,cGhvdG8x", "data:image/jpeg;base64,cGhvdG8y"];
++
++test("delivery Sales Orders owned by driver completion retain the direct-upload path", () => {
++  const start = source.indexOf("function operatorNetSuitePostingIsLocalOnly(");
++  const fn = source.slice(start, source.indexOf("async function loadOperatorNetSuitePostingPolicy(", start));
++  const context = vm.createContext({});
++  vm.runInContext(fn, context);
++  const local = context.operatorNetSuitePostingIsLocalOnly;
++  assert.equal(local({ order_type: "sales_order" }, "delivery_prep"), true);
++  assert.equal(local({ order_type: "sales_order" }, "customer_pickup"), false);
++  assert.equal(local({ order_type: "transfer_order" }, "delivery_prep"), false);
++  assert.equal(local({ is_dispatch_group: true, child_orders: [{ order_type: "sales_order" }, { order_type: "co_order" }] }, "delivery_prep"), true);
++  assert.equal(local({ is_dispatch_group: true, child_orders: [{ order_type: "sales_order" }, { order_type: "transfer_order" }] }, "delivery_prep"), false);
++});
++
++for (const kind of ["delivery", "pickup", "receiving"]) {
++  test(`${kind}: native posting submits durable photo data without waiting for R2; local mode keeps direct uploads`, async () => {
++    for (const effective of [true, false]) {
++      const calls = [];
++      const policy = { effective, gateKey: "test", revision: 1 };
++      const context = vm.createContext({
++        fulfillmentOrder: { netsuite_id: 7, order_type: kind === "delivery" ? "transfer_order" : "sales_order" }, receiptOrder: { netsuite_id: 8, order_type: "purchase_order" },
++        fulfillmentSubmitting: false, receiptSubmitting: false, fulfillmentPhotoDataUrls: photos, receiptPhotoDataUrls: photos,
++        fulfillmentNetSuitePolicy: policy, receiptNetSuitePolicy: policy, currentModule: kind === "pickup" ? "customer-pickup-load" : "delivery",
++        fulfillmentLoadRequestId: "load-id", receiptRequestId: "receipt-id", locationId: 1,
++        deliveryOrderType: kind === "delivery" ? "transfer_order" : "sales_order", receivingOrderType: "purchase_order", receivingSelectedSourceId: null,
++        fulfillmentProgressTimer: null, receiptProgressTimer: null,
++        window: { setInterval: () => 1, clearInterval: () => {} },
++        render: () => {}, showToast: (message) => calls.push({ type: "toast", message }),
++        operatorNetSuitePostingIsLocalOnly: () => false, refreshCustomerPickupPhotoRequirement: async () => {}, fulfillmentRequiredPhotoCount: () => 2,
++        loadOperatorNetSuitePostingPolicy: async () => policy, operatorNetSuitePolicyToken: (value) => value,
++        stopFulfillmentCamera: () => {}, stopReceiptCamera: () => {},
++        uploadOperatorPhotos: async () => { calls.push({ type: "upload" }); return ["r2://one", "r2://two"]; },
++        api: async (path, options) => { calls.push({ type: "post", path, payload: JSON.parse(options.body) }); return { status: "complete", result: { complete: true } }; }
++      });
++      const fn = kind === "receiving" ? functionText("confirmReceipt", "pollReceiptJob") : functionText("confirmFulfillment", "pollFulfillmentJob");
++      await vm.runInContext(`${fn}\n${kind === "receiving" ? "confirmReceipt" : "confirmFulfillment"}()`, context);
++      const post = calls.find((call) => call.type === "post");
++      assert.ok(post, JSON.stringify(calls));
++      assert.deepEqual(post.payload.photoDataUrls, effective ? photos : ["r2://one", "r2://two"]);
++      assert.equal(calls.filter((call) => call.type === "upload").length, effective ? 0 : 1);
++      assert.equal(calls.filter((call) => call.type === "post").length, 1);
++    }
++  });
++}
+--- test/mbt/unit/operator-receiving-return.test.js
++++ test/mbt/unit/operator-receiving-return.test.js
+@@ -0,0 +1,28 @@
++import assert from "node:assert/strict";
++import { readFileSync } from "node:fs";
++import vm from "node:vm";
++import test from "node:test";
++
++test("Back to Receiving clears search and invalidates stale requests before reloading", async () => {
++  const source = readFileSync(new URL("../../../public/operator.js", import.meta.url), "utf8");
++  const start = source.indexOf("async function finishReceipt()");
++  const fn = source.slice(start, source.indexOf("async function loadPersonalHistory()", start));
++  const calls = [];
++  const context = vm.createContext({
++    receiptOrder: { order_type: "purchase_order" }, receiptResult: { itemReceiptTranid: "IR14634" }, receivingOrderType: "purchase_order",
++    receivingSearch: "SN1400333", receivingItemSearch: "PALLET", receivingSelectedId: "old", receivingSelectedOrder: {}, receivingOrders: [{}], receivingItemSuggestions: [{}], receivingOrderPage: 4,
++    stopReceiptCamera: () => {}, invalidateReceivingRequests: () => calls.push("invalidate"), saveOperatorState: () => calls.push("save"),
++    loadReceivingOrders: async () => calls.push("reload"), render: () => calls.push("render")
++  });
++  vm.runInContext(`${fn}\nfinishReceipt()`, context);
++  await new Promise((resolve) => setImmediate(resolve));
++  assert.equal(context.receivingSearch, "");
++  assert.equal(context.receivingItemSearch, "");
++  assert.equal(context.receivingSelectedId, null);
++  assert.equal(context.receivingSelectedOrder, null);
++  assert.equal(context.receivingOrders.length, 0);
++  assert.equal(context.receivingItemSuggestions.length, 0);
++  assert.equal(context.receivingOrderPage, 0);
++  assert.ok(calls.indexOf("invalidate") < calls.indexOf("reload"));
++  assert.ok(calls.indexOf("save") >= 0);
++});
+--- test/mbt/unit/operator-yard-assets.test.js
++++ test/mbt/unit/operator-yard-assets.test.js
+@@ -24,9 +24,9 @@
+   const waits = [];
+   events.get("install")({ waitUntil: (promise) => waits.push(promise) });
+   await Promise.all(waits);
+-  assert.equal(installed[0].name, "mbbs-yard-operator-v149-packing-rounding-v1");
++  assert.equal(installed[0].name, "mbbs-yard-operator-v150-posting-photos-v1");
+   for (const asset of ["operator.js", "operator-load-summary.js", "operator.css", "i18n.js"]) {
+-    const version = asset === "operator.js" ? "20260915-packing-rounding-v1" : "20260915-operator-display-v1";
++    const version = (asset === "operator.js" || asset === "operator.css") ? "20260916-posting-photos-v1" : "20260915-operator-display-v1";
+     const url = `/${asset}?v=${version}`;
+     assert.ok(html.includes(url));
+     assert.ok(installed[0].assets.includes(`https://yard.invalid${url}`));
+--- test/dispatch/frontend/consolidation-load.browser.test.mjs
++++ test/dispatch/frontend/consolidation-load.browser.test.mjs
+@@ -143,7 +143,7 @@
+   });
+ }
+ 
+-test("camera captures survive updates; upload retry reuses successful photos and a pending load resumes after refresh", async () => {
++test("camera captures survive updates and submission retry without R2; a pending load resumes after refresh", async () => {
+   const browser = await chromium.launch({ headless: true, args: ["--no-sandbox"] });
+   const context = await browser.newContext({ viewport: { width: 390, height: 844 }, serviceWorkers: "block" });
+   const page = await context.newPage();
+@@ -151,7 +151,7 @@
+   page.setDefaultTimeout(6000);
+   let batch = { id, locationId: 1, status: "draft", photoRefs: [], snapshot: { assignment, orders: [first, second] } };
+   const uploads = [], submits = [], errors = [];
+-  let failUpload = true, ticket = 0;
++  let failUpload = true, failSubmit = true, ticket = 0;
+   page.on("pageerror", (error) => errors.push(error.message));
+   await page.addInitScript(() => {
+     localStorage.setItem("mbbs.staff.token", "consolidation-browser-test");
+@@ -187,6 +187,7 @@
+       data = { key: `operator/operator-consolidation-load-photo/2026/09/15/${id}/photo-${n}.jpg` };
+     } else if (url.pathname.endsWith(`/${id}/submit`)) {
+       submits.push(route.request().postDataJSON());
++      if (failSubmit) { failSubmit = false; return route.fulfill({ status: 503, contentType: "application/json", body: JSON.stringify({ error: "Temporary submission failure" }) }); }
+       batch = { ...batch, status: "pending", photoRefs: submits[0].photoRefs, error: "Second order needs retry" }; data = batch;
+     } else if (url.pathname.endsWith(`/${id}/resume`)) { batch = { ...batch, status: "completed", error: "", result: { localYardOrderStatus: "Loaded" } }; data = batch; }
+     else if (url.pathname.endsWith(`/${id}`)) data = batch;
+@@ -211,11 +212,13 @@
+     assert.deepEqual(await page.evaluate(() => [...fulfillmentPhotoDataUrls]), captures);
+     await page.locator('[data-action="confirm-fulfill"]').click();
+     await page.getByText("Load failed", { exact: true }).waitFor();
+-    assert.equal(submits.length, 0);
++    assert.equal(submits.length, 1);
++    assert.deepEqual(submits[0].photoRefs, captures);
+     await page.locator('[data-action="confirm-fulfill"]').click();
+     await page.getByRole("heading", { name: "Pending load", exact: true }).waitFor();
+-    assert.equal(uploads.length, 3, "Only the failed photo is uploaded again");
+-    assert.deepEqual(submits[0].photoRefs, [1, 3].map((n) => `r2://operator/operator-consolidation-load-photo/2026/09/15/${id}/photo-${n}.jpg`));
++    assert.equal(uploads.length, 0, "R2 uploads run on the server after completion");
++    assert.equal(ticket, 0);
++    assert.deepEqual(submits[1].photoRefs, captures);
+     batch = { ...batch, error: "Retry is available" };
+     await page.evaluate(() => window.consolidationTestEvents.listeners["app-event"]({ data: JSON.stringify({ type: "delivery.order.updated", payload: {} }) }));
+     await page.getByText("Retry is available", { exact: true }).waitFor();
+@@ -225,8 +228,8 @@
+     assert.equal(await page.locator(".consolidation-load-photos img").count(), 2);
+     await page.locator('[data-action="retry-consolidation-load"]').click();
+     await page.getByRole("heading", { name: "Load Complete", exact: true }).waitFor();
+-    assert.equal(uploads.length, 3);
+-    assert.equal(submits.length, 1);
++    assert.equal(uploads.length, 0);
++    assert.equal(submits.length, 2);
+     await page.locator('[data-action="finish-fulfill"]').first().click();
+     await page.locator(".consolidation-load-orders").waitFor();
+     assert.equal(await page.locator('[data-consolidation-order="11"]').isChecked(), false);
+--- tools/mbt-predeploy-readiness.mjs
++++ tools/mbt-predeploy-readiness.mjs
+@@ -144,7 +144,8 @@
+   "197_scm_vendor_completion.sql",
+   "198_google_maps_usage_control.sql",
+   "199_operator_yard_access.sql",
+-  "200_operator_consolidated_loads.sql"
++  "200_operator_consolidated_loads.sql",
++  "201_operator_posting_photo_uploads.sql"
+ ]);
+ 
+ export const REQUIRED_MBT_P3_FLAGS = Object.freeze([
+--- tools/operator-posting-latency-browser.mjs
++++ tools/operator-posting-latency-browser.mjs
+@@ -0,0 +1,37 @@
++/* global document, renderOperatorNetSuitePostingMode */
++import assert from "node:assert/strict";
++import { mkdirSync, readFileSync, writeFileSync } from "node:fs";
++import { chromium } from "@playwright/test";
++
++const folder = "test-artifacts/operator-posting-latency";
++mkdirSync(folder, { recursive: true });
++const source = readFileSync("public/operator.js", "utf8");
++const css = readFileSync("public/operator.css", "utf8");
++const renderer = source.slice(source.indexOf("function renderOperatorNetSuitePostingMode("), source.indexOf("function operatorNetSuitePostingReady("));
++const receivingClass = source.match(/return shell\(t\("operator.receiveOrder"[\s\S]*?<section class="([^"]+)"/)[1];
++const browser = await chromium.launch({ args: ["--no-sandbox"] });
++const results = [];
++try {
++  for (const [width, height] of [[390, 844], [768, 1024], [1280, 900]]) {
++    const page = await browser.newPage({ viewport: { width, height } });
++    await page.setContent(`<style>${css}</style><div style="height:104px"></div><section class="${receivingClass}" id="screen"></section>`);
++    await page.addScriptTag({ content: `function escapeHtml(s) {return String(s).replaceAll("<", "&lt;");}\n${renderer}` });
++    await page.evaluate(() => {
++      document.getElementById("screen").innerHTML = renderOperatorNetSuitePostingMode({ effective: true, transactionType: "IR" })
++        + '<div class="fulfillment-card"><strong>Truck photos</strong><div style="height:180px">Photo proof saved</div></div>'
++        + '<div class="fulfillment-card"><strong>Receive quantities</strong><p>Two confirmed lines</p></div>'
++        + '<div class="selected-actions"><button>Receive</button></div>';
++    });
++    const banner = await page.locator(".operator-posting-mode").boundingBox();
++    const card = await page.locator(".fulfillment-card").first().boundingBox();
++    results.push({ width, height, bannerHeight: banner.height, cardTop: card.y });
++    await page.screenshot({ path: `${folder}/notice-${width}.png`, fullPage: true });
++    assert.ok(banner.height <= 80, `Posting notice occupies ${banner.height}px at ${width}px`);
++    assert.ok(card.y < 220, "The proof card must start close to the compact notice");
++    await page.close();
++  }
++} finally {
++  writeFileSync(`${folder}/browser.json`, `${JSON.stringify(results, null, 2)}\n`);
++  await browser.close();
++}
++console.log(JSON.stringify(results));
+--- tools/operator-posting-latency-checks.mjs
++++ tools/operator-posting-latency-checks.mjs
+@@ -0,0 +1,86 @@
++import assert from "node:assert/strict";
++import crypto from "node:crypto";
++import { cpSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
++import { tmpdir } from "node:os";
++import path from "node:path";
++import { spawnSync } from "node:child_process";
++
++const folder = "test-artifacts/operator-posting-latency";
++mkdirSync(folder, { recursive: true });
++const manifest = JSON.parse(readFileSync("test/operator-posting-latency-changes.json", "utf8"));
++const hash = (value) => crypto.createHash("sha256").update(value).digest("hex");
++for (const entry of manifest) {assert.equal(hash(readFileSync(entry.file)), entry.afterSha256, `${entry.file} changed since evidence capture`);}
++const ownTests = ["test/mbt/unit/operator-posting-latency.test.js", "test/mbt/unit/operator-posting-photo-client.test.js", "test/mbt/unit/operator-receiving-return.test.js",
++  "test/mbt/integration/operator-posting-photos.test.js", "test/mbt/integration/operator-posting-http-timing.test.js", "test/mbt/integration/operator-receiving-completed.test.js"];
++const tests = [...ownTests, ...["admission", "domain", "service", "targets", "runtime", "runtime-adapters", "ui"].map((part) => `test/mbt/unit/operator-netsuite-posting-${part}.red.test.js`),
++  "test/mbt/property/operator-netsuite-posting.property.test.js", "test/mbt/adversarial/operator-netsuite-posting-adversarial.test.js",
++  "test/mbt/integration/consolidation-load.test.js", "test/mbt/integration/operator-receiving-allocations.test.js",
++  "test/mbt/unit/operator-yard-assets.test.js", "test/mbt/unit/operations-navigation-enhancements.test.js", "test/mbt/unit/operator-customer-pickup-photo-gate-ui.contract.test.js", "test/mbt/unit/operator-page-confirm-ui.contract.test.js",
++  "test/mbt/unit/smart-scm-created-po-service.test.js", "test/mbt/integration/migration-upgrade.test.js", "test/mbt/integration/p3-predeploy-readiness.test.js"];
++const records = [];
++function run(name, command, args, { cwd = process.cwd(), accept = (result) => result.status === 0 } = {}) {
++  const result = spawnSync(command, args, { cwd, encoding: "utf8", maxBuffer: 100e6 });
++  assert.ifError(result.error);
++  const output = `${result.stdout}${result.stderr}`;
++  writeFileSync(`${folder}/${name}.log`, output);
++  const accepted = accept(result, output);
++  records.push({ name, exitCode: result.status, accepted });
++  console.log(JSON.stringify(records.at(-1)));
++  writeFileSync(`${folder}/checks.json`, JSON.stringify(records, null, 2));
++  assert.ok(accepted, `${name} failed; see ${folder}/${name}.log`);
++  return output;
++}
++function baselineCopy() {
++  const target = mkdtempSync(path.join(tmpdir(), "posting-baseline-"));
++  for (const name of ["src", "public", "migrations", "test", "tools"]) {cpSync(name, path.join(target, name), { recursive: true });}
++  for (const name of ["package.json", "tsconfig.mbt.json", "eslint.mbt.config.js"]) {cpSync(name, path.join(target, name));}
++  symlinkSync(path.resolve("node_modules"), path.join(target, "node_modules"));
++  for (const entry of manifest) {
++    const file = path.join(target, entry.file);
++    if (!entry.beforeSha256) {rmSync(file); continue;}
++    const lines = readFileSync(file, "utf8").match(/[^\n]*\n|[^\n]+$/g) || [];
++    for (const edit of [...entry.edits].reverse()) {lines.splice(edit.start, edit.end - edit.start, ...edit.before);}
++    const text = lines.join("");
++    assert.equal(hash(text), entry.beforeSha256);
++    writeFileSync(file, text);
++  }
++  for (const name of ["operator-posting-latency-checks.mjs", "operator-posting-latency-browser.mjs", "operator-posting-latency-mutations.mjs"]) {
++    rmSync(path.join(target, "tools", name), { force: true });
++  }
++  return target;
++}
++const failNames = (output) => [...new Set([...output.matchAll(/^(?:not ok \d+ - |✖ )(.+?)(?: \([\d.]+ms\))?$/gm)].map((match) => match[1]).filter((name) => name !== "failing tests:"))].sort();
++const typeErrors = (output) => output.split("\n").filter((line) => /error TS\d+/.test(line)).map((line) => line.replace(/\(\d+,\d+\)/, "")).sort();
++const lintErrors = (output) => JSON.parse(output).flatMap((file) => file.messages.map((message) =>
++  `${file.filePath.replace(/^.*\/(src|test|tools)\//, "$1/")}:${message.ruleId}:${message.severity}:${message.message}`)).sort();
++
++if (process.argv.includes("--baseline-full")) {
++  const copy = baselineCopy();
++  try {run("baseline-full", "npm", ["test"], { cwd: copy, accept: (result) => result.status <= 1 });}
++  finally {rmSync(copy, { recursive: true, force: true });}
++} else if (process.argv.includes("--full")) {
++  assert.ok(existsSync(`${folder}/baseline-full.log`));
++  const expected = failNames(readFileSync(`${folder}/baseline-full.log`, "utf8"));
++  assert.equal(expected.length, 2, "Expected the two recorded infrastructure failures only");
++  run("full-final", "npm", ["test"], { accept: (result, output) => {
++    assert.equal(result.status, 1); assert.deepEqual(failNames(output), expected);
++    assert.match(output, /Isolated MBT main run failed in 2\/\d+ file\(s\):/); return true;
++  } });
++} else {
++  run("focused-final", process.execPath, ["--test", "--test-concurrency=1", ...tests]);
++  const shuffled = [...ownTests].sort((a, b) => hash(`16092026:${a}`).localeCompare(hash(`16092026:${b}`)));
++  for (const [index, file] of shuffled.entries()) {run(`shuffled-${index}`, process.execPath, ["--test", file]);}
++  const includes = manifest.filter((entry) => entry.file.startsWith("src/") && entry.file !== "src/server.js").map((entry) => `--include=${entry.file}`);
++  run("coverage", "node_modules/.bin/c8", ["--all=false", "--check-coverage=false", ...includes,
++    `--temp-directory=${folder}/c8`, `--report-dir=${folder}/coverage`, "--reporter=json", "--reporter=text", process.execPath, "--test", "--test-concurrency=1", ...tests]);
++  const baseline = baselineCopy();
++  try {
++    const before = run("types-baseline-final", path.resolve("node_modules/.bin/tsc"), ["--project", "tsconfig.mbt.json", "--noEmit", "--pretty", "false"], { cwd: baseline, accept: (result) => result.status <= 2 });
++    run("types-final", "node_modules/.bin/tsc", ["--project", "tsconfig.mbt.json", "--noEmit", "--pretty", "false"], { accept: (_result, output) => { assert.deepEqual(typeErrors(output), typeErrors(before)); return true; } });
++    const lintFiles = manifest.map((entry) => entry.file).filter((file) => file.endsWith(".mjs") || (file.endsWith(".js") && (file.startsWith("src/operator-netsuite-posting-") || file.startsWith("test/mbt/"))));
++    const lintArgs = ["--config", "eslint.mbt.config.js", "--format=json", "--max-warnings=0"];
++    const previous = run("lint-baseline-final", path.resolve("node_modules/.bin/eslint"), [...lintArgs, ...lintFiles.filter((file) => existsSync(path.join(baseline, file)))], { cwd: baseline, accept: (result) => result.status <= 1 });
++    run("lint-final", "node_modules/.bin/eslint", [...lintArgs, ...lintFiles], { accept: (_result, output) => { assert.deepEqual(lintErrors(output), lintErrors(previous)); return true; } });
++  } finally {rmSync(baseline, { recursive: true, force: true });}
++  for (const entry of manifest.filter((item) => /^(?:src|public)\/.*\.js$/.test(item.file))) {run(`syntax-${path.basename(entry.file)}`, process.execPath, ["--check", entry.file]);}
++}
+--- tools/operator-posting-latency-evidence.py
++++ tools/operator-posting-latency-evidence.py
+@@ -0,0 +1,58 @@
++"""Summarize final artifacts and enforce changed backend line coverage and integrity."""
++import hashlib
++import json
++import re
++from pathlib import Path
++
++root = Path(__file__).resolve().parents[1]
++folder = root / 'test-artifacts/operator-posting-latency'
++manifest = json.loads((root / 'test/operator-posting-latency-changes.json').read_text())
++for entry in manifest:
++    assert hashlib.sha256((root / entry['file']).read_bytes()).hexdigest() == entry['afterSha256'], entry['file']
++coverage = {}
++for name in ['coverage', 'smoke-coverage']:
++    coverage.update(json.loads((folder / name / 'coverage-final.json').read_text()))
++coverage_rows = []
++for entry in manifest:
++    if not entry['file'].startswith('src/'):
++        continue
++    data = next((v for k, v in coverage.items() if k.endswith('/' + entry['file'])), None)
++    assert data is not None, entry['file']
++    lines = {}
++    for key, span in data['statementMap'].items():
++        for line in range(span['start']['line'], span['end']['line'] + 1):
++            lines[line] = max(lines.get(line, 0), data['s'][key])
++    changed = [line for line in entry['changedLines'] if line in lines]
++    missing = [line for line in changed if not lines[line]]
++    coverage_rows.append({'file': entry['file'], 'covered': len(changed) - len(missing), 'total': len(changed), 'missing': missing})
++    assert not missing, (entry['file'], missing)
++
++def totals(name):
++    text = (folder / name).read_text()
++    result = {key: sum(map(int, re.findall(r'^(?:ℹ|#) ' + key + r' (\d+)$', text, re.M))) for key in ['tests', 'pass', 'fail', 'skipped']}
++    assert result['tests'] > 0, name
++    return result
++
++baseline, current = totals('baseline-full.log'), totals('full-final.log')
++assert current['fail'] == baseline['fail'] == 2
++mutants = json.loads((folder / 'mutations/results.json').read_text())
++assert len(mutants) == 12 and all(row['killed'] for row in mutants)
++pattern = re.compile(r'(?:AKIA[0-9A-Z]{16}|-----BEGIN (?:RSA |EC |OPENSSH )?PRIVATE KEY-----|(?:gh[pousr]_|sk-proj-)[A-Za-z0-9]{25,})')
++additions = '\n'.join(line[1:] for line in (root / 'test/operator-posting-latency.changes.patch').read_text().splitlines() if line.startswith('+') and not line.startswith('+++'))
++assert not pattern.search(additions), 'Potential secret in task diff'
++assert not any(entry['file'] in ['package.json', 'package-lock.json'] for entry in manifest)
++summary = {
++    'sourceState': hashlib.sha256(json.dumps([(row['file'], row['afterSha256']) for row in manifest]).encode()).hexdigest(),
++    'baseline': baseline, 'full': current, 'focused': totals('focused-final.log'),
++    'types': sum('error TS' in line for line in (folder / 'types-final.log').read_text().splitlines()),
++    'lint': sum(len(row['messages']) for row in json.loads((folder / 'lint-final.log').read_text())),
++    'coverage': coverage_rows, 'backendChangedLines': {
++        'covered': sum(row['covered'] for row in coverage_rows), 'total': sum(row['total'] for row in coverage_rows)},
++    'mutantsKilled': 10, 'propertyMutantsKilled': 2, 'newDependencies': 0, 'diffSecretScan': 'pass',
++    'browser': json.loads((folder / 'browser.json').read_text()),
++    'consolidationBrowser': totals('consolidation-browser-final.log'),
++    'live': json.loads((folder / 'live.json').read_text()),
++    'smoke': json.loads((folder / 'smoke.json').read_text())
++}
++(folder / 'summary.json').write_text(json.dumps(summary, indent=2) + '\n')
++print(json.dumps(summary, indent=2))
+--- tools/operator-posting-latency-gauntlet.sh
++++ tools/operator-posting-latency-gauntlet.sh
+@@ -0,0 +1,25 @@
++#!/usr/bin/env bash
++set -Eeuo pipefail
++cd "$(dirname "${BASH_SOURCE[0]}")/.."
++runner=(bash tools/operator-receiving-identity-test.sh)
++artifact=test-artifacts/operator-posting-latency
++# Preserve RED/baseline evidence; remove outputs that must come from this run.
++rm -rf "$artifact/coverage" "$artifact/c8" "$artifact/smoke-coverage" "$artifact/smoke-c8" "$artifact/mutations"
++rm -f "$artifact/full-final.log" "$artifact/summary.json" "$artifact/browser.json" "$artifact/smoke.json" "$artifact/live.json"
++# Existing baseline evidence may be reused only for this captured pre-task source.
++if [[ "${POSTING_REDO_BASELINE:-1}" == 1 ]]; then
++  "${runner[@]}" node tools/operator-posting-latency-checks.mjs --baseline-full
++fi
++"${runner[@]}" node tools/operator-posting-latency-checks.mjs
++"${runner[@]}" node tools/operator-posting-latency-mutations.mjs
++"${runner[@]}" node_modules/.bin/c8 --all=false --check-coverage=false --exclude='**/node_modules/**' \
++  --include=src/server.js --reporter=json --temp-directory="$artifact/smoke-c8" --report-dir="$artifact/smoke-coverage" \
++  node tools/operator-posting-latency-smoke.mjs
++"${runner[@]}" node tools/operator-posting-latency-checks.mjs --full
++docker run --rm --network none --ipc=host -v "$PWD/public:/app/public:ro" -v "$PWD/tools:/app/tools:ro" \
++  -v "$PWD/test-artifacts:/app/test-artifacts" --entrypoint node mbbs-mbt-p1-test-e2e:latest tools/operator-posting-latency-browser.mjs
++docker run --rm --network none --ipc=host -v "$PWD/public:/app/public:ro" -v "$PWD/test:/app/test:ro" \
++  -v "$PWD/test-artifacts:/app/test-artifacts" --entrypoint node mbbs-mbt-p1-test-e2e:latest \
++  --test test/dispatch/frontend/consolidation-load.browser.test.mjs > "$artifact/consolidation-browser-final.log" 2>&1
++python3 tools/operator-posting-latency-live.py
++python3 tools/operator-posting-latency-evidence.py
+--- tools/operator-posting-latency-live.py
++++ tools/operator-posting-latency-live.py
+@@ -0,0 +1,30 @@
++"""Replay candidate receiving reads against the live SN in a READ ONLY transaction."""
++import base64
++import json
++import subprocess
++from pathlib import Path
++
++root = Path(__file__).resolve().parents[1]
++source = (root / 'src/receiving-repository.js').read_text().replace('from "./', 'from "file:///app/src/')
++module = 'data:text/javascript;base64,' + base64.b64encode(source.encode()).decode()
++script = '''
++import assert from 'node:assert/strict';
++import {query,withTransaction,pool} from './src/db.js';
++const candidate = await import(MODULE);
++try {
++ await withTransaction(async()=>{
++  await query('SET TRANSACTION ISOLATION LEVEL REPEATABLE READ, READ ONLY');
++  const order=(await query("SELECT netsuite_id,tranid,receipt_status,status_text,last_item_receipt_id FROM purchase_orders WHERE tranid=$1",['SN1400333'])).rows[0];
++  assert.ok(order); assert.equal(order.receipt_status,'received');
++  const list=await candidate.listReceivingOrders({orderType:'purchase_order',search:order.tranid});
++  assert.ok(!list.some(row=>String(row.netsuite_id)===String(order.netsuite_id)));
++  await assert.rejects(candidate.getReceivableReceivingOrder(order.netsuite_id,{includeNetSuiteClosed:true}),{code:'RECEIVING_ALREADY_COMPLETED',status:409});
++  console.log(JSON.stringify({checkedAt:new Date().toISOString(),mode:'read-only; candidate code in memory',order:order.tranid,receiptStatus:order.receipt_status,itemReceiptId:order.last_item_receipt_id,hidden:true,repeatReceivingStatus:409}));
++ });
++} finally {await pool.end();}
++'''.replace('MODULE', json.dumps(module))
++result = subprocess.run(['docker', 'exec', '-i', 'mbbs-operator-app-app-1', 'node', '--input-type=module'], input=script, text=True, capture_output=True, check=True)
++report = json.loads(result.stdout)
++destination = root / 'test-artifacts/operator-posting-latency/live.json'
++destination.write_text(json.dumps(report, indent=2) + '\n')
++print(json.dumps(report))
+--- tools/operator-posting-latency-mutations.mjs
++++ tools/operator-posting-latency-mutations.mjs
+@@ -0,0 +1,57 @@
++import assert from "node:assert/strict";
++import { cpSync, mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
++import { tmpdir } from "node:os";
++import path from "node:path";
++import { spawnSync } from "node:child_process";
++
++const folder = path.resolve("test-artifacts/operator-posting-latency/mutations");
++mkdirSync(folder, { recursive: true });
++const target = mkdtempSync(path.join(tmpdir(), "posting-mutations-"));
++const unit = "test/mbt/unit/operator-posting-latency.test.js";
++const queue = "test/mbt/integration/operator-posting-photos.test.js";
++const mutants = [
++  { name: "missing-http-timing", file: "src/netsuite.js", from: 'operation: "netsuite.http", method: options.method', to: 'operation: "missing.http", method: options.method', test: "test/mbt/integration/operator-posting-http-timing.test.js" },
++  { name: "upload-before-completion", file: "src/operator-netsuite-posting-photo-queue.js", from: "AND coalesce(c.status,b.status)='completed'", to: "AND true", test: queue },
++  { name: "stale-lease-writes", file: "src/operator-netsuite-posting-photo-queue.js", from: "lease_token=$2 AND lease_expires_at>now()", to: "($2::uuid IS NOT NULL) AND lease_expires_at>now()", test: queue },
++  { name: "overwrite-unrelated-proof", file: "src/operator-netsuite-posting-photo-queue.js", from: "WHERE id=ANY($1::bigint[])", to: "WHERE $1::bigint[] IS NOT NULL", test: queue },
++  { name: "lose-replacement", file: "src/operator-netsuite-posting-photos.js", from: "ref === original ? replacement : ref", to: "ref === original ? original : ref", test: unit, property: true },
++  { name: "truncate-photo", file: "src/operator-netsuite-posting-photos.js", from: "return { bytes, mimeType:", to: "return { bytes: bytes.subarray(1), mimeType:", test: unit, property: true },
++  { name: "upfront-r2-receipt", file: "public/operator.js", from: "const deferPhotos = !localOnlyPosting && receiptNetSuitePolicy?.effective;", to: "const deferPhotos = false;", test: "test/mbt/unit/operator-posting-photo-client.test.js" },
++  { name: "received-po-reappears", file: "src/receiving-repository.js", from: '"ro.receipt_status IS DISTINCT FROM \'received\'", ', to: "", test: "test/mbt/integration/operator-receiving-completed.test.js" },
++  { name: "stale-receiving-search", file: "public/operator.js", from: '  receivingSearch = "";\n  receivingItemSearch = "";\n  receivingSelectedId = null;', to: '  receivingItemSearch = "";\n  receivingSelectedId = null;', test: "test/mbt/unit/operator-receiving-return.test.js" },
++  { name: "ignore-lost-photo-lease", file: "src/operator-netsuite-posting-photo-worker.js", from: "if (!await complete(job, ref))", to: "if (await complete(job, ref))", test: unit }
++];
++const results = [];
++function exercise(mutant, propertyOnly = false) {
++  const args = ["--test", ...(propertyOnly ? ["--test-name-pattern=generated cases"] : []), mutant.test];
++  const run = spawnSync(process.execPath, args, { cwd: target, encoding: "utf8", timeout: 90000 });
++  assert.ifError(run.error);
++  const output = `${run.stdout}${run.stderr}`;
++  writeFileSync(path.join(folder, `${mutant.name}${propertyOnly ? "-property" : ""}.log`), output);
++  assert.doesNotMatch(output, /SyntaxError|ERR_MODULE_NOT_FOUND/, "A collection failure is not a mutation kill");
++  assert.ok(run.status === 1 && /not ok \d+ -|✖ /.test(output), `${mutant.name} survived`);
++  results.push({ name: mutant.name, propertyOnly, killed: true });
++}
++try {
++  for (const name of ["src", "public", "test", "migrations", "tools", "package.json"]) {cpSync(name, path.join(target, name), { recursive: true });}
++  symlinkSync(path.resolve("node_modules"), path.join(target, "node_modules"));
++  for (const mutant of mutants) {
++    const file = path.join(target, mutant.file), original = readFileSync(file, "utf8");
++    assert.equal(original.split(mutant.from).length, 2, `${mutant.name} requires a unique mutation point`);
++    try {
++      writeFileSync(file, original.replace(mutant.from, mutant.to));
++      exercise(mutant);
++      if (mutant.property) {exercise(mutant, true);}
++    } finally {writeFileSync(file, original);}
++    assert.equal(readFileSync(file, "utf8"), readFileSync(mutant.file, "utf8"));
++  }
++  const tests = [...new Set(mutants.map((mutant) => mutant.test))];
++  const restored = spawnSync(process.execPath, ["--test", "--test-concurrency=1", ...tests], { cwd: target, encoding: "utf8", timeout: 90000 });
++  assert.ifError(restored.error);
++  writeFileSync(path.join(folder, "restored.log"), `${restored.stdout}${restored.stderr}`);
++  assert.equal(restored.status, 0, "Restored sources must pass");
++} finally {
++  rmSync(target, { recursive: true, force: true });
++  writeFileSync(path.join(folder, "results.json"), JSON.stringify(results, null, 2));
++}
++console.log(JSON.stringify({ killed: results.filter((entry) => !entry.propertyOnly).length, propertyKilled: results.filter((entry) => entry.propertyOnly).length }));
+--- tools/operator-posting-latency-smoke.mjs
++++ tools/operator-posting-latency-smoke.mjs
+@@ -0,0 +1,29 @@
++import assert from "node:assert/strict";
++import { spawn } from "node:child_process";
++import { mkdirSync, writeFileSync } from "node:fs";
++
++assert.equal(process.env.MBT_TEST_ISOLATED, "1", "Server smoke must use a disposable test database");
++const folder = "test-artifacts/operator-posting-latency";
++mkdirSync(folder, { recursive: true });
++const child = spawn(process.execPath, ["--input-type=module", "-e", 'process.on("SIGINT", () => process.exit(0)); const {startServer} = await import("./src/server.js"); await startServer();'], { env: { ...process.env, PORT: "3137" }, stdio: ["ignore", "pipe", "pipe"] });
++let logs = "", exit;
++child.stdout.on("data", (value) => { logs += value; });
++child.stderr.on("data", (value) => { logs += value; });
++const stopped = new Promise((resolve) => child.once("exit", (code) => { exit = code; resolve(code); }));
++try {
++  let response;
++  for (let attempt = 0; attempt < 40; attempt += 1) {
++    assert.equal(exit, undefined, logs);
++    try {response = await fetch("http://127.0.0.1:3137/health"); break;} catch {await new Promise((resolve) => setTimeout(resolve, 250));}
++  }
++  assert.ok(response?.ok, logs);
++  assert.deepEqual(await response.json(), { ok: true, app: "MBBS Yard Server" });
++  await new Promise((resolve) => setTimeout(resolve, 5500));
++  assert.equal(exit, undefined, logs);
++  assert.doesNotMatch(logs, /operator_photo_worker_error/);
++  writeFileSync(`${folder}/smoke.json`, JSON.stringify({ started: true, health: 200, photoWorkerPollsWithoutErrors: true, database: "isolated" }));
++} finally {
++  child.kill("SIGINT");
++  await stopped;
++  writeFileSync(`${folder}/smoke-server.log`, logs);
++}
+--- tools/operator-posting-latency-state.py
++++ tools/operator-posting-latency-state.py
+@@ -0,0 +1,34 @@
++"""Capture this task's diff against the preserved pre-task source, without git reset."""
++import difflib
++import hashlib
++import json
++from pathlib import Path
++
++root = Path(__file__).resolve().parents[1]
++baseline = Path('/tmp/operator-posting-latency-baseline')
++records = []
++patches = []
++for folder in ['src', 'public', 'migrations', 'test/mbt', 'test/dispatch/frontend', 'tools', 'package.json', 'package-lock.json']:
++    for target in sorted([(root / folder)] if (root / folder).is_file() else (root / folder).rglob('*')):
++        if not target.is_file() or '__pycache__' in target.parts:
++            continue
++        relative = target.relative_to(root)
++        prior = baseline / relative
++        old = prior.read_bytes() if prior.exists() else b''
++        new = target.read_bytes()
++        if old == new:
++            continue
++        before = old.decode().splitlines(keepends=True)
++        after = new.decode().splitlines(keepends=True)
++        edits = []
++        changed = []
++        for tag, a, b, c, d in difflib.SequenceMatcher(None, before, after, autojunk=False).get_opcodes():
++            if tag != 'equal':
++                edits.append({'start': c, 'end': d, 'before': before[a:b]})
++                changed.extend(range(c + 1, d + 1))
++        records.append({'file': str(relative), 'beforeSha256': hashlib.sha256(old).hexdigest() if prior.exists() else None,
++                        'afterSha256': hashlib.sha256(new).hexdigest(), 'edits': edits, 'changedLines': changed})
++        patches.extend(difflib.unified_diff(before, after, fromfile=str(relative), tofile=str(relative)))
++(root / 'test/operator-posting-latency-changes.json').write_text(json.dumps(records, indent=2) + '\n')
++(root / 'test/operator-posting-latency.changes.patch').write_text(''.join(patches))
++print(json.dumps({'files': len(records), 'runtimeFiles': [r['file'] for r in records if r['file'].startswith(('src/', 'public/', 'migrations/'))]}))

@@ -246,11 +246,12 @@ function applyPoAllocationFields(line) {
     so_allocated_section_qty: allocatedSections,
     so_allocated_piece_qty: allocatedPieces,
     so_allocated_sales_qty: allocatedSalesQty,
-    pallet_qty: Math.max(remaining.pallet_qty - allocatedPallets, 0),
-    layer_qty: Math.max(remaining.layer_qty - allocatedLayers, 0),
-    section_qty: Math.max(remaining.section_qty - allocatedSections, 0),
-    piece_qty: Math.max(remaining.piece_qty - allocatedPieces, 0),
-    quantity: Math.max(remaining.quantity - allocatedSalesQty, 0)
+    // SO allocations reserve incoming goods; only receipts reduce receiving.
+    pallet_qty: remaining.pallet_qty,
+    layer_qty: remaining.layer_qty,
+    section_qty: remaining.section_qty,
+    piece_qty: remaining.piece_qty,
+    quantity: remaining.quantity
   };
 }
 
@@ -285,6 +286,7 @@ export async function listReceivingVendors({ destinationLocationId = null } = {}
          ON schedule.order_kind = 'PO'
         AND lower(schedule.order_ref) = lower(COALESCE(NULLIF(po.dispatch_ref, ''), po.tranid))
 	     WHERE po.netsuite_active = true
+       AND po.receipt_status IS DISTINCT FROM 'received'
 	       AND NOT ${netSuiteClosedOrderFamilySql("po", "PO")}
        AND (status_text ILIKE '%Pending Receipt%' OR status_text ILIKE '%Partially Received%')
        ${destinationClause}
@@ -313,6 +315,7 @@ export async function listReceivingSources({ destinationLocationId = null } = {}
               netsuite_active
 	       FROM transfer_orders t
 	       WHERE t.to_location_id IS NOT NULL
+           AND t.receiving_status IS DISTINCT FROM 'received'
 	         AND NOT ${netSuiteClosedOrderFamilySql("t", "TO")}
          AND NOT EXISTS (
            SELECT 1 FROM order_dependencies d
@@ -333,7 +336,7 @@ export async function listReceivingSources({ destinationLocationId = null } = {}
 
 export async function listReceivingOrders({ orderType, vendor = null, sourceLocationId = null, destinationLocationId = null, search = null, itemSearch = null } = {}) {
   const params = [orderType];
-  const clauses = ["ro.order_type = $1", "ro.netsuite_active = true", "(ro.status_text ILIKE '%Pending Receipt%' OR ro.status_text ILIKE '%Partially Received%')"];
+  const clauses = ["ro.order_type = $1", "ro.netsuite_active = true", "ro.receipt_status IS DISTINCT FROM 'received'", "(ro.status_text ILIKE '%Pending Receipt%' OR ro.status_text ILIKE '%Partially Received%')"];
   if (vendor) {
     params.push(vendor);
     clauses.push(`ro.vendor = $${params.length}`);
@@ -394,6 +397,7 @@ export async function listReceivingOrders({ orderType, vendor = null, sourceLoca
               dispatch_window_end, dispatch_instructions
 	       FROM transfer_orders t
 	       WHERE t.to_location_id IS NOT NULL
+           AND t.receiving_status IS DISTINCT FROM 'received'
 	         AND NOT ${netSuiteClosedOrderFamilySql("t", "TO")}
          AND NOT EXISTS (
            SELECT 1 FROM order_dependencies d
@@ -766,6 +770,11 @@ export async function unconfirmReceivingLine(orderId, lineRowId, operatorId) {
 export async function getReceivableReceivingOrder(orderId, { includeNetSuiteClosed = false } = {}) {
   const order = await getReceivingOrder(orderId, { includeNetSuiteClosed });
   if (!order) throw new Error("Receiving order not found.");
+  if (order.receipt_status === "received") {
+    throw Object.assign(new Error("This order has already been received. Return to Receiving for open orders."), {
+      status: 409, code: "RECEIVING_ALREADY_COMPLETED"
+    });
+  }
   const receivableLines = (order.lines || []).filter((line) => {
     const physicalTotal = positiveQuantity(line.received_pallet_qty)
       + positiveQuantity(line.received_layer_qty)
@@ -1635,13 +1644,15 @@ export async function searchReceivingItems({ orderType, vendor = null, sourceLoc
          LEFT JOIN scm_transport_schedule schedule
            ON schedule.order_kind = 'PO'
           AND lower(schedule.order_ref) = lower(COALESCE(NULLIF(po.dispatch_ref, ''), po.tranid))
-	       WHERE NOT ${netSuiteClosedOrderFamilySql("po", "PO")}
+	       WHERE po.receipt_status IS DISTINCT FROM 'received'
+           AND NOT ${netSuiteClosedOrderFamilySql("po", "PO")}
 	       UNION ALL
        SELECT netsuite_id, 'transfer_order'::text AS order_type, NULL::text AS vendor,
               from_location_id AS source_location_id, to_location_id AS destination_location_id,
               status_text, netsuite_active
 	       FROM transfer_orders t
 	       WHERE t.to_location_id IS NOT NULL
+           AND t.receiving_status IS DISTINCT FROM 'received'
 	         AND NOT ${netSuiteClosedOrderFamilySql("t", "TO")}
          AND NOT EXISTS (
            SELECT 1 FROM order_dependencies d

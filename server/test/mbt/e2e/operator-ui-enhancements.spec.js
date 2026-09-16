@@ -138,7 +138,9 @@ test("saved pickup draft displays confirmed and remaining independently of Deliv
   await page.route("**/api/delivery/orders/998899", (route) => json(route, {
     netsuite_id: "998899", tranid: "PICKUP-UI-SAVED", delivery_method: "Pick-Up",
     lines: [{ id: "ui-line", sku: "ITEM-A", item_type: "InvtPart", quantity: 20,
-      piece_qty: 20, to_pcs: 1, packed_piece_qty: 5, confirmed: true, loaded_qty: 0 }]
+      piece_qty: 20, to_pcs: 1, packed_piece_qty: 5, confirmed: true, loaded_qty: 0 },
+      { id: "pallet-line", sku: "PALLET", item_name: "PALLET", item_type: "InvtPart", quantity: 10,
+        unit: "EACH", packed_sales_qty: 4, confirmed: true, loaded_qty: 0 }]
   }));
   await session(page, { currentModule: "customer-pickup", selectedId: "998899", viewMode: "packed" });
   await page.goto("/operator");
@@ -149,6 +151,11 @@ test("saved pickup draft displays confirmed and remaining independently of Deliv
   await expect(card.locator(".remaining-measure b")).toHaveText("15");
   await expect(card).toContainText("can still adjust before Loaded");
   await expect(page.locator('[data-action="confirm-line"]')).toBeVisible();
+  const pallet = page.locator('.line-card[data-line="pallet-line"]');
+  await expect(pallet.locator(".confirmed-measure span")).toHaveText("Confirmed EACH");
+  await expect(pallet.locator(".confirmed-measure b")).toHaveText("4");
+  await expect(pallet.locator(".remaining-measure span")).toHaveText("Remaining EACH");
+  await expect(pallet.locator(".remaining-measure b")).toHaveText("6");
 });
 
 for (const failedDetail of [false, true]) {
@@ -319,7 +326,7 @@ test("pickup confirmation displays the saved total, edits absolutely, and surviv
   await page.reload();
   await expect(page.locator('[data-pack="pieces"]')).toHaveValue("7");
   await page.locator('[data-action="start-fulfill"]').click();
-  await expect(page.locator(".fulfillment-lines")).toContainText("7 PCS");
+  await expect(page.locator(".fulfillment-lines")).toContainText("7 pcs");
   await page.locator('[data-action="cancel-fulfill"]').click();
   await expect(card.locator(".confirmed-measure b")).toHaveText("7");
   const headers = { authorization: `Bearer ${f.token}` };
@@ -356,8 +363,8 @@ test("pickup page reconfirmation and the load summary preserve confirmed and rem
   await expect(page.locator(`.line-card[data-line="${f.lineId}"] .confirmed-measure b`)).toHaveText("5");
   await page.locator('[data-action="start-fulfill"]').click();
   const summary = page.locator(".fulfillment-lines");
-  await expect(summary.locator("span")).toHaveText("5 PCS");
-  await expect(summary.locator("small")).toHaveText("Remaining 15 PCS");
+  await expect(summary.locator("span")).toHaveText("5 pcs");
+  await expect(summary.locator("small")).toHaveCount(0);
   await page.locator('[data-action="cancel-fulfill"]').click();
   await expect(page.locator('[data-pack="pieces"]')).toHaveValue("5");
 });

@@ -1,6 +1,7 @@
 import crypto from "node:crypto";
 
 import { query, withTransaction } from "./db.js";
+import { assertSalesDeliveryPlanningAllowed, fulfilledSalesDeliveryPlanningRefs } from "./dispatch-fulfilled-so-repository.js";
 import { canonicalizeDispatchCoGroupIdentities } from "./dispatch-co-group-identity.js";
 import {
   deactivateDispatchGlobalOrderDefinitions,
@@ -816,9 +817,11 @@ async function assertAssignmentDateAvailable(plan, command) {
   if (!uniqueRefs.length) {return;}
   await assertOtherPlanAssignmentProjectionsReady(plan);
   await assertNoDriverPwaCompletedDispatchRefs(uniqueRefs, "add these orders to Dispatch");
+  await assertSalesDeliveryPlanningAllowed(uniqueRefs, "add these orders to Dispatch");
+  const fulfilledRefs = new Set((await fulfilledSalesDeliveryPlanningRefs(uniqueRefs)).map(ref => ref.toLowerCase()));
   await assertHistoricalInactiveSalesOrdersReconciled({
     planDate: plan.planDate,
-    orderRefs: uniqueRefs,
+    orderRefs: uniqueRefs.filter(ref => !fulfilledRefs.has(ref.toLowerCase())),
     action: "add these orders to Dispatch"
   });
   for (const ref of uniqueRefs) {

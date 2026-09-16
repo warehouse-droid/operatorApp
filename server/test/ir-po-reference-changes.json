@@ -1,0 +1,16 @@
+[
+  {
+    "file": "src/operator-netsuite-posting-domain.js",
+    "beforeSha256": "8b535d0fbf7435b2a3b2f79fd034360c820b28686f8debd59cd2ddbe1e54908d",
+    "afterSha256": "1a5e4d77a9d221e257658044a80e381f3e49e9b5dbff39a26cc81d569a0e00a6",
+    "groups": [
+      {
+        "before": "    const payload = { externalId, ...(group.memo ? { memo: group.memo } : {}), item: { items: payloadLines } };\n",
+        "after": "    // custbody9 is the account's Item Receipt \"Ref No\" field.\n    const payload = { externalId, ...(group.memo ? { memo: group.memo, custbody9: group.memo } : {}), item: { items: payloadLines } };\n"
+      }
+    ],
+    "changedLines": [
+      438
+    ]
+  }
+]

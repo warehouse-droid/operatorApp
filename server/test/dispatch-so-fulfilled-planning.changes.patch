@@ -1,0 +1,548 @@
+--- a/src/dispatch-fulfilled-so-policy.js
++++ b/src/dispatch-fulfilled-so-policy.js
+@@ -0,0 +1,83 @@
++import { isNetSuiteSalesOrderFulfilled } from "./sales-order-reconciliation.js";
++import { isNetSuiteOrderClosed } from "./netsuite-closed-order-policy.js";
++
++export const fulfilledSalesRef = (value) => String(value ?? "").trim().toLowerCase();
++
++function validFulfilledSalesIdentity(row) {
++  const split = Number(row.netsuite_id) < 0;
++  return Number(row.identity_count) === 1
++    && Number(row.source_identity_count) === 1
++    && (!split || row.split_status === "active");
++}
++
++function restrictedSalesLifecycle(row, source) {
++  return row.family_closed === true || isNetSuiteOrderClosed(row) || isNetSuiteOrderClosed(source)
++    || Boolean(row.netsuite_missing_at) || Boolean(source.netsuite_missing_at)
++    || row.active_reload === true;
++}
++
++function restrictedSalesStatus(row, source) {
++  return [row.local_yard_order_status, row.operator_status, source.local_yard_order_status, source.operator_status,
++    row.application_status].some(value => ["hold", "cancelled", "canceled", "reconcile review"].includes(fulfilledSalesRef(value)))
++    || ["review", "missing", "error"].includes(fulfilledSalesRef(row.reconciliation_status));
++}
++
++function planningReason({ locallyCompleted, blocked, fulfilled }) {
++  if (locallyCompleted) return "Delivery is already completed locally.";
++  if (blocked) return "The order has an identity, lifecycle, or reconciliation restriction.";
++  return fulfilled ? "NetSuite fulfillment is complete; Driver delivery is still pending." : "";
++}
++
++// Fulfillment is a NetSuite fact. A local Loaded status alone is not proof.
++export function fulfilledSalesDeliveryState(row, { driverCompleted = false } = {}) {
++  const source = row.source || row;
++  const identityValid = validFulfilledSalesIdentity(row);
++  const delivery = [row, source].every(order => order.sales_order_type === "Delivery");
++  const fulfilled = identityValid && delivery && isNetSuiteSalesOrderFulfilled(source);
++  const locallyCompleted = driverCompleted || row.operationally_completed === true;
++  const blocked = (!identityValid && isNetSuiteSalesOrderFulfilled(source))
++    || restrictedSalesLifecycle(row, source) || restrictedSalesStatus(row, source);
++  return {
++    fulfilled,
++    eligible: fulfilled && !locallyCompleted && !blocked,
++    locallyCompleted,
++    blocked,
++    reason: planningReason({ locallyCompleted, blocked, fulfilled })
++  };
++}
++
++export function fulfilledSalesOrderState(order, states) {
++  const children = Array.isArray(order?.childOrders) ? order.childOrders : [];
++  if (!children.length) return states.get(fulfilledSalesRef(order?.id));
++  const members = children.map(ref => states.get(fulfilledSalesRef(ref)));
++  return {
++    fulfilled: members.every(state => state?.fulfilled),
++    eligible: members.every(state => state?.eligible),
++    locallyCompleted: members.some(state => state?.locallyCompleted),
++    blocked: members.some(state => !state || state.blocked),
++    reason: "Every delivery in the group must still be eligible for planning."
++  };
++}
++
++function completionFields(order, state) {
++  if (!state?.fulfilled && !state?.locallyCompleted) return {};
++  return { dispatchCompletionStatus: "completed", scm: { ...(order.scm || {}), status: "Completed" } };
++}
++
++export function annotateFulfilledSalesOrders(orders, states) {
++  return orders.map(order => {
++    if (order?.type !== "SO") return order;
++    const state = fulfilledSalesOrderState(order, states);
++    // Always replace client/snapshot eligibility flags with current authority.
++    const eligible = state?.eligible === true;
++    const restricted = state?.locallyCompleted === true || state?.blocked === true;
++    return {
++      ...order,
++      dispatchFulfilledSalesPlanningEligible: eligible,
++      dispatchPlanningRestricted: restricted,
++      dispatchPlanningRestrictionReason: restricted ? `${order.id}: ${state.reason}` : "",
++      ...completionFields(order, state),
++      ...(order.childOrderDetails?.length ? { childOrderDetails: annotateFulfilledSalesOrders(order.childOrderDetails, states) } : {})
++    };
++  });
++}
+--- a/src/dispatch-fulfilled-so-repository.js
++++ b/src/dispatch-fulfilled-so-repository.js
+@@ -0,0 +1,74 @@
++import { query } from "./db.js";
++import { listDriverPwaCompletedDispatchRefs, assertNoDriverPwaCompletedDispatchRefs } from "./dispatch-history-mode.js";
++import { netSuiteClosedOrderFamilySql } from "./netsuite-closed-order-policy.js";
++import { annotateFulfilledSalesOrders, fulfilledSalesDeliveryState, fulfilledSalesRef, fulfilledSalesOrderState } from "./dispatch-fulfilled-so-policy.js";
++
++export async function listFulfilledSalesDeliveryStates(candidateRefs = []) {
++  const refs = [...new Set(candidateRefs.map(fulfilledSalesRef).filter(Boolean))];
++  if (!refs.length) return new Map();
++  const result = await query(`
++    SELECT candidate.*, row_to_json(source_order) AS source,
++           membership.status AS split_status,
++           (SELECT count(*) FROM sales_orders duplicate WHERE lower(btrim(duplicate.tranid)) = lower(btrim(candidate.tranid))) AS identity_count,
++           (SELECT count(*) FROM sales_orders duplicate WHERE lower(btrim(duplicate.tranid)) = lower(btrim(source_order.tranid))) AS source_identity_count,
++           state.application_status, state.reconciliation_status,
++           ${netSuiteClosedOrderFamilySql("candidate", "SO")} AS family_closed,
++           EXISTS (SELECT 1 FROM operator_reload_cycles cycle
++                    WHERE cycle.sales_order_id IN (candidate.netsuite_id, source_order.netsuite_id)
++                      AND cycle.status IN ('authorized','preparing','packed','in_progress')) AS active_reload,
++           EXISTS (SELECT 1 FROM dispatch_order_completion_events completion
++                    WHERE completion.order_kind = 'SO'
++                      AND lower(btrim(completion.order_ref)) IN (lower(btrim(candidate.tranid)), lower(btrim(source_order.tranid)))
++                      AND completion.completion_evidence_type IN ('driver_job','manual_dispatch','direct_dependency')) AS operationally_completed
++      FROM sales_orders candidate
++      LEFT JOIN dispatch_scm_so_splits membership ON membership.split_so_id = candidate.netsuite_id
++      JOIN sales_orders source_order ON source_order.netsuite_id = COALESCE(membership.source_so_id, candidate.netsuite_id)
++      LEFT JOIN scm_reconciliation_order_state state ON state.order_kind = 'SO'
++           AND state.source_order_netsuite_id = source_order.netsuite_id
++     WHERE lower(btrim(candidate.tranid)) = ANY($1::text[])
++        OR candidate.netsuite_id::text = ANY($1::text[])`, [refs]);
++  const driverCompleted = await listDriverPwaCompletedDispatchRefs({ candidateRefs: [...refs, ...result.rows.map(row => row.tranid)] });
++  const states = new Map();
++  for (const row of result.rows) {
++    const state = fulfilledSalesDeliveryState(row, { driverCompleted: driverCompleted.has(fulfilledSalesRef(row.tranid)) });
++    states.set(fulfilledSalesRef(row.tranid), state);
++    states.set(String(row.netsuite_id), state);
++  }
++  return states;
++}
++
++export async function overlayFulfilledSalesDeliveryPlanning(orders = [], { preserveUnchanged = false } = {}) {
++  const refs = [];
++  const visit = order => {
++    if (order?.type === "SO") refs.push(order.id, ...(order.childOrders || []));
++    for (const child of order?.childOrderDetails || []) visit(child);
++  };
++  orders.forEach(visit);
++  const states = await listFulfilledSalesDeliveryStates(refs);
++  const annotated = annotateFulfilledSalesOrders(orders, states);
++  if (!preserveUnchanged) return annotated;
++  return annotated.map((order, index) => {
++    const original = orders[index];
++    if (original.dispatchFulfilledSalesPlanningEligible !== undefined) return order;
++    const state = fulfilledSalesOrderState(original, states);
++    return state?.fulfilled || state?.locallyCompleted || state?.blocked ? order : original;
++  });
++}
++
++export async function fulfilledSalesDeliveryPlanningRefs(refs = []) {
++  const states = await listFulfilledSalesDeliveryStates(refs);
++  return refs.filter(ref => states.get(fulfilledSalesRef(ref))?.eligible);
++}
++
++export async function assertSalesDeliveryPlanningAllowed(refs = [], action = "plan these orders") {
++  await assertNoDriverPwaCompletedDispatchRefs(refs, action);
++  const states = await listFulfilledSalesDeliveryStates(refs);
++  const conflicts = refs.filter(ref => {
++    const state = states.get(fulfilledSalesRef(ref));
++    return state && (state.locallyCompleted || state.blocked);
++  });
++  if (!conflicts.length) return;
++  throw Object.assign(new Error(`Cannot ${action}: ${conflicts.join(", ")} is completed locally or restricted.`), {
++    status: 409, code: "DISPATCH_SALES_DELIVERY_RESTRICTED", conflicts: conflicts.map(orderRef => ({ orderRef }))
++  });
++}
+--- a/src/dispatch-repository.js
++++ b/src/dispatch-repository.js
+@@ -485,6 +485,7 @@
+   includeAllDiscoverableScmPurchaseOrders = false,
+   unboundedPerType = false,
+   includeInactiveSalesOrderSearchCandidates = false,
++  includeFulfilledSalesDeliveries = false,
+   includeScmLinkedSearchRefs = false,
+   search = "",
+   perTypeLimit = DEFAULT_DISPATCH_ORDERS_PER_TYPE,
+@@ -507,7 +508,8 @@
+     Boolean(includeScmLinkedSearchRefs && searchTerm),
+     normalizedExactOrderRefs,
+     Boolean(includeAllDiscoverableScmPurchaseOrders),
+-    Boolean(unboundedPerType)
++    Boolean(unboundedPerType),
++    Boolean(includeFulfilledSalesDeliveries && (searchTerm || normalizedExactOrderRefs.length))
+   ];
+   const result = await query(
+     `
+@@ -733,7 +735,7 @@
+         CASE WHEN $2::boolean AND COALESCE(is_test_fixture, false) THEN true ELSE netsuite_active END AS netsuite_active
+       FROM sales_orders
+       WHERE sales_order_type <> '${CUSTOMER_PICKUP_DELIVERY_METHOD.replaceAll("'", "''")}'
+-        AND NOT ${billedSalesOrderFamilySql("sales_orders")}
++        AND ($11::boolean OR NOT ${billedSalesOrderFamilySql("sales_orders")})
+         AND NOT ${netSuiteClosedOrderFamilySql("sales_orders", "SO")}
+         AND (COALESCE(is_test_fixture, false) = false OR $2::boolean)
+         AND (
+@@ -1112,7 +1114,8 @@
+           'toPcs', l.to_pcs
+         ) ORDER BY l.line_id NULLS LAST, l.id) FILTER (WHERE l.id IS NOT NULL) AS items
+       FROM delivery_order_source o
+-      LEFT JOIN delivery_line_source l ON l.order_id = o.netsuite_id AND l.netsuite_active = true
++      LEFT JOIN delivery_line_source l ON l.order_id = o.netsuite_id
++        AND (l.netsuite_active = true OR ($11::boolean AND o.order_type = 'sales_order'))
+       LEFT JOIN so_alloc sa ON sa.sales_line_id = l.id
+       LEFT JOIN LATERAL (
+         SELECT co_ref, from_location, to_location, status
+@@ -1126,7 +1129,7 @@
+       WHERE (
+         o.netsuite_active = true
+         OR co.co_ref IS NOT NULL
+-        OR ($6::boolean AND o.order_type = 'sales_order')
++        OR (($6::boolean OR $11::boolean) AND o.order_type = 'sales_order')
+       )
+         AND (
+           o.dispatch_planned = true
+--- a/src/dispatch-plan-repository.js
++++ b/src/dispatch-plan-repository.js
+@@ -1,3 +1,4 @@
++import { fulfilledSalesDeliveryPlanningRefs, overlayFulfilledSalesDeliveryPlanning, assertSalesDeliveryPlanningAllowed } from "./dispatch-fulfilled-so-repository.js";
+ import { query, withTransaction } from "./db.js";
+ import { isDeepStrictEqual } from "node:util";
+ import { freezeRecordedPurchaseOrderProjections } from "./dispatch-recorded-po-projection.js";
+@@ -763,6 +764,7 @@
+     const scrubbed = scrubBilledSalesOrderFamilyFromPlan(cleanPlan, {
+       canonicalRef: family.canonicalRef,
+       familyRefs: family.familyRefs,
++      preservedOrderRefs: await fulfilledSalesDeliveryPlanningRefs(family.familyRefs),
+       inProgressOrderRefs: activeJobs.length ? family.familyRefs : []
+     });
+     cleanPlan = scrubbed.plan;
+@@ -881,8 +883,9 @@
+   };
+   const billedSanitizedPlan = await scrubBilledSalesOrderFamiliesFromPlan(pickupSanitizedPlan);
+   const groupedRefs = groupedSalesOrderChildRefs(billedSanitizedPlan);
+-  if (!groupedRefs.length) return billedSanitizedPlan;
+-  return refreshGroupedSalesOrderReconciliationInPlan(billedSanitizedPlan, {
++  const annotatedPlan = { ...billedSanitizedPlan, orders: await overlayFulfilledSalesDeliveryPlanning(billedSanitizedPlan.orders || [], { preserveUnchanged: true }) };
++  if (!groupedRefs.length) return annotatedPlan;
++  return refreshGroupedSalesOrderReconciliationInPlan(annotatedPlan, {
+     childSnapshots: await groupedSalesOrderChildSnapshots(billedSanitizedPlan),
+     targetRefs: groupedRefs
+   }).plan;
+@@ -1202,6 +1205,7 @@
+         FOR UPDATE OF p, s`,
+       [refs]
+     );
++    const preservedOrderRefs = billed && !closed ? await fulfilledSalesDeliveryPlanningRefs(refs) : [];
+     const changedPlans = [];
+     const deferredPlans = [];
+     for (const row of snapshots.rows) {
+@@ -1224,7 +1228,8 @@
+       const scrubbed = billed || closed
+         ? scrubBilledSalesOrderFamilyFromPlan(refreshed.plan, {
+             canonicalRef,
+-            familyRefs: refs
++            familyRefs: refs,
++            preservedOrderRefs
+           })
+         : {
+             plan: refreshed.plan,
+@@ -1612,6 +1617,11 @@
+       reactivatedGlobalOrderRefs,
+       rejectRetiredGlobalOrderRefs: true
+     });
++    // Driver completion uses this same fleet lock. Recheck after acquiring it,
++    // before billed cleanup or persistence can accept a stale browser decision.
++    const previousRefs = new Set([...dispatchPlannedOrderRefs(previousPlan)].map(ref => ref.toLowerCase()));
++    await assertSalesDeliveryPlanningAllowed([...dispatchPlannedOrderRefs(canonicalPlan)]
++      .filter(ref => !previousRefs.has(ref.toLowerCase())), "save this plan");
+     let sanitizedPlan = await refreshDispatchPlanAuthoritativeOrderProjection(
+       await sanitizeDispatchPlan({
+         id: String(planId),
+--- a/src/dispatch-planner-v2-repository.js
++++ b/src/dispatch-planner-v2-repository.js
+@@ -1,6 +1,7 @@
+ import crypto from "node:crypto";
+ 
+ import { query, withTransaction } from "./db.js";
++import { assertSalesDeliveryPlanningAllowed, fulfilledSalesDeliveryPlanningRefs } from "./dispatch-fulfilled-so-repository.js";
+ import { canonicalizeDispatchCoGroupIdentities } from "./dispatch-co-group-identity.js";
+ import {
+   deactivateDispatchGlobalOrderDefinitions,
+@@ -816,9 +817,11 @@
+   if (!uniqueRefs.length) {return;}
+   await assertOtherPlanAssignmentProjectionsReady(plan);
+   await assertNoDriverPwaCompletedDispatchRefs(uniqueRefs, "add these orders to Dispatch");
++  await assertSalesDeliveryPlanningAllowed(uniqueRefs, "add these orders to Dispatch");
++  const fulfilledRefs = new Set((await fulfilledSalesDeliveryPlanningRefs(uniqueRefs)).map(ref => ref.toLowerCase()));
+   await assertHistoricalInactiveSalesOrdersReconciled({
+     planDate: plan.planDate,
+-    orderRefs: uniqueRefs,
++    orderRefs: uniqueRefs.filter(ref => !fulfilledRefs.has(ref.toLowerCase())),
+     action: "add these orders to Dispatch"
+   });
+   for (const ref of uniqueRefs) {
+--- a/src/dispatch-order-catalog-repository.js
++++ b/src/dispatch-order-catalog-repository.js
+@@ -2,6 +2,7 @@
+ 
+ import { query, withTransaction } from "./db.js";
+ import { overlayDispatchOrderCompletionStatuses } from "./dispatch-completion-repository.js";
++import { overlayFulfilledSalesDeliveryPlanning } from "./dispatch-fulfilled-so-repository.js";
+ import { reconcileDispatchPlanLocalCos } from "./dispatch-co-lifecycle.js";
+ import { reconcileDispatchGlobalOrderSources } from "./dispatch-delivery-group-repository.js";
+ import {
+@@ -245,7 +246,7 @@
+   const canonical = order.type === "CO"
+     ? (await reconcileDispatchPlanLocalCos({ orders: [order], trucks: [] })).orders
+     : [order];
+-  return (await overlayDispatchOrderCompletionStatuses(canonical))[0] || null;
++  return (await overlayFulfilledSalesDeliveryPlanning(await overlayDispatchOrderCompletionStatuses(canonical)))[0] || null;
+ }
+ 
+ export async function removeDispatchOrderCatalogOrder(ref) {
+@@ -471,7 +472,7 @@
+   const [orders, state] = await Promise.all([
+     overlayDispatchOrderCompletionStatuses(
+       page.map((row) => ({ ...row.card, ...assignmentFields(row) }))
+-    ),
++    ).then(overlayFulfilledSalesDeliveryPlanning),
+     getDispatchOrderCatalogState()
+   ]);
+   return {
+--- a/src/sales-order-reconciliation.js
++++ b/src/sales-order-reconciliation.js
+@@ -247,7 +247,8 @@
+   return valueRefs(value).some((ref) => family.has(ref));
+ }
+ 
+-function directlyReferencesFamily(value, family) {
++function directlyReferencesFamily(value, family, preserved = new Set()) {
++  if (preserved.has(normalizedRef(value?.id || value?.orderId || value?.order_id))) return false;
+   return directValueRefs(value).some((ref) => family.has(ref));
+ }
+ 
+@@ -442,15 +443,15 @@
+   };
+ }
+ 
+-function pruneFamilyFromOrder(order, family) {
++function pruneFamilyFromOrder(order, family, preserved) {
+   if (typeof order === "string" || typeof order === "number") {
+     return family.has(normalizedRef(order)) ? null : order;
+   }
+   if (!order || typeof order !== "object") return order;
+   if (!Array.isArray(order.childOrders) || !order.childOrders.length) {
+-    return directlyReferencesFamily(order, family) ? null : order;
+-  }
+-  if (directlyReferencesFamily(order, family)) return null;
++    return directlyReferencesFamily(order, family, preserved) ? null : order;
++  }
++  if (directlyReferencesFamily(order, family, preserved)) return null;
+   const detailById = new Map((order.childOrderDetails || [])
+     .map((child) => [text(child?.id), child])
+     .filter(([id]) => id));
+@@ -458,7 +459,7 @@
+     const ref = text(childRef);
+     const detail = detailById.get(ref);
+     return family.has(normalizedRef(ref))
+-      || directlyReferencesFamily(detail || {}, family)
++      || directlyReferencesFamily(detail || {}, family, preserved)
+       || (detail?.childOrders?.length && referencesFamily(detail, family));
+   });
+   if (!containsFamily) return order;
+@@ -466,8 +467,8 @@
+   for (const childRef of order.childOrders) {
+     const ref = text(childRef);
+     const detail = detailById.get(ref) || { id: ref, type: order.type || "SO" };
+-    if (family.has(normalizedRef(ref)) || directlyReferencesFamily(detail, family)) continue;
+-    const pruned = pruneFamilyFromOrder(detail, family);
++    if (family.has(normalizedRef(ref)) || directlyReferencesFamily(detail, family, preserved)) continue;
++    const pruned = pruneFamilyFromOrder(detail, family, preserved);
+     if (pruned && typeof pruned === "object" && pruned.id) children.push(pruned);
+   }
+   if (!children.length) return null;
+@@ -475,7 +476,7 @@
+   return rollupGroupedSalesOrderReconciliation(order, children);
+ }
+ 
+-function stripFamilyFromLoadOrder(value, family, orderReplacements) {
++function stripFamilyFromLoadOrder(value, family, orderReplacements, preserved) {
+   if (typeof value === "string" || typeof value === "number") {
+     const ref = normalizedRef(value);
+     if (family.has(ref)) return null;
+@@ -485,7 +486,7 @@
+   if (!value || typeof value !== "object") return value;
+   const id = normalizedRef(value.id || value.orderId || value.order_id);
+   if (id && orderReplacements.has(id)) return orderReplacements.get(id);
+-  return pruneFamilyFromOrder(value, family);
++  return pruneFamilyFromOrder(value, family, preserved);
+ }
+ 
+ function rewrittenStop(stop, family, orderReplacements) {
+@@ -517,9 +518,9 @@
+   };
+ }
+ 
+-function scrubLoad(load = {}, family, orderReplacements) {
++function scrubLoad(load = {}, family, orderReplacements, preserved) {
+   const nextOrders = Array.isArray(load.orders)
+-    ? load.orders.map((order) => stripFamilyFromLoadOrder(order, family, orderReplacements)).filter(Boolean)
++    ? load.orders.map((order) => stripFamilyFromLoadOrder(order, family, orderReplacements, preserved)).filter(Boolean)
+     : load.orders;
+   const nextStops = Array.isArray(load.stops)
+     ? load.stops
+@@ -536,9 +537,11 @@
+ export function scrubBilledSalesOrderFamilyFromPlan(plan = {}, {
+   canonicalRef = "",
+   familyRefs = [],
+-  inProgressOrderRefs = []
++  inProgressOrderRefs = [],
++  preservedOrderRefs = []
+ } = {}) {
+-  const family = new Set([canonicalRef, ...(familyRefs || [])].map(normalizedRef).filter(Boolean));
++  const preserved = new Set(preservedOrderRefs.map(normalizedRef));
++  const family = new Set([canonicalRef, ...(familyRefs || [])].map(normalizedRef).filter(ref => ref && !preserved.has(ref)));
+   const active = new Set((inProgressOrderRefs || []).map(normalizedRef).filter(Boolean));
+   if ([...family].some((ref) => active.has(ref))) {
+     return { plan, changed: false, deferred: true, removedOrderRefs: [] };
+@@ -548,7 +551,7 @@
+   const orderReplacements = new Map();
+   const orders = [];
+   for (const order of Array.isArray(plan.orders) ? plan.orders : []) {
+-    const pruned = pruneFamilyFromOrder(order, family);
++    const pruned = pruneFamilyFromOrder(order, family, preserved);
+     const originalId = normalizedRef(order?.id || order?.orderId || order?.order_id);
+     if (originalId && order?.childOrders?.length && pruned !== order) {
+       orderReplacements.set(originalId, pruned && typeof pruned === "object" ? pruned : null);
+@@ -557,7 +560,7 @@
+   }
+   const trucks = (Array.isArray(plan.trucks) ? plan.trucks : []).map((truck) => ({
+     ...truck,
+-    loads: (Array.isArray(truck.loads) ? truck.loads : []).map((load) => scrubLoad(load, family, orderReplacements))
++    loads: (Array.isArray(truck.loads) ? truck.loads : []).map((load) => scrubLoad(load, family, orderReplacements, preserved))
+   }));
+   const changed = JSON.stringify(orders) !== JSON.stringify(plan.orders || [])
+     || JSON.stringify(trucks) !== JSON.stringify(plan.trucks || []);
+--- a/src/server.js
++++ b/src/server.js
+@@ -1,3 +1,5 @@
++import { listFulfilledSalesDeliveryStates, overlayFulfilledSalesDeliveryPlanning, assertSalesDeliveryPlanningAllowed, fulfilledSalesDeliveryPlanningRefs } from "./dispatch-fulfilled-so-repository.js";
++import { fulfilledSalesOrderState } from "./dispatch-fulfilled-so-policy.js";
+ import { createOperatorYardGuard, assertOperatorOrderYard, assertOperatorUploadYard, assertOperatorOrderPhotoYard } from "./operator-yard-authorization.js";
+ import { configureConsolidationLoadEvents, listConsolidationLoadOrders, createConsolidationLoadPreview, getConsolidatedLoad, listPendingConsolidatedLoads } from "./consolidation-load-repository.js";
+ import { submitConsolidatedLoad, resumeConsolidatedLoad } from "./consolidation-load-service.js";
+@@ -777,9 +779,10 @@
+   const newlyPlannedRefs = [...dispatchPlannedOrderRefs(nextPlan)]
+     .map((ref) => String(ref || "").trim())
+     .filter((ref) => ref && !previousRefs.has(ref.toLowerCase()));
++  const fulfilledRefs = new Set((await fulfilledSalesDeliveryPlanningRefs(newlyPlannedRefs)).map(ref => String(ref).trim().toLowerCase()));
+   return assertHistoricalInactiveSalesOrdersReconciled({
+     planDate: nextPlan.planDate,
+-    orderRefs: newlyPlannedRefs,
++    orderRefs: newlyPlannedRefs.filter(ref => !fulfilledRefs.has(ref.toLowerCase())),
+     action
+   });
+ }
+@@ -790,6 +793,9 @@
+     `remain in Dispatch when you ${action}`
+   );
+   await assertNoNewDriverPwaCompletedDispatchOrders(previousPlan, nextPlan, action);
++  const previousRefs = new Set([...dispatchPlannedOrderRefs(previousPlan)].map(ref => String(ref).trim().toLowerCase()));
++  const addedRefs = [...dispatchPlannedOrderRefs(nextPlan)].filter(ref => !previousRefs.has(String(ref).trim().toLowerCase()));
++  await assertSalesDeliveryPlanningAllowed(addedRefs, action);
+   return assertNewHistoricalInactiveSalesOrdersReconciled(previousPlan, nextPlan, action);
+ }
+ 
+@@ -1550,7 +1556,7 @@
+ }
+ 
+ async function enrichDispatchOrdersWithCompletionStatus(orders = []) {
+-  return overlayDispatchOrderCompletionStatuses(orders);
++  return overlayFulfilledSalesDeliveryPlanning(await overlayDispatchOrderCompletionStatuses(orders));
+ }
+ 
+ function snapshotDerivedGroupBelongsToPlan(order = {}, plan = {}) {
+@@ -1875,6 +1881,7 @@
+       type,
+       search: searchTerm,
+       includeScmLinkedSearchRefs: Boolean(searchTerm),
++      includeFulfilledSalesDeliveries: true,
+       exactOrderRefs
+     }),
+     includeCustom
+@@ -1895,6 +1902,7 @@
+           search: searchTerm,
+           includeHiddenScm: true,
+           includeInactiveSalesOrderSearchCandidates: true,
++          includeFulfilledSalesDeliveries: true,
+           includeScmLinkedSearchRefs: true,
+           exactOrderRefs
+         })
+@@ -1904,6 +1912,10 @@
+       : Promise.resolve(new Set())
+   ]);
+   const exactCandidateOrders = [...orders, ...snapshotOrders];
++  const fulfilledSalesStates = await listFulfilledSalesDeliveryStates(
++    [...orders, ...snapshotOrders, ...hiddenScmOrders].filter(order => order.type === "SO")
++      .flatMap(order => [order.id, ...(order.childOrders || [])])
++  );
+   const restrictedScmRefs = exactIdentityRequest
+     ? await listRestrictedScmDispatchOrderRefs({
+         exactOrderRefs: [
+@@ -1935,13 +1947,18 @@
+   const isBilledSalesOrderFamily = (order) => {
+     const type = String(order?.type || "").trim().toUpperCase();
+     if (type !== "SO" && !Array.isArray(order?.childOrders)) return false;
++    const state = fulfilledSalesOrderState(order, fulfilledSalesStates);
++    if (state?.eligible || ((searchTerm || exactIdentityRequest) && state?.fulfilled && state?.locallyCompleted)) return false;
+     return dispatchOrderLogicalRefs(order).some((ref) => billedSalesOrderRefs.has(ref));
+   };
+   const currentOrders = filterDispatchPlanningVisibleOrders([
+     ...orders,
+     ...customOrders.map(dispatchOrderFromCustomOrder),
+     ...historicalOrders
+-  ]).filter((order) => !isBilledSalesOrderFamily(order)).filter((order) => {
++  ]).filter(order => order.type !== "SO" || order.netsuiteActive !== false
++    || order.historicalReconciliationComplete === true
++    || fulfilledSalesOrderState(order, fulfilledSalesStates)?.fulfilled)
++    .filter((order) => !isBilledSalesOrderFamily(order)).filter((order) => {
+     if (order.historicalReconciliationComplete === true) return true;
+     if (!["PO", "TO", "VRMA"].includes(String(order?.type || "").trim().toUpperCase())) return true;
+     return !dispatchOrderScmRestrictionRefs(order).some((ref) => restrictedScmRefs.has(ref));
+--- a/public/dispatch.js
++++ b/public/dispatch.js
+@@ -11491,6 +11491,8 @@
+     && order.dispatchReconciliationPlanningEligible !== true;
+   const planningRestricted = isDispatchPlanningRestricted(order);
+   const reconciliationPlanningEligible = order.dispatchReconciliationPlanningEligible === true;
++  const fulfilledSalesPlanningEligible = order.type === "SO"
++    && order.dispatchFulfilledSalesPlanningEligible === true && !planningRestricted;
+   const dragBlocked = anyPlanned || dependencyLinked || reconciliationBlocked || planningRestricted;
+   const reviewOnly = isReviewOnlyOrder(order);
+   const packedText = packedUnitText(order);
+@@ -11515,6 +11517,7 @@
+         ${executionStatus === "complete" ? `<span class="chip complete-chip">Completed</span>` : executionStatus === "in_progress" ? `<span class="chip progress-chip">In progress</span>` : ""}
+         ${reviewOnly ? `<span class="chip complete-chip">${escapeHtml(reviewOnlyText(order))}</span>` : ""}
+         ${planningRestricted ? `<span class="chip complete-chip" title="${escapeHtml(dispatchPlanningRestrictionText(order))}">Completed · search only</span>` : ""}
++        ${fulfilledSalesPlanningEligible ? `<span class="chip complete-chip" title="NetSuite fulfillment is complete; Driver delivery is still pending.">Completed · delivery pending</span>` : ""}
+         ${reconciliationPlanningEligible ? `<span class="chip warn" title="${escapeHtml(order.dispatchReconciliationPlanningReason || "Receipt reconciliation is complete, but Driver delivery is still pending.")}">Reconciled · dispatch pending</span>` : ""}
+         ${reconciliationBlocked ? `<span class="chip warn" title="${escapeHtml(scmReconciliationBlockText(order))}">Reconcile Review</span>` : ""}
+         ${anyPlanned ? `<span class="chip planned-chip">${escapeHtml(plannedText)}</span>` : ""}
+--- a/public/dispatch.html
++++ b/public/dispatch.html
+@@ -14,6 +14,6 @@
+     <script src="/app-sidebar.js?v=20260728-custom-orders-v1"></script>
+     <script src="/dispatch-auth.js?v=20260724-sales-auth-v2"></script>
+     <script src="/delivery-instruction-upload.js?v=20260812-delivery-image-720p-v1"></script>
+-    <script src="/dispatch.js?v=20260911-map-geometry-v2&amp;cargo=20260911-v1&amp;preview=20260911-v1&amp;address=20260911-v1&amp;split=20260914-v1&amp;lifecycle=20260914-v1&amp;sov=20260914-v1&amp;pool=20260915-v1"></script>
++    <script src="/dispatch.js?v=20260911-map-geometry-v2&amp;cargo=20260911-v1&amp;preview=20260911-v1&amp;address=20260911-v1&amp;split=20260914-v1&amp;lifecycle=20260914-v1&amp;sov=20260914-v1&amp;pool=20260915-v1&amp;fulfilled-so=20260915-v1"></script>
+   </body>
+ </html>

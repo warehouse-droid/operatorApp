@@ -24,6 +24,7 @@ import { smartScmVendorUnitPriceEdit } from "./smart-scm-vendor-unit-price.js";
 import { applySmartScmVendorPalletUnitPrice } from "./smart-scm-vendor-unit-price-repository.js";
 import { listSmartScmBlanketPoolRows } from "./smart-scm-blanket-pool-repository.js";
 import { smartScmBlanketCoverageSnapshot } from "./smart-scm-blanket-coverage.js";
+import { resumeSmartScmBlanketCoveredPlanningExclusions } from "./smart-scm-planning-exclusion-repository.js";
 
 const EPSILON = 0.000001;
 const BLANKET_PENDING_ALLOCATION_STATUSES = Object.freeze(["reserved", "held"]);
@@ -679,6 +680,7 @@ export async function buildSmartScmBlanketPlan(operatorId = null) {
     // transaction-scoped advisory lock through the ready/failed transition
     // prevents two concurrent requests from exposing overlapping current plans.
     await query("SELECT pg_advisory_xact_lock(hashtext('smart-scm-blanket-plan-build'))");
+    await resumeSmartScmBlanketCoveredPlanningExclusions({ operatorId });
     const planning = await loadSmartScmPlanningDemandStates({ includeTemporarilyExcluded: false });
     const poolRows = planning.blanketPoolRows || [];
     const coverageSnapshot = smartScmBlanketCoverageSnapshot(planning.states);

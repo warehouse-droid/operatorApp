@@ -49,6 +49,30 @@ test("Chinese timestamp output uses the same Toronto instant", async () => {
   assert.equal(i18n.displayDateTime("2026-08-13T02:16:00.195Z"), "8\u670812\u65e5 22:16");
 });
 
+test("Operator business dates retain their SQL calendar day while event times still use Toronto", async () => {
+  const source = await readPublic("operator.js");
+  const functions = ["formatDate", "formatDateTime", "localDateKey"].map((name) => {
+    const start = source.indexOf(`function ${name}(`);
+    assert.ok(start >= 0);
+    return source.slice(start, source.indexOf("\nfunction ", start + 1));
+  }).join("\n");
+  const context = vm.createContext({ window: { MBBS_I18N: await loadI18n("en") } });
+  vm.runInContext(functions, context);
+  for (const [value, expected] of [
+    ["2026-09-10", "10-Sep"],
+    ["2026-09-10T00:00:00.000Z", "10-Sep"],
+    ["2026-01-01T00:00:00.000Z", "01-Jan"],
+    ["2026-03-08T00:00:00.000Z", "08-Mar"],
+    ["2026-11-01T00:00:00.000Z", "01-Nov"]
+  ]) {
+    assert.equal(context.formatDate(value), expected);
+  }
+  assert.equal(context.formatDateTime("2026-09-10T00:00:00.000Z"), "09-Sep 08:00 PM");
+  assert.equal(context.formatDate(""), "");
+  context.window.MBBS_I18N = await loadI18n("zh-CN");
+  assert.equal(context.formatDate("2026-09-10T00:00:00.000Z"), "9月10日");
+});
+
 test("every Driver completion UI routes timestamp instants through the shared formatter", async () => {
   const [loaded, control, statistics, driver, dispatch, operator, setup] = await Promise.all([
     "dispatch-loaded-export.js",

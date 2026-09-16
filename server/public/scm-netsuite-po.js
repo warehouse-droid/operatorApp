@@ -1,4 +1,5 @@
 const poApp = document.getElementById("smartNetSuitePoApp");
+let poLinkedHistoryId = null;
 let poPdfRequestSequence = 0;
 
 const poState = {
@@ -229,7 +230,7 @@ function card(record) {
       <div class="po-history-route"><strong>${esc(current.vendor || record.creationSnapshot?.vendor || "Unknown vendor")}</strong><span>${esc(current.vendorYard || "Vendor yard not set")} → ${esc([...new Set((current.lines || []).map((line) => line.destination).filter(Boolean))].join(", ") || "Destination not set")}</span></div>
       <div><strong>${money(current.total)}</strong><span>Current total</span></div>
       <div>${statusPill(record)}<span>NetSuite status</span></div>
-      <div class="po-card-actions">${netSuiteExists ? `<button class="smart-button" data-action="pdf">Preview PDF</button><button class="smart-button" data-action="refresh">Sync now</button>${writable ? `<button class="smart-button primary" data-action="save">Save to NetSuite</button>` : ""}` : `<span class="smart-help po-missing-actions">NetSuite actions unavailable</span>`}${canWrite() ? `<button class="smart-button danger" data-action="unarchive">Return to Vendor Replies</button>` : ""}</div>
+      <div class="po-card-actions">${netSuiteExists ? `<button class="smart-button" data-action="pdf">Preview PDF</button><button class="smart-button" data-action="refresh">Sync now</button>${writable ? `<button class="smart-button primary" data-action="save">Save to NetSuite</button>` : ""}` : `<span class="smart-help po-missing-actions">NetSuite actions unavailable</span>`}${canWrite() && record.archivedAt ? `<button class="smart-button danger" data-action="unarchive">Return to Vendor Replies</button>` : ""}</div>
     </header>
     ${record.lastSyncError ? `<div class="smart-notice error">${esc(record.lastSyncError)}</div>` : ""}
     <div class="po-meta-grid">
@@ -246,7 +247,7 @@ function card(record) {
       <label class="po-memo">Memo<textarea data-head-field="memo" maxlength="4000" ${writable ? "" : "disabled"}>${esc(headValue("memo", current.memo || ""))}</textarea></label>
     </div>
     <div class="smart-table-wrap"><table class="smart-table po-lines"><thead><tr><th>Item</th><th>PLT (editable)</th><th>Native quantity (read only)</th><th>Rate</th><th>Amount</th><th>Destination</th><th>Received</th></tr></thead><tbody>${(current.lines || []).map((line) => lineRow(record, line)).join("") || `<tr><td colspan="7">No current NetSuite lines were mirrored.</td></tr>`}</tbody></table></div>
-    <footer><span>Created ${date(record.appCreatedAt, true)} · Archived ${date(record.archivedAt, true)}</span><span>NetSuite synced ${date(record.lastSyncedAt, true)} · Version ${date(record.remoteLastModifiedAt, true)}</span></footer>
+    <footer><span>Created ${date(record.appCreatedAt, true)}${record.archivedAt ? ` · Archived ${date(record.archivedAt, true)}` : " · In Vendor Replies"}</span><span>NetSuite synced ${date(record.lastSyncedAt, true)} · Version ${date(record.remoteLastModifiedAt, true)}</span></footer>
     ${snapshotSummary(record)}
   </article>`;
 }
@@ -255,8 +256,8 @@ function render() {
   poApp.innerHTML = `<header class="dispatch-topbar"><div class="smart-brand"><div class="smart-brand-mark">PO</div><div><p>Smart SCM accounting history</p><h1>NetSuite PO history</h1></div></div><span class="smart-mode">live NetSuite data</span><div class="topbar-actions"><span class="dispatch-user">${esc(poState.operator?.display_name || poState.operator?.username || "")}</span><button onclick="location.href='/scm/smart'">Smart SCM</button><button onclick="location.href='/scm'">SCM menu</button><button onclick="dispatchLogout()">Logout</button></div></header>
   <div class="smart-main">
     ${poState.error ? `<div class="smart-notice error">${esc(poState.error)}</div>` : ""}${poState.syncWarning ? `<div class="smart-notice po-sync-warning">${esc(poState.syncWarning)}</div>` : ""}${poState.notice ? `<div class="smart-notice">${esc(poState.notice)}</div>` : ""}${poState.busy ? `<div class="smart-notice">${esc(poState.busy)}…</div>` : ""}
-    <section class="smart-section"><div class="smart-section-head"><div><h2>Archived application-created POs</h2><p>Creation evidence is preserved while current status, prices, quantities, dates and destinations come from NetSuite.</p></div><span class="smart-help">${poState.total} PO(s)</span></div>
-      <div class="po-filters">
+    <section class="smart-section"><div class="smart-section-head"><div><h2>${poLinkedHistoryId ? "Purchase order" : "Archived application-created POs"}</h2><p>Creation evidence is preserved while current status, prices, quantities, dates and destinations come from NetSuite.</p></div><span class="smart-help">${poState.total} PO(s)</span></div>
+      <div class="po-filters" ${poLinkedHistoryId ? 'style="display:none"' : ""}>
         <input id="poSearch" type="search" value="${esc(poState.filters.search)}" placeholder="Search PO, vendor, item or yard">
         <label>Created from<input id="poCreatedFrom" type="date" value="${esc(poState.filters.createdFrom)}"></label>
         <label>Created to<input id="poCreatedTo" type="date" value="${esc(poState.filters.createdTo)}"></label>
@@ -267,7 +268,7 @@ function render() {
         <button class="smart-button primary" data-action="filter">Apply</button><button class="smart-button" data-action="clear">Clear</button>
       </div>
       <div class="po-history-list">${poState.records.map(card).join("") || `<div class="smart-empty">No archived application-created PO matches these filters.</div>`}</div>
-      <nav class="po-pagination"><button class="smart-button" data-action="previous" ${poState.page <= 1 ? "disabled" : ""}>Previous</button><span>Page ${poState.page} of ${poState.totalPages}</span><button class="smart-button" data-action="next" ${poState.page >= poState.totalPages ? "disabled" : ""}>Next</button></nav>
+      <nav class="po-pagination" ${poLinkedHistoryId ? 'style="display:none"' : ""}><button class="smart-button" data-action="previous" ${poState.page <= 1 ? "disabled" : ""}>Previous</button><span>Page ${poState.page} of ${poState.totalPages}</span><button class="smart-button" data-action="next" ${poState.page >= poState.totalPages ? "disabled" : ""}>Next</button></nav>
     </section>
   </div>${poState.pdf ? `<div class="po-modal" role="dialog" aria-modal="true"><div class="po-modal-card"><header><div><strong>${esc(poState.pdf.label)}</strong><small>NetSuite PDF preview</small></div><button data-action="close-pdf" aria-label="Close">×</button></header>${poState.pdf.status === "error" ? `<div class="smart-notice error"><strong>Preview could not be loaded</strong><div>${esc(poState.pdf.error)}</div></div>` : poState.pdf.url ? `<iframe src="${esc(poState.pdf.url)}" title="NetSuite PO PDF"></iframe>` : `<div class="smart-notice">Loading purchase order PDF…</div>`}</div></div>` : ""}`;
 }
@@ -295,6 +296,13 @@ async function load({ quiet = false, force = false } = {}) {
   try {
     const params = new URLSearchParams({ ...poState.filters, page: String(poState.page), pageSize: String(poState.pageSize) });
     const payload = await api(`/api/scm/netsuite-po-history?${params}`);
+    if (poLinkedHistoryId) {
+      const linked = await api(`/api/scm/netsuite-po-history/${poLinkedHistoryId}`);
+      payload.records = [linked];
+      payload.page = 1;
+      payload.total = 1;
+      payload.totalPages = 1;
+    }
     if (sequence !== poState.loadSequence) return false;
     if (quiet && !force && quietRefreshBlocked()) {
       discardQuietResponse = true;
@@ -443,7 +451,7 @@ async function act(button) {
   render();
   try {
     if (action === "save" || savingVendorReference) {
-      const saved = await api(`/api/scm/netsuite-po-history/${id}`, { method: "PATCH", body: { expectedLastModifiedAt: cardElement.dataset.version, ...changes } });
+      const saved = await api(`/api/scm/netsuite-po-history/${id}`, { method: "PATCH", body: { expectedLastModifiedAt: cardElement.dataset.version, expectedVersion: record.version, ...changes } });
       if (savingVendorReference) clearHeaderDraftField(id, "vendorReference");
       else {
         poState.dirtyIds.delete(id);
@@ -552,6 +560,7 @@ requireDispatchLogin({
   mount: poApp,
   roles: ["admin", "scm", "scm_staff"],
   async onReady(operator) {
+    poLinkedHistoryId = Number(new URLSearchParams(window.location.search).get("historyId")) || null;
     poState.operator = operator;
     render();
     try { poState.options = await api("/api/scm/netsuite-po-history/options"); } catch (error) { poState.error = error.message; }

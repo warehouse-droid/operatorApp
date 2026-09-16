@@ -1,0 +1,18 @@
+[
+  "test/mbt/unit/operator-yard-access.test.js",
+  "test/mbt/integration/operator-receiving-identity.test.js",
+  "test/mbt/integration/operator-receiving-allocations.test.js",
+  "test/mbt/unit/operator-receiving-quantity-ui.test.js",
+  "test/mbt/integration/operator-yard-access.test.js",
+  "test/mbt/integration/operator-page-confirm.red.test.js",
+  "test/mbt/unit/operator-netsuite-posting-targets.red.test.js",
+  "test/mbt/unit/operator-linked-fulfillment.red.test.js",
+  "test/mbt/unit/operator-netsuite-posting-domain.red.test.js",
+  "test/mbt/unit/operator-netsuite-posting-service.red.test.js",
+  "test/mbt/adversarial/operator-netsuite-posting-adversarial.test.js",
+  "test/mbt/concurrency/operator-netsuite-posting-concurrency.test.js",
+  "test/mbt/unit/operator-yard-assets.test.js",
+  "test/mbt/unit/operator-page-confirm-ui.contract.test.js",
+  "test/mbt/unit/operator-customer-pickup-photo-gate-ui.contract.test.js",
+  "test/mbt/unit/operations-navigation-enhancements.test.js"
+]

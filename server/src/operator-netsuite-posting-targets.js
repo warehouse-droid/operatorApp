@@ -1,6 +1,7 @@
 // @ts-check
 
 import { query } from "./db.js";
+import { operatorPostingTelemetry as telemetry } from "./operator-netsuite-posting-telemetry.js";
 import {
   buildItemFulfillmentPayload,
   getDeliveryOrder,
@@ -167,11 +168,11 @@ export function createOperatorNetSuitePostingLiveSourceFetcher({
         "A valid NetSuite source is required for authoritative line mapping."
       );
     }
-    const [orders, sourceItems, linkedRows] = await Promise.all([
-      fetchReconciliationOrders({ orderIds: [id], kind, includeOpen: false, targetOnly: true }),
-      fetchSourceItemLines(kind, id),
-      fetchLinkedTransactions([id])
-    ]);
+    const [orders, sourceItems, linkedRows] = await telemetry.context({ sourceOrderKind: kind, sourceNetSuiteId: id, stage: "source_validation" }, () => Promise.all([
+      telemetry.time({ operation: "source.reconciliation" }, () => fetchReconciliationOrders({ orderIds: [id], kind, includeOpen: false, targetOnly: true })),
+      telemetry.time({ operation: "source.lines" }, () => fetchSourceItemLines(kind, id)),
+      telemetry.time({ operation: "source.linked_transactions" }, () => fetchLinkedTransactions([id]))
+    ]));
     const order = (orders || []).find((/** @type {Record<string, any>} */ candidate) => (
       Number(candidate?.id) === id && String(candidate?.kind) === kind
     ));
@@ -311,6 +312,11 @@ function localLineForPayload(order, functionKey, orderLine) {
   return line;
 }
 
+/** @param {Record<string, any>} order @param {string} functionKey */
+function receivingMemo(order, functionKey) {
+  return functionKey === "receiving" ? { memo: String(order.tranid || "").trim() } : {};
+}
+
 /**
  * @param {Record<string, any>} order
  * @param {string} functionKey
@@ -343,6 +349,7 @@ async function targetForOrder(order, functionKey, resolveRealSource) {
     sourceOrderKind: source.sourceOrderKind,
     sourceNetSuiteId: Number(source.sourceNetSuiteId),
     sourceOrderRef: String(source.sourceOrderRef || ""),
+    ...receivingMemo(order, functionKey),
     selectedLines: selectedItems.map((/** @type {Record<string, any>} */ item) => {
       const localLine = localLineForPayload(order, functionKey, Number(item.orderLine));
       const sourceLineKey = String(localLine.line_id);
@@ -555,7 +562,14 @@ export function createOperatorNetSuitePostingRealSourceResolver({ query: runQuer
             LIMIT 1`,
           [order?.netsuite_id]
         )
-      : await runQuery(
+      : orderType === "purchase_order" ? await runQuery(
+          `SELECT source_po_id AS source_id, source_po_ref AS source_ref
+             FROM dispatch_scm_po_splits
+            WHERE split_po_id = $1
+              AND status = 'active'
+            LIMIT 1`,
+          [order?.netsuite_id]
+        ) : await runQuery(
           `SELECT source_so_id AS source_id, source_so_ref AS source_ref
              FROM dispatch_scm_so_splits
             WHERE split_so_id = $1
@@ -566,7 +580,7 @@ export function createOperatorNetSuitePostingRealSourceResolver({ query: runQuer
     if (!split.rows[0]) {return null;}
     sourceNetSuiteId = Number(split.rows[0].source_id);
     sourceOrderRef = String(split.rows[0].source_ref || "");
-    sourceOrderKind = orderType === "transfer_order" ? "TO" : "SO";
+    sourceOrderKind = orderType === "transfer_order" ? "TO" : orderType === "purchase_order" ? "PO" : "SO";
   }
   if (!Number.isSafeInteger(sourceNetSuiteId) || sourceNetSuiteId <= 0) {return null;}
 
@@ -586,15 +600,37 @@ export function createOperatorNetSuitePostingRealSourceResolver({ query: runQuer
   } else if (sourceOrderKind === "PO") {
     rows = await runQuery(
       `SELECT line.line_id AS source_line_key,
-              COALESCE(line.location_id, parent.destination_location_id) AS location_id
+              COALESCE(line.location_id, parent.destination_location_id) AS location_id,
+              mapped.local_line_key, mapped.local_line_id
          FROM purchase_order_lines line
          JOIN purchase_orders parent ON parent.netsuite_id = line.purchase_order_id
+         LEFT JOIN LATERAL (
+           SELECT child.line_id AS local_line_key, child.id AS local_line_id
+             FROM dispatch_scm_po_split_lines ledger
+             JOIN dispatch_scm_po_splits split ON split.id = ledger.split_id
+             JOIN purchase_order_lines child ON child.id = ledger.split_line_id
+              AND child.purchase_order_id = split.split_po_id
+            WHERE ledger.source_line_id = line.id
+              AND split.source_po_id = line.purchase_order_id
+              AND split.split_po_id = $2 AND split.status = 'active'
+        ) mapped ON true
         WHERE line.purchase_order_id = $1
+          AND COALESCE(line.netsuite_active, true) = true
           AND line.item_type IN ('InvtPart', 'NonInvtPart')
           AND line.line_id IS NOT NULL
         ORDER BY line.line_id, line.id`,
-      [sourceNetSuiteId]
+      [sourceNetSuiteId, order.netsuite_id]
     );
+    if (Number(order.netsuite_id) < 0) {
+      for (const child of (order.receivableLines || order.lines || []).filter(eligibleLine)) {
+        const mapped = rows.rows.filter((/** @type {Record<string, any>} */ row) =>
+          String(row.local_line_id) === String(child.id) && String(row.local_line_key) === String(child.line_id));
+        if (mapped.length !== 1) {
+          throw resolutionError("OPERATOR_NETSUITE_POSTING_LINE_MAPPING_UNRESOLVED",
+            `Split PO line ${child.line_id} has no unique active source-line mapping.`);
+        }
+      }
+    }
   } else {
     const lineStage = functionKey === "receiving" ? "receiving" : "outbound";
     rows = await runQuery(
@@ -660,7 +696,9 @@ export function createOperatorNetSuitePostingRealSourceResolver({ query: runQuer
         .includes(String(row.source_line_key || "")));
       return {
         sourceLineKey: String(line.sourceLineKey || reconciliationSourceLineAliases(line)[0]),
-        sourceLineAliases: reconciliationSourceLineAliases(line),
+        sourceLineAliases: lineAliases([reconciliationSourceLineAliases(line),
+          ...(rows.rows || []).filter((/** @type {Record<string, any>} */ row) => reconciliationSourceLineAliases(line)
+            .includes(String(row.source_line_key || ""))).map((/** @type {Record<string, any>} */ row) => row.local_line_key)]),
         orderLine: Number(line.restOrderLine),
         location: line.location === null || line.location === undefined
           ? matchingLocal?.location_id === null || matchingLocal?.location_id === undefined

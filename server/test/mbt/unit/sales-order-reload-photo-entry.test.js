@@ -72,7 +72,8 @@ test("Operator wires the re-load action to the existing two-photo live-camera sc
   assert.match(detailSource, /loadAction\.label/u);
   assert.match(startSource, /await api\(`\/api\/delivery\/orders\/\$\{encodeURIComponent\(/u);
   assert.match(startSource, /isPackedReloadReady/u);
-  assert.match(startSource, /if \(order\.reload_authorized\) await startFulfillmentCamera\(\)/u);
+  assert.match(startSource, /currentModule = customerPickupLoad \? "customer-pickup-load" : "delivery-fulfill"/u);
+  assert.match(operatorSource, /syncOperatorPhotoCamera\(\)/u);
   assert.match(fulfillmentSource, /data-action="start-camera"/u);
   assert.match(operatorSource, /function fulfillmentRequiredPhotoCount\(\)[\s\S]*?return 2;/u);
   assert.match(fulfillmentSource, /const requiredPhotoCount = isPickupLoad[\s\S]*?: fulfillmentRequiredPhotoCount\(\)/u);

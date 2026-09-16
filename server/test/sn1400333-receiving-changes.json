@@ -1,0 +1,60 @@
+[
+  {
+    "file": "src/operator-netsuite-posting-domain.js",
+    "beforeSha256": "893a270a5913e9a6d9229773cd1f2d1b46e046c86c239dfdf6e84708fdd5ac9a",
+    "afterSha256": "c119f275d29626e13c0ebd1b48a043413f64cef6deebbe159051ad0ec1cd3279",
+    "changedLines": [
+      277,
+      284,
+      294,
+      295,
+      296,
+      297,
+      402,
+      403,
+      404,
+      436
+    ],
+    "groups": [
+      {
+        "before": "    assertKindForTransaction(sourceOrderKind, transactionType);\n    const sourceNetSuiteId = positiveInteger(rawTarget.sourceNetSuiteId, \"Source NetSuite ID\");\n    const sourceOrderRef = requiredText(rawTarget.sourceOrderRef, \"Source order reference\");\n    const key = `${sourceOrderKind}:${sourceNetSuiteId}`;\n    if (!grouped.has(key)) {\n      grouped.set(key, {\n        sourceOrderKind,\n        sourceNetSuiteId,\n        sourceOrderRef,\n        selectedByLine: new Map(),\n        availableByLine: new Map(),\n        lineSnapshot: []\n",
+        "after": "    assertKindForTransaction(sourceOrderKind, transactionType);\n    const sourceNetSuiteId = positiveInteger(rawTarget.sourceNetSuiteId, \"Source NetSuite ID\");\n    const sourceOrderRef = requiredText(rawTarget.sourceOrderRef, \"Source order reference\");\n    const memo = transactionType === \"IR\" ? optionalText(rawTarget.memo) : null;\n    const key = `${sourceOrderKind}:${sourceNetSuiteId}`;\n    if (!grouped.has(key)) {\n      grouped.set(key, {\n        sourceOrderKind,\n        sourceNetSuiteId,\n        sourceOrderRef,\n        memo,\n        selectedByLine: new Map(),\n        availableByLine: new Map(),\n        lineSnapshot: []\n"
+      },
+      {
+        "before": "    if (group.sourceOrderRef !== sourceOrderRef) {\n      throw inputError(\"One NetSuite source ID cannot use conflicting order references.\");\n    }\n    const availableLines = Array.isArray(rawTarget.availableLines) ? rawTarget.availableLines : [];\n    const selectedLines = Array.isArray(rawTarget.selectedLines) ? rawTarget.selectedLines : [];\n    if (!availableLines.length || !selectedLines.length) {\n",
+        "after": "    if (group.sourceOrderRef !== sourceOrderRef) {\n      throw inputError(\"One NetSuite source ID cannot use conflicting order references.\");\n    }\n    if (group.memo && memo && group.memo !== memo) {\n      throw inputError(\"One NetSuite receipt cannot use conflicting memo references.\");\n    }\n    group.memo ||= memo;\n    const availableLines = Array.isArray(rawTarget.availableLines) ? rawTarget.availableLines : [];\n    const selectedLines = Array.isArray(rawTarget.selectedLines) ? rawTarget.selectedLines : [];\n    if (!availableLines.length || !selectedLines.length) {\n"
+      },
+      {
+        "before": "      });\n    }\n    const payloadLines = [...group.availableByLine.values()]\n      .sort((left, right) => left.orderLine - right.orderLine)\n      .map((available) => {\n        const selected = group.selectedByLine.get(available.orderLine);\n",
+        "after": "      });\n    }\n    const payloadLines = [...group.availableByLine.values()]\n      // Completed receipt lines are absent from the transform's static item sublist.\n      // Keep them in reconciliation evidence, but never send a deselection for them.\n      .filter((available) => transactionType !== \"IR\" || available.remainingQuantity !== 0)\n      .sort((left, right) => left.orderLine - right.orderLine)\n      .map((available) => {\n        const selected = group.selectedByLine.get(available.orderLine);\n"
+      },
+      {
+        "before": "    const { group, payloadLines, lineSnapshot } = plan;\n    const stepIndex = index + 1;\n    const externalId = operatorNetSuiteExternalId(requestId, stepIndex);\n    const payload = { externalId, item: { items: payloadLines } };\n    return {\n      stepIndex,\n      sourceOrderKind: group.sourceOrderKind,\n",
+        "after": "    const { group, payloadLines, lineSnapshot } = plan;\n    const stepIndex = index + 1;\n    const externalId = operatorNetSuiteExternalId(requestId, stepIndex);\n    const payload = { externalId, ...(group.memo ? { memo: group.memo } : {}), item: { items: payloadLines } };\n    return {\n      stepIndex,\n      sourceOrderKind: group.sourceOrderKind,\n"
+      }
+    ]
+  },
+  {
+    "file": "src/operator-netsuite-posting-targets.js",
+    "beforeSha256": "cc88282bff32fa7e6efce7728d0593db045e3fee6add6422a3111255401a5f0c",
+    "afterSha256": "2eb8f6904d55487e2a3ea58c8d3d43b4ac9b4cb2f9dd4e444744f5df26034a82",
+    "changedLines": [
+      314,
+      315,
+      316,
+      317,
+      318,
+      351
+    ],
+    "groups": [
+      {
+        "before": "  return line;\n}\n\n/**\n * @param {Record<string, any>} order\n * @param {string} functionKey\n",
+        "after": "  return line;\n}\n\n/** @param {Record<string, any>} order @param {string} functionKey */\nfunction receivingMemo(order, functionKey) {\n  return functionKey === \"receiving\" ? { memo: String(order.tranid || \"\").trim() } : {};\n}\n\n/**\n * @param {Record<string, any>} order\n * @param {string} functionKey\n"
+      },
+      {
+        "before": "    sourceOrderKind: source.sourceOrderKind,\n    sourceNetSuiteId: Number(source.sourceNetSuiteId),\n    sourceOrderRef: String(source.sourceOrderRef || \"\"),\n    selectedLines: selectedItems.map((/** @type {Record<string, any>} */ item) => {\n      const localLine = localLineForPayload(order, functionKey, Number(item.orderLine));\n      const sourceLineKey = String(localLine.line_id);\n",
+        "after": "    sourceOrderKind: source.sourceOrderKind,\n    sourceNetSuiteId: Number(source.sourceNetSuiteId),\n    sourceOrderRef: String(source.sourceOrderRef || \"\"),\n    ...receivingMemo(order, functionKey),\n    selectedLines: selectedItems.map((/** @type {Record<string, any>} */ item) => {\n      const localLine = localLineForPayload(order, functionKey, Number(item.orderLine));\n      const sourceLineKey = String(localLine.line_id);\n"
+      }
+    ]
+  }
+]

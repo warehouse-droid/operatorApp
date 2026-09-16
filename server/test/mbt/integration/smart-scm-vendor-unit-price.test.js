@@ -4,8 +4,43 @@ import test, { after, before } from "node:test";
 import { closeDb, query } from "../../../src/db.js";
 import { getSmartScmVendorWorkflowForProposal, ensureSmartScmVendorWorkflow } from "../../../src/smart-scm-vendor-workflow-repository.js";
 import { saveSmartScmVendorReplyLoad, stageSmartScmVendorReplyLoad } from "../../../src/smart-scm-vendor-repository.js";
+import { recordScmNetSuitePoCreation, persistScmNetSuitePoSnapshot, listScmNetSuitePoHistory, listScmNetSuitePoHistoryReconciliationCandidates } from "../../../src/scm-netsuite-po-history-repository.js";
 
 after(closeDb);
+
+test("created PO replacements and quantity edits reach Vendor Replies without changing the saved review", async () => {
+  const load = await createProposal();
+  const staged = await stageSmartScmVendorReplyLoad(load.proposalId, {
+    lines: [{ proposalLineId: load.lineId, destinationLocationId: 15, decision: "confirm", decisionPallets: 2, unitPrice: 10.67 }]
+  }, actor);
+  const poId = baseId + 80_000 + proposalSequence;
+  const poRef = `PO-SYNC-${poId}`;
+  await query(`INSERT INTO purchase_orders (netsuite_id,tranid,vendor_id,vendor,status,status_text,netsuite_active)
+    VALUES ($1,$2,$3,'Vendor','B','Purchase Order : Pending Receipt',true)`, [poId,poRef,vendorId]);
+  await query(`INSERT INTO purchase_order_lines (purchase_order_id,line_id,item_id,item_name,quantity,unit,location_id,location,pallet_qty,to_plt,rate,amount)
+    VALUES ($1,1,$2,'Replacement',30,'EA',1,'3445',3,10,12,360)`, [poId,itemId+10]);
+  await query(`UPDATE scm_smart_proposals SET status='completed',netsuite_purchase_order_id=$2,netsuite_purchase_order_ref=$3 WHERE id=$1`, [staged.reviewProposalId,poId,poRef]);
+  await query(`UPDATE scm_smart_vendor_workflows SET review_proposal_id=$2,workflow_status='po_created',netsuite_purchase_order_id=$3,netsuite_purchase_order_ref=$4 WHERE source_proposal_id=$1`, [load.proposalId,staged.reviewProposalId,poId,poRef]);
+  const history = await recordScmNetSuitePoCreation({proposalId:staged.reviewProposalId,purchaseOrderId:poId,purchaseOrderRef:poRef}, actor);
+  const result = await getSmartScmVendorWorkflowForProposal(load.proposalId);
+  assert.deepEqual(result.lines.map((line) => [line.itemId,line.confirmedPallets,line.salesQuantity,line.destinationLocationId]), [[itemId+10,3,30,1]]);
+  assert.equal(result.purchaseOrderHistoryId,history.id);
+  const listed = await listScmNetSuitePoHistory({includeUnarchived:true,search:poRef});
+  assert.match(listed.records[0].version,/^[a-f0-9]{64}$/);
+  const candidates=await listScmNetSuitePoHistoryReconciliationCandidates({staleBefore:new Date(Date.now()+60_000)});
+  assert.ok(candidates.some(candidate=>candidate.historyId===history.id),'unarchived created POs participate in reconciliation');
+  assert.equal(result.physicalPalletLines.length,0);
+  assert.equal(result.canCreatePurchaseOrder,false);
+  assert.equal(Number(history.creationSnapshot.lines[0].item_id),itemId);
+  const saved = await query('SELECT item_id,sales_quantity FROM scm_smart_proposal_lines WHERE proposal_id=$1',[staged.reviewProposalId]);
+  assert.equal(Number(saved.rows[0].item_id),itemId);
+  assert.equal(Number(saved.rows[0].sales_quantity),20);
+
+  await persistScmNetSuitePoSnapshot(history.id, {id:poId,lines:[{lineId:1,itemId:itemId+10,closed:false}]}, {source:'netsuite_webhook'});
+  const financials = await query('SELECT rate,amount FROM purchase_order_lines WHERE purchase_order_id=$1',[poId]);
+  assert.equal(Number(financials.rows[0].rate),12,'a webhook with no rate must preserve known pricing');
+  assert.equal(Number(financials.rows[0].amount),360);
+});
 
 const seed = `${Date.now()}${Math.floor(Math.random() * 1000)}`;
 const baseId = 8_700_000_000_000 + Number(seed.slice(-8)) * 100;
@@ -14,6 +49,26 @@ const itemId = baseId + 1;
 const vendorId = baseId + 2;
 let palletItemId = null;
 let proposalSequence = 0;
+
+test("a price-less webhook preserves canonical PO financials", async () => {
+  const poId = baseId + 90_000;
+  await query(`INSERT INTO purchase_orders (netsuite_id,tranid) VALUES ($1,'PO-PARTIAL-WEBHOOK')`,[poId]);
+  await query(`INSERT INTO purchase_order_lines (purchase_order_id,line_id,item_id,item_name,quantity,rate,amount)
+    VALUES ($1,1,$2,'Material',30,12,360)`,[poId,itemId]);
+  const history=await recordScmNetSuitePoCreation({purchaseOrderId:poId,purchaseOrderRef:'PO-PARTIAL-WEBHOOK'},actor);
+  await persistScmNetSuitePoSnapshot(history.id,{id:poId,lines:[{lineId:1,itemId,closed:false}]},{source:'netsuite_webhook'});
+  const result=await query('SELECT rate,amount FROM purchase_order_lines WHERE purchase_order_id=$1',[poId]);
+  assert.equal(Number(result.rows[0].rate),12);
+  assert.equal(Number(result.rows[0].amount),360);
+  await persistScmNetSuitePoSnapshot(history.id,{id:poId,lines:[{lineId:1,itemId,rate:0,amount:0,closed:false}]},{source:'netsuite_webhook'});
+  const zero=await query('SELECT rate,amount FROM purchase_order_lines WHERE purchase_order_id=$1',[poId]);
+  assert.equal(Number(zero.rows[0].rate),0);
+  assert.equal(Number(zero.rows[0].amount),0);
+  await persistScmNetSuitePoSnapshot(history.id,{id:poId,lines:[{lineId:1,itemId,rate:null,amount:null,closed:false}]},{source:'reconciliation'});
+  const unknown=await query('SELECT rate,amount FROM purchase_order_lines WHERE purchase_order_id=$1',[poId]);
+  assert.equal(unknown.rows[0].rate,null);
+  assert.equal(unknown.rows[0].amount,null);
+});
 
 async function createProposal() {
   proposalSequence += 1;

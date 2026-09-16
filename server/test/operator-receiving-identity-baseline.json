@@ -1,0 +1,17 @@
+{
+  "source_sha256": "9ea57f7846825b2af3dba0cd7f8729a7237949acb2b45fbef5e44cdd4ab063fe",
+  "full": {
+    "files": 472,
+    "totals": {
+      "tests": 2395,
+      "pass": 2392,
+      "fail": 2,
+      "skipped": 1
+    },
+    "failures": [
+      "P3.12: browser specs share one worker-owned database-pool lifecycle",
+      "quality non-regression: the gauntlet builds and validates the omit-dev runtime"
+    ]
+  },
+  "typescript_errors": 233
+}

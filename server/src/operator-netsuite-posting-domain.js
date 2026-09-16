@@ -1,11 +1,13 @@
 // @ts-check
 
 import crypto from "node:crypto";
+import { postingPhotoIdentity, validatePostingPhotos } from "./operator-netsuite-posting-photos.js";
 
 const REQUEST_ID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/iu;
 const SOURCE_ORDER_KINDS = new Set(["SO", "PO", "TO"]);
 /** @type {Readonly<Record<string, Set<string>>>} */
 const LOCAL_OPERATION_TYPES = Object.freeze({
+  delivery_consolidation_load: new Set(["consolidation_load"]),
   customer_pickup_load: new Set(["sales_order"]),
   receiving_receipt: new Set(["purchase_order", "transfer_order"]),
   delivery_prep_load: new Set(["sales_order", "transfer_order", "group_order"])
@@ -273,12 +275,14 @@ export function buildOperatorNetSuitePostingDraft(input = {}) {
     assertKindForTransaction(sourceOrderKind, transactionType);
     const sourceNetSuiteId = positiveInteger(rawTarget.sourceNetSuiteId, "Source NetSuite ID");
     const sourceOrderRef = requiredText(rawTarget.sourceOrderRef, "Source order reference");
+    const memo = transactionType === "IR" ? optionalText(rawTarget.memo) : null;
     const key = `${sourceOrderKind}:${sourceNetSuiteId}`;
     if (!grouped.has(key)) {
       grouped.set(key, {
         sourceOrderKind,
         sourceNetSuiteId,
         sourceOrderRef,
+        memo,
         selectedByLine: new Map(),
         availableByLine: new Map(),
         lineSnapshot: []
@@ -288,6 +292,10 @@ export function buildOperatorNetSuitePostingDraft(input = {}) {
     if (group.sourceOrderRef !== sourceOrderRef) {
       throw inputError("One NetSuite source ID cannot use conflicting order references.");
     }
+    if (group.memo && memo && group.memo !== memo) {
+      throw inputError("One NetSuite receipt cannot use conflicting memo references.");
+    }
+    group.memo ||= memo;
     const availableLines = Array.isArray(rawTarget.availableLines) ? rawTarget.availableLines : [];
     const selectedLines = Array.isArray(rawTarget.selectedLines) ? rawTarget.selectedLines : [];
     if (!availableLines.length || !selectedLines.length) {
@@ -392,6 +400,9 @@ export function buildOperatorNetSuitePostingDraft(input = {}) {
       });
     }
     const payloadLines = [...group.availableByLine.values()]
+      // Completed receipt lines are absent from the transform's static item sublist.
+      // Keep them in reconciliation evidence, but never send a deselection for them.
+      .filter((available) => transactionType !== "IR" || available.remainingQuantity !== 0)
       .sort((left, right) => left.orderLine - right.orderLine)
       .map((available) => {
         const selected = group.selectedByLine.get(available.orderLine);
@@ -423,7 +434,8 @@ export function buildOperatorNetSuitePostingDraft(input = {}) {
     const { group, payloadLines, lineSnapshot } = plan;
     const stepIndex = index + 1;
     const externalId = operatorNetSuiteExternalId(requestId, stepIndex);
-    const payload = { externalId, item: { items: payloadLines } };
+    // custbody9 is the account's Item Receipt "Ref No" field.
+    const payload = { externalId, ...(group.memo ? { memo: group.memo, custbody9: group.memo } : {}), item: { items: payloadLines } };
     return {
       stepIndex,
       sourceOrderKind: group.sourceOrderKind,
@@ -460,13 +472,14 @@ export function buildOperatorNetSuitePostingDraft(input = {}) {
     locationId: positiveInteger(policy.locationId, "Canonical posting location"),
     yardCode: requiredText(policy.yardCode, "Canonical yard code")
   };
+  validatePostingPhotos(photoRefs);
   const inputSnapshot = {
     requestId,
     actorOperatorId,
     functionKey,
     transactionType,
     policy: normalizedPolicy,
-    photoRefs,
+    photoRefs: photoRefs.map(postingPhotoIdentity),
     claims,
     localOperation,
     localPayload,

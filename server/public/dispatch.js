@@ -3500,9 +3500,8 @@ function normalizeOrder(order) {
 
 function hasUsableDispatchAddress(order) {
   if (order?.type !== "SO") return true;
-  const address = String(order.address || "").trim();
-  if (!address) return false;
-  return !/^(3445\s+kennedy|2967\s+kennedy|12441\s+woodbine)\b/i.test(address);
+  // A sales order can return goods to one of our yards as its destination.
+  return Boolean(String(order.address || "").trim());
 }
 
 function relatedTransitCo(order) {
@@ -11426,7 +11425,8 @@ function renderSelectedOrderActions() {
   const reconciliationBlocked = selected.some((item) => isScmReconciliationBlocked(item));
   const blockedUngroup = groupedCount && groupedOrderTransitCoId(order);
   const dispatchCompleted = order.dispatchCompletionStatus === "completed"
-    && order.dispatchReconciliationPlanningEligible !== true;
+    && order.dispatchReconciliationPlanningEligible !== true
+    && order.dispatchFulfilledTransferPlanningEligible !== true;
   const transitCoSupported = selected.length === 1 && supportsTransitCoForOrder(order);
   return `
     <div class="selected-order-actions">
@@ -11488,9 +11488,13 @@ function renderOrderCard(order) {
   const anyPlanned = planned || plannedElsewhere;
   const reconciliationBlocked = isScmReconciliationBlocked(order);
   const dispatchCompleted = order.dispatchCompletionStatus === "completed"
-    && order.dispatchReconciliationPlanningEligible !== true;
+    && order.dispatchReconciliationPlanningEligible !== true
+    && order.dispatchFulfilledTransferPlanningEligible !== true;
   const planningRestricted = isDispatchPlanningRestricted(order);
   const reconciliationPlanningEligible = order.dispatchReconciliationPlanningEligible === true;
+  const fulfilledDeliveryPlanningEligible = !planningRestricted && (
+    (order.type === "SO" && order.dispatchFulfilledSalesPlanningEligible === true)
+    || (order.type === "TO" && order.dispatchFulfilledTransferPlanningEligible === true));
   const dragBlocked = anyPlanned || dependencyLinked || reconciliationBlocked || planningRestricted;
   const reviewOnly = isReviewOnlyOrder(order);
   const packedText = packedUnitText(order);
@@ -11515,6 +11519,7 @@ function renderOrderCard(order) {
         ${executionStatus === "complete" ? `<span class="chip complete-chip">Completed</span>` : executionStatus === "in_progress" ? `<span class="chip progress-chip">In progress</span>` : ""}
         ${reviewOnly ? `<span class="chip complete-chip">${escapeHtml(reviewOnlyText(order))}</span>` : ""}
         ${planningRestricted ? `<span class="chip complete-chip" title="${escapeHtml(dispatchPlanningRestrictionText(order))}">Completed · search only</span>` : ""}
+        ${fulfilledDeliveryPlanningEligible ? `<span class="chip complete-chip" title="NetSuite fulfillment is complete; Driver delivery is still pending.">Completed · delivery pending</span>` : ""}
         ${reconciliationPlanningEligible ? `<span class="chip warn" title="${escapeHtml(order.dispatchReconciliationPlanningReason || "Receipt reconciliation is complete, but Driver delivery is still pending.")}">Reconciled · dispatch pending</span>` : ""}
         ${reconciliationBlocked ? `<span class="chip warn" title="${escapeHtml(scmReconciliationBlockText(order))}">Reconcile Review</span>` : ""}
         ${anyPlanned ? `<span class="chip planned-chip">${escapeHtml(plannedText)}</span>` : ""}
@@ -17067,7 +17072,6 @@ function showOrderTooltip(event) {
   if (!card) return;
   const order = orderById(card.dataset.order);
   if (!order) return;
-  selectedOrderId = order.id;
   const tooltip = document.getElementById("orderTooltip");
   tooltip.className = "tooltip";
   tooltip.style.left = `${Math.min(event.clientX + 16, window.innerWidth - 330)}px`;
@@ -17452,7 +17456,7 @@ app.addEventListener("submit", async (event) => {
     return;
   }
   if (form.dataset.form === "edit-order-details") {
-    const order = orderById(modalOrderId);
+    let order = orderById(modalOrderId);
     if (!order) return;
     const isPurchaseOrderDeliveryOverride = order.type === "PO" && order.sourceTable === "purchase_orders";
     const windowStart = modalTimeValue(data.windowStart);
@@ -17505,30 +17509,42 @@ app.addEventListener("submit", async (event) => {
     const detailsEndpoint = isPurchaseOrderDeliveryOverride
       ? `/api/dispatch/orders/${encodeURIComponent(order.id)}/details?response=targeted`
       : `/api/dispatch/orders/${encodeURIComponent(order.id)}/details?response=ack`;
-    const saveDetails = isLocalDispatchOrder(order)
+    const persistentSalesSplit = order.type === "SO" && Boolean(splitParentOrderId(order));
+    const saveDetails = isLocalDispatchOrder(order) && !persistentSalesSplit
       ? Promise.resolve({ orders: null })
-      : fetch(detailsEndpoint, {
-          method: "PUT",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify(dispatchLeaseRequestPayload({
-            type: order.type,
-            sourceTable: order.sourceTable,
-            address: data.address,
-            pickupAddress: String(data.pickupAddress || "").trim(),
-            expectedDeliveryDate: data.expectedDeliveryDate,
-            windowStart,
-            windowEnd,
-            audit: {
-              sessionId: dispatchSessionId,
-              before: summarizeOrder(order)
-            }
-          }))
+      : Promise.resolve().then(async () => {
+          if (persistentSalesSplit) {
+            const orderId = order.id;
+            await saveCurrentPlanNow();
+            order = orderById(orderId);
+            if (!order) throw new Error("The split is no longer available. Reload Dispatch before editing it.");
+          }
+          return fetch(detailsEndpoint, {
+            method: "PUT",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify(dispatchLeaseRequestPayload({
+              type: order.type,
+              sourceTable: order.sourceTable,
+              address: data.address,
+              pickupAddress: String(data.pickupAddress || "").trim(),
+              expectedDeliveryDate: data.expectedDeliveryDate,
+              windowStart,
+              windowEnd,
+              audit: {
+                sessionId: dispatchSessionId,
+                before: summarizeOrder(order)
+              }
+            }))
+          });
         }).then((response) => {
           if (!response.ok) return response.text().then((text) => Promise.reject(new Error(text)));
           return response.json();
         });
     saveDetails.then((payload) => {
       const pickupAddress = String(data.pickupAddress || "").trim();
+      if (payload.updated?.dispatch_details_override) {
+        order.dispatchDetailsOverride = payload.updated.dispatch_details_override;
+      }
       if (!isPurchaseOrderDeliveryOverride) {
         const address = String(payload.updated?.dispatch_address ?? data.address ?? "").trim();
         order.address = address;

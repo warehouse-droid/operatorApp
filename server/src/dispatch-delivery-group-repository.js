@@ -1,4 +1,5 @@
 import { query, withTransaction } from "./db.js";
+import { DISPATCH_FLEET_PLANNING_LOCK } from "./dispatch-fleet-status.js";
 import { dispatchLoadAssignment } from "./dispatch-load-assignment.js";
 import {
   compactDispatchOrderCard,
@@ -24,6 +25,7 @@ const SPLIT_LIVE_SOURCE_FIELDS = Object.freeze([
 ]);
 const PLAN_LIVE_DEFINITION_FIELDS = Object.freeze([
   ...SPLIT_LIVE_SOURCE_FIELDS,
+  "dispatchDetailsOverride",
   "customer", "customerName", "childOrders", "groupAliases", "isGrouped", "isSplit",
   "items", "pallets", "layers", "sections", "pieces", "salesQty",
   "salesQuantities", "packed", "weight", "totalWeightLbs", "unloadMinutes",
@@ -949,6 +951,80 @@ function stripTransitOverlays(order = {}, allByRef = new Map()) {
   return clearCancelledTransitCoMetadata(order, overlays);
 }
 
+function applySplitDispatchDetails(order = {}) {
+  const details = order.dispatchDetailsOverride;
+  if (!details || typeof details !== "object" || Array.isArray(details)) return order;
+  const next = { ...order };
+  if (Object.hasOwn(details, "address")) {
+    next.address = text(details.address);
+    next.destinationAddress = next.address;
+    next.defaultDestinationAddress = next.address;
+  }
+  if (Object.hasOwn(details, "pickupAddress")) {
+    next.pickupAddressOverride = text(details.pickupAddress);
+    next.sourceAddress = next.pickupAddressOverride || next.defaultSourceAddress || "";
+  }
+  for (const field of ["expectedDeliveryDate", "windowStart", "windowEnd"]) {
+    if (Object.hasOwn(details, field)) next[field] = text(details[field]);
+  }
+  return next;
+}
+
+export async function updateDispatchSalesSplitDetails(orderRef, patch = {}) {
+  return withTransaction(async () => {
+    // Plan saves read the global definition before writing their snapshot. Share
+    // their lock so a save already in flight cannot overwrite this explicit edit.
+    await query("SELECT pg_advisory_xact_lock(hashtext($1))", [DISPATCH_FLEET_PLANNING_LOCK]);
+    const row = (await query(
+      `SELECT split_ref, full_order, active FROM dispatch_global_order_splits
+        WHERE lower(split_ref) = lower($1) AND order_type = 'SO' AND definition_kind = 'split'
+        FOR UPDATE`, [orderRef]
+    )).rows[0];
+    if (!row) return null;
+    if (!row.active) throw Object.assign(new Error("This split was retired. Reload Dispatch before editing it."), {
+      status: 409, code: "DISPATCH_DERIVED_ORDER_RETIRED"
+    });
+    const details = {
+      ...row.full_order.dispatchDetailsOverride,
+      address: text(patch.address),
+      expectedDeliveryDate: text(patch.expectedDeliveryDate ?? patch.expected_delivery_date),
+      windowStart: text(patch.windowStart ?? patch.window_start),
+      windowEnd: text(patch.windowEnd ?? patch.window_end)
+    };
+    if (patch.pickupAddress !== undefined || patch.pickup_address !== undefined) {
+      details.pickupAddress = text(patch.pickupAddress ?? patch.pickup_address);
+    }
+    // Validate even when this split has not yet been materialized for delivery.
+    const expectedDeliveryDate = details.expectedDeliveryDate || null;
+    await query("SELECT $1::date", [expectedDeliveryDate]);
+    const next = applySplitDispatchDetails({ ...row.full_order, dispatchDetailsOverride: details });
+    const pickupAddress = next.pickupAddressOverride || "";
+    await query(
+      `UPDATE dispatch_global_order_splits
+          SET full_order = $2::jsonb, card = $3::jsonb, search_text = $4, updated_at = now()
+        WHERE split_ref = $1`,
+      [row.split_ref, JSON.stringify(next), JSON.stringify(compactDispatchOrderCard(next)), dispatchOrderSearchText(next)]
+    );
+    await query(
+      `UPDATE sales_orders SET dispatch_address = $2, dispatch_pickup_address = $3,
+          expected_delivery_date = $4::date, dispatch_window_start = $5, dispatch_window_end = $6,
+          dispatch_parse_source = 'manual-dispatch-details', dispatch_parsed_at = now()
+        WHERE tranid = $1`,
+      [row.split_ref, next.address, pickupAddress, expectedDeliveryDate,
+        next.windowStart, next.windowEnd]
+    );
+    await query("DELETE FROM dispatch_order_catalog_entries WHERE lower(order_ref) = lower($1)", [row.split_ref]);
+    await query(`UPDATE dispatch_order_catalog_state SET generation = generation + 1,
+      catalog_count = (SELECT count(*)::int FROM dispatch_order_catalog_entries), updated_at = now()
+      WHERE singleton = true`);
+    await reconcileDispatchGlobalOrderSources({ orders: [next] });
+    return { tranid: row.split_ref, dispatch_address: next.address,
+      dispatch_pickup_address: pickupAddress, expected_delivery_date: expectedDeliveryDate,
+      dispatch_window_start: next.windowStart, dispatch_window_end: next.windowEnd,
+      source_table: "sales_orders", order_type: "sales_order", dispatch_details_override: details };
+  });
+}
+
 function splitWithFreshSource(split = {}, source = {}, { activeBySource, allByRef } = {}) {
   const next = cloneOrder(stripTransitOverlays(split, allByRef));
   for (const field of SPLIT_LIVE_SOURCE_FIELDS) {
@@ -959,7 +1035,7 @@ function splitWithFreshSource(split = {}, source = {}, { activeBySource, allByRe
   next.originalOrderId = splitParentRef(split);
   next.globalOrderDefinition = true;
   next.globalOrderDefinitionKind = text(split.globalOrderDefinitionKind || "split");
-  return applyActiveTransitCoMetadata(next, activeBySource);
+  return applyActiveTransitCoMetadata(applySplitDispatchDetails(next), activeBySource);
 }
 
 function groupWithFreshSources(group = {}, freshByRef = new Map(), { activeBySource, allByRef } = {}) {
@@ -1250,7 +1326,7 @@ export async function reconcileDispatchPlanGlobalOrderDefinitions(plan, {
         if (Object.prototype.hasOwnProperty.call(current, field)) {
           reconciled[field] = cloneValue(current[field]);
         } else if ([
-          "transitCo", "transitOriginalPickupLocations", "transitOriginalSourceYard"
+          "transitCo", "transitOriginalPickupLocations", "transitOriginalSourceYard", "dispatchDetailsOverride"
         ].includes(field)) {
           delete reconciled[field];
         }

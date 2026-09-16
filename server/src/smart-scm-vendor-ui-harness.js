@@ -589,7 +589,7 @@ assert(apiCalls.some((call) => String(call.url).startsWith("/api/scm/smart/vendo
 const html = readPublic("scm-smart.html");
 assert.match(html, /scm-smart-vendor\.css\?v=20260812-vendor-price-source-v1/);
 assert.match(html, /scm-smart\.js\?v=20260826-phased-planning-v1/);
-assert.match(html, /scm-smart-vendor\.js\?v=20260812-vendor-po-price-sync-v1/);
+assert.match(html, /scm-smart-vendor\.js\?v=20260915-created-po-sync-v1/);
 
 console.log(JSON.stringify({
   ok: true,

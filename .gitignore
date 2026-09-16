@@ -12,3 +12,7 @@ env.old.backup
 docker/env/
 docker/backups/
 .worktrees/
+
+# Local deployment backups and generated Python caches
+/backups/
+__pycache__/

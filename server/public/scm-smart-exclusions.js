@@ -104,7 +104,7 @@ function smartPlanningExclusionPanel() {
   if (!smartPlanningExclusionState.open) return "";
   return `<section class="smart-planning-exclusions" aria-label="Planning coverage and pauses">
     <div class="smart-planning-exclusion-head">
-      <div><h3>Coverage &amp; pauses</h3><p>Blanket balances offset matching demand by quantity; uncovered demand remains eligible for PO/TO planning. Manual pauses exclude an item only from new vendor PO planning, while generated and manually added TO loads remain available.</p></div>
+      <div><h3>Coverage &amp; pauses</h3><p>Blanket balances offset matching demand by quantity; uncovered demand remains eligible for PO/TO planning. Usable Blanket coverage automatically resumes all item holds, including newly entered holds. Manual pauses exclude an item only from new vendor PO planning, while generated and manually added TO loads remain available.</p></div>
       <button class="smart-button" data-smart-action="toggle-planning-exclusions" type="button">Close</button>
     </div>
     ${smartCanWrite() ? `<div class="smart-planning-exclusion-form">
@@ -176,14 +176,17 @@ smartScmApp.addEventListener("click", async (event) => {
       smartPlanningExclusionState.expiresAt = expiryInput?.value || smartPlanningExclusionState.expiresAt;
       if (!smartPlanningExclusionState.reason) throw new Error("Enter why this item is being paused.");
       const item = smartPlanningExclusionState.candidates.find((candidate) => Number(candidate.itemId) === Number(button.dataset.itemId));
-      await smartWork("Pausing vendor PO planning", () => smartApi("/api/scm/smart/planning-exclusions", {
+      const exclusion = await smartWork("Updating vendor PO planning", () => smartApi("/api/scm/smart/planning-exclusions", {
         method: "POST",
         body: {
           itemId: Number(button.dataset.itemId),
           reason: smartPlanningExclusionState.reason,
           expiresAt: smartPlanningExclusionState.expiresAt || null
         }
-      }), `${item?.itemName || "Item"} paused for new vendor POs; TO remains available`);
+      }), "");
+      smartState.notice = exclusion?.active === false
+        ? `${item?.itemName || "Item"} automatically resumed by Blanket coverage`
+        : `${item?.itemName || "Item"} paused for new vendor POs; TO remains available`;
       await smartRefreshPlanningExclusions();
       smartPlanningExclusionState.error = "";
       smartRender();
