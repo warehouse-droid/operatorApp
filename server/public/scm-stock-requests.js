@@ -349,13 +349,15 @@ function scmStockFilterOptions(kind, selected) {
 }
 
 function renderScmStockRequests() {
+  if (window.MBBSStockRequestTabs && !window.MBBSStockRequestTabs.isActive("regular")) return;
+  const restoreTabFocus = window.MBBSStockRequestTabs?.preserveFocus();
   const focusSnapshot = scmStockFocusSnapshot();
   scmStockRequestApp.innerHTML = `${scmStockHeader()}
     <section class="stock-request-page">
-      <div class="stock-request-tabs" role="tablist" aria-label="Stock request type">
+      ${window.MBBSStockRequestTabs?.html() || `<div class="stock-request-tabs" role="tablist" aria-label="Stock request type">
         <button aria-selected="true" type="button">Regular</button>
         <button data-scm-stock-action="special" type="button">Special</button>
-      </div>
+      </div>`}
       <div class="stock-request-toolbar">
         <div class="stock-request-tabs" role="tablist" aria-label="Regular stock request queue">
           <button data-scm-stock-action="queue" data-queue="request" aria-selected="${scmStockState.queue === "request"}" type="button">Request</button>
@@ -382,6 +384,7 @@ function renderScmStockRequests() {
       </div>
     </section>`;
   scmStockRestoreFocus(focusSnapshot);
+  restoreTabFocus?.();
 }
 
 async function scmStockLoadDetail(id) {
@@ -405,6 +408,7 @@ async function scmStockLoadDetail(id) {
 }
 
 async function scmStockLoad({ preserveSelection = true } = {}) {
+  if (window.MBBSStockRequestTabs && !window.MBBSStockRequestTabs.isActive("regular")) return;
   const generation = ++scmStockState.loadGeneration;
   scmStockState.loading = true;
   renderScmStockRequests();
@@ -736,6 +740,10 @@ function scmStockConnectEvents() {
 }
 
 window.addEventListener("mbbs-language-changed", renderScmStockRequests);
+window.addEventListener("mbbs-stock-request-tab-changed", () => {
+  scmStockState.loadGeneration += 1;
+  window.clearTimeout(scmStockState.refreshTimer);
+});
 window.addEventListener("pagehide", () => {
   scmStockState.eventSource?.close();
   scmStockState.eventSource = null;
@@ -747,7 +755,20 @@ requireDispatchLogin({
   async onReady(operator) {
     scmStockState.operator = operator;
     try {
-      await scmStockLoad({ preserveSelection: true });
+      if (window.MBBSStockRequestTabs) {
+        window.MBBSStockRequestTabs.onOpen = async (type) => {
+          if (type === "aggregate") return window.MBBSAggregateRequests.open({ mount: scmStockRequestApp, operator, scm: true });
+          if (type === "special") return window.MBBSSCMSpecialStock.open({ operator });
+          return scmStockLoad({ preserveSelection: true }).catch((error) => {
+            scmStockState.loading = false;
+            scmStockState.error = error.message;
+            renderScmStockRequests();
+          });
+        };
+        await window.MBBSStockRequestTabs.open(window.MBBSStockRequestTabs.active);
+      } else {
+        await scmStockLoad({ preserveSelection: true });
+      }
       scmStockConnectEvents();
     } catch (error) {
       scmStockState.loading = false;

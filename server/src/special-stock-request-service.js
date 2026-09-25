@@ -1,5 +1,7 @@
 import { config as applicationConfig } from "./config.js";
 import {
+  resolveSpecialOrderUnitsFromNetSuite,
+  synchronizeSpecialSalesDescriptionsInNetSuite,
   createPurchaseOrderInNetSuite,
   createSalesOrderInNetSuite,
   fetchPurchaseOrderReferenceFromNetSuite,
@@ -14,6 +16,9 @@ import {
   selectSpecialMarkerRecord
 } from "./special-stock-request-netsuite.js";
 import {
+  markSpecialOrderSubmitted,
+  prepareSpecialPurchaseOrder,
+  recordSpecialSalesDescriptionsSynced,
   claimSpecialOrderOperation,
   failSpecialOrderOperation,
   getSpecialStockCase,
@@ -26,6 +31,8 @@ import {
   specialSalesOrderMarker
 } from "./special-stock-request-domain.js";
 import { recordScmNetSuitePoCreation } from "./scm-netsuite-po-history-repository.js";
+import { assertSpecialStockRemoteOrderAllowed } from './special-stock-request-policy.js';
+import { assertSpecialDeliveryDate } from '../public/special-stock-pricing.js';
 
 function serviceError(message, code, status = 409) {
   return Object.assign(new Error(message), { code, status, specialStockAttention: true });
@@ -56,6 +63,8 @@ function salesDraft(detail) {
     operationalYardLocationId: detail.operationalYardLocationId,
     fulfillmentMethod: detail.fulfillmentMethod,
     deliveryAddress: detail.deliveryAddress,
+    deliveryContactName: detail.deliveryContactName,
+    deliveryContactPhone: detail.deliveryContactPhone,
     deliveryDate: detail.deliveryDate,
     windowStart: detail.windowStart,
     windowEnd: detail.windowEnd,
@@ -89,6 +98,11 @@ async function recoverMarker({
 
 export function createSpecialStockRequestService(dependencies = {}) {
   const deps = {
+    markSubmitted: markSpecialOrderSubmitted,
+    preparePurchaseOrder: prepareSpecialPurchaseOrder,
+    synchronizeSalesDescriptions: synchronizeSpecialSalesDescriptionsInNetSuite,
+    recordDescriptionSync: recordSpecialSalesDescriptionsSynced,
+    resolveOrderUnits: resolveSpecialOrderUnitsFromNetSuite,
     getCase: getSpecialStockCase,
     claimOperation: claimSpecialOrderOperation,
     linkSalesOrder: linkSpecialSalesOrder,
@@ -129,7 +143,9 @@ export function createSpecialStockRequestService(dependencies = {}) {
     const operationId = String(input.operationId || "");
     let claimed = null;
     try {
-      const before = await deps.getCase(caseId, { audience: "scm" });
+      const before = await deps.getCase(caseId, { audience: "scm", authorizedStoreLocationIds: context.authorizedStoreLocationIds });
+      assertSpecialStockRemoteOrderAllowed(before);
+      if (!before.salesOrderSubmissionStartedAt && before.fulfillmentMethod === 'mbt_delivery') assertSpecialDeliveryDate(before.deliveryDate);
       const source = input.source === "estimate_transform" ? "estimate_transform" : "standalone";
       if (source === "estimate_transform" && !recordId(before.estimateId)) {
         throw serviceError("This case has no linked NetSuite estimate to transform.", "SPECIAL_ESTIMATE_REQUIRED", 400);
@@ -152,14 +168,20 @@ export function createSpecialStockRequestService(dependencies = {}) {
       let match = await recoverMarker({ ...recoveryInput, attempts: 1 });
       let remoteId = recordId(match?.id);
       if (!remoteId) {
+        if (claimed.salesOrderSubmissionStartedAt) throw serviceError('The SO submission already started. Its marker is not yet visible; recover again after NetSuite sync.', 'SPECIAL_REMOTE_OUTCOME_UNCERTAIN');
         const payload = buildSpecialSalesOrderPayload({
           caseId: claimed.id,
-          draft: salesDraft(claimed),
+          draft: {
+            ...salesDraft(claimed),
+            materialLines: await deps.resolveOrderUnits(salesDraft(claimed).materialLines),
+            ancillaryLines: await deps.resolveOrderUnits(salesDraft(claimed).ancillaryLines)
+          },
           netsuiteLocationId: location.netsuiteLocationId,
           subsidiaryId: location.subsidiaryId || deps.config.subsidiaryId,
           deliveryMethodId: deps.config.deliveryMethodId,
           pickupMethodId: deps.config.pickupMethodId
         });
+        claimed = await deps.markSubmitted(caseId, { expectedRevision: claimed.revision, operationId, orderKind: 'sales_order' }, context);
         let remoteError = null;
         try {
           const created = source === "estimate_transform"
@@ -201,7 +223,8 @@ export function createSpecialStockRequestService(dependencies = {}) {
         await deps.failOperation(caseId, {
           orderKind: "sales_order",
           operationId,
-          errorMessage: error.message
+          errorMessage: error.message,
+          errorCode: error.code
         }, context).catch(() => null);
       }
       throw error;
@@ -212,11 +235,26 @@ export function createSpecialStockRequestService(dependencies = {}) {
     const operationId = String(input.operationId || "");
     let claimed = null;
     try {
+      const before = await deps.getCase(caseId, { audience: 'scm' });
+      assertSpecialStockRemoteOrderAllowed(before);
+      const prepared = Array.isArray(input.lines) && before.purchaseOrderOperationStatus !== 'attention'
+        ? await deps.preparePurchaseOrder(caseId, input, context) : before;
       claimed = await deps.claimOperation(caseId, {
-        expectedRevision: input.expectedRevision,
+        expectedRevision: prepared !== before ? prepared.revision : input.expectedRevision,
         orderKind: "purchase_order",
         operationId
       }, context);
+      const changes = (claimed.purchaseOrderLines || []).flatMap(line => {
+        const sales = (claimed.salesOrderLines || []).find(candidate => candidate.caseLineId === line.caseLineId && !candidate.ancillary);
+        if (!sales || sales.description === line.description) return [];
+        if (!sales.remoteLineId) throw serviceError('Wait for the exact SO lines to synchronize before changing descriptions.', 'SPECIAL_SO_LINES_NOT_READY');
+        return [{ ...sales, previousDescription: sales.description, description: line.description }];
+      });
+      if (changes.length) {
+        const resolved = await deps.resolveOrderUnits(changes);
+        await deps.synchronizeSalesDescriptions({ salesOrderId: claimed.salesOrderId, changes: resolved });
+        claimed = await deps.recordDescriptionSync(caseId, { expectedRevision: claimed.revision, operationId, changes: resolved }, context);
+      }
       const location = await resolvedLocation(claimed);
       const recoveryInput = {
         findMarkerOrders: deps.findMarkerOrders,
@@ -230,13 +268,15 @@ export function createSpecialStockRequestService(dependencies = {}) {
       let match = await recoverMarker({ ...recoveryInput, attempts: 1 });
       let remoteId = recordId(match?.id);
       if (!remoteId) {
+        if (claimed.purchaseOrderSubmissionStartedAt) throw serviceError('The PO submission already started. Its marker is not yet visible; recover again after NetSuite sync.', 'SPECIAL_REMOTE_OUTCOME_UNCERTAIN');
         const payload = buildSpecialPurchaseOrderPayload({
           caseId: claimed.id,
           vendorId: claimed.vendorId,
           netsuiteLocationId: location.netsuiteLocationId,
           subsidiaryId: location.subsidiaryId || deps.config.subsidiaryId,
-          lines: claimed.purchaseOrderLines || []
+          lines: await deps.resolveOrderUnits(claimed.purchaseOrderLines || [])
         });
+        claimed = await deps.markSubmitted(caseId, { expectedRevision: claimed.revision, operationId, orderKind: 'purchase_order' }, context);
         let remoteError = null;
         try {
           const created = await deps.createPurchaseOrder(payload);
@@ -297,7 +337,8 @@ export function createSpecialStockRequestService(dependencies = {}) {
   }
 
   async function refreshSalesOrder(caseId, context = {}) {
-    const detail = await deps.getCase(caseId, { audience: "scm" });
+    const detail = await deps.getCase(caseId, { audience: "scm", authorizedStoreLocationIds: context.authorizedStoreLocationIds });
+    assertSpecialStockRemoteOrderAllowed(detail);
     if (!recordId(detail.salesOrderId)) {
       throw serviceError("This case has no linked Sales Order.", "SPECIAL_SO_NOT_LINKED", 400);
     }
@@ -314,8 +355,14 @@ export function createSpecialStockRequestService(dependencies = {}) {
   return { createSalesOrder, createPurchaseOrder, refreshSalesOrder };
 }
 
-const defaultService = createSpecialStockRequestService();
+let defaultService = createSpecialStockRequestService();
+export function configureSpecialStockReviewBoundary(dependencies) {
+  if (process.env.NODE_ENV !== 'test' || process.env.MBT_TEST_ISOLATED !== '1' || process.env.NETSUITE_DIRECT_ACCESS_ENABLED !== 'false') {
+    throw new Error('The simulated boundary is restricted to the isolated test environment.');
+  }
+  defaultService = createSpecialStockRequestService(dependencies);
+}
 
-export const createSpecialSalesOrder = defaultService.createSalesOrder;
-export const createSpecialPurchaseOrder = defaultService.createPurchaseOrder;
-export const refreshSpecialSalesOrder = defaultService.refreshSalesOrder;
+export const createSpecialSalesOrder = (...args) => defaultService.createSalesOrder(...args);
+export const createSpecialPurchaseOrder = (...args) => defaultService.createPurchaseOrder(...args);
+export const refreshSpecialSalesOrder = (...args) => defaultService.refreshSalesOrder(...args);

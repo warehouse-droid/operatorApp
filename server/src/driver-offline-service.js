@@ -263,7 +263,7 @@ async function validateLocationEvidence(event, effectiveJob) {
 }
 
 function validatePhotoEvidence(event, effectiveJob) {
-  const durablePhotos = (event.photos || []).filter((photo) => photo.durableReceipt);
+  const durablePhotos = (event.photos || []).filter((photo) => photo.durableReceipt && photo.recordType !== "driver-customer-signature");
   let required = 0;
   if (event.eventType === "job_completed") {
     required = Math.max(0, Number(effectiveJob?.requiredPhotos || 0));

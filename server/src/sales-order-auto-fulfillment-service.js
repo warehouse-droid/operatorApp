@@ -11,10 +11,12 @@ import {
 
 /** @param {LooseRecord | null | undefined} record */
 function safeRemoteEvidence(record) {
+  const value = record || {};
   return {
-    id: Number(record?.id),
-    tranId: String(record?.tranId ?? record?.tranid ?? record?.id ?? ""),
-    externalId: String(record?.externalId ?? record?.externalid ?? "")
+    id: Number(value.id),
+    tranId: String(value.tranId ?? value.tranid ?? value.id ?? ""),
+    externalId: String(value.externalId ?? value.externalid ?? ""),
+    ...(value.fulfillmentParts ? { fulfillmentParts: value.fulfillmentParts } : {})
   };
 }
 
@@ -113,7 +115,8 @@ export function createSalesOrderAutoFulfillmentProcessor({
     if (candidate.status === "uncertain" && rawResolutionAction(candidate) !== "recover") {
       return candidate;
     }
-    const recoveryPayload = rawResolutionAction(candidate) === "recover"
+    const splitRecovery = await adapter.hasSplitPlan?.(candidate) === true;
+    const recoveryPayload = rawResolutionAction(candidate) === "recover" || splitRecovery
       ? retainedRecoveryPayload(candidate)
       : null;
     // An Admin recovery first checks the immutable external identity. When the
@@ -137,10 +140,10 @@ export function createSalesOrderAutoFulfillmentProcessor({
     if (!preRecoveredRecord && comparison.state === "closed") {
       return repository.closed({ candidateId: candidate.id, liveOrder, issues: comparison.issues });
     }
-    if (!preRecoveredRecord && comparison.state === "reconciled") {
+    if (!preRecoveredRecord && !splitRecovery && comparison.state === "reconciled") {
       return repository.reconciled({ candidateId: candidate.id, liveOrder });
     }
-    if (!preRecoveredRecord && comparison.state === "attention" && requiresAutomaticDriftStop(candidate)) {
+    if (!preRecoveredRecord && !splitRecovery && comparison.state === "attention" && requiresAutomaticDriftStop(candidate)) {
       return repository.attention({ candidateId: candidate.id, liveOrder, issues: comparison.issues });
     }
 

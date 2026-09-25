@@ -1,0 +1,310 @@
+--- a/public/dispatch.js
++++ b/public/dispatch.js
+@@ -3470,6 +3470,11 @@
+     ? groupedOrderDependencyLabels(groupedDependencySources, orderDependencies)
+     : order.dependencyLabels;
+   const dependencyChildren = groupedDependencySources.length ? groupMembers.childOrderDetails : [];
++  const directPickupManifest = groupMembers.childOrders.length
++    ? [...new Map([...groupMembers.childOrderDetails, order]
++        .flatMap((member) => member.directPickupManifest || [])
++        .map((entry) => [String(entry.dependencyId || entry.transferOrderRef), entry])).values()]
++    : order.directPickupManifest;
+   const basePickupLocations = Array.isArray(order.pickupLocations) && order.pickupLocations.length
+     ? order.pickupLocations
+     : order.sourceYard
+@@ -3477,7 +3482,7 @@
+       : type === "SO"
+         ? ["3445"]
+         : [];
+-  const pickupLocations = activeTransitPickupLocations(order, basePickupLocations);
++  const pickupLocations = activeTransitPickupLocations({ ...order, directPickupManifest }, basePickupLocations);
+   const effectiveSourceYard = order.transitCo?.toYard
+     || order.sourceYard
+     || pickupLocations[0]
+@@ -3535,6 +3540,7 @@
+     childOrderDetails: groupMembers.childOrderDetails,
+     groupAliases: groupMembers.groupAliases,
+     orderDependencies,
++    directPickupManifest,
+     dependencyLabels,
+     dependencyDirectPickup: Boolean(order.dependencyDirectPickup
+       || dependencyChildren.some((child) => child.dependencyDirectPickup)
+@@ -5064,7 +5070,10 @@
+   const type = modalType === "to-link" ? "to" : "po";
+   const draft = getLinkModalDraft(type, modalOrderId);
+   const refInput = document.getElementById(type === "to" ? "toLinkRef" : "poLinkRef");
+-  if (refInput) draft.ref = refInput.value;
++  if (refInput) {
++    if (type === "to") refInput.value = refInput.value.toUpperCase();
++    draft.ref = refInput.value;
++  }
+   if (type === "to") {
+     const mode = document.getElementById("toLinkMode");
+     if (mode) draft.mode = mode.value || "direct_to_customer";
+@@ -13039,7 +13048,7 @@
+   if (!order?.id) return;
+   const targetRef = order.id;
+   const draft = getLinkModalDraft("to", targetRef);
+-  const requestRef = String(transferOrderRef ?? draft.ref).trim();
++  const requestRef = String(transferOrderRef ?? draft.ref).trim().toUpperCase();
+   draft.ref = requestRef;
+   const sequence = ++orderDependencyRequestSequence;
+   orderDependencyAbortController?.abort();
+@@ -14702,8 +14711,14 @@
+       || "this Sales Order"
+     );
+     const mode = String(dependency.mode || "");
+-    if (mode !== "yard_replenishment") {
+-      return `Cannot group ${salesRef}: ${transferRef} is a direct-pickup dependency. Change or unlink it first.`;
++    if (mode === "yard_replenishment") continue;
++    const hasProgress = (dependency.lines || []).some((line) =>
++      Number(line.loadedQuantity || 0) > 0
++      || Number(line.deliveredQuantity || 0) > 0
++      || Number(line.locallyReceivedQuantity || 0) > 0
++    );
++    if (mode !== "direct_to_customer" || !["active", "attention"].includes(dependency.status) || hasProgress) {
++      return `Cannot group ${salesRef}: ${transferRef} has started execution or requires dependency review.`;
+     }
+   }
+   return "";
+@@ -14807,8 +14822,14 @@
+       }
+       continue;
+     }
+-    if (stop.type === "pick" && planning.refs.has(String(stop.orderId || ""))) {
+-      nextStops.push({ ...stop, orderId: grouped.id });
++    if (stop.type === "pick") {
++      nextStops.push({
++        ...stop,
++        orderId: planning.refs.has(String(stop.orderId || "")) ? grouped.id : stop.orderId,
++        ...(Array.isArray(stop.orderRefs) ? { orderRefs: [...new Set(stop.orderRefs.map((ref) =>
++          planning.refs.has(String(ref)) ? grouped.id : ref
++        ))] } : {})
++      });
+       continue;
+     }
+     nextStops.push(stop);
+@@ -14900,6 +14921,8 @@
+     items: groupItems.flatMap((item) => item.items || []),
+     childOrders: flattenedMembers.childOrders,
+     childOrderDetails: leafItems.map((item) => normalizeOrder({ ...item })),
++    orderDependencies: groupedOrderDependencies(groupItems),
++    directPickupManifest: groupItems.flatMap((item) => item.directPickupManifest || []),
+     groupAliases,
+     notes: `Grouped orders: ${flattenedMembers.childOrders.join(", ")}`
+   });
+@@ -16902,7 +16925,12 @@
+   if (["po-link", "to-link"].includes(modalType) && event.target.closest('[data-link-modal="true"]')) {
+     if (modalType === "to-link" && event.target?.id === "toLinkRef") {
+       const draft = getLinkModalDraft("to", modalOrderId);
+-      const nextRef = event.target.value;
++      const nextRef = event.target.value.toUpperCase();
++      if (event.target.value !== nextRef) {
++        const { selectionStart, selectionEnd } = event.target;
++        event.target.value = nextRef;
++        event.target.setSelectionRange(selectionStart, selectionEnd);
++      }
+       if (draft.ref !== nextRef) {
+         draft.ref = nextRef;
+         draft.quantities = {};
+@@ -17578,7 +17606,7 @@
+     if (!order) return;
+     captureActiveLinkModalDraft();
+     const draft = getLinkModalDraft("to", order.id);
+-    const transferOrderRef = String(draft.ref || "").trim();
++    const transferOrderRef = String(draft.ref || "").trim().toUpperCase();
+     const allocations = [...form.querySelectorAll(".to-link-line[data-target-line-key]")]
+       .map((row) => {
+         const quantities = {};
+--- a/public/dispatch.html
++++ b/public/dispatch.html
+@@ -15,6 +15,6 @@
+     <script src="/dispatch-auth.js?v=20260724-sales-auth-v2"></script>
+     <script src="/delivery-instruction-upload.js?v=20260812-delivery-image-720p-v1"></script>
+     <script src="/dispatch-address-guard.js?v=20260920-executed-review-v1"></script>
+-    <script src="/dispatch.js?v=20260920-actual-arrival-v2"></script>
++    <script src="/dispatch.js?v=20260923-link-to-group"></script>
+   </body>
+ </html>
+--- a/src/order-dependency-repository.js
++++ b/src/order-dependency-repository.js
+@@ -523,7 +523,7 @@
+   return loadDependencies(filters);
+ }
+ 
+-export async function assertNoActiveOrderDependenciesByRefs(orderRefs = [], action = "change these orders", _options = {}) {
++export async function assertNoActiveOrderDependenciesByRefs(orderRefs = [], action = "change these orders", options = {}) {
+   const refs = [...new Set((orderRefs || []).map(text).filter(Boolean))];
+   if (!refs.length) return;
+   const result = await query(
+@@ -558,9 +558,12 @@
+   // the temporary Dispatch container. Group/split edits therefore leave its
+   // inventory contract intact; ordering and execution gates are enforced by
+   // validateDispatchPlanDependencies and getSalesOrderDependencyExecutionBlock.
+-  // Direct-to-customer dependencies remain locked because their pickup and
+-  // customer drop must stay coupled on one physical load.
+-  const blocked = result.rows.filter(dependencyBlocksDispatchStructureChange);
++  // Direct pickups may move from a normal SO to its proven new group before
++  // execution. Splits, ungrouping, and independent TO edits remain protected.
++  const blocked = result.rows.filter((dependency) =>
++    dependencyBlocksDispatchStructureChange(dependency, options)
++    || (dependency.dependency_mode === "direct_to_customer" && refs.includes(dependency.transfer_order_ref))
++  );
+   if (!blocked.length) return;
+   const relations = blocked.map((row) => `${row.dispatch_target_ref || row.sales_order_ref} -> ${row.transfer_order_ref}`).join(", ");
+   const error = new Error(`Cannot ${action} while an active order dependency exists: ${relations}. Unlink the dependency first.`);
+@@ -1211,6 +1214,7 @@
+ }
+ 
+ export async function getOrderDependencyOptions({ dispatchTargetRef = "", salesOrderRef = "", transferOrderRef = "", planDate = "" } = {}) {
++  transferOrderRef = text(transferOrderRef).toUpperCase();
+   const targetRef = text(dispatchTargetRef || salesOrderRef);
+   const existingLinks = targetRef ? await loadDependencies({ salesOrderRef: targetRef }) : [];
+   const transferOrders = await query(
+@@ -1227,8 +1231,8 @@
+       LIMIT 500`
+   );
+   const requestedTransfer = transferOrderRef
+-    ? transferOrders.rows.find((row) => row.tranid === text(transferOrderRef))
+-      || (await query("SELECT * FROM transfer_orders WHERE tranid = $1", [text(transferOrderRef)])).rows[0]
++    ? transferOrders.rows.find((row) => text(row.tranid).toUpperCase() === transferOrderRef)
++      || (await query("SELECT * FROM transfer_orders WHERE UPPER(tranid) = $1", [transferOrderRef])).rows[0]
+     : null;
+   const requestedTerminalStatus = terminalTransferOrderStatus(requestedTransfer);
+   const transfer = requestedTerminalStatus ? null : requestedTransfer;
+@@ -4060,6 +4064,7 @@
+   operatorId = null
+ } = {}) {
+   const normalizedMode = normalizeMode(mode);
++  transferOrderRef = text(transferOrderRef).toUpperCase();
+   return withTransaction(async () => {
+     const targetRef = text(dispatchTargetRef || salesOrderRef);
+     await query(
+@@ -4068,8 +4073,8 @@
+     );
+     const resolved = await resolveDispatchSalesTarget({ dispatchTargetRef: targetRef, planDate });
+     const transfer = await query(
+-      "SELECT * FROM transfer_orders WHERE tranid = $1 FOR UPDATE",
+-      [text(transferOrderRef)]
++      "SELECT * FROM transfer_orders WHERE UPPER(tranid) = $1 FOR UPDATE",
++      [transferOrderRef]
+     );
+     if (targetSignature && targetSignature !== resolved.signature) {
+       const error = new Error(`${targetRef} changed while the link window was open. Refresh the matched lines before linking.`);
+@@ -4078,6 +4083,7 @@
+       throw error;
+     }
+     if (!transfer.rowCount) throw new Error("Transfer Order not found.");
++    transferOrderRef = transfer.rows[0].tranid;
+     const terminalStatus = terminalTransferOrderStatus(transfer.rows[0]);
+     if (transfer.rows[0].netsuite_active === false || terminalStatus) {
+       throw new Error(`${transferOrderRef} is ${terminalStatus || "inactive"} and cannot be linked.`);
+@@ -4950,7 +4956,7 @@
+         groupRef
+         && dependency.dispatchTargetKind === "normal"
+         && currentTargetRef === canonicalRef
+-        && dependency.mode === "yard_replenishment"
++        && ["yard_replenishment", "direct_to_customer"].includes(dependency.mode)
+         && ["active", "attention"].includes(dependency.status)
+         && !hasExecutionProgress
+       ) {
+@@ -4961,7 +4967,7 @@
+               AND dispatch_target_ref = $3
+               AND sales_order_ref = $4
+               AND dispatch_target_kind = 'normal'
+-              AND dependency_mode = 'yard_replenishment'
++              AND dependency_mode IN ('yard_replenishment', 'direct_to_customer')
+               AND status IN ('active', 'attention')
+               AND NOT EXISTS (
+                 SELECT 1
+--- a/src/dispatch-delivery-group-repository.js
++++ b/src/dispatch-delivery-group-repository.js
+@@ -902,8 +902,11 @@
+     (total, child) => total + Number(child?.[field] || 0),
+     0
+   );
+-  const pickupLocations = [...new Set(childOrderDetails
+-    .flatMap((child) => child.pickupLocations || [])
++  const pickupLocations = [...new Set([
++    ...childOrderDetails.flatMap((child) => child.pickupLocations || []),
++    ...(order.directPickupManifest || []).map((entry) => entry.location),
++    ...(order.poPickupManifest || []).map((entry) => entry.location)
++  ]
+     .map(text)
+     .filter(Boolean))];
+   const existingSourceYard = text(order.sourceYard);
+--- a/src/sales-order-reconciliation.js
++++ b/src/sales-order-reconciliation.js
+@@ -339,7 +339,11 @@
+     weight: groupedSalesOrderTotals(children, "weight"),
+     unloadMinutes: groupedSalesOrderTotals(children, "unloadMinutes"),
+     travelMinutes: children.reduce((max, child) => Math.max(max, Number(child?.travelMinutes || 0)), 0),
+-    pickupLocations: uniqueValues(children.flatMap((child) => child?.pickupLocations || [])),
++    pickupLocations: uniqueValues([
++      ...children.flatMap((child) => child?.pickupLocations || []),
++      ...(order.directPickupManifest || []).map((entry) => entry.location),
++      ...(order.poPickupManifest || []).map((entry) => entry.location)
++    ]),
+     items: children.flatMap((child) => Array.isArray(child?.items) ? child.items : []),
+     fulfillmentStatus,
+     reconciliationApplicationStatus: rollup.applicationStatus,
+--- a/src/yard-dependency-structure.js
++++ b/src/yard-dependency-structure.js
+@@ -2,9 +2,19 @@
+   return String(value ?? "").trim();
+ }
+ 
+-export function dependencyBlocksDispatchStructureChange(dependency = {}) {
++export function dependencyBlocksDispatchStructureChange(dependency = {}, { allowEstablishedGroupTargets = [] } = {}) {
+   const mode = text(dependency.dependency_mode ?? dependency.mode);
+-  return mode !== "yard_replenishment";
++  if (mode === "yard_replenishment") {return false;}
++  const sourceRef = text(dependency.sales_order_ref);
++  const canGroupDirect = mode === "direct_to_customer"
++    && dependency.dispatch_target_kind === "normal"
++    && text(dependency.dispatch_target_ref || sourceRef) === sourceRef
++    && ["active", "attention"].includes(dependency.status)
++    && dependency.has_execution_progress === false
++    && allowEstablishedGroupTargets.some((target) =>
++      text(target.sourceOrderRef) === sourceRef && Boolean(text(target.groupRef))
++    );
++  return !canGroupDirect;
+ }
+ 
+ export function dispatchDependencyOrderRefs(order = {}) {
+--- a/src/scm-dependency-preview-service.js
++++ b/src/scm-dependency-preview-service.js
+@@ -358,7 +358,10 @@
+     }
+   }
+ 
+-  const transferRef = text(payload.transferOrderRef || relation.dependency?.transfer_order_ref);
++  const requestedTransferRef = text(payload.transferOrderRef || relation.dependency?.transfer_order_ref);
++  const transferRef = requestedTransferRef
++    ? (await query("SELECT tranid FROM transfer_orders WHERE UPPER(tranid) = $1", [requestedTransferRef.toUpperCase()])).rows[0]?.tranid || requestedTransferRef
++    : "";
+   const purchaseRef = text(payload.poRef || relation.poAllocation?.po_order_ref);
+   const dependencyIds = [relation.dependency?.id, payload.dependencyId]
+     .map(Number).filter(Number.isInteger);
+--- a/src/server.js
++++ b/src/server.js
+@@ -6933,6 +6933,9 @@
+     if (!after.membership.has(key) || before.membership.get(key) === after.membership.get(key)) continue;
+     refs.add(key);
+   }
++  for (const [key, membership] of after.membership) {
++    if (membership !== "normal" && !before.membership.has(key)) refs.add(key);
++  }
+   for (const key of before.containers.keys()) {
+     if (!after.containers.has(key)) continue;
+     const left = before.containers.get(key);
+@@ -6951,7 +6954,8 @@
+ export function safeNormalDependencyGroupingTargets(previousPlan = {}, nextPlan = {}) {
+   const before = dispatchOrderStructureState(previousPlan);
+   return [...normalDispatchGroupTargets(nextPlan).entries()]
+-    .filter(([sourceOrderRef]) => before.membership.get(sourceOrderRef) === "normal")
++    .filter(([sourceOrderRef]) => !before.membership.has(sourceOrderRef)
++      || before.membership.get(sourceOrderRef) === "normal")
+     .map(([sourceOrderRef, groupRef]) => ({ sourceOrderRef, groupRef }));
+ }
+ 

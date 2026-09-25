@@ -122,13 +122,13 @@ test("operation cycle-count facets paginate independently from the SKU result li
 
 test("operator cache assets advance with the cycle-count pagination release", () => {
   for (const asset of [
-    "/operator.css?v=20260916-operator-auto-camera-v1",
-    "/operator.js?v=20260916-operator-auto-camera-v1"
+    "/operator.css?v=20260916-operator-bottom-inset-v1",
+    "/operator.js?v=20260917-receiving-followup-v1"
   ]) {
     assert.ok(operatorHtml.includes(asset));
     assert.ok(serviceWorker.includes(asset));
   }
-  assert.ok(serviceWorker.includes("mbbs-yard-operator-v153-auto-camera-v1"));
+  assert.ok(serviceWorker.includes("mbbs-yard-operator-20260917-receiving-followup-v1"));
 });
 
 test("Dispatch and SCM card menus scroll within the fixed-height application shell", () => {
@@ -152,13 +152,25 @@ test("main sidebar modules follow live primary and secondary authorities on ever
   const hrefs = () => sidebar.visibleMainItems().map((item) => item.href);
 
   sidebar.window.MBBS_DISPATCH_OPERATOR = { role: "admin", roles: ["admin"] };
-  assert.deepEqual(hrefs(), ["/admin", "/control", "/dispatch", "/scm", "/sales", "/mbt", "/operator"]);
+  assert.deepEqual(hrefs(), ["/admin", "/control", "/dispatch", "/scm", "/sales", "/field-sales/", "/mbt", "/operator"]);
+
+  sidebar.window.MBBS_DISPATCH_OPERATOR = { role: "field_sales", roles: ["field_sales"] };
+  assert.deepEqual(hrefs(), ["/field-sales/"]);
+
+  sidebar.window.MBBS_DISPATCH_OPERATOR = { role: "operator", roles: ["operator", "field_sales"], aggregateRequestYardLocationIds: [1] };
+  assert.deepEqual(hrefs(), ["/field-sales/", "/aggregate-requests", "/operator"]);
 
   sidebar.window.MBBS_DISPATCH_OPERATOR = {
     role: "operator",
-    roles: ["operator", "sales", "mbt-frontdesk"]
+    roles: ["operator", "sales", "mbt-frontdesk"], aggregateRequestYardLocationIds: [1]
   };
-  assert.deepEqual(hrefs(), ["/sales", "/mbt", "/operator"]);
+  assert.deepEqual(hrefs(), ["/sales", "/mbt", "/aggregate-requests", "/operator"]);
+
+  sidebar.window.MBBS_DISPATCH_OPERATOR = { role: "sales", roles: ["sales"], aggregateRequestYardLocationIds: [1] };
+  assert.deepEqual(hrefs(), ["/sales", "/aggregate-requests"]);
+
+  sidebar.window.MBBS_DISPATCH_OPERATOR = { role: "yard_manager", roles: ["yard_manager"], aggregateRequestYardLocationIds: [1] };
+  assert.ok(hrefs().includes("/aggregate-requests"));
 
   sidebar.localStorage.setItem("mbbs.staff.roles", JSON.stringify(["admin"]));
   sidebar.window.MBBS_DISPATCH_OPERATOR = { role: "sales", roles: ["sales"], publicSales: true };
@@ -170,8 +182,8 @@ test("main sidebar modules follow live primary and secondary authorities on ever
   assert.deepEqual(hrefs(), ["/dispatch", "/scm", "/mbt"]);
 
   sidebar.localStorage.clear();
-  sidebar.setSidebarOperator({ role: "admin", roles: ["admin"] });
-  assert.deepEqual(hrefs(), ["/admin", "/control", "/dispatch", "/scm", "/sales", "/mbt", "/operator"]);
+  sidebar.setSidebarOperator({ role: "admin", roles: ["admin", "operator"], aggregateRequestYardLocationIds: [1] });
+  assert.deepEqual(hrefs(), ["/admin", "/control", "/dispatch", "/scm", "/sales", "/field-sales/", "/mbt", "/aggregate-requests", "/operator"]);
 
   assert.doesNotMatch(sidebarSource, /if \(path\.startsWith\("\/mbt"\)\) return visibleMbtItems\(\)/);
   assert.doesNotMatch(sidebarSource, /if \(path\.startsWith\("\/sales"\)\) return mainItems/);
@@ -198,4 +210,14 @@ test("SCM menu decisions include normalized secondary authorities", () => {
   harness.setOperator({ role: "yard-manager", roles: ["yard-manager"] });
   assert.equal(harness.scmCanEditScm(), false);
   assert.equal(harness.scmIsYardManager(), true);
+});
+
+ test("Aggregate navigation requires a live separate grant and eligible account", () => {
+  const sidebar = buildSidebarHarness();
+  for (const role of ["operator", "sales", "yard_manager", "admin"]) {
+    sidebar.window.MBBS_DISPATCH_OPERATOR = { role, roles: [role], yardLocationIds: [1], operatorYardLocationIds: [1] };
+    assert.equal(sidebar.visibleMainItems().some(item => item.href === "/aggregate-requests"), false);
+  }
+  sidebar.window.MBBS_DISPATCH_OPERATOR = { role: "sales", aggregateRequestYardLocationIds: [1], publicSales: true };
+  assert.equal(sidebar.visibleMainItems().some(item => item.href === "/aggregate-requests"), false);
 });

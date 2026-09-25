@@ -1,3 +1,4 @@
+import { withBackgroundNetSuitePriority } from './operator-netsuite-request-pool.js';
 import crypto from "node:crypto";
 import { config } from "./config.js";
 import { query, withTransaction } from "./db.js";
@@ -357,7 +358,7 @@ export async function syncReturnCustomerDirectory({
 }
 
 function kickReturnCustomerDirectoryRefresh() {
-  void syncReturnCustomerDirectory().catch((error) => {
+  void withBackgroundNetSuitePriority(() => syncReturnCustomerDirectory()).catch((error) => {
     console.error("Return customer directory refresh failed:", error.message);
   });
 }

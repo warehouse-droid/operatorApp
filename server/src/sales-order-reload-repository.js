@@ -1,3 +1,5 @@
+import { outboundLocationIds } from "./outbound-location-domain.js";
+import { isBackgroundPhotoReference } from "./operator-background-photos.js";
 import { writeAudit } from "./auth-repository.js";
 import { query, withTransaction } from "./db.js";
 import {
@@ -40,7 +42,7 @@ function positiveId(value, label = "ID") {
 function photoReferences(values = []) {
   return (Array.isArray(values) ? values : [])
     .map((value) => String(value || ""))
-    .filter((value) => value.startsWith("data:image/") || value.startsWith("r2://"));
+    .filter((value) => value.startsWith("data:image/") || value.startsWith("r2://") || isBackgroundPhotoReference(value));
 }
 
 function requireReloadPhotos(values) {
@@ -890,7 +892,7 @@ export async function listActiveReloadOrders({ locationId = null } = {}) {
   const params = [ACTIVE_RELOAD_STATUSES];
   const locationClause = locationId === null || locationId === undefined || locationId === ""
     ? ""
-    : `AND o.outbound_location_id = $${params.push(Number(locationId))}`;
+    : `AND o.outbound_location_id = ANY($${params.push(outboundLocationIds(locationId))}::bigint[])`;
   const result = await query(
     `SELECT o.*, o.sales_order_type AS delivery_method, 'sales_order'::text AS order_type,
             cycle.id AS reload_cycle_id

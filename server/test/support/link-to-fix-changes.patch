@@ -1,0 +1,711 @@
+--- a/src/driver-repository.js
++++ b/src/driver-repository.js
+@@ -559,8 +559,14 @@
+ 
+ function dropAddressForStop(stop = {}, order = {}) {
+   const location = dropLocationForStop(stop, order);
++  const dropoffs = purchaseOrderRouteProjection(order)?.dropoffs || order.dropoffs || [];
++  const dropoff = dropoffs.find(candidate => candidate.key === stop.dropoffKey)
++    || dropoffs.find(candidate => dispatchLocationsShareYard(candidate.destinationYard, location))
++    || (dropoffs.length === 1 ? dropoffs[0] : null);
+   return String(
+-    stop.dropAddress
++    dropoff?.address
++    || order.deliveryAddressOverride
++    || stop.dropAddress
+     || yardAddress(location)
+     || order.address
+     || order.dropAddress
+--- a/src/dispatch-delivery-group-repository.js
++++ b/src/dispatch-delivery-group-repository.js
+@@ -30,6 +30,7 @@
+   "items", "pallets", "layers", "sections", "pieces", "salesQty",
+   "salesQuantities", "packed", "weight", "totalWeightLbs", "unloadMinutes",
+   "travelMinutes", "stopMinutes", "childOrderDetails", "transitCo",
++  "dropoffs", "poRouteProjection",
+   "transitOriginalPickupLocations", "transitOriginalSourceYard"
+ ]);
+ 
+@@ -888,7 +889,7 @@
+   };
+ }
+ 
+-function aggregateGlobalGroup(order = {}, childOrderDetails = [], { preserveTransitCo = false } = {}) {
++export function aggregateGlobalGroup(order = {}, childOrderDetails = [], { preserveTransitCo = false } = {}) {
+   // A CO for a grouped SO/TO owns its persisted manifest. Source children are
+   // informational and may be incomplete cards, not constituent CO cargo.
+   if (text(order.type).toUpperCase() === "CO" && order.sourceTable === "local_co_orders"
+@@ -1542,12 +1543,25 @@
+   }
+ }
+ 
++async function assertNoGroupedSplitParents(plan) {
++  const parents = [...new Set((plan.orders || []).map(splitParentRef).filter(Boolean))];
++  if (!parents.length) return;
++  const stored = await query(`SELECT group_ref FROM dispatch_global_order_groups WHERE group_ref=ANY($1::text[])`, [parents]);
++  const local = (plan.orders || []).some(order => parents.includes(orderIdentity(order)) && isGroupedDispatchOrder(order));
++  if (stored.rowCount || local) {
++    throw Object.assign(new Error("Ungroup first, then split the child order."), {
++      status: 409, code: "DISPATCH_GROUP_SPLIT_UNSUPPORTED"
++    });
++  }
++}
++
+ async function syncDispatchDeliveryGroupsFromPlanInTransaction(plan = {}, {
+   reactivatedGlobalOrderRefs = [],
+   rejectRetiredGlobalOrderRefs = false
+ } = {}) {
+   const planId = Number(plan.id);
+   if (!Number.isInteger(planId)) return { groups: 0, members: 0 };
++  await assertNoGroupedSplitParents(plan);
+   const allowedReactivations = new Set((Array.isArray(reactivatedGlobalOrderRefs)
+     ? reactivatedGlobalOrderRefs
+     : [])
+--- a/src/dispatch-planner-performance.js
++++ b/src/dispatch-planner-performance.js
+@@ -496,6 +496,9 @@
+   const sourceRef = text(payload.sourceOrderRef || payload.orderRef);
+   const source = (plan.orders || []).find((order) => orderRef(order) === sourceRef);
+   if (!source) {throw commandError("The source order no longer exists.", "DISPATCH_ORDER_NOT_FOUND", 404);}
++  if (source.childOrders?.length) {
++    throw commandError("Ungroup first, then split the child order.", "DISPATCH_GROUP_SPLIT_UNSUPPORTED", 409);
++  }
+   const requestedParts = Array.isArray(payload.parts) && payload.parts.length ? payload.parts : [{}, {}];
+   const parts = requestedParts.map((part, index) => {
+     const refNumber = text(part.refNumber || part.orderRef) || `${sourceRef}-S${index + 1}`;
+--- a/src/dispatch-order-target-repository.js
++++ b/src/dispatch-order-target-repository.js
+@@ -152,6 +152,23 @@
+     planId: result.rows[0].plan_id,
+     planDate: dateOnly(result.rows[0].plan_date)
+   };
++}
++
++async function globalSalesTarget(targetRef) {
++  const result = await query(
++    `SELECT full_order, active FROM dispatch_global_order_groups WHERE group_ref = $1
++     UNION ALL
++     SELECT full_order, active FROM dispatch_global_order_splits WHERE split_ref = $1`,
++    [targetRef]
++  );
++  if (!result.rowCount) return null;
++  if (result.rows.some(row => !row.active)) {
++    throw Object.assign(new Error(`${targetRef} is a retired Dispatch order. Refresh the order pool.`),
++      { status: 409, code: "DISPATCH_DERIVED_ORDER_RETIRED" });
++  }
++  const order = result.rows[0].full_order;
++  if (text(order?.type).toUpperCase() !== "SO") throw new Error(`${targetRef} is not a Sales Order target.`);
++  return order;
+ }
+ 
+ async function loadCanonicalOrders(refs = []) {
+@@ -301,12 +318,13 @@
+ export async function resolveDispatchSalesTarget({ dispatchTargetRef = "", planDate = "" } = {}) {
+   const ref = text(dispatchTargetRef);
+   if (!ref) throw new Error("Dispatch Sales Order target is required.");
++  const globalOrder = await globalSalesTarget(ref);
+   const snapshot = await findSnapshotTarget(ref, planDate) || await projectedGroupTarget(ref, planDate);
+-  const initialRefs = [ref, splitParentRef(snapshot?.order || { id: ref })];
++  const order = globalOrder || snapshot?.order || { id: ref, type: "SO", items: [] };
++  const initialRefs = [ref, splitParentRef(order)];
+   let canonical = await loadCanonicalOrders(initialRefs);
+   const exactCanonical = canonical.headers.get(ref) || null;
+-  if (!snapshot && !exactCanonical) throw new Error(`${ref} was not found in the selected dispatch plan or Sales Order table.`);
+-  const order = snapshot?.order || { id: ref, type: "SO", items: [] };
++  if (!globalOrder && !snapshot && !exactCanonical) throw new Error(`${ref} was not found in the selected dispatch plan or Sales Order table.`);
+   const kind = targetKind(order, exactCanonical);
+   const entries = kind === "group"
+     ? flattenGroupMembers(order)
+--- a/src/driver-co-pickup-evidence.js
++++ b/src/driver-co-pickup-evidence.js
+@@ -0,0 +1,50 @@
++import { planJobsForDriver } from "./driver-repository.js";
++import { dispatchLocationsShareYard } from "./dispatch-location.js";
++
++const text = value => String(value || "").trim();
++const refSet = values => [...new Set((values || []).map(value => text(value).toLowerCase()))].sort();
++const sameRefs = (left, right) => JSON.stringify(refSet(left)) === JSON.stringify(refSet(right));
++
++function completedCorrection(record, order, corrections, location) {
++  const matches = corrections.filter(row => row.co_ref === order.id
++    && String(row.proof?.planId) === String(record.plan_id) && row.proof?.loadId === record.load_id
++    && row.proof?.stopType === "drop");
++  if (matches.length !== 1) {return null;}
++  const row = matches[0];
++  const pickupAt = new Date(record.completed_at).getTime();
++  const createdAt = new Date(row.proof.coCreatedAt).getTime();
++  const arrivedAt = new Date(row.completion_at).getTime();
++  if (row.status !== "completed" || !row.completion_at || !Number.isFinite(pickupAt)
++    || !Number.isFinite(createdAt) || !Number.isFinite(arrivedAt) || pickupAt < createdAt || pickupAt > arrivedAt
++    || !dispatchLocationsShareYard(location, row.proof.fromYard)
++    || !dispatchLocationsShareYard(location, row.from_location)
++    || !sameRefs(order.childOrders, row.proof.sourceRefs)) {return null;}
++  return row.proof.sourceRefs;
++}
++
++function canInterpretPickup(record, corrections) {
++  return record.stop_type === "pickup" && record.status === "complete" && Boolean(record.completed_at)
++    && Boolean(record.snapshot_orders) && Boolean(record.snapshot_trucks) && corrections.length > 0;
++}
++
++// Interpret only the old CO expansion bug, without editing historical evidence.
++// Any extra/missing cargo or missing route/proof leaves the original blocker intact.
++export function driverActivityOrderRefs(record, corrections = []) {
++  const original = record.order_refs || [];
++  if (!canInterpretPickup(record, corrections)) { return original; }
++  const plan = { id: record.plan_id, planDate: record.plan_date,
++    orders: record.snapshot_orders, trucks: record.snapshot_trucks };
++  const jobs = planJobsForDriver(plan, record.driver_login).filter(job => job.jobId === record.job_id
++    && job.loadId === record.load_id && job.stopId === record.stop_id && job.stopType === "pickup");
++  if (jobs.length !== 1 || !dispatchLocationsShareYard(jobs[0].location, record.job_details?.location)) {return original;}
++  const expected = jobs[0].orderRefs;
++  let corrected = false;
++  const legacy = expected.flatMap(ref => {
++    const order = plan.orders.find(candidate => candidate.id === ref && candidate.type === "CO");
++    const sources = order && completedCorrection(record, order, corrections, jobs[0].location);
++    if (!sources) {return [ref];}
++    corrected = true;
++    return sources;
++  });
++  return corrected && sameRefs(legacy, original) ? expected : original;
++}
+--- a/src/co-source-packing-handoff.js
++++ b/src/co-source-packing-handoff.js
+@@ -137,7 +137,19 @@
+     WHERE sales.tranid=ANY($1::text[]) AND co.status<>'cancelled'`, [salesRefs])).rows;
+ }
+ 
+-export async function coSourcePackingActivityRefs(salesRefs, salesLineIds = null) {
++export function completedCoArrivalSql(alias = "co") {
++  return `COALESCE(${alias}.received_at, (
++    SELECT completion.completed_at FROM driver_job_records completion
++    WHERE completion.job_id=${alias}.details->>'driverCompletionJobId'
++      AND completion.id::text=${alias}.details->>'driverCompletionRecordId'
++      AND completion.stop_type='dropoff' AND completion.status IN ('complete','completed')
++      AND completion.order_refs @> jsonb_build_array(${alias}.co_ref)
++      AND completion.completed_at >= ${alias}.created_at
++      AND lower(btrim(completion.job_details->>'location'))=lower(btrim(${alias}.to_location))
++  ))`;
++}
++
++export async function coSourcePackingActivityRefs(salesRefs, salesLineIds = null, { allowReceivedCo = false } = {}) {
+   const result = await query(`SELECT DISTINCT sales.tranid AS ref
+     FROM local_co_orders co JOIN sales_orders sales ON ${CO_SOURCE_SALES_JOIN}
+     JOIN sales_order_lines line ON line.sales_order_id=sales.netsuite_id
+@@ -146,12 +158,13 @@
+       co_line.raw->>'lineRowId'=line.id::text OR co_line.raw->>'line_row_id'=line.id::text
+       OR (COALESCE(NULLIF(co_line.raw->>'lineRowId',''),NULLIF(co_line.raw->>'line_row_id','')) IS NULL
+         AND co_line.line_id=line.line_id AND co_line.item_id=line.item_id))
+-    WHERE sales.tranid=ANY($1::text[]) AND co.status<>'cancelled' AND (
++    WHERE sales.tranid=ANY($1::text[]) AND co.status<>'cancelled'
++      AND NOT ($3::boolean AND co.status='completed' AND ${completedCoArrivalSql()} IS NOT NULL) AND (
+       co.preparing_operator_id IS NOT NULL OR co.preparing_started_at IS NOT NULL
+       OR co.status IN ('preparing','loaded','received','completed') OR co.loaded_at IS NOT NULL OR co.received_at IS NOT NULL
+       OR ($2::bigint[] IS NULL AND co.status='packed') OR co_line.confirmed_at IS NOT NULL
+       OR COALESCE(co_line.packed_pallet_qty,0)>0 OR COALESCE(co_line.packed_layer_qty,0)>0
+       OR COALESCE(co_line.packed_section_qty,0)>0 OR COALESCE(co_line.packed_piece_qty,0)>0
+-      OR COALESCE(co_line.packed_sales_qty,0)>0)`, [salesRefs, salesLineIds]);
++      OR COALESCE(co_line.packed_sales_qty,0)>0)`, [salesRefs, salesLineIds, allowReceivedCo]);
+   return result.rows.map(row => row.ref);
+ }
+--- a/src/scm-dependency-preview-service.js
++++ b/src/scm-dependency-preview-service.js
+@@ -1,8 +1,9 @@
+ import { query } from "./db.js";
++import { driverActivityOrderRefs } from "./driver-co-pickup-evidence.js";
+ import { DISPATCH_FLEET_PLANNING_LOCK } from './dispatch-fleet-status.js';
+ import { lockDispatchPlanEditLease, lockDispatchPlanEditLeaseDate } from './dispatch-plan-lease-repository.js';
+ import { lockConsolidatedLoadOrders } from "./consolidation-load-locks.js";
+-import { coSourcePackingActivityRefs, coSourcePackingOrders } from "./co-source-packing-handoff.js";
++import { completedCoArrivalSql, coSourcePackingActivityRefs, coSourcePackingOrders } from "./co-source-packing-handoff.js";
+ import { getDispatchPlan } from "./dispatch-plan-repository.js";
+ import { resolveDispatchSalesTarget } from "./dispatch-order-target-repository.js";
+ import { listClosedNetSuiteOrders } from "./netsuite-closed-order-repository.js";
+@@ -120,10 +121,10 @@
+   await query("SELECT id FROM local_co_order_lines WHERE co_id=ANY($1::bigint[]) ORDER BY id FOR UPDATE", [coIds]);
+ }
+ 
+-async function operatorActivityRefs({ salesRefs = [], transferRefs = [], salesLineIds = null } = {}) {
++async function operatorActivityRefs({ salesRefs = [], transferRefs = [], salesLineIds = null, allowReceivedCo = false } = {}) {
+   const refs = [];
+   if (salesRefs.length) {
+-    refs.push(...await coSourcePackingActivityRefs(salesRefs, salesLineIds));
++    refs.push(...await coSourcePackingActivityRefs(salesRefs, salesLineIds, { allowReceivedCo }));
+     const sales = await query(
+       `SELECT DISTINCT sales.tranid AS ref, sales.operator_status,
+               sales.local_yard_order_status, sales.preparing_operator_id,
+@@ -256,18 +257,26 @@
+ async function driverActivity({ refs = [] } = {}) {
+   if (!refs.length) {return [];}
+   const result = await query(
+-    `SELECT id, job_id
+-       FROM driver_job_records
++    `SELECT record.*, snapshot.orders AS snapshot_orders, snapshot.trucks AS snapshot_trucks
++       FROM driver_job_records record
++       LEFT JOIN dispatch_plan_snapshots snapshot ON snapshot.plan_id = record.plan_id
+       WHERE order_refs ?| $1::text[]
+         AND (
+           started_at IS NOT NULL
+           OR completed_at IS NOT NULL
+           OR lower(COALESCE(status, '')) IN ('in_progress', 'in-progress', 'started', 'complete', 'completed')
+         )
+-      ORDER BY id`,
++      ORDER BY record.id`,
+     [refs]
+   );
+-  return result.rows.map((row) => row.job_id || String(row.id));
++  if (!result.rowCount) {return [];}
++  const corrections = await query(`SELECT correction.co_ref, correction.proof, co.status, co.from_location,
++    ${completedCoArrivalSql()} AS completion_at
++    FROM dispatch_driver_co_identity_corrections correction JOIN local_co_orders co ON co.co_ref=correction.co_ref
++    WHERE correction.proof->>'planId'=ANY($1::text[])`,
++  [[...new Set(result.rows.map(row => String(row.plan_id)))]]);
++  return result.rows.filter(row => driverActivityOrderRefs(row, corrections.rows).some(ref => refs.includes(ref)))
++    .map(row => row.job_id || String(row.id));
+ }
+ 
+ async function offlineEvidence({ planId = null } = {}) {
+@@ -423,7 +432,8 @@
+   // queries on the same transaction connection.
+   if (lock && salesLineIds) {await lockDependencyOperatorOrders(memberRefs, guardedTransferRefs);}
+   const closed = await closedOrderRefs(guardedRefs);
+-  const operatorRefs = await operatorActivityRefs({ salesRefs: memberRefs, transferRefs: guardedTransferRefs, salesLineIds });
++  const operatorRefs = await operatorActivityRefs({ salesRefs: memberRefs, transferRefs: guardedTransferRefs, salesLineIds,
++    allowReceivedCo: action === "link_to" && Boolean(salesLineIds?.length) });
+   const receivingRefs = await receivingActivityRefs({ purchaseRefs, transferRefs: guardedTransferRefs });
+   const executionIds = completedUnlink ? [] : await dependencyExecutionIds({ dependencyIds, transferRefs });
+   const jobIds = await driverActivity({ refs: guardedRefs });
+--- a/src/operator-linked-transfer-plan.js
++++ b/src/operator-linked-transfer-plan.js
+@@ -0,0 +1,51 @@
++// A direct TO rides the SO's route. Operator needs that assignment while Dispatch
++// must continue treating the TO as linked, not independently scheduled.
++export function operatorLinkedTransferPlanJoinSql(alias = "transfer_orders") {
++  return `LEFT JOIN LATERAL (
++    SELECT dependency.planned_plan_id AS linked_plan_id,
++           dependency.planned_date AS linked_plan_date,
++           dependency.planned_truck_plate AS linked_truck_plate,
++           dependency.planned_load_name AS linked_load_name,
++           COALESCE(NULLIF(load.value->>'parkingSpot',''),truck.value->>'parkingSpot','') AS linked_parking_spot,
++           GREATEST(dependency.created_at,COALESCE(plan.confirmed_at,plan.created_at)) AS linked_planned_at
++      FROM order_dependencies dependency
++      JOIN dispatch_plans plan ON plan.id=dependency.planned_plan_id AND plan.status='confirmed'
++      JOIN dispatch_plan_snapshots snapshot ON snapshot.plan_id=plan.id
++      CROSS JOIN LATERAL jsonb_array_elements(snapshot.trucks) truck(value)
++      CROSS JOIN LATERAL jsonb_array_elements(truck.value->'loads') load(value)
++     WHERE dependency.transfer_order_id=${alias}.netsuite_id
++       AND NOT COALESCE(${alias}.dispatch_planned,false)
++       AND dependency.dependency_mode='direct_to_customer'
++       AND dependency.status NOT IN ('cancelled','attention')
++       AND dependency.planned_date=plan.plan_date
++       AND load.value->>'id'=dependency.planned_load_id
++       AND COALESCE(load.value->>'returnOnly','false')<>'true'
++       AND EXISTS (
++         SELECT 1 FROM jsonb_array_elements(load.value->'stops') stop(value)
++         JOIN LATERAL jsonb_array_elements(snapshot.orders) target(value)
++           ON target.value->>'id'=stop.value->>'orderId' AND target.value->>'type'='SO'
++         WHERE stop.value->>'type'='drop' AND (
++           target.value->>'id'=COALESCE(dependency.dispatch_target_ref,dependency.sales_order_ref)
++           OR target.value->'childOrders' ? COALESCE(dependency.dispatch_target_ref,dependency.sales_order_ref)
++         )
++       )
++     ORDER BY dependency.id LIMIT 1
++  ) operator_linked_plan ON true`;
++}
++
++export function operatorTransferPlanValueSql(field, alias = "transfer_orders") {
++  if (field === "dispatch_planned") {return `(linked_plan_id IS NOT NULL OR COALESCE(${alias}.dispatch_planned,false))`;}
++  const linked = {
++    dispatch_plan_date: "linked_plan_date", dispatch_planned_at: "linked_planned_at",
++    dispatch_truck_plate: "linked_truck_plate", dispatch_load_name: "linked_load_name",
++    dispatch_parking_spot: "linked_parking_spot"
++  }[field];
++  if (!linked) {throw new Error(`Unsupported Operator plan field: ${field}`);}
++  return `COALESCE(${linked},${alias}.${field})`;
++}
++
++export function operatorTransferPlanColumnsSql(alias = "transfer_orders") {
++  return ["dispatch_planned", "dispatch_plan_date", "dispatch_planned_at", "dispatch_truck_plate",
++    "dispatch_load_name", "dispatch_parking_spot"]
++    .map(field => `${operatorTransferPlanValueSql(field, alias)} AS ${field}`).join(",\n");
++}
+--- a/src/delivery-repository.js
++++ b/src/delivery-repository.js
+@@ -1,4 +1,5 @@
+ import { outboundLocationIds, outboundYardLocationId } from "./outbound-location-domain.js";
++import { operatorLinkedTransferPlanJoinSql, operatorTransferPlanColumnsSql, operatorTransferPlanValueSql } from "./operator-linked-transfer-plan.js";
+ import { ensureOutboundLocationDirectory } from "./outbound-location-runtime.js";
+ import { digestDispatchPlan } from "./dispatch-planner-performance.js";
+ import { deferDispatchPlanMaintenance } from "./dispatch-plan-maintenance-queue.js";
+@@ -1870,13 +1871,12 @@
+               NULL::text AS delivery_method, outbound_operator_status AS operator_status,
+               local_yard_order_status, preparing_operator_id, preparing_started_at,
+                status_updated_at, netsuite_active, false AS is_test_fixture, synced_at, fulfillment_status,
+-              dispatch_planned, dispatch_plan_date, dispatch_planned_at, dispatch_truck_plate,
+-              dispatch_load_name, dispatch_parking_spot, expected_delivery_date,
++              ${operatorTransferPlanColumnsSql()}, expected_delivery_date,
+               dispatch_address, dispatch_window_start, dispatch_window_end,
+               dispatch_instructions, memo, 'transfer_order'::text AS order_type,
+               from_location_id AS source_location_id, from_location AS source_location,
+               to_location_id AS destination_location_id, to_location AS destination_location
+-	       FROM transfer_orders
++	       FROM transfer_orders ${operatorLinkedTransferPlanJoinSql()}
+ 	       WHERE from_location_id IS NOT NULL
+ 	         AND NOT ${netSuiteClosedOrderFamilySql("transfer_orders", "TO")}
+      ),
+@@ -2078,12 +2078,13 @@
+ 	            AND (COALESCE(is_test_fixture, false) = false OR ${sandboxSql})
+            AND (netsuite_active = true OR (${sandboxSql} AND COALESCE(is_test_fixture, false)))
+        UNION ALL
+-       SELECT dispatch_truck_plate, dispatch_load_name, from_location_id AS outbound_location_id,
++       SELECT ${operatorTransferPlanValueSql("dispatch_truck_plate")} AS dispatch_truck_plate,
++              ${operatorTransferPlanValueSql("dispatch_load_name")} AS dispatch_load_name, from_location_id AS outbound_location_id,
+               outbound_operator_status AS operator_status, local_yard_order_status,
+               'transfer_order'::text AS order_type, false AS reload_authorized
+-         FROM transfer_orders
+-	        WHERE dispatch_plan_date = $1
+-	          AND COALESCE(dispatch_truck_plate, '') <> ''
++         FROM transfer_orders ${operatorLinkedTransferPlanJoinSql()}
++	        WHERE ${operatorTransferPlanValueSql("dispatch_plan_date")} = $1
++	          AND COALESCE(${operatorTransferPlanValueSql("dispatch_truck_plate")}, '') <> ''
+ 	          AND from_location_id IS NOT NULL
+ 	          AND NOT ${netSuiteClosedOrderFamilySql("transfer_orders", "TO")}
+ 	          AND netsuite_active = true
+@@ -2435,13 +2436,12 @@
+               NULL::text AS delivery_method, outbound_operator_status AS operator_status,
+               local_yard_order_status, preparing_operator_id, preparing_started_at,
+                status_updated_at, netsuite_active, false AS is_test_fixture, synced_at, fulfillment_status,
+-              dispatch_planned, dispatch_plan_date, dispatch_planned_at, dispatch_truck_plate,
+-              dispatch_load_name, dispatch_parking_spot, expected_delivery_date,
++              ${operatorTransferPlanColumnsSql()}, expected_delivery_date,
+               dispatch_address, dispatch_window_start, dispatch_window_end,
+               dispatch_instructions, memo, 'transfer_order'::text AS order_type,
+               from_location_id AS source_location_id, from_location AS source_location,
+               to_location_id AS destination_location_id, to_location AS destination_location
+-	       FROM transfer_orders
++	       FROM transfer_orders ${operatorLinkedTransferPlanJoinSql()}
+ 	       WHERE from_location_id IS NOT NULL
+ 	         AND ${transferVisibilitySql}
+      ),
+--- a/src/order-dependency-repository.js
++++ b/src/order-dependency-repository.js
+@@ -5101,7 +5101,7 @@
+           [dependency.id, plan.id || null, plan.planDate, assignment.truckPlate,
+             assignment.loadId || null, assignment.loadName || null]
+         );
+-      } else if (String(dependency.plannedDate || "").slice(0, 10) === String(plan.planDate || "").slice(0, 10)) {
++      } else if (dateText(dependency.plannedDate) === dateText(plan.planDate)) {
+         await query(
+           `UPDATE order_dependencies
+               SET planned_plan_id = null, planned_date = null, planned_truck_plate = null,
+--- a/src/dispatch-group-action-repository.js
++++ b/src/dispatch-group-action-repository.js
+@@ -0,0 +1,89 @@
++import { query, withTransaction } from "./db.js";
++import { DISPATCH_FLEET_PLANNING_LOCK } from "./dispatch-fleet-status.js";
++import { assertNoClosedNetSuiteOrders } from "./netsuite-closed-order-repository.js";
++import { upsertDispatchOrderCatalog } from "./dispatch-order-catalog-repository.js";
++import { compactDispatchOrderCard, dispatchOrderSearchText } from "./dispatch-planner-optimization.js";
++import { aggregateGlobalGroup } from "./dispatch-delivery-group-repository.js";
++import { applyActiveTransitCoMetadata } from "./dispatch-planner-performance.js";
++
++const deliveryFields = ["address", "destinationAddress", "defaultDestinationAddress", "deliveryAddressOverride",
++  "pickupAddressOverride", "sourceAddress", "defaultSourceAddress", "expectedDeliveryDate", "windowStart", "windowEnd",
++  "vendorYard", "instructions", "parseSource"];
++const text = value => String(value ?? "").trim();
++const failure = (message, code = "DISPATCH_GROUP_ACTION_INVALID") => Object.assign(new Error(message), { status: 409, code });
++
++async function groupDefinition(ref) {
++  return (await query(`SELECT group_ref,order_type,full_order,active FROM dispatch_global_order_groups
++    WHERE lower(group_ref)=lower($1) FOR UPDATE`, [ref])).rows[0];
++}
++
++async function expandGroup(row, state, path = new Set()) {
++  const key = row.group_ref.toLowerCase();
++  if (!row.active) {
++    throw failure(`${row.group_ref} was retired. Reload Dispatch before editing it.`, "DISPATCH_DERIVED_ORDER_RETIRED");
++  }
++  if (path.has(key)) { throw failure("The grouped order has circular membership. Reload Dispatch."); }
++  if (row.order_type !== state.type) { throw failure("Grouped actions require children of the same order type."); }
++  const refs = [...new Set((row.full_order.childOrders || []).map(text).filter(Boolean))];
++  if (!refs.length) { throw failure("The grouped order has no child orders."); }
++  state.groups.set(key, row);
++  const nextPath = new Set([...path, key]);
++  for (const ref of refs) {
++    const nested = await groupDefinition(ref);
++    if (nested) { await expandGroup(nested, state, nextPath); }
++    else { state.leaves.add(ref); }
++    if (state.leaves.size + state.groups.size > 200) { throw failure("This group is too large for one edit."); }
++  }
++}
++
++function actionSnapshot(order, childOrderDetails) {
++  const next = aggregateGlobalGroup(order, childOrderDetails, { preserveTransitCo: true });
++  const representative = childOrderDetails[0];
++  for (const field of deliveryFields) {
++    if (Object.hasOwn(representative, field)) { next[field] = representative[field]; }
++  }
++  const co = order.transitCo;
++  return applyActiveTransitCoMetadata(next, co ? [{ ...co, coRef: co.id, sourceOrderRef: order.id }] : []);
++}
++
++async function persistGroups(state, children) {
++  const byRef = new Map(children.map(order => [order.id.toLowerCase(), order]));
++  for (const row of [...state.groups.values()].reverse()) {
++    const childOrderDetails = row.full_order.childOrders.map(ref => byRef.get(ref.toLowerCase()));
++    if (childOrderDetails.some(child => !child)) { throw failure("A grouped child is unavailable. Reload Dispatch."); }
++    const current = (await groupDefinition(row.group_ref)).full_order;
++    const next = await state.projectGroup(actionSnapshot(current, childOrderDetails));
++    await query(`UPDATE dispatch_global_order_groups SET full_order=$2::jsonb,card=$3::jsonb,
++      search_text=$4,updated_at=now() WHERE group_ref=$1`,
++    [row.group_ref, JSON.stringify(next), JSON.stringify(compactDispatchOrderCard(next)), dispatchOrderSearchText(next)]);
++    byRef.set(row.group_ref.toLowerCase(), next);
++  }
++  return byRef;
++}
++
++// Membership comes from canonical definitions, never the caller's card or a
++// formatted reference. One transaction protects both source rows and projections.
++export async function applyDispatchGroupAction(orderRef, { types, updateChild, loadChildren, projectGroup }) {
++  return withTransaction(async () => {
++    await query("SELECT pg_advisory_xact_lock(hashtext($1))", [DISPATCH_FLEET_PLANNING_LOCK]);
++    const root = await groupDefinition(orderRef);
++    if (!root) { return null; }
++    if (!types.includes(root.order_type)) {
++      throw failure("This group does not support that edit. Use Manage CO to change a CO route.");
++    }
++    const state = { type: root.order_type, groups: new Map(), leaves: new Set(), projectGroup };
++    await expandGroup(root, state);
++    const refs = [...state.leaves].sort();
++    await assertNoClosedNetSuiteOrders(refs, "change grouped Dispatch details");
++    for (const ref of refs) { await updateChild(ref, state.type); }
++    const children = await loadChildren(refs, state.type);
++    if (children.length !== refs.length || children.some(child => child.type !== state.type)) {
++      throw failure("A grouped child is unavailable. No changes were saved. Reload Dispatch.");
++    }
++    await upsertDispatchOrderCatalog({ orders: children, source: "dispatch-group-action" });
++    const byRef = await persistGroups(state, children);
++    const order = byRef.get(root.group_ref.toLowerCase());
++    await query(`UPDATE dispatch_order_catalog_state SET generation=generation+1,updated_at=now() WHERE singleton=true`);
++    return { tranid: root.group_ref, child_order_refs: refs, dispatch_address: order.address, order };
++  });
++}
+--- a/src/dispatch-repository.js
++++ b/src/dispatch-repository.js
+@@ -9,6 +9,7 @@
+ import { dispatchLoadAssignment } from "./dispatch-load-assignment.js";
+ import { DISPATCH_FLEET_PLANNING_LOCK } from "./dispatch-fleet-status.js";
+ import { updateDispatchSalesSplitDetails } from "./dispatch-delivery-group-repository.js";
++import { applyDispatchGroupAction } from "./dispatch-group-action-repository.js";
+ import { assertDispatchExecutedPrefixPreserved } from "./dispatch-executed-prefix-repository.js";
+ import {
+   syncDispatchPlanOrderAssignments,
+@@ -2092,7 +2093,35 @@
+   };
+ }
+ 
++async function loadGroupActionChildren(refs, type) {
++  const splits = (await query(`SELECT split_ref,full_order FROM dispatch_global_order_splits
++    WHERE split_ref=ANY($1::text[]) AND active=true`, [refs])).rows;
++  const splitRefs = new Set(splits.map(row => row.split_ref));
++  const sourceRefs = refs.filter(ref => !splitRefs.has(ref));
++  const sourceOrders = sourceRefs.length
++    ? await listDispatchOrders({ type, exactOrderRefs: sourceRefs, includeHiddenScm: true }) : [];
++  return [...splits.map(row => row.full_order), ...sourceOrders.filter(order => sourceRefs.includes(order.id))];
++}
++
++async function projectGroupActionRoute(order) {
++  if (order.type !== "PO") return order;
++  const next = { ...order, dropoffs: purchaseOrderDropoffs(order.items, {
++    destinationLocationId: order.destinationLocationId,
++    destinationYard: order.destinationYard,
++    destinationAddress: order.defaultDestinationAddress,
++    destinationAddressOverride: order.deliveryAddressOverride
++  }) };
++  const lineIds = (order.items || []).map(item => item.lineRowId).filter(Boolean);
++  const allocations = await query(`SELECT * FROM dispatch_so_po_allocations
++    WHERE status='active' AND po_line_id=ANY($1::bigint[]) ORDER BY id`, [lineIds]);
++  return projectPurchaseOrderRouteResidual(next, allocations.rows, { force: true });
++}
++
+ export async function setPurchaseOrderVendorYard(orderRef, vendorYardId) {
++  const grouped = await applyDispatchGroupAction(orderRef, { types: ["PO"],
++    updateChild: ref => setPurchaseOrderVendorYard(ref, vendorYardId), loadChildren: loadGroupActionChildren,
++    projectGroup: projectGroupActionRoute });
++  if (grouped) return grouped;
+   await assertNoClosedNetSuiteOrders([orderRef], "change vendor yard in Dispatch");
+   const yard = await query(
+     `SELECT id, vendor, yard, day_label, window_start, window_end, instructions, address
+@@ -2111,7 +2140,7 @@
+             dispatch_vendor_yard = $6,
+             dispatch_parse_source = 'manual-po-yard',
+             dispatch_parsed_at = now()
+-      WHERE tranid = $1 OR netsuite_id::text = $1
++      WHERE tranid = $1 OR netsuite_id::text = $1 OR dispatch_ref = $1
+       RETURNING netsuite_id, tranid`,
+     [
+       orderRef,
+@@ -2127,6 +2156,10 @@
+ }
+ 
+ export async function updateDispatchOrderDetails(orderRef, patch = {}) {
++  const grouped = await applyDispatchGroupAction(orderRef, { types: ["SO", "PO", "TO"],
++    updateChild: (ref, type) => updateDispatchOrderDetails(ref, { ...patch, type, sourceTable: "", source_table: "" }),
++    loadChildren: loadGroupActionChildren, projectGroup: projectGroupActionRoute });
++  if (grouped) return grouped;
+   await assertNoClosedNetSuiteOrders([orderRef], "change Dispatch details");
+   const split = await updateDispatchSalesSplitDetails(orderRef, patch);
+   if (split) return split;
+@@ -2170,7 +2203,7 @@
+               dispatch_pickup_address = CASE WHEN $6::boolean THEN $7 ELSE dispatch_pickup_address END,
+               dispatch_parse_source = 'manual-dispatch-details',
+               dispatch_parsed_at = now()
+-        WHERE (tranid = $1 OR netsuite_id::text = $1)
++        WHERE (tranid = $1 OR netsuite_id::text = $1${table === "purchase_orders" ? " OR dispatch_ref = $1" : ""})
+         RETURNING netsuite_id, tranid, ${deliveryAddressColumn} AS dispatch_address,
+                   ${returnedDeliveryAddress} AS dispatch_delivery_address, dispatch_window_start,
+                   dispatch_window_end, expected_delivery_date, dispatch_pickup_address,
+--- a/src/server.js
++++ b/src/server.js
+@@ -17285,7 +17285,8 @@
+       details: { vendorYardId: req.body?.vendorYardId }
+     }).catch(() => null);
+     emitAppEvent("dispatch.orders.updated", { orderId: req.params.id, type: "PO", change: "vendor_yard", sourceSessionId: req.body?.audit?.sessionId });
+-    const orderResponse = await dispatchMutationOrderResponse(req, [req.params.id], { legacyType: "PO" });
++    const orderResponse = updated.order ? { orders: [updated.order] }
++      : await dispatchMutationOrderResponse(req, [req.params.id], { legacyType: "PO" });
+     res.json({ updated, order: req.query.response === "targeted" ? orderResponse.orders[0] || null : undefined, ...orderResponse });
+   } catch (error) {
+     next(error);
+@@ -17336,7 +17337,7 @@
+       return res.json({ updated });
+     }
+     if (req.query.response === "targeted") {
+-      const order = (await targetedDispatchMutationOrders([req.params.id]))[0] || null;
++      const order = updated.order || (await targetedDispatchMutationOrders([req.params.id]))[0] || null;
+       return res.json({ updated, order });
+     }
+     res.json({ updated, orders: await listDispatchOrdersForResponse() });
+--- a/public/dispatch.css
++++ b/public/dispatch.css
+@@ -7001,14 +7001,15 @@
+ }
+ 
+ .selected-order-actions {
+-  display: grid;
+-  grid-template-columns: minmax(0, 1fr) repeat(4, auto);
++  display: flex;
++  flex-wrap: wrap;
+   gap: 6px;
+   align-items: center;
+   padding-top: 2px;
+ }
+ 
+ .selected-order-actions span {
++  flex: 1 0 100%;
+   min-width: 0;
+   overflow: hidden;
+   text-overflow: ellipsis;
+@@ -7019,6 +7020,8 @@
+ }
+ 
+ .selected-order-actions button {
++  flex: 0 0 auto;
++  white-space: nowrap;
+   min-height: 28px;
+   padding: 0 7px;
+   font-size: 11px;
+--- a/public/dispatch.js
++++ b/public/dispatch.js
+@@ -10114,8 +10114,8 @@
+ 
+ function dropAddressForStop(stop = {}, order = {}) {
+   const location = dropLocationForStop(stop, order);
+-  return stop.dropAddress
+-    || dropoffForStop(order, stop)?.address
++  return dropoffForStop(order, stop)?.address
++    || stop.dropAddress
+     || HUBS[dispatchLocationHierarchyRoot(location)]?.address
+     || order?.destinationAddress
+     || order?.address
+@@ -11610,9 +11610,9 @@
+       ${!reviewOnly && !reconciliationBlocked && order.type === "PO" && order.sourceTable !== "scm_vrma_orders" ? `<button data-action="open-po-yard-modal" data-order-ref="${escapeHtml(order.id)}" type="button">Set Yard</button>` : ""}
+       ${!reviewOnly && order.type === "SO" ? `<button data-action="open-po-link-modal" data-order-ref="${escapeHtml(order.id)}" type="button">Link PO</button>` : ""}
+       ${!reviewOnly && order.type === "SO" ? `<button data-action="open-to-link-modal" data-order-ref="${escapeHtml(order.id)}" type="button">Link TO</button>` : ""}
+-      ${!reviewOnly && !reconciliationBlocked && !["CO", "CUSTOM"].includes(order.type) && order.sourceTable !== "scm_vrma_orders" && !order.originalOrderId ? `<button data-action="open-split-modal" data-order-ref="${escapeHtml(order.id)}" type="button">Split</button>` : ""}
++      ${!reviewOnly && !reconciliationBlocked && !["CO", "CUSTOM"].includes(order.type) && order.sourceTable !== "scm_vrma_orders" && !order.originalOrderId ? `<button data-action="open-split-modal" data-order-ref="${escapeHtml(order.id)}" ${groupedCount ? 'disabled title="Ungroup first, then split the child order"' : ""} type="button">Split</button>` : ""}
+       ${!reviewOnly && !reconciliationBlocked && order.type !== "CUSTOM" && order.originalOrderId ? `<button data-action="unsplit-order" data-order-ref="${escapeHtml(order.id)}" type="button">Unsplit</button>` : ""}
+-      ${!reviewOnly && canConsolidatePick(order) ? `<button data-action="open-consolidate-modal" data-order-ref="${escapeHtml(order.id)}" type="button">Consolidate Pick</button>` : ""}
++      ${!reviewOnly && canConsolidatePick(order) ? `<button data-action="open-consolidate-modal" data-order-ref="${escapeHtml(order.id)}" ${groupedCount ? 'disabled title="Ungroup first, then consolidate the child order that needs stock"' : ""} type="button">Consolidate Pick</button>` : ""}
+       ${!SALES_PLANNING_HOST && !dispatchCompleted && !reviewOnly && !reconciliationBlocked && !groupedCount && selected.length === 1 && dispatchCompletionOrderKind(order) ? `<button data-action="manual-complete-order" data-order-ref="${escapeHtml(order.id)}" type="button" title="Use only when the Driver physically completed this order but forgot to submit the PWA stop">Mark completed</button>` : ""}
+     </div>
+   `;
+@@ -14474,6 +14474,10 @@
+ function splitOrder(orderId, parts = 2, startSuffix = 1) {
+   const order = orderById(orderId);
+   if (!order || order.type === "CUSTOM") return;
++  if (order.childOrders?.length) {
++    routeNotice = "Ungroup first, then split the child order.";
++    return;
++  }
+   const cleanParts = Math.min(Math.max(Number(parts) || 2, 2), 10);
+   const cleanStartSuffix = Math.max(Number(startSuffix) || 1, 1);
+   const originalPallets = order.pallets;
+@@ -14909,6 +14913,10 @@
+ function consolidatePick(orderId, sourceYard) {
+   const order = orderById(orderId);
+   if (!order) return;
++  if (order.childOrders?.length) {
++    routeNotice = "Ungroup first, then consolidate the child order that needs stock.";
++    return;
++  }
+   const shortage = shortageQty(order);
+   const yard = consolidateYards(order).find((item) => item.yard === sourceYard);
+   if (!yard) return;
+@@ -17682,14 +17690,16 @@
+       ? `/api/dispatch/orders/${encodeURIComponent(order.id)}/details?response=targeted`
+       : `/api/dispatch/orders/${encodeURIComponent(order.id)}/details?response=ack`;
+     const persistentSalesSplit = order.type === "SO" && Boolean(splitParentOrderId(order));
+-    const saveDetails = isLocalDispatchOrder(order) && !persistentSalesSplit
++    const persistentGroup = Boolean(order.childOrders?.length)
++      && (order.type !== "CO" || order.childOrders.every(ref => String(ref).startsWith("CO-")));
++    const saveDetails = isLocalDispatchOrder(order) && !persistentSalesSplit && !persistentGroup
+       ? Promise.resolve({ orders: null })
+       : Promise.resolve().then(async () => {
+-          if (persistentSalesSplit) {
++          if (persistentSalesSplit || persistentGroup) {
+             const orderId = order.id;
+             await saveCurrentPlanNow();
+             order = orderById(orderId);
+-            if (!order) throw new Error("The split is no longer available. Reload Dispatch before editing it.");
++            if (!order) throw new Error("The order is no longer available. Reload Dispatch before editing it.");
+           }
+           return fetch(detailsEndpoint, {
+             method: "PUT",
+@@ -17728,6 +17738,7 @@
+       order.expectedDeliveryDate = data.expectedDeliveryDate || "";
+       order.windowStart = windowStart;
+       order.windowEnd = windowEnd;
++      if (payload.updated?.order) Object.assign(order, payload.updated.order);
+       mergeTargetedDispatchMutationOrders(payload);
+       const savedOrder = orderById(order.id) || order;
+       let coOrder = null;
+--- a/public/dispatch.html
++++ b/public/dispatch.html
+@@ -4,7 +4,7 @@
+     <meta charset="UTF-8" />
+     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+     <title>MBBS Dispatch Planning</title>
+-    <link rel="stylesheet" href="/dispatch.css?v=20260917-save-reliability-v1" />
++    <link rel="stylesheet" href="/dispatch.css?v=20260918-linked-to-v1" />
+     <link rel="stylesheet" href="/delivery-instructions.css?v=20260812-delivery-image-720p-v1" />
+     <link rel="stylesheet" href="/i18n.css?v=20260701-i18n-v2" />
+   </head>
+@@ -14,6 +14,6 @@
+     <script src="/app-sidebar.js?v=20260728-custom-orders-v1"></script>
+     <script src="/dispatch-auth.js?v=20260724-sales-auth-v2"></script>
+     <script src="/delivery-instruction-upload.js?v=20260812-delivery-image-720p-v1"></script>
+-    <script src="/dispatch.js?v=20260917-order-update-save-v1"></script>
++    <script src="/dispatch.js?v=20260918-group-actions-v1"></script>
+   </body>
+ </html>

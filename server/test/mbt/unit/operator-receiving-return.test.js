@@ -7,14 +7,16 @@ test("Back to Receiving clears search and invalidates stale requests before relo
   const source = readFileSync(new URL("../../../public/operator.js", import.meta.url), "utf8");
   const start = source.indexOf("async function finishReceipt()");
   const fn = source.slice(start, source.indexOf("async function loadPersonalHistory()", start));
+  const journalStart = source.indexOf("function receiptPostingJournalKey(");
+  const journal = journalStart < 0 ? "" : source.slice(journalStart, source.indexOf("function observeReceiptPostingJob(", journalStart));
   const calls = [];
   const context = vm.createContext({
-    receiptOrder: { order_type: "purchase_order" }, receiptResult: { itemReceiptTranid: "IR14634" }, receivingOrderType: "purchase_order",
+    receiptOrder: { order_type: "purchase_order" }, receiptResult: { itemReceiptTranid: "IR14634" }, receiptServiceWorkerReloadPending: false, receivingOrderType: "purchase_order",
     receivingSearch: "SN1400333", receivingItemSearch: "PALLET", receivingSelectedId: "old", receivingSelectedOrder: {}, receivingOrders: [{}], receivingItemSuggestions: [{}], receivingOrderPage: 4,
     stopReceiptCamera: () => {}, invalidateReceivingRequests: () => calls.push("invalidate"), saveOperatorState: () => calls.push("save"),
     loadReceivingOrders: async () => calls.push("reload"), render: () => calls.push("render")
   });
-  vm.runInContext(`${fn}\nfinishReceipt()`, context);
+  vm.runInContext(`${journal}\n${fn}\nfinishReceipt()`, context);
   await new Promise((resolve) => setImmediate(resolve));
   assert.equal(context.receivingSearch, "");
   assert.equal(context.receivingItemSearch, "");

@@ -68,7 +68,11 @@ function salesReturnReference(record) {
 function salesReturnStatus(record) {
   const syncStatus = String(salesFirst(record, ["netSuiteSyncStatus", "netsuite_sync_status"], "")).toLowerCase();
   if (syncStatus === "failed") {
-    return salesReturnType(record) === "pallet" ? "credit_memo_creation_failed" : "ra_creation_failed";
+    return salesReturnType(record) === "pallet" && Number(record.workflowVersion || 1) < 2 ? "credit_memo_creation_failed" : "ra_creation_failed";
+  }
+  if (Number(record.workflowVersion) >= 2 && !["voided", "rejected"].includes(record.status)) {
+    const result = { disabled: "local_only", pending: "ra_pending", succeeded: "ra_created", manual_linked: "ra_created" }[syncStatus];
+    if (result) {return result;}
   }
   return String(salesFirst(record, ["status", "returnStatus", "return_status", "approvalStatus", "approval_status"], "unknown"))
     .trim()
@@ -88,6 +92,9 @@ function salesReturnStatusLabel(recordOrStatus) {
     rejected: "Rejected",
     partially_rejected: "Partially Rejected",
     voided: "Voided",
+    local_only: "Local only",
+    ra_pending: "RA Pending",
+    ra_created: "RA Created",
     ra_creation_failed: "RA Creation Failed",
     credit_memo_creation_failed: "Credit Memo Creation Failed",
     sync_failed: "NetSuite Sync Failed",
@@ -159,7 +166,7 @@ function salesReturnPhotoRef(photo) {
 
 function salesReturnPhotoImgAttributes(photo) {
   const ref = salesReturnPhotoRef(photo);
-  if (!ref.startsWith("r2://")) return `src="${salesEscape(ref)}"`;
+  if (!ref.startsWith("r2://") && !ref.startsWith("operator-photo://")) return `src="${salesEscape(ref)}"`;
   return `data-secure-photo-ref="${salesEscape(ref)}"`;
 }
 

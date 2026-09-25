@@ -78,6 +78,7 @@ export async function createDispatchV2Fixture({ role = "dispatcher" } = {}) {
     const listener = app.listen(0, "127.0.0.1", () => resolve(listener));
   });
   const baseUrl = `http://127.0.0.1:${server.address().port}`;
+  const leaseSessions = new Map();
 
   /**
    * @param {string} path
@@ -145,6 +146,7 @@ export async function createDispatchV2Fixture({ role = "dispatcher" } = {}) {
     });
     assert.equal(result.response.status, 200, JSON.stringify(result.payload));
     assert.ok(result.payload.editLeaseToken, "The v2 command fixture needs a normal dispatcher edit lease.");
+    leaseSessions.set(result.payload.editLeaseToken, sessionId);
     return result.payload.editLeaseToken;
   }
 
@@ -157,5 +159,6 @@ export async function createDispatchV2Fixture({ role = "dispatcher" } = {}) {
     await closeDb();
   }
 
-  return { request, seedPlan, acquireLease, close, operator, session, username };
+  return { request, seedPlan, acquireLease, close, operator, session, username, baseUrl,
+    leaseSession: token => leaseSessions.get(token) };
 }

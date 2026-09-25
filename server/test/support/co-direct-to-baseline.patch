@@ -1,0 +1,256 @@
+--- a/src/co-direct-to-cargo.js
++++ /dev/null
+@@ -1,105 +0,0 @@
+-import { query, withTransaction } from "./db.js";
+-import { writeAudit } from "./auth-repository.js";
+-import { lockConsolidatedLoadOrders } from "./consolidation-load-locks.js";
+-import { dispatchLocationsShareYard } from "./dispatch-location.js";
+-
+-const FIELDS = ["quantity", "pallet_qty", "layer_qty", "section_qty", "piece_qty"];
+-const ITEM_FIELDS = ["quantity", "pallets", "layers", "sections", "pieces"];
+-const PACKED = ["packed_sales_qty", "packed_pallet_qty", "packed_layer_qty", "packed_section_qty", "packed_piece_qty"];
+-
+-function conflict(message) {
+-  return Object.assign(new Error(message), { code: "CO_DIRECT_TO_CARGO_CONFLICT", status: 409 });
+-}
+-
+-function quantity(value) {
+-  const number = Number(value || 0);
+-  if (!Number.isFinite(number) || number < 0) {throw conflict("CO cargo has an invalid quantity.");}
+-  return number;
+-}
+-
+-// Keep the independent CO requirement so refreshes and unlinking are reversible.
+-export function coDirectToRequirement(line, allocatedQuantity) {
+-  const base = Object.fromEntries(FIELDS.map(field => [field, quantity((line.raw?.coDirectToRequirement || line)[field])]));
+-  const allocated = quantity(allocatedQuantity);
+-  const remaining = Math.max(0, base.quantity - allocated);
+-  const ratio = base.quantity > 0 ? remaining / base.quantity : 1;
+-  return { base, required: Object.fromEntries(FIELDS.map(field => [field,
+-    Number((field === "quantity" ? remaining : base[field] * ratio).toFixed(6))])) };
+-}
+-
+-export function restoreCoSourceRequirement(item) {
+-  const base = item.coDirectToRequirement;
+-  return base ? { ...item, ...Object.fromEntries(FIELDS.map((field, index) => [ITEM_FIELDS[index], quantity(base[field])])) } : item;
+-}
+-
+-function sourceRefs(co) {
+-  return [...new Set([co.source_order_ref, ...(co.details?.childOrderIds || [])].filter(Boolean))];
+-}
+-
+-function sourceLineFor(line, sources) {
+-  const rowId = line.raw?.lineRowId || line.raw?.line_row_id;
+-  const matches = sources.filter(source => String(source.item_id) === String(line.item_id)
+-    && (rowId ? String(source.id) === String(rowId) : String(source.line_id) === String(line.line_id)));
+-  if (matches.length > 1) {throw conflict("CO cargo matches multiple SO lines. Refresh its source line identity before linking.");}
+-  return matches[0];
+-}
+-
+-function assertCargoEditable(co, line) {
+-  if (co.preparing_operator_id || co.preparing_started_at || co.status === "preparing"
+-    || line.confirmed_at || PACKED.some(field => quantity(line[field]) > 0)) {
+-    throw conflict(`${co.co_ref} has operator work on affected cargo. Release that work before changing its TO link.`);
+-  }
+-}
+-
+-async function reconcileCo(co, requestedBy) {
+-  const lines = (await query("SELECT * FROM local_co_order_lines WHERE co_id=$1 ORDER BY id FOR UPDATE", [co.id])).rows;
+-  const sources = (await query(`SELECT line.*,sales.outbound_location FROM sales_order_lines line
+-    JOIN sales_orders sales ON sales.netsuite_id=line.sales_order_id
+-    WHERE sales.tranid=ANY($1::text[])`, [sourceRefs(co)])).rows
+-    .filter(line => dispatchLocationsShareYard(line.outbound_location, co.from_location));
+-  const allocations = (await query(`SELECT line.sales_line_id,SUM(line.allocated_quantity) AS quantity
+-    FROM order_dependency_lines line JOIN order_dependencies dep ON dep.id=line.dependency_id
+-    WHERE line.sales_line_id=ANY($1::bigint[]) AND line.line_role='sales_allocation'
+-      AND dep.dependency_mode='direct_to_customer' AND dep.status<>'cancelled'
+-      AND COALESCE(dep.dispatch_target_ref,dep.sales_order_ref)=ANY($2::text[])
+-    GROUP BY line.sales_line_id`, [sources.map(line => line.id), sourceRefs(co)])).rows;
+-  const byId = new Map(allocations.map(row => [String(row.sales_line_id), quantity(row.quantity)]));
+-  const changes = [];
+-  for (const line of lines) {
+-    const sourceId = sourceLineFor(line, sources)?.id;
+-    const allocated = byId.get(String(sourceId)) || 0;
+-    if (!allocated && !line.raw?.coDirectToRequirement) {continue;}
+-    const { base, required } = coDirectToRequirement(line, allocated);
+-    const changed = FIELDS.some(field => quantity(line[field]) !== required[field]);
+-    if (changed) {assertCargoEditable(co, line);}
+-    if (!changed && line.raw?.coDirectToRequirement) {continue;}
+-    await query(`UPDATE local_co_order_lines SET quantity=$2,pallet_qty=$3,layer_qty=$4,section_qty=$5,piece_qty=$6,
+-      raw=COALESCE(raw,'{}'::jsonb)||jsonb_build_object('coDirectToRequirement',$7::jsonb) WHERE id=$1`,
+-    [line.id, ...FIELDS.map(field => required[field]), JSON.stringify(base)]);
+-    changes.push({ lineId: line.id, salesLineId: sourceId, allocatedQuantity: allocated,
+-      before: Object.fromEntries(FIELDS.map(field => [field, line[field]])), after: required });
+-  }
+-  if (changes.length) {
+-    await writeAudit({ actorType: "dispatcher", source: "dispatch", action: "delivery.co.direct_to.reconciled",
+-      orderId: co.delivery_order_id, details: { coRef: co.co_ref, requestedBy, lines: changes } });
+-  }
+-  return { coRef: co.co_ref, changes };
+-}
+-
+-export function reconcileCoDirectToCargo({ salesRefs = [], coRefs = [], requestedBy = "" } = {}) {
+-  return withTransaction(async () => {
+-    const candidates = (await query(`SELECT * FROM local_co_orders co
+-      WHERE (co.co_ref=ANY($1::text[]) OR co.source_order_ref=ANY($2::text[]) OR co.details->'childOrderIds' ?| $2::text[])
+-        AND co.status IN ('pending_load','preparing','packed','planned')
+-        AND co.loaded_at IS NULL AND co.received_at IS NULL ORDER BY co.id`, [coRefs, salesRefs])).rows;
+-    const sales = (await query("SELECT netsuite_id FROM sales_orders WHERE tranid=ANY($1::text[])",
+-      [[...new Set(candidates.flatMap(sourceRefs))]])).rows;
+-    await lockConsolidatedLoadOrders([...candidates.map(co => co.delivery_order_id || -Number(co.id)), ...sales.map(row => row.netsuite_id)]);
+-    const locked = (await query(`SELECT * FROM local_co_orders WHERE id=ANY($1::bigint[])
+-      AND status IN ('pending_load','preparing','packed','planned') AND loaded_at IS NULL AND received_at IS NULL
+-      ORDER BY id FOR UPDATE`, [candidates.map(co => co.id)])).rows;
+-    const results = [];
+-    for (const co of locked) {results.push(await reconcileCo(co, requestedBy));}
+-    return results;
+-  });
+-}
+--- a/src/dispatch-repository.js
++++ b/src/dispatch-repository.js
+@@ -1,4 +1,3 @@
+-import { reconcileCoDirectToCargo, restoreCoSourceRequirement } from "./co-direct-to-cargo.js";
+ import crypto from "node:crypto";
+ import { withCoSourcePackingHandoff } from "./co-source-packing-handoff.js";
+ import { VOYAGE_DISPATCH_YARD } from "./dispatch-sales-order-locations.js";
+@@ -8945,7 +8944,7 @@
+ 
+ function localCoSourceItems(order = {}, fromYard = "") {
+   const children = Array.isArray(order.childOrderDetails) ? order.childOrderDetails : [];
+-  if (!children.length) return (Array.isArray(order.items) ? order.items : []).map(restoreCoSourceRequirement).filter(isLocalCoTransportItem);
++  if (!children.length) return (Array.isArray(order.items) ? order.items : []).filter(isLocalCoTransportItem);
+   const fromText = locationTextFromId(fromYard);
+   const selectedChildren = children.filter((child) => {
+     const yards = localCoChildSourceYards(child);
+@@ -8955,8 +8954,8 @@
+     Array.isArray(child.items) && child.items.length
+       ? child.items
+       : Array.isArray(child.raw?.items) ? child.raw.items : []
+-  )).map(restoreCoSourceRequirement).filter(isLocalCoTransportItem);
+-  if (!childItems.length) return (Array.isArray(order.items) ? order.items : []).map(restoreCoSourceRequirement).filter(isLocalCoTransportItem);
++  )).filter(isLocalCoTransportItem);
++  if (!childItems.length) return (Array.isArray(order.items) ? order.items : []).filter(isLocalCoTransportItem);
+   const unique = new Map();
+   childItems.forEach((item, index) => {
+     const key = String(item.lineRowId || item.line_row_id || item.lineId || item.line_id || `${item.itemId || item.item_id || item.sku || "item"}:${index}`);
+@@ -9155,12 +9154,10 @@
+     await query(
+       `DELETE FROM local_co_order_lines
+        WHERE co_id = $1
+-         AND NOT (line_id = ANY($2::bigint[]))
+-         AND NOT (quantity=0 AND raw ? 'coDirectToRequirement')`,
++         AND NOT (line_id = ANY($2::bigint[]))`,
+       [co.id, activeLineIds]
+     );
+   }
+-  await reconcileCoDirectToCargo({ coRefs: [coRef], requestedBy });
+   return getLocalCoOrder(coRef);
+ }
+ 
+--- a/src/delivery-repository.js
++++ b/src/delivery-repository.js
+@@ -1415,10 +1415,7 @@
+ 
+ function mapLocalCoOrderForDelivery(co = {}, lines = []) {
+   const details = co.details && typeof co.details === "object" ? co.details : {};
+-  const mappedLines = lines.map(mapLocalCoLineForDelivery);
+-  const releasedPacking = co.status === "pending_load" && !co.preparing_operator_id && !co.preparing_started_at
+-    && mappedLines.some(line => line.confirmed_at && lineHasPackedQuantity(line));
+-  const status = releasedPacking ? "packed" : String(co.status || "pending_load");
++  const status = String(co.status || "pending_load");
+   const loaded = isLocalCoLoaded(co);
+   const operatorStatus = loaded ? "loaded" : status === "packed" ? "packed" : status === "preparing" ? "preparing" : "open";
+   return {
+@@ -1428,7 +1425,7 @@
+     trandate: co.created_at,
+     customer_id: null,
+     customer: details.customer || "Transit Depot",
+-    status,
++    status: co.status,
+     status_text: co.status === "pending_load" ? "Local CO - Pending Load" : "Local CO",
+     foreign_total: null,
+     order_location_id: null,
+@@ -1464,9 +1461,8 @@
+     destination_location_id: co.to_location_id,
+     destination_location: co.to_location,
+     warning_count: 0,
+-    underpack_count: loaded ? 0 : mappedLines.filter(lineHasOpenQuantity).length,
+-    line_count: mappedLines.filter(hasDeliveryDisplayQuantity).length,
+-    lines: mappedLines.map(line => loaded ? projectLoadedCoLine(line, lineRequiredSalesQuantity(line)) : line).filter(hasDeliveryDisplayQuantity)
++    underpack_count: 0,
++    lines: lines.map(mapLocalCoLineForDelivery).map(line => loaded ? projectLoadedCoLine(line, lineRequiredSalesQuantity(line)) : line).filter(hasDeliveryDisplayQuantity)
+   };
+ }
+ 
+@@ -1499,7 +1495,11 @@
+ 
+ async function listLocalCoDeliveryOrders({ locationId = null, status = "active", planDate = null, truckPlate = null } = {}) {
+   const params = [];
+-  const clauses = ["co.status IN ('pending_load', 'preparing', 'packed') AND co.loaded_at IS NULL AND co.received_at IS NULL"];
++  const clauses = [
++    status === "packed"
++      ? "co.status = 'packed'"
++      : "co.status IN ('pending_load', 'preparing')"
++  ];
+   if (locationId) {
+     params.push(Number(locationId));
+     clauses.push(`co.from_location_id = $${params.length}`);
+@@ -1514,7 +1514,7 @@
+   }
+   const result = await query(
+     `SELECT co.*,
+-            COALESCE(jsonb_agg(line ORDER BY line.line_id,line.id) FILTER (WHERE line.id IS NOT NULL),'[]'::jsonb) AS cargo_lines
++            COUNT(line.id)::int AS line_count
+        FROM local_co_orders co
+        LEFT JOIN local_co_order_lines line ON line.co_id = co.id
+       WHERE ${clauses.join(" AND ")}
+@@ -1529,9 +1529,7 @@
+   )).map((entry) => entry.requestedRef));
+   return result.rows
+     .filter((row) => !closedRefs.has(String(row.source_order_ref || "").trim().toUpperCase()))
+-    .map((row) => mapLocalCoOrderForDelivery(row, row.cargo_lines))
+-    .filter(row => status === "packed" ? row.operator_status === "packed"
+-      : row.operator_status !== "packed" || row.underpack_count > 0);
++    .map((row) => mapLocalCoOrderForDelivery(row, []));
+ }
+ 
+ const VRMA_OPERATOR_YARD_BY_LOCATION = new Map([
+--- a/src/dispatch-local-co-cargo.js
++++ b/src/dispatch-local-co-cargo.js
+@@ -14,8 +14,7 @@
+ export function applyLocalCoCargo(order = {}, record = {}) {
+   if (record.cargoLocked || !Array.isArray(record.cargoLines) || !record.cargoLines.length) return order;
+   if (String(order.id || "").toLowerCase() !== String(record.coRef || "").toLowerCase()) return order;
+-  const items = record.cargoLines.filter(line => [line.quantity, line.pallet_qty, line.layer_qty, line.section_qty, line.piece_qty]
+-    .some(value => Number(value || 0) > 0)).map((line) => ({
++  const items = record.cargoLines.map((line) => ({
+     // Allocations belong to the source SO, not this CO's independent manifest.
+     ...Object.fromEntries(Object.entries(line.raw || {}).filter(([key]) => !key.startsWith("poAllocated"))),
+     lineId: Number(line.line_id),
+--- a/src/scm-dependency-command-service.js
++++ b/src/scm-dependency-command-service.js
+@@ -92,16 +92,6 @@
+ }
+ 
+ async function mutateRelationship(command, actor, preview) {
+-  const result = await mutateRelationshipOnly(command, actor, preview);
+-  if (["link_to", "unlink_to", "change_mode"].includes(command.action)) {
+-    await reconcileCoDirectToCargo({ salesRefs: [...new Set([command.targetRef,
+-      ...(result.relatedOrderRefs || []), ...(preview.affectedOrderRefs || [])].filter(Boolean))],
+-    requestedBy: actor.sessionId || String(actor.id || "") });
+-  }
+-  return result;
+-}
+-
+-async function mutateRelationshipOnly(command, actor, preview) {
+   const payload = command.payload || {};
+   switch (command.action) {
+     case "link_to": {
+@@ -404,7 +394,6 @@
+ import crypto from "node:crypto";
+ 
+ import { withTransaction } from "./db.js";
+-import { reconcileCoDirectToCargo } from "./co-direct-to-cargo.js";
+ import { applyConfirmedDispatchPlanToDelivery } from "./delivery-repository.js";
+ import {
+   createSalesOrderPoAllocation,

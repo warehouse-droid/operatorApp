@@ -1,0 +1,17 @@
+export const runtimeFiles = ['src/netsuite.js', 'src/server.js', 'src/operator-netsuite-request-pool.js',
+  'src/operator-netsuite-priority-middleware.js', 'src/netsuite-request-queue-store.js',
+  'src/netsuite-request-scheduler.js', 'src/return-customer-directory.js'];
+export const focusedFiles = ['test/mbt/integration/netsuite-priority-queue.test.js',
+  'test/mbt/integration/netsuite-priority-queue-http.test.js',
+  'test/mbt/integration/netsuite-priority-queue-process.test.js',
+  'test/mbt/integration/netsuite-priority-queue-failure.test.js',
+  'test/mbt/integration/netsuite-priority-queue-transport.test.js',
+  'test/mbt/integration/operator-suiteql-priority.test.js',
+  'test/mbt/unit/operator-direct-orderline-pool.test.js',
+  'test/mbt/integration/operator-posting-http-timing.test.js',
+  'test/mbt/integration/p2-netsuite-production-transport.test.js',
+  'test/mbt/unit/smart-scm-created-po-service.test.js',
+  'test/mbt/integration/operator-direct-orderline-http.test.js',
+  'test/mbt/integration/pickup-existing-if-http.test.js',
+  'test/mbt/integration/return-ra-workflow.test.js',
+  'test/mbt/integration/return-batch-ra.test.js'];

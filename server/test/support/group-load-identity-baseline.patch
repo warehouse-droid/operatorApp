@@ -1,0 +1,23 @@
+--- a/src/co-source-packing-handoff.js
++++ b/src/co-source-packing-handoff.js
+@@ -116,7 +116,7 @@
+ }
+ 
+ export async function assertNoCoSourcePacking(order) {
+-  const sources = [...(order?.is_dispatch_group ? order.child_orders || [] : [order])]
++  const sources = [order, ...(order?.child_orders || [])]
+     .filter(row => row?.order_type === "sales_order");
+   if (!sources.length) {return;}
+   const result = await query(`SELECT co.co_ref FROM local_co_orders co
+--- a/src/delivery-repository.js
++++ b/src/delivery-repository.js
+@@ -6031,7 +6031,8 @@
+     await writeAudit({
+       actorOperatorId: operatorId,
+       action: "delivery.group.line.unpack",
+-      details: { groupId: orderId, groupLineId: lineId, childOrders: groupChildOrderIds(groupOrder) }
++      lineId,
++      details: { groupId: orderId, childOrders: groupChildOrderIds(groupOrder) }
+     });
+     return;
+   }

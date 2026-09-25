@@ -15,10 +15,11 @@ test("every accepted finite case quantity round-trips without sign or magnitude 
     (quantity) => {
       const normalized = normalizeSpecialCaseDraft({
         storeLocationId: 1,
+        fulfillmentMethod: "yard_pickup",
         inquiryDate: "2026-08-21",
         customerName: "Property Customer",
         vendorName: "Property Vendor",
-        lines: [{ productName: "Property Item", quantity, uom: "PCS", requiredDate: "2099-09-01" }]
+        lines: [{ productName: "Property Item", quantity, uom: "PCS", rate: 1, requiredDate: "2099-09-01" }]
       }, { authorizedStoreLocationIds: [1], minimumRequiredDate: "2099-08-26" });
       assert.equal(normalized.lines[0].quantity, quantity);
       assert.ok(normalized.lines[0].quantity > 0 && normalized.lines[0].quantity <= 1_000_000_000);

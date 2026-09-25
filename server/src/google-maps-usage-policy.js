@@ -4,6 +4,7 @@ const FIFTEEN_MINUTES_MS = 15 * 60 * 1000;
 
 export const GOOGLE_MAPS_USAGE_LIMITS = Object.freeze({
   windowDays: 30,
+  dailyLimit: 150,
   alertLimit: 3_000,
   conserveLimit: 3_500,
   normalLimit: 4_000,
@@ -13,8 +14,7 @@ export const GOOGLE_MAPS_USAGE_LIMITS = Object.freeze({
     dispatch_route: 1_200,
     monitor_eta: 600,
     driver_geocode: 800,
-    support_route: 400,
-    dynamic_map: 300
+    support_route: 400
   })
 });
 
@@ -45,9 +45,24 @@ export function googleMapsBudgetState(rollingUsage, limits = GOOGLE_MAPS_USAGE_L
   return "normal";
 }
 
+export function googleMapsDailyCapacity({
+  day, resetsAt, dailyUsage = 0, dailyExtraUnits = 0, rollingUsage = 0,
+  limits = GOOGLE_MAPS_USAGE_LIMITS
+} = {}) {
+  const baseLimit = limits.dailyLimit ?? GOOGLE_MAPS_USAGE_LIMITS.dailyLimit;
+  const used = finiteNonnegative(dailyUsage);
+  const extraUnits = finiteNonnegative(dailyExtraUnits);
+  const limit = baseLimit + extraUnits;
+  const reopenUnits = Math.min(baseLimit, Math.max(0, limits.hardLimit - finiteNonnegative(rollingUsage)));
+  return { day, resetsAt, used, baseLimit, extraUnits, limit,
+    remaining: Math.max(0, limit - used), reopenUnits, canReopen: used >= limit && reopenUnits > 0 };
+}
+
 export function googleMapsAdmissionDecision({
   mode = "normal",
   rollingUsage = 0,
+  dailyUsage = 0,
+  dailyExtraUnits = 0,
   subsystemUsage = 0,
   subsystem = "support_route",
   units = 1,
@@ -62,6 +77,10 @@ export function googleMapsAdmissionDecision({
   const budgetState = googleMapsBudgetState(usage, limits);
   if (normalizedMode === "disabled") return { admitted: false, reason: "disabled", budgetState, units: requestedUnits };
   if (afterUsage > limits.hardLimit) return { admitted: false, reason: "hard_limit", budgetState: "exhausted", units: requestedUnits };
+  const daily = googleMapsDailyCapacity({ dailyUsage, dailyExtraUnits, rollingUsage, limits });
+  if (daily.used + requestedUnits > daily.limit) {
+    return { admitted: false, reason: "daily_limit", budgetState, units: requestedUnits };
+  }
   if (automatic && (normalizedMode === "conserve" || usage >= limits.conserveLimit)) {
     return { admitted: false, reason: "automatic_disabled", budgetState, units: requestedUnits };
   }

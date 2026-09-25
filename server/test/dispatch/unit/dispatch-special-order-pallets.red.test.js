@@ -47,7 +47,7 @@ test("ordinary and VRMA orders retain their existing pallet rules", () => {
 test("Dispatch normalizes split cards, saves new splits, and defaults a unique compatible PO line", () => {
   const source = readFileSync(new URL("../../../public/dispatch.js", import.meta.url), "utf8");
   assert.match(source, /pallets:\s*effectiveOrderPalletQuantity\(order, items, groupMembers\.childOrderDetails\)/u);
-  assert.match(source, /const specialPallets = specialOrderPalletItemQuantity\(items\);[\s\S]*?const pallets = specialPallets \?\?/u);
+  assert.match(source, /const specialPallets = specialOrderPalletItemQuantity\(items\);[\s\S]*?const pallets = order\.specialPalletTotal === 0 \? 0 : specialPallets \?\?/u);
   assert.match(source, /if \(localPlanDirty \|\| saveQueued \|\| saveInFlight\) await saveCurrentPlanNow\(\);[\s\S]*?await loadPoAllocationOptions\(actionOrderId\);/u);
   assert.match(source, /const selected = exactCandidates\.length === 1 \? exactCandidates\[0\] : \(candidates\.length === 1 \? candidates\[0\] : null\);/u);
   assert.doesNotMatch(source, /!line\.isSpecial && candidates\.length === 1/u);

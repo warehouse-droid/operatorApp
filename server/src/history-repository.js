@@ -351,11 +351,14 @@ export async function listOperatorHistory({ operatorId, date = "", limit = 100, 
               'vehiclePlate', r.vehicle_plate,
               'palletQuantity', r.pallet_quantity,
               'netSuiteSyncStatus', r.netsuite_sync_status,
+              'workflowVersion', CASE WHEN ra.batch_id IS NOT NULL THEN 3 ELSE r.workflow_version END,
+              'netSuiteTransactionRef', CASE WHEN ra.batch_id IS NOT NULL OR r.workflow_version=2 THEN r.netsuite_transaction_ref END,
               'lines', COALESCE(lines.lines, '[]'::jsonb)
             ) AS details,
             COALESCE(photos.photos, '[]'::jsonb) AS photos
        FROM return_records r
        INNER JOIN return_batches b ON b.id = r.batch_id
+       LEFT JOIN return_batch_authorizations ra ON ra.batch_id=r.batch_id
        LEFT JOIN LATERAL (
          SELECT jsonb_agg(jsonb_build_object(
            'lineId', l.id,

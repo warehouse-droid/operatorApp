@@ -1,0 +1,722 @@
+--- a/src/dispatch-plan-repository.js
++++ b/src/dispatch-plan-repository.js
+@@ -1,7 +1,5 @@
+ import { fulfilledSalesDeliveryPlanningRefs, overlayFulfilledSalesDeliveryPlanning, assertSalesDeliveryPlanningAllowed } from "./dispatch-fulfilled-so-repository.js";
+ import { query, withTransaction } from "./db.js";
+-import { deferDispatchPlanMaintenance, enqueueDispatchPlanMaintenance } from "./dispatch-plan-maintenance-queue.js";
+-import { applyPendingDispatchPlanMaintenance, notifyDispatchPlanMaintenance } from "./dispatch-plan-maintenance.js";
+ import { persistedDispatchPlan } from './dispatch-plan-fence.js';
+ import { isDeepStrictEqual } from "node:util";
+ import { freezeRecordedPurchaseOrderProjections } from "./dispatch-recorded-po-projection.js";
+@@ -40,7 +38,7 @@
+   reconcileAuthoritativeDispatchOrderProjection,
+   stripDispatchRelationshipProjections
+ } from "./dispatch-plan-order-projection.js";
+-import { listClosedNetSuiteOrders, scrubClosedNetSuiteOrdersFromOperationalPlan } from "./netsuite-closed-order-repository.js";
++import { scrubClosedNetSuiteOrdersFromOperationalPlan } from "./netsuite-closed-order-repository.js";
+ import {
+   buildCompactDispatchSnapshot,
+   digestDispatchPlan,
+@@ -760,7 +758,7 @@
+   return result.rows;
+ }
+ 
+-export async function scrubBilledSalesOrderFamiliesFromPlan(plan = {}) {
++async function scrubBilledSalesOrderFamiliesFromPlan(plan = {}) {
+   let cleanPlan = plan;
+   for (const family of await billedSalesOrderFamiliesInPlan(plan)) {
+     const activeJobs = await activeDriverJobsForSalesOrderFamily(family.familyRefs);
+@@ -770,10 +768,6 @@
+       preservedOrderRefs: await fulfilledSalesDeliveryPlanningRefs(family.familyRefs),
+       inProgressOrderRefs: activeJobs.length ? family.familyRefs : []
+     });
+-    if (scrubbed.changed) {
+-      const policy = await evaluateDispatchExecutedPrefixPreservation({ previousPlan: cleanPlan, nextPlan: scrubbed.plan });
+-      if (!policy.allowed) {continue;}
+-    }
+     cleanPlan = scrubbed.plan;
+   }
+   return cleanPlan;
+@@ -1157,27 +1151,6 @@
+   return snapshots;
+ }
+ 
+-// Re-read source state when queued work runs; a billed/closed/review flag
+-// recorded yesterday must not undo a subsequently reopened order.
+-export async function applyDispatchSalesFamilyMaintenance(plan, request) {
+-  const refs = uniqueTextValues([request.canonicalRef, ...(request.refs || [])]);
+-  const refreshed = refreshGroupedSalesOrderReconciliationInPlan(plan, {
+-    childSnapshots: await groupedSalesOrderChildSnapshots(plan), targetRefs: refs
+-  });
+-  const closed = (await listClosedNetSuiteOrders(refs)).length > 0;
+-  const families = await billedSalesOrderFamiliesInPlan({ ...plan,
+-    orders: [...(plan.orders || []), ...refs.map(id => ({ id }))] });
+-  const family = families.find(entry => entry.canonicalRef === request.canonicalRef);
+-  if (!closed && !family) {return { plan: refreshed.plan };}
+-  const familyRefs = family?.familyRefs || refs;
+-  const activeJobs = closed ? [] : await activeDriverJobsForSalesOrderFamily(familyRefs);
+-  return scrubBilledSalesOrderFamilyFromPlan(refreshed.plan, {
+-    canonicalRef: request.canonicalRef, familyRefs,
+-    preservedOrderRefs: closed ? [] : await fulfilledSalesDeliveryPlanningRefs(familyRefs),
+-    inProgressOrderRefs: activeJobs.length ? familyRefs : []
+-  });
+-}
+-
+ export async function reconcileSalesOrderFamilyInDispatchPlans({
+   canonicalRef = "",
+   familyRefs = [],
+@@ -1186,17 +1159,30 @@
+   reconciliationStatus = "current",
+   reconciliationReason = "",
+   reconciliationApplicationStatus = "",
+-  actor = "scm-reconciliation",
+-  queueOnly = false
++  actor = "scm-reconciliation"
+ } = {}) {
+   const refs = uniqueTextValues([canonicalRef, ...(familyRefs || [])]).map((ref) => ref.toUpperCase());
+   if (!refs.length) return { changedPlans: [], deferred: false, familyRefs: [] };
+   return withTransaction(async () => {
+     await lockDispatchFleetPlanning();
+     const activeJobs = billed && !closed ? await activeDriverJobsForSalesOrderFamily(refs) : [];
++    if (billed && activeJobs.length) {
++      return {
++        changedPlans: [],
++        deferred: true,
++        familyRefs: refs,
++        activeJobs: activeJobs.map((row) => ({
++          jobId: row.job_id,
++          planId: row.plan_id,
++          loadId: row.load_id,
++          stopId: row.stop_id,
++          orderRefs: row.order_refs || []
++        }))
++      };
++    }
+ 
+     const snapshots = await query(
+-      `SELECT p.id, p.plan_date::text AS plan_date, p.revision, p.status, p.note,
++      `SELECT p.id, p.plan_date::text AS plan_date, p.revision,
+               s.orders, s.trucks, s.summary, s.saved_at
+          FROM dispatch_plans p
+          JOIN dispatch_plan_snapshots s ON s.plan_id = p.id
+@@ -1218,23 +1204,17 @@
+                    WHERE upper(BTRIM(child_ref.value)) = ANY($1::text[])
+                 )
+           )
+-        ORDER BY p.plan_date, p.id`,
++        ORDER BY p.plan_date, p.id
++        FOR UPDATE OF p, s`,
+       [refs]
+     );
+     const preservedOrderRefs = billed && !closed ? await fulfilledSalesDeliveryPlanningRefs(refs) : [];
+     const changedPlans = [];
+     const deferredPlans = [];
+     for (const row of snapshots.rows) {
+-      if (queueOnly) {
+-        await enqueueDispatchPlanMaintenance(row.id, { kind: "sales_family", canonicalRef: String(canonicalRef).toUpperCase(), refs });
+-        deferredPlans.push({ planId: String(row.id), planDate: row.plan_date, reason: "queued" });
+-        continue;
+-      }
+       const originalPlan = {
+         id: String(row.id),
+         planDate: row.plan_date,
+-        status: row.status,
+-        note: row.note,
+         orders: row.orders || [],
+         trucks: row.trucks || [],
+         summary: row.summary || {}
+@@ -1260,20 +1240,11 @@
+             removedOrderRefs: []
+           };
+       if (!refreshed.changed && !scrubbed.changed) continue;
+-      const maintenance = { kind: "sales_family", canonicalRef: String(canonicalRef).toUpperCase(), refs };
+-      const editing = await deferDispatchPlanMaintenance(originalPlan, maintenance);
+-      if (editing || activeJobs.length) {
+-        if (!editing) {await enqueueDispatchPlanMaintenance(row.id, maintenance);}
+-        deferredPlans.push({ planId: String(row.id), planDate: row.plan_date, reason: editing ? "editing" : "driver_active" });
+-        continue;
+-      }
+-      await query("SELECT id FROM dispatch_plans WHERE id=$1 FOR UPDATE", [row.id]);
+       const executionPolicy = await evaluateDispatchExecutedPrefixPreservation({
+         previousPlan: originalPlan,
+         nextPlan: scrubbed.plan
+       });
+       if (!executionPolicy.allowed) {
+-        await enqueueDispatchPlanMaintenance(row.id, maintenance);
+         deferredPlans.push({
+           planId: String(row.id),
+           planDate: row.plan_date,
+@@ -1334,8 +1305,6 @@
+       await syncDispatchDeliveryGroupsFromPlan(cleanPlan);
+       await syncDispatchPlanLoadAssignments(cleanPlan);
+       await syncDispatchPlannerReadProjections(cleanPlan);
+-      await query("UPDATE dispatch_plan_snapshots SET plan_digest=$2 WHERE plan_id=$1", [row.id, digestDispatchPlan({ ...cleanPlan, status: row.status, note: row.note })]);
+-      notifyDispatchPlanMaintenance(cleanPlan, refs);
+       changedPlans.push({
+         planId: String(row.id),
+         planDate: row.plan_date,
+@@ -1348,8 +1317,6 @@
+       changedPlans,
+       deferred: deferredPlans.length > 0,
+       deferredPlans,
+-      ...(activeJobs.length ? { activeJobs: activeJobs.map(row => ({ jobId: row.job_id, planId: row.plan_id,
+-        loadId: row.load_id, stopId: row.stop_id, orderRefs: row.order_refs || [] })) } : {}),
+       familyRefs: refs
+     };
+   });
+@@ -1358,22 +1325,19 @@
+ export async function cleanupBilledSalesOrderFamilyFromDispatchPlans({
+   canonicalRef = "",
+   familyRefs = [],
+-  actor = "scm-reconciliation",
+-  queueOnly = false
++  actor = "scm-reconciliation"
+ } = {}) {
+   return reconcileSalesOrderFamilyInDispatchPlans({
+     canonicalRef,
+     familyRefs,
+     billed: true,
+-    actor,
+-    queueOnly
++    actor
+   });
+ }
+ 
+ export async function cleanupBilledSalesOrderFamiliesFromDispatchPlan({
+   planId,
+-  actor = "driver-completion",
+-  queueOnly = false
++  actor = "driver-completion"
+ } = {}) {
+   const result = await query(
+     `SELECT p.id, p.plan_date::text AS plan_date, p.status, p.revision,
+@@ -1393,8 +1357,7 @@
+     const cleanup = await cleanupBilledSalesOrderFamilyFromDispatchPlans({
+       canonicalRef: family.canonicalRef,
+       familyRefs: family.familyRefs,
+-      actor,
+-      queueOnly
++      actor
+     });
+     changedPlans.push(...(cleanup.changedPlans || []));
+     if (cleanup.deferred) deferredFamilies.push(family.familyRefs);
+@@ -1666,7 +1629,6 @@
+       }),
+       { comparisonOrders: canonicalPlan.orders || [] }
+     );
+-    sanitizedPlan = await applyPendingDispatchPlanMaintenance(sanitizedPlan);
+     const pickupVisits = materializeDispatchPickupVisits(sanitizedPlan, {
+       previousPlan,
+       allowLegacyPassthrough: true,
+--- a/src/dispatch-planner-v2-repository.js
++++ b/src/dispatch-planner-v2-repository.js
+@@ -1,5 +1,4 @@
+ import crypto from "node:crypto";
+-import { applyPendingDispatchPlanMaintenance } from "./dispatch-plan-maintenance.js";
+ 
+ import { query, withTransaction } from "./db.js";
+ import { persistedDispatchPlan } from './dispatch-plan-fence.js';
+@@ -21,8 +20,7 @@
+ import {
+   dispatchPlannedAssignmentMap,
+   dispatchPlanV2Summary,
+-  refreshDispatchPlanAuthoritativeOrderProjection,
+-  scrubBilledSalesOrderFamiliesFromPlan
++  refreshDispatchPlanAuthoritativeOrderProjection
+ } from "./dispatch-plan-repository.js";
+ import {
+   applyDispatchPlanDelta,
+@@ -190,7 +188,7 @@
+   return reconcileDispatchPlanLocalCos(await reconcileDispatchPlanGlobalOrderDefinitions(plan, options));
+ }
+ 
+-export async function syncDispatchPlanLoadProjection(plan = {}) {
++async function syncDispatchPlanLoadProjection(plan = {}) {
+   // The load projection depends on Driver route materialization, whose module
+   // already participates in the Dispatch repository graph. Resolve it only at
+   // operation time so V2 commands can keep both assignment projections in the
+@@ -976,8 +974,6 @@
+       reactivatedGlobalOrderRefs: commandReactivatedRefs,
+       rejectRetiredGlobalOrderRefs: true
+     });
+-    result.plan = await applyPendingDispatchPlanMaintenance(result.plan);
+-    result.plan = await scrubBilledSalesOrderFamiliesFromPlan(result.plan);
+     // Global definitions can replace hydrated group lines with raw allocation
+     // quantities. Refresh relationships after that replacement, just as a full
+     // save does, before deciding which physical pickups are actually required.
+--- a/src/dispatch-repository.js
++++ b/src/dispatch-repository.js
+@@ -1,5 +1,3 @@
+-import { notifyDispatchPlanMaintenance } from "./dispatch-plan-maintenance.js";
+-import { deferDispatchPlanMaintenance, enqueueDispatchPlanMaintenance } from "./dispatch-plan-maintenance-queue.js";
+ import { reconcileCoDirectToCargo, restoreCoSourceRequirement } from "./co-direct-to-cargo.js";
+ import crypto from "node:crypto";
+ import { withCoSourcePackingHandoff } from "./co-source-packing-handoff.js";
+@@ -2457,14 +2455,6 @@
+   return { orders: nextOrders, trucks: nextTrucks };
+ }
+ 
+-export function rewriteDispatchSnapshotReference(plan, { oldRef, newRef, remove = false }) {
+-  const arrays = remove ? removeRefFromPlanArrays(plan, oldRef) : {
+-    orders: replaceRefDeep(plan.orders || [], oldRef, newRef),
+-    trucks: replaceRefDeep(plan.trucks || [], oldRef, newRef)
+-  };
+-  return { ...plan, ...arrays };
+-}
+-
+ async function updateDispatchSnapshotsForRef(executor, { oldRef = "", newRef = "", remove = false } = {}) {
+   const ref = String(oldRef || "").trim();
+   if (!ref) return { planIds: [] };
+@@ -2473,27 +2463,22 @@
+   const snapshots = await runQuery(
+     `SELECT snapshot.plan_id, plan.plan_date::text AS plan_date,
+             plan.status, plan.note, plan.revision,
+-            snapshot.orders, snapshot.trucks, snapshot.summary, maintenance.requests AS pending_requests
++            snapshot.orders, snapshot.trucks, snapshot.summary
+        FROM dispatch_plan_snapshots snapshot
+        JOIN dispatch_plans plan ON plan.id = snapshot.plan_id
+-       LEFT JOIN dispatch_plan_maintenance maintenance ON maintenance.plan_id=plan.id
+       WHERE snapshot.orders::text LIKE $1 OR snapshot.trucks::text LIKE $1
+-         OR EXISTS (SELECT 1 FROM jsonb_each(COALESCE(maintenance.requests,'{}'::jsonb)) request
+-           WHERE request.value->>'kind'='po_reference' AND request.value->>'newRef'=$2)
+-      ORDER BY plan.plan_date, snapshot.plan_id`,
+-    [`%"${ref.replaceAll('"', '\\"')}"%`, ref]
++      ORDER BY snapshot.plan_id
++      FOR UPDATE OF plan, snapshot`,
++    [`%"${ref.replaceAll('"', '\\"')}"%`]
+   );
+   const changedPlans = [];
+   for (const row of snapshots.rows) {
+-    // A prior rename may still be queued, so this snapshot can contain the
+-    // original identity rather than the source's latest reference.
+-    if (Object.values(row.pending_requests || {}).some(request => request.kind === "po_reference" && request.newRef === ref)) {
+-      await enqueueDispatchPlanMaintenance(row.plan_id, { kind: "po_reference", oldRef: ref, newRef: String(newRef || "").trim(), remove }, runQuery);
+-      continue;
+-    }
+-    const next = rewriteDispatchSnapshotReference({ orders: row.orders || [], trucks: row.trucks || [] }, {
+-      oldRef: ref, newRef: String(newRef || "").trim(), remove
+-    });
++    const next = remove
++      ? removeRefFromPlanArrays({ orders: row.orders || [], trucks: row.trucks || [] }, ref)
++      : {
++          orders: replaceRefDeep(row.orders || [], ref, String(newRef || "").trim()),
++          trucks: replaceRefDeep(row.trucks || [], ref, String(newRef || "").trim())
++        };
+     const previousPlan = {
+       id: String(row.plan_id),
+       planDate: String(row.plan_date || "").slice(0, 10),
+@@ -2510,13 +2495,6 @@
+       orders: next.orders,
+       trucks: next.trucks
+     };
+-    if (JSON.stringify([previousPlan.orders, previousPlan.trucks]) === JSON.stringify([next.orders, next.trucks])) {continue;}
+-    if (await deferDispatchPlanMaintenance(previousPlan, {
+-      kind: "po_reference", oldRef: ref, newRef: String(newRef || "").trim(), remove
+-    }, runQuery)) {continue;}
+-    await runQuery(`SELECT plan.id FROM dispatch_plans plan
+-      JOIN dispatch_plan_snapshots snapshot ON snapshot.plan_id=plan.id
+-      WHERE plan.id=$1 FOR UPDATE OF plan, snapshot`, [row.plan_id]);
+     await assertDispatchExecutedPrefixPreserved({
+       previousPlan,
+       nextPlan,
+@@ -2549,8 +2527,7 @@
+       await syncDispatchPlanRelationEdges(plan, { execute: runQuery });
+     }
+   }
+-  if (executor === query) {for (const plan of changedPlans) {notifyDispatchPlanMaintenance(plan, [ref, newRef].filter(Boolean));}}
+-  return { planIds: changedPlans.map((plan) => plan.id), plans: changedPlans };
++  return { planIds: changedPlans.map((plan) => plan.id) };
+ }
+ 
+ export function scmPurchaseOrderListKind(order = {}) {
+@@ -6218,7 +6195,6 @@
+       actor: updatedBy
+     });
+     await client.query("COMMIT");
+-    for (const plan of snapshotUpdate.plans || []) {notifyDispatchPlanMaintenance(plan);}
+     return {
+       splitId: split.id,
+       sourcePoRef: split.source_po_ref,
+@@ -6703,7 +6679,6 @@
+       actor: cancelledBy
+     });
+     await client.query("COMMIT");
+-    for (const plan of snapshotUpdate.plans || []) {notifyDispatchPlanMaintenance(plan);}
+     return {
+       splitId: split.id,
+       sourcePoRef: split.source_po_ref,
+--- a/src/delivery-repository.js
++++ b/src/delivery-repository.js
+@@ -1,6 +1,3 @@
+-import { digestDispatchPlan } from "./dispatch-planner-performance.js";
+-import { deferDispatchPlanMaintenance } from "./dispatch-plan-maintenance-queue.js";
+-import { notifyDispatchPlanMaintenance } from "./dispatch-plan-maintenance.js";
+ import { attachOperatorLoadState } from "./operator-load-state-repository.js";
+ import { isBackgroundPhotoReference } from "./operator-background-photos.js";
+ import { isLocalCoLoaded, projectLoadedCoLine } from "./local-co-loaded-policy.js";
+@@ -3414,10 +3411,10 @@
+        FROM dispatch_plans p
+        JOIN dispatch_plan_snapshots s ON s.plan_id = p.id
+       WHERE s.orders::text LIKE $1
+-      ORDER BY p.id`,
++      ORDER BY p.id
++      FOR UPDATE OF p, s`,
+     [`%${originalRef}%`]
+   );
+-  const snapshotWrites = [];
+   for (const row of snapshotCandidates.rows) {
+     const previousPlan = {
+       id: row.id,
+@@ -3434,10 +3431,6 @@
+       orders: previousPlan.orders.filter((order) => !refs.includes(String(order?.id || "")))
+     };
+     await assertDispatchExecutedPrefixPreserved({ previousPlan, nextPlan });
+-    if (JSON.stringify(previousPlan.orders) === JSON.stringify(nextPlan.orders)) {continue;}
+-    if (await deferDispatchPlanMaintenance(previousPlan, { kind: "retire_splits", refs })) {continue;}
+-    await query("SELECT id FROM dispatch_plans WHERE id=$1 FOR UPDATE", [row.id]);
+-    snapshotWrites.push(nextPlan);
+   }
+ 
+   const deleted = isSales
+@@ -3509,12 +3502,17 @@
+       [refs]
+     );
+   }
+-  for (const plan of snapshotWrites) {
+-    plan.revision = Number((await query("UPDATE dispatch_plans SET revision=revision+1,updated_at=now() WHERE id=$1 RETURNING revision", [plan.id])).rows[0].revision);
+-    await query("UPDATE dispatch_plan_snapshots SET orders=$2::jsonb,saved_at=now(),plan_digest=$3 WHERE plan_id=$1",
+-      [plan.id, JSON.stringify(plan.orders), digestDispatchPlan(plan)]);
+-    notifyDispatchPlanMaintenance(plan, refs);
+-  }
++  await query(
++    `UPDATE dispatch_plan_snapshots
++        SET orders = (
++              SELECT COALESCE(jsonb_agg(order_item), '[]'::jsonb)
++                FROM jsonb_array_elements(orders) AS order_item
++               WHERE NOT (order_item->>'id' = ANY($1::text[]))
++            ),
++            saved_at = now()
++      WHERE orders::text LIKE $2`,
++    [refs, `%${originalRef}%`]
++  );
+ 
+   return {
+     deactivated: refs,
+--- a/src/dispatch-co-group-identity-repository.js
++++ b/src/dispatch-co-group-identity-repository.js
+@@ -1,5 +1,3 @@
+-import { deferDispatchPlanMaintenance, enqueueDispatchPlanMaintenance } from "./dispatch-plan-maintenance-queue.js";
+-import { notifyDispatchPlanMaintenance } from "./dispatch-plan-maintenance.js";
+ import { query, withTransaction } from "./db.js";
+ import { writeDispatchAudit } from "./dispatch-audit-repository.js";
+ import {
+@@ -35,8 +33,9 @@
+          FROM dispatch_plans p
+          JOIN dispatch_plan_snapshots s ON s.plan_id = p.id
+         WHERE (cardinality($1::bigint[]) = 0 OR p.id = ANY($1::bigint[]))
+-        ORDER BY p.plan_date, p.id
+-        LIMIT $2`,
++        ORDER BY p.id
++        LIMIT $2
++        FOR UPDATE OF p, s`,
+       [selectedPlanIds, safeLimit]
+     );
+     const repairedPlanIds = [];
+@@ -57,22 +56,15 @@
+       };
+       const mappings = dispatchCoGroupIdentityMappings(current);
+       if (!mappings.length) continue;
+-      if (await deferDispatchPlanMaintenance(current, { kind: "co_identity" })) {
+-        deferredPlanIds.push(text(row.id));
+-        continue;
+-      }
+-      await query("SELECT id FROM dispatch_plans WHERE id=$1 FOR UPDATE", [row.id]);
+       const canonical = buildCompactDispatchSnapshot(canonicalizeDispatchCoGroupIdentities(current));
+       const executionPolicy = await evaluateDispatchExecutedPrefixPreservation({
+         previousPlan: current,
+         nextPlan: canonical
+       });
+       if (!executionPolicy.allowed) {
+-        await enqueueDispatchPlanMaintenance(row.id, { kind: "co_identity" });
+         deferredPlanIds.push(text(row.id));
+         continue;
+       }
+-      canonical.revision = Number((await query("UPDATE dispatch_plans SET revision=revision+1,updated_at=now() WHERE id=$1 RETURNING revision", [row.id])).rows[0].revision);
+       const board = dispatchPlanBoard(canonical);
+       await query(
+         `UPDATE dispatch_plan_snapshots
+@@ -83,8 +75,7 @@
+                 order_count = $6,
+                 truck_count = $7,
+                 load_count = $8,
+-                stop_count = $9,
+-                saved_at = now()
++                stop_count = $9
+           WHERE plan_id = $1`,
+         [
+           row.id,
+@@ -114,8 +105,7 @@
+           after: { orderRef: mapping.newRef },
+           details: {
+             reason: "canonicalize_grouped_internal_co_identity",
+-            previousRevision: current.revision,
+-            revision: canonical.revision
++            preservedRevision: current.revision
+           }
+         });
+         repairedMappings.push({
+@@ -124,7 +114,6 @@
+           newRef: mapping.newRef
+         });
+       }
+-      notifyDispatchPlanMaintenance(canonical, mappings.flatMap(mapping => [mapping.oldRef, mapping.newRef]));
+       repairedPlanIds.push(text(row.id));
+     }
+     return {
+--- a/src/server.js
++++ b/src/server.js
+@@ -1,5 +1,3 @@
+-import { hasUnappliedDispatchPlanMaintenance, pendingDispatchPlanMaintenance } from "./dispatch-plan-maintenance-queue.js";
+-import { configureDispatchMaintenanceEvents, drainDispatchPlanMaintenance } from "./dispatch-plan-maintenance.js";
+ import { listFulfilledTransferStates, fulfilledTransferPlanningRefs } from "./dispatch-fulfilled-to-repository.js";
+ import { annotateFulfilledTransferOrders } from "./dispatch-fulfilled-to-policy.js";
+ import { listFulfilledSalesDeliveryStates, overlayFulfilledSalesDeliveryPlanning, assertSalesDeliveryPlanningAllowed, fulfilledSalesDeliveryPlanningRefs } from "./dispatch-fulfilled-so-repository.js";
+@@ -4645,11 +4643,6 @@
+       });
+     }
+     const primary = jobResults.find((result) => String(result.job.jobId) === String(job.jobId)) || jobResults[0];
+-    // Commit the intention with Driver evidence. A crash after completion must
+-    // not lose cleanup; execution remains outside this critical transaction.
+-    if (!strictPlanCleanup && job.planId) {await cleanupBilledSalesOrderFamiliesFromDispatchPlan({
+-      planId: job.planId, actor: `driver:${driverLogin}`, queueOnly: true
+-    });}
+     const billedSalesOrderPlanCleanup = strictPlanCleanup && job.planId
+       ? await cleanupBilledSalesOrderFamiliesFromDispatchPlan({
+           planId: job.planId,
+@@ -4695,7 +4688,14 @@
+         planId: job.planId,
+         actor: `driver:${driverLogin}`
+       });
+-
++      if (billedSalesOrderPlanCleanup.changedPlans.length) {
++        emitAppEvent("dispatch.plan.saved", {
++          planId: job.planId,
++          planDate: job.planDate || "",
++          source: "billed-so-driver-completion-cleanup",
++          refreshOrderPool: true
++        });
++      }
+     } catch (error) {
+       billedSalesOrderPlanCleanupWarning = String(error?.message || error);
+       console.error("Billed SO plan cleanup after driver completion failed:", error);
+@@ -5219,7 +5219,6 @@
+ }
+ 
+ configureOperatorNetSuitePostingCompletionEvents(emitAppEvent);
+-configureDispatchMaintenanceEvents(emitAppEvent);
+ 
+ function closeOperatorEventStreams(id) {
+   for (const client of eventClients) {
+@@ -13594,7 +13593,6 @@
+       });
+     }
+     res.json({ released: Boolean(released) });
+-    if (released) {void dispatchMaintenanceTick({ planDate: released.planDate });}
+   } catch (error) {
+     next(error);
+   }
+@@ -13941,15 +13939,8 @@
+         { orders: cleanOrders, trucks: cleanTrucks }
+       )
+     ) {
+-      const unchanged = await withDispatchPlanWrite(dispatchPlanWriteRequest(req, previousPlan, 'save_snapshot'), async () => {
+-        if (!hasUnappliedDispatchPlanMaintenance(await pendingDispatchPlanMaintenance(previousPlan.id))) {return getDispatchPlan(req.params.id);}
+-        return saveDispatchPlanSnapshot(previousPlan.id, {
+-          orders: cleanOrders, trucks: cleanTrucks, summary: req.body?.summary || previousPlan.summary || {},
+-          baseRevision: previousPlan.revision, planDate: previousPlan.planDate,
+-          sessionId: req.body?.audit?.sessionId || req.body?.sessionId || ""
+-        });
+-      });
+-      return res.json({ ...unchanged, operatorFlags: null, noChange: Number(unchanged.revision) === Number(previousPlan.revision) });
++      const unchanged = await withDispatchPlanWrite(dispatchPlanWriteRequest(req, previousPlan, 'save_snapshot'), () => getDispatchPlan(req.params.id));
++      return res.json({ ...unchanged, operatorFlags: null, noChange: true });
+     }
+     const nextPlanForValidation = {
+       ...previousPlan,
+@@ -17657,7 +17648,6 @@
+         { orders: previousPlan.orders || [], trucks: previousPlan.trucks || [] },
+         { orders: payload.orders, trucks: payload.trucks }
+       )
+-      && !hasUnappliedDispatchPlanMaintenance(await pendingDispatchPlanMaintenance(previousPlan.id))
+     ) {
+       return res.json({ ...previousPlan, operatorFlags: null, noChange: true });
+     }
+@@ -24231,15 +24221,6 @@
+   ].map((value) => String(value || "").trim()).filter(Boolean))];
+ }
+ 
+-export async function dispatchMaintenanceTick(options = {}) {
+-  try {
+-    return await drainDispatchPlanMaintenance(options);
+-  } catch (error) {
+-    console.error("Dispatch maintenance sweep failed:", error.message);
+-    return { failed: 1 };
+-  }
+-}
+-
+ export async function dispatchV2FollowupTick() {
+   if (dispatchV2FollowupTickRunning) return { skipped: true, claimed: 0, completed: 0, failed: 0 };
+   dispatchV2FollowupTickRunning = true;
+@@ -24576,8 +24557,6 @@
+     setInterval(() => void scmReconciliationScheduledTick(), 60000);
+     setTimeout(() => void dispatchV2FollowupTick(), 2000);
+     setInterval(() => void dispatchV2FollowupTick(), 30000);
+-    void dispatchMaintenanceTick();
+-    setInterval(() => void dispatchMaintenanceTick(), 30000);
+     if (config.dispatch?.plannerOrderPoolMode !== "off") {
+       void enqueueDispatchOrderCatalogRefresh({ source: "startup" })
+         .then(() => dispatchOrderCatalogTick())
+--- a/public/dispatch.js
++++ b/public/dispatch.js
+@@ -981,17 +981,14 @@
+   if (dispatchPlannerSnapshotState !== "ready") {
+     throw new Error("Wait until the current Dispatch snapshot is verified before entering Edit Mode.");
+   }
+-  const requestedDate = currentPlanDate;
+-  const requestedGeneration = localPlanGeneration;
+   await refreshPlannedAssignments();
+   const response = await fetch("/api/dispatch/plan-edit-lease/acquire", {
+     method: "POST",
+     headers: { "Content-Type": "application/json" },
+-    body: JSON.stringify({ planDate: requestedDate, sessionId: dispatchSessionId })
++    body: JSON.stringify({ planDate: currentPlanDate, sessionId: dispatchSessionId })
+   });
+   if (!response.ok) throw new Error(await dispatchErrorMessage(response));
+   const payload = await response.json();
+-  if (currentPlanDate !== requestedDate) {throw new Error("The selected plan date changed while entering Edit Mode.");}
+   planEditLease = payload.lease
+     ? {
+         ...payload.lease,
+@@ -1000,33 +997,10 @@
+       }
+     : null;
+   planEditLeaseToken = payload.editLeaseToken || "";
+-  planEditMode = false;
+-  if (!hasDispatchEditLeaseCredentials()) {throw new Error("The server did not grant an edit lease.");}
++  planEditMode = Boolean(hasDispatchEditLeaseCredentials());
++  if (!planEditMode) throw new Error("The server did not grant an edit lease.");
+   persistStoredDispatchEditLease();
+   startDispatchEditHeartbeat();
+-  // A maintenance worker may have committed just before lease acquisition.
+-  // Verify its final snapshot while the lease prevents any further cleanup.
+-  if (currentPlan?.id) {
+-    const snapshotResponse = await fetch(`/api/dispatch/v2/bootstrap?planId=${encodeURIComponent(currentPlan.id)}&date=${encodeURIComponent(requestedDate)}`, {
+-      headers: { "Cache-Control": "no-cache" }
+-    });
+-    if (!snapshotResponse.ok) {throw new Error(await dispatchErrorMessage(snapshotResponse));}
+-    const snapshot = await snapshotResponse.json();
+-    if (currentPlanDate !== requestedDate || localPlanGeneration !== requestedGeneration) {
+-      throw new Error("The plan changed while entering Edit Mode. Your draft has been retained.");
+-    }
+-    if (String(snapshot.plan?.id || "") !== String(currentPlan.id) || snapshot.plan?.planDate !== requestedDate) {
+-      throw new Error("The server did not verify the selected Dispatch plan.");
+-    }
+-    const changed = snapshot.plan.revision !== currentPlan.revision || snapshot.plan.digest !== currentPlan.digest;
+-    if (changed && localPlanDirty) {throw new Error("Review the unsaved draft before loading the current plan.");}
+-    if (changed) {
+-      const applied = applyDispatchPlanSnapshotResult(snapshot);
+-      if (applied.invalid) {throw new Error(dispatchPlannerSnapshotError);}
+-      resetUndoHistory();
+-    }
+-  }
+-  planEditMode = true;
+   if (!currentPlan?.id) await createPlanForDate(currentPlanDate);
+   if (isDispatchHistoryEditMode()) await loadDispatchOrders();
+   routeNotice = isDispatchHistoryEditMode()
+@@ -6941,9 +6915,7 @@
+       return { saved: true, ignoredOlderResult: true };
+     }
+     if (saveTargetsCurrentView) {
+-      if (typeof dispatchRecoveredDraft !== "undefined" && dispatchRecoveredDraft) {acknowledgeDispatchRecoveredSave(attempt);}
+       currentPlan = compactCurrentPlan(result);
+-      minimumPlanRevisionToApply = { planId: String(targetPlanId), revision: resultRevision };
+       lastAcknowledgedPlanState = dispatchPlanWireState(result);
+       clearDispatchForecast();
+     }
+@@ -7727,16 +7699,9 @@
+   try {
+     if (!currentPlan?.id) return false;
+     const requestedPlanId = currentPlan.id;
+-    const requestedDate = currentPlanDate;
+-    const requestedGeneration = localPlanGeneration;
+-    const requestedRevision = Number(currentPlan.revision || 0);
+-    const isCurrent = () => String(currentPlan?.id) === String(requestedPlanId)
+-      && currentPlanDate === requestedDate && localPlanGeneration === requestedGeneration
+-      && Number(currentPlan?.revision || 0) === requestedRevision;
+     const response = await fetch(`/api/dispatch/plans/${encodeURIComponent(requestedPlanId)}`);
+     if (!response.ok) return false;
+     const saved = await response.json();
+-    if (!isCurrent()) {return false;}
+     if (!saved?.savedAt || !Array.isArray(saved.orders) || !Array.isArray(saved.trucks)) return false;
+     const savedRevision = Number(saved.revision || 0);
+     const localRevision = Number(currentPlan?.revision || 0);
+@@ -7749,14 +7714,14 @@
+       return false;
+     }
+     await refreshPlannedAssignments();
++    isApplyingRemotePlan = true;
++    currentPlanDate = saved.planDate || currentPlanDate;
+     await loadDriverJobStatuses();
+-    if (!isCurrent() || localPlanDirty || pendingPlanSaveAttempt || pendingDispatchPlanAction) {return false;}
+-    isApplyingRemotePlan = true;
+     const applied = applySavedPlan(saved);
+     currentPlan = compactCurrentPlan(saved);
++    await loadDispatchForecast();
+     if (applied) resetUndoHistory();
+     isApplyingRemotePlan = false;
+-    await loadDispatchForecast();
+     return applied;
+   } catch {
+     isApplyingRemotePlan = false;
+@@ -17926,30 +17891,16 @@
+   }, 150);
+ }
+ 
+-function acknowledgeDispatchRecoveredSave(attempt) {
+-  const record = dispatchRecoveredDraft;
+-  if (!record || record.action || String(record.planId) !== String(attempt.payload?.planId)
+-    || Number(record.generation) !== Number(attempt.saveGeneration)
+-    || JSON.stringify(record.pendingPayload) !== JSON.stringify(attempt.payload)) {return;}
+-  dispatchRecoveredDraft = null;
+-  if (routeNotice === "The saved plan has changed since this draft. Download the draft and review its changes against the current plan.") {routeNotice = "";}
+-}
+-
+ function scheduleDispatchDraftRecovery() {
+   const date = currentPlanDate;
+   const planId = String(currentPlan?.id || "");
+-  const generation = localPlanGeneration;
+-  const revision = currentPlan?.revision;
+-  const digest = currentPlan?.digest;
+   dispatchRecoveredDraft = null;
+   // Defer module loading and database reads until the current board can paint.
+   const recover = async () => {
+     try {
+       const { journal, key } = await dispatchDraftStorage(date);
+       const record = await journal.read(key);
+-      if (currentPlanDate !== date || String(currentPlan?.id || "") !== planId
+-        || localPlanGeneration !== generation || currentPlan?.revision !== revision
+-        || currentPlan?.digest !== digest || localPlanDirty) {return;}
++      if (currentPlanDate !== date || String(currentPlan?.id || "") !== planId) {return;}
+       if (record?.version === 1 && String(record.planId) === planId) {
+         dispatchRecoveredDraft = record;
+         renderDispatchNoticePatch();
+--- a/public/dispatch.html
++++ b/public/dispatch.html
+@@ -14,6 +14,6 @@
+     <script src="/app-sidebar.js?v=20260728-custom-orders-v1"></script>
+     <script src="/dispatch-auth.js?v=20260724-sales-auth-v2"></script>
+     <script src="/delivery-instruction-upload.js?v=20260812-delivery-image-720p-v1"></script>
+-    <script src="/dispatch.js?v=20260917-order-update-save-v1"></script>
++    <script src="/dispatch.js?v=20260917-save-reliability-v1"></script>
+   </body>
+ </html>

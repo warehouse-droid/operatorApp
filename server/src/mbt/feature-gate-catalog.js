@@ -2,6 +2,7 @@
 
 import {
   OPERATOR_NETSUITE_GATE_DEFINITIONS,
+  OPERATOR_NETSUITE_RETURN_GATE_DEFINITIONS,
   OPERATOR_NETSUITE_YARDS
 } from "../operator-netsuite-posting-policy.js";
 
@@ -10,6 +11,15 @@ import {
  * and NetSuite posting remain deployment-owned boundaries.
  */
 export const MBT_ADMIN_GATE_DEFINITIONS = Object.freeze([
+  Object.freeze({
+    flagKey: "sor_rental_workflow",
+    label: "SOR rental workflow",
+    description: "Enable SOR dispatch planning, automatic equipment returns and optional Driver customer signatures. When off, existing work, settings and saved evidence are retained.",
+    environmentProperty: null,
+    independent: true,
+    locked: false,
+    lockReason: null
+  }),
   Object.freeze({
     flagKey: "driver_offline_mode",
     label: "Driver PWA offline mode",
@@ -56,6 +66,16 @@ export const MBT_ADMIN_GATE_DEFINITIONS = Object.freeze([
     lockReason: null
   }),
   Object.freeze({
+    flagKey: 'special_stock_request_test_skip_orders',
+    label: 'Special Item: skip SO / PO creation (testing)',
+    description: 'Show test buttons that advance Special Item order steps without creating NetSuite orders. Skipped steps are audited and cannot post to NetSuite or live Dispatch.',
+    environmentProperty: null,
+    independent: true,
+    configuredDefault: false,
+    locked: false,
+    lockReason: null
+  }),
+  Object.freeze({
     flagKey: "dispatch_optimized_order_pool",
     label: "Dispatch optimized order pool",
     description: "Serve the indexed, paged Dispatch order pool only after shadow verification and catalog/assignment readiness. Turning this off immediately retains the legacy read path.",
@@ -66,7 +86,7 @@ export const MBT_ADMIN_GATE_DEFINITIONS = Object.freeze([
     locked: false,
     lockReason: null
   }),
-  ...OPERATOR_NETSUITE_GATE_DEFINITIONS.map((definition) => Object.freeze({
+  ...[...OPERATOR_NETSUITE_GATE_DEFINITIONS, ...OPERATOR_NETSUITE_RETURN_GATE_DEFINITIONS].map((definition) => Object.freeze({
     ...definition,
     environmentProperty: "netSuiteDirectAccessEnabled",
     gateGroup: "operator_netsuite_posting"

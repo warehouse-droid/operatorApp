@@ -4,6 +4,7 @@ import test, { after } from "node:test";
 
 import { beginRollbackContext, closeDb, query } from "../../../src/db.js";
 import {
+  prepareSpecialPurchaseOrder,
   claimSpecialOrderOperation,
   chooseSpecialHandoffRoute,
   completeSpecialVendorPickup,
@@ -39,7 +40,7 @@ function response(overrides = {}) {
 
 function itemResolution(overrides = {}) {
   return {
-    itemId: 8_890_001,
+    itemId: 2055,
     itemName: "SPECIAL-TEST",
     description: "Special test item",
     salesUom: "PC",
@@ -55,7 +56,7 @@ function acceptedDecision(overrides = {}) {
   return {
     decision: "accepted",
     itemResolution: {
-      itemId: 8_890_001,
+      itemId: 2055,
       itemName: "SPECIAL-TEST",
       description: "Special test item",
       salesUom: "PC",
@@ -91,23 +92,24 @@ test("multi-line case transitions atomically from Sales to SCM and back to an ex
       await query(
         `INSERT INTO inventory_items (
            item_id, item_name, display_name, item_description, item_type, stock_unit, raw, synced_at
-         ) VALUES (8890001, 'SPECIAL-TEST', 'Special Test', 'Special test item', 'InvtPart', 'PC', '{}'::jsonb, now())
+         ) VALUES (2055, 'SPECIAL-TEST', 'Special Test', 'Special test item', 'InvtPart', 'PC', '{}'::jsonb, now())
          ON CONFLICT (item_id) DO NOTHING`
       );
 
       let detail = await createSpecialStockCase({
         storeLocationId: 15,
+        fulfillmentMethod: "yard_pickup",
         inquiryDate: "2099-08-21",
         customerName: "Special Customer",
         vendorName: "Special Test Vendor",
         lines: [
-          { productName: "Special A", quantity: 2, uom: "PLT", requiredDate: "2099-09-01" },
-          { productName: "Special B", quantity: 1, uom: "PLT", requiredDate: "2099-09-01" }
+          { productName: "Special A", quantity: 2, uom: "PLT", rate: 42.5, requiredDate: "2099-09-01" },
+          { productName: "Special B", quantity: 1, uom: "PLT", rate: 85, requiredDate: "2099-09-01" }
         ]
       }, { operatorId: salesId, authorizedStoreLocationIds: [15] });
       assert.match(detail.requestRef, /^SPREQ-/u);
       assert.equal(detail.lines.length, 2);
-      assert.equal(detail.stage, "awaiting_purchase");
+      assert.equal(detail.stage, "new_enquiry");
 
       detail = await respondSpecialStockLine(detail.id, detail.lines[0].id, {
         expectedRevision: detail.revision,
@@ -127,19 +129,20 @@ test("multi-line case transitions atomically from Sales to SCM and back to an ex
         decision: "declined",
         reason: "Customer declined line B."
       }, { operatorId: salesId, authorizedStoreLocationIds: [15] });
-      assert.equal(detail.stage, "awaiting_so");
+      assert.equal(detail.stage, "await_customer_confirmation");
 
       detail = await saveSpecialSalesOrderDraft(detail.id, {
         expectedRevision: detail.revision,
         customerId: 8880001,
         operationalYardLocationId: 15,
         fulfillmentMethod: "mbt_delivery",
+        palletTotal: 0, deliveryContactName: "Site contact", deliveryContactPhone: "416-555-0100",
         deliveryAddress: "37 Sunmount Rd, Scarborough, ON M1T 2A4",
         deliveryDate: "2099-09-10",
         windowStart: "09:00",
         windowEnd: "12:00",
         deliveryInstructions: "Call before unloading.",
-        materialLines: [{ caseLineId: detail.lines[0].id, itemId: 8890001, quantity: 20, uom: "PC", rate: 4.25 }],
+        materialLines: [{ caseLineId: detail.lines[0].id, itemId: 2055, description: "Special test item", quantity: 20, packageQuantity: 2, conversionToPc: 10, uom: "PC", rate: 42.5 }],
         ancillaryLines: []
       }, { operatorId: salesId, authorizedStoreLocationIds: [15] });
       assert.equal(detail.customerId, 8880001);
@@ -160,7 +163,7 @@ test("multi-line case transitions atomically from Sales to SCM and back to an ex
         `INSERT INTO sales_order_lines (
            sales_order_id, line_id, item_id, item_name, sku, item_description,
            item_type, quantity, unit, location_id, location, netsuite_active, synced_at
-         ) VALUES ($1,9001,8890001,'SPECIAL-TEST','SPECIAL-TEST','Special test item',
+         ) VALUES ($1,9001,2055,'SPECIAL-TEST','SPECIAL-TEST','Special test item',
                    'InvtPart',20,'PC',15,'12441',true,now())`,
         [salesOrderId]
       );
@@ -171,7 +174,7 @@ test("multi-line case transitions atomically from Sales to SCM and back to an ex
         source: "manual_link"
       }, { operatorId: salesId, authorizedStoreLocationIds: [15] });
       assert.equal(detail.salesOrderApproved, true);
-      assert.equal(detail.stage, "awaiting_po");
+      assert.equal(detail.stage, "confirmed");
       assert.equal(detail.lines[0].poReady, false);
       await assert.rejects(
         () => claimSpecialOrderOperation(detail.id, {
@@ -181,9 +184,9 @@ test("multi-line case transitions atomically from Sales to SCM and back to an ex
         }, { operatorId: scmId }),
         (error) => error?.code === "SPECIAL_PO_SECOND_RESPONSE_REQUIRED"
       );
-      detail = await respondSpecialStockLine(detail.id, detail.lines[0].id, {
+      detail = await prepareSpecialPurchaseOrder(detail.id, {
         expectedRevision: detail.revision,
-        ...response({ itemResolution: itemResolution() })
+        lines: [{ caseLineId: detail.lines[0].id, description: 'Special test item', quantity: 20, uom: 'PC', unitPurchaseCost: 2.1 }]
       }, { operatorId: scmId });
       const storedReadiness = await query(
         `SELECT po_ready, po_ready_response_revision
@@ -206,7 +209,7 @@ test("multi-line case transitions atomically from Sales to SCM and back to an ex
         `INSERT INTO purchase_order_lines (
            purchase_order_id, line_id, item_id, item_name, sku, item_description,
            item_type, quantity, unit, location_id, location, netsuite_active, synced_at
-         ) VALUES ($1,9101,8890001,'SPECIAL-TEST','SPECIAL-TEST','Special test item',
+         ) VALUES ($1,9101,2055,'SPECIAL-TEST','SPECIAL-TEST','Special test item',
                    'InvtPart',20,'PC',15,'12441',true,now())`,
         [purchaseOrderId]
       );
@@ -240,7 +243,7 @@ test("multi-line case transitions atomically from Sales to SCM and back to an ex
       );
       detail = await getSpecialStockCase(detail.id, { audience: "scm" });
       assert.equal(detail.operationallyComplete, true);
-      assert.equal(detail.stage, "operationally_complete");
+      assert.equal(detail.stage, "completed");
 
       await query(
         `UPDATE sales_orders
@@ -260,10 +263,11 @@ test("multi-line case transitions atomically from Sales to SCM and back to an ex
 
       let pickup = await createSpecialStockCase({
         storeLocationId: 15,
+        fulfillmentMethod: "yard_pickup",
         inquiryDate: "2099-08-22",
         customerName: "Special Customer",
         vendorName: "Special Test Vendor",
-        lines: [{ productName: "Vendor pickup item", quantity: 2, uom: "PLT", requiredDate: "2099-09-01" }]
+        lines: [{ productName: "Vendor pickup item", quantity: 2, uom: "PLT", rate: 42.5, requiredDate: "2099-09-01" }]
       }, { operatorId: salesId, authorizedStoreLocationIds: [15] });
       pickup = await respondSpecialStockLine(pickup.id, pickup.lines[0].id, {
         expectedRevision: pickup.revision,
@@ -277,8 +281,8 @@ test("multi-line case transitions atomically from Sales to SCM and back to an ex
         expectedRevision: pickup.revision,
         customerId: 8880001,
         operationalYardLocationId: 15,
-        fulfillmentMethod: "vendor_pickup",
-        materialLines: [{ caseLineId: pickup.lines[0].id, itemId: 8890001, quantity: 20, uom: "PC", rate: 4.25 }],
+        fulfillmentMethod: "vendor_pickup", palletTotal: 0,
+        materialLines: [{ caseLineId: pickup.lines[0].id, itemId: 2055, description: "Special test item", quantity: 20, packageQuantity: 2, conversionToPc: 10, uom: "PC", rate: 42.5 }],
         ancillaryLines: []
       }, { operatorId: salesId, authorizedStoreLocationIds: [15] });
       const pickupSalesOrderId = salesOrderId + 100_000_000;
@@ -294,7 +298,7 @@ test("multi-line case transitions atomically from Sales to SCM and back to an ex
         `INSERT INTO sales_order_lines (
            sales_order_id, line_id, item_id, item_name, sku, item_description,
            item_type, quantity, unit, location_id, location, netsuite_active, synced_at
-         ) VALUES ($1,9201,8890001,'SPECIAL-TEST','SPECIAL-TEST','Special test item',
+         ) VALUES ($1,9201,2055,'SPECIAL-TEST','SPECIAL-TEST','Special test item',
                    'InvtPart',20,'PC',15,'12441',true,now())`,
         [pickupSalesOrderId]
       );
@@ -304,9 +308,9 @@ test("multi-line case transitions atomically from Sales to SCM and back to an ex
         salesOrderRef: `SO-PICKUP-${suffix}`,
         source: "manual_link"
       }, { operatorId: salesId, authorizedStoreLocationIds: [15] });
-      pickup = await respondSpecialStockLine(pickup.id, pickup.lines[0].id, {
+      pickup = await prepareSpecialPurchaseOrder(pickup.id, {
         expectedRevision: pickup.revision,
-        ...response({ itemResolution: itemResolution() })
+        lines: [{ caseLineId: pickup.lines[0].id, description: 'Special test item', quantity: 20, uom: 'PC', unitPurchaseCost: 2.1 }]
       }, { operatorId: scmId });
       await query(
         `INSERT INTO purchase_orders (
@@ -319,7 +323,7 @@ test("multi-line case transitions atomically from Sales to SCM and back to an ex
         `INSERT INTO purchase_order_lines (
            purchase_order_id, line_id, item_id, item_name, sku, item_description,
            item_type, quantity, unit, location_id, location, netsuite_active, synced_at
-         ) VALUES ($1,9301,8890001,'SPECIAL-TEST','SPECIAL-TEST','Special test item',
+         ) VALUES ($1,9301,2055,'SPECIAL-TEST','SPECIAL-TEST','Special test item',
                    'InvtPart',20,'PC',15,'12441',true,now())`,
         [pickupPurchaseOrderId]
       );
@@ -339,7 +343,7 @@ test("multi-line case transitions atomically from Sales to SCM and back to an ex
       assert.equal(pickup.operationalCompletionSource, "vendor_pickup");
       assert.equal(pickup.vendorPickupDate, "2099-09-06");
       assert.equal(pickup.vendorPickupReference, "SIGNED-PICKUP-888");
-      assert.equal(pickup.stage, "operationally_complete");
+      assert.equal(pickup.stage, "completed");
     });
   } finally {
     await rollback.rollback();
@@ -359,7 +363,7 @@ test("optimistic revision permits one SCM response and one winner in the close/c
   );
   await query(
     `INSERT INTO inventory_items (item_id, item_name, display_name, item_description, item_type, stock_unit, raw, synced_at)
-     VALUES (8890001, 'SPECIAL-TEST', 'Special Test', 'Special test item', 'InvtPart', 'PC', '{}'::jsonb, now())
+     VALUES (2055, 'SPECIAL-TEST', 'Special Test', 'Special test item', 'InvtPart', 'PC', '{}'::jsonb, now())
      ON CONFLICT (item_id) DO NOTHING`
   );
   await query(
@@ -372,10 +376,11 @@ test("optimistic revision permits one SCM response and one winner in the close/c
   );
   const detail = await createSpecialStockCase({
     storeLocationId: 15,
+        fulfillmentMethod: "yard_pickup",
     inquiryDate: "2099-08-21",
     customerName: "Race Customer",
     vendorName: "Special Test Vendor",
-    lines: [{ productName: "Race A", quantity: 1, uom: "PLT", requiredDate: "2099-09-01" }]
+    lines: [{ productName: "Race A", quantity: 1, uom: "PLT", rate: 85, requiredDate: "2099-09-01" }]
   }, { operatorId: salesId, authorizedStoreLocationIds: [15] });
   const attempts = await Promise.allSettled([
     respondSpecialStockLine(detail.id, detail.lines[0].id, { expectedRevision: detail.revision, ...response() }, { operatorId: scmId }),
@@ -393,8 +398,8 @@ test("optimistic revision permits one SCM response and one winner in the close/c
     expectedRevision: current.revision,
     customerId: 8880002,
     operationalYardLocationId: 15,
-    fulfillmentMethod: "vendor_pickup",
-    materialLines: [{ caseLineId: current.lines[0].id, itemId: 8890001, quantity: 20, uom: "PC", rate: 4.25 }],
+    fulfillmentMethod: "vendor_pickup", palletTotal: 0,
+    materialLines: [{ caseLineId: current.lines[0].id, itemId: 2055, description: "Special test item", quantity: 20, packageQuantity: 1, conversionToPc: 20, uom: "PC", rate: 85 }],
     ancillaryLines: []
   }, { operatorId: salesId, authorizedStoreLocationIds: [15] });
   assert.equal(current.salesOrderLines.length, 1);
@@ -402,9 +407,9 @@ test("optimistic revision permits one SCM response and one winner in the close/c
     expectedRevision: current.revision,
     ...response({ availableDate: "2099-09-06", salesVisibleNote: "The vendor revised its first reply." })
   }, { operatorId: scmId });
-  assert.equal(current.lines[0].salesDecision, "pending");
-  assert.equal(current.lines[0].itemResolution, null);
-  assert.equal(current.salesOrderLines.length, 0);
+  assert.equal(current.lines[0].salesDecision, "accepted");
+  assert.equal(current.lines[0].itemResolution.itemId, 2055);
+  assert.equal(current.salesOrderLines.length, 1);
   current = await decideSpecialStockLine(current.id, current.lines[0].id, {
     expectedRevision: current.revision,
     ...acceptedDecision()
@@ -413,8 +418,8 @@ test("optimistic revision permits one SCM response and one winner in the close/c
     expectedRevision: current.revision,
     customerId: 8880002,
     operationalYardLocationId: 15,
-    fulfillmentMethod: "vendor_pickup",
-    materialLines: [{ caseLineId: current.lines[0].id, itemId: 8890001, quantity: 20, uom: "PC", rate: 4.25 }],
+    fulfillmentMethod: "vendor_pickup", palletTotal: 0,
+    materialLines: [{ caseLineId: current.lines[0].id, itemId: 2055, description: "Special test item", quantity: 20, packageQuantity: 1, conversionToPc: 20, uom: "PC", rate: 85 }],
     ancillaryLines: []
   }, { operatorId: salesId, authorizedStoreLocationIds: [15] });
   const operationId = crypto.randomUUID();
@@ -490,13 +495,13 @@ test("optimistic revision permits one SCM response and one winner in the close/c
   );
 });
 
-test("a PO claim racing the second SCM response can never bypass PO readiness", async () => {
+test("a PO claim racing the SCM purchase review can never bypass PO readiness", async () => {
   const suffix = crypto.randomUUID().replaceAll("-", "").slice(0, 8);
   const numericSuffix = Number.parseInt(suffix, 16);
   const salesId = `special-po-race-sales-${suffix}`;
   const scmId = `special-po-race-scm-${suffix}`;
   const customerId = 9_100_000_000 + numericSuffix;
-  const itemId = 9_200_000_000 + numericSuffix;
+  const itemId = 2055;
   const salesOrderId = 9_300_000_000 + numericSuffix;
   await query(
     `INSERT INTO operators (id, username, display_name, password_hash, password_salt, role, roles, yard_location_ids)
@@ -515,16 +520,17 @@ test("a PO claim racing the second SCM response can never bypass PO readiness", 
   await query(
     `INSERT INTO inventory_items (
        item_id, item_name, display_name, item_description, item_type, stock_unit, raw, synced_at
-     ) VALUES ($1,$2,$2,'PO race special item','InvtPart','PC','{}'::jsonb,now())`,
+     ) VALUES ($1,$2,$2,'PO race special item','InvtPart','PC','{}'::jsonb,now()) ON CONFLICT (item_id) DO NOTHING`,
     [itemId, `SPECIAL-PO-RACE-${suffix}`]
   );
 
   let detail = await createSpecialStockCase({
     storeLocationId: 15,
+        fulfillmentMethod: "yard_pickup",
     inquiryDate: "2099-08-21",
     customerName: "PO Race Customer",
     vendorName: "Special Test Vendor",
-    lines: [{ productName: "PO Race Item", quantity: 2, uom: "PLT", requiredDate: "2099-09-01" }]
+    lines: [{ productName: "PO Race Item", quantity: 2, uom: "PLT", rate: 42.5, requiredDate: "2099-09-01" }]
   }, { operatorId: salesId, authorizedStoreLocationIds: [15] });
   detail = await respondSpecialStockLine(detail.id, detail.lines[0].id, {
     expectedRevision: detail.revision,
@@ -546,8 +552,8 @@ test("a PO claim racing the second SCM response can never bypass PO readiness", 
     expectedRevision: detail.revision,
     customerId,
     operationalYardLocationId: 15,
-    fulfillmentMethod: "vendor_pickup",
-    materialLines: [{ caseLineId: detail.lines[0].id, itemId, quantity: 20, uom: "PC", rate: 4.25 }],
+    fulfillmentMethod: "vendor_pickup", palletTotal: 0,
+    materialLines: [{ caseLineId: detail.lines[0].id, itemId, description: "PO race special item", quantity: 20, packageQuantity: 2, conversionToPc: 10, uom: "PC", rate: 42.5 }],
     ancillaryLines: []
   }, { operatorId: salesId, authorizedStoreLocationIds: [15] });
   await query(
@@ -572,15 +578,9 @@ test("a PO claim racing the second SCM response can never bypass PO readiness", 
   }, { operatorId: salesId, authorizedStoreLocationIds: [15] });
 
   const attempts = await Promise.allSettled([
-    respondSpecialStockLine(detail.id, detail.lines[0].id, {
+    prepareSpecialPurchaseOrder(detail.id, {
       expectedRevision: detail.revision,
-      ...response({
-        itemResolution: itemResolution({
-          itemId,
-          itemName: `SPECIAL-PO-RACE-${suffix}`,
-          description: "PO race special item"
-        })
-      })
+      lines: [{ caseLineId: detail.lines[0].id, description:'PO race special item', quantity:20, uom:'PC', unitPurchaseCost:2.1 }]
     }, { operatorId: scmId }),
     claimSpecialOrderOperation(detail.id, {
       expectedRevision: detail.revision,

@@ -33,7 +33,7 @@ const activityAt = (id, status = "in_progress", type = "dropoff", extra = {}) =>
 test("SOV-01 Voyage is location 4 and has the exact dispatch address", () => {
   assert.deepEqual(VOYAGE_DISPATCH_YARD, { code: "195", name: "195", locationId: 4,
     address: "195 Milner Ave Unit 5, Scarborough, ON M1S 4P4" });
-  assert.deepEqual(SALES_ORDER_SYNC_LOCATIONS, [1, 28, 15, 26, 4]);
+  assert.deepEqual(SALES_ORDER_SYNC_LOCATIONS, [1, 28, 15, 26, 4, 50]);
 });
 
 test("SOV-02 saved setup gains Voyage once without changing existing yards", () => {

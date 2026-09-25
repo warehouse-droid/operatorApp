@@ -1,0 +1,35 @@
+{
+  "runtime": [
+    "src/aggregate-request-access-repository.js",
+    "src/aggregate-request-access-router.js",
+    "src/aggregate-request-domain.js",
+    "src/aggregate-request-repository.js",
+    "src/aggregate-request-router.js",
+    "src/auth-repository.js",
+    "src/server.js",
+    "migrations/216_aggregate_request_access.sql",
+    "public/admin.html",
+    "public/control.html",
+    "public/control.js",
+    "public/i18n.js",
+    "public/app-sidebar.js",
+    "public/operator.html",
+    "public/operator.js",
+    "public/service-worker.js",
+    "public/aggregate-requester.js",
+    "public/aggregate-requests.html",
+    "public/aggregate-requests.css",
+    "public/aggregate-requests-i18n.js",
+    "public/scm-stock-requests.html",
+    "public/aggregate-requests.js",
+    "public/control.css"
+  ],
+  "tests": [
+    "test/mbt/unit/aggregate-request-domain.test.js",
+    "test/mbt/unit/aggregate-request-access.test.js",
+    "test/mbt/integration/aggregate-request-repository.test.js",
+    "test/mbt/integration/aggregate-request-http.test.js",
+    "test/mbt/integration/aggregate-request-access.test.js",
+    "test/mbt/integration/aggregate-request-browser.test.js"
+  ]
+}

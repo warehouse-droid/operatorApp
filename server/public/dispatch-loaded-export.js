@@ -307,7 +307,7 @@ async function loadLoadedSearch() {
 
 function loadedPhotoSrc(value, { thumbnail = false } = {}) {
   const ref = String(value || "");
-  if (!ref.startsWith("r2://")) return ref;
+  if (!ref.startsWith("r2://") && !ref.startsWith("operator-photo://")) return ref;
   const params = new URLSearchParams({
     ref,
     token: dispatchAuthToken || ""

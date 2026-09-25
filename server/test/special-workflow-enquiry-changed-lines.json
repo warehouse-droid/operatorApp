@@ -1,0 +1,79 @@
+{
+  "src/special-stock-request-domain.js": {
+    "afterSha256": "1d30b3c643c8d280cf96e7e7bcf9a56b4fa436a4ec6ee39abc3ec4e3d40b75ab",
+    "changedLines": [
+      105,
+      131
+    ]
+  },
+  "src/special-stock-request-repository.js": {
+    "afterSha256": "1455f39e3a413d2155bc9eda268faa669686f0f0935db205636cab0ec3974e60",
+    "changedLines": [
+      2,
+      206,
+      637,
+      639,
+      640,
+      641,
+      660,
+      661,
+      664,
+      667,
+      679,
+      864,
+      865,
+      960,
+      963,
+      965,
+      1176,
+      1782
+    ]
+  },
+  "src/special-stock-customer-directory.js": {
+    "afterSha256": "6e585ac576e8455abe118fd848a5b74855c9acdf780e3da32c71c922147c5de3",
+    "changedLines": [
+      1,
+      2,
+      3,
+      4,
+      5,
+      6,
+      7,
+      8,
+      9,
+      10,
+      11,
+      12,
+      13,
+      14,
+      15,
+      16,
+      17,
+      18,
+      19,
+      20,
+      21,
+      22,
+      23,
+      24,
+      25,
+      26,
+      27,
+      28,
+      29,
+      30,
+      31,
+      32,
+      33,
+      34,
+      35,
+      36,
+      37,
+      38,
+      39,
+      40,
+      41,
+      42
+    ]
+  }
+}

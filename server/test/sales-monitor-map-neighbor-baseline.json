@@ -1,0 +1,6 @@
+{
+  "knownFailures": [
+    "dispatch rendering and autosave never trigger route API work"
+  ],
+  "reason": "Pre-existing source contract expects route refresh directly inside the confirmation wrapper. The current wrapper delegates to performDispatchPlanConfirmation. This task changes only the server access guard."
+}

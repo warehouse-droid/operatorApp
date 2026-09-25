@@ -1,0 +1,24 @@
+# Start another Aggregate request after completion
+
+Tier 3: durable history and concurrent submissions. Spec approval: not obtained (autonomous run). Implements the user's report that completed, acknowledged AGG-000001 leaves no way to start the next request.
+
+1. A reported request, including a same-day request for tomorrow, no longer occupies the requester workspace. The page immediately shows the blank eight-card request form and allows a fresh request for tomorrow with a new reference. SCM acknowledgment is not an additional submission prerequisite. Rejected requests also release the workspace.
+2. Completed/rejected headers, quantities, differences, acknowledgments and audit events remain unchanged and available to SCM. A lost-response retry returns the original submission even after completion; it never creates an extra request.
+3. Exactly one unfinished (`submitted` or `confirmed`) request can exist per yard, across service dates and submitter reassignments. The UI opens that request, and direct API submissions fail with 409 and the existing request ID. Existing overdue-report error semantics remain supported.
+4. Reporting/rejection and new submission serialize per yard. Concurrent distinct submissions have one winner; identical operation retries have one durable result. Different yards remain independent. Separate Admin-granted access, roles, ownership, revisions, quantity rules and SCM correction behavior remain unchanged.
+5. Replace the daily uniqueness constraint with an unfinished-request uniqueness index. Migration preserves every request, line and event, tolerates reapplication, and rolls back transactionally on failure. If existing data contains multiple unfinished requests for one yard, fail rather than discard or modify records.
+6. English/Chinese explain a blocked new request. Browser checks reproduce report → acknowledgment → fresh same-date request, reload/edit of the new reference, and preserved original history. Existing responsive cards and default zero behavior remain.
+
+This supersedes the original one-request-per-yard/date assumption, the former same-date closed workspace behavior, and the test allowing a newly assigned submitter to bypass an unfinished request owned by the previous submitter. These are explicit behavior corrections, not test refactors.
+
+Failure model: duplicate active requests (DB constraint, concurrency/property tests); lost history (snapshot/audit comparisons, migration rehearsal); stale retry mistaken for a new request (operation idempotency tests); stale/reassigned access bypass (existing grant/revocation tests and unfinished-yard check); incomplete migration/deployment (transaction rollback rehearsal, backup/row hashes, exact image checks and rollback plan).
+
+Setup: use the installed Node/PostgreSQL/Playwright/ESLint/TypeScript/c8/fast-check Docker image; add no dependencies. Snapshot this dirty workspace, use the recorded full-suite baseline with zero new failures, write behavior tests before implementation, record changed-line coverage and three targeted mutations/property reruns. No commits or operational test submissions. Deploy only the task patch over the current live image after migration rehearsal, preflight and candidate verification. Keep historical rows intact and retain rollback evidence.
+
+## User-added SCM material memos
+
+7. SCM/Admin can enter or clear a free-text memo independently for each of the seven material rows. An “Edit material memos” action opens the material comparison table with one textarea per row and a “Save material memos” action. Memos remain editable on submitted, confirmed, reported and rejected requests without changing quantities, state or review acknowledgments.
+8. Each memo supports up to 2,000 characters, including Chinese and line breaks. Save/reload and language switching preserve memos; HTML-like text displays literally. Every save uses existing request revisions, idempotent operation IDs and an audited `memo` event. Requesters cannot write SCM memos, including through forged or replayed commands after losing SCM authority.
+9. Add an empty-by-default memo column to material lines and allow the new audit action. Existing quantities and historical event snapshots remain unchanged. Test malformed/oversized text, clear-to-empty, stale concurrent saves, retry conflicts, role denial and atomic audit failure. Rehearse both migrations and build a rollback image compatible with the updated uniqueness rule so operational records never need deletion during rollback.
+
+Failure model addition: lost or misassigned row notes (round-trip/property tests), memo text executed as HTML (browser escaping check), unauthorized or stale memo changes (HTTP/repository tests), and notes accidentally changing loads or review state (domain and persisted-row comparisons).

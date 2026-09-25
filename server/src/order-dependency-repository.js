@@ -523,7 +523,7 @@ export async function listOrderDependencies(filters = {}) {
   return loadDependencies(filters);
 }
 
-export async function assertNoActiveOrderDependenciesByRefs(orderRefs = [], action = "change these orders", _options = {}) {
+export async function assertNoActiveOrderDependenciesByRefs(orderRefs = [], action = "change these orders", options = {}) {
   const refs = [...new Set((orderRefs || []).map(text).filter(Boolean))];
   if (!refs.length) return;
   const result = await query(
@@ -558,9 +558,12 @@ export async function assertNoActiveOrderDependenciesByRefs(orderRefs = [], acti
   // the temporary Dispatch container. Group/split edits therefore leave its
   // inventory contract intact; ordering and execution gates are enforced by
   // validateDispatchPlanDependencies and getSalesOrderDependencyExecutionBlock.
-  // Direct-to-customer dependencies remain locked because their pickup and
-  // customer drop must stay coupled on one physical load.
-  const blocked = result.rows.filter(dependencyBlocksDispatchStructureChange);
+  // Direct pickups may move from a normal SO to its proven new group before
+  // execution. Splits, ungrouping, and independent TO edits remain protected.
+  const blocked = result.rows.filter((dependency) =>
+    dependencyBlocksDispatchStructureChange(dependency, options)
+    || (dependency.dependency_mode === "direct_to_customer" && refs.includes(dependency.transfer_order_ref))
+  );
   if (!blocked.length) return;
   const relations = blocked.map((row) => `${row.dispatch_target_ref || row.sales_order_ref} -> ${row.transfer_order_ref}`).join(", ");
   const error = new Error(`Cannot ${action} while an active order dependency exists: ${relations}. Unlink the dependency first.`);
@@ -1211,6 +1214,7 @@ export async function syncDirectDependencyOperatorProgress(transferOrderId) {
 }
 
 export async function getOrderDependencyOptions({ dispatchTargetRef = "", salesOrderRef = "", transferOrderRef = "", planDate = "" } = {}) {
+  transferOrderRef = text(transferOrderRef).toUpperCase();
   const targetRef = text(dispatchTargetRef || salesOrderRef);
   const existingLinks = targetRef ? await loadDependencies({ salesOrderRef: targetRef }) : [];
   const transferOrders = await query(
@@ -1227,8 +1231,8 @@ export async function getOrderDependencyOptions({ dispatchTargetRef = "", salesO
       LIMIT 500`
   );
   const requestedTransfer = transferOrderRef
-    ? transferOrders.rows.find((row) => row.tranid === text(transferOrderRef))
-      || (await query("SELECT * FROM transfer_orders WHERE tranid = $1", [text(transferOrderRef)])).rows[0]
+    ? transferOrders.rows.find((row) => text(row.tranid).toUpperCase() === transferOrderRef)
+      || (await query("SELECT * FROM transfer_orders WHERE UPPER(tranid) = $1", [transferOrderRef])).rows[0]
     : null;
   const requestedTerminalStatus = terminalTransferOrderStatus(requestedTransfer);
   const transfer = requestedTerminalStatus ? null : requestedTransfer;
@@ -1366,7 +1370,7 @@ async function salesOrderShortageRows(salesOrderId = null) {
             o.is_test_fixture,
             EXISTS (
               SELECT 1
-                FROM dispatch_order_completion_events completion
+                FROM dispatch_effective_order_completion_events completion
                WHERE completion.order_kind = 'SO'
                  AND lower(btrim(completion.order_ref)) = lower(btrim(o.tranid))
             ) AS dispatch_completed,
@@ -4060,6 +4064,7 @@ export async function createOrderDependency({
   operatorId = null
 } = {}) {
   const normalizedMode = normalizeMode(mode);
+  transferOrderRef = text(transferOrderRef).toUpperCase();
   return withTransaction(async () => {
     const targetRef = text(dispatchTargetRef || salesOrderRef);
     await query(
@@ -4068,8 +4073,8 @@ export async function createOrderDependency({
     );
     const resolved = await resolveDispatchSalesTarget({ dispatchTargetRef: targetRef, planDate });
     const transfer = await query(
-      "SELECT * FROM transfer_orders WHERE tranid = $1 FOR UPDATE",
-      [text(transferOrderRef)]
+      "SELECT * FROM transfer_orders WHERE UPPER(tranid) = $1 FOR UPDATE",
+      [transferOrderRef]
     );
     if (targetSignature && targetSignature !== resolved.signature) {
       const error = new Error(`${targetRef} changed while the link window was open. Refresh the matched lines before linking.`);
@@ -4078,6 +4083,7 @@ export async function createOrderDependency({
       throw error;
     }
     if (!transfer.rowCount) throw new Error("Transfer Order not found.");
+    transferOrderRef = transfer.rows[0].tranid;
     const terminalStatus = terminalTransferOrderStatus(transfer.rows[0]);
     if (transfer.rows[0].netsuite_active === false || terminalStatus) {
       throw new Error(`${transferOrderRef} is ${terminalStatus || "inactive"} and cannot be linked.`);
@@ -4950,7 +4956,7 @@ export async function syncOrderDependenciesFromDispatchPlan(plan = {}, {
         groupRef
         && dependency.dispatchTargetKind === "normal"
         && currentTargetRef === canonicalRef
-        && dependency.mode === "yard_replenishment"
+        && ["yard_replenishment", "direct_to_customer"].includes(dependency.mode)
         && ["active", "attention"].includes(dependency.status)
         && !hasExecutionProgress
       ) {
@@ -4961,7 +4967,7 @@ export async function syncOrderDependenciesFromDispatchPlan(plan = {}, {
               AND dispatch_target_ref = $3
               AND sales_order_ref = $4
               AND dispatch_target_kind = 'normal'
-              AND dependency_mode = 'yard_replenishment'
+              AND dependency_mode IN ('yard_replenishment', 'direct_to_customer')
               AND status IN ('active', 'attention')
               AND NOT EXISTS (
                 SELECT 1
@@ -5101,7 +5107,7 @@ export async function syncOrderDependenciesFromDispatchPlan(plan = {}, {
           [dependency.id, plan.id || null, plan.planDate, assignment.truckPlate,
             assignment.loadId || null, assignment.loadName || null]
         );
-      } else if (String(dependency.plannedDate || "").slice(0, 10) === String(plan.planDate || "").slice(0, 10)) {
+      } else if (dateText(dependency.plannedDate) === dateText(plan.planDate)) {
         await query(
           `UPDATE order_dependencies
               SET planned_plan_id = null, planned_date = null, planned_truck_plate = null,

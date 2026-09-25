@@ -1,4 +1,9 @@
 import { query } from "./db.js";
+import { driverActivityOrderRefs } from "./driver-co-pickup-evidence.js";
+import { DISPATCH_FLEET_PLANNING_LOCK } from './dispatch-fleet-status.js';
+import { lockDispatchPlanEditLease, lockDispatchPlanEditLeaseDate } from './dispatch-plan-lease-repository.js';
+import { lockConsolidatedLoadOrders } from "./consolidation-load-locks.js";
+import { completedCoArrivalSql, coSourcePackingActivityRefs, coSourcePackingOrders } from "./co-source-packing-handoff.js";
 import { getDispatchPlan } from "./dispatch-plan-repository.js";
 import { resolveDispatchSalesTarget } from "./dispatch-order-target-repository.js";
 import { listClosedNetSuiteOrders } from "./netsuite-closed-order-repository.js";
@@ -65,33 +70,88 @@ async function closedOrderRefs(refs = []) {
     .filter(Boolean))];
 }
 
-async function operatorActivityRefs({ salesRefs = [], transferRefs = [] } = {}) {
+// Match createOrderDependency's key-first, legacy-ID fallback exactly. Only a
+// fully resolved explicit selection can narrow the existing whole-order guard.
+function selectedSalesLineIds(action, allocations, lines) {
+  if (action !== "link_to" || !Array.isArray(allocations) || !allocations.length) {return null;}
+  const byKey = new Map(lines.map((line) => [line.targetLineKey, line]));
+  const selected = allocations.map((allocation) => (
+    byKey.get(text(allocation?.targetLineKey))
+    || lines.find((line) => Number(line.salesLineId) === Number(allocation?.salesLineId))
+  ));
+  if (selected.some((line) => !line || !Number.isSafeInteger(line.salesLineId) || line.salesLineId <= 0)) {return null;}
+  return [...new Set(selected.map((line) => line.salesLineId))];
+}
+
+function salesStatusBlocks(value, salesLineIds) {
+  // Packed/confirmed summarize other lines too; preparation and execution do not.
+  return activeWorkStatus(value)
+    && !(salesLineIds && ["confirmed", "packed"].includes(text(value).toLowerCase()));
+}
+
+async function lockDependencyOperatorOrders(salesRefs, transferRefs) {
+  const orders = await query(
+    `SELECT netsuite_id FROM sales_orders WHERE tranid = ANY($1::text[])
+     UNION SELECT netsuite_id FROM transfer_orders WHERE tranid = ANY($2::text[])`,
+    [salesRefs, transferRefs]
+  );
+  const sourceCos = await coSourcePackingOrders(salesRefs);
+  await lockConsolidatedLoadOrders([
+    ...orders.rows.map((row) => row.netsuite_id),
+    ...sourceCos.map((row) => row.delivery_order_id).filter(Boolean)
+  ]);
+  // Advisory locks serialize normal Operator mutations. Row locks also fence
+  // direct canonical-row writers until the dependency transaction commits.
+  for (const [header, lineTable, parent, refs] of [
+    ["sales_orders", "sales_order_lines", "sales_order_id", salesRefs],
+    ["transfer_orders", "transfer_order_lines", "transfer_order_id", transferRefs]
+  ]) {
+    await query(`SELECT netsuite_id FROM ${header} WHERE tranid = ANY($1::text[])
+      ORDER BY netsuite_id FOR UPDATE`, [refs]);
+    await query(`SELECT line.id FROM ${lineTable} line JOIN ${header} header ON header.netsuite_id = line.${parent}
+      WHERE header.tranid = ANY($1::text[]) ORDER BY line.id FOR UPDATE OF line`, [refs]);
+  }
+  const currentCos = await coSourcePackingOrders(salesRefs);
+  if (JSON.stringify(currentCos.map(row => [row.id, row.delivery_order_id]).sort())
+    !== JSON.stringify(sourceCos.map(row => [row.id, row.delivery_order_id]).sort())) {
+    throw statusError(409, "CO_SOURCE_PACKING_CHANGED", "A source CO changed while linking. Refresh and try again.");
+  }
+  const coIds = sourceCos.map((row) => row.id);
+  await query("SELECT id FROM local_co_orders WHERE id=ANY($1::bigint[]) ORDER BY id FOR UPDATE", [coIds]);
+  await query("SELECT id FROM local_co_order_lines WHERE co_id=ANY($1::bigint[]) ORDER BY id FOR UPDATE", [coIds]);
+}
+
+async function operatorActivityRefs({ salesRefs = [], transferRefs = [], salesLineIds = null, allowReceivedCo = false } = {}) {
   const refs = [];
   if (salesRefs.length) {
+    refs.push(...await coSourcePackingActivityRefs(salesRefs, salesLineIds, { allowReceivedCo }));
     const sales = await query(
       `SELECT DISTINCT sales.tranid AS ref, sales.operator_status,
               sales.local_yard_order_status, sales.preparing_operator_id,
               sales.preparing_started_at,
-              bool_or(
+              bool_or(COALESCE(line.loaded_qty, 0) > 0) AS order_loaded,
+              bool_or(($2::bigint[] IS NULL OR line.id = ANY($2::bigint[])) AND (
                 COALESCE(line.confirmed, false)
+                OR ($2::bigint[] IS NOT NULL AND line.confirmed_at IS NOT NULL)
                 OR COALESCE(line.packed_pallet_qty, 0) > 0
                 OR COALESCE(line.packed_layer_qty, 0) > 0
                 OR COALESCE(line.packed_section_qty, 0) > 0
                 OR COALESCE(line.packed_piece_qty, 0) > 0
                 OR COALESCE(line.packed_sales_qty, 0) > 0
                 OR COALESCE(line.loaded_qty, 0) > 0
-              ) AS line_started
+              )) AS line_started
          FROM sales_orders sales
          LEFT JOIN sales_order_lines line ON line.sales_order_id = sales.netsuite_id
         WHERE sales.tranid = ANY($1::text[])
         GROUP BY sales.netsuite_id`,
-      [salesRefs]
+      [salesRefs, salesLineIds]
     );
     refs.push(...sales.rows.filter((row) => (
       text(row.preparing_operator_id)
       || row.preparing_started_at
-      || activeWorkStatus(row.operator_status)
-      || activeWorkStatus(row.local_yard_order_status)
+      || salesStatusBlocks(row.operator_status, salesLineIds)
+      || salesStatusBlocks(row.local_yard_order_status, salesLineIds)
+      || row.order_loaded === true
       || row.line_started === true
     )).map((row) => text(row.ref)));
   }
@@ -197,18 +257,26 @@ async function dependencyExecutionIds({ dependencyIds = [], transferRefs = [] } 
 async function driverActivity({ refs = [] } = {}) {
   if (!refs.length) {return [];}
   const result = await query(
-    `SELECT id, job_id
-       FROM driver_job_records
+    `SELECT record.*, snapshot.orders AS snapshot_orders, snapshot.trucks AS snapshot_trucks
+       FROM driver_job_records record
+       LEFT JOIN dispatch_plan_snapshots snapshot ON snapshot.plan_id = record.plan_id
       WHERE order_refs ?| $1::text[]
         AND (
           started_at IS NOT NULL
           OR completed_at IS NOT NULL
           OR lower(COALESCE(status, '')) IN ('in_progress', 'in-progress', 'started', 'complete', 'completed')
         )
-      ORDER BY id`,
+      ORDER BY record.id`,
     [refs]
   );
-  return result.rows.map((row) => row.job_id || String(row.id));
+  if (!result.rowCount) {return [];}
+  const corrections = await query(`SELECT correction.co_ref, correction.proof, co.status, co.from_location,
+    ${completedCoArrivalSql()} AS completion_at
+    FROM dispatch_driver_co_identity_corrections correction JOIN local_co_orders co ON co.co_ref=correction.co_ref
+    WHERE correction.proof->>'planId'=ANY($1::text[])`,
+  [[...new Set(result.rows.map(row => String(row.plan_id)))]]);
+  return result.rows.filter(row => driverActivityOrderRefs(row, corrections.rows).some(ref => refs.includes(ref)))
+    .map(row => row.job_id || String(row.id));
 }
 
 async function offlineEvidence({ planId = null } = {}) {
@@ -249,6 +317,11 @@ async function activeForeignLease(planDate, actor = {}) {
 }
 
 export async function previewScmDependencyMutation(command = {}, actor = {}, { lock = false } = {}) {
+  if (lock) {
+    await query('SELECT pg_advisory_xact_lock(hashtext($1))', [DISPATCH_FLEET_PLANNING_LOCK]);
+    if (actor.editLease) {await lockDispatchPlanEditLease(actor.editLease);}
+    else if (command.planDate) {await lockDispatchPlanEditLeaseDate(command.planDate);}
+  }
   const relation = await relationshipContext(command);
   const action = text(command.action);
   const payload = command.payload || {};
@@ -285,7 +358,10 @@ export async function previewScmDependencyMutation(command = {}, actor = {}, { l
     }
   }
 
-  const transferRef = text(payload.transferOrderRef || relation.dependency?.transfer_order_ref);
+  const requestedTransferRef = text(payload.transferOrderRef || relation.dependency?.transfer_order_ref);
+  const transferRef = requestedTransferRef
+    ? (await query("SELECT tranid FROM transfer_orders WHERE UPPER(tranid) = $1", [requestedTransferRef.toUpperCase()])).rows[0]?.tranid || requestedTransferRef
+    : "";
   const purchaseRef = text(payload.poRef || relation.poAllocation?.po_order_ref);
   const dependencyIds = [relation.dependency?.id, payload.dependencyId]
     .map(Number).filter(Number.isInteger);
@@ -326,10 +402,21 @@ export async function previewScmDependencyMutation(command = {}, actor = {}, { l
   // changes a Driver route only when the resolved target is actually assigned to
   // that route (or an existing relationship retains a historical planned plan).
   const planId = Number(resolved.target.planId || relation.dependency?.planned_plan_id) || null;
+  if (lock && !actor.editLease && !command.planDate && resolved.target.planDate) {await lockDispatchPlanEditLeaseDate(resolved.target.planDate);}
   if (lock && planId) {await query("SELECT id FROM dispatch_plans WHERE id = $1 FOR UPDATE", [planId]);}
   const plan = planId ? await getDispatchPlan(planId) : null;
+  if (lock && actor.editLease && plan && text(actor.editLease.planDate).slice(0, 10) !== plan.planDate) {
+    throw statusError(409, 'DISPATCH_PLAN_EDIT_LEASE_REQUIRED', 'Enter Edit Mode on the affected plan date before changing its dependency.');
+  }
+  if (lock && actor.editLease && plan && (command.expectedPlanRevision === null
+    || command.expectedPlanRevision === undefined || command.expectedPlanRevision === ''
+    || !Number.isFinite(Number(command.expectedPlanRevision)) || !text(command.expectedPlanDigest))) {
+    throw statusError(409, 'DISPATCH_PLAN_FENCE_REQUIRED', 'Refresh the affected plan before changing its dependency.');
+  }
+  const salesLineIds = selectedSalesLineIds(action, payload.allocations, resolved.lines);
   const memberRefs = [...new Set([
     resolved.target.ref,
+    ...(salesLineIds ? resolved.lines.map((line) => line.sourceOrderRef) : []),
     ...(resolved.target.memberRefs || []),
     relation.dependency?.sales_order_ref,
     relation.poAllocation?.sales_order_ref
@@ -346,8 +433,10 @@ export async function previewScmDependencyMutation(command = {}, actor = {}, { l
   // Preview often runs under the command transaction's row/advisory locks.
   // Keep these reads sequential because pg clients do not support concurrent
   // queries on the same transaction connection.
+  if (lock && salesLineIds) {await lockDependencyOperatorOrders(memberRefs, guardedTransferRefs);}
   const closed = await closedOrderRefs(guardedRefs);
-  const operatorRefs = await operatorActivityRefs({ salesRefs: memberRefs, transferRefs: guardedTransferRefs });
+  const operatorRefs = await operatorActivityRefs({ salesRefs: memberRefs, transferRefs: guardedTransferRefs, salesLineIds,
+    allowReceivedCo: action === "link_to" && Boolean(salesLineIds?.length) });
   const receivingRefs = await receivingActivityRefs({ purchaseRefs, transferRefs: guardedTransferRefs });
   const executionIds = completedUnlink ? [] : await dependencyExecutionIds({ dependencyIds, transferRefs });
   const jobIds = await driverActivity({ refs: guardedRefs });

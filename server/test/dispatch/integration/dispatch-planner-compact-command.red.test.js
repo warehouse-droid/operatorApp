@@ -57,7 +57,7 @@ async function compactCommand({ plan, lease, commandId, commandType = "update_lo
       commandId,
       baseRevision: plan.revision,
       baseDigest: plan.digest,
-      sessionId: "dispatch-planner-compact-test",
+      sessionId: fixture.leaseSession(lease),
       commandType,
       payload: { planDelta, actionName: "dispatch_plan_compact_test" }
     }

@@ -1,0 +1,186 @@
+{
+  "recorded": "2026-09-18 before Field Sales implementation",
+  "filesRun": 543,
+  "failedFiles": [
+    "test/mbt/infrastructure/p3-gauntlet-artifacts.test.js",
+    "test/mbt/infrastructure/p3-gauntlet-contract.test.js",
+    "test/mbt/infrastructure/production-runtime-contract.test.js",
+    "test/mbt/unit/control-yard-photo-thumbnail.test.js",
+    "test/mbt/unit/driver-camera-ordinary-upload.test.js",
+    "test/mbt/unit/driver-plan-date-execution-wiring.contract.test.js",
+    "test/mbt/unit/driver-pwa-cache-repair.test.js",
+    "test/mbt/unit/driver-pwa-site-reset.test.js",
+    "test/mbt/unit/driver-pwa-ux-regressions.test.js",
+    "test/mbt/unit/netsuite-order-line.test.js",
+    "test/mbt/unit/operations-navigation-enhancements.test.js",
+    "test/mbt/unit/operator-customer-pickup-photo-gate-ui.contract.test.js",
+    "test/mbt/unit/operator-page-confirm-ui.contract.test.js",
+    "test/mbt/unit/operator-yard-assets.test.js",
+    "test/mbt/integration/dispatch-completion-http.red.test.js",
+    "test/mbt/integration/dispatch-completion-status.red.test.js",
+    "test/mbt/integration/driver-live-route-prefix-lock.integration.test.js",
+    "test/mbt/integration/feature-gate-admin-http.test.js",
+    "test/mbt/integration/http-capabilities.test.js",
+    "test/mbt/integration/http-role-matrix.test.js",
+    "test/mbt/integration/http-shell.test.js",
+    "test/mbt/integration/local-load-performance.test.js",
+    "test/mbt/integration/migration-upgrade.test.js",
+    "test/mbt/integration/operator-background-photos.test.js",
+    "test/mbt/integration/operator-display-settings.test.js",
+    "test/mbt/integration/p3-predeploy-readiness.test.js",
+    "test/mbt/integration/sales-order-auto-fulfillment-admin-http.test.js",
+    "test/mbt/integration/sales-order-auto-fulfillment-migration.red.test.js",
+    "test/mbt/integration/special-stock-request-dispatch-guard.red.test.js",
+    "test/mbt/integration/stock-return-draft-insert.test.js"
+  ],
+  "failedTests": [
+    {
+      "file": "test/mbt/infrastructure/p3-gauntlet-artifacts.test.js",
+      "name": "P3 gauntlet artifacts: CI always uploads the bounded artifact directory with a pinned action"
+    },
+    {
+      "file": "test/mbt/infrastructure/p3-gauntlet-contract.test.js",
+      "name": "P3.11: the extended mutation manifest owns every dedicated runner and the P3 gauntlet executes it"
+    },
+    {
+      "file": "test/mbt/infrastructure/p3-gauntlet-contract.test.js",
+      "name": "P3.12: browser specs share one worker-owned database-pool lifecycle"
+    },
+    {
+      "file": "test/mbt/infrastructure/production-runtime-contract.test.js",
+      "name": "quality non-regression: the gauntlet builds and validates the omit-dev runtime"
+    },
+    {
+      "file": "test/mbt/integration/dispatch-completion-http.red.test.js",
+      "name": "U4 HTTP: only Dispatch/Admin can record a confirmed, reasoned manual completion"
+    },
+    {
+      "file": "test/mbt/integration/dispatch-completion-status.red.test.js",
+      "name": "U3: a TOB00870-shaped direct dependency is completed and billed even without a TO Driver row"
+    },
+    {
+      "file": "test/mbt/integration/driver-live-route-prefix-lock.integration.test.js",
+      "name": "automated billed reconciliation defers instead of deleting a completed route prefix"
+    },
+    {
+      "file": "test/mbt/integration/feature-gate-admin-http.test.js",
+      "name": "P3-F29 Admin gate inventory is private, complete, and keeps live integrations locked"
+    },
+    {
+      "file": "test/mbt/integration/http-capabilities.test.js",
+      "name": "F01/F16: MBT status is authenticated, fail-closed, and reports the Phase 1 safety boundary"
+    },
+    {
+      "file": "test/mbt/integration/http-capabilities.test.js",
+      "name": "F01: the database cannot enable NetSuite writes while the environment write gate is false"
+    },
+    {
+      "file": "test/mbt/integration/http-role-matrix.test.js",
+      "name": "F02/F15: Front Desk sees its exact controlled server gate state"
+    },
+    {
+      "file": "test/mbt/integration/http-shell.test.js",
+      "name": "F15: all MBT routes render one accessible controlled shell with an explicit controller"
+    },
+    {
+      "file": "test/mbt/integration/local-load-performance.test.js",
+      "name": "/app/test/mbt/integration/local-load-performance.test.js"
+    },
+    {
+      "file": "test/mbt/integration/migration-upgrade.test.js",
+      "name": "F06/F16: schema-101 upgrade preserves representative legacy records and is migration-runner idempotent"
+    },
+    {
+      "file": "test/mbt/integration/operator-background-photos.test.js",
+      "name": "/app/test/mbt/integration/operator-background-photos.test.js"
+    },
+    {
+      "file": "test/mbt/integration/operator-display-settings.test.js",
+      "name": "/app/test/mbt/integration/operator-display-settings.test.js"
+    },
+    {
+      "file": "test/mbt/integration/p3-predeploy-readiness.test.js",
+      "name": "P3.11: the deployment inventory exactly covers every on-disk MBT-era migration"
+    },
+    {
+      "file": "test/mbt/integration/sales-order-auto-fulfillment-admin-http.test.js",
+      "name": "L9/L11 completion-owned SO fulfillment Admin HTTP is private and audit-reasoned"
+    },
+    {
+      "file": "test/mbt/integration/sales-order-auto-fulfillment-migration.red.test.js",
+      "name": "L11 an activation watermark stops backlog until Admin selects an exact historical event"
+    },
+    {
+      "file": "test/mbt/integration/sales-order-auto-fulfillment-migration.red.test.js",
+      "name": "L2/L7 direct TO quantity requires the exact dependency pickup and customer-drop job"
+    },
+    {
+      "file": "test/mbt/integration/sales-order-auto-fulfillment-migration.red.test.js",
+      "name": "L7/L11 migration gates new completions and records immutable allocation-scoped PO execution"
+    },
+    {
+      "file": "test/mbt/integration/special-stock-request-dispatch-guard.red.test.js",
+      "name": "Dispatch save and restore require a route and Via Yard receipt without weakening snapshots"
+    },
+    {
+      "file": "test/mbt/integration/stock-return-draft-insert.test.js",
+      "name": "normal stock draft preserves every line field and consumes the draft only on success"
+    },
+    {
+      "file": "test/mbt/unit/control-yard-photo-thumbnail.test.js",
+      "name": "Control and Admin request the cache-busted thumbnail hydration client"
+    },
+    {
+      "file": "test/mbt/unit/driver-camera-ordinary-upload.test.js",
+      "name": "a fresh Driver shell version evicts older copy-enabled cached assets"
+    },
+    {
+      "file": "test/mbt/unit/driver-plan-date-execution-wiring.contract.test.js",
+      "name": "S11: the guarded client ships in a new atomic Driver shell generation"
+    },
+    {
+      "file": "test/mbt/unit/driver-pwa-cache-repair.test.js",
+      "name": "a failed staging download leaves the active and non-Driver caches byte-for-byte unchanged"
+    },
+    {
+      "file": "test/mbt/unit/driver-pwa-cache-repair.test.js",
+      "name": "a fresh Driver worker reloads every v41 shell asset and initializes only its scoped sentinel"
+    },
+    {
+      "file": "test/mbt/unit/driver-pwa-cache-repair.test.js",
+      "name": "a successful repair replaces only the complete Driver shell and preserves offline data sentinels"
+    },
+    {
+      "file": "test/mbt/unit/driver-pwa-site-reset.test.js",
+      "name": "the reset ships as a new atomic shell generation without forcing a protocol-version cutover"
+    },
+    {
+      "file": "test/mbt/unit/driver-pwa-ux-regressions.test.js",
+      "name": "the updated override policy is atomically included in the Driver PWA shell"
+    },
+    {
+      "file": "test/mbt/unit/netsuite-order-line.test.js",
+      "name": "netsuite-order-webhook-scheduled.js sends actual non-consecutive orderLine independently of unique key"
+    },
+    {
+      "file": "test/mbt/unit/netsuite-order-line.test.js",
+      "name": "netsuite-order-webhook-user-event-direct.js sends actual non-consecutive orderLine independently of unique key"
+    },
+    {
+      "file": "test/mbt/unit/operations-navigation-enhancements.test.js",
+      "name": "operator cache assets advance with the cycle-count pagination release"
+    },
+    {
+      "file": "test/mbt/unit/operator-customer-pickup-photo-gate-ui.contract.test.js",
+      "name": "S7: Operator cache revision ships the live-policy client once; later toggles are server-only"
+    },
+    {
+      "file": "test/mbt/unit/operator-page-confirm-ui.contract.test.js",
+      "name": "page confirmation has a duplicate-click guard and ships in a fresh Operator cache"
+    },
+    {
+      "file": "test/mbt/unit/operator-yard-assets.test.js",
+      "name": "Operator service worker precaches the exact new page assets, preserves Driver caches, and bypasses API requests"
+    }
+  ]
+}

@@ -1,0 +1,1231 @@
+--- a/src/return-netsuite.js
++++ b/src/return-netsuite.js
+@@ -1,7 +1,6 @@
+ import {
+   createOrUpdateCreditMemoInNetSuite,
+   createOrUpdateReturnAuthorizationInNetSuite,
+-  createStandaloneReturnAuthorizationInNetSuite,
+   fetchCreditMemoFromNetSuite,
+   fetchCreditMemoMetadataFromNetSuite,
+   fetchReturnAuthorizationFromNetSuite,
+@@ -10,7 +9,6 @@
+   suiteql,
+   suiteqlAll
+ } from "./netsuite.js";
+-import { buildPalletReturnAuthorizationPayload, verifyReturnAuthorizationSnapshot } from "./return-ra-workflow.js";
+ 
+ export const CONFIRMED_RETURN_REASONS = Object.freeze([
+   { id: 5, code: "R1", label: "R1 - Color Variation", kind: "quality" },
+@@ -134,7 +132,6 @@
+     itemTypeText: row.item_type_text || "",
+     salesQuantity: number(row.sales_quantity),
+     salesUom: row.sales_uom || "",
+-    salesUomId: Number(row.sales_uom_id) || null,
+     fulfilledQuantity: number(row.fulfilled_quantity),
+     rate: nullableNumber(row.rate),
+     foreignAmount: nullableNumber(row.foreign_amount),
+@@ -178,7 +175,6 @@
+       ABS(NVL(tl.quantity, 0)) AS sales_quantity,
+       ABS(NVL(tl.quantityshiprecv, 0)) AS fulfilled_quantity,
+       BUILTIN.DF(tl.units) AS sales_uom,
+-      tl.units AS sales_uom_id,
+       tl.rate,
+       tl.foreignamount AS foreign_amount,
+       tl.location AS line_location_id,
+@@ -793,10 +789,6 @@
+      ORDER BY t.id DESC
+      FETCH FIRST 2 ROWS ONLY
+   `);
+-  if (result.items?.length > 1) {
+-    throw Object.assign(new Error("Multiple NetSuite return transactions have the same external ID. Resolve the duplicate before retrying."),
+-      { status: 409, code: "RETURN_EXTERNAL_ID_AMBIGUOUS" });
+-  }
+   return result.items?.[0] || null;
+ }
+ 
+@@ -849,7 +841,6 @@
+       item: { id: String(line.itemId) },
+       quantity: Number(line.returnedSalesQuantity),
+       rate,
+-      ...(line.salesUomId ? { units: { id: String(line.salesUomId) } } : {}),
+       custcol_atlas_rc_so: { id: String(line.reasonId) }
+     };
+   });
+@@ -910,74 +901,6 @@
+   });
+ }
+ 
+-// Version 2 never PATCHes an uncertain or mismatched RA. Recovery verifies the
+-// persisted intent; a second create is prohibited after an ambiguous response.
+-async function createConfirmedReturnAuthorization(record, payload) {
+-  try {
+-    return record.recordType === "stock"
+-      ? await createOrUpdateReturnAuthorizationInNetSuite({ salesOrderId: record.sourceSalesOrderId, payload })
+-      : await createStandaloneReturnAuthorizationInNetSuite(payload);
+-  } catch (error) {
+-    error.returnRaCreationRejected = error.netsuiteResponseReceived === true
+-      && [400, 401, 403, 404, 422].includes(Number(error.status))
+-      && !(error.netsuiteErrorCodes || []).some((code) => /DUP|EXIST/i.test(code));
+-    throw error;
+-  }
+-}
+-
+-export async function postConfirmedReturnAuthorization(record, { beforeCreate, onIdentified }) {
+-  const payload = record.recordType === "stock"
+-    ? buildReturnAuthorizationPayload(record)
+-    : buildPalletReturnAuthorizationPayload(record);
+-  let found = record.netsuiteTransactionId
+-    ? { id: record.netsuiteTransactionId }
+-    : await findReturnTransactionByExternalId(record.externalId, "return_authorization");
+-  if (!found) {
+-    if (record.netSuiteRaAttemptedAt) {
+-      throw Object.assign(new Error("NetSuite RA creation is unconfirmed. Recheck this return; another RA will not be created."),
+-        { code: "RETURN_RA_CREATION_UNCERTAIN", status: 409 });
+-    }
+-    await beforeCreate();
+-    found = await createConfirmedReturnAuthorization(record, payload);
+-    if (!found.id) {
+-      found = await findReturnTransactionByExternalId(record.externalId, "return_authorization");
+-    }
+-  }
+-  const id = positiveId(found?.id, "created Return Authorization ID");
+-  await onIdentified(id);
+-  const snapshot = await fetchReturnAuthorizationFromNetSuite(id);
+-  if (!snapshot) {throw Object.assign(new Error("Created Return Authorization could not be read back."), { status: 409 });}
+-  verifyReturnAuthorizationSnapshot({ ...record, netsuiteTransactionId: id }, snapshot);
+-  return { id, tranid: snapshot.tranId || snapshot.tranid || "", status: snapshot.status, snapshot, recovered: true };
+-}
+-
+-export async function fetchPalletReturnCreditsFromNetSuite(returnAuthorizationIds, palletItemId) {
+-  if (!returnAuthorizationIds.length) {return [];}
+-  const ids = [...new Set(returnAuthorizationIds.map((id) => positiveId(id, "Return Authorization ID")))];
+-  const itemId = positiveId(palletItemId, "PALLET item ID");
+-  // Deduplicate transaction links before summing each physical Credit Memo row.
+-  const rows = await suiteqlAll(`
+-    SELECT return_ra_credit_lines.return_authorization_id,
+-           return_ra_credit_lines.transaction_id, SUM(return_ra_credit_lines.quantity) AS quantity
+-    FROM (
+-      SELECT DISTINCT link.previousdoc AS return_authorization_id,
+-             cm.id AS transaction_id, cmline.id AS credit_line_id,
+-             ABS(NVL(cmline.quantity, 0)) AS quantity
+-      FROM NextTransactionLineLink link
+-      INNER JOIN transaction cm ON cm.id = link.nextdoc AND cm.type = 'CustCred'
+-      INNER JOIN transactionline cmline ON cmline.transaction = cm.id AND cmline.id = link.nextline
+-      WHERE link.previousdoc IN (${ids.join(",")}) AND cmline.item = ${itemId}
+-        AND cmline.mainline = 'F' AND (cmline.taxline = 'F' OR cmline.taxline IS NULL)
+-        AND UPPER(NVL(BUILTIN.DF(cm.status), '')) NOT LIKE '%VOID%'
+-        AND UPPER(NVL(BUILTIN.DF(cm.status), '')) NOT LIKE '%CANCEL%'
+-        AND UPPER(NVL(BUILTIN.DF(cm.status), '')) NOT LIKE '%REJECT%'
+-    ) return_ra_credit_lines
+-    GROUP BY return_ra_credit_lines.return_authorization_id, return_ra_credit_lines.transaction_id
+-  `);
+-  return rows.map(row => ({ returnAuthorizationId: Number(row.return_authorization_id),
+-    transactionId: Number(row.transaction_id), quantity: number(row.quantity) }));
+-}
+-
+ export async function fetchLinkedReturnTransaction(record) {
+   if (!record?.netsuiteTransactionId) return null;
+   return record.netsuiteStage === "credit_memo"
+--- a/src/return-repository.js
++++ b/src/return-repository.js
+@@ -1,6 +1,6 @@
+ import { assertOperatorYard } from "./operator-yard-access.js";
+ import crypto from "node:crypto";
+-import { query, withTransaction, withIndependentTransaction } from "./db.js";
++import { query, withTransaction } from "./db.js";
+ import { writeAudit } from "./auth-repository.js";
+ import {
+   assertCrossYardReturn,
+@@ -14,14 +14,12 @@
+   CONFIRMED_RETURN_REASONS,
+   fetchLinkedReturnTransaction,
+   fetchPalletBalanceFromNetSuite,
+-  fetchPalletReturnCreditsFromNetSuite,
+   fetchReturnCustomerFromNetSuite,
+   fetchReturnReasonsFromNetSuite,
+   fetchReturnSalesOrderFromNetSuite,
+   fetchStockReturnsFromNetSuite,
+   findCreditMemosFromReturnAuthorization,
+   findReturnTransactionByExternalId,
+-  postConfirmedReturnAuthorization,
+   upsertPalletCreditMemoInNetSuite,
+   upsertReturnAuthorizationInNetSuite
+ } from "./return-netsuite.js";
+@@ -36,9 +34,6 @@
+ } from "./photo-upload.js";
+ import { readArchivedPhoto } from "./photo-archive-repository.js";
+ import { withNetSuiteOperationalWork } from "./netsuite-operational-work.js";
+-import { getOperatorNetSuitePostingPolicy } from "./operator-netsuite-posting-policy-repository.js";
+-import { assertExpectedOperatorNetSuitePostingPolicy } from "./operator-netsuite-posting-policy.js";
+-import { confirmedReturnPolicy, remainingPalletReservation, verifyReturnAuthorizationSnapshot } from "./return-ra-workflow.js";
+ 
+ export const RETURN_YARDS = Object.freeze([
+   { locationId: 1, yardCode: "3445", name: "3445" },
+@@ -302,28 +297,25 @@
+   });
+ }
+ 
+-export async function localPalletReserved(customerId, observedExternalIds = [], observedTransactionIds = [], linkedCredits = []) {
++export async function localPalletReserved(customerId, observedExternalIds = [], observedTransactionIds = []) {
+   const result = await query(
+-    `SELECT r.pallet_quantity, r.workflow_version, r.netsuite_transaction_id
++    `SELECT COALESCE(SUM(r.pallet_quantity), 0) AS reserved
+        FROM return_records r
+       WHERE r.record_type = 'pallet'
+         AND r.customer_id = $1
+         AND r.status NOT IN ('rejected', 'voided')
+-        AND (r.workflow_version = 2 OR (
+-          NOT (r.external_id = ANY($2::text[]))
+-          AND (r.netsuite_transaction_id IS NULL
+-            OR NOT (r.netsuite_transaction_id = ANY($3::bigint[])))
+-        ))`,
++        AND NOT (r.external_id = ANY($2::text[]))
++        AND (
++          r.netsuite_transaction_id IS NULL
++          OR NOT (r.netsuite_transaction_id = ANY($3::bigint[]))
++        )`,
+     [
+       customerId,
+       observedExternalIds.map(String).filter(Boolean),
+       observedTransactionIds.map(Number).filter((id) => Number.isSafeInteger(id) && id > 0)
+     ]
+   );
+-  return result.rows.reduce((total, row) => total + (Number(row.workflow_version) === 2
+-    ? remainingPalletReservation({ palletQuantity: row.pallet_quantity,
+-      netSuiteTransactionId: row.netsuite_transaction_id }, linkedCredits, observedTransactionIds)
+-    : Number(row.pallet_quantity)), 0);
++  return Number(result.rows[0]?.reserved || 0);
+ }
+ 
+ export async function localStockReserved(sourceLineIds = [], observedExternalIds = [], observedTransactionIds = []) {
+@@ -369,29 +361,20 @@
+ }
+ 
+ async function customerPalletBalance(customer, remoteBalance = null, { force = false } = {}) {
+-  const customerId = customer.id || customer.internalId;
+   const remote = remoteBalance || await fetchPalletBalanceFromNetSuite(
+-    customerId,
++    customer.id || customer.internalId,
+     { force }
+   );
+-  const authorizations = await query(
+-    `SELECT netsuite_transaction_id FROM return_records
+-      WHERE customer_id = $1 AND record_type = 'pallet' AND workflow_version = 2
+-        AND status NOT IN ('rejected', 'voided') AND netsuite_transaction_id IS NOT NULL`,
+-    [customerId]
++  const localReserved = await localPalletReserved(
++    customer.id || customer.internalId,
++    remote.externalIds || [],
++    remote.transactionIds || []
+   );
+-  const linkedCredits = await fetchPalletReturnCreditsFromNetSuite(
+-    authorizations.rows.map(row => Number(row.netsuite_transaction_id)), remote.item?.id || remote.item?.itemId
+-  );
+-  const externalIds = remote.externalIds || [];
+-  const transactionIds = remote.transactionIds || [];
+-  const localReserved = await localPalletReserved(customerId, externalIds, transactionIds, linkedCredits);
+   return {
+     customer,
+     item: remote.item,
+-    externalIds,
+-    transactionIds,
+-    linkedCredits,
++    externalIds: remote.externalIds || [],
++    transactionIds: remote.transactionIds || [],
+     ...returnBalance({
+       fulfilled: remote.fulfilled,
+       netsuiteReturned: remote.netsuiteReturned,
+@@ -563,10 +546,10 @@
+       && String(line.itemName || "").trim().toUpperCase() !== "PALLET")
+     .map((line) => {
+       const stored = policies.get(String(line.itemId)) || {};
+-      const policy = confirmedReturnPolicy(effectiveReturnPolicy({
++      const policy = effectiveReturnPolicy({
+         productType: stored.product_type || line.productType,
+         override: stored.return_policy_override
+-      }));
++      });
+       const remote = remoteReturns.get(String(line.sourceLineId)) || {};
+       const reserved = localReserved.get(String(line.sourceLineId)) || 0;
+       const balance = returnBalance({
+@@ -1121,7 +1104,7 @@
+       reason,
+       photos,
+       note: cleanText(input.note, "Return note", 500),
+-      approvalStatus: "not_required"
++      approvalStatus: line.returnPolicy.effective === "APPROVAL_REQUIRED" ? "pending" : "not_required"
+     };
+   });
+   const totals = new Map();
+@@ -1248,7 +1231,7 @@
+        ) VALUES (
+          $1, $2, $3, NULL, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13,
+          $14, $15, $16, $17, $18, $19, $20, $21, $22,
+-         $23, $24, $25, $26, $27, $28, $29, $30, $31, $32, $33::jsonb, $34::jsonb
++         $23, $24, $25, $26, $27, $28, $29, $30, $31, $32, $33, $34::jsonb, $35::jsonb
+        )
+        RETURNING id`,
+       [
+@@ -1447,20 +1430,6 @@
+   const palletQuantity = quantity(input.palletQuantity || 0, "PALLET quantity", { whole: true });
+   const hasPallet = palletQuantity > 0;
+   if (!hasStock && !hasPallet) throw httpError(400, "Add stock or PALLET quantities before confirming the return.");
+-  const postingFunctions = [hasStock && "stock_return", hasPallet && "pallet_return"].filter(Boolean);
+-  const postingPolicies = async (lock = false) => {
+-    const policies = {};
+-    for (const functionKey of postingFunctions) {
+-      const actual = await getOperatorNetSuitePostingPolicy({ functionKey, locationId: receiving.locationId, lock });
+-      const expected = input.expectedPostingPolicies?.[functionKey];
+-      // Old clients may still save local-only returns. Posting always requires
+-      // the exact policy the operator reviewed, checked again under a flag lock.
+-      if (actual.effective || expected) {assertExpectedOperatorNetSuitePostingPolicy({ expected, actual });}
+-      policies[functionKey] = actual;
+-    }
+-    return policies;
+-  };
+-  await postingPolicies();
+ 
+   let lookup = null;
+   let customer = null;
+@@ -1578,8 +1547,7 @@
+       const currentLocal = await localPalletReserved(
+         customer.id,
+         palletBalance.externalIds || [],
+-        palletBalance.transactionIds || [],
+-        palletBalance.linkedCredits || []
++        palletBalance.transactionIds || []
+       );
+       const currentAvailable = Math.max(palletBalance.fulfilled - palletBalance.netsuiteReturned - currentLocal, 0);
+       if (palletQuantity - currentAvailable > QUANTITY_EPSILON) {
+@@ -1597,7 +1565,7 @@
+     if (existing.rowCount) return { replayBatchId: existing.rows[0].id };
+ 
+     const batchReference = await nextReference("return_batch_reference_seq", "RB");
+-    const admittedPolicies = await postingPolicies(true);
++    const settings = await getReturnYardSettings(receiving.locationId);
+     const batchResult = await query(
+       `INSERT INTO return_batches (
+          batch_reference, idempotency_key, operator_id, receiving_location_id,
+@@ -1631,7 +1599,7 @@
+       validatedLines,
+       photos: stockPhotos,
+       submittedAt,
+-      automation: admittedPolicies.stock_return.effective,
++      automation: settings.autoCreateStockRa,
+       note: returnNote
+     }) : null;
+     const palletRecord = hasPallet ? await insertPalletReturn({
+@@ -1643,15 +1611,9 @@
+       palletQuantity,
+       photos: palletPhotos,
+       submittedAt,
+-      automation: admittedPolicies.pallet_return.effective,
++      automation: settings.autoCreatePalletCreditMemo,
+       note: returnNote
+     }) : null;
+-    for (const record of [stockRecord, palletRecord].filter(Boolean)) {
+-      await query(
+-        `UPDATE return_records SET workflow_version = 2, netsuite_posting_policy = $2::jsonb WHERE id = $1`,
+-        [record.id, JSON.stringify(admittedPolicies[`${record.record_type}_return`])]
+-      );
+-    }
+     if (draftState) {
+       await query(
+         "DELETE FROM return_drafts WHERE id = $1::uuid AND operator_id = $2",
+@@ -1724,9 +1686,6 @@
+     batchId: Number(row.batch_id),
+     batchReference: row.batch_reference || "",
+     recordType: row.record_type,
+-    workflowVersion: Number(row.workflow_version || 1),
+-    netSuitePostingPolicy: row.netsuite_posting_policy || {},
+-    netSuiteRaAttemptedAt: row.netsuite_ra_attempted_at || null,
+     stockReturnType: row.stock_return_type || null,
+     status: row.status,
+     operatorId: row.operator_id,
+@@ -2019,7 +1978,6 @@
+         netSuiteOrderLine: line.netSuiteOrderLine,
+         itemId: line.itemId,
+         returnedSalesQuantity: line.returnedSalesQuantity,
+-        salesUomId: line.sourceLineSnapshot?.salesUomId || null,
+         rate: line.rate,
+         reasonId: line.reasonId
+       }))
+@@ -2044,32 +2002,12 @@
+   );
+ }
+ 
+-let activeReturnSyncs = 0;
+-const waitingReturnSyncs = [];
+-
+-export async function syncReturnRecord(options = {}) {
+-  // Admit work before taking a transaction connection. The durable checkpoints
+-  // need a separate connection even when many callers retry the same record.
+-  if (activeReturnSyncs >= 3) {
+-    await new Promise(resolve => waitingReturnSyncs.push(resolve));
+-  } else {
+-    activeReturnSyncs += 1;
+-  }
+-  try {
+-    return await synchronizeReturnRecord(options);
+-  } finally {
+-    const next = waitingReturnSyncs.shift();
+-    if (next) {next();} else {activeReturnSyncs -= 1;}
+-  }
+-}
+-
+-async function synchronizeReturnRecord({ recordId, actorOperatorId = null, force = false } = {}) {
++export async function syncReturnRecord({ recordId, actorOperatorId = null, force = false } = {}) {
+   const id = positiveId(recordId, "return record ID");
+   const outcome = await withTransaction(async () => {
+     await query("SELECT pg_advisory_xact_lock(hashtext($1))", [`return-sync:${id}`]);
+     const detail = await recordForSync(id);
+-    const confirmedWorkflow = detail.workflowVersion === 2;
+-    const eventType = confirmedWorkflow || detail.recordType === "stock"
++    const eventType = detail.recordType === "stock"
+       ? "return_authorization_upsert"
+       : "pallet_credit_memo_upsert";
+     const block = async (syncStatus, message) => {
+@@ -2109,29 +2047,15 @@
+     if (detail.recordType === "stock" && !detail.acceptedLineCount) {
+       return block("cancelled", "This return has no accepted line for a Return Authorization.");
+     }
+-    if (confirmedWorkflow) {
+-      const policy = detail.netSuitePostingPolicy;
+-      if (policy.effective !== true || policy.functionKey !== `${detail.recordType}_return`
+-          || Number(policy.locationId) !== detail.receivingLocationId) {
+-        return block("disabled", "This return was saved locally and was not admitted for NetSuite posting.");
+-      }
+-    } else {
+-      const settings = await getReturnYardSettings(detail.receivingLocationId);
+-      const enabled = detail.recordType === "stock"
+-        ? settings.autoCreateStockRa
+-        : settings.autoCreatePalletCreditMemo;
+-      if (!enabled && !force) {
+-        return block("disabled", "NetSuite automation is disabled for this receiving yard.");
+-      }
+-    }
+-
+-    // Keep the advisory lock throughout posting, but commit checkpoints on a
+-    // separate connection before NetSuite writes. A process crash must leave
+-    // enough evidence for recovery. Do not row-lock this record first.
+-    const checkpoint = confirmedWorkflow
+-      ? (sql, params) => withIndependentTransaction(q => q(sql, params))
+-      : query;
+-    await checkpoint(
++    const settings = await getReturnYardSettings(detail.receivingLocationId);
++    const enabled = detail.recordType === "stock"
++      ? settings.autoCreateStockRa
++      : settings.autoCreatePalletCreditMemo;
++    if (!enabled && !force) {
++      return block("disabled", "NetSuite automation is disabled for this receiving yard.");
++    }
++
++    await query(
+       `UPDATE return_records
+           SET netsuite_sync_status = 'pending',
+               netsuite_sync_attempts = netsuite_sync_attempts + 1,
+@@ -2148,26 +2072,11 @@
+           "PALLET item ID"
+         );
+       }
+-      const transactionType = confirmedWorkflow || detail.recordType === "stock" ? "return_authorization" : "credit_memo";
++      const transactionType = detail.recordType === "stock" ? "return_authorization" : "credit_memo";
+       const { response, recovered } = await withNetSuiteOperationalWork(
+         "returns.pending",
+         async () => {
+-          const response = confirmedWorkflow
+-            ? await postConfirmedReturnAuthorization(detail, {
+-              beforeCreate: async () => {
+-                const marked = await checkpoint(
+-                  `UPDATE return_records SET netsuite_ra_attempted_at = now(), updated_at = now()
+-                    WHERE id = $1 AND netsuite_ra_attempted_at IS NULL AND netsuite_transaction_id IS NULL RETURNING id`,
+-                  [detail.id]
+-                );
+-                if (!marked.rowCount) {throw httpError(409, "Return Authorization creation is already in progress.", { code: "RETURN_RA_CREATION_UNCERTAIN" });}
+-              },
+-              onIdentified: transactionId => checkpoint(
+-                `UPDATE return_records SET netsuite_transaction_id = $2, netsuite_stage = 'return_authorization',
+-                  updated_at = now() WHERE id = $1`, [detail.id, transactionId]
+-              )
+-            })
+-            : detail.recordType === "stock"
++          const response = detail.recordType === "stock"
+             ? await upsertReturnAuthorizationInNetSuite(detail)
+             : await upsertPalletCreditMemoInNetSuite(detail);
+           const recovered = response.recovered
+@@ -2205,8 +2114,8 @@
+           transactionType,
+           transactionId,
+           recovered?.tranid || response.tranid || "",
+-          recovered?.status_text || recovered?.status?.refName || recovered?.status?.id || recovered?.status || "",
+-          JSON.stringify(response.snapshot || recovered || response),
++          recovered?.status_text || recovered?.status || "",
++          JSON.stringify(recovered || response),
+           Number.isFinite(creditValue) ? creditValue : null
+         ]
+       );
+@@ -2235,11 +2144,10 @@
+         `UPDATE return_records
+             SET netsuite_sync_status = 'failed',
+                 netsuite_sync_error = $2,
+-                netsuite_ra_attempted_at = CASE WHEN $3 THEN NULL ELSE netsuite_ra_attempted_at END,
+                 netsuite_last_synced_at = now(),
+                 updated_at = now()
+           WHERE id = $1`,
+-        [detail.id, String(error.message || error).slice(0, 4000), confirmedWorkflow && error.returnRaCreationRejected === true]
++        [detail.id, String(error.message || error).slice(0, 4000)]
+       );
+       await writeSyncEvent({
+         recordId: detail.id,
+@@ -2254,12 +2162,6 @@
+   });
+   if (outcome.error) throw outcome.error;
+   return getReturnRecordDetail(outcome.recordId);
+-}
+-
+-function receivingYardFilter(params, allowedReceivingLocationIds, prefix = "") {
+-  if (!allowedReceivingLocationIds?.length) {return "";}
+-  params.push(allowedReceivingLocationIds.map(Number));
+-  return `AND ${prefix}receiving_location_id = ANY($${params.length}::bigint[])`;
+ }
+ 
+ export async function decideReturnLine({
+@@ -2278,9 +2180,12 @@
+       positiveId(recordId, "return record ID"),
+       positiveId(lineId, "return line ID")
+     ];
+-    const yardClause = receivingYardFilter(params, allowedReceivingLocationIds, "r.");
++    const yardClause = allowedReceivingLocationIds?.length
++      ? `AND r.receiving_location_id = ANY($3::bigint[])`
++      : "";
++    if (allowedReceivingLocationIds?.length) params.push(allowedReceivingLocationIds.map(Number));
+     const locked = await query(
+-      `SELECT l.*, r.status AS record_status, r.receiving_location_id, r.workflow_version
++      `SELECT l.*, r.status AS record_status, r.receiving_location_id
+          FROM return_record_lines l
+          INNER JOIN return_records r ON r.id = l.return_record_id
+         WHERE r.id = $1
+@@ -2291,7 +2196,6 @@
+     );
+     const line = locked.rows[0];
+     if (!line) throw httpError(404, "Return line was not found.");
+-    if (Number(line.workflow_version) === 2) {throw httpError(409, "Confirmed returns do not require local approval.");}
+     if (line.record_status === "voided") throw httpError(409, "A voided return cannot be approved or rejected.");
+     if (line.approval_status !== "pending") throw httpError(409, "This return line already has a final decision.");
+     await query(
+@@ -2367,7 +2271,10 @@
+     const id = positiveId(recordId, "return record ID");
+     await query("SELECT pg_advisory_xact_lock(hashtext($1))", [`return-sync:${id}`]);
+     const params = [id];
+-    const yardClause = receivingYardFilter(params, allowedReceivingLocationIds);
++    const yardClause = allowedReceivingLocationIds?.length
++      ? `AND receiving_location_id = ANY($2::bigint[])`
++      : "";
++    if (allowedReceivingLocationIds?.length) params.push(allowedReceivingLocationIds.map(Number));
+     const locked = await query(
+       `SELECT *
+          FROM return_records
+@@ -2379,9 +2286,6 @@
+     const record = locked.rows[0];
+     if (!record) throw httpError(404, "Return record was not found.");
+     if (record.status === "voided") return getReturnRecordDetail(record.id);
+-    if (Number(record.workflow_version) === 2 && record.netsuite_ra_attempted_at && !record.netsuite_transaction_id) {
+-      throw httpError(409, "NetSuite RA creation is unconfirmed. Recover the transaction before voiding this return.");
+-    }
+     if (record.netsuite_transaction_id && !/cancel|void/i.test(record.netsuite_transaction_status || "")) {
+       throw httpError(
+         409,
+@@ -2441,7 +2345,7 @@
+         && detail.lines.some((line) => line.approvalStatus === "pending")) {
+       throw httpError(409, "Finish every approval decision before linking a Return Authorization.");
+     }
+-    const expected = detail.workflowVersion === 2 || detail.recordType === "stock" ? "return_authorization" : "credit_memo";
++    const expected = detail.recordType === "stock" ? "return_authorization" : "credit_memo";
+     if (type !== expected) {
+       throw httpError(400, `${detail.recordReference} must link to a ${expected.replaceAll("_", " ")}.`);
+     }
+@@ -2464,11 +2368,6 @@
+       })
+     );
+     if (!snapshot) throw httpError(404, "NetSuite transaction was not found.");
+-    if (detail.workflowVersion === 2) {
+-      const intent = await recordForSync(detail.id);
+-      intent.palletItemId = detail.balanceSnapshot?.item?.id || detail.balanceSnapshot?.item?.itemId;
+-      verifyReturnAuthorizationSnapshot(intent, snapshot);
+-    }
+     const statusText = cleanText(
+       snapshot.status?.refName || snapshot.status?.id || snapshot.status || "",
+       "NetSuite status",
+@@ -2607,17 +2506,14 @@
+   const pending = await query(
+     `SELECT r.id
+        FROM return_records r
+-       LEFT JOIN return_yard_settings ys
++       INNER JOIN return_yard_settings ys
+          ON ys.location_id = r.receiving_location_id
+-      WHERE r.status NOT IN ('voided', 'rejected')
++      WHERE r.netsuite_sync_status = 'pending'
++        AND r.status NOT IN ('voided', 'rejected')
+         AND (
+-          (r.workflow_version = 2 AND r.netsuite_posting_policy->>'effective' = 'true'
+-            AND (r.netsuite_sync_status = 'pending'
+-              OR (r.netsuite_sync_status = 'failed' AND r.netsuite_ra_attempted_at IS NOT NULL)))
+-          OR (r.workflow_version = 1 AND r.netsuite_sync_status = 'pending' AND (
+-            (r.record_type = 'stock' AND ys.auto_create_stock_ra = true)
+-            OR (r.record_type = 'pallet' AND ys.auto_create_pallet_credit_memo = true)
+-          ))
++          (r.record_type = 'stock' AND ys.auto_create_stock_ra = true)
++          OR
++          (r.record_type = 'pallet' AND ys.auto_create_pallet_credit_memo = true)
+         )
+       ORDER BY r.updated_at, r.id
+       LIMIT $1`,
+@@ -2629,7 +2525,8 @@
+       await syncReturnRecord({ recordId: row.id });
+       summary.succeeded += 1;
+     } catch {
+-      // Uncertain v2 attempts are recovery-only; definite failures need retry.
++      // syncReturnRecord persists a deterministic blocked/failed state while
++      // holding the per-record advisory lock. Failed rows require admin retry.
+       summary.failed += 1;
+     }
+   }
+@@ -2668,11 +2565,6 @@
+           }
+         );
+         if (!snapshot) throw new Error("Linked NetSuite return transaction was not found.");
+-        if (detail.workflowVersion === 2) {
+-          const intent = await recordForSync(detail.id);
+-          intent.palletItemId = detail.balanceSnapshot?.item?.id || detail.balanceSnapshot?.item?.itemId;
+-          verifyReturnAuthorizationSnapshot(intent, snapshot, { allowInactive: true });
+-        }
+         const transactionStatus = cleanText(
+           snapshot.status?.refName || snapshot.status?.id || snapshot.status || "",
+           "NetSuite status",
+--- a/src/netsuite.js
++++ b/src/netsuite.js
+@@ -853,13 +853,6 @@
+     method: Number.isInteger(existingId) && existingId > 0 ? "PATCH" : "POST",
+     body: payload
+   });
+-  const result = restMutationQueue.then(run, run);
+-  restMutationQueue = result.catch(() => {});
+-  return result;
+-}
+-
+-export async function createStandaloneReturnAuthorizationInNetSuite(payload) {
+-  const run = () => netsuiteRest("/record/v1/returnAuthorization", { method: "POST", body: payload });
+   const result = restMutationQueue.then(run, run);
+   restMutationQueue = result.catch(() => {});
+   return result;
+--- a/src/server.js
++++ b/src/server.js
+@@ -6239,9 +6239,7 @@
+   "externalid",
+   "externalids",
+   "foreignamount",
+-  "linkedcredits",
+   "netsuitelastsyncedat",
+-  "netsuiteraattemptedat",
+   "netsuitelinesnapshot",
+   "netsuiteorderlinesnapshot",
+   "netsuiteorderline",
+@@ -6269,10 +6267,6 @@
+   const safe = {};
+   for (const [key, child] of Object.entries(value)) {
+     const normalizedKey = key.toLowerCase().replaceAll("_", "");
+-    if (Number(value.workflowVersion) === 2 && ["netsuitetransactionid", "netsuitetransactionref"].includes(normalizedKey)) {
+-      safe[key] = child;
+-      continue;
+-    }
+     if (OPERATOR_RETURN_PRIVATE_KEYS.has(normalizedKey)) continue;
+     safe[key] = operatorSafeReturnPayload(child);
+   }
+--- a/src/operator-netsuite-posting-policy.js
++++ b/src/operator-netsuite-posting-policy.js
+@@ -25,16 +25,9 @@
+   Object.freeze({ locationId: 26, yardCode: "150" })
+ ]);
+ 
+-// Return posting uses its own durable return records; keep the IF/IR command
+-// function catalog separate while sharing gate policy and administration.
+-export const OPERATOR_NETSUITE_RETURN_FUNCTIONS = Object.freeze([
+-  { functionKey: "stock_return", transactionType: "RA", gateSegment: "stock_return_ra" },
+-  { functionKey: "pallet_return", transactionType: "RA", gateSegment: "pallet_return_ra" }
+-]);
+-
+ /** @type {Map<string, Record<string, any>>} */
+ const FUNCTIONS_BY_KEY = new Map(
+-  [...Object.values(OPERATOR_NETSUITE_POSTING_FUNCTIONS), ...OPERATOR_NETSUITE_RETURN_FUNCTIONS]
++  Object.values(OPERATOR_NETSUITE_POSTING_FUNCTIONS)
+     .map((details) => [details.functionKey, details])
+ );
+ /** @type {Map<number, Record<string, any>>} */
+@@ -66,19 +59,6 @@
+   `${definition.operatorFunction}:${definition.locationId}`,
+   definition
+ ]));
+-
+-export const OPERATOR_NETSUITE_RETURN_GATE_DEFINITIONS = Object.freeze(
+-  OPERATOR_NETSUITE_YARDS.flatMap((yard) => OPERATOR_NETSUITE_RETURN_FUNCTIONS.map((details) => Object.freeze({
+-    flagKey: `operator_netsuite_${details.gateSegment}_${yard.yardCode}`,
+-    label: `${yard.yardCode} ${details.functionKey.replaceAll("_", " ")} RA`,
+-    description: `Create a Return Authorization on Operator ${details.functionKey.replaceAll("_", " ")} confirmation at ${yard.yardCode}.`,
+-    operatorFunction: details.functionKey, transactionType: "RA", locationId: yard.locationId, yardCode: yard.yardCode,
+-    configuredDefault: false, requiresNetSuiteDirectAccess: true, independent: true, locked: false, lockReason: null
+-  })))
+-);
+-for (const definition of OPERATOR_NETSUITE_RETURN_GATE_DEFINITIONS) {
+-  GATES_BY_IDENTITY.set(`${definition.operatorFunction}:${definition.locationId}`, definition);
+-}
+ 
+ /** @param {unknown} value */
+ export function normalizeOperatorNetSuiteLocationId(value) {
+--- a/src/mbt/feature-gate-catalog.js
++++ b/src/mbt/feature-gate-catalog.js
+@@ -2,7 +2,6 @@
+ 
+ import {
+   OPERATOR_NETSUITE_GATE_DEFINITIONS,
+-  OPERATOR_NETSUITE_RETURN_GATE_DEFINITIONS,
+   OPERATOR_NETSUITE_YARDS
+ } from "../operator-netsuite-posting-policy.js";
+ 
+@@ -67,7 +66,7 @@
+     locked: false,
+     lockReason: null
+   }),
+-  ...[...OPERATOR_NETSUITE_GATE_DEFINITIONS, ...OPERATOR_NETSUITE_RETURN_GATE_DEFINITIONS].map((definition) => Object.freeze({
++  ...OPERATOR_NETSUITE_GATE_DEFINITIONS.map((definition) => Object.freeze({
+     ...definition,
+     environmentProperty: "netSuiteDirectAccessEnabled",
+     gateGroup: "operator_netsuite_posting"
+--- a/public/operator.js
++++ b/public/operator.js
+@@ -279,10 +279,6 @@
+ let returnDirty = false;
+ let returnResult = null;
+ let returnValidationMessage = "";
+-let returnPostingPolicies = {};
+-let returnPostingError = "";
+-let returnPostingLoading = false;
+-let returnPostingGeneration = 0;
+ 
+ let cycleStep = initialOperatorState.cycleStep || "type";
+ let cycleSelection = initialOperatorState.cycleSelection || { productType: "", brand: "", series: "" };
+@@ -2577,8 +2573,8 @@
+     .toUpperCase()
+     .replaceAll(" ", "_");
+   return {
+-    effective: effective === "APPROVAL_REQUIRED" ? "ALLOWED" : effective,
+-    requiresApproval: false
++    effective,
++    requiresApproval: Boolean(policy.requiresApproval ?? policy.requires_approval ?? effective === "APPROVAL_REQUIRED")
+   };
+ }
+ 
+@@ -3519,7 +3515,6 @@
+           </div>
+           <span class="status-pill open">${t("common.review", "Review")}</span>
+         </div>
+-        <div class="return-posting-policies">${renderReturnPostingPolicies()}</div>
+         <div class="return-review-detail-scroll">
+           ${renderReturnCustomerSummary()}
+           ${renderReturnYardBanner()}
+@@ -3554,21 +3549,10 @@
+       </div>
+       <div class="selected-actions return-review-actions">
+         <button class="secondary-button" data-action="return-back-to-form" ${returnBusy ? "disabled" : ""} type="button">${t("common.back", "Back")}</button>
+-        <button class="primary-button" data-action="return-confirm-submit" ${returnBusy || !returnPostingReady() ? "disabled" : ""} type="button">${returnBusy ? t("operator.confirming", "Confirming...") : t("operator.confirmReturn", "Confirm Return")}</button>
++        <button class="primary-button" data-action="return-confirm-submit" ${returnBusy ? "disabled" : ""} type="button">${returnBusy ? t("operator.confirming", "Confirming...") : t("operator.confirmReturn", "Confirm Return")}</button>
+       </div>
+     </section>
+   `;
+-}
+-
+-function returnNetSuiteResultLabel(record) {
+-  if (Number(record?.workflowVersion) !== 2) {return record?.status || "";}
+-  const status = record.netSuiteSyncStatus;
+-  if (status === "disabled") {return "Local only — return saved";}
+-  if (status === "failed") {return "NetSuite RA failed — return saved; contact an administrator";}
+-  if (["succeeded", "manual_linked"].includes(status)) {
+-    return `NetSuite RA ${record.netSuiteTransactionRef || record.netSuiteTransactionId || "verified"}`;
+-  }
+-  return "NetSuite RA pending — return saved";
+ }
+ 
+ function renderReturnSuccess() {
+@@ -3576,13 +3560,13 @@
+   const stock = returnResult?.stockReturn || returnResult?.stock_return || null;
+   const pallet = returnResult?.palletReturn || returnResult?.pallet_return || null;
+   const referenceOf = (record) => record?.reference || record?.returnReference || record?.return_reference || "";
+-  const statusOf = returnNetSuiteResultLabel;
++  const statusOf = (record) => record?.status || "";
+   return `
+     <section class="return-success-shell">
+       <div class="return-success-mark">✓</div>
+       <span>${t("operator.returnRecorded", "Return recorded")}</span>
+       <h2>${escapeHtml(batch || referenceOf(stock) || referenceOf(pallet))}</h2>
+-      <p>Your return records are saved. NetSuite results are shown below.</p>
++      <p>${t("operator.returnRecordedHelp", "The local records are saved in PostgreSQL. Inventory was not changed.")}</p>
+       <div class="return-created-records">
+         ${stock ? `<div><span>${t("operator.stockReturn", "Stock Return")}</span><strong>${escapeHtml(referenceOf(stock))}</strong><em>${escapeHtml(localizeMessage(statusOf(stock)))}</em></div>` : ""}
+         ${pallet ? `<div><span>${t("operator.palletReturn", "Pallet Return")}</span><strong>${escapeHtml(referenceOf(pallet))}</strong><em>${escapeHtml(localizeMessage(statusOf(pallet)))}</em></div>` : ""}
+@@ -3610,7 +3594,6 @@
+   const headerPhotos = (record?.photos || []).map(returnSavedPhotoReference).filter(Boolean);
+   const palletQuantity = record?.palletQuantity ?? record?.pallet_quantity;
+   return `
+-    ${Number(record.workflowVersion) === 2 ? `<div class="sync-alert"><strong>${escapeHtml(returnNetSuiteResultLabel(record))}</strong></div>` : ""}
+     ${palletQuantity !== null && palletQuantity !== undefined ? `
+       <div class="return-header-note">
+         <span>${t("operator.palletQuantity", "PALLET quantity")}</span>
+@@ -7784,10 +7767,6 @@
+   returnBusy = false;
+   returnValidationMessage = "";
+   returnIdempotencyKey = createReturnIdempotencyKey();
+-  returnPostingPolicies = {};
+-  returnPostingError = "";
+-  returnPostingLoading = false;
+-  returnPostingGeneration += 1;
+   if (!keepResult) returnResult = null;
+ }
+ 
+@@ -8421,10 +8400,7 @@
+     lines: returnPayloadLines({ includeEmpty: draft }),
+     palletQuantity: Number(returnPalletQuantity) || 0,
+     palletPhotos: returnPalletPhotos.filter(Boolean),
+-    photos: returnRecordPhotos.filter(Boolean),
+-    expectedPostingPolicies: draft ? undefined : Object.fromEntries(
+-      returnPostingFunctions().map(key => [key, operatorNetSuitePolicyToken(returnPostingPolicies[key])])
+-    )
++    photos: returnRecordPhotos.filter(Boolean)
+   };
+ }
+ 
+@@ -8524,52 +8500,7 @@
+   }
+ }
+ 
+-function returnPostingFunctions() {
+-  return [returnMode === "stock" && returnSelectedRows().length > 0 && "stock_return",
+-    Number(returnPalletQuantity) > 0 && "pallet_return"].filter(Boolean);
+-}
+-
+-function returnPostingReady() {
+-  return !returnPostingLoading && !returnPostingError && returnPostingFunctions().length > 0
+-    && returnPostingFunctions().every(key => Number(returnPostingPolicies[key]?.locationId) === Number(locationId)
+-      && Boolean(operatorNetSuitePolicyToken(returnPostingPolicies[key])));
+-}
+-
+-async function loadReturnPostingPolicies() {
+-  const generation = ++returnPostingGeneration;
+-  const yardId = Number(locationId);
+-  returnPostingLoading = true;
+-  returnPostingError = "";
+-  returnPostingPolicies = {};
+-  render();
+-  try {
+-    const entries = await Promise.all(returnPostingFunctions().map(async key => [key, await loadOperatorNetSuitePostingPolicy(key)]));
+-    if (generation !== returnPostingGeneration || yardId !== Number(locationId)) {return;}
+-    returnPostingPolicies = Object.fromEntries(entries);
+-  } catch (error) {
+-    if (generation !== returnPostingGeneration || yardId !== Number(locationId)) {return;}
+-    returnPostingError = error.message || "Unable to check NetSuite posting mode.";
+-  } finally {
+-    if (generation === returnPostingGeneration && yardId === Number(locationId)) {
+-      returnPostingLoading = false;
+-      render();
+-    }
+-  }
+-}
+-
+-function renderReturnPostingPolicies() {
+-  if (returnPostingLoading) {return `<div class="sync-alert" role="status">Checking NetSuite posting mode…</div>`;}
+-  if (returnPostingError || !returnPostingReady()) {
+-    return `<div class="sync-alert danger">${escapeHtml(returnPostingError || "Refresh the posting mode before confirming.")}</div>
+-      <button data-action="return-refresh-posting" type="button">Refresh posting mode</button>`;
+-  }
+-  return returnPostingFunctions().map(key => `<div class="sync-alert operator-posting-mode" data-posting-mode="${returnPostingPolicies[key].effective ? "netsuite" : "local"}">
+-    <strong>${key === "stock_return" ? "Stock Return" : "Pallet Return"}</strong>
+-    <span>${returnPostingPolicies[key].effective ? "Creates NetSuite RA" : "Local only — NetSuite posting is off"}</span>
+-  </div>`).join("");
+-}
+-
+-async function openReturnReview() {
++function openReturnReview() {
+   const error = validateReturnForReview({ requireVehiclePlate: false, requirePhotos: false });
+   returnValidationMessage = error;
+   if (error) return render();
+@@ -8577,12 +8508,11 @@
+   stopReturnScannerCamera();
+   selectReturnReviewPhotoTarget(returnPhotoTarget, { preferMissing: true });
+   returnStage = "review";
+-  await loadReturnPostingPolicies();
++  render();
+ }
+ 
+ async function submitReturn() {
+   if (returnBusy) return;
+-  if (!returnPostingReady()) {return showToast("Refresh the posting mode before confirming.");}
+   const validation = validateReturnForReview();
+   if (validation) {
+     returnValidationMessage = validation;
+@@ -8997,7 +8927,6 @@
+     }
+     if (button.dataset.action === "return-save-draft") return saveReturnDraft();
+     if (button.dataset.action === "return-open-review") return openReturnReview();
+-    if (button.dataset.action === "return-refresh-posting") {return loadReturnPostingPolicies();}
+     if (button.dataset.action === "return-back-to-form") {
+       stopReturnCamera();
+       returnStage = "form";
+--- a/public/operator.html
++++ b/public/operator.html
+@@ -21,6 +21,6 @@
+     <script src="/vendor/quagga2/quagga.min.js?v=1.12.1"></script>
+     <script src="/i18n.js?v=20260916-operator-direct-orderline-v1"></script>
+     <script src="/operator-load-summary.js?v=20260915-operator-display-v1"></script>
+-    <script src="/operator.js?v=20260917-return-ra-v1"></script>
++    <script src="/operator.js?v=20260916-operator-direct-orderline-v1"></script>
+   </body>
+ </html>
+--- a/public/service-worker.js
++++ b/public/service-worker.js
+@@ -1,4 +1,4 @@
+-const CACHE_NAME = "mbbs-yard-operator-v156-return-ra-v1";
++const CACHE_NAME = "mbbs-yard-operator-v155-bottom-inset-v1";
+ const OPERATOR_CACHE_PREFIX = "mbbs-yard-operator-";
+ const APP_SHELL = [
+   "/operator",
+@@ -8,7 +8,7 @@
+   "/vendor/quagga2/quagga.min.js?v=1.12.1",
+   "/i18n.js?v=20260916-operator-direct-orderline-v1",
+   "/operator-load-summary.js?v=20260915-operator-display-v1",
+-  "/operator.js?v=20260917-return-ra-v1",
++  "/operator.js?v=20260916-operator-direct-orderline-v1",
+   "/manifest.webmanifest",
+   "/icons/mbbs-yard-192.png",
+   "/icons/mbbs-yard-512.png",
+--- a/public/control.js
++++ b/public/control.js
+@@ -1878,11 +1878,7 @@
+   if (record?.draftId || record?.draft_id) return "draft";
+   const syncStatus = String(firstDefined(record, ["netSuiteSyncStatus", "netsuite_sync_status"], "")).toLowerCase();
+   if (syncStatus === "failed") {
+-    return returnType(record) === "pallet" && Number(record.workflowVersion || 1) < 2 ? "credit_memo_creation_failed" : "ra_creation_failed";
+-  }
+-  if (Number(record.workflowVersion) === 2 && !["voided", "rejected"].includes(record.status)) {
+-    const result = { disabled: "local_only", pending: "ra_pending", succeeded: "ra_created", manual_linked: "ra_created" }[syncStatus];
+-    if (result) {return result;}
++    return returnType(record) === "pallet" ? "credit_memo_creation_failed" : "ra_creation_failed";
+   }
+   return String(firstDefined(record, ["status", "returnStatus", "return_status", "approvalStatus", "approval_status"], "unknown"))
+     .trim()
+@@ -1923,9 +1919,6 @@
+     partially_rejected: "Partially Rejected",
+     voided: "Voided",
+     draft: "Draft",
+-    local_only: "Local only",
+-    ra_pending: "RA Pending",
+-    ra_created: "RA Created",
+     ra_creation_failed: "RA Creation Failed",
+     credit_memo_creation_failed: "Credit Memo Creation Failed",
+     sync_failed: "NetSuite Sync Failed",
+@@ -2115,7 +2108,6 @@
+ }
+ 
+ function renderReturnLineDecisionActions(line) {
+-  if (Number(returnHeader().workflowVersion) === 2) {return "";}
+   if (returnStatus(returnHeader()) === "draft") return "";
+   const status = returnStatus(line);
+   const policy = String(firstDefined(line, [
+@@ -2356,18 +2348,18 @@
+   return `<section class="panel return-automation">
+     <div class="section-heading">
+       <div>
+-        <h2>Legacy Return NetSuite Automation</h2>
+-        <p class="muted">These settings apply to earlier return records. For new stock and pallet Return Authorizations, use the per-yard RA columns in <a href="/mbt-gates.html">Feature Gates</a>.</p>
++        <h2>Return NetSuite Automation</h2>
++        <p class="muted">These settings are yard-specific and default to Off. The actual receiving yard controls automation, including approved cross-yard stock returns and customer-level PALLET returns.</p>
+       </div>
+       <button data-action="refresh-return-automation" type="button">Refresh</button>
+     </div>
+     <div class="notice">
+-      <strong>Earlier records</strong>
+-      <span>Legacy stock returns retain approval and Return Authorization processing. Legacy PALLET returns retain direct Credit Memo processing at $40 per Each.</span>
++      <strong>Safe rollout</strong>
++      <span>Stock returns create Return Authorizations. PALLET returns create Credit Memos directly at $40 per Each. Keep both settings off until that yard is ready for live NetSuite transactions.</span>
+     </div>
+     <div class="notice">
+-      <strong>Legacy split reasons</strong>
+-      <span>Earlier Quality Returns with multiple reasons on one Sales Order line still require manual linking. New confirmations preserve separate reason rows in one Return Authorization.</span>
++      <strong>Current NetSuite limitation</strong>
++      <span>A Quality Return that splits one Sales Order line across multiple reason codes remains local. Link its Return Authorization manually after creating it in NetSuite; automatic creation stays fail-safe for that record.</span>
+     </div>
+     ${returnSettingsError ? `<div class="notice sync-error"><strong>Return automation settings could not be loaded</strong><span>${escapeHtml(returnSettingsError)}</span></div>` : `
+       <div class="return-automation-grid">
+--- a/public/control.html
++++ b/public/control.html
+@@ -9,8 +9,8 @@
+   </head>
+   <body>
+     <main id="controlApp"></main>
+-    <script src="/i18n.js?v=20260917-return-ra-v1"></script>
++    <script src="/i18n.js?v=20260915-operator-yards-v1"></script>
+     <script src="/app-sidebar.js?v=20260911-maps-usage-v1"></script>
+-    <script src="/control.js?v=20260917-return-ra-v1"></script>
++    <script src="/control.js?v=20260915-operator-yards-v1"></script>
+   </body>
+ </html>
+--- a/public/sales.js
++++ b/public/sales.js
+@@ -68,11 +68,7 @@
+ function salesReturnStatus(record) {
+   const syncStatus = String(salesFirst(record, ["netSuiteSyncStatus", "netsuite_sync_status"], "")).toLowerCase();
+   if (syncStatus === "failed") {
+-    return salesReturnType(record) === "pallet" && Number(record.workflowVersion || 1) < 2 ? "credit_memo_creation_failed" : "ra_creation_failed";
+-  }
+-  if (Number(record.workflowVersion) === 2 && !["voided", "rejected"].includes(record.status)) {
+-    const result = { disabled: "local_only", pending: "ra_pending", succeeded: "ra_created", manual_linked: "ra_created" }[syncStatus];
+-    if (result) {return result;}
++    return salesReturnType(record) === "pallet" ? "credit_memo_creation_failed" : "ra_creation_failed";
+   }
+   return String(salesFirst(record, ["status", "returnStatus", "return_status", "approvalStatus", "approval_status"], "unknown"))
+     .trim()
+@@ -92,9 +88,6 @@
+     rejected: "Rejected",
+     partially_rejected: "Partially Rejected",
+     voided: "Voided",
+-    local_only: "Local only",
+-    ra_pending: "RA Pending",
+-    ra_created: "RA Created",
+     ra_creation_failed: "RA Creation Failed",
+     credit_memo_creation_failed: "Credit Memo Creation Failed",
+     sync_failed: "NetSuite Sync Failed",
+--- a/public/sales.html
++++ b/public/sales.html
+@@ -5,14 +5,14 @@
+     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+     <title>MBBS Sales</title>
+     <link rel="stylesheet" href="/dispatch.css?v=20260721-sales-v2" />
+-    <link rel="stylesheet" href="/sales.css?v=20260917-return-ra-v1" />
++    <link rel="stylesheet" href="/sales.css?v=20260729-return-records-v1" />
+     <link rel="stylesheet" href="/i18n.css?v=20260701-i18n-v2" />
+   </head>
+   <body>
+     <main class="dispatch-shell dispatch-menu-shell" id="salesApp"></main>
+     <script src="/i18n.js?v=20260815-customer-pickup-photo-gate-v1"></script>
+-    <script src="/app-sidebar.js?v=20260917-return-ra-v1"></script>
++    <script src="/app-sidebar.js?v=20260729-return-records-v1"></script>
+     <script src="/dispatch-auth.js?v=20260725-private-record-v1"></script>
+-    <script src="/sales.js?v=20260917-return-ra-v1"></script>
++    <script src="/sales.js?v=20260729-return-records-v1"></script>
+   </body>
+ </html>
+--- a/public/mbt-gates.js
++++ b/public/mbt-gates.js
+@@ -197,9 +197,7 @@
+   const functions = [
+     { key: "customer_pickup", label: "Customer Pickup", type: "IF" },
+     { key: "receiving", label: "Receiving", type: "IR" },
+-    { key: "delivery_prep", label: "Delivery Prep", type: "IF" },
+-    { key: "stock_return", label: "Stock Return", type: "RA" },
+-    { key: "pallet_return", label: "Pallet Return", type: "RA" }
++    { key: "delivery_prep", label: "Delivery Prep", type: "IF" }
+   ];
+   const yards = [...new Set(gates.map((gate) => String(gate.yardCode || "")))];
+   const table = document.createElement("table");
+--- a/public/mbt-gates.html
++++ b/public/mbt-gates.html
+@@ -116,6 +116,6 @@
+       </section>
+     </main>
+     <script src="/app-sidebar.js"></script>
+-    <script src="/mbt-gates.js?v=20260917-return-ra-v1" type="module"></script>
++    <script src="/mbt-gates.js" type="module"></script>
+   </body>
+ </html>
+--- a/test/mbt/unit/operator-yard-assets.test.js
++++ b/test/mbt/unit/operator-yard-assets.test.js
+@@ -24,11 +24,10 @@
+   const waits = [];
+   events.get("install")({ waitUntil: (promise) => waits.push(promise) });
+   await Promise.all(waits);
+-  assert.equal(installed[0].name, "mbbs-yard-operator-v156-return-ra-v1");
++  assert.equal(installed[0].name, "mbbs-yard-operator-v155-bottom-inset-v1");
+   for (const asset of ["operator.js", "operator-load-summary.js", "operator.css", "i18n.js"]) {
+     const version = asset === "operator.css" ? "20260916-operator-bottom-inset-v1"
+-      : asset === "operator-load-summary.js" ? "20260915-operator-display-v1"
+-        : asset === "operator.js" ? "20260917-return-ra-v1" : "20260916-operator-direct-orderline-v1";
++      : asset === "operator-load-summary.js" ? "20260915-operator-display-v1" : "20260916-operator-direct-orderline-v1";
+     const url = `/${asset}?v=${version}`;
+     assert.ok(html.includes(url));
+     assert.ok(installed[0].assets.includes(`https://yard.invalid${url}`));
+--- a/public/admin.html
++++ b/public/admin.html
+@@ -11,6 +11,6 @@
+     <main id="controlApp"></main>
+     <script src="/i18n.js?v=20260915-operator-yards-v1"></script>
+     <script src="/app-sidebar.js?v=20260911-maps-usage-v1"></script>
+-    <script src="/control.js?v=20260917-return-ra-v1"></script>
++    <script src="/control.js?v=20260915-operator-yards-v1"></script>
+   </body>
+ </html>
+--- a/test/mbt/unit/operator-customer-pickup-photo-gate-ui.contract.test.js
++++ b/test/mbt/unit/operator-customer-pickup-photo-gate-ui.contract.test.js
+@@ -90,7 +90,7 @@
+     source("public/operator.html"),
+     source("public/service-worker.js")
+   ]);
+-  assert.match(html, /operator\.js\?v=20260917-return-ra-v1/u);
+-  assert.match(serviceWorker, /mbbs-yard-operator-v156-return-ra-v1/u);
+-  assert.match(serviceWorker, /operator\.js\?v=20260917-return-ra-v1/u);
++  assert.match(html, /operator\.js\?v=20260916-operator-direct-orderline-v1/u);
++  assert.match(serviceWorker, /mbbs-yard-operator-v155-bottom-inset-v1/u);
++  assert.match(serviceWorker, /operator\.js\?v=20260916-operator-direct-orderline-v1/u);
+ });
+--- a/test/mbt/unit/operator-page-confirm-ui.contract.test.js
++++ b/test/mbt/unit/operator-page-confirm-ui.contract.test.js
+@@ -59,10 +59,10 @@
+   assert.match(operator, /pageConfirming = false;/u);
+   assert.match(css, /@media \(max-width: 700px\)[\s\S]*?\.receiving-grid\s*\{[\s\S]*?grid-template-columns:\s*minmax\(0, 1fr\)/u);
+   assert.match(html, /operator\.css\?v=20260916-operator-bottom-inset-v1/u);
+-  assert.match(html, /operator\.js\?v=20260917-return-ra-v1/u);
+-  assert.match(serviceWorker, /mbbs-yard-operator-v156-return-ra-v1/u);
++  assert.match(html, /operator\.js\?v=20260916-operator-direct-orderline-v1/u);
++  assert.match(serviceWorker, /mbbs-yard-operator-v155-bottom-inset-v1/u);
+   assert.match(serviceWorker, /operator\.css\?v=20260916-operator-bottom-inset-v1/u);
+-  assert.match(serviceWorker, /operator\.js\?v=20260917-return-ra-v1/u);
++  assert.match(serviceWorker, /operator\.js\?v=20260916-operator-direct-orderline-v1/u);
+ });
+ 
+ test("server exposes separate Customer Pickup and PO-only batch endpoints", async () => {
+--- a/test/mbt/unit/operations-navigation-enhancements.test.js
++++ b/test/mbt/unit/operations-navigation-enhancements.test.js
+@@ -123,12 +123,12 @@
+ test("operator cache assets advance with the cycle-count pagination release", () => {
+   for (const asset of [
+     "/operator.css?v=20260916-operator-bottom-inset-v1",
+-    "/operator.js?v=20260917-return-ra-v1"
++    "/operator.js?v=20260916-operator-direct-orderline-v1"
+   ]) {
+     assert.ok(operatorHtml.includes(asset));
+     assert.ok(serviceWorker.includes(asset));
+   }
+-  assert.ok(serviceWorker.includes("mbbs-yard-operator-v156-return-ra-v1"));
++  assert.ok(serviceWorker.includes("mbbs-yard-operator-v155-bottom-inset-v1"));
+ });
+ 
+ test("Dispatch and SCM card menus scroll within the fixed-height application shell", () => {
+--- a/test/mbt/unit/control-yard-photo-thumbnail.test.js
++++ b/test/mbt/unit/control-yard-photo-thumbnail.test.js
+@@ -69,7 +69,7 @@
+ });
+ 
+ test("Control and Admin request the cache-busted thumbnail hydration client", () => {
+-  const expectedAsset = "/control.js?v=20260917-return-ra-v1";
++  const expectedAsset = "/control.js?v=20260915-operator-yards-v1";
+   assert.ok(controlHtml.includes(expectedAsset));
+   assert.ok(adminHtml.includes(expectedAsset));
+ });
+--- a/test/mbt/unit/feature-gate-catalog.test.js
++++ b/test/mbt/unit/feature-gate-catalog.test.js
+@@ -74,14 +74,6 @@
+     "operator_netsuite_customer_pickup_if_150",
+     "operator_netsuite_receiving_ir_150",
+     "operator_netsuite_delivery_prep_if_150",
+-    "operator_netsuite_stock_return_ra_3445",
+-    "operator_netsuite_pallet_return_ra_3445",
+-    "operator_netsuite_stock_return_ra_2967",
+-    "operator_netsuite_pallet_return_ra_2967",
+-    "operator_netsuite_stock_return_ra_12441",
+-    "operator_netsuite_pallet_return_ra_12441",
+-    "operator_netsuite_stock_return_ra_150",
+-    "operator_netsuite_pallet_return_ra_150",
+     "dispatch_netsuite_sales_order_if_3445",
+     "dispatch_netsuite_sales_order_if_2967",
+     "dispatch_netsuite_sales_order_if_12441",
+@@ -96,7 +88,7 @@
+     "mbt_customer_sync",
+     "mbt_netsuite_writes"
+   ]);
+-  assert.deepEqual(MBT_ADMIN_WRITABLE_GATE_KEYS, MBT_ADMIN_GATE_KEYS.slice(0, 37));
++  assert.deepEqual(MBT_ADMIN_WRITABLE_GATE_KEYS, MBT_ADMIN_GATE_KEYS.slice(0, 29));
+   for (const flagKey of MBT_ADMIN_GATE_KEYS.filter((key) => key.startsWith("dispatch_netsuite_sales_order_if_"))) {
+     const selected = gate(materializeMbtAdminGates({ flags: flags([]), environment: environmentOpen }), flagKey);
+     assert.equal(selected.gateGroup, "dispatch_sales_order_fulfillment");
+--- a/test/mbt/integration/feature-gate-admin-http.test.js
++++ b/test/mbt/integration/feature-gate-admin-http.test.js
+@@ -38,14 +38,6 @@
+   "operator_netsuite_customer_pickup_if_150",
+   "operator_netsuite_receiving_ir_150",
+   "operator_netsuite_delivery_prep_if_150",
+-  "operator_netsuite_stock_return_ra_3445",
+-  "operator_netsuite_pallet_return_ra_3445",
+-  "operator_netsuite_stock_return_ra_2967",
+-  "operator_netsuite_pallet_return_ra_2967",
+-  "operator_netsuite_stock_return_ra_12441",
+-  "operator_netsuite_pallet_return_ra_12441",
+-  "operator_netsuite_stock_return_ra_150",
+-  "operator_netsuite_pallet_return_ra_150",
+   "dispatch_netsuite_sales_order_if_3445",
+   "dispatch_netsuite_sales_order_if_2967",
+   "dispatch_netsuite_sales_order_if_12441",
+--- a/test/mbt/integration/http-shell.test.js
++++ b/test/mbt/integration/http-shell.test.js
+@@ -26,7 +26,7 @@
+ test("F15: all MBT routes render one accessible controlled shell with an explicit controller", async () => {
+   for (const [path, surface, controllers, heading] of [
+     ["/mbt", "home", ["mbt-home.js"], "MBT Bin Operations"],
+-    ["/admin/mbt-gates", "gates", ["mbt-gates.js?v=20260917-return-ra-v1"], "Feature gates"],
++    ["/admin/mbt-gates", "gates", ["mbt-gates.js"], "Feature gates"],
+     ["/mbt/config", "config", ["mbt-shell.js"], "Configuration"],
+     ["/mbt/assets", "assets", ["mbt-assets.js"], "Bin asset registry"],
+     ["/mbt/frontdesk", "frontdesk", ["mbt-frontdesk.js"], "Front Desk"],
+@@ -45,7 +45,7 @@
+     assert.match(html, /href=["']\/mbt-shell\.css["']/i);
+     assert.match(html, /src=["']\/app-sidebar\.js["']/i);
+     for (const controller of controllers) {
+-      assert.match(html, new RegExp(`src=["']/${controller.replace(".", "\\.").replace("?", "\\?")}["']`, "i"));
++      assert.match(html, new RegExp(`src=["']/${controller.replace(".", "\\.")}["']`, "i"));
+     }
+   }
+ });
+--- a/test/mbt/integration/migration-upgrade.test.js
++++ b/test/mbt/integration/migration-upgrade.test.js
+@@ -726,10 +726,10 @@
+       immutable_trigger: true
+     }]);
+ 
+-    assert.equal(receiptsBeforeNoOp.rowCount, 203);
++    assert.equal(receiptsBeforeNoOp.rowCount, 202);
+     assert.equal(
+       receiptsBeforeNoOp.rows.at(-1)?.filename,
+-      "203_operator_return_authorizations.sql"
++      "202_netsuite_order_line.sql"
+     );
+     assert.deepEqual(
+       receiptsBeforeNoOp.rows
+--- a/tools/mbt-predeploy-readiness.mjs
++++ b/tools/mbt-predeploy-readiness.mjs
+@@ -146,8 +146,7 @@
+   "199_operator_yard_access.sql",
+   "200_operator_consolidated_loads.sql",
+   "201_operator_posting_photo_uploads.sql",
+-  "202_netsuite_order_line.sql",
+-  "203_operator_return_authorizations.sql"
++  "202_netsuite_order_line.sql"
+ ]);
+ 
+ export const REQUIRED_MBT_P3_FLAGS = Object.freeze([
+--- a/test/mbt/integration/p3-predeploy-readiness.test.js
++++ b/test/mbt/integration/p3-predeploy-readiness.test.js
+@@ -178,8 +178,7 @@
+     "199_operator_yard_access.sql",
+     "200_operator_consolidated_loads.sql",
+     "201_operator_posting_photo_uploads.sql",
+-    "202_netsuite_order_line.sql",
+-    "203_operator_return_authorizations.sql"
++    "202_netsuite_order_line.sql"
+   ]);
+   assert.deepEqual(REQUIRED_MBT_P3_FLAGS, EXPECTED_FLAGS);
+   const rows = EXPECTED_FLAGS.map((flag_key) => ({ flag_key, enabled: false }));

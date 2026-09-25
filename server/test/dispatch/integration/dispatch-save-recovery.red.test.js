@@ -104,6 +104,7 @@ test("failed Save Now retains a separate recovery draft and leaves the confirmed
   const requestBody = {
     planDate: seeded.plan_date,
     baseRevision: activeBefore.revision,
+    baseDigest: active.payload.digest,
     forceSave: true,
     editLeaseToken: lease,
     orders: active.payload.orders,

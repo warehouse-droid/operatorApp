@@ -50,6 +50,7 @@ button:disabled {
 
 .tablet-shell {
   height: 100dvh;
+  padding-bottom: calc(15px + env(safe-area-inset-bottom, 0px));
   min-height: 0;
   display: flex;
   flex-direction: column;

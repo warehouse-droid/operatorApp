@@ -6,6 +6,8 @@ import { getReceivingOrder, getLocalCoReceivingOrder } from "./receiving-reposit
 import { getPublicOperatorNetSuitePostingCommand } from "./operator-netsuite-posting-controller.js";
 import { assertOperatorYard, deliveryOrderWithinYards, operatorYardLocationIds, requireAssignedOperatorYards, operatorYardForbidden } from "./operator-yard-access.js";
 import { operatorRequestPath, operatorRouteId } from "./operator-yard-route.js";
+import { outboundOrderYards, outboundYardLocationId } from './outbound-location-domain.js';
+import { ensureOutboundLocationDirectory } from './outbound-location-runtime.js';
 
 /** @param {any} row */
 function found(row) {
@@ -25,11 +27,17 @@ export async function assertOperatorOrderYard(operator, id, { receiving = false,
       order = await getLocalCoReceivingOrder(id);
     }
   } else {
+    await ensureOutboundLocationDirectory();
     order = await getDeliveryOrder(id, { includeNetSuiteClosed: true });
   }
   found(order);
-  assertOperatorYard(operator, receiving ? order.destination_location_id : order.outbound_location_id ?? order.source_location_id);
-  assertOperatorChildOrderYards(operator, order);
+  if (receiving) {
+    assertOperatorYard(operator, order.destination_location_id);
+    assertOperatorChildOrderYards(operator, order);
+  } else {
+    if (!deliveryOrderWithinYards(order, operatorYardLocationIds(operator))) throw operatorYardForbidden();
+    for (const yard of outboundOrderYards(order)) assertOperatorYard(operator, yard);
+  }
   return order;
 }
 
@@ -49,12 +57,13 @@ export async function assertOperatorUploadYard(operator, body = {}) {
     body.source = "operator";
     return batch.locationId;
   }
-  if (body.recordType === "operator-return-photo") return assertOperatorYard(operator, body.locationId);
+  if (body.recordType === "operator-return-photo" || body.recordType === "operator-damage-photo") return assertOperatorYard(operator, body.locationId);
   if (!body.orderId) throw Object.assign(new Error("An order is required for this photo."), { status: 400 });
   const order = await assertOperatorOrderYard(operator, body.orderId, {
     receiving: String(body.recordType).includes("receiving"), orderType: body.orderType
   });
-  return Number(order.destination_location_id || order.outbound_location_id || order.source_location_id);
+  return String(body.recordType).includes('receiving') ? Number(order.destination_location_id)
+    : outboundYardLocationId(order.outbound_location_id ?? order.source_location_id);
 }
 
 /** @param {import("./operator-yard-access.js").OperatorYardAccount} operator @param {string} reference */
@@ -244,7 +253,8 @@ export function createOperatorYardGuard({ receivingJobs = new Map(), fulfillment
       if (controlInventorySync(req, pathname)) return next();
       requireAssignedOperatorYards(req.operator);
       suppliedYards(req, ["locationId", "destinationLocationId"]);
-      await authorizeOperatorRequest(req, pathname, { receivingJobs, fulfillmentJobs });
+      if (/^\/api\/(?:delivery|customer-pickup)\//.test(pathname)) await ensureOutboundLocationDirectory();
+      req.operatorYardOrder = await authorizeOperatorRequest(req, pathname, { receivingJobs, fulfillmentJobs });
       next();
     } catch (error) { next(error); }
   };

@@ -1,6 +1,7 @@
 import {
   createOrUpdateCreditMemoInNetSuite,
   createOrUpdateReturnAuthorizationInNetSuite,
+  createStandaloneReturnAuthorizationInNetSuite,
   fetchCreditMemoFromNetSuite,
   fetchCreditMemoMetadataFromNetSuite,
   fetchReturnAuthorizationFromNetSuite,
@@ -9,6 +10,7 @@ import {
   suiteql,
   suiteqlAll
 } from "./netsuite.js";
+import { buildPalletReturnAuthorizationPayload, verifyReturnAuthorizationSnapshot } from "./return-ra-workflow.js";
 
 export const CONFIRMED_RETURN_REASONS = Object.freeze([
   { id: 5, code: "R1", label: "R1 - Color Variation", kind: "quality" },
@@ -132,6 +134,7 @@ function normalizeReturnOrderRows(rows = []) {
     itemTypeText: row.item_type_text || "",
     salesQuantity: number(row.sales_quantity),
     salesUom: row.sales_uom || "",
+    salesUomId: Number(row.sales_uom_id) || null,
     fulfilledQuantity: number(row.fulfilled_quantity),
     rate: nullableNumber(row.rate),
     foreignAmount: nullableNumber(row.foreign_amount),
@@ -175,6 +178,7 @@ export async function fetchReturnSalesOrderFromNetSuite(code, {
       ABS(NVL(tl.quantity, 0)) AS sales_quantity,
       ABS(NVL(tl.quantityshiprecv, 0)) AS fulfilled_quantity,
       BUILTIN.DF(tl.units) AS sales_uom,
+      tl.units AS sales_uom_id,
       tl.rate,
       tl.foreignamount AS foreign_amount,
       tl.location AS line_location_id,
@@ -789,6 +793,10 @@ export async function findReturnTransactionByExternalId(externalId, transactionT
      ORDER BY t.id DESC
      FETCH FIRST 2 ROWS ONLY
   `);
+  if (result.items?.length > 1) {
+    throw Object.assign(new Error("Multiple NetSuite return transactions have the same external ID. Resolve the duplicate before retrying."),
+      { status: 409, code: "RETURN_EXTERNAL_ID_AMBIGUOUS" });
+  }
   return result.items?.[0] || null;
 }
 
@@ -841,6 +849,7 @@ export function buildReturnAuthorizationPayload(record) {
       item: { id: String(line.itemId) },
       quantity: Number(line.returnedSalesQuantity),
       rate,
+      ...(line.salesUomId ? { units: { id: String(line.salesUomId) } } : {}),
       custcol_atlas_rc_so: { id: String(line.reasonId) }
     };
   });
@@ -899,6 +908,74 @@ export async function upsertPalletCreditMemoInNetSuite(record) {
     creditMemoId: record.netsuiteTransactionId,
     payload: buildPalletCreditMemoPayload(record)
   });
+}
+
+// Version 2 never PATCHes an uncertain or mismatched RA. Recovery verifies the
+// persisted intent; a second create is prohibited after an ambiguous response.
+async function createConfirmedReturnAuthorization(record, payload) {
+  try {
+    return record.recordType === "stock"
+      ? await createOrUpdateReturnAuthorizationInNetSuite({ salesOrderId: record.sourceSalesOrderId, payload })
+      : await createStandaloneReturnAuthorizationInNetSuite(payload);
+  } catch (error) {
+    error.returnRaCreationRejected = error.netsuiteResponseReceived === true
+      && [400, 401, 403, 404, 422].includes(Number(error.status))
+      && !(error.netsuiteErrorCodes || []).some((code) => /DUP|EXIST/i.test(code));
+    throw error;
+  }
+}
+
+export async function postConfirmedReturnAuthorization(record, { beforeCreate, onIdentified }) {
+  const payload = record.recordType === "stock"
+    ? buildReturnAuthorizationPayload(record)
+    : buildPalletReturnAuthorizationPayload(record);
+  let found = record.netsuiteTransactionId
+    ? { id: record.netsuiteTransactionId }
+    : await findReturnTransactionByExternalId(record.externalId, "return_authorization");
+  if (!found) {
+    if (record.netSuiteRaAttemptedAt) {
+      throw Object.assign(new Error("NetSuite RA creation is unconfirmed. Recheck this return; another RA will not be created."),
+        { code: "RETURN_RA_CREATION_UNCERTAIN", status: 409 });
+    }
+    await beforeCreate();
+    found = await createConfirmedReturnAuthorization(record, payload);
+    if (!found.id) {
+      found = await findReturnTransactionByExternalId(record.externalId, "return_authorization");
+    }
+  }
+  const id = positiveId(found?.id, "created Return Authorization ID");
+  await onIdentified(id);
+  const snapshot = await fetchReturnAuthorizationFromNetSuite(id);
+  if (!snapshot) {throw Object.assign(new Error("Created Return Authorization could not be read back."), { status: 409 });}
+  verifyReturnAuthorizationSnapshot({ ...record, netsuiteTransactionId: id }, snapshot);
+  return { id, tranid: snapshot.tranId || snapshot.tranid || "", status: snapshot.status, snapshot, recovered: true };
+}
+
+export async function fetchPalletReturnCreditsFromNetSuite(returnAuthorizationIds, palletItemId) {
+  if (!returnAuthorizationIds.length) {return [];}
+  const ids = [...new Set(returnAuthorizationIds.map((id) => positiveId(id, "Return Authorization ID")))];
+  const itemId = positiveId(palletItemId, "PALLET item ID");
+  // Deduplicate transaction links before summing each physical Credit Memo row.
+  const rows = await suiteqlAll(`
+    SELECT return_ra_credit_lines.return_authorization_id,
+           return_ra_credit_lines.transaction_id, SUM(return_ra_credit_lines.quantity) AS quantity
+    FROM (
+      SELECT DISTINCT link.previousdoc AS return_authorization_id,
+             cm.id AS transaction_id, cmline.id AS credit_line_id,
+             ABS(NVL(cmline.quantity, 0)) AS quantity
+      FROM NextTransactionLineLink link
+      INNER JOIN transaction cm ON cm.id = link.nextdoc AND cm.type = 'CustCred'
+      INNER JOIN transactionline cmline ON cmline.transaction = cm.id AND cmline.id = link.nextline
+      WHERE link.previousdoc IN (${ids.join(",")}) AND cmline.item = ${itemId}
+        AND cmline.mainline = 'F' AND (cmline.taxline = 'F' OR cmline.taxline IS NULL)
+        AND UPPER(NVL(BUILTIN.DF(cm.status), '')) NOT LIKE '%VOID%'
+        AND UPPER(NVL(BUILTIN.DF(cm.status), '')) NOT LIKE '%CANCEL%'
+        AND UPPER(NVL(BUILTIN.DF(cm.status), '')) NOT LIKE '%REJECT%'
+    ) return_ra_credit_lines
+    GROUP BY return_ra_credit_lines.return_authorization_id, return_ra_credit_lines.transaction_id
+  `);
+  return rows.map(row => ({ returnAuthorizationId: Number(row.return_authorization_id),
+    transactionId: Number(row.transaction_id), quantity: number(row.quantity) }));
 }
 
 export async function fetchLinkedReturnTransaction(record) {

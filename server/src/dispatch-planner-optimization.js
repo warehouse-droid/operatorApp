@@ -54,7 +54,7 @@ function compactCardItem(item = {}) {
   const fields = [
     "id", "itemId", "lineRowId", "lineId", "lineUniqueKey", "sku", "itemName", "description", "quantity",
     "pallets", "layers", "sections", "pieces", "salesQty", "unit", "uom", "location",
-    "locationId", "sourceYard", "destinationYard"
+    "locationId", "sourceYard", "destinationYard", "itemType", "itemTypeText", "fullName", "rentalEquipment", "sorAutoReturn"
   ];
   return Object.fromEntries(fields
     .filter((key) => item[key] !== undefined && item[key] !== null && item[key] !== "")
@@ -76,6 +76,7 @@ function compactTransitCo(value) {
 export function compactDispatchOrderCard(order = {}) {
   const fields = [
     "id", "orderId", "orderRef", "tranid", "refNumber", "type", "orderKind", "sourceTable",
+    "sorRentalReturn", "sorReviewReason", "needsAddress", "sorOrder", "dispatchPlanningRestricted", "dispatchPlanningRestrictionReason",
     "customer", "customerName", "address", "dropAddress", "destinationAddress", "pickupAddress",
     "pickupAddressOverride", "dispatchDetailsOverride", "sourceAddress", "dropoffLocation", "pickupLocation", "pickupLocations",
     "sourceYard", "destinationYard", "destinationLocationId", "expectedDeliveryDate", "windowStart",

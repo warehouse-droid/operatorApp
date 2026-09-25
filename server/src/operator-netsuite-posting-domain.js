@@ -1,7 +1,9 @@
 // @ts-check
+import { EXISTING_PICKUP_IF_STRATEGY } from './operator-pickup-existing-if-domain.js';
 
 import crypto from "node:crypto";
 import { postingPhotoIdentity, validatePostingPhotos } from "./operator-netsuite-posting-photos.js";
+import { operatorKitError } from './operator-netsuite-posting-kits.js';
 
 const REQUEST_ID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/iu;
 const SOURCE_ORDER_KINDS = new Set(["SO", "PO", "TO"]);
@@ -173,7 +175,9 @@ function normalizedSelectedLine(line) {
     location: optionalLocation(line.location),
     localOrderKey: requiredText(line.localOrderKey, "Local order key"),
     localLineId: requiredText(line.localLineId, "Local line ID"),
-    ...(sourceLineKey ? { sourceLineKey } : {})
+    ...(sourceLineKey ? { sourceLineKey } : {}),
+    ...(line.itemId ? { itemId: positiveInteger(line.itemId, 'Selected item ID') } : {}),
+    ...(line.kit ? { kit: canonicalValue(line.kit) } : {})
   };
 }
 
@@ -233,6 +237,13 @@ function payloadItem(item) {
   return result;
 }
 
+/** @param {boolean} existingPickup @param {any} available */
+function assertExistingPickupAvailable(existingPickup, available) {
+  if (existingPickup && (available.remainingQuantity !== 0 || !available.linkedTransactions.length)) {
+    throw inputError('An existing pickup IF must fully reconcile every confirmed line.');
+  }
+}
+
 /**
  * Build a canonical, immutable command draft. Callers must resolve every source
  * identity and transform line number from server-owned records first.
@@ -266,6 +277,15 @@ export function buildOperatorNetSuitePostingDraft(input = {}) {
   const localOperation = normalizedLocalOperation(input.localOperation);
   if (!Array.isArray(input.targets) || !input.targets.length) {
     throw inputError("At least one NetSuite source target is required.");
+  }
+  const direct = input.targets.some((/** @type {Record<string, any>} */ target) => target.postingStrategy === "stored_order_line_v1");
+  const existingPickup = input.targets.some((/** @type {Record<string, any>} */ target) => target.postingStrategy === EXISTING_PICKUP_IF_STRATEGY);
+  if (existingPickup && (functionKey !== 'customer_pickup' || transactionType !== 'IF'
+      || !input.targets.every((/** @type {any} */ target) => target.postingStrategy === EXISTING_PICKUP_IF_STRATEGY))) {
+    throw inputError('Existing pickup IF reconciliation requires only verified pickup targets.');
+  }
+  if (direct && !input.targets.every((/** @type {Record<string, any>} */ target) => target.postingStrategy === "stored_order_line_v1")) {
+    throw inputError("A posting command cannot mix stored and live line strategies.");
   }
 
   const grouped = new Map();
@@ -352,6 +372,9 @@ export function buildOperatorNetSuitePostingDraft(input = {}) {
     left.sourceOrderKind.localeCompare(right.sourceOrderKind)
       || left.sourceNetSuiteId - right.sourceNetSuiteId
   ));
+  if (direct || existingPickup) {
+    claims.push(...sortedGroups.map(group => `source:${transactionType}:${group.sourceOrderKind}:${group.sourceNetSuiteId}`));
+  }
   const plannedGroups = sortedGroups.map((group) => {
     const reconciliationLines = [];
     const postedByLine = new Map();
@@ -359,11 +382,16 @@ export function buildOperatorNetSuitePostingDraft(input = {}) {
       const selected = group.selectedByLine.get(available.orderLine);
       if (!selected) {continue;}
       const requestedQuantity = selected.quantity;
-      if (available.orderedQuantity !== null
+      assertExistingPickupAvailable(existingPickup, available);
+      const kitSelected = group.lineSnapshot.some((/** @type {any} */ line) => line.orderLine === available.orderLine && line.kit);
+      if (kitSelected && requestedQuantity > available.remainingQuantity + 0.000001) {
+        throw operatorKitError('Combined kit allocations exceed the remaining source quantity.');
+      }
+      if (!direct && available.orderedQuantity !== null
           && requestedQuantity > available.orderedQuantity + 0.000001) {
         throw inputError("A selected quantity exceeds the authoritative NetSuite source-line quantity.");
       }
-      const authoritative = available.remainingQuantity !== null;
+      const authoritative = !direct && available.remainingQuantity !== null;
       const postedQuantity = Number((authoritative
         ? Math.min(requestedQuantity, available.remainingQuantity)
         : requestedQuantity).toFixed(6));
@@ -384,6 +412,7 @@ export function buildOperatorNetSuitePostingDraft(input = {}) {
         sourceOrderRef: group.sourceOrderRef,
         orderLine: available.orderLine,
         sourceLineKey: available.sourceLineKey,
+        ...(existingPickup ? { location: available.location } : {}),
         sourceLineAliases: available.sourceLineAliases,
         requestedQuantity,
         postedQuantity,
@@ -402,7 +431,9 @@ export function buildOperatorNetSuitePostingDraft(input = {}) {
     const payloadLines = [...group.availableByLine.values()]
       // Completed receipt lines are absent from the transform's static item sublist.
       // Keep them in reconciliation evidence, but never send a deselection for them.
-      .filter((available) => transactionType !== "IR" || available.remainingQuantity !== 0)
+      .filter((available) => direct
+        ? group.selectedByLine.has(available.orderLine) || available.remainingQuantity !== 0
+        : transactionType !== "IR" || available.remainingQuantity !== 0)
       .sort((left, right) => left.orderLine - right.orderLine)
       .map((available) => {
         const selected = group.selectedByLine.get(available.orderLine);
@@ -474,6 +505,8 @@ export function buildOperatorNetSuitePostingDraft(input = {}) {
   };
   validatePostingPhotos(photoRefs);
   const inputSnapshot = {
+    ...(direct ? { postingStrategy: "stored_order_line_v1" } : {}),
+    ...(existingPickup ? { postingStrategy: EXISTING_PICKUP_IF_STRATEGY } : {}),
     requestId,
     actorOperatorId,
     functionKey,

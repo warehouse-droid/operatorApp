@@ -139,6 +139,7 @@ function buildConfig(env) {
       m2mMasterKeyPath: path.resolve(env.NETSUITE_M2M_MASTER_KEY_PATH || path.join(dataDir, ".netsuite-m2m-master-key")),
       m2mStorageSecret: env.NETSUITE_M2M_STORAGE_SECRET || "",
       requestTimeoutMs: Number(env.NETSUITE_REQUEST_TIMEOUT_MS || 120000),
+      operatorStoredOrderLinePosting: booleanValue(env.OPERATOR_NETSUITE_STORED_ORDER_LINE_POSTING, false),
       subsidiaryId: env.NETSUITE_SUBSIDIARY_ID || "",
       webhookSecret: env.NETSUITE_WEBHOOK_SECRET || "",
       mbtSandboxAccountAllowlist: commaSeparatedValues(

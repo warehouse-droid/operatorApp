@@ -5,6 +5,8 @@ import crypto from "node:crypto";
 import { query, withTransaction } from "./db.js";
 import { stableCanonicalJson } from "./operator-netsuite-posting-domain.js";
 import { buildSalesOrderCompletionSnapshot } from "./sales-order-auto-fulfillment-domain.js";
+import { outboundYardLocationId, outboundOrderYards } from './outbound-location-domain.js';
+import { ensureOutboundLocationDirectory } from './outbound-location-runtime.js';
 
 const TERMINAL_STATUSES = new Set(["historical", "gate_disabled", "completed", "reconciled", "closed", "skipped"]);
 /** @typedef {Record<string, any>} LooseRecord */
@@ -65,6 +67,7 @@ function publicCandidate(row) {
     netSuiteTransactionRef: row.netsuite_transaction_ref,
     lastError: row.last_error,
     result: row.result || {},
+    fulfillmentParts: row.fulfillment_parts || row.result?.response?.fulfillmentParts || [],
     resolutionAction: row.resolution_action,
     resolutionLines: row.resolution_lines || [],
     customLines: row.resolution_lines || [],
@@ -83,12 +86,18 @@ function publicCandidate(row) {
   };
 }
 
+const candidatePartsSql = `(SELECT jsonb_agg(jsonb_build_object(
+  'inventoryLocationIds',jsonb_build_array(part.location_id), 'externalId',part.external_id,
+  'status',part.status,'transactionId',part.netsuite_transaction_id,
+  'transactionRef',part.netsuite_transaction_ref,'lastError',part.last_error) ORDER BY part.location_id)
+  FROM netsuite_item_fulfillment_parts part WHERE part.plan_external_id=candidate.external_id) AS fulfillment_parts`;
+
 /** @param {unknown} candidateId @param {{lock?: boolean}} [options] */
 async function candidateRow(candidateId, { lock = false } = {}) {
   const result = await query(
-    `SELECT * FROM dispatch_sales_order_if_candidates
-      WHERE id = $1
-      ${lock ? "FOR UPDATE" : ""}`,
+    `SELECT candidate.*, ${candidatePartsSql} FROM dispatch_sales_order_if_candidates candidate
+      WHERE candidate.id = $1
+      ${lock ? "FOR UPDATE OF candidate" : ""}`,
     [text(candidateId)]
   );
   return result.rows[0] || null;
@@ -101,7 +110,7 @@ export async function getSalesOrderAutoFulfillmentCandidate(candidateId) {
 
 /** @param {unknown} locationId */
 function yardCode(locationId) {
-  return ({ 1: "3445", 28: "2967", 15: "12441", 26: "150" })[Number(locationId)] || "";
+  return ({ 1: "3445", 28: "2967", 15: "12441", 26: "150" })[outboundYardLocationId(locationId) || 0] || "";
 }
 
 /** @param {LooseRecord} row */
@@ -115,7 +124,7 @@ async function completionSource(row) {
             COALESCE(split.source_so_id, local_order.netsuite_id) AS source_order_id,
             COALESCE(split.source_so_ref, local_order.tranid) AS source_order_ref,
             split.id AS split_ledger_id
-       FROM dispatch_order_completion_events event
+       FROM dispatch_effective_order_completion_events event
        LEFT JOIN sales_orders local_order
          ON lower(btrim(local_order.tranid)) = lower(btrim(event.order_ref))
        LEFT JOIN dispatch_scm_so_splits split
@@ -183,7 +192,7 @@ async function sourceLines(source) {
             local_line.loaded_qty AS mutable_loaded_quantity,
             local_line.location_id,
             source_line.id AS source_line_id,
-            source_line.line_id AS source_order_line
+            COALESCE(source_line.netsuite_order_line, source_line.line_id) AS source_order_line
        FROM sales_order_lines local_line
        JOIN LATERAL (
          SELECT retained.*
@@ -373,6 +382,8 @@ async function directToExecutionEvidence(source, lines) {
 async function materializeCandidate(row, source, decision) {
   const lines = await sourceLines(source);
   if (!lines.length) {throw failure("SALES_ORDER_IF_LINES_UNAVAILABLE", "No fulfillable Sales Order lines belong to this completed Dispatch target.");}
+  const yards = outboundOrderYards({ outbound_location_id: source.outbound_location_id, lines });
+  if (yards.length !== 1) {throw failure('SALES_ORDER_IF_MIXED_YARDS', 'The completed SO spans different outbound yards.');}
   const operatorEvidence = await operatorLoadedEvidence(source, lines);
   const poEvidence = await poExecutionEvidence(source, lines);
   const toEvidence = await directToExecutionEvidence(source, lines);
@@ -403,7 +414,7 @@ async function materializeCandidate(row, source, decision) {
     dispatchOrderRef: source.order_ref,
     sourceSalesOrderId: Number(source.source_order_id),
     sourceSalesOrderRef: source.source_order_ref,
-    locationId: Number(source.outbound_location_id),
+    locationId: yards[0],
     lines: snapshotLines
   });
   for (const line of snapshot.lines) {
@@ -464,6 +475,7 @@ async function materializeCandidate(row, source, decision) {
 
 /** @param {unknown} candidateId */
 export async function prepareSalesOrderAutoFulfillmentCandidate(candidateId) {
+  await ensureOutboundLocationDirectory();
   // Materialization keeps gate, lineage, evidence, claims, and audit changes atomic.
   // eslint-disable-next-line complexity
   return withTransaction(async () => {
@@ -537,6 +549,8 @@ export async function claimSalesOrderAutoFulfillmentCandidate({ candidateId, wor
         WHERE candidate.id = $1
           AND candidate.status IN ('queued', 'uncertain')
           AND (candidate.lease_expires_at IS NULL OR candidate.lease_expires_at <= now())
+          AND EXISTS (SELECT 1 FROM dispatch_effective_order_completion_events completion
+                       WHERE completion.id = candidate.completion_event_id)
           AND EXISTS (
             SELECT 1
               FROM mbt_feature_flags flag
@@ -764,7 +778,7 @@ export async function listRunnableSalesOrderAutoFulfillmentCandidateIds({ limit 
 export async function listSalesOrderAutoFulfillmentCandidates({ statuses = [], limit = 100 } = {}) {
   const retained = (Array.isArray(statuses) ? statuses : []).map(text).filter(Boolean);
   const result = await query(
-    `SELECT candidate.*,
+    `SELECT candidate.*, ${candidatePartsSql},
             event.completion_evidence_type,
             event.completion_evidence_id,
             event.dispatch_completed_at AS evidence_completed_at,
@@ -813,7 +827,7 @@ export async function previewHistoricalSalesOrderAutoFulfillmentEvents({ search,
             local_order.outbound_location_id,
             COALESCE(split.source_so_id, local_order.netsuite_id) AS source_order_id,
             COALESCE(split.source_so_ref, local_order.tranid) AS source_order_ref
-       FROM dispatch_order_completion_events event
+       FROM dispatch_effective_order_completion_events event
        LEFT JOIN dispatch_sales_order_if_candidates candidate
          ON candidate.completion_event_id = event.id
        LEFT JOIN sales_orders local_order
@@ -866,7 +880,7 @@ export async function queueHistoricalSalesOrderAutoFulfillmentCandidates({
   return withTransaction(async () => {
     const selected = await query(
       `SELECT event.id, event.order_ref
-         FROM dispatch_order_completion_events event
+         FROM dispatch_effective_order_completion_events event
         WHERE event.order_kind = 'SO'
           AND event.completion_evidence_type IN ('driver_job', 'manual_dispatch')
           AND (

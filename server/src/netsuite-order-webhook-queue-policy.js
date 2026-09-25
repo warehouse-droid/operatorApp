@@ -96,9 +96,10 @@ export function compareNetSuiteWebhookVersions(left = {}, right = {}) {
   const leftTime = Date.parse(left.sourceModifiedAt || "") || 0;
   const rightTime = Date.parse(right.sourceModifiedAt || "") || 0;
   if (leftTime !== rightTime) return leftTime < rightTime ? -1 : 1;
-  const leftHash = text(left.payloadHash);
-  const rightHash = text(right.payloadHash);
-  return leftHash === rightHash ? 0 : leftHash < rightHash ? -1 : 1;
+  // NetSuite may report modification times only to the minute. Content hashes
+  // identify duplicates; their lexical order says nothing about edit chronology.
+  // Equal source versions are accepted in serialized inbox arrival order.
+  return 0;
 }
 
 export function webhookRetryDelayMs(attemptNumber) {

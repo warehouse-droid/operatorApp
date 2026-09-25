@@ -1,0 +1,68 @@
+--- a/src/co-operator-linked-supply.js
++++ /dev/null
+@@ -1,33 +0,0 @@
+-// @ts-check
+-import { applyOperatorLinkedQuantityProjection } from "./operator-linked-quantity-domain.js";
+-
+-/** @typedef {"quantity" | "pallet_qty" | "layer_qty" | "section_qty" | "piece_qty"} QuantityField */
+-/** @type {ReadonlyArray<readonly [QuantityField, string]>} */
+-const QUANTITIES = Object.freeze([
+-  ["quantity", "sales"], ["pallet_qty", "pallets"], ["layer_qty", "layers"],
+-  ["section_qty", "sections"], ["piece_qty", "pieces"]
+-]);
+-
+-/**
+- * Canonical CO quantities already exclude direct TO supply. Restore the saved
+- * original only for the shared Operator projection, never for transport cargo.
+- * Loaded quantities describe actual cargo and cannot infer a supply allocation.
+- * @param {Record<string, any>} line
+- * @param {{loaded?: boolean}} options
+- */
+-export function projectCoOperatorLinkedSupply(line, options = {}) {
+-  const saved = line.raw?.coDirectToRequirement;
+-  if (options.loaded || !saved) {return line;}
+-  const residual = applyOperatorLinkedQuantityProjection(line);
+-  const original = applyOperatorLinkedQuantityProjection(Object.fromEntries(
+-    QUANTITIES.map(([field]) => [field, saved[field]])
+-  ));
+-  const required = { ...line };
+-  /** @type {Record<string, number>} */
+-  const linkedDirectTo = {};
+-  for (const [field, unit] of QUANTITIES) {
+-    required[field] = Math.max(original[field], residual[field]);
+-    linkedDirectTo[unit] = Number((required[field] - residual[field]).toFixed(6));
+-  }
+-  return applyOperatorLinkedQuantityProjection(required, { linkedDirectTo });
+-}
+--- a/src/delivery-repository.js
++++ b/src/delivery-repository.js
+@@ -17,7 +17,6 @@
+ import { assertNoClosedNetSuiteOrders, listClosedNetSuiteOrders } from "./netsuite-closed-order-repository.js";
+ import { getOperatorCustomerPickupPhotoRequirement } from "./operator-customer-pickup-photo-policy.js";
+ import { applyOperatorLinkedQuantityProjection } from "./operator-linked-quantity-domain.js";
+-import { projectCoOperatorLinkedSupply } from "./co-operator-linked-supply.js";
+ import {
+   ACTIVE_RELOAD_STATUSES,
+   getActiveReloadCycleForOrder,
+@@ -1416,11 +1415,11 @@
+ 
+ function mapLocalCoOrderForDelivery(co = {}, lines = []) {
+   const details = co.details && typeof co.details === "object" ? co.details : {};
+-  const loaded = isLocalCoLoaded(co);
+-  const mappedLines = lines.map(line => projectCoOperatorLinkedSupply(mapLocalCoLineForDelivery(line), { loaded }));
++  const mappedLines = lines.map(mapLocalCoLineForDelivery);
+   const releasedPacking = co.status === "pending_load" && !co.preparing_operator_id && !co.preparing_started_at
+     && mappedLines.some(line => line.confirmed_at && lineHasPackedQuantity(line));
+   const status = releasedPacking ? "packed" : String(co.status || "pending_load");
++  const loaded = isLocalCoLoaded(co);
+   const operatorStatus = loaded ? "loaded" : status === "packed" ? "packed" : status === "preparing" ? "preparing" : "open";
+   return {
+     local_co_id: co.id,
+@@ -4767,7 +4766,6 @@
+   const order = await claimLocalCoPreparingOrder(currentOrder, operatorId);
+   const line = (order.lines || []).find((item) => String(item.id) === String(lineId));
+   if (!line) throw new Error("Local CO line not found.");
+-  assertOperatorLinkedLineLoadable(line);
+   const available = remainingPackAvailability(line);
+   const valuesToApply = {
+     pallets: normalizeQuantity(values?.pallets) || 0,

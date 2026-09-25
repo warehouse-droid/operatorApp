@@ -130,6 +130,8 @@ function rowToCustomOrder(row = {}, corrections = []) {
     completedAt: row.completed_at || null,
     cancelledAt: row.cancelled_at || null,
     orderKind: row.order_kind || "custom",
+    sorReviewReason: row.sor_review_reason || "",
+    sorCustomer: row.sor_customer || "",
     systemManaged: Boolean(row.system_managed),
     parentSalesOrderId: row.parent_sales_order_id === null || row.parent_sales_order_id === undefined
       ? null
@@ -414,6 +416,8 @@ export function dispatchOrderFromCustomOrder(customOrder = {}) {
   const effectivePickupLocation = String(transitCo?.toYard || pickupLocation).trim();
   const ownYardPickup = ["3445", "2967", "12441", "150"].includes(effectivePickupLocation);
   const salesOrderReattempt = customOrder.orderKind === "sales_order_reattempt";
+  const sorRentalReturn = customOrder.orderKind === "sor_rental_return";
+  const hasItemSnapshot = salesOrderReattempt || sorRentalReturn;
   const genericItem = {
     lineRowId: `custom:${customOrder.id}`,
     lineId: 1,
@@ -431,8 +435,10 @@ export function dispatchOrderFromCustomOrder(customOrder = {}) {
     itemWeight: Number(customOrder.weightLbs || 0),
     lineWeight: Number(customOrder.weightLbs || 0)
   };
-  const items = salesOrderReattempt && Array.isArray(customOrder.lineSnapshot)
+  const items = hasItemSnapshot && Array.isArray(customOrder.lineSnapshot)
     ? customOrder.lineSnapshot.map((line, index) => ({
+        rentalEquipment: sorRentalReturn,
+        itemType: line.itemType || "",
         lineRowId: line.lineRowId || `reattempt:${customOrder.id}:${index}`,
         lineId: line.lineId ?? index + 1,
         itemId: line.itemId ?? null,
@@ -476,6 +482,14 @@ export function dispatchOrderFromCustomOrder(customOrder = {}) {
     customOrder: true,
     orderKind: customOrder.orderKind || "custom",
     salesOrderReattempt,
+    sorRentalReturn,
+    sorReviewReason: customOrder.sorReviewReason || "",
+    needsAddress: sorRentalReturn && !pickupLocation,
+    ...(sorRentalReturn && !pickupLocation ? {
+      dispatchPlanningRestricted: true,
+      dispatchPlanningRestrictionReason: 'Set the SOR customer address before assigning its return.'
+    } : {}),
+    eligible: !sorRentalReturn || customOrder.status === "open",
     parentSalesOrderId: customOrder.parentSalesOrderId || null,
     parentOrderRef: customOrder.parentOrderRef || "",
     reloadCycleId: customOrder.reloadCycleId || null,
@@ -485,7 +499,7 @@ export function dispatchOrderFromCustomOrder(customOrder = {}) {
     type: "CUSTOM",
     sourceTable: "dispatch_custom_orders",
     dispatchRef: customOrder.refNumber,
-    customer: salesOrderReattempt
+    customer: sorRentalReturn ? customOrder.sorCustomer || `SOR Return · ${customOrder.parentOrderRef}` : salesOrderReattempt
       ? `Sales Order re-attempt · ${customOrder.parentOrderRef || "linked parent"}`
       : "Custom Order",
     address: customOrder.dropoffLocation,
@@ -508,12 +522,12 @@ export function dispatchOrderFromCustomOrder(customOrder = {}) {
     transitOriginalSourceYard: transitCo ? pickupLocation : undefined,
     transitCo,
     dropoffs: [],
-    pallets: salesOrderReattempt ? Number(customOrder.palletQty || 0) : 0,
-    layers: salesOrderReattempt ? Number(customOrder.layerQty || 0) : 0,
-    sections: salesOrderReattempt ? Number(customOrder.sectionQty || 0) : 0,
-    pieces: salesOrderReattempt ? Number(customOrder.pieceQty || 0) : 0,
-    salesQty: salesOrderReattempt ? Number(customOrder.salesQty || 0) : 1,
-    salesQuantities: salesOrderReattempt ? salesQuantities : [{ unit: "LOAD", quantity: 1 }],
+    pallets: hasItemSnapshot ? Number(customOrder.palletQty || 0) : 0,
+    layers: hasItemSnapshot ? Number(customOrder.layerQty || 0) : 0,
+    sections: hasItemSnapshot ? Number(customOrder.sectionQty || 0) : 0,
+    pieces: hasItemSnapshot ? Number(customOrder.pieceQty || 0) : 0,
+    salesQty: hasItemSnapshot ? Number(customOrder.salesQty || 0) : 1,
+    salesQuantities: hasItemSnapshot ? salesQuantities : [{ unit: "LOAD", quantity: 1 }],
     packed: { pallets: 0, layers: 0, sections: 0, pieces: 0 },
     weight: Number(customOrder.weightLbs || 0),
     items,
@@ -534,7 +548,7 @@ export function dispatchOrderFromCustomOrder(customOrder = {}) {
       updated_at: customOrder.updatedAt
     },
     netsuiteStatus: customOrder.status,
-    netsuiteStatusText: salesOrderReattempt ? "Sales Order re-attempt" : "Custom Order",
+    netsuiteStatusText: sorRentalReturn ? "SOR rental return" : salesOrderReattempt ? "Sales Order re-attempt" : "Custom Order",
     fulfillmentStatus: "",
     netsuiteActive: true,
     operatorStatus: "",
@@ -675,6 +689,12 @@ function customStopError(customOrder, message, code = "DISPATCH_CUSTOM_ORDER_STR
 
 function canonicalizeCustomStops(plan = {}, customMappings = []) {
   const mappingsByAlias = new Map();
+  for (const mapping of customMappings) {
+    const order = mapping.customOrder;
+    if (mapping.assigned && order.orderKind === "sor_rental_return" && !String(order.pickupLocation || "").trim()) {
+      throw customStopError(order, "Set the SOR customer address before assigning its return.", "SOR_RETURN_ADDRESS_REQUIRED");
+    }
+  }
   for (const mapping of customMappings) {
     for (const alias of mapping.aliases) mappingsByAlias.set(normalizedRef(alias), mapping);
     mappingsByAlias.set(normalizedRef(mapping.customOrder.refNumber), mapping);

@@ -109,8 +109,10 @@ function recordStartedEpoch(record = {}) {
 }
 
 function recordActualArrivalEpoch(record = {}) {
-  return epochValue(recordValue(record, "actual_arrival_at", "actualArrivalAt"))
-    ?? recordStartedEpoch(record);
+  const arrival = epochValue(recordValue(record, "actual_arrival_at", "actualArrivalAt"));
+  if (arrival !== null) {return arrival;}
+  return recordValue(record, "actual_arrival_resolution_status", "actualArrivalResolutionStatus") === "unresolved"
+    ? null : recordStartedEpoch(record);
 }
 
 function recordCompletedEpoch(record = {}) {
@@ -219,15 +221,19 @@ function physicalVisitActuals(visit = {}, records = [], assignment = {}, load = 
   const allComplete = matched.length > 0 && matched.every((record) => recordStatus(record) === "complete");
   const completions = allComplete ? matched.map(recordCompletedEpoch).filter(Number.isFinite) : [];
   const derived = active.find((record) => recordValue(record, "actual_arrival_at", "actualArrivalAt"));
+  const unresolved = !derived && active.find((record) =>
+    recordValue(record, "actual_arrival_resolution_status", "actualArrivalResolutionStatus") === "unresolved"
+  );
   return {
-    actualStart: starts.length ? Math.min(...starts) : null,
+    actualStart: unresolved ? null : starts.length ? Math.min(...starts) : null,
     actualEnd: allComplete && completions.length === matched.length ? Math.max(...completions) : null,
     actualArrivalSource: derived
       ? text(recordValue(derived, "actual_arrival_source", "actualArrivalSource")) || "derived"
-      : active.length ? "pwa_started_at" : "",
+      : unresolved ? "unresolved" : active.length ? "pwa_started_at" : "",
     actualArrivalConfidence: derived
       ? text(recordValue(derived, "actual_arrival_confidence", "actualArrivalConfidence"))
-      : active.length ? "explicit" : "",
+      : unresolved ? "unknown" : active.length ? "explicit" : "",
+    actualArrivalReason: unresolved ? text(recordValue(unresolved, "actual_arrival_error", "actualArrivalError")) : "",
     actualArrivalAlgorithmVersion: derived
       ? text(recordValue(derived, "actual_arrival_algorithm_version", "actualArrivalAlgorithmVersion"))
       : "",
@@ -753,6 +759,7 @@ function publicStop(row) {
     actualLeave: isoValue(row.actualEnd),
     actualArrivalSource: row.actualArrivalSource || "",
     actualArrivalConfidence: row.actualArrivalConfidence || "",
+    actualArrivalReason: row.actualArrivalReason || "",
     actualArrivalAlgorithmVersion: row.actualArrivalAlgorithmVersion || "",
     status: row.status,
     basis: row.basis

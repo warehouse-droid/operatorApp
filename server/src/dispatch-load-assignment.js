@@ -448,6 +448,7 @@ function dispatchItemHasQuantity(item = {}) {
 }
 
 function dispatchOperationalPickupItem(item = {}) {
+  if (item.rentalEquipment === true) { return true; }
   if (item.dispatchServiceFee === true) return false;
   if (item.isSpecial === true || item.salesQuantityOnly === true || Number(item.itemId ?? item.item_id) === 2055) return true;
   const label = `${item.sku || ""} ${item.itemName || item.item_name || ""}`.trim();
@@ -465,10 +466,10 @@ function dispatchPickupItemsForLocation(plan = {}, order = {}, location = "") {
   const poItems = dispatchPoPickupItemsForLocation(order, location);
   const ownYard = dispatchOwnYardLocationKeys(plan).has(normalizedYardLocationText(location));
   if (poItems.length && !ownYard) return poItems.filter(dispatchOperationalPickupItem).filter(dispatchItemHasQuantity);
-  return (order.items || [])
+  const sourceItems = (order.items || [])
     .filter(dispatchOperationalPickupItem)
-    .map((item) => dispatchItemForPickupLocation(plan, order, item, location))
-    .filter(dispatchItemHasQuantity);
+    .map((item) => dispatchItemForPickupLocation(plan, order, item, location));
+  return [...sourceItems, ...directItems].filter(dispatchOperationalPickupItem).filter(dispatchItemHasQuantity);
 }
 
 function dispatchPickupFootprintForOrderLocation(plan = {}, order = {}, location = "") {

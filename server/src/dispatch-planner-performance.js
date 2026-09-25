@@ -279,12 +279,11 @@ function stableValue(value) {
   if (value instanceof Date) {return value.toJSON();}
   if (Array.isArray(value)) {return value.map(stableValue);}
   if (!value || typeof value !== "object") {return value;}
-  return Object.fromEntries(
-    Object.entries(value)
-      .filter(([, candidate]) => candidate !== undefined)
-      .sort(([left], [right]) => left.localeCompare(right))
-      .map(([key, candidate]) => [key, stableValue(candidate)])
-  );
+  const ordered = Object.create(null);
+  for (const key of Object.keys(value).sort((left, right) => left.localeCompare(right))) {
+    if (value[key] !== undefined) {ordered[key] = stableValue(value[key]);}
+  }
+  return ordered;
 }
 
 function stableJson(value) {
@@ -306,24 +305,25 @@ function boardOrderRefs(plan = {}) {
 }
 
 function planWithoutVolatileFields(plan = {}) {
-  const compact = buildCompactDispatchSnapshot(plan);
+  const refs = compactOrderRefs(plan);
   return {
-    id: text(compact.id || compact.planId),
-    planDate: text(compact.planDate).slice(0, 10),
-    status: compact.status,
-    note: compact.note,
-    orders: compact.orders || [],
-    trucks: compact.trucks || [],
-    summary: compact.summary || {}
+    id: text(plan.id || plan.planId),
+    planDate: text(plan.planDate).slice(0, 10),
+    status: plan.status,
+    note: plan.note,
+    orders: (plan.orders || []).filter(order => refs.has(orderRef(order))),
+    trucks: plan.trucks || [],
+    summary: plan.summary || {}
   };
 }
 
 export function buildCompactDispatchSnapshot(plan = {}) {
   const refs = compactOrderRefs(plan);
+  const { orders, trucks, ...metadata } = plan;
   return {
-    ...clone(plan),
-    orders: (plan.orders || []).filter((order) => refs.has(orderRef(order))).map(clone),
-    trucks: (plan.trucks || []).map(clone)
+    ...clone(metadata),
+    orders: (orders || []).filter((order) => refs.has(orderRef(order))).map(clone),
+    trucks: (trucks || []).map(clone)
   };
 }
 
@@ -496,6 +496,9 @@ function splitOrder(plan, payload = {}) {
   const sourceRef = text(payload.sourceOrderRef || payload.orderRef);
   const source = (plan.orders || []).find((order) => orderRef(order) === sourceRef);
   if (!source) {throw commandError("The source order no longer exists.", "DISPATCH_ORDER_NOT_FOUND", 404);}
+  if (source.childOrders?.length) {
+    throw commandError("Ungroup first, then split the child order.", "DISPATCH_GROUP_SPLIT_UNSUPPORTED", 409);
+  }
   const requestedParts = Array.isArray(payload.parts) && payload.parts.length ? payload.parts : [{}, {}];
   const parts = requestedParts.map((part, index) => {
     const refNumber = text(part.refNumber || part.orderRef) || `${sourceRef}-S${index + 1}`;
@@ -627,7 +630,35 @@ function commandPatch(plan, command = {}) {
   }
 }
 
-export function applyDispatchPlanCommand({ plan = {}, command = {}, receiptStore = createDispatchCommandReceiptStore() } = {}) {
+export function assertDispatchPlanFence(plan, { baseRevision, baseDigest } = {}, { required = false, computedDigest } = {}) {
+  const currentRevision = Number(plan.revision || 0);
+  // A database caller may reuse the hash it just computed from its locked raw
+  // row. Never pass the cached plan_digest column or an enriched read here.
+  const currentDigest = computedDigest ?? digestDispatchPlan(plan);
+  const details = { expectedRevision: Number(baseRevision), currentRevision, expectedDigest: text(baseDigest), currentDigest };
+  if (required && (baseRevision === null || baseRevision === undefined || baseRevision === '' || !Number.isFinite(Number(baseRevision)) || !text(baseDigest))) {
+    throw commandError('Refresh the saved plan before retrying. Keep your unsaved draft for recovery.', 'DISPATCH_PLAN_FENCE_REQUIRED', 409, { ...details, conflictReason: 'missing_fence' });
+  }
+  if (baseRevision !== null && baseRevision !== undefined && baseRevision !== '' && Number(baseRevision) !== currentRevision) {
+    throw commandError('A newer version of this plan has been saved. Your draft has not been applied.', 'STALE_DISPATCH_PLAN', 409, { ...details, conflictReason: 'revision' });
+  }
+  if (text(baseDigest) && text(baseDigest) !== currentDigest) {
+    throw commandError('The saved plan content has changed. Your draft has not been applied.', 'STALE_DISPATCH_PLAN', 409, { ...details, conflictReason: 'persisted_content' });
+  }
+  return { revision: currentRevision, digest: currentDigest };
+}
+
+// Pure transformation shared by the in-memory and database command wrappers.
+// Each wrapper validates its persisted fence and owns its receipt transaction.
+export function applyDispatchPlanMutation({ plan = {}, command = {} } = {}) {
+  const replacesBoard = text(command.type || command.commandType) === 'replace_plan' && !command.payload?.planDelta;
+  const nextPlan = clone(replacesBoard ? { ...plan, orders: [], trucks: [], summary: {} } : plan);
+  const patch = commandPatch(nextPlan, command);
+  nextPlan.revision = Number(plan.revision || 0) + 1;
+  return { plan: nextPlan, patch };
+}
+
+export function applyDispatchPlanCommand({ plan = {}, persistedPlan = plan, command = {}, receiptStore = createDispatchCommandReceiptStore() } = {}) {
   const commandId = text(command.commandId);
   if (!commandId) {throw commandError("A command ID is required.", "DISPATCH_COMMAND_INVALID", 400);}
   const bodyDigest = crypto.createHash("sha256").update(stableJson({
@@ -643,23 +674,8 @@ export function applyDispatchPlanCommand({ plan = {}, command = {}, receiptStore
     }
     return { ...clone(stored.result), replay: true };
   }
-  const currentRevision = Number(plan.revision || 0);
-  if (Number(command.baseRevision) !== currentRevision) {
-    throw commandError("Dispatch plan changed before this command was applied.", "STALE_DISPATCH_PLAN", 409, {
-      expectedRevision: Number(command.baseRevision),
-      currentRevision
-    });
-  }
-  const currentDigest = digestDispatchPlan(plan);
-  if (text(command.baseDigest) && text(command.baseDigest) !== currentDigest) {
-    throw commandError("Dispatch plan content changed before this command was applied.", "STALE_DISPATCH_PLAN", 409, {
-      expectedDigest: text(command.baseDigest),
-      currentDigest
-    });
-  }
-  const nextPlan = clone(plan);
-  const patch = commandPatch(nextPlan, command);
-  nextPlan.revision = currentRevision + 1;
+  assertDispatchPlanFence(persistedPlan, { ...command, baseRevision: Number(command.baseRevision) });
+  const { plan: nextPlan, patch } = applyDispatchPlanMutation({ plan, command });
   const digest = digestDispatchPlan(nextPlan);
   const acknowledgement = { commandId, revision: nextPlan.revision, digest, patch: clone(patch) };
   const result = {

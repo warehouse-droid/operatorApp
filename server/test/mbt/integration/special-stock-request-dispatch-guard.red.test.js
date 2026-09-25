@@ -48,10 +48,11 @@ test("Dispatch save and restore require a route and Via Yard receipt without wea
       await query("INSERT INTO dispatch_trucks (plate, active) VALUES ($1,true)", [truckPlate]);
       const special = await createSpecialStockCase({
         storeLocationId: 15,
+      fulfillmentMethod: "yard_pickup",
         inquiryDate: "2099-11-01",
         customerName: "Special Plan Customer",
         vendorName: "Special Plan Vendor",
-        lines: [{ productName: "Special Plan Item", quantity: 1, uom: "PLT", requiredDate: "2099-11-04" }]
+        lines: [{ productName: "Special Plan Item", quantity: 1, uom: "PLT", rate: 120, requiredDate: "2099-11-04" }]
       }, { operatorId: salesId, authorizedStoreLocationIds: [15] });
       const remoteSeed = 700_000_000 + Number.parseInt(suffix.slice(0, 6), 16);
       const salesOrderId = remoteSeed;
@@ -95,6 +96,12 @@ test("Dispatch save and restore require a route and Via Yard receipt without wea
         "UPDATE sales_special_stock_handoffs SET route = 'via_yard', status = 'ready' WHERE request_id = $1",
         [special.id]
       );
+      await query("UPDATE sales_special_stock_lines SET sales_decision='accepted', supply_status='production' WHERE request_id=$1", [special.id]);
+      for (const waitingRef of [soRef, poRef]) {
+        const waiting = candidatePlan({ planId:plan.id, planDate, soRef:waitingRef, driverLogin, truckPlate });
+        await assert.rejects(() => saveDispatchPlanSnapshot(plan.id, { ...waiting, baseRevision:plan.revision }), error => error?.code === 'SPECIAL_STOCK_NOT_READY');
+      }
+      await query("UPDATE sales_special_stock_lines SET supply_status='in_stock' WHERE request_id=$1", [special.id]);
       await assert.rejects(
         () => saveDispatchPlanSnapshot(plan.id, { ...candidate, baseRevision: plan.revision }),
         (error) => error?.code === "SPECIAL_PLAN_PO_RECEIPT_REQUIRED"
@@ -105,6 +112,9 @@ test("Dispatch save and restore require a route and Via Yard receipt without wea
           WHERE netsuite_id = $1`,
         [purchaseOrderId]
       );
+      await query("UPDATE sales_special_stock_cases SET quantity_review='{\"status\":\"pending\"}'::jsonb WHERE request_id=$1",[special.id]);
+      await assert.rejects(() => saveDispatchPlanSnapshot(plan.id, { ...candidate, baseRevision: plan.revision }), error => error?.code === 'SPECIAL_QUANTITY_REVIEW_REQUIRED');
+      await query("UPDATE sales_special_stock_cases SET quantity_review='{}'::jsonb WHERE request_id=$1",[special.id]);
       const assigned = await saveDispatchPlanSnapshot(plan.id, { ...candidate, baseRevision: plan.revision });
       assert.equal(assigned.trucks[0].loads[0].stops[0].orderId, soRef);
 

@@ -1,6 +1,9 @@
 import crypto from "node:crypto";
+import { applyPendingDispatchPlanMaintenance } from "./dispatch-plan-maintenance.js";
 
 import { query, withTransaction } from "./db.js";
+import { persistedDispatchPlan } from './dispatch-plan-fence.js';
+import { lockDispatchPlanEditLease, assertDispatchPlanEditLease } from './dispatch-plan-lease-repository.js';
 import { assertSalesDeliveryPlanningAllowed, fulfilledSalesDeliveryPlanningRefs } from "./dispatch-fulfilled-so-repository.js";
 import { canonicalizeDispatchCoGroupIdentities } from "./dispatch-co-group-identity.js";
 import {
@@ -18,7 +21,8 @@ import { materializeDispatchPickupVisits } from "./dispatch-pickup-visits.js";
 import {
   dispatchPlannedAssignmentMap,
   dispatchPlanV2Summary,
-  refreshDispatchPlanAuthoritativeOrderProjection
+  refreshDispatchPlanAuthoritativeOrderProjection,
+  scrubBilledSalesOrderFamiliesFromPlan
 } from "./dispatch-plan-repository.js";
 import {
   applyDispatchPlanDelta,
@@ -36,9 +40,9 @@ import {
 } from "./netsuite-closed-order-repository.js";
 import { operationalPlanOrderRefs } from "./netsuite-closed-order-policy.js";
 import {
-  applyDispatchPlanCommand,
+  applyDispatchPlanMutation,
+  assertDispatchPlanFence,
   buildCompactDispatchSnapshot,
-  createDispatchCommandReceiptStore,
   digestDispatchPlan,
   dispatchPlanBoard,
   evaluateExecutedPrefixPolicy
@@ -85,12 +89,11 @@ function snapshotMarkerTimestamp(row = {}) {
 function stableValue(value) {
   if (Array.isArray(value)) {return value.map(stableValue);}
   if (!value || typeof value !== "object") {return value;}
-  return Object.fromEntries(
-    Object.entries(value)
-      .filter(([, candidate]) => candidate !== undefined)
-      .sort(([left], [right]) => left.localeCompare(right))
-      .map(([key, candidate]) => [key, stableValue(candidate)])
-  );
+  const ordered = Object.create(null);
+  for (const key of Object.keys(value).sort((left, right) => left.localeCompare(right))) {
+    if (value[key] !== undefined) {ordered[key] = stableValue(value[key]);}
+  }
+  return ordered;
 }
 
 function requestHash(command = {}) {
@@ -112,6 +115,7 @@ function commandError(message, code, status = 409, details = {}) {
 function rowPlan(row = {}) {
   const summary = row.summary && typeof row.summary === "object" ? row.summary : {};
   return canonicalizeDispatchCoGroupIdentities({
+    digest: persistedDispatchPlan(row).digest,
     id: text(row.id || row.plan_id),
     planId: text(row.id || row.plan_id),
     planDate: planDate(row.plan_date),
@@ -163,7 +167,7 @@ function slimAssignedOrder(order = {}) {
 
 function publicPlan(plan = {}) {
   const compact = buildCompactDispatchSnapshot(plan);
-  const digest = digestDispatchPlan(plan);
+  const digest = plan.digest || digestDispatchPlan(plan);
   return {
     exists: true,
     id: text(plan.id || plan.planId),
@@ -186,7 +190,7 @@ async function reconcileCancelledLocalCos(plan, options = {}) {
   return reconcileDispatchPlanLocalCos(await reconcileDispatchPlanGlobalOrderDefinitions(plan, options));
 }
 
-async function syncDispatchPlanLoadProjection(plan = {}) {
+export async function syncDispatchPlanLoadProjection(plan = {}) {
   // The load projection depends on Driver route materialization, whose module
   // already participates in the Dispatch repository graph. Resolve it only at
   // operation time so V2 commands can keep both assignment projections in the
@@ -195,7 +199,7 @@ async function syncDispatchPlanLoadProjection(plan = {}) {
   return syncDispatchPlanLoadAssignments(plan, { allowBin: true });
 }
 
-async function selectPlan({ planId = "", date = "", lock = false } = {}) {
+async function selectPlan({ planId = "", date = "", lock = false, enrich = true } = {}) {
   const cleanId = text(planId);
   const cleanDate = planDate(date);
   const params = [];
@@ -221,6 +225,7 @@ async function selectPlan({ planId = "", date = "", lock = false } = {}) {
     params
   );
   if (!result.rows[0]) {return null;}
+  if (!enrich) {return persistedDispatchPlan(result.rows[0]);}
   const reconciled = await reconcileCancelledLocalCos(rowPlan(result.rows[0]));
   return (await scrubClosedNetSuiteOrdersFromOperationalPlan(reconciled)).plan;
 }
@@ -331,9 +336,9 @@ export async function repairDispatchV2SummaryMarkers({
   });
 }
 
-async function existingReceipt(commandId, hash) {
+async function existingReceipt(commandId, hash, planId = '') {
   const result = await query(
-    `SELECT command_id, request_hash, result
+    `SELECT command_id, plan_id, request_hash, result
        FROM dispatch_plan_commands
       WHERE command_id = $1
       LIMIT 1`,
@@ -341,7 +346,7 @@ async function existingReceipt(commandId, hash) {
   );
   const row = result.rows[0];
   if (!row) {return null;}
-  if (row.request_hash !== hash) {
+  if (row.request_hash !== hash || (planId && String(row.plan_id) !== String(planId))) {
     throw commandError(
       "This command ID was already used for a different change.",
       "DISPATCH_COMMAND_ID_REUSED",
@@ -351,10 +356,10 @@ async function existingReceipt(commandId, hash) {
   return row.result;
 }
 
-export async function getDispatchV2CommandReplay({ command = {} } = {}) {
+export async function getDispatchV2CommandReplay({ command = {}, planId = '' } = {}) {
   const commandId = text(command.commandId);
   if (!commandId) {return null;}
-  const payload = await existingReceipt(commandId, requestHash(command));
+  const payload = await existingReceipt(commandId, requestHash(command), planId);
   if (!payload) {return null;}
   if (payload.receipt?.compact === true && !payload.plan) {
     const plan = await selectPlan({ planId: payload.receipt.planId });
@@ -914,7 +919,7 @@ async function recordDispatchCommandCheckpointState(previousPlan = {}, nextPlan 
   );
 }
 
-export async function applyDispatchV2Command({ planId, command = {}, actorId = null } = {}) {
+export async function applyDispatchV2Command({ planId, command = {}, actorId = null, editLease = null } = {}) {
   const commandId = text(command.commandId);
   const commandType = text(command.commandType || command.type);
   if (!commandId || !commandType || !Number.isFinite(Number(command.baseRevision))) {
@@ -924,17 +929,21 @@ export async function applyDispatchV2Command({ planId, command = {}, actorId = n
   let deferredAssignmentError = null;
   const transactionResult = await withTransaction(async () => {
     await query("SELECT pg_advisory_xact_lock(hashtext($1))", [DISPATCH_FLEET_PLANNING_LOCK]);
-    const plan = await selectPlan({ planId, lock: true });
-    if (!plan) {throw commandError("Dispatch plan not found.", "DISPATCH_PLAN_NOT_FOUND", 404);}
-    const replay = await existingReceipt(commandId, hash);
+    await lockDispatchPlanEditLease(editLease);
+    const persistedPlan = await selectPlan({ planId, lock: true, enrich: false });
+    if (!persistedPlan) {throw commandError("Dispatch plan not found.", "DISPATCH_PLAN_NOT_FOUND", 404);}
+    if (editLease && planDate(editLease.planDate) !== persistedPlan.planDate) {throw commandError('Edit lease belongs to a different plan date.', 'DISPATCH_PLAN_EDIT_LEASE_REQUIRED');}
+    const replay = await existingReceipt(commandId, hash, planId);
     if (replay) {
       return {
         payload: replay.receipt?.compact === true && !replay.plan
-          ? { ...replay, plan: publicPlan(plan) }
+          ? { ...replay, plan: publicPlan(persistedPlan) }
           : replay,
         replay: true
       };
     }
+    assertDispatchPlanFence(persistedPlan, command, { required: Boolean(editLease), computedDigest: persistedPlan.digest });
+    const plan = (await scrubClosedNetSuiteOrdersFromOperationalPlan(await reconcileCancelledLocalCos(persistedPlan))).plan;
     await assertNoClosedNetSuiteOrders(commandOrderRefs({ ...command, commandType }, plan), "be changed in Dispatch");
     try {
       await assertAssignmentDateAvailable(plan, { ...command, commandType });
@@ -948,10 +957,9 @@ export async function applyDispatchV2Command({ planId, command = {}, actorId = n
       }
       throw error;
     }
-    const result = applyDispatchPlanCommand({
+    const result = applyDispatchPlanMutation({
       plan,
-      command: { ...command, type: commandType },
-      receiptStore: createDispatchCommandReceiptStore()
+      command: { ...command, type: commandType }
     });
     const commandReactivatedRefs = [
       ...(Array.isArray(command.payload?.reactivatedGlobalOrderRefs)
@@ -968,6 +976,8 @@ export async function applyDispatchV2Command({ planId, command = {}, actorId = n
       reactivatedGlobalOrderRefs: commandReactivatedRefs,
       rejectRetiredGlobalOrderRefs: true
     });
+    result.plan = await applyPendingDispatchPlanMaintenance(result.plan);
+    result.plan = await scrubBilledSalesOrderFamiliesFromPlan(result.plan);
     // Global definitions can replace hydrated group lines with raw allocation
     // quantities. Refresh relationships after that replacement, just as a full
     // save does, before deciding which physical pickups are actually required.
@@ -995,7 +1005,7 @@ export async function applyDispatchV2Command({ planId, command = {}, actorId = n
     }
     await assertActiveDispatchCosForPlan(result.plan);
     if (plan.savedAt && command.compactReceipt !== true) {
-      const previousCounts = snapshotCounts(plan);
+      const previousCounts = snapshotCounts(persistedPlan);
       await query(
         `INSERT INTO dispatch_plan_snapshot_history (
            plan_id, plan_date, revision, orders, trucks, summary,
@@ -1010,13 +1020,13 @@ export async function applyDispatchV2Command({ planId, command = {}, actorId = n
           plan.id,
           plan.planDate,
           plan.revision,
-          JSON.stringify(plan.orders || []),
-          JSON.stringify(plan.trucks || []),
-          JSON.stringify(plan.summary || {}),
+          JSON.stringify(persistedPlan.orders || []),
+          JSON.stringify(persistedPlan.trucks || []),
+          JSON.stringify(persistedPlan.summary || {}),
           plan.savedAt,
           text(command.sessionId),
           SNAPSHOT_SCHEMA_VERSION,
-          digestDispatchPlan(plan),
+          persistedPlan.digest,
           previousCounts.orderCount,
           previousCounts.truckCount,
           previousCounts.loadCount,
@@ -1039,6 +1049,7 @@ export async function applyDispatchV2Command({ planId, command = {}, actorId = n
     result.plan.revision = Number(updated.rows[0].revision);
     result.plan.savedAt = updated.rows[0].updated_at;
     const digest = digestDispatchPlan(result.plan);
+    result.plan.digest = digest;
     const counts = snapshotCounts(result.plan);
     await query(
       `UPDATE dispatch_plan_snapshots
@@ -1098,8 +1109,9 @@ export async function applyDispatchV2Command({ planId, command = {}, actorId = n
     const payload = {
       plan: publicPlan(result.plan),
       patch: result.patch,
-      acknowledgement: { ...result.acknowledgement, revision: result.plan.revision, digest }
+      acknowledgement: { commandId, revision: result.plan.revision, digest, patch: result.patch }
     };
+    if (editLease) {await assertDispatchPlanEditLease(editLease);}
     const storedPayload = command.compactReceipt === true
       ? {
           patch: payload.patch,
@@ -1169,7 +1181,8 @@ export async function createDispatchV2Checkpoint({
   sessionId = "",
   checkpointKey = "",
   expectedRevision = null,
-  expectedDigest = ""
+  expectedDigest = "",
+  editLease = null
 } = {}) {
   const checkpointKind = text(kind).toLowerCase();
   if (!["periodic", "manual", "lifecycle"].includes(checkpointKind)) {
@@ -1179,6 +1192,7 @@ export async function createDispatchV2Checkpoint({
   const cleanReason = text(reason).replace(/[^a-z0-9_-]+/giu, "_").slice(0, 80) || checkpointKind;
   return withTransaction(async () => {
     await query("SELECT pg_advisory_xact_lock(hashtext($1))", [DISPATCH_FLEET_PLANNING_LOCK]);
+    await lockDispatchPlanEditLease(editLease);
     if (cleanKey) {
       const existing = await query(
         `SELECT id::text, plan_id::text, plan_date::text, revision, archived_at,
@@ -1193,7 +1207,7 @@ export async function createDispatchV2Checkpoint({
       );
       if (existing.rows[0]) {return { ...checkpointResult(existing.rows[0]), replay: true };}
     }
-    const plan = await selectPlan({ planId, lock: true });
+    const plan = await selectPlan({ planId, lock: true, enrich: false });
     if (!plan) {throw commandError("Dispatch plan not found.", "DISPATCH_PLAN_NOT_FOUND", 404);}
     const revision = Number(plan.revision || 0);
     const digest = digestDispatchPlan(plan);

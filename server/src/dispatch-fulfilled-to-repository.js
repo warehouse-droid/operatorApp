@@ -21,7 +21,7 @@ export async function listFulfilledTransferStates(candidateRefs = []) {
     (SELECT count(*) FROM transfer_orders duplicate WHERE lower(btrim(duplicate.tranid))=lower(btrim(candidate.tranid))) AS identity_count,
     (SELECT count(*) FROM transfer_orders duplicate WHERE lower(btrim(duplicate.tranid))=lower(btrim(source_order.tranid))) AS source_identity_count,
     ${netSuiteClosedOrderFamilySql("candidate", "TO")} AS family_closed,
-    (EXISTS (SELECT 1 FROM dispatch_order_completion_events completion WHERE completion.order_kind='TO'
+    (EXISTS (SELECT 1 FROM dispatch_effective_order_completion_events completion WHERE completion.order_kind='TO'
       AND lower(btrim(completion.order_ref)) IN (lower(btrim(candidate.tranid)),lower(btrim(source_order.tranid)))
       AND completion.completion_evidence_type IN ('driver_job','manual_dispatch','direct_dependency'))) AS operationally_completed,
     (EXISTS (SELECT 1 FROM unnest(ARRAY[candidate.outbound_operator_status,candidate.local_yard_order_status,

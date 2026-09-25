@@ -62,16 +62,14 @@ export async function enqueueNetSuiteOrderWebhook({ payload = {}, rawBody = "" }
         WHERE entity_key = $1
           AND status IN ('queued', 'running', 'succeeded', 'failed')
         ORDER BY COALESCE(source_modified_at, '-infinity'::timestamptz) DESC,
-                 payload_hash DESC, received_at DESC, id DESC
+                 id DESC
         LIMIT 1
         FOR UPDATE`,
       [envelope.entityKey]
     );
     const latestRow = latest.rows[0] || null;
-    // When NetSuite omits its modification timestamp, receipt order is the
-    // only trustworthy ordering signal. Never discard the newly received
-    // full snapshot merely because its content hash sorts before an older
-    // snapshot's hash; hashes provide identity, not chronology.
+    // The entity lock serializes insertion. Equal or absent modification times
+    // use that arrival order; the hash is only used for duplicate identity.
     const superseded = latestRow && envelope.sourceModifiedAt
       ? compareNetSuiteWebhookVersions(envelope, versionOfRow(latestRow)) < 0
       : false;
@@ -119,10 +117,10 @@ export async function enqueueNetSuiteOrderWebhook({ payload = {}, rawBody = "" }
               OR COALESCE(source_modified_at, '-infinity'::timestamptz) < $3::timestamptz
               OR (
                 COALESCE(source_modified_at, '-infinity'::timestamptz) = $3::timestamptz
-                AND payload_hash < $4
+                AND id < $2
               )
             )`,
-        [envelope.entityKey, row.id, envelope.sourceModifiedAt, envelope.payloadHash]
+        [envelope.entityKey, row.id, envelope.sourceModifiedAt]
       );
       coalesced = replaced.rowCount;
     }

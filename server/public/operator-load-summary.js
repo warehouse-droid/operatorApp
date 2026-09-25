@@ -10,13 +10,14 @@
   function salesUnit(line) {
     return line.unit || "Qty";
   }
+  const displayUnit = (value) => root.MBBS_I18N?.unit(value) ?? value;
   function format(line) {
     if (converted(line)) {
       const values = units.filter((unit) => number(line[unit[0]]) > 0.000001)
-        .map((unit) => `${display(line[unit[0]])} ${unit[2]}`);
+        .map((unit) => `${display(line[unit[0]])} ${displayUnit(unit[2])}`);
       if (values.length) return values.join(" ");
     }
-    return number(line.packed_sales_qty) > 0.000001 ? `${display(line.packed_sales_qty)} ${salesUnit(line)}` : "";
+    return number(line.packed_sales_qty) > 0.000001 ? `${display(line.packed_sales_qty)} ${displayUnit(salesUnit(line))}` : "";
   }
   function rows(lines) {
     const groups = new Map();

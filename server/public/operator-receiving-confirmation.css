@@ -1,0 +1,39 @@
+.receiving-confirmation-dialog {
+  width: min(540px, calc(100vw - 32px));
+  max-height: calc(100dvh - 40px);
+  box-sizing: border-box;
+  overflow: auto;
+  padding: 24px;
+  border: 1px solid #cbd5e1;
+  border-radius: 12px;
+  color: #172b3a;
+  background: #fff;
+  box-shadow: 0 18px 60px rgb(0 0 0 / 30%);
+}
+
+.receiving-confirmation-dialog::backdrop {
+  background: rgb(3 12 18 / 65%);
+}
+
+.receiving-confirmation-dialog h2 {
+  margin-top: 0;
+}
+
+.receiving-confirmation-dialog p,
+.receiving-confirmation-dialog li {
+  line-height: 1.5;
+}
+
+.receiving-confirmation-dialog ul {
+  max-height: 25dvh;
+  overflow: auto;
+  padding-left: 24px;
+}
+
+.receiving-confirmation-actions {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: flex-end;
+  gap: 12px;
+  margin-top: 24px;
+}

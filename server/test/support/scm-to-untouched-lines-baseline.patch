@@ -1,0 +1,112 @@
+--- scm-dependency-preview-service.js
++++ scm-dependency-preview-service.js
+@@ -1,5 +1,4 @@
+ import { query } from "./db.js";
+-import { lockConsolidatedLoadOrders } from "./consolidation-load-locks.js";
+ import { getDispatchPlan } from "./dispatch-plan-repository.js";
+ import { resolveDispatchSalesTarget } from "./dispatch-order-target-repository.js";
+ import { listClosedNetSuiteOrders } from "./netsuite-closed-order-repository.js";
+@@ -66,75 +65,33 @@
+     .filter(Boolean))];
+ }
+ 
+-// Match createOrderDependency's key-first, legacy-ID fallback exactly. Only a
+-// fully resolved explicit selection can narrow the existing whole-order guard.
+-function selectedSalesLineIds(action, allocations, lines) {
+-  if (action !== "link_to" || !Array.isArray(allocations) || !allocations.length) {return null;}
+-  const byKey = new Map(lines.map((line) => [line.targetLineKey, line]));
+-  const selected = allocations.map((allocation) => (
+-    byKey.get(text(allocation?.targetLineKey))
+-    || lines.find((line) => Number(line.salesLineId) === Number(allocation?.salesLineId))
+-  ));
+-  if (selected.some((line) => !line || !Number.isSafeInteger(line.salesLineId) || line.salesLineId <= 0)) {return null;}
+-  return [...new Set(selected.map((line) => line.salesLineId))];
+-}
+-
+-function salesStatusBlocks(value, salesLineIds) {
+-  // Packed/confirmed summarize other lines too; preparation and execution do not.
+-  return activeWorkStatus(value)
+-    && !(salesLineIds && ["confirmed", "packed"].includes(text(value).toLowerCase()));
+-}
+-
+-async function lockDependencyOperatorOrders(salesRefs, transferRefs) {
+-  const orders = await query(
+-    `SELECT netsuite_id FROM sales_orders WHERE tranid = ANY($1::text[])
+-     UNION SELECT netsuite_id FROM transfer_orders WHERE tranid = ANY($2::text[])`,
+-    [salesRefs, transferRefs]
+-  );
+-  await lockConsolidatedLoadOrders(orders.rows.map((row) => row.netsuite_id));
+-  // Advisory locks serialize normal Operator mutations. Row locks also fence
+-  // direct canonical-row writers until the dependency transaction commits.
+-  for (const [header, lineTable, parent, refs] of [
+-    ["sales_orders", "sales_order_lines", "sales_order_id", salesRefs],
+-    ["transfer_orders", "transfer_order_lines", "transfer_order_id", transferRefs]
+-  ]) {
+-    await query(`SELECT netsuite_id FROM ${header} WHERE tranid = ANY($1::text[])
+-      ORDER BY netsuite_id FOR UPDATE`, [refs]);
+-    await query(`SELECT line.id FROM ${lineTable} line JOIN ${header} header ON header.netsuite_id = line.${parent}
+-      WHERE header.tranid = ANY($1::text[]) ORDER BY line.id FOR UPDATE OF line`, [refs]);
+-  }
+-}
+-
+-async function operatorActivityRefs({ salesRefs = [], transferRefs = [], salesLineIds = null } = {}) {
++async function operatorActivityRefs({ salesRefs = [], transferRefs = [] } = {}) {
+   const refs = [];
+   if (salesRefs.length) {
+     const sales = await query(
+       `SELECT DISTINCT sales.tranid AS ref, sales.operator_status,
+               sales.local_yard_order_status, sales.preparing_operator_id,
+               sales.preparing_started_at,
+-              bool_or(COALESCE(line.loaded_qty, 0) > 0) AS order_loaded,
+-              bool_or(($2::bigint[] IS NULL OR line.id = ANY($2::bigint[])) AND (
++              bool_or(
+                 COALESCE(line.confirmed, false)
+-                OR ($2::bigint[] IS NOT NULL AND line.confirmed_at IS NOT NULL)
+                 OR COALESCE(line.packed_pallet_qty, 0) > 0
+                 OR COALESCE(line.packed_layer_qty, 0) > 0
+                 OR COALESCE(line.packed_section_qty, 0) > 0
+                 OR COALESCE(line.packed_piece_qty, 0) > 0
+                 OR COALESCE(line.packed_sales_qty, 0) > 0
+                 OR COALESCE(line.loaded_qty, 0) > 0
+-              )) AS line_started
++              ) AS line_started
+          FROM sales_orders sales
+          LEFT JOIN sales_order_lines line ON line.sales_order_id = sales.netsuite_id
+         WHERE sales.tranid = ANY($1::text[])
+         GROUP BY sales.netsuite_id`,
+-      [salesRefs, salesLineIds]
++      [salesRefs]
+     );
+     refs.push(...sales.rows.filter((row) => (
+       text(row.preparing_operator_id)
+       || row.preparing_started_at
+-      || salesStatusBlocks(row.operator_status, salesLineIds)
+-      || salesStatusBlocks(row.local_yard_order_status, salesLineIds)
+-      || row.order_loaded === true
++      || activeWorkStatus(row.operator_status)
++      || activeWorkStatus(row.local_yard_order_status)
+       || row.line_started === true
+     )).map((row) => text(row.ref)));
+   }
+@@ -371,10 +328,8 @@
+   const planId = Number(resolved.target.planId || relation.dependency?.planned_plan_id) || null;
+   if (lock && planId) {await query("SELECT id FROM dispatch_plans WHERE id = $1 FOR UPDATE", [planId]);}
+   const plan = planId ? await getDispatchPlan(planId) : null;
+-  const salesLineIds = selectedSalesLineIds(action, payload.allocations, resolved.lines);
+   const memberRefs = [...new Set([
+     resolved.target.ref,
+-    ...(salesLineIds ? resolved.lines.map((line) => line.sourceOrderRef) : []),
+     ...(resolved.target.memberRefs || []),
+     relation.dependency?.sales_order_ref,
+     relation.poAllocation?.sales_order_ref
+@@ -391,9 +346,8 @@
+   // Preview often runs under the command transaction's row/advisory locks.
+   // Keep these reads sequential because pg clients do not support concurrent
+   // queries on the same transaction connection.
+-  if (lock && salesLineIds) {await lockDependencyOperatorOrders(memberRefs, guardedTransferRefs);}
+   const closed = await closedOrderRefs(guardedRefs);
+-  const operatorRefs = await operatorActivityRefs({ salesRefs: memberRefs, transferRefs: guardedTransferRefs, salesLineIds });
++  const operatorRefs = await operatorActivityRefs({ salesRefs: memberRefs, transferRefs: guardedTransferRefs });
+   const receivingRefs = await receivingActivityRefs({ purchaseRefs, transferRefs: guardedTransferRefs });
+   const executionIds = completedUnlink ? [] : await dependencyExecutionIds({ dependencyIds, transferRefs });
+   const jobIds = await driverActivity({ refs: guardedRefs });

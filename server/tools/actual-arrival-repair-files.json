@@ -1,0 +1,23 @@
+{
+  "production": [
+    "src/dispatch-actual-arrival-evidence.js",
+    "src/dispatch-actual-arrival-policy.js",
+    "src/dispatch-actual-arrival-repository.js",
+    "src/dispatch-actual-arrival-service.js",
+    "src/dispatch-forecast-service.js",
+    "src/driver-repository.js",
+    "public/dispatch.js",
+    "public/dispatch.html",
+    "tools/actual-arrival-backfill.mjs"
+  ],
+  "tests": [
+    "test/dispatch/integration/dispatch-actual-arrival-repair.test.js",
+    "test/dispatch/integration/dispatch-actual-arrival-backfill.test.js",
+    "test/dispatch/integration/dispatch-actual-arrival-repository.test.js",
+    "test/dispatch/unit/dispatch-actual-arrival-policy.test.js",
+    "test/dispatch/unit/dispatch-actual-arrival-service.test.js",
+    "test/dispatch/property/dispatch-actual-arrival-evidence.test.js",
+    "test/dispatch/frontend/dispatch-actual-arrival-repair.test.js",
+    "test/dispatch/frontend/dispatch-actual-arrival-ui.contract.test.js"
+  ]
+}

@@ -1,0 +1,36 @@
+{
+  "capturedAt": "2026-09-25T19:56:20.243051+00:00",
+  "modifiedFromApp": [
+    "package.json",
+    "public/dispatch.css",
+    "public/dispatch.html",
+    "public/dispatch.js",
+    "public/operator.html",
+    "public/operator.js",
+    "public/sales.html",
+    "public/service-worker.js",
+    "src/dispatch-delivery-group-repository.js",
+    "src/dispatch-executed-prefix-repository.js",
+    "src/dispatch-plan-repository.js",
+    "src/dispatch-planner-performance.js",
+    "src/dispatch-planner-v2-repository.js",
+    "src/dispatch-repository.js",
+    "src/driver-offline-client-harness.js",
+    "src/netsuite.js",
+    "src/server.js",
+    "tools/mbt-predeploy-readiness.mjs"
+  ],
+  "workspaceOnlyRuntimeFiles": [
+    "migrations/212_dispatch_executed_order_reviews.sql",
+    "public/dispatch-address-guard.js",
+    "src/dispatch-address-guard.js",
+    "src/dispatch-executed-order-review-repository.js",
+    "src/dispatch-executed-order-review.js"
+  ],
+  "localBackupFilesExcluded": [
+    "src/server.js.orig"
+  ],
+  "appliedMigrationsMissingFromAppImage": [
+    "055_dual_yard_printer_routing.sql"
+  ]
+}

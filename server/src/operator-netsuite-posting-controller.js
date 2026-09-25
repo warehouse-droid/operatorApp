@@ -1,6 +1,7 @@
 // @ts-check
 
 import { afterTransactionCommit, withTransaction } from "./db.js";
+import { ensureOutboundLocationDirectory } from './outbound-location-runtime.js';
 import { getDeliveryOrder, recordCustomerPickupLoad, recordDeliveryLoad } from "./delivery-repository.js";
 import { withConsolidatedLoadMutation } from "./consolidation-load-locks.js";
 import {
@@ -80,6 +81,7 @@ const admit = createOperatorNetSuitePostingAdmission({
 
 /** @param {Record<string, any>} input */
 export async function submitOperatorNetSuitePostingAction(input) {
+  if (input.functionKey !== 'receiving') {await ensureOutboundLocationDirectory();}
   if (input.functionKey === "delivery_prep") {
     return withConsolidatedLoadMutation(() => getDeliveryOrder(input.orderId, { includeNetSuiteClosed: true }), () => admit(input));
   }
@@ -141,6 +143,8 @@ export function publicOperatorNetSuitePostingCommand(command) {
       attemptCount: step.attemptCount,
       transactionId: step.netSuiteTransactionId,
       transactionRef: step.netSuiteTransactionRef,
+      observedTransaction: step.response?.observedTransaction || null,
+      fulfillmentParts: step.fulfillmentParts || step.response?.fulfillmentParts || [],
       lastError: step.lastError
     }))
   };

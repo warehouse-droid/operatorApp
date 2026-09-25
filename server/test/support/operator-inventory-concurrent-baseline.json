@@ -1,0 +1,10 @@
+{
+  "failedTests": [
+    "receiving: renders the NetSuite stage before awaiting submission"
+  ],
+  "inventoryChangesRemoved": true,
+  "sourceSha256": "f2162b6497bb5836efcbc511504c3407900e25e1f8d80979dc58d3030a83021d",
+  "workspaceSha256": "6a2f94d1d696defce95d9bf40ea9d9fdb85f2fec10f890841037c7ecd3454baf",
+  "testLogSha256": "545af25cbb28f1cf2425a9742333895c97e47dd73e21249cff8c5e3b9e51f881",
+  "reason": "Separate Receiving changes arrived during the long inventory run. These failures reproduce with the inventory patch reversed."
+}

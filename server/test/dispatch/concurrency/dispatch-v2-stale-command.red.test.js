@@ -16,7 +16,7 @@ after(async () => {
   await fixture?.close();
 });
 
-test("DP-10: concurrent dispatchers at the same revision produce one durable winner and one stale rejection", async () => {
+test("DP-10: overlapping requests from one editor produce one durable winner and one stale rejection", async () => {
   const seeded = await fixture.seedPlan({ date: "2025-03-15", refs: ["DP-RACE-A", "DP-RACE-B"] });
   const leftLease = await fixture.acquireLease({ planDate: seeded.plan_date, sessionId: "dispatch-v2-race-left" });
   // The production implementation retains one edit lease. The second request
@@ -34,7 +34,7 @@ test("DP-10: concurrent dispatchers at the same revision produce one durable win
       commandId,
       baseRevision: boot.plan.revision,
       baseDigest: boot.plan.digest,
-      sessionId: commandId,
+      sessionId: "dispatch-v2-race-left",
       commandType: "remove_order",
       payload: { orderRef }
     }

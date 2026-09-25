@@ -9,6 +9,7 @@ const ACCOUNT_ROLE_OPTIONS = [
   { value: "scm", labelKey: "control.roleScm", label: "SCM Staff" },
   { value: "yard_manager", labelKey: "control.roleYardManager", label: "Yard Manager" },
   { value: "sales", labelKey: "control.roleSales", label: "Sales" },
+  { value: "field_sales", labelKey: "control.roleFieldSales", label: "Field Sales" },
   { value: "mbt_frontdesk", labelKey: "control.roleMbtFrontdesk", label: "MBT Front Desk" },
   { value: "mbt_billing", labelKey: "control.roleMbtBilling", label: "MBT Billing" },
   { value: "admin", labelKey: "control.roleAdmin", label: "Admin" }
@@ -23,8 +24,8 @@ const IS_ADMIN_PAGE = window.location.pathname.startsWith("/admin");
 const SECTION_STORAGE_KEY = IS_ADMIN_PAGE ? "mbbs.admin.section" : "mbbs.control.section";
 const ACCOUNT_SELECTION_KEY = "mbbs.admin.selectedAccount";
 const SCM_RECONCILIATION_SELECTED_RUN_KEY = "mbbs.admin.reconciliation.selectedRun";
-const ADMIN_SECTIONS = new Set(["dashboard", "operators", "sync", "maps-usage", "reconciliation", "return-automation", "storage", "audit"]);
-const CONTROL_SECTIONS = new Set(["dashboard", "returns", "locks", "classification", "vendor-mapping", "warnings", "loaded-export", "cycle-count", "fulfillment"]);
+const ADMIN_SECTIONS = new Set(["dashboard", "operators", "sync", "maps-usage", "reconciliation", "return-automation", "sor-auto-returns", "storage", "audit"]);
+const CONTROL_SECTIONS = new Set(["dashboard", "returns", "locks", "classification", "vendor-mapping", "warnings", "loaded-export", "cycle-count", "count-sheets", "damage-stock", "fulfillment"]);
 const CONTROL_SECTION_ROUTES = {
   dashboard: "/control",
   returns: "/control/returns",
@@ -34,6 +35,8 @@ const CONTROL_SECTION_ROUTES = {
   warnings: "/control/operator-warnings",
   "loaded-export": "/control/yard-in-outbound",
   "cycle-count": "/control/cycle-count-review",
+  "count-sheets": "/control/count-sheets",
+  "damage-stock": "/control/damage-stock",
   fulfillment: "/control/operator-load-records"
 };
 const ADMIN_SECTION_ROUTES = {
@@ -43,6 +46,7 @@ const ADMIN_SECTION_ROUTES = {
   "maps-usage": "/admin/maps-usage",
   reconciliation: "/admin/reconciliation",
   "return-automation": "/admin/return-automation",
+  "sor-auto-returns": "/admin/sor-auto-returns",
   storage: "/admin/photo-storage",
   audit: "/admin/audit"
 };
@@ -226,13 +230,18 @@ function setActiveSection(section, { updateRoute = true } = {}) {
     if (window.location.pathname !== route) window.history.pushState({ controlSection: activeSection }, "", route);
     window.dispatchEvent(new Event("mbbs-sidebar-route-changed"));
   }
+  if (activeSection === "count-sheets") { void controlCountSheets.load(); return; }
+  if (activeSection === "damage-stock") { void controlDamage.load(); return; }
   render();
 }
 
 let token = readStaffToken();
 let operator = null;
 let operators = [];
+let aggregateAccess = { assignments: [] };
 let publicSalesSettings = { enabled: false, updatedBy: null, updatedAt: null };
+let mapsDailyReopenBusy = false;
+let mapsDailyReopenRequest = null;
 let mapsUsage = {
   rolling30Day: 0,
   projected30DayFromSevenDays: 0,
@@ -333,6 +342,7 @@ let scmReconciliationPollTimer = null;
 let photoArchivePollTimer = null;
 
 function updateControlPageLayoutClass() {
+  document.body.classList.toggle("admin-maps-usage-page", IS_ADMIN_PAGE && activeSection === "maps-usage");
   document.body.classList.toggle(
     "admin-sync-page",
     IS_ADMIN_PAGE && ["sync", "reconciliation"].includes(activeSection)
@@ -468,7 +478,7 @@ function escapeHtml(value) {
 function photoImgAttributes(value, { thumbnail = false, lazy = false } = {}) {
   const text = String(value || "");
   const loadingAttributes = lazy ? ' loading="lazy" decoding="async"' : "";
-  if (!text.startsWith("r2://")) return `src="${escapeHtml(text)}"${loadingAttributes}`;
+  if (!text.startsWith("r2://") && !text.startsWith("operator-photo://")) return `src="${escapeHtml(text)}"${loadingAttributes}`;
   return `data-secure-photo-ref="${escapeHtml(text)}"${thumbnail ? ' data-secure-photo-variant="thumbnail"' : ""}${loadingAttributes}`;
 }
 
@@ -1616,6 +1626,7 @@ function render() {
       </section>
     </section>
   `;
+  if (activeSection === "sor-auto-returns") { void window.SorAdmin?.mount(app.querySelector("[data-sor-admin]"), request); }
   restoreControlFocus(focusState);
   restoreControlScrollPositions(scrollPositions);
   hydrateSecurePhotoImages(app);
@@ -1628,6 +1639,7 @@ function renderActiveSection() {
   activeSection = normalizedSection(activeSection);
   if (activeSection === "operators") return renderOperatorsSection();
   if (activeSection === "returns") return renderReturnManagementSection();
+  if (activeSection === "sor-auto-returns") { return "<div data-sor-admin></div>"; }
   if (activeSection === "return-automation") return renderReturnAutomationSection();
   if (activeSection === "locks") return renderLocksSection();
   if (activeSection === "classification") return renderClassificationSection();
@@ -1639,12 +1651,15 @@ function renderActiveSection() {
   if (activeSection === "warnings") return renderWarningsSection();
   if (activeSection === "loaded-export") return renderLoadedExportSection();
   if (activeSection === "cycle-count") return renderCycleCountSection();
+  if (activeSection === "count-sheets") return controlCountSheets.render();
+  if (activeSection === "damage-stock") return controlDamage.render();
   if (activeSection === "fulfillment") return renderFulfillmentSection();
   if (activeSection === "audit") return renderAuditSection();
   return renderDashboardSection();
 }
 
 function mapsUsageActionLabel(action = {}) {
+  if (action.subsystem === "dynamic_map" && action.reason === "manual_refresh") return "Manual map display";
   const labels = {
     confirm: "Dispatch plan confirmation",
     manual_refresh: "Manual route / ETA refresh",
@@ -1656,6 +1671,36 @@ function mapsUsageActionLabel(action = {}) {
   return labels[action.reason] || String(action.reason || action.subsystem || "Unknown action")
     .replaceAll("_", " ")
     .replace(/\b\w/gu, (letter) => letter.toUpperCase());
+}
+
+function mapsUsageFeatureLabel(subsystem) {
+  return ({
+    dynamic_map: "Embedded map displays",
+    driver_geocode: "Driver address checks",
+    dispatch_route: "Dispatch routing",
+    monitor_eta: "Truck monitor ETA refresh",
+    support_route: "Support routing"
+  })[subsystem] || String(subsystem || "Unknown feature").replaceAll("_", " ");
+}
+
+async function reopenMapsDailyCapacity() {
+  if (mapsDailyReopenBusy || !mapsUsage.dailyCapacity?.canReopen || mapsUsage.error || mapsUsage.mode === "disabled") return;
+  const day = mapsUsage.dailyCapacity.day;
+  if (!mapsDailyReopenRequest || mapsDailyReopenRequest.day !== day
+      || mapsDailyReopenRequest.expectedLimit !== mapsUsage.dailyCapacity.limit) {
+    mapsDailyReopenRequest = { requestId: crypto.randomUUID(), day, expectedLimit: mapsUsage.dailyCapacity.limit };
+  }
+  mapsDailyReopenBusy = true;
+  render();
+  try {
+    mapsUsage = await request("/api/admin/maps-usage/reopen-daily", {
+      method: "POST", body: JSON.stringify(mapsDailyReopenRequest)
+    });
+    mapsDailyReopenRequest = null;
+  } finally {
+    mapsDailyReopenBusy = false;
+    render();
+  }
 }
 
 function mapsUsagePercent(value, maximum) {
@@ -1671,30 +1716,47 @@ function renderMapsUsageSection() {
   const daily = mapsUsage.daily || [];
   const dailyMaximum = Math.max(1, ...daily.map((row) => Number(row.admittedUnits || 0)));
   const topAction = actions[0] || null;
+  const features = Object.entries(mapsUsage.perSubsystem || {}).sort((left, right) => Number(right[1]) - Number(left[1]));
+  const topFeature = features[0];
+  const capacity = mapsUsage.dailyCapacity;
+  const dailyPercent = capacity ? mapsUsagePercent(capacity.used, capacity.limit) : null;
+  const canReopen = capacity?.canReopen && mapsUsage.mode !== "disabled" && !mapsUsage.error && !mapsDailyReopenBusy;
   const usagePercent = mapsUsagePercent(mapsUsage.rolling30Day, mapsUsage.hardLimit);
   return `
     <section class="panel maps-usage-panel">
       <div class="section-heading">
         <div>
           <h2>Google Maps API Usage</h2>
-          <p class="muted">Application-metered calls for the rolling 30-day window. Google Cloud billing remains the final authority.</p>
+          <p class="muted">All features share one daily capacity. Usage below is metered by this app; Google Cloud billing remains the final authority.</p>
         </div>
         <button data-action="refresh-maps-usage" type="button">Refresh</button>
       </div>
       ${mapsUsage.error ? `<div class="notice sync-error" role="alert"><strong>Usage data unavailable</strong><span>${escapeHtml(mapsUsage.error)}</span></div>` : ""}
       <div class="maps-usage-metrics">
-        <article><span>Admitted units · rolling 30 days</span><strong>${Number(mapsUsage.rolling30Day || 0).toLocaleString()}</strong><small>${usagePercent}% of the ${Number(mapsUsage.hardLimit || 0).toLocaleString()} app limit</small></article>
+        <article class="${capacity && capacity.remaining === 0 ? "maps-usage-exhausted" : ""}"><span>Today · ${escapeHtml(capacity?.day || "UTC")}${capacity ? " UTC" : ""}</span><strong>${capacity ? `${Number(capacity.used).toLocaleString()} / ${Number(capacity.limit).toLocaleString()}` : "— / —"}</strong><small>${capacity ? `${dailyPercent}% used · ${Number(capacity.remaining).toLocaleString()} remaining` : "Daily usage unavailable"}</small><small>Resets at 00:00 UTC · shared by all features</small></article>
+        <article><span>Admitted units · rolling 30 days</span><strong>${Number(mapsUsage.rolling30Day || 0).toLocaleString()} / ${Number(mapsUsage.hardLimit || 0).toLocaleString()}</strong><small>${usagePercent}% used · ${Number(mapsUsage.remaining || 0).toLocaleString()} remaining</small></article>
         <article><span>Projected 30 days</span><strong>${Number(mapsUsage.projected30DayFromSevenDays || 0).toLocaleString()}</strong><small>Based on the latest seven complete UTC days</small></article>
-        <article><span>Capacity remaining</span><strong>${Number(mapsUsage.remaining || 0).toLocaleString()}</strong><small>Requests over capacity fall back immediately; they are not queued</small></article>
-        <article><span>Blocked / failed</span><strong>${Number(mapsUsage.deniedCount30Day || 0).toLocaleString()} / ${Number(mapsUsage.failedCount30Day || 0).toLocaleString()}</strong><small>Denied before Google / admitted calls that failed</small></article>
+        <article><span>Blocked / failed · rolling 30 days</span><strong>${Number(mapsUsage.deniedCount30Day || 0).toLocaleString()} / ${Number(mapsUsage.failedCount30Day || 0).toLocaleString()}</strong><small>Denied before Google / admitted calls that failed</small></article>
+      </div>
+      <div class="maps-usage-reopen">
+        <div><strong>Daily capacity${capacity ? ` · ${Number(capacity.baseLimit).toLocaleString()} base + ${Number(capacity.extraUnits).toLocaleString()} reopened` : ""}</strong><p class="muted">${capacity ? `Adds up to ${Number(capacity.reopenUnits).toLocaleString()} units for this UTC day when daily capacity is exhausted. The ${Number(mapsUsage.hardLimit || 0).toLocaleString()} rolling 30-day ceiling still applies.` : "Refresh usage to load daily capacity."}</p><p class="muted">Reopening preserves usage history. Refresh a blocked Dispatch or Monitor page to load its map again.</p></div>
+        <button data-action="reopen-maps-daily-capacity" type="button" ${canReopen ? "" : "disabled"}>${mapsDailyReopenBusy ? "Reopening…" : "Reopen daily capacity"}</button>
       </div>
       <div class="maps-usage-budget" role="img" aria-label="${usagePercent}% of Google Maps application budget used">
         <span style="width:${usagePercent}%"></span>
       </div>
       <div class="maps-usage-highlight">
+        <strong>Highest usage feature</strong>
+        <span>${topFeature ? `${escapeHtml(mapsUsageFeatureLabel(topFeature[0]))} · ${Number(topFeature[1]).toLocaleString()} admitted unit(s) · ${mapsUsagePercent(topFeature[1], mapsUsage.rolling30Day)}% of rolling usage` : "No metered calls recorded yet."}</span>
+      </div>
+      <div class="maps-usage-highlight">
         <strong>Highest usage action</strong>
         <span>${topAction ? `${escapeHtml(mapsUsageActionLabel(topAction))} · ${Number(topAction.admittedUnits || 0).toLocaleString()} admitted unit(s)` : "No metered calls recorded yet."}</span>
       </div>
+      <section class="maps-usage-actions">
+        <h3>Usage by feature · rolling 30 days</h3>
+        <div class="table-scroll"><table><thead><tr><th>Feature</th><th>Admitted units</th><th>Share of usage</th></tr></thead><tbody>${features.map(([subsystem, units]) => `<tr><td>${escapeHtml(mapsUsageFeatureLabel(subsystem))}</td><td>${Number(units).toLocaleString()}</td><td>${mapsUsagePercent(units, mapsUsage.rolling30Day)}%</td></tr>`).join("") || '<tr><td colspan="3">No metered features recorded yet.</td></tr>'}</tbody></table></div>
+      </section>
       <section class="maps-usage-chart-section">
         <div><h3>Daily admitted usage</h3><p class="muted">UTC days · ${escapeHtml(mapsUsage.mode || "conserve")} mode · hover a bar for attempted, denied, and failed counts</p></div>
         <div class="maps-usage-chart" data-maps-usage-chart role="img" aria-label="Thirty-day Google Maps API usage graph">
@@ -1878,7 +1940,11 @@ function returnStatus(record) {
   if (record?.draftId || record?.draft_id) return "draft";
   const syncStatus = String(firstDefined(record, ["netSuiteSyncStatus", "netsuite_sync_status"], "")).toLowerCase();
   if (syncStatus === "failed") {
-    return returnType(record) === "pallet" ? "credit_memo_creation_failed" : "ra_creation_failed";
+    return returnType(record) === "pallet" && Number(record.workflowVersion || 1) < 2 ? "credit_memo_creation_failed" : "ra_creation_failed";
+  }
+  if (Number(record.workflowVersion) >= 2 && !["voided", "rejected"].includes(record.status)) {
+    const result = { disabled: "local_only", pending: "ra_pending", succeeded: "ra_created", manual_linked: "ra_created" }[syncStatus];
+    if (result) {return result;}
   }
   return String(firstDefined(record, ["status", "returnStatus", "return_status", "approvalStatus", "approval_status"], "unknown"))
     .trim()
@@ -1919,6 +1985,9 @@ function returnStatusLabel(value) {
     partially_rejected: "Partially Rejected",
     voided: "Voided",
     draft: "Draft",
+    local_only: "Local only",
+    ra_pending: "RA Pending",
+    ra_created: "RA Created",
     ra_creation_failed: "RA Creation Failed",
     credit_memo_creation_failed: "Credit Memo Creation Failed",
     sync_failed: "NetSuite Sync Failed",
@@ -2108,6 +2177,7 @@ function renderReturnRecordList() {
 }
 
 function renderReturnLineDecisionActions(line) {
+  if (Number(returnHeader().workflowVersion) >= 2) {return "";}
   if (returnStatus(returnHeader()) === "draft") return "";
   const status = returnStatus(line);
   const policy = String(firstDefined(line, [
@@ -2348,18 +2418,18 @@ function renderReturnAutomationSection() {
   return `<section class="panel return-automation">
     <div class="section-heading">
       <div>
-        <h2>Return NetSuite Automation</h2>
-        <p class="muted">These settings are yard-specific and default to Off. The actual receiving yard controls automation, including approved cross-yard stock returns and customer-level PALLET returns.</p>
+        <h2>Legacy Return NetSuite Automation</h2>
+        <p class="muted">These settings apply to earlier return records. For new stock and pallet Return Authorizations, use the per-yard RA columns in <a href="/mbt-gates.html">Feature Gates</a>.</p>
       </div>
       <button data-action="refresh-return-automation" type="button">Refresh</button>
     </div>
     <div class="notice">
-      <strong>Safe rollout</strong>
-      <span>Stock returns create Return Authorizations. PALLET returns create Credit Memos directly at $40 per Each. Keep both settings off until that yard is ready for live NetSuite transactions.</span>
+      <strong>Earlier records</strong>
+      <span>Legacy stock returns retain approval and Return Authorization processing. Legacy PALLET returns retain direct Credit Memo processing at $40 per Each.</span>
     </div>
     <div class="notice">
-      <strong>Current NetSuite limitation</strong>
-      <span>A Quality Return that splits one Sales Order line across multiple reason codes remains local. Link its Return Authorization manually after creating it in NetSuite; automatic creation stays fail-safe for that record.</span>
+      <strong>Legacy split reasons</strong>
+      <span>Earlier Quality Returns with multiple reasons on one Sales Order line still require manual linking. New confirmations preserve separate reason rows in one Return Authorization.</span>
     </div>
     ${returnSettingsError ? `<div class="notice sync-error"><strong>Return automation settings could not be loaded</strong><span>${escapeHtml(returnSettingsError)}</span></div>` : `
       <div class="return-automation-grid">
@@ -4306,6 +4376,21 @@ function renderNewOperatorDetail() {
   `;
 }
 
+function renderAggregateAccess(item) {
+  const eligible = item.active && hasStaffAuthority(item, ["operator", "sales", "yard_manager"]);
+  return `<section class="account-detail-card account-access-editor" data-aggregate-access>
+    <h3>${t("control.aggregateAccess", "Aggregate request access")}</h3>
+    <p class="muted">${t("control.aggregateAccessHelp", "Separate from Operator and Sales yard access. Only one designated person can submit Aggregate requests for each yard.")}</p>
+    <p class="muted">${t("control.aggregateAccessReplace", "Selecting a yard replaces its current Aggregate submitter when you save.")}</p>
+    ${!eligible ? `<p>${t("control.aggregateAccessEligible", "An active Operator, Sales, or Yard Manager account is required. Save the account role first.")}</p>` : ""}
+    <div class="authority-choice-grid">${aggregateAccess.assignments.map(yard => `<label class="authority-choice">
+      <input type="checkbox" data-account-aggregate-yard value="${yard.yardLocationId}" aria-label="${yard.yardCode}" ${yard.operatorId === item.id ? "checked" : ""} ${!eligible && yard.operatorId !== item.id ? "disabled" : ""} />
+      <span><strong>${yard.yardCode}</strong><small>${t("control.aggregateCurrent", "Current submitter")}: ${escapeHtml(yard.displayName || t("operator.unassigned", "Unassigned"))}</small></span>
+    </label>`).join("")}</div>
+    <div class="account-detail-actions"><button class="primary" data-action="save-aggregate-access" data-id="${escapeHtml(item.id)}" type="button">${t("control.saveAggregateAccess", "Save Aggregate access")}</button></div>
+  </section>`;
+}
+
 function renderOperatorDetail(item) {
   if (!item) {
     return `
@@ -4359,6 +4444,7 @@ function renderOperatorDetail(item) {
           <button class="primary" data-action="save-account-roles" data-id="${escapeHtml(item.id)}" type="button">${t("control.saveAccess", "Save access")}</button>
         </div>
       </section>
+      ${renderAggregateAccess(item)}
       <section class="account-detail-card">
         <h3>${t("control.security", "Security")}</h3>
         <form class="password-reset-form" data-form="reset-password" data-id="${escapeHtml(item.id)}" data-name="${escapeHtml(item.display_name)}">
@@ -4715,8 +4801,10 @@ async function loadAdminReturnSettings() {
 }
 
 async function loadControlData() {
+  if (!IS_ADMIN_PAGE && activeSection === "count-sheets") return controlCountSheets.load();
+  if (!IS_ADMIN_PAGE && activeSection === "damage-stock") return controlDamage.load();
   if (IS_ADMIN_PAGE) {
-    const [nextOperators, nextAuditOptions, nextAudit, nextSyncSettings, nextM2mStatus, nextEnvSettings, nextPhotoArchiveSettings, nextMirrorStatus, nextPublicSalesSettings, nextMapsUsage] = await Promise.all([
+    const [nextOperators, nextAuditOptions, nextAudit, nextSyncSettings, nextM2mStatus, nextEnvSettings, nextPhotoArchiveSettings, nextMirrorStatus, nextPublicSalesSettings, nextMapsUsage, nextAggregateAccess] = await Promise.all([
       request("/api/operators"),
       request(auditOptionsQueryString()),
       request(auditQueryString()),
@@ -4726,9 +4814,11 @@ async function loadControlData() {
       request("/api/admin/photo-archive"),
       request("/api/admin/netsuite-mirror"),
       request("/api/admin/public-sales"),
-      request("/api/admin/maps-usage").catch((error) => ({ ...mapsUsage, error: error.message }))
+      request("/api/admin/maps-usage").catch((error) => ({ ...mapsUsage, error: error.message })),
+      request("/api/admin/aggregate-request-access")
     ]);
     operators = nextOperators;
+    aggregateAccess = nextAggregateAccess;
     auditOptions = nextAuditOptions;
     audit = nextAudit;
     syncSettings = nextSyncSettings;
@@ -4892,6 +4982,9 @@ app.addEventListener("click", async (event) => {
       mapsUsage = await request("/api/admin/maps-usage");
       render();
       return;
+    }
+    if (button.dataset.action === "reopen-maps-daily-capacity") {
+      return await reopenMapsDailyCapacity();
     }
     if (button.dataset.action === "new-account") {
       selectedOperatorId = "new";
@@ -5637,6 +5730,21 @@ app.addEventListener("click", async (event) => {
       alert(`Public Sales access is now ${enabled ? "on" : "off"}.`);
       return render();
     }
+    if (button.dataset.action === "save-aggregate-access") {
+      const row = button.closest("[data-account-row]");
+      const yardLocationIds = [...row.querySelectorAll("[data-account-aggregate-yard]:checked")].map(input => Number(input.value));
+      const expectedRevisions = Object.fromEntries(aggregateAccess.assignments.map(yard => [yard.yardLocationId, yard.revision]));
+      button.disabled = true;
+      try {
+        aggregateAccess = await request(`/api/admin/aggregate-request-access/${encodeURIComponent(button.dataset.id)}`, {
+          method: "PUT", body: JSON.stringify({ yardLocationIds, expectedRevisions })
+        });
+        alert(t("control.aggregateAccessSaved", "Aggregate request access updated."));
+        return loadControlData();
+      } catch (error) {
+        alert(window.MBBS_I18N?.message(error.message) || error.message);
+      } finally { button.disabled = false; }
+    }
     if (button.dataset.action === "save-account-roles") {
       const row = button.closest("[data-account-row]");
       const role = row?.querySelector("[data-account-primary-role]")?.value || "operator";
@@ -5767,6 +5875,9 @@ app.addEventListener("input", (event) => {
       });
   }, 250);
 });
+
+const controlCountSheets = window.MBBSControlCountSheets?.create({root:app, request, escape:escapeHtml, render});
+const controlDamage = window.MBBSControlDamage?.create({root:app, request, escape:escapeHtml, render, photo:photoImgAttributes, preview:openPhotoLightbox, active:()=>activeSection==="damage-stock"});
 
 async function boot() {
   const bootstrap = await request("/api/auth/bootstrap-needed");

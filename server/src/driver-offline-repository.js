@@ -1,4 +1,5 @@
 import crypto from "node:crypto";
+import { sanitizeSorSignature } from "./sor-signature-evidence.js";
 import { query, withTransaction } from "./db.js";
 import { normalizeDispatchPlanLoadAssignments } from "./dispatch-load-assignment.js";
 import { DISPATCH_FLEET_PLANNING_LOCK } from "./dispatch-fleet-status.js";
@@ -496,6 +497,8 @@ export function sanitizeDriverOfflineJob(job = {}) {
     "orderRefs",
     "orderTypes",
     "dependencyPickupManifests",
+    "customerSignaturePrompt",
+    "sorReturnReadiness",
     "requiredPhotos",
     "retainedPhotoReferences",
     "retainedPhotoCount",
@@ -1708,6 +1711,7 @@ export function sanitizeDriverOfflineEventDetails(eventType, details = {}) {
         ? uuidValue(source.locationVerificationId, "Location verification ID")
         : undefined,
       locationOverrideReason: optionalText(source.locationOverrideReason, { maxLength: 1000 }),
+      customerSignature: eventType === "job_completed" ? sanitizeSorSignature(source.customerSignature) : undefined,
       driverRemark: eventType === "job_completed"
         ? optionalText(source.driverRemark ?? source.remark, { maxLength: 1000 })
         : undefined,

@@ -30,6 +30,7 @@ const PLAN_LIVE_DEFINITION_FIELDS = Object.freeze([
   "items", "pallets", "layers", "sections", "pieces", "salesQty",
   "salesQuantities", "packed", "weight", "totalWeightLbs", "unloadMinutes",
   "travelMinutes", "stopMinutes", "childOrderDetails", "transitCo",
+  "dropoffs", "poRouteProjection",
   "transitOriginalPickupLocations", "transitOriginalSourceYard"
 ]);
 
@@ -454,6 +455,7 @@ function canonicalDerivedOrderType(order = {}) {
 
 function derivedDefinitionKind(order = {}) {
   if (!canonicalDerivedOrderType(order)) return "";
+  if (order.orderKind === "sor_rental_return") { return "derived"; }
   if (splitParentRef(order)) return "split";
   const declared = text(order.globalOrderDefinitionKind).toLowerCase();
   if (["consolidation", "derived"].includes(declared)) return declared;
@@ -888,7 +890,7 @@ function groupedSalesOrderDeliveryFields(order = {}, children = []) {
   };
 }
 
-function aggregateGlobalGroup(order = {}, childOrderDetails = [], { preserveTransitCo = false } = {}) {
+export function aggregateGlobalGroup(order = {}, childOrderDetails = [], { preserveTransitCo = false } = {}) {
   // A CO for a grouped SO/TO owns its persisted manifest. Source children are
   // informational and may be incomplete cards, not constituent CO cargo.
   if (text(order.type).toUpperCase() === "CO" && order.sourceTable === "local_co_orders"
@@ -899,8 +901,11 @@ function aggregateGlobalGroup(order = {}, childOrderDetails = [], { preserveTran
     (total, child) => total + Number(child?.[field] || 0),
     0
   );
-  const pickupLocations = [...new Set(childOrderDetails
-    .flatMap((child) => child.pickupLocations || [])
+  const pickupLocations = [...new Set([
+    ...childOrderDetails.flatMap((child) => child.pickupLocations || []),
+    ...(order.directPickupManifest || []).map((entry) => entry.location),
+    ...(order.poPickupManifest || []).map((entry) => entry.location)
+  ]
     .map(text)
     .filter(Boolean))];
   const existingSourceYard = text(order.sourceYard);
@@ -1107,6 +1112,7 @@ export async function reconcileDispatchGlobalOrderSources({ orders = [] } = {}) 
          FROM dispatch_global_order_splits
         WHERE active = true
           AND lower(parent_order_ref) = ANY($1::text[])
+          AND full_order->>'orderKind' IS DISTINCT FROM 'sor_rental_return'
         ORDER BY lower(split_ref)
         FOR UPDATE`,
       [sourceRefs]
@@ -1265,11 +1271,13 @@ export async function reconcileDispatchPlanGlobalOrderDefinitions(plan, {
     `SELECT definition.order_ref, definition.full_order, definition.active,
             definition.definition_kind
        FROM (
-         SELECT group_ref AS order_ref, full_order, active, 'group'::text AS definition_kind
+         SELECT group_ref AS order_ref, CASE WHEN active THEN full_order ELSE '{}'::jsonb END AS full_order,
+                active, 'group'::text AS definition_kind
            FROM dispatch_global_order_groups
           WHERE lower(group_ref) = ANY($1::text[])
          UNION ALL
-         SELECT split_ref AS order_ref, full_order, active, definition_kind
+         SELECT split_ref AS order_ref, CASE WHEN active THEN full_order ELSE '{}'::jsonb END AS full_order,
+                active, definition_kind
            FROM dispatch_global_order_splits
           WHERE lower(split_ref) = ANY($1::text[])
        ) definition`,
@@ -1319,6 +1327,9 @@ export async function reconcileDispatchPlanGlobalOrderDefinitions(plan, {
   return {
     ...visiblePlan,
     orders: (visiblePlan.orders || []).map((order) => {
+      // The canonical Custom Order owns a collection's reversed route and cargo.
+      // Old global definitions may still contain its delivery parent's fields.
+      if (order.orderKind === "sor_rental_return") { return order; }
       const current = byRef.get(orderIdentity(order).toLowerCase());
       if (!current) return order;
       const reconciled = cloneOrder(order);
@@ -1540,12 +1551,25 @@ async function lockDispatchGlobalOrderDefinitionRefs(orderRefs = []) {
   }
 }
 
+async function assertNoGroupedSplitParents(plan) {
+  const parents = [...new Set((plan.orders || []).map(splitParentRef).filter(Boolean))];
+  if (!parents.length) return;
+  const stored = await query(`SELECT group_ref FROM dispatch_global_order_groups WHERE group_ref=ANY($1::text[])`, [parents]);
+  const local = (plan.orders || []).some(order => parents.includes(orderIdentity(order)) && isGroupedDispatchOrder(order));
+  if (stored.rowCount || local) {
+    throw Object.assign(new Error("Ungroup first, then split the child order."), {
+      status: 409, code: "DISPATCH_GROUP_SPLIT_UNSUPPORTED"
+    });
+  }
+}
+
 async function syncDispatchDeliveryGroupsFromPlanInTransaction(plan = {}, {
   reactivatedGlobalOrderRefs = [],
   rejectRetiredGlobalOrderRefs = false
 } = {}) {
   const planId = Number(plan.id);
   if (!Number.isInteger(planId)) return { groups: 0, members: 0 };
+  await assertNoGroupedSplitParents(plan);
   const allowedReactivations = new Set((Array.isArray(reactivatedGlobalOrderRefs)
     ? reactivatedGlobalOrderRefs
     : [])

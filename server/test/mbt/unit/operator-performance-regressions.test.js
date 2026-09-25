@@ -16,13 +16,13 @@ test("Delivery Prep materializes its line summary once per query", () => {
   assert.match(deliveryRepository, /delivery_line_summary AS MATERIALIZED\s*\(/);
 });
 
-test("photo uploads retain source resolution and use a bounded two-file queue", async () => {
+test("photos retain source resolution and direct Return uploads use a bounded two-file queue", async () => {
   assert.match(operator, /OPERATOR_CAMERA_IDEAL_WIDTH\s*=\s*4096/);
   assert.match(operator, /OPERATOR_CAMERA_IDEAL_HEIGHT\s*=\s*3072/);
   assert.match(operator, /imageCapture\.takePhoto\(photoSettings\)/);
 
-  const uploadSection = section(operator, "async function uploadOperatorPhotos", "async function publicApi");
-  assert.match(uploadSection, /mapWithConcurrency\(photos, 2,/);
+  const uploadSection = section(operator, "async function uploadReturnPhotoList", "async function uploadReturnEvidence");
+  assert.match(uploadSection, /mapWithConcurrency\(photos\.filter\(Boolean\), 2,/);
   assert.doesNotMatch(uploadSection, /resize|compress|canvas/i);
 
   const helperSource = section(operator, "async function mapWithConcurrency", "function updateUploadElapsed");

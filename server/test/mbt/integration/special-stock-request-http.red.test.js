@@ -129,12 +129,13 @@ test("HTTP workflow is fail-closed, role-separated, and keeps SCM costs private"
     method: "POST",
     body: {
       storeLocationId: 15,
+      fulfillmentMethod: "yard_pickup",
       inquiryDate: "2099-08-21",
       customerName: "HTTP Special Customer",
       vendorName: "HTTP Special Vendor",
       lines: [
-        { productName: "HTTP multi-line A", quantity: 2, uom: "PLT", requiredDate: "2099-09-01" },
-        { productName: "HTTP multi-line B", quantity: 1, uom: "PLT", requiredDate: "2099-09-01" }
+        { productName: "HTTP multi-line A", quantity: 2, uom: "PLT", rate: 120, requiredDate: "2099-09-01" },
+        { productName: "HTTP multi-line B", quantity: 1, uom: "PLT", rate: 120, requiredDate: "2099-09-01" }
       ]
     }
   });

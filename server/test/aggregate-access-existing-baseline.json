@@ -1,0 +1,108 @@
+{
+  "files": 559,
+  "tests": 2923,
+  "passes": 2899,
+  "failures": {
+    "test/mbt/infrastructure/p3-gauntlet-contract.test.js": [
+      "P3.12: browser specs share one worker-owned database-pool lifecycle"
+    ],
+    "test/mbt/integration/feature-gate-admin-http.test.js": [
+      "P3-F29 Admin gate inventory is private, complete, and keeps live integrations locked"
+    ],
+    "test/mbt/integration/http-capabilities.test.js": [
+      "F01/F16: MBT status is authenticated, fail-closed, and reports the Phase 1 safety boundary",
+      "F01: the database cannot enable NetSuite writes while the environment write gate is false"
+    ],
+    "test/mbt/integration/http-role-matrix.test.js": [
+      "F02/F15: Front Desk sees its exact controlled server gate state"
+    ],
+    "test/mbt/integration/http-shell.test.js": [
+      "F15: all MBT routes render one accessible controlled shell with an explicit controller"
+    ],
+    "test/mbt/integration/local-load-performance.test.js": [
+      "test/mbt/integration/local-load-performance.test.js"
+    ],
+    "test/mbt/integration/migration-upgrade.test.js": [
+      "F06/F16: schema-101 upgrade preserves representative legacy records and is migration-runner idempotent"
+    ],
+    "test/mbt/integration/operator-background-photos.test.js": [
+      "test/mbt/integration/operator-background-photos.test.js"
+    ],
+    "test/mbt/integration/operator-display-settings.test.js": [
+      "test/mbt/integration/operator-display-settings.test.js"
+    ],
+    "test/mbt/integration/p3-predeploy-readiness.test.js": [
+      "P3.11: the deployment inventory exactly covers every on-disk MBT-era migration"
+    ],
+    "test/mbt/unit/control-yard-photo-thumbnail.test.js": [
+      "Control and Admin request the cache-busted thumbnail hydration client"
+    ],
+    "test/mbt/unit/driver-camera-ordinary-upload.test.js": [
+      "a fresh Driver shell version evicts older copy-enabled cached assets"
+    ],
+    "test/mbt/unit/driver-plan-date-execution-wiring.contract.test.js": [
+      "S11: the guarded client ships in a new atomic Driver shell generation"
+    ],
+    "test/mbt/unit/driver-pwa-cache-repair.test.js": [
+      "a failed staging download leaves the active and non-Driver caches byte-for-byte unchanged",
+      "a fresh Driver worker reloads every v41 shell asset and initializes only its scoped sentinel",
+      "a successful repair replaces only the complete Driver shell and preserves offline data sentinels"
+    ],
+    "test/mbt/unit/driver-pwa-site-reset.test.js": [
+      "the reset ships as a new atomic shell generation without forcing a protocol-version cutover"
+    ],
+    "test/mbt/unit/driver-pwa-ux-regressions.test.js": [
+      "the updated override policy is atomically included in the Driver PWA shell"
+    ],
+    "test/mbt/unit/operations-navigation-enhancements.test.js": [
+      "operator cache assets advance with the cycle-count pagination release"
+    ],
+    "test/mbt/unit/operator-customer-pickup-photo-gate-ui.contract.test.js": [
+      "S7: Operator cache revision ships the live-policy client once; later toggles are server-only"
+    ],
+    "test/mbt/unit/operator-page-confirm-ui.contract.test.js": [
+      "page confirmation has a duplicate-click guard and ships in a fresh Operator cache"
+    ],
+    "test/mbt/unit/operator-yard-assets.test.js": [
+      "Operator service worker precaches the exact new page assets, preserves Driver caches, and bypasses API requests"
+    ],
+    "test/mbt/integration/stock-return-draft-insert.test.js": [
+      "normal stock draft preserves every line field and consumes the draft only on success"
+    ]
+  },
+  "countsDescribe": "Initial full baseline run; failure-name union additionally includes the independently reproduced cache-age case below.",
+  "additionalBaselineObservations": {
+    "reason": "The unchanged return-reason cache expires after ten minutes. The test treats its metadata GET as an unexpected write. Fresh-cache old/new runs pass; expired-cache old/new runs fail identically.",
+    "unchangedSources": {
+      "test/mbt/integration/stock-return-draft-insert.test.js": "bdabb1b3d05c0075e2ce9120078a768031aaca3b66d00053634f940efff345fc",
+      "src/return-repository.js": "e4975c5590b23f1ad7ba43e579c38ed5bbddfde56791cc33ee96b643ea5905fb",
+      "src/return-netsuite.js": "693705a7b32cef44b24e671d556ecd3107e5c4ed7c8c740adb07c56590c85f40",
+      "src/netsuite.js": "04d103073ce84d1af6661c5f229c6ddb41b50c3b0dbb1f2b91229334e351a9ee",
+      "src/config.js": "9e6e6c869e4f50bc37925e93f24538e9961387b9d76498a4ff621da8c84b0e6d",
+      "src/db.js": "4c77e4fb654cedb6743d4f737850825b4df5337ca27dbbcc8aa73d37c43b14cf"
+    },
+    "replays": {
+      "flake-baseline.log": {
+        "runs": 8,
+        "failedRuns": 0,
+        "sha256": "6b7e202219c53bd69b15ff7b020ad90227768f1aca4f3f75c8dfe19e9f66c74e"
+      },
+      "flake-baseline-expired.log": {
+        "runs": 3,
+        "failedRuns": 3,
+        "sha256": "547e84ee7099d585dc369896512ed58ef82db7d8ae9495bcd22e76016e66d672"
+      },
+      "flake-final.log": {
+        "runs": 5,
+        "failedRuns": 5,
+        "sha256": "6c93c317f3052dc6953832e5405126c28aeb69ce73244d80d1e40c723713e0c3"
+      },
+      "flake-final-fresh.log": {
+        "runs": 3,
+        "failedRuns": 0,
+        "sha256": "0dddcc911167707b31f94ca9b872b9f9dd2e57d8c9caa7edf8087bf4aa765ee2"
+      }
+    },
+    "reproductionTool": "tools/aggregate-regression-replay.mjs"
+  }
+}

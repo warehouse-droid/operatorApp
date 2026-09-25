@@ -43,19 +43,20 @@ test("Dispatch dependency commands carry the exact saved plan fence and a reques
   assert.match(requestId, /crypto\.randomUUID/u);
 });
 
-test("an atomic dependency response replaces the local snapshot and never schedules a second save", () => {
+test("an atomic dependency response applies its snapshot while preserving a newer local generation", () => {
   const apply = functionBody("applyAtomicDependencyMutationPayload");
   assert.match(apply, /payload\?\.pending/u);
   assert.match(apply, /applySavedPlan\(payload\.plan\)/u);
   assert.match(apply, /compactCurrentPlan\(payload\.plan\)/u);
   assert.match(apply, /resetLocalPlanDirty\(\)/u);
   assert.match(apply, /resetUndoHistory\(\)/u);
-  assert.doesNotMatch(apply, /commitPlanMutation|queueServerSave|requestOrderPoolRefreshOnNextSave/u);
+  assert.doesNotMatch(apply, /commitPlanMutation|requestOrderPoolRefreshOnNextSave/u);
+  assert.match(apply, /context\.generation !== localPlanGeneration/u);
 });
 
 test("all four Dispatch relationship flows flush autosave then consume the atomic plan", () => {
-  assert.match(dispatchSource, /async function runAtomicDispatchDependencyMutation\(/u);
-  const runner = functionBody("runAtomicDispatchDependencyMutation");
+  assert.match(functionBody("runAtomicDispatchDependencyMutation"), /serializeDispatchPlanAction/u);
+  const runner = functionBody("performDispatchDependencyMutation");
   assert.match(runner, /await saveCurrentPlanNow\(\)/u);
   assert.match(runner, /await refreshDispatchDependencyPlanFence\(\)/u,
     "a no-op autosave must still refresh the server revision/digest before previewing a dependency");
@@ -80,11 +81,12 @@ test("all four Dispatch relationship flows flush autosave then consume the atomi
   }
 });
 
-test("the dependency fence refresh uses the lightweight revision endpoint", () => {
+test("the dependency fence check uses the lightweight endpoint without adopting unreviewed changes", () => {
   const refresh = functionBody("refreshDispatchDependencyPlanFence");
   assert.match(refresh, /\/api\/dispatch\/plans\/\$\{encodeURIComponent\(currentPlan\.id\)\}\/revision/u);
-  assert.match(refresh, /currentPlan[\s\S]*revision:\s*Number\(fence\.revision/u);
-  assert.match(refresh, /digest:\s*fence\.digest/u);
+  assert.match(refresh, /fence\.digest !== currentPlan\.digest/u);
+  assert.match(refresh, /throw new Error\("Saved plan data changed/u);
+  assert.doesNotMatch(refresh, /currentPlan\s*=/u);
 });
 
 test("Link PO lets the user explicitly classify MBBS-Special SO and PO service fees", () => {

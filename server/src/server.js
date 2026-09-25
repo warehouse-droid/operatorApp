@@ -1,3 +1,16 @@
+import { operatorNetSuitePriority } from './operator-netsuite-priority-middleware.js';
+import { filterSorPlanningOrders } from './sor-feature-gate.js';
+import { createCountSheetRouter, createInventoryDamageRouter } from "./operator-inventory-router.js";
+import { damagePostingTick } from "./inventory-damage-service.js";
+import { createControlDamageRouter } from "./control-damage-router.js";
+import { damageAdjustmentTick } from "./control-damage-service.js";
+import { assertDamagePhotoAccess } from "./inventory-damage-repository.js";
+import { createAggregateRequestAccessRouter } from "./aggregate-request-access-router.js";
+import { outboundYardLocationId } from "./outbound-location-domain.js";
+import { createOperatorPreferencesRouter } from "./operator-preferences-router.js";
+import { createAggregateRequestRouter } from "./aggregate-request-router.js";
+import { hasUnappliedDispatchPlanMaintenance, pendingDispatchPlanMaintenance } from "./dispatch-plan-maintenance-queue.js";
+import { configureDispatchMaintenanceEvents, drainDispatchPlanMaintenance } from "./dispatch-plan-maintenance.js";
 import { listFulfilledTransferStates, fulfilledTransferPlanningRefs } from "./dispatch-fulfilled-to-repository.js";
 import { annotateFulfilledTransferOrders } from "./dispatch-fulfilled-to-policy.js";
 import { listFulfilledSalesDeliveryStates, overlayFulfilledSalesDeliveryPlanning, assertSalesDeliveryPlanningAllowed, fulfilledSalesDeliveryPlanningRefs } from "./dispatch-fulfilled-so-repository.js";
@@ -7,6 +20,11 @@ import { configureConsolidationLoadEvents, listConsolidationLoadOrders, createCo
 import { submitConsolidatedLoad, resumeConsolidatedLoad } from "./consolidation-load-service.js";
 import { assertOperatorYard, operatorYardLocationIds } from "./operator-yard-access.js";
 import express from "express";
+import { createFieldSalesRuntime } from "./field-sales/runtime.js";
+import { decorateSorOrders } from "./sor-rental-repository.js";
+import { resolveSorSignature, assertSorSignaturePhotoAccess } from "./sor-signature-evidence.js";
+import { sorAdminRouter } from "./sor-rental-routes.js";
+import { runSorReturnQueue } from "./sor-rental-service.js";
 import { SALES_ORDER_SYNC_LOCATIONS, withVoyageDispatchYard } from "./dispatch-sales-order-locations.js";
 import { completeScmVendorOrder } from "./scm-vendor-completion.js";
 import crypto from "node:crypto";
@@ -123,6 +141,7 @@ import {
   listReconciliationCompletedOperationallyPendingDispatchRefs
 } from "./dispatch-history-mode.js";
 import { syncTargetedNetSuiteOrder } from "./targeted-order-sync.js";
+import { applyPurchaseOrderItemWeights } from "./purchase-order-weight-refresh.js";
 import { authorizeSalesOrderReload, cancelSalesOrderReload } from "./sales-order-reload.js";
 import {
   cancelReloadCycle,
@@ -153,7 +172,10 @@ import {
   submitOperatorNetSuitePostingAction
 } from "./operator-netsuite-posting-controller.js";
 import { startOperatorNetSuitePostingRuntime } from "./operator-netsuite-posting-runtime.js";
+import { createOperatorReceiptRecoveryRouter } from "./operator-receipt-recovery.js";
 import { startPostingPhotoWorker } from "./operator-netsuite-posting-photo-worker.js";
+import { startBackgroundPhotoWorker } from "./operator-background-photo-worker.js";
+import { withOperatorPhotoAction, isBackgroundPhotoReference, getBackgroundPhoto, getBackgroundPhotoAction, receiveBackgroundPhoto } from "./operator-background-photos.js";
 import {
   enqueueSalesOrderAutoFulfillmentCandidate,
   startSalesOrderAutoFulfillmentRuntime
@@ -252,9 +274,10 @@ import {
   replaceScmPurchaseOrderCatalog,
   upsertScmPurchaseOrderCatalog
 } from "./scm-purchase-order-catalog-repository.js";
-import { applyActiveTransitCoMetadata, clearCancelledTransitCoMetadata, digestDispatchPlan, evaluateExecutedPrefixPolicy } from "./dispatch-planner-performance.js";
+import { applyActiveTransitCoMetadata, clearCancelledTransitCoMetadata, evaluateExecutedPrefixPolicy } from "./dispatch-planner-performance.js";
 import { applyDispatchPlanDelta, buildDispatchPlanDelta } from "./dispatch-planner-optimization.js";
 import { DispatchPlanEditLeaseError, acquireDispatchPlanEditLease, assertDispatchPlanEditLease, getDispatchPlanEditLease, heartbeatDispatchPlanEditLease, releaseDispatchPlanEditLease } from "./dispatch-plan-lease-repository.js";
+import { withDispatchPlanWrite, getDispatchPlanWriteReplay } from './dispatch-plan-write.js';
 import {
   executeScmDependencyCommand,
   scmDependencyPayloadHash
@@ -461,6 +484,8 @@ import { getSalesStockRequestAvailabilityPolicy } from "./stock-request-policy.j
 import {
   acknowledgeSpecialPostPoChange,
   chooseSpecialHandoffRoute,
+  closeSpecialUnavailableCase,
+  checkSpecialStockReadiness,
   completeSpecialVendorPickup,
   createSpecialStockCase,
   decideSpecialStockLine,
@@ -475,6 +500,8 @@ import {
   requestSpecialCaseClosure,
   respondSpecialStockLine,
   saveSpecialSalesOrderDraft,
+  requestSpecialQuantityChange,
+  skipSpecialOrderCreation,
   searchSpecialCustomers,
   searchSpecialItems,
   searchSpecialOrderLinks,
@@ -485,9 +512,11 @@ import {
   createSpecialSalesOrder,
   refreshSpecialSalesOrder
 } from "./special-stock-request-service.js";
+import { reviewSpecialQuantityChange } from './special-stock-quantity-service.js';
 import {
   assertSpecialStockRequestEnabled,
-  getSpecialStockRequestPolicy
+  getSpecialStockRequestPolicy,
+  getSpecialStockTestSkipPolicy
 } from "./special-stock-request-policy.js";
 import { addSmartScmVendorAlternativeLine, listSmartScmNetSuitePoReviewLoads, removeSmartScmNetSuitePoReviewLoad, removeSmartScmVendorAlternativeLine, removeSmartScmVendorReplyLoad, saveSmartScmVendorReplyLoad, searchSmartScmVendorAlternatives, stageSmartScmVendorReplyLoad, updateSmartScmNetSuitePoReviewPalletQuantity } from "./smart-scm-vendor-repository.js";
 import {
@@ -1025,6 +1054,7 @@ function sendDispatchLoadAssignmentConflictResponse(res, conflicts = []) {
 const DISPATCH_RECOVERY_EXCLUDED_ERROR_CODES = new Set([
   "DISPATCH_COMMAND_ID_REUSED",
   "DISPATCH_PLAN_DATE_MISMATCH",
+  "DISPATCH_PLAN_FENCE_REQUIRED",
   "STALE_DISPATCH_PLAN"
 ]);
 
@@ -1658,7 +1688,8 @@ async function listDispatchSnapshotDerivedOrders({ type = null, search = "", exa
         WHERE active = false`
     ),
     query(
-      `SELECT tranid FROM sales_orders WHERE tranid LIKE '%-S%' AND netsuite_active = false
+      `SELECT tranid FROM sales_orders WHERE tranid LIKE '%-S%'
+         AND (netsuite_active = false OR sales_order_type = 'Pick-Up')
        UNION
        SELECT tranid FROM transfer_orders WHERE tranid LIKE '%-S%' AND netsuite_active = false`
     ),
@@ -1713,6 +1744,7 @@ async function listDispatchSnapshotDerivedOrders({ type = null, search = "", exa
     if (!isSnapshotDerivedDispatchOrder(order)) continue;
     const id = String(order?.id || row.order_ref || "").trim();
     if (!id || retiredGlobalRefs.has(id.toLowerCase()) || derivedOrders.has(id)) continue;
+    if (inactiveSplitRefs.has(id)) continue;
     derivedOrders.set(id, order);
   }
   for (const row of result.rows) {
@@ -1880,7 +1912,7 @@ export async function loadDispatchOrdersForResponse({
     .filter(Boolean))].slice(0, 200);
   const exactIdentityRequest = normalizedExactOrderRefs.length > 0;
   const requestedType = String(type || "").trim().toUpperCase();
-  const includeCustom = !requestedType || requestedType === "TO" || requestedType === "CUSTOM";
+  const includeCustom = !requestedType || ["SO", "TO", "CUSTOM"].includes(requestedType);
   const historicalDate = historicalDispatchPlanDate(historyPlanDate);
   const revealCompletedScmSearch = Boolean(includeCompletedScmSearch && searchTerm && !historicalDate);
   const [orders, customOrders, snapshotOrders, initialRestrictedScmRefs, billedSalesOrders, hiddenScmOrders, completedReconciliationRefs] = await Promise.all([
@@ -1966,7 +1998,7 @@ export async function loadDispatchOrdersForResponse({
   };
   const currentOrders = filterDispatchPlanningVisibleOrders([
     ...orders.map(decorateTransfer),
-    ...customOrders.map(dispatchOrderFromCustomOrder),
+    ...customOrders.filter(order => requestedType !== "SO" || order.orderKind === "sor_rental_return").map(dispatchOrderFromCustomOrder),
     ...historicalOrders
   ]).filter(order => order.type !== "SO" || order.netsuiteActive !== false
     || order.historicalReconciliationComplete === true
@@ -2102,7 +2134,9 @@ export async function loadDispatchOrdersForResponse({
       dispatchPlanningRestrictionReason: `${order.id} is completed in PO/TO Schedule and is available for search only.`
     };
   });
-  return enrichDispatchOrdersWithCompletionStatus(planningAnnotatedOrders);
+  const scopedOrders = exactIdentityRequest || historicalDate
+    ? planningAnnotatedOrders : await filterSorPlanningOrders(planningAnnotatedOrders);
+  return enrichDispatchOrdersWithCompletionStatus(await decorateSorOrders(scopedOrders));
 }
 
 const dispatchOrderResponseSingleFlight = createSingleFlight({
@@ -3196,16 +3230,21 @@ async function findDispatchPlanDateConflictsFromProjection({
       planId: row.planId,
       planDate: row.planDate,
       status: row.status,
-      refs: new Set()
+      refs: new Set(),
+      wholeOrderRefs: new Set()
     });
     byPlan.get(row.planId).refs.add(row.orderRef.toLowerCase());
+    // A child's parent alias protects the whole parent, not its sibling splits.
+    if (row.assignmentKind !== "split_parent_alias") {
+      byPlan.get(row.planId).wholeOrderRefs.add(row.orderRef.toLowerCase());
+    }
   }
   const conflicts = [];
   for (const otherPlan of byPlan.values()) {
     for (const ref of currentRefs) {
       const key = String(ref || "").trim().toLowerCase();
       const parent = String(parentRefs.get(key) || "").toLowerCase();
-      if (!key || (!otherPlan.refs.has(key) && (!parent || !otherPlan.refs.has(parent)))) continue;
+      if (!key || (!otherPlan.refs.has(key) && (!parent || !otherPlan.wholeOrderRefs.has(parent)))) continue;
       conflicts.push({
         orderRef: ref,
         planId: otherPlan.planId,
@@ -4461,6 +4500,7 @@ function uniqueDriverCompletedCustomOrders(orders = []) {
 }
 
 export async function completeDriverJobOperationalEffects({
+  customerSignature = null,
   driverLogin,
   job,
   routeJobs = [],
@@ -4524,6 +4564,7 @@ export async function completeDriverJobOperationalEffects({
         continue;
       }
       const record = await recordDriverJobPhotos(driverLogin, visitJob.jobId, {
+        customerSignature,
         photoDataUrls,
         job: visitJob,
         occurredAt,
@@ -4531,6 +4572,9 @@ export async function completeDriverJobOperationalEffects({
         driverRemark,
         completionContext
       });
+      // The database can correct an old offline manifest's CO cargo references.
+      // Apply subsequent operational effects to the saved execution identity.
+      visitJob.orderRefs = record.order_refs;
       if (
         completionContext?.source === "dispatch_historical_assist"
         && record?.job_details?.completionRequestId !== completionContext.requestId
@@ -4634,6 +4678,11 @@ export async function completeDriverJobOperationalEffects({
       });
     }
     const primary = jobResults.find((result) => String(result.job.jobId) === String(job.jobId)) || jobResults[0];
+    // Commit the intention with Driver evidence. A crash after completion must
+    // not lose cleanup; execution remains outside this critical transaction.
+    if (!strictPlanCleanup && job.planId) {await cleanupBilledSalesOrderFamiliesFromDispatchPlan({
+      planId: job.planId, actor: `driver:${driverLogin}`, queueOnly: true
+    });}
     const billedSalesOrderPlanCleanup = strictPlanCleanup && job.planId
       ? await cleanupBilledSalesOrderFamiliesFromDispatchPlan({
           planId: job.planId,
@@ -4679,14 +4728,7 @@ export async function completeDriverJobOperationalEffects({
         planId: job.planId,
         actor: `driver:${driverLogin}`
       });
-      if (billedSalesOrderPlanCleanup.changedPlans.length) {
-        emitAppEvent("dispatch.plan.saved", {
-          planId: job.planId,
-          planDate: job.planDate || "",
-          source: "billed-so-driver-completion-cleanup",
-          refreshOrderPool: true
-        });
-      }
+
     } catch (error) {
       billedSalesOrderPlanCleanupWarning = String(error?.message || error);
       console.error("Billed SO plan cleanup after driver completion failed:", error);
@@ -4866,7 +4908,8 @@ async function applyDriverOfflineEvent({
       photoDataUrls: photoReferences,
       occurredAt: event.occurredAt,
       offlineTrace,
-      driverRemark: event.details?.driverRemark
+      driverRemark: event.details?.driverRemark,
+      customerSignature: await resolveSorSignature(event.details?.customerSignature, {job,photos:event.photos || [],offline:true})
     });
     emitAppEvent("driver.job.completed", {
       driverLogin,
@@ -5210,6 +5253,7 @@ function emitAppEvent(type, payload = {}) {
 }
 
 configureOperatorNetSuitePostingCompletionEvents(emitAppEvent);
+configureDispatchMaintenanceEvents(emitAppEvent);
 
 function closeOperatorEventStreams(id) {
   for (const client of eventClients) {
@@ -5227,6 +5271,7 @@ function updateFulfillmentJob(jobId, patch) {
 }
 
 function updateReceivingJob(jobId, patch) {
+  if (!jobId) return;
   const current = receivingJobs.get(jobId) || { id: jobId };
   receivingJobs.set(jobId, {
     ...current,
@@ -5258,6 +5303,19 @@ function requiredPhotoDataUrls(values, minimum = 2) {
     throw error;
   }
   return photos;
+}
+
+/** @param {any} req @param {string} functionKey @param {(refs: string[]) => Promise<any>} run @param {{minimum?: number, batch?: any}} [options] */
+function operatorPhotoAction(req, functionKey, run, { minimum = 2, batch = null } = {}) {
+  const order = req.operatorYardOrder;
+  const backgroundPhotos = req.body?.backgroundPhotos;
+  return withOperatorPhotoAction({
+    actor: req.operator, requestId: batch?.id || req.body?.requestId, functionKey,
+    orderId: req.params.id, orderType: batch ? "consolidation_load" : functionKey === "customer_pickup" ? "sales_order" : req.body?.orderType,
+    locationId: batch?.locationId || (functionKey === "receiving" ? order?.destination_location_id : outboundYardLocationId(order?.outbound_location_id ?? order?.source_location_id)),
+    backgroundPhotos, minimum,
+    legacyPhotos: backgroundPhotos === undefined ? requiredPhotoDataUrls(batch ? req.body?.photoRefs : req.body?.photoDataUrls, minimum) : []
+  }, run);
 }
 
 async function requireRegisteredForegroundDvirEvidence(req, type, photoReferences) {
@@ -6232,7 +6290,9 @@ const OPERATOR_RETURN_PRIVATE_KEYS = new Set([
   "externalid",
   "externalids",
   "foreignamount",
+  "linkedcredits",
   "netsuitelastsyncedat",
+  "netsuiteraattemptedat",
   "netsuitelinesnapshot",
   "netsuiteorderlinesnapshot",
   "netsuiteorderline",
@@ -6260,6 +6320,10 @@ function operatorSafeReturnPayload(value) {
   const safe = {};
   for (const [key, child] of Object.entries(value)) {
     const normalizedKey = key.toLowerCase().replaceAll("_", "");
+    if (Number(value.workflowVersion) >= 2 && ["netsuitetransactionid", "netsuitetransactionref"].includes(normalizedKey)) {
+      safe[key] = child;
+      continue;
+    }
     if (OPERATOR_RETURN_PRIVATE_KEYS.has(normalizedKey)) continue;
     safe[key] = operatorSafeReturnPayload(child);
   }
@@ -6322,14 +6386,6 @@ async function requireDispatchPlanEditLease(req, planDate = "") {
 
 async function requireDispatchV2PlanEditLease(req, planDate = "") {
   const input = dispatchEditLeaseInput(req, planDate);
-  const lease = await getDispatchPlanEditLease(input.planDate);
-  if (
-    input.token
-    && lease?.active
-    && String(lease.operatorId || "") === String(req.operator?.id || "")
-  ) {
-    return assertDispatchPlanEditLease({ ...input, sessionId: lease.sessionId });
-  }
   return assertDispatchPlanEditLease(input);
 }
 
@@ -6339,6 +6395,11 @@ function sendDispatchPlanEditLeaseError(res, error) {
     code: error.code || "DISPATCH_PLAN_EDIT_LEASE_REQUIRED",
     lease: error.lease || null
   });
+}
+
+function dispatchPlanWriteRequest(req, plan, operation) {
+  return { planId: plan.id, editLease: dispatchEditLeaseInput(req, plan.planDate), operation,
+    request: { ...(req.body || {}), ...(req.params.snapshotId ? { snapshotId: req.params.snapshotId } : {}) } };
 }
 
 function normalizedOperatorRole(operator) {
@@ -6363,6 +6424,7 @@ function requireDispatchAccess(req, res, next) {
     return sendRoleForbidden(res, req.operator, "SCM account required");
   }
   if (req.method === "GET" && operatorHasAnyRole(req.operator, ["sales"])) return next();
+  if (req.method === "POST" && req.path === "/maps/browser-session" && operatorHasAnyRole(req.operator, ["sales"])) return next();
   if (!operatorHasAnyRole(req.operator, ["dispatcher", "admin"])) {
     return sendRoleForbidden(res, req.operator, "Dispatcher account required");
   }
@@ -6893,6 +6955,9 @@ function changedDispatchOrderStructureRefs(previousPlan = {}, nextPlan = {}) {
     if (!after.membership.has(key) || before.membership.get(key) === after.membership.get(key)) continue;
     refs.add(key);
   }
+  for (const [key, membership] of after.membership) {
+    if (membership !== "normal" && !before.membership.has(key)) refs.add(key);
+  }
   for (const key of before.containers.keys()) {
     if (!after.containers.has(key)) continue;
     const left = before.containers.get(key);
@@ -6911,7 +6976,8 @@ export function safeNormalDependencyGroupingRefs(previousPlan = {}, nextPlan = {
 export function safeNormalDependencyGroupingTargets(previousPlan = {}, nextPlan = {}) {
   const before = dispatchOrderStructureState(previousPlan);
   return [...normalDispatchGroupTargets(nextPlan).entries()]
-    .filter(([sourceOrderRef]) => before.membership.get(sourceOrderRef) === "normal")
+    .filter(([sourceOrderRef]) => !before.membership.has(sourceOrderRef)
+      || before.membership.get(sourceOrderRef) === "normal")
     .map(([sourceOrderRef, groupRef]) => ({ sourceOrderRef, groupRef }));
 }
 
@@ -8392,6 +8458,8 @@ const delayedStatusRefreshWorker = createDelayedStatusRefreshWorker({
     fetchTransactionStatusFromNetSuite(netsuiteOrderId, netsuiteType)
   ),
   fetchSalesOrderLines: fetchDeliveryOrderDetailsFromNetSuite,
+  fetchPurchaseOrderLines: fetchPurchaseOrderDetailsFromNetSuite,
+  applyPurchaseOrderWeights: applyPurchaseOrderItemWeights,
   applyStatus: async ({ orderType, netsuiteOrderId, tranid, status, statusText }) => {
     const refreshConfig = DELAYED_STATUS_REFRESH_CONFIG[orderType];
     if (!refreshConfig) throw new Error(`Unsupported delayed status refresh order type: ${orderType}`);
@@ -8904,9 +8972,11 @@ app.use((req, res, next) => {
     );
   } else if (["/scm/netsuite-po", "/scm-netsuite-po.html", "/scm/vendors", "/scm-vendors.html"].includes(req.path)) {
     res.setHeader("Cache-Control", "no-cache, no-store, must-revalidate");
+  } else if (req.path === "/field-sales" || req.path.startsWith("/field-sales/")) {
+    res.setHeader("Cache-Control", "no-cache, no-store, must-revalidate");
   } else if (req.path === "/mbt" || req.path.startsWith("/mbt/")) {
     res.setHeader("Cache-Control", "no-cache, no-store, must-revalidate");
-  } else if (req.path.endsWith(".webmanifest") || ["/", "/operator", "/driver", "/control", "/control/returns", "/admin", "/admin/accounts", "/admin/sync", "/admin/maps-usage", "/admin/reconciliation", "/admin/printers", "/admin/photo-storage", "/admin/audit", "/admin/return-automation", "/admin/mbt-gates", "/dispatch", "/dispatch/custom-orders", "/dispatch/special-stock", "/dispatch/driver-pwa", "/dispatch/offline-review", "/sales", "/sales/planning", "/sales/schedule", "/sales/monitor", "/sales/printing", "/sales/in-outbound-record", "/sales/returns", "/sales/stock-requests", "/sales/delivery-instructions", "/dispatch/loaded-export", "/dispatch/in-outbound-record", "/control/in-outbound-record", "/dispatch/po-to-schedule", "/scm/custom-orders", "/scm/smart", "/scm/stock-requests", "/scm/to-printing", "/scm/dependency-management", "/scm/printers", "/scm/route-rules", "/scm/schedule-formatting", "/operator.html", "/driver.html", "/control.html", "/admin.html", "/dispatch-menu.html", "/dispatch-special-stock.html", "/dispatch-custom-orders.html", "/dispatch-offline-review.html", "/sales.html", "/sales-stock-requests.html", "/sales-delivery-instructions.html", "/sales-printing.html", "/dispatch-loaded-export.html", "/scm-smart.html", "/scm-stock-requests.html", "/scm/to-printing.html", "/scm/dependency-management.html", "/scm-dependency-management.js", "/scm-dependency-management.css", "/scm-printers.html", "/scm-route-rules.html", "/scm-schedule-formatting.html"].includes(req.path)) {
+  } else if (req.path.endsWith(".webmanifest") || ["/", "/operator", "/driver", "/control", "/control/returns", "/admin", "/admin/accounts", "/admin/sync", "/admin/maps-usage", "/admin/reconciliation", "/admin/printers", "/admin/photo-storage", "/admin/audit", "/admin/return-automation", "/admin/sor-auto-returns", "/admin/mbt-gates", "/dispatch", "/dispatch/custom-orders", "/dispatch/special-stock", "/dispatch/driver-pwa", "/dispatch/offline-review", "/sales", "/sales/planning", "/sales/schedule", "/sales/monitor", "/sales/printing", "/sales/in-outbound-record", "/sales/returns", "/sales/stock-requests", "/sales/delivery-instructions", "/dispatch/loaded-export", "/dispatch/in-outbound-record", "/control/in-outbound-record", "/dispatch/po-to-schedule", "/scm/custom-orders", "/scm/smart", "/scm/stock-requests", "/scm/to-printing", "/scm/dependency-management", "/scm/printers", "/scm/route-rules", "/scm/schedule-formatting", "/operator.html", "/driver.html", "/control.html", "/admin.html", "/dispatch-menu.html", "/dispatch-special-stock.html", "/dispatch-custom-orders.html", "/dispatch-offline-review.html", "/sales.html", "/sales-stock-requests.html", "/sales-delivery-instructions.html", "/sales-printing.html", "/dispatch-loaded-export.html", "/scm-smart.html", "/scm-stock-requests.html", "/scm/to-printing.html", "/scm/dependency-management.html", "/scm-dependency-management.js", "/scm-dependency-management.css", "/scm-printers.html", "/scm-route-rules.html", "/scm-schedule-formatting.html"].includes(req.path)) {
     res.setHeader("Cache-Control", "no-cache, no-store, must-revalidate");
   }
   next();
@@ -10326,6 +10396,19 @@ app.get("/api/sales/public-access", async (_req, res, next) => {
 });
 
 app.use("/api/scm", requireOperator, requireScmAccess);
+app.use("/api/count-sheets", requireOperator, requireOperatorAccess, operatorNetSuitePriority, createCountSheetRouter());
+app.use("/api/control/count-sheets", requireOperator, requireControlAccess, createCountSheetRouter({ management: true }));
+app.use("/api/inventory/damage", requireOperator, requireOperatorAccess, operatorNetSuitePriority, createInventoryDamageRouter());
+app.use("/api/control/damage", requireOperator, requireControlAccess, createControlDamageRouter());
+app.use("/api/admin/aggregate-request-access", requireOperator, requireAdmin, createAggregateRequestAccessRouter({
+  onChange: () => emitAppEvent("operator.access.updated", {})
+}));
+app.use("/api/aggregate-requests", requireOperator, createAggregateRequestRouter({
+  onChange: (payload) => emitAppEvent("aggregate-request.updated", payload)
+}));
+app.use("/api/scm/aggregate-requests", createAggregateRequestRouter({
+  scm: true, onChange: (payload) => emitAppEvent("aggregate-request.updated", payload)
+}));
 app.use("/api/dispatch", requireOperatorOrPublicSalesRead, requireDispatchAccess);
 
 app.post("/api/dispatch/order-completions", requireDispatcher, async (req, res, next) => {
@@ -10374,6 +10457,9 @@ app.post("/api/dispatch/order-completions", requireDispatcher, async (req, res, 
   }
 });
 app.use("/api/sales", requireSalesOperator, requireSalesAccess);
+const fieldSalesRuntime = createFieldSalesRuntime({ maps: googleMapsGateway, browserMap: authorizeGoogleBrowserMap });
+app.use("/api/field-sales", requireOperator, fieldSalesRuntime.router);
+app.get("/field-sales", (req, res) => res.redirect(302, "/field-sales/"));
 app.use("/api/mbt", requireOperator, createMbtRouter({
   frontdeskPricing: createFrontdeskPricingAdapter({
     routeEstimator: (input) => googleMapsGateway.estimateRoute({ ...input, subsystem: "support_route" })
@@ -12250,7 +12336,7 @@ function emitSpecialStockUpdate(source, detail = {}) {
 app.get("/api/sales/special-stock-requests/policy", requirePrivateSalesRecordAccess, async (_req, res, next) => {
   try {
     specialStockNoStore(res);
-    res.json(await getSpecialStockRequestPolicy());
+    res.json({ ...await getSpecialStockRequestPolicy(), testSkipOrdersEnabled: (await getSpecialStockTestSkipPolicy()).enabled });
   } catch (error) {
     next(error);
   }
@@ -12259,7 +12345,7 @@ app.get("/api/sales/special-stock-requests/policy", requirePrivateSalesRecordAcc
 app.get("/api/scm/special-stock-requests/policy", async (_req, res, next) => {
   try {
     specialStockNoStore(res);
-    res.json(await getSpecialStockRequestPolicy());
+    res.json({ ...await getSpecialStockRequestPolicy(), testSkipOrdersEnabled: (await getSpecialStockTestSkipPolicy()).enabled });
   } catch (error) {
     next(error);
   }
@@ -12368,6 +12454,22 @@ app.put("/api/sales/special-stock-requests/:id/sales-order-draft", requirePrivat
   }
 });
 
+app.post('/api/sales/special-stock-requests/:id/quantity-change', requirePrivateSalesRecordAccess, requireSpecialStockWorkflow, async (req, res, next) => {
+  try {
+    const detail = await requestSpecialQuantityChange(req.params.id, req.body || {}, specialStockSalesContext(req));
+    emitSpecialStockUpdate('quantity-change', { requestId: detail.id });
+    res.json(detail);
+  } catch (error) { next(error); }
+});
+app.post('/api/scm/special-stock-requests/:id/quantity-review', requireSmartScmWriteAccess, requireSpecialStockWorkflow, async (req, res, next) => {
+  try {
+    const detail = await reviewSpecialQuantityChange(req.params.id, req.body || {}, { operatorId: req.operator.id });
+    emitSpecialStockUpdate('quantity-review', { requestId: detail.id });
+    emitAppEvent('dispatch.orders.updated', { source: 'special-stock-request', refreshOrderPool: true });
+    res.json(detail);
+  } catch (error) { next(error); }
+});
+
 app.post("/api/sales/special-stock-requests/:id/sales-order/create", requirePrivateSalesRecordAccess, requireSpecialStockWorkflow, async (req, res, next) => {
   try {
     const detail = await createSpecialSalesOrder(req.params.id, req.body || {}, specialStockSalesContext(req));
@@ -12379,11 +12481,19 @@ app.post("/api/sales/special-stock-requests/:id/sales-order/create", requirePriv
   }
 });
 
+app.post('/api/sales/special-stock-requests/:id/sales-order/skip', requirePrivateSalesRecordAccess, requireSpecialStockWorkflow, async (req, res, next) => {
+  try {
+    const detail = await skipSpecialOrderCreation(req.params.id, { ...req.body, orderKind: 'sales_order' }, specialStockSalesContext(req));
+    emitSpecialStockUpdate('sales-order-test-skipped', { requestId: detail.id });
+    res.json(detail);
+  } catch (error) { next(error); }
+});
+
 app.post("/api/sales/special-stock-requests/:id/sales-order/link", requirePrivateSalesRecordAccess, requireSpecialStockWorkflow, async (req, res, next) => {
   try {
     const detail = await linkSpecialSalesOrder(req.params.id, {
       ...req.body,
-      source: "manual_link"
+      source: "manual_link", verifiedRemote: false, operationId: null
     }, specialStockSalesContext(req));
     emitSpecialStockUpdate("sales-order-link", { requestId: detail.id, salesOrderId: detail.salesOrderId });
     res.json(detail);
@@ -12547,6 +12657,19 @@ app.post("/api/scm/special-stock-requests/:id/sales-order/refresh", requireSmart
   }
 });
 
+app.post('/api/scm/special-stock-requests/:id/close-unavailable', requireSpecialStockWorkflow, requireSmartScmWriteAccess, async (req, res, next) => {
+  try {
+    const detail = await closeSpecialUnavailableCase(req.params.id, req.body || {}, { operatorId: req.operator.id });
+    emitSpecialStockUpdate('scm-close', { requestId: detail.id }); res.json(detail);
+  } catch (error) { next(error); }
+});
+app.post('/api/scm/special-stock-requests/:id/lines/:lineId/readiness', requireSpecialStockWorkflow, requireSmartScmWriteAccess, async (req, res, next) => {
+  try {
+    const detail = await checkSpecialStockReadiness(req.params.id, req.params.lineId, req.body || {}, { operatorId: req.operator.id });
+    emitSpecialStockUpdate('scm-readiness', { requestId: detail.id }); res.json(detail);
+  } catch (error) { next(error); }
+});
+
 app.post("/api/scm/special-stock-requests/:id/purchase-order/create", requireSmartScmWriteAccess, requireSpecialStockWorkflow, async (req, res, next) => {
   try {
     const detail = await createSpecialPurchaseOrder(req.params.id, req.body || {}, { operatorId: req.operator.id });
@@ -12557,9 +12680,17 @@ app.post("/api/scm/special-stock-requests/:id/purchase-order/create", requireSma
   }
 });
 
+app.post('/api/scm/special-stock-requests/:id/purchase-order/skip', requireSmartScmWriteAccess, requireSpecialStockWorkflow, async (req, res, next) => {
+  try {
+    const detail = await skipSpecialOrderCreation(req.params.id, { ...req.body, orderKind: 'purchase_order' }, { operatorId: req.operator?.id });
+    emitSpecialStockUpdate('purchase-order-test-skipped', { requestId: detail.id });
+    res.json(detail);
+  } catch (error) { next(error); }
+});
+
 app.post("/api/scm/special-stock-requests/:id/purchase-order/link", requireSmartScmWriteAccess, requireSpecialStockWorkflow, async (req, res, next) => {
   try {
-    const detail = await linkSpecialPurchaseOrder(req.params.id, req.body || {}, { operatorId: req.operator.id });
+    const detail = await linkSpecialPurchaseOrder(req.params.id, { ...req.body, verifiedRemote: false, operationId: null }, { operatorId: req.operator.id });
     emitSpecialStockUpdate("purchase-order-link", { requestId: detail.id, purchaseOrderId: detail.purchaseOrderId });
     res.json(detail);
   } catch (error) {
@@ -13290,7 +13421,7 @@ app.post("/api/dispatch/v2/plans/:id/commands", requireOperator, requireDispatch
         payload: req.body?.payload || {}
       }))).digest("hex")
     };
-    const stored = await getDispatchV2CommandReplay({ command: submittedCommand });
+    const stored = await getDispatchV2CommandReplay({ command: submittedCommand, planId: req.params.id });
     if (stored) {
       res.setHeader("X-Dispatch-Idempotent-Replay", "true");
       return res.json(stored.payload);
@@ -13320,7 +13451,8 @@ app.post("/api/dispatch/v2/plans/:id/commands", requireOperator, requireDispatch
     const result = await applyDispatchV2Command({
       planId: req.params.id,
       command,
-      actorId: req.operator?.id || null
+      actorId: req.operator?.id || null,
+      editLease: dispatchEditLeaseInput(req, previousPlan.planDate)
     });
     if (result.replay) res.setHeader("X-Dispatch-Idempotent-Replay", "true");
     if (!result.replay) {
@@ -13411,6 +13543,7 @@ app.post("/api/dispatch/v2/plans/:id/checkpoints", requireOperator, requireDispa
       checkpointKey: req.body?.idempotencyKey || "",
       expectedRevision: req.body?.expectedRevision,
       expectedDigest: req.body?.expectedDigest || ""
+      , editLease: dispatchEditLeaseInput(req, plan.planDate)
     });
     await writeDispatchAudit({
       action: `dispatch_plan_checkpoint_${kind}`,
@@ -13544,7 +13677,7 @@ app.post("/api/dispatch/plan-edit-lease/release", requireOperator, requireDispat
         sessionId: req.body?.sessionId || "",
         checkpointKey: `edit_release:${req.body?.sessionId || ""}:${planBeforeRelease.revision}`,
         expectedRevision: planBeforeRelease.revision,
-        expectedDigest: digestDispatchPlan(planBeforeRelease)
+        expectedDigest: planBeforeRelease.digest
       });
     }
     const released = await releaseDispatchPlanEditLease(dispatchEditLeaseInput(req));
@@ -13565,6 +13698,7 @@ app.post("/api/dispatch/plan-edit-lease/release", requireOperator, requireDispat
       });
     }
     res.json({ released: Boolean(released) });
+    if (released) {void dispatchMaintenanceTick({ planDate: released.planDate });}
   } catch (error) {
     next(error);
   }
@@ -13633,6 +13767,8 @@ app.post("/api/dispatch/plan-snapshots/:snapshotId/restore", requireOperator, re
     if (!beforePlan) return res.status(404).json({ error: "Dispatch snapshot not found" });
     await requireDispatchPlanEditLease(req, beforePlan.planDate);
     const currentPlanBeforeRestore = await getDispatchPlan(beforePlan.planId);
+    const replay = await getDispatchPlanWriteReplay(dispatchPlanWriteRequest(req, currentPlanBeforeRestore, 'restore_plan'));
+    if (replay) {return res.json(replay);}
     const expectedRevision = req.body?.expectedRevision;
     if (expectedRevision !== undefined && expectedRevision !== null && Number(expectedRevision) !== Number(currentPlanBeforeRestore?.revision || 0)) {
       throw Object.assign(new Error("Dispatch plan changed before the snapshot could be restored."), {
@@ -13643,7 +13779,7 @@ app.post("/api/dispatch/plan-snapshots/:snapshotId/restore", requireOperator, re
       });
     }
     const expectedDigest = String(req.body?.expectedDigest || "").trim();
-    const currentDigest = digestDispatchPlan(currentPlanBeforeRestore || {});
+    const currentDigest = currentPlanBeforeRestore?.digest || "";
     if (expectedDigest && expectedDigest !== currentDigest) {
       throw Object.assign(new Error("Dispatch plan content changed before the snapshot could be restored."), {
         code: "STALE_DISPATCH_PLAN",
@@ -13691,10 +13827,11 @@ app.post("/api/dispatch/plan-snapshots/:snapshotId/restore", requireOperator, re
     if (assignmentConflicts.length) return sendDispatchLoadAssignmentConflictResponse(res, assignmentConflicts);
     const dependencyConflicts = await validateDispatchPlanDependencies(restoreCandidate);
     if (dependencyConflicts.length) return sendDispatchDependencyConflictResponse(res, dependencyConflicts);
-    const restored = await restoreDispatchPlanSnapshot(req.params.snapshotId, {
+    const restored = await withDispatchPlanWrite(dispatchPlanWriteRequest(req, currentPlanBeforeRestore, 'restore_plan'), () => restoreDispatchPlanSnapshot(req.params.snapshotId, {
       sessionId: req.body?.audit?.sessionId || ""
-    });
+    }));
     const plan = restored.plan;
+    if (restored.idempotentReplay) {return res.json(restored);}
     await syncOrderDependenciesFromDispatchPlan(plan, {
       allowEstablishedUngroupTargets: dependencyStructureChanges.safeUngroupTargets
     });
@@ -13803,6 +13940,8 @@ app.put("/api/dispatch/plans/:id", reportDispatchSaveTiming, requireOperator, re
     if (!previousPlan) return res.status(404).json({ error: "Dispatch plan not found" });
     await requireDispatchPlanEditLease(req, previousPlan.planDate);
     const forceSave = req.body?.forceSave === true;
+    const replay = await getDispatchPlanWriteReplay(dispatchPlanWriteRequest(req, previousPlan, 'save_snapshot'));
+    if (replay) {return res.json(replay);}
     const requestedPlanDate = String(req.body?.planDate || req.body?.date || previousPlan?.planDate || "").slice(0, 10);
     const existingPlanDate = String(previousPlan?.planDate || "").slice(0, 10);
     if (previousPlan && requestedPlanDate && existingPlanDate && requestedPlanDate !== existingPlanDate) {
@@ -13906,7 +14045,15 @@ app.put("/api/dispatch/plans/:id", reportDispatchSaveTiming, requireOperator, re
         { orders: cleanOrders, trucks: cleanTrucks }
       )
     ) {
-      return res.json({ ...previousPlan, operatorFlags: null, noChange: true });
+      const unchanged = await withDispatchPlanWrite(dispatchPlanWriteRequest(req, previousPlan, 'save_snapshot'), async () => {
+        if (!hasUnappliedDispatchPlanMaintenance(await pendingDispatchPlanMaintenance(previousPlan.id))) {return getDispatchPlan(req.params.id);}
+        return saveDispatchPlanSnapshot(previousPlan.id, {
+          orders: cleanOrders, trucks: cleanTrucks, summary: req.body?.summary || previousPlan.summary || {},
+          baseRevision: previousPlan.revision, planDate: previousPlan.planDate,
+          sessionId: req.body?.audit?.sessionId || req.body?.sessionId || ""
+        });
+      });
+      return res.json({ ...unchanged, operatorFlags: null, noChange: Number(unchanged.revision) === Number(previousPlan.revision) });
     }
     const nextPlanForValidation = {
       ...previousPlan,
@@ -13963,16 +14110,17 @@ app.put("/api/dispatch/plans/:id", reportDispatchSaveTiming, requireOperator, re
     }
     const storedSummary = await dispatchPlanSummaryWithSetup(req.body?.summary || {});
     recoveryCandidate = { ...recoveryCandidate, summary: storedSummary };
-    const plan = await saveDispatchPlanSnapshot(req.params.id, {
+    const plan = await withDispatchPlanWrite(dispatchPlanWriteRequest(req, previousPlan, 'save_snapshot'), () => saveDispatchPlanSnapshot(req.params.id, {
       orders: cleanOrders,
       trucks: cleanTrucks,
       summary: storedSummary,
-      baseRevision: forceSave || saveMode === "truck_sequence" ? null : req.body?.baseRevision,
+      baseRevision: req.body?.baseRevision,
       planDate: req.body?.planDate || req.body?.date || "",
       sessionId: req.body?.audit?.sessionId || "",
       retiredGlobalOrderRefs,
       reactivatedGlobalOrderRefs
-    });
+    }));
+    if (plan.idempotentReplay) {return res.json(plan);}
     const followupWarnings = [];
     const followupContext = {
       plan,
@@ -14113,9 +14261,12 @@ app.post("/api/dispatch/plans/:id/confirm", requireOperator, requireDispatcher, 
     previousPlan = await getDispatchPlan(req.params.id);
     if (!previousPlan) return res.status(404).json({ error: "Dispatch plan not found" });
     await requireDispatchPlanEditLease(req, previousPlan.planDate);
+    let dependencyStructureChanges = { safeGroupingTargets: [], safeUngroupTargets: [] };
     const hasSubmittedSnapshot = Array.isArray(req.body?.orders) || Array.isArray(req.body?.trucks);
     let planForConfirm = previousPlan;
-    let dependencyStructureChanges = { safeGroupingTargets: [], safeUngroupTargets: [] };
+    const plan = await withDispatchPlanWrite(dispatchPlanWriteRequest(req, previousPlan, 'confirm_plan'), async () => {
+    previousPlan = await getDispatchPlan(req.params.id);
+    planForConfirm = previousPlan;
     if (hasSubmittedSnapshot) {
       const requestedPlanDate = String(req.body?.planDate || req.body?.date || previousPlan?.planDate || "").slice(0, 10);
       const existingPlanDate = String(previousPlan?.planDate || "").slice(0, 10);
@@ -14162,7 +14313,7 @@ app.post("/api/dispatch/plans/:id/confirm", requireOperator, requireDispatcher, 
         { planDate: previousPlan?.planDate || req.body?.planDate || req.body?.date }
       );
       const duplicateDrivers = config.dispatch?.driverOrientedPlanning ? [] : dispatchDuplicateDriverAssignments(requestedTrucks);
-      if (duplicateDrivers.length) return sendDispatchDuplicateDriverResponse(res, duplicateDrivers);
+      if (duplicateDrivers.length) {throw dispatchV2CandidateConflict("DISPATCH_DRIVER_DUPLICATE", "One driver can only be assigned to one truck.", duplicateDrivers);}
       dependencyStructureChanges = await assertNoConsolidationStructureConflict(
         previousPlan,
         { orders: requestedOrders }
@@ -14178,26 +14329,26 @@ app.post("/api/dispatch/plans/:id/confirm", requireOperator, requireDispatcher, 
         submittedPlanForValidation,
         { requireAssignments: true }
       );
-      if (assignmentConflicts.length) return sendDispatchLoadAssignmentConflictResponse(res, assignmentConflicts);
+      if (assignmentConflicts.length) {throw dispatchV2CandidateConflict(assignmentConflicts[0]?.code || "DISPATCH_DRIVER_TIME_CONFLICT", assignmentConflicts[0]?.message || assignmentConflicts[0]?.reason || "Driver or truck assignment is invalid.", assignmentConflicts);}
       const dateConflicts = await findNewDispatchPlanDateConflicts(previousPlan || {}, {
         ...submittedPlanForValidation,
         id: req.params.id
       });
-      if (dateConflicts.length) return sendDispatchPlanDateConflictResponse(res, dateConflicts);
+      if (dateConflicts.length) {throw dispatchV2CandidateConflict(dateConflicts[0]?.code || "DISPATCH_ORDER_ALREADY_PLANNED", dateConflicts[0]?.message || dateConflicts[0]?.reason || "Some orders are already planned on another date.", dateConflicts);}
       const coSequenceConflicts = await findChangedDispatchCoSequenceConflicts(previousPlan, {
         id: req.params.id,
         planDate: previousPlan?.planDate || req.body?.planDate || req.body?.date,
         orders: requestedOrders,
         trucks: requestedTrucks
       });
-      if (coSequenceConflicts.length) return sendDispatchCoSequenceConflictResponse(res, coSequenceConflicts);
+      if (coSequenceConflicts.length) {throw dispatchV2CandidateConflict(coSequenceConflicts[0]?.code || "DISPATCH_CO_SEQUENCE_INVALID", coSequenceConflicts[0]?.message || coSequenceConflicts[0]?.reason || "CO must be planned before the original order pickup.", coSequenceConflicts);}
       const dependencyConflicts = await validateDispatchPlanDependencies({
         id: req.params.id,
         planDate: previousPlan?.planDate || req.body?.planDate || req.body?.date,
         orders: requestedOrders,
         trucks: requestedTrucks
       });
-      if (dependencyConflicts.length) return sendDispatchDependencyConflictResponse(res, dependencyConflicts);
+      if (dependencyConflicts.length) {throw dispatchV2CandidateConflict(dependencyConflicts[0]?.code || "DISPATCH_ORDER_DEPENDENCY_CONFLICT", dependencyConflicts[0]?.message || dependencyConflicts[0]?.reason || "Order dependency timing is invalid.", dependencyConflicts);}
       if (dispatchConfirmPlanDataChanged(
         { orders: previousPlan.orders || [], trucks: previousPlan.trucks || [] },
         { orders: requestedOrders, trucks: requestedTrucks }
@@ -14218,11 +14369,11 @@ app.post("/api/dispatch/plans/:id/confirm", requireOperator, requireDispatcher, 
       planDate: planForConfirm.planDate
     });
     const duplicateDrivers = config.dispatch?.driverOrientedPlanning ? [] : dispatchDuplicateDriverAssignments(planForConfirm?.trucks || []);
-    if (duplicateDrivers.length) return sendDispatchDuplicateDriverResponse(res, duplicateDrivers);
+    if (duplicateDrivers.length) {throw dispatchV2CandidateConflict("DISPATCH_DRIVER_DUPLICATE", "One driver can only be assigned to one truck.", duplicateDrivers);}
     const finalAssignmentConflicts = await dispatchLoadAssignmentConflicts(previousPlan, planForConfirm, { requireAssignments: true });
-    if (finalAssignmentConflicts.length) return sendDispatchLoadAssignmentConflictResponse(res, finalAssignmentConflicts);
+    if (finalAssignmentConflicts.length) {throw dispatchV2CandidateConflict(finalAssignmentConflicts[0]?.code || "DISPATCH_DRIVER_TIME_CONFLICT", finalAssignmentConflicts[0]?.message || finalAssignmentConflicts[0]?.reason || "Driver or truck assignment is invalid.", finalAssignmentConflicts);}
     const finalDependencyConflicts = await validateDispatchPlanDependencies(planForConfirm);
-    if (finalDependencyConflicts.length) return sendDispatchDependencyConflictResponse(res, finalDependencyConflicts);
+    if (finalDependencyConflicts.length) {throw dispatchV2CandidateConflict(finalDependencyConflicts[0]?.code || "DISPATCH_ORDER_DEPENDENCY_CONFLICT", finalDependencyConflicts[0]?.message || finalDependencyConflicts[0]?.reason || "Order dependency timing is invalid.", finalDependencyConflicts);}
     const binConfirmationRequired = binDispatchOrders(planForConfirm).length > 0;
     let binConfirmationCapability = null;
     if (binConfirmationRequired) {
@@ -14241,9 +14392,9 @@ app.post("/api/dispatch/plans/:id/confirm", requireOperator, requireDispatcher, 
         sessionId: req.body?.audit?.sessionId || "",
         checkpointKey: `before_confirm:${planForConfirm.revision}`,
         expectedRevision: planForConfirm.revision,
-        expectedDigest: digestDispatchPlan(planForConfirm)
+        expectedDigest: planForConfirm.digest
       });
-    const plan = binConfirmationRequired
+    return binConfirmationRequired
       ? await confirmMbtBinDispatchPlan({
           actor: {
             operatorId: String(req.operator?.id || ""),
@@ -14253,6 +14404,8 @@ app.post("/api/dispatch/plans/:id/confirm", requireOperator, requireDispatcher, 
           note: req.body?.note || ""
         }, { capability: binConfirmationCapability })
       : await confirmDispatchPlan(req.params.id, { note: req.body?.note || "" });
+    });
+    if (plan.idempotentReplay) {return res.json(plan);}
     const followupWarnings = [];
     const followupContext = {
       plan,
@@ -14367,6 +14520,7 @@ app.post("/api/dispatch/plans/:id/reopen", requireOperator, requireDispatcher, a
     const existingPlan = await getDispatchPlan(req.params.id);
     if (!existingPlan) return res.status(404).json({ error: "Dispatch plan not found" });
     await requireDispatchPlanEditLease(req, existingPlan.planDate);
+    const plan = await withDispatchPlanWrite(dispatchPlanWriteRequest(req, existingPlan, 'reopen_plan'), async () => {
     if (config.dispatch?.plannerCommandMode === "on") await createDispatchV2Checkpoint({
         planId: existingPlan.id,
         kind: "lifecycle",
@@ -14374,9 +14528,11 @@ app.post("/api/dispatch/plans/:id/reopen", requireOperator, requireDispatcher, a
         sessionId: req.body?.audit?.sessionId || "",
         checkpointKey: `before_reopen:${existingPlan.revision}`,
         expectedRevision: existingPlan.revision,
-        expectedDigest: digestDispatchPlan(existingPlan)
+        expectedDigest: existingPlan.digest
       });
-    const plan = await reopenDispatchPlan(req.params.id, { note: req.body?.note || "" });
+    return reopenDispatchPlan(req.params.id, { note: req.body?.note || "" });
+    });
+    if (plan.idempotentReplay) {return res.json(plan);}
     await writeDispatchAudit({
       action: "dispatch_plan_reopened",
       entityType: "plan",
@@ -14964,7 +15120,8 @@ function scmDependencyActor(req, surface = "scm") {
     id: req.operator?.id || "",
     name: req.operator?.display_name || req.operator?.username || "",
     sessionId: req.body?.sessionId || req.body?.audit?.sessionId || req.query?.sessionId || "",
-    surface
+    surface,
+    ...(surface === 'dispatch' ? { editLease: dispatchEditLeaseInput(req) } : {})
   };
 }
 
@@ -17224,7 +17381,8 @@ app.put("/api/dispatch/orders/:id/vendor-yard", async (req, res, next) => {
       details: { vendorYardId: req.body?.vendorYardId }
     }).catch(() => null);
     emitAppEvent("dispatch.orders.updated", { orderId: req.params.id, type: "PO", change: "vendor_yard", sourceSessionId: req.body?.audit?.sessionId });
-    const orderResponse = await dispatchMutationOrderResponse(req, [req.params.id], { legacyType: "PO" });
+    const orderResponse = updated.order ? { orders: [updated.order] }
+      : await dispatchMutationOrderResponse(req, [req.params.id], { legacyType: "PO" });
     res.json({ updated, order: req.query.response === "targeted" ? orderResponse.orders[0] || null : undefined, ...orderResponse });
   } catch (error) {
     next(error);
@@ -17275,7 +17433,7 @@ app.put("/api/dispatch/orders/:id/details", reportDispatchCoTiming("details_upda
       return res.json({ updated });
     }
     if (req.query.response === "targeted") {
-      const order = (await targetedDispatchMutationOrders([req.params.id]))[0] || null;
+      const order = updated.order || (await targetedDispatchMutationOrders([req.params.id]))[0] || null;
       return res.json({ updated, order });
     }
     res.json({ updated, orders: await listDispatchOrdersForResponse() });
@@ -17283,6 +17441,20 @@ app.put("/api/dispatch/orders/:id/details", reportDispatchCoTiming("details_upda
     next(error);
   }
 });
+
+let sorTickRunning = false;
+async function sorReturnTick() {
+  if (sorTickRunning) { return { running: true }; }
+  sorTickRunning = true;
+  try {
+    return await runSorReturnQueue({ loadOrders: loadDispatchOrdersForResponse, refreshRefs: async refs => {
+      if (refs.length) { await refreshDispatchOrderCatalogRefsNow(refs); }
+      emitAppEvent("dispatch.orders.updated", { source: "sor-returns", refreshOrderPool: true });
+    }});
+  } catch (error) { console.error("SOR returns:", error.message); return { error: error.message }; }
+  finally { sorTickRunning = false; }
+}
+app.use("/api/admin/sor-auto-returns", requireOperator, requireAdmin, sorAdminRouter({ tick: sorReturnTick }));
 
 app.get("/api/dispatch/orders/:id/po-allocations", async (req, res, next) => {
   try {
@@ -17604,6 +17776,7 @@ app.put("/api/dispatch/plan", async (req, res, next) => {
         { orders: previousPlan.orders || [], trucks: previousPlan.trucks || [] },
         { orders: payload.orders, trucks: payload.trucks }
       )
+      && !hasUnappliedDispatchPlanMaintenance(await pendingDispatchPlanMaintenance(previousPlan.id))
     ) {
       return res.json({ ...previousPlan, operatorFlags: null, noChange: true });
     }
@@ -17697,6 +17870,11 @@ app.get("/operator", (req, res) => {
   res.sendFile(path.join(publicDir, "operator.html"));
 });
 
+app.get("/aggregate-requests", (_req, res) => {
+  res.setHeader("Cache-Control", "no-store");
+  res.sendFile(path.join(publicDir, "aggregate-requests.html"));
+});
+
 function setDriverSiteResetResponseHeaders(res) {
   res.setHeader("Cache-Control", "no-store, no-cache, must-revalidate, private, max-age=0");
   res.setHeader("Pragma", "no-cache");
@@ -17786,6 +17964,8 @@ app.get([
   "/control/yard-in-outbound",
   "/control/in-outbound-record",
   "/control/cycle-count-review",
+  "/control/count-sheets",
+  "/control/damage-stock",
   "/control/operator-load-records"
 ], (req, res) => {
   res.sendFile(path.join(publicDir, "control.html"));
@@ -17799,7 +17979,7 @@ app.get([
   "/admin/reconciliation",
   "/admin/photo-storage",
   "/admin/audit",
-  "/admin/return-automation"
+  "/admin/return-automation", "/admin/sor-auto-returns"
 ], (req, res) => {
   res.sendFile(path.join(publicDir, "admin.html"));
 });
@@ -18069,7 +18249,10 @@ app.post("/api/auth/logout", requireOperator, async (req, res, next) => {
   }
 });
 
-app.use("/api/operator", requireOperator, requireOperatorAccess, requireOperatorYardRequest);
+// Account preferences are independent of the currently selected yard.
+app.use("/api/operator/preferences", requireOperator, requireOperatorAccess, createOperatorPreferencesRouter());
+
+app.use("/api/operator", requireOperator, requireOperatorAccess, requireOperatorYardRequest, operatorNetSuitePriority);
 
 app.get("/api/photo-upload/config", requireOperator, (req, res) => {
   res.json(publicPhotoUploadConfig());
@@ -18077,12 +18260,25 @@ app.get("/api/photo-upload/config", requireOperator, (req, res) => {
 
 app.get("/api/photo-upload/preview", requirePhotoPreviewViewer, async (req, res, next) => {
   try {
-    const ref = String(req.query.ref || req.query.key || "");
+    let ref = String(req.query.ref || req.query.key || "");
+    const background = isBackgroundPhotoReference(ref) ? await getBackgroundPhoto(ref.slice(17)) : null;
+    if (background) {
+      const viewer = /** @type {any} */ (req).photoViewer;
+      if (operatorHasAnyRole(viewer, ["operator"]) && !operatorHasAnyRole(viewer, ["admin", "dispatcher", "yard_manager", "sales"])) {
+        assertOperatorYard(viewer, background.location_id);
+      }
+      res.setHeader("Cache-Control", "no-store");
+      if (background.bytes) return res.type(background.mime_type).send(background.bytes);
+      if (!background.r2_ref) return res.type("image/svg+xml").send('<svg xmlns="http://www.w3.org/2000/svg" width="400" height="240"><rect width="400" height="240" fill="#f1f5f4"/><text x="200" y="120" text-anchor="middle" fill="#354b48" font-family="sans-serif" font-size="20">Photo upload pending</text></svg>');
+      ref = background.r2_ref;
+    }
     if (!isR2PhotoReference(ref) && !String(req.query.key || "")) {
       return res.status(400).json({ error: "R2 photo reference is required." });
     }
+    await assertSorSignaturePhotoAccess(req.photoViewer, ref || req.query.key);
+    const damagePhoto = await assertDamagePhotoAccess(req.photoViewer, ref || req.query.key);
     await assertReturnPhotoPreviewAccess(req.photoViewer, ref || req.query.key);
-    if (!returnPhotoActorId(ref || req.query.key) && operatorHasAnyRole(req.photoViewer, ["operator"])
+    if (!background && !damagePhoto && !returnPhotoActorId(ref || req.query.key) && operatorHasAnyRole(req.photoViewer, ["operator"])
         && !operatorHasAnyRole(req.photoViewer, ["admin", "dispatcher", "yard_manager", "sales"])) {
       await assertOperatorOrderPhotoYard(req.photoViewer, ref || req.query.key);
     }
@@ -18220,6 +18416,15 @@ app.post("/api/operator/photo-upload-token", requireOperator, async (req, res, n
   } catch (error) {
     next(error);
   }
+});
+
+app.get("/api/operator/photo-actions/:id", async (req, res, next) => {
+  try { res.setHeader("Cache-Control", "no-store"); res.json(await getBackgroundPhotoAction(/** @type {any} */ (req).operator, req.params.id)); }
+  catch (error) { next(error); }
+});
+app.put("/api/operator/background-photos/:id", express.raw({ type: "application/octet-stream", limit: "10mb" }), async (req, res, next) => {
+  try { res.json(await receiveBackgroundPhoto(/** @type {any} */ (req).operator, req.params.id, req.body)); }
+  catch (error) { next(error); }
 });
 
 app.use("/api/driver", (_req, res, next) => {
@@ -20648,7 +20853,8 @@ app.post("/api/driver/jobs/:jobId/confirm-truck-switch", requireDriver, async (r
         }
       }).catch(() => null);
       let nextJob = await getNextDriverJob(req.driverLogin);
-      if (!receipt && nextJob && nextJob.stopType !== "truck_switch") {
+      if (!receipt && nextJob && nextJob.stopType !== "truck_switch"
+        && !nextJob.sorReturnReadiness?.some(state => !state.allowed)) {
         const nextContext = await getDriverNextJobContext(req.driverLogin);
         nextJob = nextContext.job || nextJob;
         await startDriverPhysicalVisitJobs(req.driverLogin, nextJob, nextContext.jobs || [], { requireCurrentJob: true });
@@ -20735,7 +20941,8 @@ app.post("/api/driver/jobs/:jobId/skip-samsara", requireDriver, async (req, res,
         }
       }).catch(() => null);
       let nextJob = await getNextDriverJob(req.driverLogin);
-      if (!receipt && nextJob && nextJob.stopType !== "truck_switch") {
+      if (!receipt && nextJob && nextJob.stopType !== "truck_switch"
+        && !nextJob.sorReturnReadiness?.some(state => !state.allowed)) {
         const nextContext = await getDriverNextJobContext(req.driverLogin);
         nextJob = nextContext.job || nextJob;
         await startDriverPhysicalVisitJobs(req.driverLogin, nextJob, nextContext.jobs || [], { requireCurrentJob: true });
@@ -20859,6 +21066,7 @@ app.post("/api/driver/jobs/:jobId/photos", requireDriver, async (req, res, next)
       routeJobs: jobContext.jobs || [],
       photoDataUrls,
       driverRemark: req.body?.driverRemark,
+      customerSignature: await resolveSorSignature(req.body?.customerSignature, {job}),
       requireCurrentJob: true
     });
     const {
@@ -20947,6 +21155,8 @@ app.post("/api/driver/jobs/:jobId/photos", requireDriver, async (req, res, next)
           }
         }
       }
+      const sorBlock = nextJob?.sorReturnReadiness?.find(state => !state.allowed);
+      if (sorBlock) { autoStartAllowed = false; nextStartBlock = sorBlock; }
       if (autoStartAllowed) {
         nextJobContext ||= await getDriverNextJobContext(req.driverLogin);
         if (!nextJobContext.job || String(nextJobContext.job.jobId) !== String(nextJob.jobId)) {
@@ -21018,6 +21228,23 @@ app.get("/api/admin/maps-usage", requireOperator, requireAdmin, async (_req, res
     const summary = await googleMapsUsageRepository.summary();
     res.setHeader("Cache-Control", "no-store");
     res.json({ ...summary, mode: config.googleMaps?.mode || "conserve" });
+  } catch (error) {
+    next(error);
+  }
+});
+
+app.post("/api/admin/maps-usage/reopen-daily", requireOperator, requireAdmin, async (req, res, next) => {
+  try {
+    const reopen = await googleMapsUsageRepository.reopenDailyCapacity({
+      requestId: req.body?.requestId,
+      day: req.body?.day,
+      expectedLimit: req.body?.expectedLimit,
+      actorId: req.operator.id,
+      mode: config.googleMaps?.mode || "conserve"
+    });
+    const summary = await googleMapsUsageRepository.summary();
+    res.setHeader("Cache-Control", "no-store");
+    res.json({ ...summary, mode: config.googleMaps?.mode || "conserve", reopen });
   } catch (error) {
     next(error);
   }
@@ -21158,7 +21385,7 @@ app.put("/api/operators/:id/roles", requireOperator, requireAdmin, async (req, r
 
 // Return workflow operator endpoints. These routes intentionally use explicit
 // staff middleware because /api/returns has no broader role middleware.
-app.get("/api/returns/reasons", requireOperator, requireOperatorAccess, requireOperatorYardRequest, async (req, res, next) => {
+app.get("/api/returns/reasons", requireOperator, requireOperatorAccess, requireOperatorYardRequest, operatorNetSuitePriority, async (req, res, next) => {
   try {
     res.setHeader("Cache-Control", "no-store");
     const [reasons, settings] = await Promise.all([
@@ -21178,7 +21405,7 @@ app.get("/api/returns/reasons", requireOperator, requireOperatorAccess, requireO
   }
 });
 
-app.post("/api/returns/orders/lookup", requireOperator, requireOperatorAccess, requireOperatorYardRequest, async (req, res, next) => {
+app.post("/api/returns/orders/lookup", requireOperator, requireOperatorAccess, requireOperatorYardRequest, operatorNetSuitePriority, async (req, res, next) => {
   try {
     assertReturnOperatorYard(req.operator, req.body?.receivingLocationId || req.body?.yardLocationId);
     const returnMode = String(req.body?.mode || req.body?.returnMode || "").trim().toLowerCase();
@@ -21195,7 +21422,7 @@ app.post("/api/returns/orders/lookup", requireOperator, requireOperatorAccess, r
   }
 });
 
-app.get("/api/returns/customers", requireOperator, requireOperatorAccess, requireOperatorYardRequest, async (req, res, next) => {
+app.get("/api/returns/customers", requireOperator, requireOperatorAccess, requireOperatorYardRequest, operatorNetSuitePriority, async (req, res, next) => {
   try {
     res.setHeader("Cache-Control", "no-store");
     res.json({
@@ -21206,7 +21433,7 @@ app.get("/api/returns/customers", requireOperator, requireOperatorAccess, requir
   }
 });
 
-app.get("/api/returns/customers/:customerId/pallet-balance", requireOperator, requireOperatorAccess, requireOperatorYardRequest, async (req, res, next) => {
+app.get("/api/returns/customers/:customerId/pallet-balance", requireOperator, requireOperatorAccess, requireOperatorYardRequest, operatorNetSuitePriority, async (req, res, next) => {
   try {
     res.setHeader("Cache-Control", "no-store");
     const result = await lookupReturnCustomerPalletBalance(req.params.customerId);
@@ -21216,7 +21443,7 @@ app.get("/api/returns/customers/:customerId/pallet-balance", requireOperator, re
   }
 });
 
-app.get("/api/returns/operator/drafts", requireOperator, requireOperatorAccess, requireOperatorYardRequest, async (req, res, next) => {
+app.get("/api/returns/operator/drafts", requireOperator, requireOperatorAccess, requireOperatorYardRequest, operatorNetSuitePriority, async (req, res, next) => {
   try {
     assertReturnOperatorYard(req.operator, req.query.receivingLocationId || req.query.yardLocationId);
     res.json(operatorSafeReturnPayload({
@@ -21230,7 +21457,7 @@ app.get("/api/returns/operator/drafts", requireOperator, requireOperatorAccess, 
   }
 });
 
-app.get("/api/returns/operator/history", requireOperator, requireOperatorAccess, requireOperatorYardRequest, async (req, res, next) => {
+app.get("/api/returns/operator/history", requireOperator, requireOperatorAccess, requireOperatorYardRequest, operatorNetSuitePriority, async (req, res, next) => {
   try {
     const result = await listReturnRecords(returnListFilters(req, {
       receivingLocationIds: operatorYardLocationIds(req.operator),
@@ -21243,7 +21470,7 @@ app.get("/api/returns/operator/history", requireOperator, requireOperatorAccess,
   }
 });
 
-app.get("/api/returns/operator/history/:id", requireOperator, requireOperatorAccess, requireOperatorYardRequest, async (req, res, next) => {
+app.get("/api/returns/operator/history/:id", requireOperator, requireOperatorAccess, requireOperatorYardRequest, operatorNetSuitePriority, async (req, res, next) => {
   try {
     const record = await getReturnRecordDetail(req.params.id, { operatorId: req.operator.id });
     if (!record) return res.status(404).json({ error: "Return record was not found." });
@@ -21253,7 +21480,7 @@ app.get("/api/returns/operator/history/:id", requireOperator, requireOperatorAcc
   }
 });
 
-app.post("/api/returns/drafts", requireOperator, requireOperatorAccess, requireOperatorYardRequest, async (req, res, next) => {
+app.post("/api/returns/drafts", requireOperator, requireOperatorAccess, requireOperatorYardRequest, operatorNetSuitePriority, async (req, res, next) => {
   try {
     assertReturnOperatorYard(req.operator, req.body?.receivingLocationId || req.body?.yardLocationId);
     res.json(operatorSafeReturnPayload({
@@ -21264,7 +21491,7 @@ app.post("/api/returns/drafts", requireOperator, requireOperatorAccess, requireO
   }
 });
 
-app.delete("/api/returns/drafts/:draftId", requireOperator, requireOperatorAccess, requireOperatorYardRequest, async (req, res, next) => {
+app.delete("/api/returns/drafts/:draftId", requireOperator, requireOperatorAccess, requireOperatorYardRequest, operatorNetSuitePriority, async (req, res, next) => {
   try {
     const result = await deleteReturnDraft({
       draftId: req.params.draftId,
@@ -21277,7 +21504,7 @@ app.delete("/api/returns/drafts/:draftId", requireOperator, requireOperatorAcces
   }
 });
 
-app.post("/api/returns/submit", requireOperator, requireOperatorAccess, requireOperatorYardRequest, async (req, res, next) => {
+app.post("/api/returns/submit", requireOperator, requireOperatorAccess, requireOperatorYardRequest, operatorNetSuitePriority, async (req, res, next) => {
   try {
     assertReturnOperatorYard(req.operator, req.body?.receivingLocationId || req.body?.yardLocationId);
     const result = await submitReturnBatch({
@@ -22739,11 +22966,12 @@ app.post("/api/admin/sales-order-fulfillment/historical", requireOperator, requi
   }
 });
 
-app.use("/api/delivery", requireOperator, requireOperatorAccess, requireOperatorYardRequest);
-app.use("/api/customer-pickup", requireOperator, requireOperatorAccess, requireOperatorYardRequest);
-app.use("/api/receiving", requireOperator, requireOperatorAccess, requireOperatorYardRequest);
-app.use("/api/inventory", requireOperator, requireOperatorAccess, requireOperatorYardRequest);
-app.use("/api/cycle-count", requireOperator, requireOperatorAccess, requireOperatorYardRequest);
+app.use("/api/delivery", requireOperator, requireOperatorAccess, requireOperatorYardRequest, operatorNetSuitePriority);
+app.use("/api/customer-pickup", requireOperator, requireOperatorAccess, requireOperatorYardRequest, operatorNetSuitePriority);
+app.use("/api/receiving", requireOperator, requireOperatorAccess, requireOperatorYardRequest, operatorNetSuitePriority);
+app.use("/api/receiving", createOperatorReceiptRecoveryRouter());
+app.use("/api/inventory", requireOperator, requireOperatorAccess, requireOperatorYardRequest, operatorNetSuitePriority);
+app.use("/api/cycle-count", requireOperator, requireOperatorAccess, requireOperatorYardRequest, operatorNetSuitePriority);
 
 app.use("/api/delivery/orders/:id", async (req, res, next) => {
   try {
@@ -22806,9 +23034,9 @@ app.post("/api/customer-pickup/lookup", async (req, res, next) => {
       if (isPendingApprovalStatus(order.status, order.status_text)) {
         return res.status(409).json({ error: "This pickup sales order is still pending approval in NetSuite." });
       }
-      assertOperatorYard(req.operator, order.outbound_location_id);
+      assertOperatorYard(req.operator, outboundYardLocationId(order.outbound_location_id));
       await upsertSalesOrders([order]);
-      const lines = await fetchDeliveryOrderDetailsFromNetSuite(order.id, locationId);
+      const lines = await fetchDeliveryOrderDetailsFromNetSuite(order.id);
       await upsertSalesOrderLines(order.id, lines);
       await markMissingOutboundOrderLines(order.id, lines.map((line) => line.line_id));
       orderId = order.id;
@@ -22872,7 +23100,7 @@ app.post("/api/customer-pickup/orders/:id/clear-draft", async (req, res, next) =
 
 app.post("/api/customer-pickup/orders/:id/load", async (req, res, next) => {
   try {
-    const photoDataUrls = requiredPhotoDataUrls(req.body?.photoDataUrls, 0);
+    const saved = await operatorPhotoAction(req, "customer_pickup", async photoDataUrls => {
     const admission = await submitOperatorNetSuitePostingAction({
       requestId: req.body?.requestId,
       actorOperatorId: operatorId(req),
@@ -22884,12 +23112,14 @@ app.post("/api/customer-pickup/orders/:id/load", async (req, res, next) => {
       expectedPolicy: req.body?.netSuitePostingPolicy || req.body?.postingPolicy
     });
     const posting = operatorNetSuitePostingHttpResult(admission);
-    if (posting) return res.json(posting);
+    if (posting) return posting;
     const result = await recordCustomerPickupLoad(req.params.id, operatorId(req), {
       photoDataUrls
     });
     emitAppEvent("delivery.order.loaded", { orderId: req.params.id, source: "customer-pickup", operatorId: operatorId(req), result });
-    res.json(result);
+    return result;
+    }, { minimum: 0 });
+    res.json(saved);
   } catch (error) {
     next(error);
   }
@@ -23009,7 +23239,10 @@ app.get("/api/delivery/consolidation-loads/:id", async (req, res, next) => {
   try { res.json(await getConsolidatedLoad(req.operator, req.params.id)); } catch (error) { next(error); }
 });
 app.post("/api/delivery/consolidation-loads/:id/submit", async (req, res, next) => {
-  try { res.json(await submitConsolidatedLoad(req.operator, req.params.id, req.body?.photoRefs)); } catch (error) { next(error); }
+  try {
+    const batch = await getConsolidatedLoad(/** @type {any} */ (req).operator, req.params.id);
+    res.json(await operatorPhotoAction(req, "delivery_prep", photos => submitConsolidatedLoad(req.operator, req.params.id, photos), { batch }));
+  } catch (error) { next(error); }
 });
 app.post("/api/delivery/consolidation-loads/:id/resume", async (req, res, next) => {
   try { res.json(await resumeConsolidatedLoad(req.operator, req.params.id)); } catch (error) { next(error); }
@@ -23437,7 +23670,8 @@ app.post("/api/receiving/orders/:id/lines/:lineId/unconfirm", async (req, res, n
 
 app.post("/api/receiving/orders/:id/receive", async (req, res, next) => {
   try {
-    req.body = { ...(req.body || {}), photoDataUrls: requiredPhotoDataUrls(req.body?.photoDataUrls) };
+    const saved = await operatorPhotoAction(req, "receiving", async photos => {
+    req.body = { ...(req.body || {}), photoDataUrls: photos };
     const admission = await submitOperatorNetSuitePostingAction({
       requestId: req.body?.requestId,
       actorOperatorId: operatorId(req),
@@ -23449,7 +23683,7 @@ app.post("/api/receiving/orders/:id/receive", async (req, res, next) => {
       expectedPolicy: req.body?.netSuitePostingPolicy || req.body?.postingPolicy
     });
     const posting = operatorNetSuitePostingHttpResult(admission);
-    if (posting) return res.json(posting);
+    if (posting) return posting;
     if (req.body?.orderType === "co_order" || String(req.params.id).startsWith("CO-")) {
       const result = await receiveLocalCoOrder(req.params.id, operatorId(req), {
         photoDataUrls: req.body?.photoDataUrls
@@ -23457,7 +23691,12 @@ app.post("/api/receiving/orders/:id/receive", async (req, res, next) => {
       emitAppEvent("receiving.order.received", { orderId: req.params.id, orderType: "co_order", operatorId: operatorId(req) });
       emitAppEvent("delivery.order.updated", { orderId: result.deliveryOrderId, coOrderId: req.params.id, orderType: "co_order", source: "co-received" });
       emitAppEvent("dispatch.orders.updated", { orderId: result.deliveryOrderId, coOrderId: req.params.id, source: "co-received" });
-      return res.json({ jobId: null, status: "complete", result });
+      return { jobId: null, status: "complete", result };
+    }
+    if (req.body.backgroundPhotos) {
+      const result = await runReceivingReceipt(req.params.id, req.body, operatorId(req), null);
+      emitAppEvent("receiving.order.received", { orderId: req.params.id, orderType: req.body.orderType, operatorId: operatorId(req) });
+      return { jobId: null, status: "complete", result };
     }
     const jobId = crypto.randomUUID();
     receivingJobs.set(jobId, {
@@ -23469,7 +23708,6 @@ app.post("/api/receiving/orders/:id/receive", async (req, res, next) => {
       message: "Receiving request received.",
       startedAt: new Date().toISOString()
     });
-    res.json({ jobId, status: "running" });
     Promise.resolve().then(async () => {
       const result = await runReceivingReceipt(req.params.id, req.body || {}, operatorId(req), jobId);
       updateReceivingJob(jobId, {
@@ -23497,6 +23735,9 @@ app.post("/api/receiving/orders/:id/receive", async (req, res, next) => {
       });
       emitAppEvent("receiving.order.receive_failed", { orderId: req.params.id, operatorId: operatorId(req), jobId, error: error.message });
     });
+    return { jobId, status: "running" };
+    });
+    res.json(saved);
   } catch (error) {
     next(error);
   }
@@ -23662,7 +23903,7 @@ app.post("/api/delivery/orders/:id/fulfill", async (req, res, next) => {
 
 app.post("/api/delivery/orders/:id/load", async (req, res, next) => {
   try {
-    const photoDataUrls = requiredPhotoDataUrls(req.body?.photoDataUrls);
+    const saved = await operatorPhotoAction(req, "delivery_prep", async photoDataUrls => {
     const admission = await submitOperatorNetSuitePostingAction({
       requestId: req.body?.requestId,
       actorOperatorId: operatorId(req),
@@ -23674,7 +23915,7 @@ app.post("/api/delivery/orders/:id/load", async (req, res, next) => {
       expectedPolicy: req.body?.netSuitePostingPolicy || req.body?.postingPolicy
     });
     const posting = operatorNetSuitePostingHttpResult(admission);
-    if (posting) return res.json(posting);
+    if (posting) return posting;
     const result = await recordDeliveryLoad(req.params.id, operatorId(req), {
       photoDataUrls,
       requestId: req.body?.requestId
@@ -23687,7 +23928,9 @@ app.post("/api/delivery/orders/:id/load", async (req, res, next) => {
       emitAppEvent("receiving.order.updated", { orderId: req.params.id, activatedCo: result.activatedCo, source: "delivery-load" });
       emitAppEvent("dispatch.co.updated", { orderId: req.params.id, activatedCo: result.activatedCo, source: "delivery-load" });
     }
-    res.json(result);
+    return result;
+    });
+    res.json(saved);
   } catch (error) {
     if (error.code === "DELIVERY_LOAD_VALIDATION_FAILED") {
       return res.status(409).json({ error: error.message, validation: error.validation });
@@ -23979,6 +24222,7 @@ app.use((error, req, res, next) => {
     ...(error.currentRevision !== undefined ? { currentRevision: error.currentRevision } : {}),
     ...(error.expectedDigest ? { expectedDigest: error.expectedDigest } : {}),
     ...(error.currentDigest ? { currentDigest: error.currentDigest } : {}),
+    ...(error.conflictReason ? { conflictReason: error.conflictReason } : {}),
     ...(error.expectedPlanDate ? { expectedPlanDate: error.expectedPlanDate } : {}),
     ...(error.payloadPlanDate ? { payloadPlanDate: error.payloadPlanDate } : {}),
     ...(error.requiredReturnLocation ? { requiredReturnLocation: error.requiredReturnLocation } : {}),
@@ -24139,6 +24383,15 @@ function dispatchV2PatchOrderRefs(patch = {}) {
     patch.sourceOrder?.refNumber || patch.sourceOrder?.id,
     patch.co?.refNumber || patch.co?.id
   ].map((value) => String(value || "").trim()).filter(Boolean))];
+}
+
+export async function dispatchMaintenanceTick(options = {}) {
+  try {
+    return await drainDispatchPlanMaintenance(options);
+  } catch (error) {
+    console.error("Dispatch maintenance sweep failed:", error.message);
+    return { failed: 1 };
+  }
 }
 
 export async function dispatchV2FollowupTick() {
@@ -24450,8 +24703,20 @@ export async function startServer() {
   return app.listen(config.port, () => {
     console.log(`MBBS Yard Server listening on ${config.appBaseUrl}`);
     startNetSuiteMirrorWorkers();
+    setTimeout(() => void sorReturnTick(), 7000);
+    setInterval(() => void sorReturnTick(), 30000);
+    fieldSalesRuntime.start();
     startOperatorNetSuitePostingRuntime();
     startPostingPhotoWorker();
+    startBackgroundPhotoWorker();
+    if (config.netsuite.directAccessEnabled) {
+      const tickDamage = () => void damagePostingTick().catch(error => console.error("Damage posting worker:", error.message));
+      const tickDamageAdjustments = () => void damageAdjustmentTick().catch(error => console.error("Damage adjustment worker:", error.message));
+      setTimeout(tickDamage, 5000);
+      setInterval(tickDamage, 15000);
+      setTimeout(tickDamageAdjustments, 6000);
+      setInterval(tickDamageAdjustments, 15000);
+    }
     startSalesOrderAutoFulfillmentRuntime();
     void delayedStatusRefreshTick();
     setTimeout(() => void scmScheduleStatusRefreshTick(), 60_000);
@@ -24476,6 +24741,8 @@ export async function startServer() {
     setInterval(() => void scmReconciliationScheduledTick(), 60000);
     setTimeout(() => void dispatchV2FollowupTick(), 2000);
     setInterval(() => void dispatchV2FollowupTick(), 30000);
+    void dispatchMaintenanceTick();
+    setInterval(() => void dispatchMaintenanceTick(), 30000);
     if (config.dispatch?.plannerOrderPoolMode !== "off") {
       void enqueueDispatchOrderCatalogRefresh({ source: "startup" })
         .then(() => dispatchOrderCatalogTick())

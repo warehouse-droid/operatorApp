@@ -244,6 +244,10 @@ export function compareSalesOrderFulfillmentSnapshot({ snapshotLines = [], liveO
       issues.push({ code: "LIVE_ITEM_CHANGED", orderLine, snapshotItemId: itemId, liveItemId: current.itemId });
       continue;
     }
+    if (snapshot.location !== null && snapshot.location !== undefined && Number(snapshot.location) !== current.location) {
+      issues.push({ code: 'LIVE_LOCATION_CHANGED', orderLine, snapshotLocation: Number(snapshot.location), liveLocation: current.location });
+      continue;
+    }
     if (current.remainingQuantity + EPSILON >= delivered) {continue;}
     if (current.remainingQuantity <= EPSILON && current.fulfilledQuantity + EPSILON >= delivered) {
       reconciled += 1;

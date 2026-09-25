@@ -240,10 +240,14 @@ test("property: stored order yard requires its own grant even with another autho
     await fc.assert(fc.asyncProperty(fc.subarray([1, 28, 15, 26]), fc.constantFrom(1, 28, 15, 26), async (grants, canonical) => {
       await updateOperatorRoles(session.operator.id, { role: "operator", roles: ["operator"], operatorYardLocationIds: grants });
       await query("UPDATE sales_orders SET outbound_location_id=$2 WHERE netsuite_id=$1", [fixture.orderId, canonical]);
+      await query("UPDATE sales_order_lines SET location_id=$2 WHERE sales_order_id=$1", [fixture.orderId, canonical]);
       const result = await request(session, `/api/delivery/orders/${fixture.orderId}?locationId=${grants[0] || 1}`);
       assert.equal(result.status, grants.includes(canonical) ? 200 : 403);
     }), { seed: 20260915, numRuns: 40 });
-  } finally { await query("UPDATE sales_orders SET outbound_location_id=1 WHERE netsuite_id=$1", [fixture.orderId]); }
+  } finally {
+    await query("UPDATE sales_orders SET outbound_location_id=1 WHERE netsuite_id=$1", [fixture.orderId]);
+    await query("UPDATE sales_order_lines SET location_id=1 WHERE sales_order_id=$1", [fixture.orderId]);
+  }
 });
 
 test("posting jobs enforce stored yard and ownership while retaining accepted work", async () => {
@@ -340,7 +344,9 @@ async function withNetSuiteReadStub(responder, run) {
   await query("INSERT INTO netsuite_tokens(id,access_token,expires_at) VALUES(1,$1,now()+interval '1 hour')", [crypto.randomUUID()]);
   Object.assign(config.netsuite, { restBaseUrl: "https://yard-netsuite.invalid/services/rest", directAccessEnabled: true });
   globalThis.fetch = (url, options) => String(url).startsWith("https://yard-netsuite.invalid")
-    ? Promise.resolve(new Response(JSON.stringify(responder(JSON.parse(options.body))), { headers: { "content-type": "application/json" } })) : nativeFetch(url, options);
+    ? Promise.resolve(new Response(JSON.stringify(JSON.parse(options.body).q.includes('FROM location l')
+      ? { items: [{ id: 1 }, { id: 28 }, { id: 15 }, { id: 26 }, { id: 14, parent: 1 }] }
+      : responder(JSON.parse(options.body))), { headers: { "content-type": "application/json" } })) : nativeFetch(url, options);
   try { await run(); }
   finally {
     globalThis.fetch = nativeFetch;
@@ -354,7 +360,7 @@ test("NetSuite pickup lookup confines its query to the assigned yard and checks 
   let returnedYard = 28;
   await withNetSuiteReadStub(({ q }) => {
     if (q.includes("SELECT DISTINCT")) {
-      assert.match(q, /AND tl\.location = 1/);
+      assert.match(q, /AND tl\.location IN \(1,14\)/);
       return { items: [{ id, tranid: "SOB999900", status: "B", status_text: "Pending Fulfillment", outbound_location_id: returnedYard, sales_order_type: "Pick-Up", delivery_method: "Pick-Up", order_type: "sales_order" }] };
     }
     return { items: [] };
@@ -476,6 +482,7 @@ async function crossYardGroup() {
   const first = await seedOperatorPickup(), second = await seedOperatorPickup();
   await query("UPDATE sales_orders SET sales_order_type='Delivery' WHERE netsuite_id=ANY($1::bigint[])", [[first.orderId, second.orderId]]);
   await query("UPDATE sales_orders SET outbound_location_id=28 WHERE netsuite_id=$1", [second.orderId]);
+  await query("UPDATE sales_order_lines SET location_id=28 WHERE sales_order_id=$1", [second.orderId]);
   const plan = (await query("INSERT INTO dispatch_plans(plan_date,status) VALUES(current_date,'confirmed') ON CONFLICT(plan_date) DO UPDATE SET plan_date=EXCLUDED.plan_date RETURNING id,plan_date::text", [])).rows[0];
   const id = `GRP-YARD-${crypto.randomUUID()}`;
   await query("INSERT INTO dispatch_delivery_groups(group_ref,plan_id,plan_date,order_type,truck_plate) VALUES($1,$2,current_date,'sales_order','YARD')", [id, plan.id]);
@@ -527,6 +534,7 @@ test("property: grouped access requires both the first yard and each child yard"
   await fc.assert(fc.asyncProperty(fc.subarray([1, 28, 15, 26]), fc.constantFrom(1, 28, 15, 26), async (grants, childYard) => {
     await updateOperatorRoles(session.operator.id, { role: "operator", roles: ["operator"], operatorYardLocationIds: grants });
     await query("UPDATE sales_orders SET outbound_location_id=$2 WHERE netsuite_id=$1", [group.second.orderId, childYard]);
+    await query("UPDATE sales_order_lines SET location_id=$2 WHERE sales_order_id=$1", [group.second.orderId, childYard]);
     const result = await request(session, `/api/delivery/orders/${group.id}`);
     assert.equal(result.status, grants.includes(1) && grants.includes(childYard) ? 200 : 403);
   }), { seed: 20260915, numRuns: 30 });

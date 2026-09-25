@@ -1,3 +1,4 @@
+import { isBackgroundPhotoReference } from "./operator-background-photos.js";
 import { createConsolidationPostingPreparation } from "./consolidation-load-posting.js";
 // @ts-check
 import { query, withTransaction, afterTransactionCommit } from "./db.js";
@@ -18,7 +19,7 @@ import { operatorPostingTelemetry } from "./operator-netsuite-posting-telemetry.
 /** @param {unknown} values @param {string} batchId */
 export function validatedConsolidationPhotos(values, batchId) {
   if (!Array.isArray(values) || values.length < 2 || new Set(values).size !== values.length
-      || values.some((ref) => typeof ref !== "string" || (!ref.startsWith("data:image/")
+      || values.some((ref) => typeof ref !== "string" || (!ref.startsWith("data:image/") && !isBackgroundPhotoReference(ref)
         && (!/^r2:\/\/operator\/operator-consolidation-load-photo\/\d{4}\/\d{2}\/\d{2}\//.test(ref)
         || ref.split("/")[7] !== batchId || ref.includes(".."))))) {
     throw consolidationError("Take at least two photos for this Consolidation Load.", "CONSOLIDATION_LOAD_PHOTOS_INVALID", 400);

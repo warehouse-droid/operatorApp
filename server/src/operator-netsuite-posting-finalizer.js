@@ -1,3 +1,5 @@
+import { fulfillmentTransactions } from "./item-fulfillment-parts-domain.js";
+import { pickupExistingFulfillmentTransactions } from './operator-pickup-existing-if-domain.js';
 // @ts-check
 
 import { query } from "./db.js";
@@ -50,15 +52,7 @@ function postingEvidence(command) {
     requestId: command.requestId,
     gateKey: command.gateKey,
     gateRevision: command.gateRevision,
-    transactions: (command.steps || []).map((/** @type {Record<string, any>} */ step) => ({
-      transactionType: step.transactionType,
-      sourceOrderKind: step.sourceOrderKind,
-      sourceNetSuiteId: step.sourceNetSuiteId,
-      sourceOrderRef: step.sourceOrderRef,
-      externalId: step.externalId,
-      transactionId: step.netSuiteTransactionId,
-      transactionRef: step.netSuiteTransactionRef
-    })),
+    transactions: [...(command.steps || []).flatMap(fulfillmentTransactions), ...pickupExistingFulfillmentTransactions(command)],
     lineReconciliation: command?.inputSnapshot?.lineReconciliation || null
   };
 }

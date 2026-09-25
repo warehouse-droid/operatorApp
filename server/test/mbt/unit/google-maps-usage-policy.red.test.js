@@ -28,7 +28,7 @@ test("normal, reserve, and hard budget boundaries leave 500 units of safety head
     subsystem: "dynamic_map",
     subsystemUsage: 300,
     automatic: true
-  }).reason, "subsystem_limit");
+  }).admitted, true);
 });
 
 test("fallback previews always contain finite ordered leg and total minutes", () => {

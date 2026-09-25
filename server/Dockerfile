@@ -15,6 +15,7 @@ COPY netsuite-smart-scm-picking-ticket-restlet.js ./
 COPY netsuite-order-webhook-user-event.js ./
 COPY netsuite-order-webhook-user-event-direct.js ./
 COPY netsuite-order-webhook-scheduled.js ./
+COPY netsuite-field-sales-restlet.js ./
 COPY public ./public
 COPY src ./src
 COPY tools/mbt-predeploy-readiness.mjs ./tools/mbt-predeploy-readiness.mjs

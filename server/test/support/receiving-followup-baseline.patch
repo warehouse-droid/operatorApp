@@ -1,0 +1,307 @@
+--- a/src/receiving-repository.js
++++ b/src/receiving-repository.js
+@@ -1,5 +1,4 @@
+-import { query, withTransaction } from "./db.js";
+-import { readReceivingReceiptProgress, applyReceivingReceiptProgress, receivingQuantityAfterReceipt } from "./receiving-receipt-progress.js";
++import { query } from "./db.js";
+ import { writeAudit } from "./auth-repository.js";
+ import { netSuiteClosedOrderFamilySql } from "./netsuite-closed-order-policy.js";
+ import { assertNoClosedNetSuiteOrders, listClosedNetSuiteOrders } from "./netsuite-closed-order-repository.js";
+@@ -20,7 +19,7 @@
+ }
+ 
+ function netsuiteReceivedBaseline(line) {
+-  return positiveQuantity(line?.receiving_completed_qty ?? line?.netsuite_received_baseline_qty ?? line?.netsuite_received_qty);
++  return positiveQuantity(line?.netsuite_received_baseline_qty ?? line?.netsuite_received_qty);
+ }
+ 
+ function isPhotoReference(value) {
+@@ -499,8 +498,8 @@
+               item_type_text, item_description, sku, quantity, unit, location_id, location,
+               pallet_qty, layer_qty, piece_qty, section_qty, to_plt, to_lyr, to_sec, to_pcs,
+               netsuite_active, sync_exception, synced_at, received_pallet_qty,
+-              received_layer_qty, received_piece_qty, received_section_qty, confirmed_at,
+-              confirmed_by, netsuite_received_qty, netsuite_received_baseline_qty, pack_quantity_source, received_sales_qty
++              received_layer_qty, received_piece_qty, received_section_qty, NULL::timestamptz AS confirmed_at,
++              NULL::text AS confirmed_by, netsuite_received_qty, netsuite_received_baseline_qty, pack_quantity_source, received_sales_qty
+        FROM purchase_order_lines
+        UNION ALL
+        SELECT transfer_order_id AS order_id, id, line_id, item_id, item_name, item_type,
+@@ -527,8 +526,6 @@
+     [orderId]
+   );
+   const receivingOrder = order.rows[0];
+-  const receipts = receivingOrder.order_type === "purchase_order"
+-    ? await readReceivingReceiptProgress(query, orderId) : null;
+   const overrideLocationId = receivingOrder.order_type === "purchase_order"
+     ? supportedReceivingDestinationLocationId(receivingOrder.destination_override)
+     : null;
+@@ -544,8 +541,7 @@
+     : line);
+   return {
+     ...receivingOrder,
+-    lines: projectedLines.map((/** @type {Record<string,any>} */ line) => applyPoAllocationFields(receipts ? applyReceivingReceiptProgress(line, receipts) : line))
+-      .filter(hasReceivingDisplayQuantity)
++    lines: projectedLines.map(applyPoAllocationFields).filter(hasReceivingDisplayQuantity)
+   };
+ }
+ 
+@@ -568,7 +564,7 @@
+               item_type_text, item_description, sku, quantity, unit, location_id, location,
+               pallet_qty, layer_qty, piece_qty, section_qty, to_plt, to_lyr, to_sec, to_pcs,
+               netsuite_active, sync_exception, synced_at, received_pallet_qty,
+-              received_layer_qty, received_piece_qty, received_section_qty, confirmed_at, netsuite_received_qty,
++              received_layer_qty, received_piece_qty, received_section_qty, netsuite_received_qty,
+               netsuite_received_baseline_qty, pack_quantity_source, received_sales_qty
+        FROM purchase_order_lines
+        UNION ALL
+@@ -576,7 +572,7 @@
+               item_type_text, item_description, sku, quantity, unit, location_id, location,
+               pallet_qty, layer_qty, piece_qty, section_qty, to_plt, to_lyr, to_sec, to_pcs,
+               netsuite_active, sync_exception, synced_at, received_pallet_qty,
+-              received_layer_qty, received_piece_qty, received_section_qty, confirmed_at, netsuite_received_qty,
++              received_layer_qty, received_piece_qty, received_section_qty, netsuite_received_qty,
+               netsuite_received_qty AS netsuite_received_baseline_qty, pack_quantity_source, received_sales_qty
+        FROM transfer_order_lines
+        WHERE line_stage = 'receiving'
+@@ -595,9 +591,7 @@
+     [lineRowId, orderId]
+   );
+   if (!line.rowCount) throw new Error("Receiving line not found.");
+-  const raw = line.rows[0];
+-  const receipts = raw.order_type === "purchase_order" ? await readReceivingReceiptProgress(query, orderId) : null;
+-  const current = applyPoAllocationFields(receipts ? applyReceivingReceiptProgress(raw, receipts) : raw);
++  const current = applyPoAllocationFields(line.rows[0]);
+   const available = receivingUnitAvailability(current);
+   const salesOnly = isSalesQuantityOnlyLine(current);
+   const pallets = salesOnly ? 0 : Math.min(positiveQuantity(values.pallets), available.pallets);
+@@ -1478,7 +1472,7 @@
+   };
+ }
+ 
+-async function recordReceivingReceiptUnlocked(orderId, operatorId, {
++export async function recordReceivingReceipt(orderId, operatorId, {
+   photoDataUrls,
+   payload,
+   response,
+@@ -1493,9 +1487,6 @@
+   if (photos.length < 2) throw new Error("Two receiving photos are required.");
+   const order = await getReceivingOrder(orderId, { includeNetSuiteClosed: allowNetSuiteCompleted });
+   if (!order) throw new Error("Receiving order not found.");
+-  const receivedQuantities = new Map((payload?.item?.items || [])
+-    .filter((/** @type {Record<string,any>} */ item) => item.itemReceive !== false && item.itemreceive !== false && positiveQuantity(item.quantity) > 0)
+-    .map((/** @type {Record<string,any>} */ item) => [String(item.orderLine), positiveQuantity(item.quantity)]));
+   const receivedIds = (payload?.item?.items || [])
+     .filter((item) => item.itemReceive !== false && positiveQuantity(item.quantity) > 0)
+     .map((item) => Number(item.orderLine))
+@@ -1503,9 +1494,6 @@
+ 
+   const remainingLines = (order.lines || []).filter((line) => {
+     if (!line.netsuite_active || !["InvtPart", "NonInvtPart"].includes(line.item_type || "")) return false;
+-    if (order.order_type === "purchase_order") {
+-      return receivingQuantityAfterReceipt(line, receivedQuantities.get(String(line.line_id)) || 0) > 0.000001;
+-    }
+     if (!receivedIds.includes(Number(line.line_id))) return true;
+     if (receivedSalesQuantity(line) + 0.000001 < remainingSalesQuantity(line)) return true;
+     return false;
+@@ -1558,23 +1546,6 @@
+     details: { receivingOrderId: orderId, receiptStatus, itemReceiptId, itemReceiptTranid, payload, response }
+   });
+   return { receiptStatus, itemReceiptId, itemReceiptTranid };
+-}
+-
+-/** @param {string|number} orderId @param {string|null} operatorId
+- * @param {{photoDataUrls:any,payload:any,response:any,itemReceiptId:any,itemReceiptTranid:any,allowNetSuiteCompleted?:boolean}} options */
+-export async function recordReceivingReceipt(orderId, operatorId, options) {
+-  return withTransaction(async () => {
+-    await query("SELECT pg_advisory_xact_lock(hashtextextended($1,0))", [`receiving-receipt:${orderId}`]);
+-    if (options.itemReceiptId) {
+-      const existing = (await query(`SELECT receipt_status,item_receipt_id,item_receipt_tranid
+-        FROM receiving_receipt_records WHERE order_id=$1 AND item_receipt_id=$2
+-          AND receipt_status IN ('partial_received','received') ORDER BY id LIMIT 1`, [orderId, options.itemReceiptId])).rows[0];
+-      if (existing) {
+-        return { receiptStatus: existing.receipt_status, itemReceiptId: Number(existing.item_receipt_id), itemReceiptTranid: existing.item_receipt_tranid };
+-      }
+-    }
+-    return recordReceivingReceiptUnlocked(orderId, operatorId, options);
+-  });
+ }
+ 
+ export async function recordReceivingReceiptFailure(orderId, operatorId, { photoDataUrls, payload, error, stage }) {
+--- a/src/operator-netsuite-posting-targets.js
++++ b/src/operator-netsuite-posting-targets.js
+@@ -3,7 +3,6 @@
+ import { query } from "./db.js";
+ import { config } from "./config.js";
+ import { STORED_ORDER_LINE_STRATEGY, storedOperatorPostingLines } from "./operator-netsuite-posting-stored-lines.js";
+-import { applyVerifiedPoReceiptProgress } from "./receiving-receipt-progress.js";
+ import { operatorPostingTelemetry as telemetry } from "./operator-netsuite-posting-telemetry.js";
+ import {
+   buildItemFulfillmentPayload,
+@@ -683,11 +682,9 @@
+     }
+   }
+   if (useStoredOrderLines) {
+-    const sourceRows = sourceOrderKind === "PO"
+-      ? await applyVerifiedPoReceiptProgress(runQuery, sourceNetSuiteId, rows.rows || []) : rows.rows || [];
+     return { sourceOrderKind, sourceNetSuiteId, sourceOrderRef,
+       postingStrategy: STORED_ORDER_LINE_STRATEGY,
+-      availableLines: storedOperatorPostingLines(sourceRows) };
++      availableLines: storedOperatorPostingLines(rows.rows || []) };
+   }
+   if (typeof fetchLiveSource !== "function") {
+     throw resolutionError(
+--- a/public/operator.js
++++ b/public/operator.js
+@@ -7310,44 +7310,8 @@
+   render();
+ }
+ 
+-let receivingPartialConfirmation = null;
+-
+-function confirmMissingReceivingLines(order) {
+-  const outstanding = (order.lines || []).filter(line => isPickableLine(line) && hasReceivingRemainingQty(line));
+-  const missing = outstanding.filter(line => !hasReceivedQty(line));
+-  if (!missing.length) {return Promise.resolve(true);}
+-  if (receivingPartialConfirmation) {return Promise.resolve(false);}
+-  const dialog = document.createElement("dialog");
+-  dialog.className = "receiving-confirmation-dialog";
+-  dialog.dataset.receivingPartialConfirmation = "true";
+-  dialog.setAttribute("aria-labelledby", "receiving-confirmation-title");
+-  dialog.innerHTML = `
+-    <form method="dialog">
+-      <h2 id="receiving-confirmation-title">${t("operator.unconfirmedReceivingLines", "Unconfirmed receiving lines")}</h2>
+-      <p><strong>${escapeHtml(order.tranid || "")}</strong></p>
+-      <p>${tf("operator.receivingMissingLineCount", "{count} of {total} lines are still unconfirmed.", { count: missing.length, total: outstanding.length })}</p>
+-      <ul>${missing.map(line => `<li>${escapeHtml(line.sku || line.item_name || "Item")}</li>`).join("")}</ul>
+-      <p>${t("operator.receivingPartialExplanation", "Only confirmed lines will be received. The remaining lines will stay open for a separate receipt.")}</p>
+-      <div class="receiving-confirmation-actions">
+-        <button class="secondary-button" value="back" autofocus>${t("operator.receivingGoBack", "Go back")}</button>
+-        <button class="primary-button" value="receive">${t("operator.receiveConfirmedLines", "Receive confirmed lines")}</button>
+-      </div>
+-    </form>`;
+-  receivingPartialConfirmation = dialog;
+-  return new Promise(resolve => {
+-    dialog.addEventListener("close", () => {
+-      receivingPartialConfirmation = null;
+-      dialog.remove();
+-      resolve(dialog.returnValue === "receive");
+-    }, { once: true });
+-    document.body.appendChild(dialog);
+-    dialog.showModal();
+-  });
+-}
+-
+ async function startReceipt() {
+   if (!receivingSelectedOrder) return;
+-  if (!await confirmMissingReceivingLines(receivingSelectedOrder)) {return;}
+   receiptOrder = receivingSelectedOrder;
+   receiptPhotoDataUrls = [];
+   receiptActivePhotoSlot = 0;
+--- a/public/operator.html
++++ b/public/operator.html
+@@ -14,7 +14,6 @@
+     <link rel="apple-touch-icon" href="/icons/mbbs-yard-192.png" />
+     <link rel="stylesheet" href="/operator.css?v=20260916-operator-bottom-inset-v1" />
+     <link rel="stylesheet" href="/i18n.css?v=20260701-i18n-v2" />
+-    <link rel="stylesheet" href="/operator-receiving-confirmation.css?v=20260917-receiving-followup-v1" />
+   </head>
+   <body>
+     <main id="app" class="tablet-shell"></main>
+@@ -22,6 +21,6 @@
+     <script src="/vendor/quagga2/quagga.min.js?v=1.12.1"></script>
+     <script src="/i18n.js?v=20260916-operator-direct-orderline-v1"></script>
+     <script src="/operator-load-summary.js?v=20260915-operator-display-v1"></script>
+-    <script src="/operator.js?v=20260917-receiving-followup-v1"></script>
++    <script src="/operator.js?v=20260917-return-ra-v1"></script>
+   </body>
+ </html>
+--- a/public/service-worker.js
++++ b/public/service-worker.js
+@@ -1,15 +1,14 @@
+-const CACHE_NAME = "mbbs-yard-operator-20260917-receiving-followup-v1";
++const CACHE_NAME = "mbbs-yard-operator-v156-return-ra-v1";
+ const OPERATOR_CACHE_PREFIX = "mbbs-yard-operator-";
+ const APP_SHELL = [
+   "/operator",
+   "/operator.html",
+   "/operator.css?v=20260916-operator-bottom-inset-v1",
+   "/i18n.css?v=20260701-i18n-v2",
+-  "/operator-receiving-confirmation.css?v=20260917-receiving-followup-v1",
+   "/vendor/quagga2/quagga.min.js?v=1.12.1",
+   "/i18n.js?v=20260916-operator-direct-orderline-v1",
+   "/operator-load-summary.js?v=20260915-operator-display-v1",
+-  "/operator.js?v=20260917-receiving-followup-v1",
++  "/operator.js?v=20260917-return-ra-v1",
+   "/manifest.webmanifest",
+   "/icons/mbbs-yard-192.png",
+   "/icons/mbbs-yard-512.png",
+--- a/test/mbt/unit/operations-navigation-enhancements.test.js
++++ b/test/mbt/unit/operations-navigation-enhancements.test.js
+@@ -123,12 +123,12 @@
+ test("operator cache assets advance with the cycle-count pagination release", () => {
+   for (const asset of [
+     "/operator.css?v=20260916-operator-bottom-inset-v1",
+-    "/operator.js?v=20260917-receiving-followup-v1"
++    "/operator.js?v=20260917-return-ra-v1"
+   ]) {
+     assert.ok(operatorHtml.includes(asset));
+     assert.ok(serviceWorker.includes(asset));
+   }
+-  assert.ok(serviceWorker.includes("mbbs-yard-operator-20260917-receiving-followup-v1"));
++  assert.ok(serviceWorker.includes("mbbs-yard-operator-v156-return-ra-v1"));
+ });
+ 
+ test("Dispatch and SCM card menus scroll within the fixed-height application shell", () => {
+--- a/test/mbt/unit/operator-customer-pickup-photo-gate-ui.contract.test.js
++++ b/test/mbt/unit/operator-customer-pickup-photo-gate-ui.contract.test.js
+@@ -90,7 +90,7 @@
+     source("public/operator.html"),
+     source("public/service-worker.js")
+   ]);
+-  assert.match(html, /operator\.js\?v=20260917-receiving-followup-v1/u);
+-  assert.match(serviceWorker, /mbbs-yard-operator-20260917-receiving-followup-v1/u);
+-  assert.match(serviceWorker, /operator\.js\?v=20260917-receiving-followup-v1/u);
++  assert.match(html, /operator\.js\?v=20260917-return-ra-v1/u);
++  assert.match(serviceWorker, /mbbs-yard-operator-v156-return-ra-v1/u);
++  assert.match(serviceWorker, /operator\.js\?v=20260917-return-ra-v1/u);
+ });
+--- a/test/mbt/unit/operator-page-confirm-ui.contract.test.js
++++ b/test/mbt/unit/operator-page-confirm-ui.contract.test.js
+@@ -59,10 +59,10 @@
+   assert.match(operator, /pageConfirming = false;/u);
+   assert.match(css, /@media \(max-width: 700px\)[\s\S]*?\.receiving-grid\s*\{[\s\S]*?grid-template-columns:\s*minmax\(0, 1fr\)/u);
+   assert.match(html, /operator\.css\?v=20260916-operator-bottom-inset-v1/u);
+-  assert.match(html, /operator\.js\?v=20260917-receiving-followup-v1/u);
+-  assert.match(serviceWorker, /mbbs-yard-operator-20260917-receiving-followup-v1/u);
++  assert.match(html, /operator\.js\?v=20260917-return-ra-v1/u);
++  assert.match(serviceWorker, /mbbs-yard-operator-v156-return-ra-v1/u);
+   assert.match(serviceWorker, /operator\.css\?v=20260916-operator-bottom-inset-v1/u);
+-  assert.match(serviceWorker, /operator\.js\?v=20260917-receiving-followup-v1/u);
++  assert.match(serviceWorker, /operator\.js\?v=20260917-return-ra-v1/u);
+ });
+ 
+ test("server exposes separate Customer Pickup and PO-only batch endpoints", async () => {
+--- a/test/mbt/unit/operator-yard-assets.test.js
++++ b/test/mbt/unit/operator-yard-assets.test.js
+@@ -24,18 +24,15 @@
+   const waits = [];
+   events.get("install")({ waitUntil: (promise) => waits.push(promise) });
+   await Promise.all(waits);
+-  assert.equal(installed[0].name, "mbbs-yard-operator-20260917-receiving-followup-v1");
++  assert.equal(installed[0].name, "mbbs-yard-operator-v156-return-ra-v1");
+   for (const asset of ["operator.js", "operator-load-summary.js", "operator.css", "i18n.js"]) {
+     const version = asset === "operator.css" ? "20260916-operator-bottom-inset-v1"
+       : asset === "operator-load-summary.js" ? "20260915-operator-display-v1"
+-        : asset === "operator.js" ? "20260917-receiving-followup-v1" : "20260916-operator-direct-orderline-v1";
++        : asset === "operator.js" ? "20260917-return-ra-v1" : "20260916-operator-direct-orderline-v1";
+     const url = `/${asset}?v=${version}`;
+     assert.ok(html.includes(url));
+     assert.ok(installed[0].assets.includes(`https://yard.invalid${url}`));
+   }
+-  const popupCss = "/operator-receiving-confirmation.css?v=20260917-receiving-followup-v1";
+-  assert.ok(html.includes(popupCss));
+-  assert.ok(installed[0].assets.includes(`https://yard.invalid${popupCss}`));
+   events.get("activate")({ waitUntil: (promise) => waits.push(promise) });
+   await Promise.all(waits);
+   assert.deepEqual(deleted, ["mbbs-yard-operator-old"]);

@@ -2,6 +2,7 @@ import { query, withTransaction } from "./db.js";
 import { writeAudit } from "./auth-repository.js";
 import { enqueueNetSuiteMirrorInventoryEvent } from "./netsuite-mirror-repository.js";
 import { defaultReturnPolicy, normalizeReturnPolicy } from "./return-policy.js";
+import { enqueuePurchaseOrderWeightRefreshes } from "./purchase-order-weight-refresh.js";
 
 function normalizeNumber(value) {
   if (value === null || value === undefined || value === "") return 0;
@@ -136,6 +137,7 @@ export async function upsertInventoryBalances(rows) {
     balanceCount += 1;
   }
   await enqueueNetSuiteMirrorInventoryEvent(rows.map((row) => row.item_id));
+  await enqueuePurchaseOrderWeightRefreshes(rows.map((row) => row.item_id));
 
   return { items: itemCount, balances: balanceCount };
 }
@@ -232,6 +234,7 @@ export async function upsertInventoryBalancesBulk(rows = []) {
   }
 
   await enqueueNetSuiteMirrorInventoryEvent(itemRows.map((row) => row.item_id));
+  await enqueuePurchaseOrderWeightRefreshes(itemRows.map((row) => row.item_id));
   return { items: itemRows.length, balances: validRows.length };
 }
 

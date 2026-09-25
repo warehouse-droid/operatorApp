@@ -1,4 +1,7 @@
-import { query } from "./db.js";
+import { isBackgroundPhotoReference } from "./operator-background-photos.js";
+import { query, withTransaction } from "./db.js";
+import { readReceivingReceiptProgress, applyReceivingReceiptProgress, receivingQuantityAfterReceipt } from "./receiving-receipt-progress.js";
+import { readReceivingPoSplitReservations, applyReceivingPoSplitReservations } from "./receiving-po-split-progress.js";
 import { writeAudit } from "./auth-repository.js";
 import { netSuiteClosedOrderFamilySql } from "./netsuite-closed-order-policy.js";
 import { assertNoClosedNetSuiteOrders, listClosedNetSuiteOrders } from "./netsuite-closed-order-repository.js";
@@ -19,12 +22,12 @@ function positiveQuantity(value) {
 }
 
 function netsuiteReceivedBaseline(line) {
-  return positiveQuantity(line?.netsuite_received_baseline_qty ?? line?.netsuite_received_qty);
+  return positiveQuantity(line?.receiving_completed_qty ?? line?.netsuite_received_baseline_qty ?? line?.netsuite_received_qty);
 }
 
 function isPhotoReference(value) {
   const text = String(value || "");
-  return text.startsWith("data:image/") || text.startsWith("r2://");
+  return text.startsWith("data:image/") || text.startsWith("r2://") || isBackgroundPhotoReference(text);
 }
 
 function roundQuantity(value) {
@@ -183,7 +186,7 @@ function resolveIndependentReceivedSalesQuantity(line, received, requestedSalesQ
 }
 
 function remainingLineQuantities(line) {
-  const baselineReceived = netsuiteReceivedBaseline(line);
+  const baselineReceived = positiveQuantity(line.receiving_unavailable_qty ?? netsuiteReceivedBaseline(line));
   const quantity = Math.max(positiveQuantity(line.quantity) - baselineReceived, 0);
   if (baselineReceived <= 0) {
     return {
@@ -246,7 +249,7 @@ function applyPoAllocationFields(line) {
     so_allocated_section_qty: allocatedSections,
     so_allocated_piece_qty: allocatedPieces,
     so_allocated_sales_qty: allocatedSalesQty,
-    // SO allocations reserve incoming goods; only receipts reduce receiving.
+    // SO reservations keep goods receivable here; SCM splits move capacity to their child PO.
     pallet_qty: remaining.pallet_qty,
     layer_qty: remaining.layer_qty,
     section_qty: remaining.section_qty,
@@ -498,8 +501,8 @@ export async function getReceivingOrder(orderId, { includeNetSuiteClosed = false
               item_type_text, item_description, sku, quantity, unit, location_id, location,
               pallet_qty, layer_qty, piece_qty, section_qty, to_plt, to_lyr, to_sec, to_pcs,
               netsuite_active, sync_exception, synced_at, received_pallet_qty,
-              received_layer_qty, received_piece_qty, received_section_qty, NULL::timestamptz AS confirmed_at,
-              NULL::text AS confirmed_by, netsuite_received_qty, netsuite_received_baseline_qty, pack_quantity_source, received_sales_qty
+              received_layer_qty, received_piece_qty, received_section_qty, confirmed_at,
+              confirmed_by, netsuite_received_qty, netsuite_received_baseline_qty, pack_quantity_source, received_sales_qty
        FROM purchase_order_lines
        UNION ALL
        SELECT transfer_order_id AS order_id, id, line_id, item_id, item_name, item_type,
@@ -526,6 +529,9 @@ export async function getReceivingOrder(orderId, { includeNetSuiteClosed = false
     [orderId]
   );
   const receivingOrder = order.rows[0];
+  const receipts = receivingOrder.order_type === "purchase_order"
+    ? await readReceivingReceiptProgress(query, orderId) : null;
+  const splitReservations = receipts ? await readReceivingPoSplitReservations(query, orderId) : new Map();
   const overrideLocationId = receivingOrder.order_type === "purchase_order"
     ? supportedReceivingDestinationLocationId(receivingOrder.destination_override)
     : null;
@@ -541,7 +547,9 @@ export async function getReceivingOrder(orderId, { includeNetSuiteClosed = false
     : line);
   return {
     ...receivingOrder,
-    lines: projectedLines.map(applyPoAllocationFields).filter(hasReceivingDisplayQuantity)
+    lines: projectedLines.map((/** @type {Record<string,any>} */ line) => applyPoAllocationFields(receipts
+      ? applyReceivingPoSplitReservations(applyReceivingReceiptProgress(line, receipts), splitReservations) : line))
+      .filter(hasReceivingDisplayQuantity)
   };
 }
 
@@ -564,7 +572,7 @@ export async function confirmReceivingLine(orderId, lineRowId, values, operatorI
               item_type_text, item_description, sku, quantity, unit, location_id, location,
               pallet_qty, layer_qty, piece_qty, section_qty, to_plt, to_lyr, to_sec, to_pcs,
               netsuite_active, sync_exception, synced_at, received_pallet_qty,
-              received_layer_qty, received_piece_qty, received_section_qty, netsuite_received_qty,
+              received_layer_qty, received_piece_qty, received_section_qty, confirmed_at, netsuite_received_qty,
               netsuite_received_baseline_qty, pack_quantity_source, received_sales_qty
        FROM purchase_order_lines
        UNION ALL
@@ -572,7 +580,7 @@ export async function confirmReceivingLine(orderId, lineRowId, values, operatorI
               item_type_text, item_description, sku, quantity, unit, location_id, location,
               pallet_qty, layer_qty, piece_qty, section_qty, to_plt, to_lyr, to_sec, to_pcs,
               netsuite_active, sync_exception, synced_at, received_pallet_qty,
-              received_layer_qty, received_piece_qty, received_section_qty, netsuite_received_qty,
+              received_layer_qty, received_piece_qty, received_section_qty, confirmed_at, netsuite_received_qty,
               netsuite_received_qty AS netsuite_received_baseline_qty, pack_quantity_source, received_sales_qty
        FROM transfer_order_lines
        WHERE line_stage = 'receiving'
@@ -591,7 +599,11 @@ export async function confirmReceivingLine(orderId, lineRowId, values, operatorI
     [lineRowId, orderId]
   );
   if (!line.rowCount) throw new Error("Receiving line not found.");
-  const current = applyPoAllocationFields(line.rows[0]);
+  const raw = line.rows[0];
+  const receipts = raw.order_type === "purchase_order" ? await readReceivingReceiptProgress(query, orderId) : null;
+  const splitReservations = receipts ? await readReceivingPoSplitReservations(query, orderId) : new Map();
+  const current = applyPoAllocationFields(receipts
+    ? applyReceivingPoSplitReservations(applyReceivingReceiptProgress(raw, receipts), splitReservations) : raw);
   const available = receivingUnitAvailability(current);
   const salesOnly = isSalesQuantityOnlyLine(current);
   const pallets = salesOnly ? 0 : Math.min(positiveQuantity(values.pallets), available.pallets);
@@ -1472,7 +1484,7 @@ export async function receiveLocalCoOrder(coRefOrId, operatorId, { photoDataUrls
   };
 }
 
-export async function recordReceivingReceipt(orderId, operatorId, {
+async function recordReceivingReceiptUnlocked(orderId, operatorId, {
   photoDataUrls,
   payload,
   response,
@@ -1487,6 +1499,9 @@ export async function recordReceivingReceipt(orderId, operatorId, {
   if (photos.length < 2) throw new Error("Two receiving photos are required.");
   const order = await getReceivingOrder(orderId, { includeNetSuiteClosed: allowNetSuiteCompleted });
   if (!order) throw new Error("Receiving order not found.");
+  const receivedQuantities = new Map((payload?.item?.items || [])
+    .filter((/** @type {Record<string,any>} */ item) => item.itemReceive !== false && item.itemreceive !== false && positiveQuantity(item.quantity) > 0)
+    .map((/** @type {Record<string,any>} */ item) => [String(item.orderLine), positiveQuantity(item.quantity)]));
   const receivedIds = (payload?.item?.items || [])
     .filter((item) => item.itemReceive !== false && positiveQuantity(item.quantity) > 0)
     .map((item) => Number(item.orderLine))
@@ -1494,6 +1509,9 @@ export async function recordReceivingReceipt(orderId, operatorId, {
 
   const remainingLines = (order.lines || []).filter((line) => {
     if (!line.netsuite_active || !["InvtPart", "NonInvtPart"].includes(line.item_type || "")) return false;
+    if (order.order_type === "purchase_order") {
+      return receivingQuantityAfterReceipt(line, receivedQuantities.get(String(line.line_id)) || 0) > 0.000001;
+    }
     if (!receivedIds.includes(Number(line.line_id))) return true;
     if (receivedSalesQuantity(line) + 0.000001 < remainingSalesQuantity(line)) return true;
     return false;
@@ -1546,6 +1564,23 @@ export async function recordReceivingReceipt(orderId, operatorId, {
     details: { receivingOrderId: orderId, receiptStatus, itemReceiptId, itemReceiptTranid, payload, response }
   });
   return { receiptStatus, itemReceiptId, itemReceiptTranid };
+}
+
+/** @param {string|number} orderId @param {string|null} operatorId
+ * @param {{photoDataUrls:any,payload:any,response:any,itemReceiptId:any,itemReceiptTranid:any,allowNetSuiteCompleted?:boolean}} options */
+export async function recordReceivingReceipt(orderId, operatorId, options) {
+  return withTransaction(async () => {
+    await query("SELECT pg_advisory_xact_lock(hashtextextended($1,0))", [`receiving-receipt:${orderId}`]);
+    if (options.itemReceiptId) {
+      const existing = (await query(`SELECT receipt_status,item_receipt_id,item_receipt_tranid
+        FROM receiving_receipt_records WHERE order_id=$1 AND item_receipt_id=$2
+          AND receipt_status IN ('partial_received','received') ORDER BY id LIMIT 1`, [orderId, options.itemReceiptId])).rows[0];
+      if (existing) {
+        return { receiptStatus: existing.receipt_status, itemReceiptId: Number(existing.item_receipt_id), itemReceiptTranid: existing.item_receipt_tranid };
+      }
+    }
+    return recordReceivingReceiptUnlocked(orderId, operatorId, options);
+  });
 }
 
 export async function recordReceivingReceiptFailure(orderId, operatorId, { photoDataUrls, payload, error, stage }) {

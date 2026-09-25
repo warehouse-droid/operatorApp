@@ -339,7 +339,11 @@ export function rollupGroupedSalesOrderReconciliation(order = {}, childOrderDeta
     weight: groupedSalesOrderTotals(children, "weight"),
     unloadMinutes: groupedSalesOrderTotals(children, "unloadMinutes"),
     travelMinutes: children.reduce((max, child) => Math.max(max, Number(child?.travelMinutes || 0)), 0),
-    pickupLocations: uniqueValues(children.flatMap((child) => child?.pickupLocations || [])),
+    pickupLocations: uniqueValues([
+      ...children.flatMap((child) => child?.pickupLocations || []),
+      ...(order.directPickupManifest || []).map((entry) => entry.location),
+      ...(order.poPickupManifest || []).map((entry) => entry.location)
+    ]),
     items: children.flatMap((child) => Array.isArray(child?.items) ? child.items : []),
     fulfillmentStatus,
     reconciliationApplicationStatus: rollup.applicationStatus,

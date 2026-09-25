@@ -178,7 +178,10 @@ test("P3.12: deployment readiness requires every Phase 3 migration and exactly n
     "199_operator_yard_access.sql",
     "200_operator_consolidated_loads.sql",
     "201_operator_posting_photo_uploads.sql",
-    "202_netsuite_order_line.sql"
+    "202_netsuite_order_line.sql",
+    "203_operator_return_authorizations.sql",
+    "204_operator_background_photos.sql",
+    "205_dispatch_plan_maintenance.sql"
   ]);
   assert.deepEqual(REQUIRED_MBT_P3_FLAGS, EXPECTED_FLAGS);
   const rows = EXPECTED_FLAGS.map((flag_key) => ({ flag_key, enabled: false }));

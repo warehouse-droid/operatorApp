@@ -1,0 +1,77 @@
+import {beforeEach,afterEach} from 'node:test';
+import test,{after} from 'node:test';
+import assert from 'node:assert/strict';
+import fc from 'fast-check';
+import {query,withTransaction,closeDb} from '../../../src/db.js';
+import {sanitizeSorSignature,resolveSorSignature,assertSorSignaturePhotoAccess} from '../../../src/sor-signature-evidence.js';
+import {getSorSignatureSettings,updateSorSignatureSettings} from '../../../src/sor-rental-repository.js';
+import {sanitizeDriverOfflineEventDetails,sanitizeDriverOfflineJob} from '../../../src/driver-offline-repository.js';
+import {recordDriverJobPhotos,listDriverHistory,getDriverDayJobs} from '../../../src/driver-repository.js';
+import {listDriverPwaStops} from '../../../src/driver-pwa-repository.js';
+import {getDriverCompletedVisit} from '../../../src/driver-completed-photo-repository.js';
+beforeEach(()=>query("UPDATE mbt_feature_flags SET enabled=true WHERE flag_key='sor_rental_workflow'"));
+afterEach(()=>query("UPDATE mbt_feature_flags SET enabled=false WHERE flag_key='sor_rental_workflow'"));
+after(closeDb);
+const photoId='98800188-1111-4111-8111-111111111111';
+const input=()=>({photoId,termsRevision:1,signedBy:'Customer',capturedAt:'2026-09-24T14:00:00.000Z'});
+const job={stopType:'dropoff',orderRefs:['SOR00188'],jobId:'test-sor-delivery'};
+test('SOR-9 optional signature preserves validated metadata through offline sanitization',()=>{
+ assert.equal(sanitizeSorSignature(undefined),undefined);
+ assert.deepEqual(sanitizeSorSignature(input()),input());
+ assert.deepEqual(sanitizeDriverOfflineEventDetails('job_completed',{customerSignature:input()}).customerSignature,input());
+ assert.equal(sanitizeDriverOfflineEventDetails('job_started',{customerSignature:input()}).customerSignature,undefined);
+});
+test('SOR-9/10 signature freezes historical Admin T&C and cannot use unrelated evidence',async()=>withTransaction(async()=>{
+ const settings=await getSorSignatureSettings();
+ await updateSorSignatureSettings({terms:'New terms for future signatures',expectedRevision:settings.revision,actor:'admin'});
+ const signature={...input(),termsRevision:settings.revision};
+ const photos=[{photoId,recordType:'driver-customer-signature',durableReceipt:true,objectReference:'r2://driver-offline/test/signature.jpg'}];
+ const evidence=await resolveSorSignature(signature,{job,photos,offline:true});
+ assert.equal(evidence.terms,settings.terms);assert.deepEqual(evidence.orderRefs,['SOR00188']);
+ assert.equal(evidence.imageReference,photos[0].objectReference);
+ await assert.rejects(resolveSorSignature(signature,{job:{...job,stopType:'pickup'},photos,offline:true}));
+ await assert.rejects(resolveSorSignature(signature,{job,photos:[],offline:true}));
+ await assert.rejects(resolveSorSignature(signature,{job,photos:[{...photos[0],durableReceipt:false}],offline:true}));
+ assert.equal(await resolveSorSignature(undefined,{job,photos:[],offline:true}),null);
+}, {rollback:true}));
+test('SOR-9 property: invalid revision never becomes a valid signing contract',()=>{
+ fc.assert(fc.property(fc.integer({min:-100000,max:0}),revision=>{
+  assert.throws(()=>sanitizeSorSignature({...input(),termsRevision:revision}));
+ }),{numRuns:100,seed:188});
+});
+test('SOR-9/10 signed completion retains exact evidence separately from mandatory photos and enforces ownership',async()=>withTransaction(async()=>{
+ const image='data:image/jpeg;base64,/9j/2Q==';
+ const signature=await resolveSorSignature({...input(),imageDataUrl:image},{job});
+ await assert.rejects(recordDriverJobPhotos('signature-test',job.jobId,{job:{...job,requiredPhotos:2},photoDataUrls:[image],customerSignature:signature}),/2 photos/);
+ const row=await recordDriverJobPhotos('signature-test',job.jobId,{job:{...job,planDate:'2026-09-24',requiredPhotos:2},photoDataUrls:[image,image],customerSignature:signature});
+ const saved=(await query('SELECT * FROM driver_job_records WHERE id=$1',[row.id])).rows[0];
+ assert.equal(saved.photo_data_urls.length,2);assert.deepEqual(saved.job_details.customerSignature,signature);
+ const history=await listDriverHistory('signature-test',{date:'2026-09-24'});assert.deepEqual(history.find(record=>record.details?.jobId===job.jobId).details.customerSignature,signature);
+ await recordDriverJobPhotos('signature-test',job.jobId,{job:{...job,requiredPhotos:2},photoDataUrls:[image,image],customerSignature:{...signature,terms:'Changed attempt'}});
+ assert.equal((await query('SELECT job_details FROM driver_job_records WHERE id=$1',[row.id])).rows[0].job_details.customerSignature.terms,signature.terms);
+ const reference='r2://driver/driver-customer-signature/test/signature.jpg';
+ await query("UPDATE driver_job_records SET job_details=jsonb_set(job_details,'{customerSignature,imageReference}',to_jsonb($2::text)) WHERE id=$1",[row.id,reference]);
+ await assertSorSignaturePhotoAccess({role:'driver',login:'signature-test'},reference);
+ await assert.rejects(assertSorSignaturePhotoAccess({role:'driver',login:'other-driver'},reference),error=>error.status===403);
+ await assertSorSignaturePhotoAccess({role:'dispatcher'},reference);
+ await assert.rejects(assertSorSignaturePhotoAccess({role:'operator'},reference),error=>error.status===403);
+},{rollback:true}));
+test('SOR-8/10 a confirmed Driver route carries rental cargo, signature wording, and Dispatch history evidence',async()=>withTransaction(async()=>{
+ const date='1901-09-24',login='sor-route-signature';
+ const plan=(await query("INSERT INTO dispatch_plans(plan_date,status,revision,confirmed_at) VALUES($1,'confirmed',1,now()) RETURNING id",[date])).rows[0];
+ const order={id:'SOR98800331',type:'SO',customer:'Rental customer',address:'77 Customer Road',sourceYard:'3445',pickupLocations:['3445'],items:[{itemId:98800331,itemName:'Lift/Day',itemType:'Service',quantity:2},{itemId:22,itemName:'Delivery Charge',itemType:'OthCharge',quantity:1}]};
+ const trucks=[{id:'sor-truck',plate:'SOR-TEST',base:'3445',driverLogin:login,loads:[{id:'sor-load',name:'Rental delivery',driverLogin:login,stops:[{id:'sor-drop',type:'drop',orderId:order.id,location:order.address}]}]}];
+ await query("INSERT INTO dispatch_plan_snapshots(plan_id,orders,trucks,summary) VALUES($1,$2,$3,'{}')",[plan.id,JSON.stringify([order]),JSON.stringify(trucks)]);
+ const route=await getDriverDayJobs(login,{date});
+ const delivery=route.jobs.find(row=>row.stopType==='dropoff');assert.ok(delivery);
+ const settings=await getSorSignatureSettings();assert.equal(delivery.customerSignaturePrompt.terms,settings.terms);
+ assert.deepEqual(delivery.customerSignaturePrompt.orderRefs,[order.id]);
+ assert.deepEqual(delivery.orders[0].items.map(item=>item.itemName),['Lift/Day']);
+ assert.deepEqual(sanitizeDriverOfflineJob(delivery).customerSignaturePrompt,delivery.customerSignaturePrompt);
+ const image='data:image/jpeg;base64,/9j/2Q==';
+ const signature=await resolveSorSignature({...input(),termsRevision:settings.revision,imageDataUrl:image},{job:delivery});
+ const record=await recordDriverJobPhotos(login,delivery.jobId,{job:delivery,photoDataUrls:[image,image],customerSignature:signature});
+ const dispatch=await listDriverPwaStops({planDate:date,driverLogin:login});
+ assert.deepEqual(dispatch.stops.find(row=>Number(row.recordId)===Number(record.id)).customerSignature,signature);
+ assert.deepEqual((await getDriverCompletedVisit({recordId:record.id})).customerSignature,signature);
+},{rollback:true}));

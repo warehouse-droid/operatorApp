@@ -149,6 +149,7 @@ const P3_ADVERSARIAL_TESTS = Object.freeze([
   "driver-pwa-historical-assist-adversarial.test.js",
   "operator-netsuite-posting-adversarial.test.js",
   "p311-completed-load-snapshot-integrity.test.js",
+  "pickup-existing-if.test.js",
   "sales-order-reattempt-correction-adversarial.test.js",
   "scm-split-po-status-evidence-precedence.adversarial.test.js",
   "shadow-billing-adversarial.test.js",

@@ -154,6 +154,23 @@ async function projectedGroupTarget(targetRef, planDate = "") {
   };
 }
 
+async function globalSalesTarget(targetRef) {
+  const result = await query(
+    `SELECT full_order, active FROM dispatch_global_order_groups WHERE group_ref = $1
+     UNION ALL
+     SELECT full_order, active FROM dispatch_global_order_splits WHERE split_ref = $1`,
+    [targetRef]
+  );
+  if (!result.rowCount) return null;
+  if (result.rows.some(row => !row.active)) {
+    throw Object.assign(new Error(`${targetRef} is a retired Dispatch order. Refresh the order pool.`),
+      { status: 409, code: "DISPATCH_DERIVED_ORDER_RETIRED" });
+  }
+  const order = result.rows[0].full_order;
+  if (text(order?.type).toUpperCase() !== "SO") throw new Error(`${targetRef} is not a Sales Order target.`);
+  return order;
+}
+
 async function loadCanonicalOrders(refs = []) {
   const cleaned = [...new Set(refs.map(text).filter(Boolean))];
   if (!cleaned.length) return { headers: new Map(), lines: new Map() };
@@ -301,12 +318,13 @@ async function applyExistingAllocations(targetRef, lines) {
 export async function resolveDispatchSalesTarget({ dispatchTargetRef = "", planDate = "" } = {}) {
   const ref = text(dispatchTargetRef);
   if (!ref) throw new Error("Dispatch Sales Order target is required.");
+  const globalOrder = await globalSalesTarget(ref);
   const snapshot = await findSnapshotTarget(ref, planDate) || await projectedGroupTarget(ref, planDate);
-  const initialRefs = [ref, splitParentRef(snapshot?.order || { id: ref })];
+  const order = globalOrder || snapshot?.order || { id: ref, type: "SO", items: [] };
+  const initialRefs = [ref, splitParentRef(order)];
   let canonical = await loadCanonicalOrders(initialRefs);
   const exactCanonical = canonical.headers.get(ref) || null;
-  if (!snapshot && !exactCanonical) throw new Error(`${ref} was not found in the selected dispatch plan or Sales Order table.`);
-  const order = snapshot?.order || { id: ref, type: "SO", items: [] };
+  if (!globalOrder && !snapshot && !exactCanonical) throw new Error(`${ref} was not found in the selected dispatch plan or Sales Order table.`);
   const kind = targetKind(order, exactCanonical);
   const entries = kind === "group"
     ? flattenGroupMembers(order)

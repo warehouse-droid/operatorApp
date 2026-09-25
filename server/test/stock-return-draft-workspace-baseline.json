@@ -1,0 +1,65 @@
+{
+  "reason": "Baseline of unrelated existing workspace changes; this task did not edit workspace runtime source.",
+  "failedFiles": [
+    "/app/test/mbt/infrastructure/p3-gauntlet-contract.test.js",
+    "/app/test/mbt/unit/driver-camera-ordinary-upload.test.js",
+    "/app/test/mbt/unit/driver-plan-date-execution-wiring.contract.test.js",
+    "/app/test/mbt/unit/driver-pwa-cache-repair.test.js",
+    "/app/test/mbt/unit/driver-pwa-site-reset.test.js",
+    "/app/test/mbt/unit/driver-pwa-ux-regressions.test.js",
+    "/app/test/mbt/unit/operations-navigation-enhancements.test.js",
+    "/app/test/mbt/unit/operator-customer-pickup-photo-gate-ui.contract.test.js",
+    "/app/test/mbt/unit/operator-page-confirm-ui.contract.test.js",
+    "/app/test/mbt/integration/local-load-performance.test.js",
+    "/app/test/mbt/integration/migration-upgrade.test.js",
+    "/app/test/mbt/integration/operator-background-photos.test.js",
+    "/app/test/mbt/integration/operator-display-settings.test.js",
+    "/app/test/mbt/integration/p3-predeploy-readiness.test.js"
+  ],
+  "failedTests": {
+    "/app/test/mbt/infrastructure/p3-gauntlet-contract.test.js": [
+      "P3.12: browser specs share one worker-owned database-pool lifecycle"
+    ],
+    "/app/test/mbt/unit/driver-camera-ordinary-upload.test.js": [
+      "a fresh Driver shell version evicts older copy-enabled cached assets"
+    ],
+    "/app/test/mbt/unit/driver-plan-date-execution-wiring.contract.test.js": [
+      "S11: the guarded client ships in a new atomic Driver shell generation"
+    ],
+    "/app/test/mbt/unit/driver-pwa-cache-repair.test.js": [
+      "a fresh Driver worker reloads every v41 shell asset and initializes only its scoped sentinel",
+      "a successful repair replaces only the complete Driver shell and preserves offline data sentinels",
+      "a failed staging download leaves the active and non-Driver caches byte-for-byte unchanged"
+    ],
+    "/app/test/mbt/unit/driver-pwa-site-reset.test.js": [
+      "the reset ships as a new atomic shell generation without forcing a protocol-version cutover"
+    ],
+    "/app/test/mbt/unit/driver-pwa-ux-regressions.test.js": [
+      "the updated override policy is atomically included in the Driver PWA shell"
+    ],
+    "/app/test/mbt/unit/operations-navigation-enhancements.test.js": [
+      "operator cache assets advance with the cycle-count pagination release"
+    ],
+    "/app/test/mbt/unit/operator-customer-pickup-photo-gate-ui.contract.test.js": [
+      "S7: Operator cache revision ships the live-policy client once; later toggles are server-only"
+    ],
+    "/app/test/mbt/unit/operator-page-confirm-ui.contract.test.js": [
+      "page confirmation has a duplicate-click guard and ships in a fresh Operator cache"
+    ],
+    "/app/test/mbt/integration/local-load-performance.test.js": [
+      "/app/test/mbt/integration/local-load-performance.test.js"
+    ],
+    "/app/test/mbt/integration/migration-upgrade.test.js": [
+      "F06/F16: schema-101 upgrade preserves representative legacy records and is migration-runner idempotent"
+    ],
+    "/app/test/mbt/integration/operator-background-photos.test.js": [
+      "/app/test/mbt/integration/operator-background-photos.test.js"
+    ],
+    "/app/test/mbt/integration/operator-display-settings.test.js": [
+      "/app/test/mbt/integration/operator-display-settings.test.js"
+    ],
+    "/app/test/mbt/integration/p3-predeploy-readiness.test.js": [
+      "P3.11: the deployment inventory exactly covers every on-disk MBT-era migration"
+    ]
+  }
+}

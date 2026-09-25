@@ -5,7 +5,7 @@ export const VOYAGE_DISPATCH_YARD = Object.freeze({
   locationId: 4,
   address: "195 Milner Ave Unit 5, Scarborough, ON M1S 4P4"
 });
-export const SALES_ORDER_SYNC_LOCATIONS = Object.freeze([1, 28, 15, 26, 4]);
+export const SALES_ORDER_SYNC_LOCATIONS = Object.freeze([1, 28, 15, 26, 4, 50]);
 
 export function withVoyageDispatchYard(yards = []) {
   const existing = Array.isArray(yards) ? yards : [];

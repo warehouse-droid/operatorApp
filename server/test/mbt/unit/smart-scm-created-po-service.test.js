@@ -4,6 +4,8 @@ import vm from "node:vm";
 import test from "node:test";
 import { scmNetSuitePoVersion } from "../../../src/scm-netsuite-po-version.js";
 import { buildPurchaseOrderHistoryRestPayload } from "../../../src/netsuite.js";
+import { operatorPostingTelemetry } from "../../../src/operator-netsuite-posting-telemetry.js";
+import { isOperatorNetSuiteRequest } from "../../../src/operator-netsuite-request-pool.js";
 
 const original = { id:991607,tranid:'POB03875',lastModifiedAt:'2026-09-15',status:'B',statusText:'Pending Receipt',memo:'old',lines:[] };
 function service({ remote=original, failLines=false }={}) {
@@ -74,15 +76,16 @@ test('a request without a content version cannot bypass stale-edit protection',a
 test('NetSuite transport rechecks content immediately before PATCH and blocks a race',async () => {
   const transportUrl=new URL('../../../src/netsuite.js',import.meta.url);
   const source=fs.readFileSync(transportUrl,'utf8');
+  const queueSource=source.slice(source.indexOf('function queueNetSuiteMutation('),source.indexOf('const MBT_NETSUITE_READ_RESPONSE_LIMIT'));
   const start=source.indexOf('function comparableNetSuiteDate');
   const transportSource=source.slice(0,start).replace(/[^\r\n]/g," ")+source.slice(start,source.indexOf('export async function resolvePalletItemFromNetSuite')).replace(/^export /gm,'       ');
   for (const changed of [true,false]) {
     const methods=[];
-    const context={scmNetSuitePoVersion,buildPurchaseOrderHistoryRestPayload,restMutationQueue:Promise.resolve(),
+    const context={scmNetSuitePoVersion,buildPurchaseOrderHistoryRestPayload,restMutationQueue:Promise.resolve(),operatorPostingTelemetry,isOperatorNetSuiteRequest,
       fetchPurchaseOrderHistorySnapshotFromNetSuite:async ()=>changed ? {...original,memo:'external edit'} : original,
       netsuiteRest:async (_path,options)=>{methods.push(options.method);return {status:204,data:{lastModifiedDate:original.lastModifiedAt,item:{items:[]}}};}
     };
-    const update=vm.runInNewContext(`${transportSource}\nupdatePurchaseOrderHistoryInNetSuite`,context,{filename:transportUrl.pathname});
+    const update=vm.runInNewContext(`${queueSource}\n${transportSource}\nupdatePurchaseOrderHistoryInNetSuite`,context,{filename:transportUrl.pathname});
     const pending=update(991607,{expectedLastModifiedAt:original.lastModifiedAt,expectedVersion:scmNetSuitePoVersion(original),header:{memo:'new'}});
     if (changed) {
       await assert.rejects(pending,{status:409});

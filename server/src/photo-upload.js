@@ -26,9 +26,11 @@ const RECORD_TYPES = new Set([
   "operator-co-receiving-photo",
   "operator-customer-pickup-photo",
   "operator-return-photo",
+  "operator-damage-photo",
   "driver-dvir-pre-photo",
   "driver-dvir-post-photo",
   "driver-stop-photo",
+  "driver-customer-signature",
   "driver-pickup-photo",
   "driver-dropoff-photo",
   "sales-delivery-instruction-media",
@@ -287,7 +289,7 @@ function buildKeyPrefix({ source, recordType, actor, metadata }) {
     || actor?.id
     || actor?.login
     || "general";
-  if (recordType === "operator-return-photo") {
+  if (recordType === "operator-return-photo" || recordType === "operator-damage-photo") {
     return [
       safePathSegment(source || "app"),
       safePathSegment(recordType),

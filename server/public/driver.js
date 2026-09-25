@@ -702,6 +702,7 @@ function finishPhotoCapture() {
 function photoInteractionActive() {
   return Boolean(
     photoCaptureInProgress
+    || window.SorSignature?.isOpen()
     || photoPromptOpen
     || dvirMode
     || (isDriverBinJob() && (driverBinDraftHasContent() || photos.some(Boolean)))
@@ -979,7 +980,14 @@ function comparableJobDetails(job = {}) {
     orderRefs: job.orderRefs || [],
     orderTypes: job.orderTypes || [],
     dependencyPickupManifests: job.dependencyPickupManifests || [],
-    deliveryInstructions: job.deliveryInstructions || { revision: 0, orders: [] },
+    deliveryInstructions: {
+      ...(job.deliveryInstructions || { revision: 0, orders: [] }),
+      // Translations belong to this device's display. Compare the original
+      // instructions so rendering a translation does not look like a route edit.
+      orders: (job.deliveryInstructions?.orders || []).map((order) => Object.fromEntries(
+        Object.entries(order).filter(([key]) => key !== "localized")
+      ))
+    },
     orders: job.orders || [],
     requiredPhotos: Number(job.requiredPhotos || 0),
     sequence: job.sequence || null
@@ -1053,6 +1061,10 @@ function authoritativeJobChanged(previousJob, result = {}) {
     return previousContent !== authoritative.contentFingerprint;
   }
   return JSON.stringify(comparableJobDetails(previousJob)) !== JSON.stringify(comparableJobDetails(authoritative.job));
+}
+
+function sameLocationVerificationStop(previousJob, nextJob) {
+  return Boolean(previousJob && nextJob && !authoritativeJobChanged(previousJob, { job: nextJob }));
 }
 
 function localCompletionReconciliationStatus(event) {
@@ -1142,6 +1154,13 @@ function classifyAuthoritativeRoute(previousJob, result = {}, {
   return bridge || DRIVER_ROUTE_RECONCILIATION.serverExecutionChanged;
 }
 
+function jobStartWaitsForLocalCompletions(job, manifest, events = []) {
+  return (manifest?.jobs || []).some((previousJob) =>
+    localCompletionBridge(job, previousJob, manifest, events)
+      === DRIVER_ROUTE_RECONCILIATION.localProgressPending
+  );
+}
+
 function crossDevicePendingCompletionMatchesJob(completion, job) {
   if (
     completion?.eventType !== "job_completed"
@@ -1210,7 +1229,15 @@ function displayQuietSyncHold() {
 }
 
 function requestQuietSyncHold(token, { immediate = false } = {}) {
-  if (!token || token.epoch !== quietSyncEpoch || !quietSyncActive()) return;
+  if (
+    !navigator.onLine
+    || browserOfflineObserved
+    || !token
+    || token.epoch !== quietSyncEpoch
+    || !quietSyncActive()
+  ) {
+    return;
+  }
   quietSyncHoldLatched = true;
   if (!quietSyncRestoreFocus && document.activeElement instanceof HTMLElement) {
     quietSyncRestoreFocus = document.activeElement;
@@ -1321,6 +1348,14 @@ function currentDriverRemarkDraftKey() {
   const planDate = String(currentJob?.planDate || offlineManifest?.planDate || "").slice(0, 10);
   if (!partitionKey || !planDate || !jobId) return "";
   return `driverRemarkDraft::${partitionKey}::${planDate}::${jobId}`;
+}
+
+function sorSignatureContext() {
+  return {
+    partitionKey: offlinePartition?.partitionKey || (driver?.login ? `sor-signature:${driver.login}:${offlineDeviceId}` : ''),
+    draftKey: currentPhotoDraftKey(),
+    manifest: offlineManifest
+  };
 }
 
 function normalizedDriverRemark(value = driverRemark) {
@@ -2879,7 +2914,7 @@ function unitPills(units = []) {
     const label = unit?.unit || unit?.label || unit?.uom || t("driver.uom", "UOM");
     const value = unit?.value ?? unit?.quantity ?? 0;
     return `
-      <span class="unit-pill ${unit?.fallback ? "fallback" : ""}">${Number(value || 0).toLocaleString()} ${escapeHtml(label)}</span>
+      <span class="unit-pill ${unit?.fallback ? "fallback" : ""}">${Number(value || 0).toLocaleString()} ${escapeHtml(window.MBBS_I18N?.unit(label) ?? label)}</span>
     `;
   }).join("");
 }
@@ -3713,6 +3748,7 @@ function renderPhotoSlots(job) {
           <textarea data-driver-photo-remark ${routeProtectedControlAttributes()} maxlength="${DRIVER_REMARK_MAX_LENGTH}" placeholder="${t("driver.photoRemarkPlaceholder", "Add a note about this stop or the photos")}">${escapeHtml(driverRemark)}</textarea>
         </label>
         ${completionBlockers.length ? `<div class="photo-completion-blockers" id="driverPhotoCompletionBlockers" role="status">${completionBlockers.map((message) => `<span>${escapeHtml(message)}</span>`).join("")}</div>` : ""}
+        ${job.customerSignaturePrompt ? '<button class="secondary" data-action="sor-signature" type="button">Customer signature (optional)</button>' : ''}
         <button class="primary" data-action="complete-job" data-job-confirm data-gps-gate="complete" ${routeProtectedControlAttributes()} data-photo-required="true" data-ready-label="${t("driver.completeStop", "Complete Stop")}" ${completionBlockers.length || !canCompleteCurrentJob(job) ? "disabled" : ""} ${completionBlockers.length ? `aria-describedby="driverPhotoCompletionBlockers"` : ""} type="button">${completeWaitSeconds(job) > 0 ? tf("driver.waitSeconds", "Wait {seconds}s", { seconds: completeWaitSeconds(job) }) : t("driver.completeStop", "Complete Stop")}</button>
       </section>
     </div>
@@ -3796,6 +3832,7 @@ function renderJob() {
       </section>` : renderLocationCheck(job)}
       ${isTravel || isTruckSwitch ? "" : isBin ? renderDriverBinSummary(job) : renderStopDetails(job)}
       <div class="job-actions ${isTruckSwitch ? "truck-switch-job-actions" : ""}">
+        ${isStarted && job.customerSignaturePrompt ? '<button class="secondary" data-action="sor-signature" type="button">Customer signature (optional)</button>' : ''}
         ${isTruckSwitch
           ? `<div class="truck-switch-action-set">
               <button class="primary" data-action="confirm-truck-switch" ${routeProtectedControlAttributes()} type="button">${driverUsesSamsaraWorkflow() && switchAttention ? t("driver.retryTruckSwitch", "Retry Samsara & Confirm") : t("driver.confirmTruckSwitch", "Confirm Truck Switch")}</button>
@@ -4017,7 +4054,7 @@ async function restoreDraftPhotos(kind = "job", suffix = "") {
       ? expectedDvirMode !== (dvirMode || "pre")
       : expectedJobId !== String(currentJob?.jobId || ""))
   ) return false;
-  const drafts = records.map((record) => window.DriverOfflinePhotos.hydrate(record));
+  const drafts = records.filter(record => record.recordType !== 'driver-customer-signature').map((record) => window.DriverOfflinePhotos.hydrate(record));
   const target = kind === "dvir" ? dvirPhotos : photos;
   drafts.forEach((photo) => {
     target[Number(photo.ordinal || 0)] = photo;
@@ -4040,6 +4077,7 @@ async function renderOfflineProjection(manifest = offlineManifest) {
   if (routeRefreshWasSuperseded(projectionEpoch)) return false;
   offlineManifest = manifest;
   dayState = projection.dayState;
+  const keepLocationVerification = sameLocationVerificationStop(currentJob, projection.currentJob);
   currentJob = projection.currentJob;
   activeRest = acceptDriverRestCandidate(projection.rest);
   restSummary = projection.restSummary;
@@ -4051,7 +4089,10 @@ async function renderOfflineProjection(manifest = offlineManifest) {
   binDraft = null;
   dvirPhotos = [];
   photoPromptOpen = false;
-  locationCheck = null;
+  if (!keepLocationVerification) {
+    locationCheck = null;
+    locationOverrideApproval.clear();
+  }
   locationOverrideApproval.reconcile(currentJob);
 
   // A refreshed offline route cannot perform a live GPS check. Restore the
@@ -4289,7 +4330,7 @@ async function revalidateOnlineRoute({
   const partitionKey = driverOfflineModeEnabled ? offlinePartition.partitionKey : "";
   onlineRouteValidationPromise = (async () => {
     try {
-      const authoritative = await request(`/api/driver/next-job?revalidate=${encodeURIComponent(Date.now())}`);
+      let authoritative = await request(`/api/driver/next-job?revalidate=${encodeURIComponent(Date.now())}`);
       if (partitionKey && partitionKey !== offlinePartition?.partitionKey) throw driverSessionChangedError();
       if (crossDevicePendingCompletionMatchesJob(authoritative.pendingCompletion, expectedJob)) {
         onlineRouteLastValidatedAt = Date.now();
@@ -4338,17 +4379,34 @@ async function revalidateOnlineRoute({
         || localDate();
       const payload = await fetchDriverDayPlanPayload(planDate, { forceRefresh });
       if (partitionKey !== offlinePartition?.partitionKey) throw driverSessionChangedError();
-      const currentChanged = authoritativeJobChanged(expectedJob, authoritative);
+      let currentChanged = authoritativeJobChanged(expectedJob, authoritative);
       const dispatchRouteChanged = manifestRevisionChanged(offlineManifest, payload);
       const projectionEvents = currentChanged && !dispatchRouteChanged && offlineManifest?.manifestId
         ? await window.DriverOfflineDB.getProjectionEvents(partitionKey, offlineManifest)
         : [];
       if (partitionKey !== offlinePartition?.partitionKey) throw driverSessionChangedError();
-      const routeReconciliation = classifyAuthoritativeRoute(expectedJob, authoritative, {
+      let routeReconciliation = classifyAuthoritativeRoute(expectedJob, authoritative, {
         manifest: offlineManifest,
         events: projectionEvents,
         dispatchRouteChanged
       });
+      if (beforeAction && routeReconciliation === DRIVER_ROUTE_RECONCILIATION.serverExecutionChanged) {
+        // A completion can finish syncing between the cursor response and the
+        // local event read. Recheck once before treating that older cursor as a
+        // route change; real edits and pending evidence still require review.
+        const latest = await request(`/api/driver/next-job?revalidate=${encodeURIComponent(Date.now())}`);
+        if (partitionKey !== offlinePartition?.partitionKey) {
+          throw driverSessionChangedError();
+        }
+        if (
+          !authoritativeJobChanged(expectedJob, latest)
+          && !crossDevicePendingCompletionMatchesJob(latest.pendingCompletion, expectedJob)
+        ) {
+          authoritative = latest;
+          currentChanged = false;
+          routeReconciliation = DRIVER_ROUTE_RECONCILIATION.unchanged;
+        }
+      }
       const protectedInteraction = Boolean(activeRest || photoInteractionActive());
       const routeChanged = incomingRouteDiffers(payload);
       const requestedActivation = routeReconciliation === "local_progress_pending"
@@ -5176,6 +5234,15 @@ function historyTypeText(record) {
   return record.title || t("driver.stop", "Stop");
 }
 
+function renderSorSignatureHistory(signature) {
+  return `<section class="history-signature"><h3>Customer signature</h3>
+    <p>${escapeHtml(signature.signedBy || '')} · ${escapeHtml(dateTimeText(signature.capturedAt))}</p>
+    <p>${escapeHtml((signature.orderRefs || []).join(', '))}</p>
+    <button class="history-photo-button" data-action="open-history-photo" data-photo-ref="${escapeHtml(signature.imageReference)}" data-photo-label="Customer signature" type="button">
+      <img src="${photoImgSrc(signature.imageReference)}" alt="Customer signature" /></button>
+    <details><summary>Signed terms &amp; conditions</summary><p style="white-space:pre-wrap">${escapeHtml(signature.terms)}</p></details></section>`;
+}
+
 function renderHistoryPhotos(record) {
   const photos = (record?.photos || []).filter(Boolean);
   if (!photos.length) return `<div class="history-empty small">${t("driver.noPhotosSaved", "No photos saved for this record.")}</div>`;
@@ -5235,6 +5302,7 @@ function renderDriverHistory() {
               </div>
               ${record.details?.driverRemark ? `<p class="history-driver-remark"><strong>${t("driver.photoRemark", "Driver remark")}:</strong> ${escapeHtml(record.details.driverRemark)}</p>` : ""}
               ${renderHistoryPhotos(record)}
+              ${record.details?.customerSignature ? renderSorSignatureHistory(record.details.customerSignature) : ''}
             </div>` : ""}
           </section>`;
         }).join("") || `<div class="history-empty">${t("driver.noHistory", "No history for this date.")}</div>`}
@@ -5308,7 +5376,9 @@ async function loadNextJob() {
       throw error;
     }
     if (routeRefreshWasSuperseded(loadEpoch)) return;
-    currentJob = withManifestJobIdentity(result.job, result.routeBootstrap);
+    const nextJob = withManifestJobIdentity(result.job, result.routeBootstrap);
+    const keepLocationVerification = sameLocationVerificationStop(currentJob, nextJob);
+    currentJob = nextJob;
     activeRest = acceptDriverRestCandidate(result.rest);
     restSummary = result.restSummary || null;
     photos = [];
@@ -5317,7 +5387,10 @@ async function loadNextJob() {
     dvirMode = "";
     dvirPhotos = [];
     photoPromptOpen = false;
-    locationCheck = null;
+    if (!keepLocationVerification) {
+      locationCheck = null;
+      locationOverrideApproval.clear();
+    }
     locationOverrideApproval.reconcile(currentJob);
     if (driverUsesSamsaraWorkflow() && dayState?.truckPlate && (dayState.preDvirStatus !== "complete" || !dayState.samsaraOnDutyConfirmed || !dayState.samsaraPreDvirConfirmed)) {
       currentJob = null;
@@ -5563,6 +5636,16 @@ app.addEventListener("click", async (event) => {
   const button = event.target.closest("button");
   if (!button) return;
   const action = button.dataset.action;
+  if (action === 'start-job' && currentJob?.sorReturnReadiness?.some(state => !state.allowed)) {
+    showToast(currentJob.sorReturnReadiness.find(state => !state.allowed).message);
+    return;
+  }
+  if (action === 'sor-signature' && currentJob?.status === 'in_progress') {
+    try {
+      await window.SorDriverSignature.open(currentJob, sorSignatureContext(), saved => showToast(saved ? 'Customer signature saved on this device.' : 'Signature removed.'));
+    } catch (error) { showToast(error.message); }
+    return;
+  }
   if (action === "reload-driver-pwa") {
     await reloadLatestDriverPwa(button);
     return;
@@ -5685,6 +5768,18 @@ app.addEventListener("click", async (event) => {
     const overrideJob = currentJob;
     if (!(await ensureAuthoritativeJobBeforeAction(overrideJob))) return;
     if (!currentJob || String(currentJob.jobId || "") !== String(overrideJob?.jobId || "")) return renderJob();
+    // An online override still needs the server's receipt, including after a
+    // page reload where no location check has run for this stop yet.
+    if (navigator.onLine && !locationCheck?.verificationId && locationCheck?.status !== "not_checked_offline") {
+      await checkCurrentJobLocation({ render: false });
+      if (!currentJob || String(currentJob.jobId || "") !== String(overrideJob?.jobId || "")) {
+        return renderJob();
+      }
+      if (!locationCheck?.verificationId && locationCheck?.status !== "not_checked_offline") {
+        showToast(t("driver.recheckOrOverride", "Recheck location or confirm override first."));
+        return renderJob();
+      }
+    }
     locationOverrideApproval.accept(currentJob);
     showToast(t("driver.locationOverrideAccepted", "Location override accepted for this stop"));
     return renderJob();
@@ -6015,13 +6110,21 @@ app.addEventListener("click", async (event) => {
       }
       let foregroundEvent = null;
       try {
+        // Keep Start behind a previous stop's uploading evidence in the same
+        // ordered ledger. The foreground endpoint still expects that old stop.
+        const startInForeground = navigator.onLine && !browserOfflineObserved && !jobStartWaitsForLocalCompletions(
+          startedJob,
+          offlineManifest,
+          await window.DriverOfflineDB.getProjectionEvents(offlinePartition.partitionKey, offlineManifest)
+        );
         foregroundEvent = await queueDriverEvent("job_started", {
+          job: startedJob,
           details: {
             truckPlate: dayState?.truckPlate || startedJob?.truckPlate || null
           },
-          deferSync: navigator.onLine
+          deferSync: startInForeground
         });
-        if (navigator.onLine) {
+        if (startInForeground) {
           const result = await request(`/api/driver/jobs/${encodeURIComponent(startedJob.jobId)}/start`, {
             method: "POST",
             body: JSON.stringify({
@@ -6237,6 +6340,9 @@ app.addEventListener("click", async (event) => {
     if (!(await prepareOfflineRecord())) return renderJob();
     if (!(await ensureLocationApprovalBeforeConfirmation())) return;
     if (!canUseOfflineLedger() && !(await prepareOfflineRecord())) return renderJob();
+    let submittedSignature;
+    try { submittedSignature = await window.SorDriverSignature.read(completedJob, sorSignatureContext()); }
+    catch (error) { showToast(error.message); return renderJob(); }
     button.disabled = true;
     button.textContent = t("common.uploading", "Uploading...");
     if (canUseOfflineLedger()) {
@@ -6247,13 +6353,14 @@ app.addEventListener("click", async (event) => {
         }
         await queueDriverEvent("job_completed", {
           job: completedJob,
-          eventPhotos: submittedJobPhotos,
+          eventPhotos: submittedSignature ? [...submittedJobPhotos, submittedSignature.photo] : submittedJobPhotos,
           details: {
             stopType: completedJob.stopType,
             stopId: completedJob.stopId || null,
             loadId: completedJob.loadId || null,
             planId: completedJob.planId || offlineManifest.planId || null,
             driverRemark: submittedDriverRemark,
+            ...(submittedSignature ? {customerSignature: submittedSignature.metadata} : {}),
             ...(submittedBinDetails ? { mbt: submittedBinDetails } : {})
           }
         });
@@ -6342,12 +6449,14 @@ app.addEventListener("click", async (event) => {
         method: "POST",
         body: JSON.stringify({
           photoDataUrls: uploadedPhotos,
+          customerSignature: await window.SorDriverSignature.onlinePayload(submittedSignature),
           driverRemark: submittedDriverRemark,
           locationOverride: locationOverrideApproval.isAccepted(completedJob),
           autoStartNext: true
         })
       });
       await clearLegacyDraftPhotos(submittedJobPhotos);
+      if (submittedSignature) { await window.DriverOfflineDB.deleteDraftPhoto(submittedSignature.photo.photoId); }
       currentJob = withManifestJobIdentity(result.nextJob);
       activeRest = acceptDriverRestCandidate(result.rest);
       restSummary = result.restSummary || restSummary;
@@ -6796,6 +6905,7 @@ window.addEventListener("online", () => {
 
 window.addEventListener("offline", () => {
   markDriverBrowserOffline();
+  clearQuietSyncHold();
   stopOnlineRouteRevalidation();
   if (currentJob?.status === "in_progress" && !photoInteractionActive()) {
     locationCheck = offlineLocationCheckResult();
@@ -6909,7 +7019,7 @@ if ("serviceWorker" in navigator) {
     window.setTimeout(requestDriverWorkerVersion, 0);
     window.setTimeout(publishDriverOfflineMode, 0);
   });
-  navigator.serviceWorker.register("/driver-service-worker.js?v=20260910-route-prefix-cursor-v1", {
+  navigator.serviceWorker.register("/driver-service-worker.js?v=20260924-driver-workflow-v1", {
     scope: "/driver",
     updateViaCache: "none"
   })

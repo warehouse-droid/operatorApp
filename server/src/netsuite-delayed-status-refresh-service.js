@@ -205,6 +205,8 @@ export function createDelayedStatusRefreshWorker(dependencies = {}) {
     dependencies.applySalesOrderLines,
     "applySalesOrderLines"
   );
+  const fetchPurchaseOrderLines = dependencies.fetchPurchaseOrderLines || (async () => []);
+  const applyPurchaseOrderWeights = dependencies.applyPurchaseOrderWeights || (async () => {});
   const runInTransaction = requiredFunction(dependencies.withTransaction, "withTransaction");
   const writeAudit = requiredFunction(dependencies.writeAudit, "writeAudit");
   const emitEvents = requiredFunction(dependencies.emitEvents, "emitEvents");
@@ -264,6 +266,9 @@ export function createDelayedStatusRefreshWorker(dependencies = {}) {
         allocationRefreshError = errorMessage(error);
       }
     }
+    if (job.orderType === "purchase_order") {
+      lines = await fetchPurchaseOrderLines(job.netsuiteOrderId);
+    }
     return { remoteStatus, lines, allocationRefresh, allocationRefreshError };
   }
 
@@ -280,6 +285,9 @@ export function createDelayedStatusRefreshWorker(dependencies = {}) {
     });
     if (job.orderType === "sales_order" && lines.length > 0) {
       await applySalesOrderLines({ netsuiteOrderId: job.netsuiteOrderId, lines });
+    }
+    if (job.orderType === "purchase_order" && lines.length > 0) {
+      await applyPurchaseOrderWeights({ netsuiteOrderId: job.netsuiteOrderId, lines });
     }
     return updated;
   }

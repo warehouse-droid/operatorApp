@@ -2093,6 +2093,7 @@ function driverPwaRenderStopDetail() {
             ${offlineReviewRenderJobCard("Current dispatch stop", Object.keys(currentJob).length ? currentJob : null, "The current stop snapshot is unavailable. Refresh before reopening.")}
           </div>
         </section>
+        ${driverPwaSignatureEvidence(record.customerSignature)}
         ${driverPwaRenderReopen(record)}
       </div>
     </section>
@@ -2347,6 +2348,7 @@ function driverPwaRenderCompletedVisitDetail() {
           </div>
           ${driverPwaCompletedCommittedPhotos(visit)}
         </section>
+        ${driverPwaSignatureEvidence(visit.customerSignature)}
         ${driverPwaRenderCompletedPhotoAppend(visit)}
       </div>
     </section>
@@ -2986,6 +2988,18 @@ function offlineReviewClosePhoto() {
   const objectUrl = lightbox.dataset.objectUrl || "";
   lightbox.remove();
   if (objectUrl) URL.revokeObjectURL(objectUrl);
+}
+
+function driverPwaSignatureEvidence(signature) {
+  if (!signature) { return ''; }
+  const reference = String(signature.imageReference || '');
+  const source = reference.startsWith('data:image/jpeg;base64,') ? reference
+    : `/api/photo-upload/preview?ref=${encodeURIComponent(reference)}`;
+  return `<section class="offline-review-section"><h3>Customer signature</h3>
+    <p>${offlineReviewEscape(signature.signedBy || '')} · ${offlineReviewEscape(offlineReviewFormatDateTime(signature.capturedAt))}</p>
+    <p>${offlineReviewEscape((signature.orderRefs || []).join(', '))}</p>
+    <img src="${offlineReviewEscape(source)}" alt="Customer signature" style="max-width:100%;max-height:240px;background:white" />
+    <details><summary>Signed terms &amp; conditions</summary><p style="white-space:pre-wrap">${offlineReviewEscape(signature.terms)}</p></details></section>`;
 }
 
 async function offlineReviewOpenPhoto(button) {

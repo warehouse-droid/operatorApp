@@ -1,0 +1,13 @@
+import assert from 'node:assert/strict';
+import { readFile, writeFile } from 'node:fs/promises';
+import { spawnSync } from 'node:child_process';
+import { runtimeFiles } from './order-update-save-files.mjs';
+const mode = process.argv[2] || 'candidate';
+const present = [];
+for (const file of runtimeFiles) if (await readFile(file).then(() => true).catch(() => false)) present.push(file);
+const lint = spawnSync(process.execPath, ['node_modules/eslint/bin/eslint.js', '--config', 'tools/order-update-save-eslint.config.mjs', '--format=json', ...present], { encoding: 'utf8', maxBuffer: 32 * 1024 * 1024 });
+assert.ok([0, 1].includes(lint.status), lint.stderr);
+const types = spawnSync(process.execPath, ['node_modules/typescript/bin/tsc', '--project', 'tsconfig.mbt.json', '--noEmit'], { encoding: 'utf8', maxBuffer: 32 * 1024 * 1024 });
+const report = { mode, lint: JSON.parse(lint.stdout), typesExit: types.status, types: types.stdout + types.stderr };
+await writeFile(`test-artifacts/order-update-save/static-${mode}.json`, JSON.stringify(report, null, 2));
+console.log(JSON.stringify({ mode, lintErrors: report.lint.reduce((n, file) => n + file.errorCount, 0), typesExit: types.status }));

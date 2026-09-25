@@ -1,0 +1,605 @@
+--- a/src/netsuite-order-webhook-queue-policy.js
++++ b/src/netsuite-order-webhook-queue-policy.js
+@@ -96,9 +96,10 @@
+   const leftTime = Date.parse(left.sourceModifiedAt || "") || 0;
+   const rightTime = Date.parse(right.sourceModifiedAt || "") || 0;
+   if (leftTime !== rightTime) return leftTime < rightTime ? -1 : 1;
+-  const leftHash = text(left.payloadHash);
+-  const rightHash = text(right.payloadHash);
+-  return leftHash === rightHash ? 0 : leftHash < rightHash ? -1 : 1;
++  // NetSuite may report modification times only to the minute. Content hashes
++  // identify duplicates; their lexical order says nothing about edit chronology.
++  // Equal source versions are accepted in serialized inbox arrival order.
++  return 0;
+ }
+ 
+ export function webhookRetryDelayMs(attemptNumber) {
+--- a/src/netsuite-order-webhook-queue-repository.js
++++ b/src/netsuite-order-webhook-queue-repository.js
+@@ -62,16 +62,14 @@
+         WHERE entity_key = $1
+           AND status IN ('queued', 'running', 'succeeded', 'failed')
+         ORDER BY COALESCE(source_modified_at, '-infinity'::timestamptz) DESC,
+-                 payload_hash DESC, received_at DESC, id DESC
++                 id DESC
+         LIMIT 1
+         FOR UPDATE`,
+       [envelope.entityKey]
+     );
+     const latestRow = latest.rows[0] || null;
+-    // When NetSuite omits its modification timestamp, receipt order is the
+-    // only trustworthy ordering signal. Never discard the newly received
+-    // full snapshot merely because its content hash sorts before an older
+-    // snapshot's hash; hashes provide identity, not chronology.
++    // The entity lock serializes insertion. Equal or absent modification times
++    // use that arrival order; the hash is only used for duplicate identity.
+     const superseded = latestRow && envelope.sourceModifiedAt
+       ? compareNetSuiteWebhookVersions(envelope, versionOfRow(latestRow)) < 0
+       : false;
+@@ -119,10 +117,10 @@
+               OR COALESCE(source_modified_at, '-infinity'::timestamptz) < $3::timestamptz
+               OR (
+                 COALESCE(source_modified_at, '-infinity'::timestamptz) = $3::timestamptz
+-                AND payload_hash < $4
++                AND id < $2
+               )
+             )`,
+-        [envelope.entityKey, row.id, envelope.sourceModifiedAt, envelope.payloadHash]
++        [envelope.entityKey, row.id, envelope.sourceModifiedAt]
+       );
+       coalesced = replaced.rowCount;
+     }
+--- a/src/delivery-repository.js
++++ b/src/delivery-repository.js
+@@ -1,3 +1,4 @@
++import { attachOperatorLoadState } from "./operator-load-state-repository.js";
+ import { isBackgroundPhotoReference } from "./operator-background-photos.js";
+ import { isLocalCoLoaded, projectLoadedCoLine } from "./local-co-loaded-policy.js";
+ import { deliveryPackingRemainder, deliveryPackingRemainderSql, DELIVERY_PACK_ROUNDING_TOLERANCE as LOAD_SALES_QTY_TOLERANCE } from "./delivery-packing-progress.js";
+@@ -2374,7 +2375,12 @@
+   };
+ }
+ 
+-export async function getDeliveryOrder(id, { includeNetSuiteClosed = false } = {}) {
++/** @param {any} id @param {{includeNetSuiteClosed?: boolean}} [options] */
++export async function getDeliveryOrder(id, options = {}) {
++  return attachOperatorLoadState(await getDeliveryOrderData(id, options));
++}
++
++async function getDeliveryOrderData(id, { includeNetSuiteClosed = false } = {}) {
+   if (isVrmaDeliveryRef(id)) return getVrmaDeliveryPrepOrder(id);
+   if (isLocalCoRef(id)) return getLocalCoDeliveryOrder(id);
+   if (isDispatchGroupOrderId(id)) return getDispatchGroupDeliveryOrder(id);
+--- a/src/consolidation-load-repository.js
++++ b/src/consolidation-load-repository.js
+@@ -32,7 +32,12 @@
+   if (!row) throw consolidationError("Consolidation Load not found.", "CONSOLIDATION_LOAD_NOT_FOUND", 404);
+   if (String(row.operator_id) !== String(operator.id)) throw consolidationError("This load belongs to another operator.", "OPERATOR_YARD_FORBIDDEN", 403);
+   assertOperatorYard(operator, row.location_id);
+-  return publicBatch(row);
++  const batch = publicBatch(row);
++  if (batch.status === 'draft') {
++    const orders = await Promise.all(batch.snapshot.orders.map(order => getDeliveryOrder(order.netsuite_id)));
++    return { ...batch, confirmationSummaries: orders.filter(Boolean).map(order => order.confirmationSummary) };
++  }
++  return batch;
+ }
+ /** @param {any} operator @param {unknown} locationId */
+ export async function listPendingConsolidatedLoads(operator, locationId) {
+--- a/src/operator-netsuite-posting-service.js
++++ b/src/operator-netsuite-posting-service.js
+@@ -97,10 +97,26 @@
+     }
+   }
+ 
++  /** @param {Record<string, any>} step @param {Record<string, any>} record */
++  function verifyObservedRecord(step, record) {
++    try { return adapter.verify(step, record); }
++    catch (error) {
++      // An observed record proves neither the requested quantities nor completion.
++      // Retain its reference only when it belongs to this command and source.
++      if (error && typeof error === 'object'
++          && String(record.externalId ?? record.externalid ?? '') === String(step.externalId)
++          && Number(record.createdFromId ?? record.createdfrom ?? record.createdFrom?.id) === Number(step.sourceNetSuiteId)
++          && Number.isSafeInteger(Number(record.id)) && Number(record.id) > 0) {
++        Object.assign(error, { observedTransaction: safeRemoteEvidence(record) });
++      }
++      throw error;
++    }
++  }
++
+   async function verifiedExternalRecord(/** @type {Record<string, any>} */ step, stage = "duplicate_check", direct = false) {
+     const record = await telemetry.context({ stage }, () => telemetry.time({ operation: `posting.${stage}` }, () => adapter.findByExternalId(step, direct)));
+     if (!record) {return null;}
+-    const verified = adapter.verify(step, record);
++    const verified = verifyObservedRecord(step, record);
+     return { record, verified };
+   }
+ 
+@@ -143,7 +159,7 @@
+               ambiguous: true
+             });
+           }
+-          verified = adapter.verify(step, record);
++          verified = verifyObservedRecord(step, record);
+         } else {
+           recoveryAttempted = true;
+           const afterTransform = await verifiedExternalRecord(step, "recovery", direct);
+@@ -158,6 +174,7 @@
+         }
+       }
+     } catch (error) {
++      const observedTransaction = failureDetails(error).observedTransaction;
+       const ambiguous = remoteMayExist || isAmbiguousOperatorNetSuiteFailure(error);
+       if (ambiguous && !recoveryAttempted) {
+         try {
+@@ -178,7 +195,8 @@
+           leaseToken: command.leaseToken,
+           attemptNumber: attempt.attemptNumber,
+           error,
+-          uncertain: ambiguous
++          uncertain: ambiguous,
++          observedTransaction: failureDetails(error).observedTransaction || observedTransaction
+         });
+         replaceStep(command, updated);
+         throw error;
+--- a/src/operator-netsuite-posting-repository.js
++++ b/src/operator-netsuite-posting-repository.js
+@@ -564,7 +564,8 @@
+  *   leaseToken: string,
+  *   attemptNumber: number,
+  *   error: unknown,
+- *   uncertain?: boolean
++ *   uncertain?: boolean,
++ *   observedTransaction?: Record<string, any>
+  * }} input
+  */
+ export async function recordOperatorNetSuitePostingStepFailure(input) {
+@@ -574,6 +575,7 @@
+   const attemptNumber = Number(input?.attemptNumber);
+   const message = errorText(input?.error);
+   const outcome = input?.uncertain ? "uncertain" : "failed";
++  const observed = input.observedTransaction;
+   return withTransaction(async () => {
+     await lockedLeasedCommand(commandId, leaseToken);
+     const step = await lockedStep(commandId, stepId);
+@@ -604,10 +606,11 @@
+       `UPDATE operator_netsuite_posting_steps
+           SET status = $2,
+               last_error = $3,
++              response = response || $4::jsonb,
+               updated_at = now()
+         WHERE id = $1
+         RETURNING *`,
+-      [stepId, outcome, message]
++      [stepId, outcome, message, JSON.stringify(observed ? { observedTransaction: observed } : {})]
+     );
+     return publicStep(updated.rows[0]);
+   });
+--- a/src/operator-netsuite-posting-controller.js
++++ b/src/operator-netsuite-posting-controller.js
+@@ -141,6 +141,7 @@
+       attemptCount: step.attemptCount,
+       transactionId: step.netSuiteTransactionId,
+       transactionRef: step.netSuiteTransactionRef,
++      observedTransaction: step.response?.observedTransaction || null,
+       lastError: step.lastError
+     }))
+   };
+--- a/public/operator.js
++++ b/public/operator.js
+@@ -4493,13 +4493,14 @@
+         ${vrmaReferenceOnly
+           ? `<span class="muted">${t("operator.referenceOnlyNoInventory", "Reference only · No inventory deduction")}</span>`
+           : directPickupInfo ? "" : isCustomerPickupMode()
+-            ? `<button class="primary-button" data-action="start-fulfill" type="button" ${hasCustomerPickupDraft(order) && !pickupConfirming && !pageConfirming ? "" : "disabled"}>${t("common.load", "Load")}</button>`
++            ? `<button class="primary-button" data-action="start-fulfill" type="button" ${hasCustomerPickupDraft(order) && !pickupConfirming && !pageConfirming && !order.posting?.loadBlocked ? "" : "disabled"}>${t("common.load", "Load")}</button>`
+             : loadAction.show
+-              ? `<button class="primary-button" data-action="start-fulfill" type="button">${loadAction.label}</button>`
++              ? `<button class="primary-button" data-action="start-fulfill" type="button" ${order.posting?.loadBlocked ? "disabled" : ""}>${loadAction.label}</button>`
+               : `<button class="secondary-button" data-action="set-preparing" type="button">${t("operator.preparing", "Preparing")}</button>
+                  <button class="primary-button" data-action="set-packed" type="button" ${canMarkPacked(order) ? "" : "disabled"}>${t("operator.packed", "Packed")}</button>`}
+       </div>
+     </div>
++    ${renderLoadPostingStatus(order)}
+     <div class="progress-strip">
+       <div><span>${vrmaReferenceOnly ? t("operator.referenceLines", "Reference lines") : isCustomerPickupMode() ? t("operator.pickupLines", "Pickup lines") : viewMode === "packed" ? t("operator.packedLines", "Packed lines") : t("operator.openLines", "Open lines")}</span><strong>${vrmaReferenceOnly ? lines.length : confirmed} / ${lines.length}</strong></div>
+       <div><span>${t("common.location", "Location")}</span><strong>${currentLocation()?.text}</strong></div>
+@@ -4607,6 +4608,7 @@
+         localOnly: localOnlyPosting,
+         error: fulfillmentNetSuitePolicyError
+       })}
++      ${renderLoadPostingStatus(order)}
+       <div class="fulfillment-card fulfillment-photo-card">
+         <span>${isPickupLoad && requiredPhotoCount === 0
+           ? t("operator.customerPickupPhotoOptional", "Customer Pickup photo proof (optional)")
+@@ -4647,7 +4649,7 @@
+         ${fulfillmentSubmitting ? `<div class="sync-alert"><strong>${localizeMessage(fulfillmentJobStage || t("operator.savingLoadProof", "Saving load proof"))}</strong><span>${localizeMessage(fulfillmentStatusText || t("operator.savingLocalYardStatus", "Saving local yard status..."))}<span data-fulfillment-upload-elapsed>${fulfillmentStartedAt ? ` (${Math.max(1, Math.round((Date.now() - fulfillmentStartedAt) / 1000))}s)` : ""}</span></span></div>` : ""}
+         ${!fulfillmentSubmitting && fulfillmentJobStage === "Load failed" ? `<div class="sync-alert danger"><strong>${t("operator.loadFailed", "Load failed")}</strong><span>${escapeHtml(localizeMessage(fulfillmentStatusText))}</span></div>` : ""}
+         ${renderLoadValidation(fulfillmentValidation)}
+-        <button class="primary-button" data-action="confirm-fulfill" ${(isPickupLoad || fulfillmentPhotoCount >= requiredPhotoCount) && postingModeReady && !fulfillmentSubmitting ? "" : "disabled"} type="button">${fulfillmentSubmitting ? t("operator.loading", "Loading...") : t("common.load", "Load")}</button>
++        <button class="primary-button" data-action="confirm-fulfill" ${(isPickupLoad || fulfillmentPhotoCount >= requiredPhotoCount) && postingModeReady && !fulfillmentSubmitting && !order.posting?.loadBlocked ? "" : "disabled"} type="button">${fulfillmentSubmitting ? t("operator.loading", "Loading...") : t("common.load", "Load")}</button>
+       </div>
+     </section>
+   `, `
+@@ -4758,7 +4760,7 @@
+       ? `<button class="secondary-button danger-button" data-action="unpack-line" data-line="${line.id}" type="button">${t("operator.unpackPackedQty", "Unpack packed qty")}</button>`
+       : `<button class="primary-button" data-action="update-packed-line" data-line="${line.id}" type="button">${t("operator.updatePackedQty", "Update packed qty")}</button>
+          <button class="secondary-button danger-button" data-action="unpack-line" data-line="${line.id}" type="button">${t("operator.unpackPackedQty", "Unpack packed qty")}</button>`
+-    : `<button class="primary-button" data-action="start-fulfill" type="button">${loadAction.label}</button>
++    : `<button class="primary-button" data-action="start-fulfill" type="button" ${selectedOrder?.posting?.loadBlocked ? "disabled" : ""}>${loadAction.label}</button>
+        <button class="secondary-button" data-action="edit-reload-packing" type="button">Edit packing</button>`;
+   return `
+     <aside class="selected-panel" data-selected-line="${line.id}">
+@@ -5694,6 +5696,16 @@
+   if (fulfillmentSubmitting || !state.batch) return;
+   const batchId = state.batch.id;
+   const pending = state.batch.status === "pending";
++  if (!pending) {
++    fulfillmentSubmitting = true;
++    try {
++      const latest = await api(`/api/delivery/consolidation-loads/${encodeURIComponent(batchId)}`);
++      if (state.batchId !== batchId) return;
++      state.batch = latest;
++      if (!await confirmMissingLoadLines(latest.confirmationSummaries)) return;
++    } catch (error) { showToast(error.message); return; }
++    finally { fulfillmentSubmitting = false; }
++  }
+   const photos = fulfillmentPhotoDataUrls.filter(Boolean);
+   if (!pending && photos.length < 2) { showToast(t("operator.takeTwoLoadPhotos", "Take at least 2 photos before confirming load.")); return; }
+   fulfillmentSubmitting = true; fulfillmentJobStage = "Saving proof"; fulfillmentStatusText = "Saving the selected load...";
+@@ -6551,7 +6563,7 @@
+   }
+   if (currentModule === "customer-pickup") {
+     const load = app.querySelector('[data-action="start-fulfill"]');
+-    if (load) load.disabled = busy || !hasCustomerPickupDraft();
++    if (load) load.disabled = busy || !hasCustomerPickupDraft() || selectedOrder?.posting?.loadBlocked;
+   }
+ }
+ 
+@@ -6793,7 +6805,9 @@
+       throw error;
+     }
+     if (job.status === "failed") {
+-      throw new Error(job.lastError || "NetSuite posting failed. The order was not completed locally.");
++      const error = new Error(job.lastError || "NetSuite posting failed. The order was not completed locally.");
++      error.payload = { posting: job };
++      throw error;
+     }
+     const postedSteps = (job.steps || []).filter((step) => step.status === "posted").length;
+     const elapsedSeconds = Math.max(1, Math.round((Date.now() - pollingStartedAt) / 1000));
+@@ -6830,7 +6844,12 @@
+ 
+ async function startFulfillment() {
+   if (!selectedOrder) return;
+-  let order = selectedOrder;
++  let order = await api(`/api/delivery/orders/${encodeURIComponent(selectedOrder.netsuite_id)}`);
++  await resumePreviousLoadJournal(order);
++  selectedOrder = order;
++  if (order.posting?.loadBlocked) { render(); return showToast(order.posting.reason); }
++  if (!await confirmMissingLoadLines([order.confirmationSummary])) { return; }
++  order.loadConfirmationAcknowledged = JSON.stringify(order.confirmationSummary);
+   if (order.reload_authorized) {
+     const refreshed = await api(`/api/delivery/orders/${encodeURIComponent(order.netsuite_id)}`);
+     acceptRefreshedDeliveryOrder(refreshed, { renderPanels: false });
+@@ -6859,7 +6878,7 @@
+   fulfillmentJobStage = "";
+   fulfillmentStartedAt = 0;
+   fulfillmentValidation = null;
+-  fulfillmentLoadRequestId = createOperatorUuid();
++  fulfillmentLoadRequestId = loadPostingJournal(order)?.requestId || createOperatorUuid();
+   fulfillmentNetSuitePolicy = null;
+   fulfillmentNetSuitePolicyError = "";
+   const postingFunction = customerPickupLoad ? "customer_pickup" : "delivery_prep";
+@@ -6979,7 +6998,24 @@
+ async function confirmFulfillment() {
+   if (fulfillmentOrder?.is_consolidation_load) return confirmConsolidationLoad();
+   if (!fulfillmentOrder || fulfillmentSubmitting) return;
++  if (fulfillmentOrder.posting?.loadBlocked) return;
+   fulfillmentSubmitting = true;
++  if (fulfillmentOrder.confirmationSummary) {
++    try {
++      const latest = await api(`/api/delivery/orders/${encodeURIComponent(fulfillmentOrder.netsuite_id)}`);
++      if (latest.posting?.loadBlocked) {
++        fulfillmentOrder.posting = latest.posting;
++        fulfillmentSubmitting = false; render(); return;
++      }
++      if (JSON.stringify(latest.confirmationSummary) !== fulfillmentOrder.loadConfirmationAcknowledged
++          && !await confirmMissingLoadLines([latest.confirmationSummary])) {
++        fulfillmentSubmitting = false; render(); return;
++      }
++      fulfillmentOrder = { ...latest, loadConfirmationAcknowledged: JSON.stringify(latest.confirmationSummary) };
++    } catch (error) {
++      fulfillmentSubmitting = false; showToast(error.message); render(); return;
++    }
++  }
+   const isPickupLoad = currentModule === "customer-pickup-load";
+   const postingFunction = isPickupLoad ? "customer_pickup" : "delivery_prep";
+   const localOnlyPosting = operatorNetSuitePostingIsLocalOnly(fulfillmentOrder, postingFunction);
+@@ -7031,6 +7067,7 @@
+       ? "Creating and verifying the NetSuite fulfillment..."
+       : "Saving local loaded status...";
+     showFulfillmentPostingStage(deferPhotos);
++    rememberFulfillmentPosting({ status: "submitting", loadBlocked: true });
+     const started = await api(path, {
+       method: "POST",
+       body: JSON.stringify({
+@@ -7046,6 +7083,7 @@
+     if (started.status === "complete" && started.result) {
+       fulfillmentResult = started.result;
+     } else if (started.status === "running") {
++      rememberFulfillmentPosting({ jobId: started.jobId, status: "posting", loadBlocked: true });
+       fulfillmentJobStage = "Posting to NetSuite";
+       fulfillmentStatusText = t("operator.waitingNetSuiteVerification", "Waiting for NetSuite transaction verification...");
+       render();
+@@ -7057,9 +7095,13 @@
+     } else {
+       fulfillmentResult = started;
+     }
++    rememberFulfillmentPosting(null);
+     showToast(fulfillmentNetSuitePolicy?.effective ? "NetSuite verified and order loaded" : "Order loaded locally");
+   } catch (error) {
+-    fulfillmentJobStage = "Load failed";
++    const job = error.payload?.posting;
++    if (job) rememberFulfillmentPosting(["completed", "failed"].includes(job.status) ? null : postingSummaryFromJob(job));
++    else if (error.status >= 400 && error.status < 500 && !["OPERATOR_NETSUITE_POSTING_IN_PROGRESS", "OPERATOR_NETSUITE_POSTING_ORDER_CLAIMED"].includes(error.payload?.code || error.code)) rememberFulfillmentPosting(null);
++    fulfillmentJobStage = fulfillmentOrder.posting?.loadBlocked ? "Verification pending" : "Load failed";
+     fulfillmentValidation = error.payload?.validation || null;
+     fulfillmentStatusText = fulfillmentValidation
+       ? "Correct the listed packed lines before loading."
+@@ -7077,6 +7119,102 @@
+ function showFulfillmentPostingStage(deferPhotos) {
+   if (deferPhotos) {fulfillmentJobStage = "Posting to NetSuite";}
+   render();
++}
++
++function postingSummaryFromJob(job) {
++  return { jobId: job.id, status: job.status, loadBlocked: job.status !== "completed" && job.status !== "failed",
++    reason: job.status === "attention" ? "NetSuite verification needs review. This load is held until reconciliation finishes." : "This load is being verified.",
++    transactions: (job.steps || []).flatMap(step => {
++      const id = step.transactionId || step.observedTransaction?.id;
++      return id ? [{ id, ref: step.transactionRef || step.observedTransaction?.tranId || String(id), verified: step.status === "posted" }] : [];
++    }) };
++}
++
++function loadPostingJournalKey(order) {
++  const account = typeof operator === "undefined" ? "" : operator?.id || "";
++  return `mbbs.operator.posting:${account}:${order?.order_type}:${order?.netsuite_id}`;
++}
++
++function loadPostingJournal(order) {
++  try { return JSON.parse(window.localStorage?.getItem(loadPostingJournalKey(order)) || "null"); }
++  catch { return null; }
++}
++
++function rememberFulfillmentPosting(posting) {
++  if (!fulfillmentOrder) return;
++  fulfillmentOrder.posting = posting;
++  try {
++    const key = loadPostingJournalKey(fulfillmentOrder);
++    if (posting) window.localStorage?.setItem(key, JSON.stringify({ requestId: fulfillmentLoadRequestId, ...posting }));
++    else window.localStorage?.removeItem(key);
++  } catch { /* Durable server claims remain authoritative if browser storage is unavailable. */ }
++}
++
++async function resumePreviousLoadJournal(order) {
++  const previous = loadPostingJournal(order);
++  if (!previous || order.posting?.loadBlocked) return;
++  // The request UUID is also the durable command ID, even if admission's
++  // response was lost before the browser learned the job ID.
++  const job = await api(`/api/operator/netsuite-posting-jobs/${encodeURIComponent(previous.jobId || previous.requestId)}`).catch(() => null);
++  if (!job) return;
++  if (["completed", "failed"].includes(job.status)) {
++    try { window.localStorage?.removeItem(loadPostingJournalKey(order)); } catch { /* Server state still prevents duplicate completion. */ }
++  } else order.posting = postingSummaryFromJob(job);
++}
++
++function renderLoadPostingStatus(order) {
++  const posting = order?.posting;
++  if (!posting?.loadBlocked) return "";
++  const references = (posting.transactions || []).map(transaction => transaction.ref).filter(Boolean).join(", ");
++  return `<div class="sync-alert danger" data-load-posting-status role="status">
++    <strong>${posting.status === "attention" ? "Needs review" : "Verification pending"}${references ? ` · ${escapeHtml(references)}` : ""}</strong>
++    <span>${escapeHtml(posting.reason || "The previous load is being checked. Check its status before continuing.")}</span>
++    <button class="secondary-button" data-action="refresh-load-posting" type="button">Check status</button>
++  </div>`;
++}
++
++async function refreshLoadPostingStatus() {
++  const order = fulfillmentOrder || selectedOrder;
++  if (!order) return;
++  const refreshed = await api(`/api/delivery/orders/${encodeURIComponent(order.netsuite_id)}`);
++  if (fulfillmentOrder) {
++    const jobId = refreshed.posting?.jobId || fulfillmentOrder.posting?.jobId || loadPostingJournal(order)?.requestId;
++    if (jobId) {
++      const job = await api(`/api/operator/netsuite-posting-jobs/${encodeURIComponent(jobId)}`).catch(() => null);
++      if (job?.status === "completed") {
++        fulfillmentResult = job.result?.localFinalization || job.result;
++        rememberFulfillmentPosting(null);
++      } else if (job) refreshed.posting = postingSummaryFromJob(job);
++    }
++    fulfillmentOrder = { ...refreshed, loadConfirmationAcknowledged: fulfillmentOrder.loadConfirmationAcknowledged };
++    if (!refreshed.posting?.loadBlocked && !fulfillmentResult && !hasDraftPackedQty(refreshed)) {
++      return finishFulfillment();
++    }
++  } else selectedOrder = refreshed;
++  render();
++}
++
++let loadPartialConfirmation = null;
++function confirmMissingLoadLines(summaries) {
++  const missing = (summaries || []).filter(summary => summary?.missing?.length);
++  if (!missing.length) return Promise.resolve(true);
++  if (loadPartialConfirmation) return Promise.resolve(false);
++  const dialog = document.createElement("dialog");
++  dialog.className = "receiving-confirmation-dialog";
++  dialog.dataset.loadPartialConfirmation = "true";
++  dialog.setAttribute("aria-labelledby", "load-confirmation-title");
++  dialog.innerHTML = `<form method="dialog"><h2 id="load-confirmation-title">Unconfirmed load lines</h2>
++    ${missing.map(summary => `<p><strong>${escapeHtml(summary.orderRef)}</strong></p>
++      <p>${summary.confirmed} of ${summary.total} lines confirmed; ${summary.missing.length} still unconfirmed.</p>
++      <ul>${summary.missing.map(line => `<li>${escapeHtml(line.sku)}</li>`).join("")}</ul>`).join("")}
++    <p>Only confirmed lines will be loaded. Remaining lines stay open and will appear when you scan the order again.</p>
++    <div class="receiving-confirmation-actions"><button class="secondary-button" value="back" autofocus>Go back</button>
++      <button class="primary-button" value="load">Load confirmed lines</button></div></form>`;
++  loadPartialConfirmation = dialog;
++  return new Promise(resolve => {
++    dialog.addEventListener("close", () => { loadPartialConfirmation = null; dialog.remove(); resolve(dialog.returnValue === "load"); }, { once: true });
++    document.body.appendChild(dialog); dialog.showModal();
++  });
+ }
+ 
+ async function pollFulfillmentJob(jobId) {
+@@ -9514,6 +9652,7 @@
+     if (button.dataset.action === "set-preparing") return setOrderStatus("preparing");
+     if (button.dataset.action === "set-packed") return setOrderStatus("packed");
+     if (button.dataset.action === "edit-reload-packing") return editReloadPacking();
++    if (button.dataset.action === "refresh-load-posting") return refreshLoadPostingStatus();
+     if (button.dataset.action === "start-fulfill") return startFulfillment();
+     if (button.dataset.action === "cancel-fulfill") {
+       stopFulfillmentCamera();
+--- a/public/operator.html
++++ b/public/operator.html
+@@ -23,6 +23,6 @@
+     <script src="/i18n.js?v=20260916-operator-direct-orderline-v1"></script>
+     <script src="/operator-load-summary.js?v=20260915-operator-display-v1"></script>
+     <script src="/operator-photo-outbox.js?v=20260917-background-photos-v1"></script>
+-    <script src="/operator.js?v=20260917-background-photos-v1"></script>
++    <script src="/operator.js?v=20260917-load-followup-v1"></script>
+   </body>
+ </html>
+--- a/public/service-worker.js
++++ b/public/service-worker.js
+@@ -1,4 +1,4 @@
+-const CACHE_NAME = "mbbs-yard-operator-20260917-background-photos-v1";
++const CACHE_NAME = "mbbs-yard-operator-20260917-load-followup-v1";
+ const OPERATOR_CACHE_PREFIX = "mbbs-yard-operator-";
+ const APP_SHELL = [
+   "/operator",
+@@ -10,7 +10,7 @@
+   "/i18n.js?v=20260916-operator-direct-orderline-v1",
+   "/operator-load-summary.js?v=20260915-operator-display-v1",
+   "/operator-photo-outbox.js?v=20260917-background-photos-v1",
+-  "/operator.js?v=20260917-background-photos-v1",
++  "/operator.js?v=20260917-load-followup-v1",
+   "/manifest.webmanifest",
+   "/icons/mbbs-yard-192.png",
+   "/icons/mbbs-yard-512.png",
+--- /dev/null
++++ b/src/operator-load-state.js
+@@ -0,0 +1,38 @@
++// @ts-check
++const PACKED_FIELDS = ['packed_sales_qty', 'packed_pallet_qty', 'packed_layer_qty', 'packed_section_qty', 'packed_piece_qty'];
++/** @param {any} value */
++function positive(value) { return Number.isFinite(Number(value)) ? Math.max(0, Number(value)) : 0; }
++/** @param {any} line */
++function requiredQuantity(line) {
++  if (positive(line.quantity)) return positive(line.quantity);
++  const units = [['pallet_qty','to_plt'],['layer_qty','to_lyr'],['section_qty','to_sec'],['piece_qty','to_pcs']];
++  if (units.some(([, conversion]) => positive(line[conversion]))) {
++    return units.reduce((total, [field, conversion]) => total + positive(line[field]) * positive(line[conversion]), 0);
++  }
++  return positive(line.piece_qty) || positive(line.section_qty) || positive(line.layer_qty) || positive(line.pallet_qty);
++}
++/** @param {any} line */
++function outstandingLoadLine(line) {
++  return ['InvtPart','NonInvtPart'].includes(line.item_type)
++    && !/^(?:DELIVERY CHARGE|SALES CREDIT)/i.test(String(line.sku || line.item_name || '').trim())
++    && line.netsuite_active !== false && !line.netsuite_closed && !line.sync_exception
++    && !line.no_yard_load_required && !line.linked_quantity_blocked
++    && requiredQuantity(line) - positive(line.loaded_qty) > 0.000001;
++}
++/** @param {any} order */
++export function deliveryLoadConfirmation(order) {
++  const outstanding = (order?.lines || []).filter(outstandingLoadLine);
++  const missing = outstanding.filter((/** @type {any} */ line) => !PACKED_FIELDS.some(field => positive(line[field]) > 0));
++  return { orderId: String(order?.netsuite_id || ''), orderRef: String(order?.tranid || ''),
++    total: outstanding.length, confirmed: outstanding.length - missing.length,
++    missing: missing.map((/** @type {any} */ line) => ({ id: String(line.id), sku: String(line.sku || line.item_name || 'Item') })) };
++}
++/** @param {any} order @returns {string[]} */
++export function postingOrderKeys(order) {
++  if (!order) return [];
++  const id = String(order.netsuite_id || ''), type = String(order.order_type || '');
++  const keys = ['customer_pickup', 'delivery_prep'].map(kind => `${kind}:${type}:${id}`);
++  const source = { sales_order: 'SO', transfer_order: 'TO' }[type];
++  if (source && /^[1-9]\d*$/.test(id)) keys.push(`source:IF:${source}:${id}`);
++  return [...new Set([...keys, ...(order.child_orders || []).flatMap(postingOrderKeys)])];
++}
+--- /dev/null
++++ b/src/operator-load-state-repository.js
+@@ -0,0 +1,29 @@
++// @ts-check
++import { query } from './db.js';
++import { deliveryLoadConfirmation, postingOrderKeys } from './operator-load-state.js';
++
++/** Only minimal order-scoped state is public; actor, photos and snapshots stay private.
++ * @param {any} order
++ */
++export async function attachOperatorLoadState(order) {
++  if (!order) return order;
++  const commands = (await query(`SELECT c.id,c.status,c.last_error,c.created_at,
++      COALESCE(jsonb_agg(jsonb_build_object(
++        'id',s.netsuite_transaction_id,'ref',s.netsuite_transaction_ref,'verified',s.status='posted',
++        'observed',s.response->'observedTransaction')) FILTER (WHERE s.id IS NOT NULL),'[]'::jsonb) AS transactions
++    FROM operator_netsuite_posting_commands c
++    LEFT JOIN operator_netsuite_posting_steps s ON s.command_id=c.id
++    WHERE EXISTS (SELECT 1 FROM operator_netsuite_posting_order_claims claim
++      WHERE claim.command_id=c.id AND claim.active=true AND claim.local_order_key=ANY($1::text[]))
++    GROUP BY c.id ORDER BY c.created_at DESC,c.id`, [postingOrderKeys(order)])).rows;
++  const command = commands[0];
++  const transactions = commands.flatMap((/** @type {any} */ row) => row.transactions).flatMap((/** @type {any} */ row) => {
++    const id = row.id || row.observed?.id, ref = row.ref || row.observed?.tranId;
++    return id ? [{ id: Number(id), ref: String(ref || id), verified: row.verified === true }] : [];
++  });
++  return { ...order, confirmationSummary: deliveryLoadConfirmation(order), posting: command ? {
++    jobId: command.id, status: command.status, loadBlocked: true, transactions,
++    reason: command.status === 'attention' ? 'NetSuite verification needs review. This load is held until reconciliation finishes.'
++      : 'This load is already being processed. Check its status before continuing.'
++  } : null };
++}
+--- a/test/mbt/unit/operator-yard-assets.test.js
++++ b/test/mbt/unit/operator-yard-assets.test.js
+@@ -24,11 +24,11 @@
+   const waits = [];
+   events.get("install")({ waitUntil: (promise) => waits.push(promise) });
+   await Promise.all(waits);
+-  assert.equal(installed[0].name, "mbbs-yard-operator-20260917-background-photos-v1");
++  assert.equal(installed[0].name, "mbbs-yard-operator-20260917-load-followup-v1");
+   for (const asset of ["operator.js", "operator-photo-outbox.js", "operator-load-summary.js", "operator.css", "i18n.js"]) {
+     const version = asset === "operator.css" ? "20260916-operator-bottom-inset-v1"
+       : asset === "operator-load-summary.js" ? "20260915-operator-display-v1"
+-        : ["operator.js", "operator-photo-outbox.js"].includes(asset) ? "20260917-background-photos-v1" : "20260916-operator-direct-orderline-v1";
++        : asset === "operator.js" ? "20260917-load-followup-v1" : asset === "operator-photo-outbox.js" ? "20260917-background-photos-v1" : "20260916-operator-direct-orderline-v1";
+     const url = `/${asset}?v=${version}`;
+     assert.ok(html.includes(url));
+     assert.ok(installed[0].assets.includes(`https://yard.invalid${url}`));
+--- a/test/mbt/unit/operator-page-confirm-ui.contract.test.js
++++ b/test/mbt/unit/operator-page-confirm-ui.contract.test.js
+@@ -59,10 +59,10 @@
+   assert.match(operator, /pageConfirming = false;/u);
+   assert.match(css, /@media \(max-width: 700px\)[\s\S]*?\.receiving-grid\s*\{[\s\S]*?grid-template-columns:\s*minmax\(0, 1fr\)/u);
+   assert.match(html, /operator\.css\?v=20260916-operator-bottom-inset-v1/u);
+-  assert.match(html, /operator\.js\?v=20260917-background-photos-v1/u);
+-  assert.match(serviceWorker, /mbbs-yard-operator-20260917-background-photos-v1/u);
++  assert.match(html, /operator\.js\?v=20260917-load-followup-v1/u);
++  assert.match(serviceWorker, /mbbs-yard-operator-20260917-load-followup-v1/u);
+   assert.match(serviceWorker, /operator\.css\?v=20260916-operator-bottom-inset-v1/u);
+-  assert.match(serviceWorker, /operator\.js\?v=20260917-background-photos-v1/u);
++  assert.match(serviceWorker, /operator\.js\?v=20260917-load-followup-v1/u);
+ });
+ 
+ test("server exposes separate Customer Pickup and PO-only batch endpoints", async () => {
+--- a/test/mbt/unit/operator-customer-pickup-photo-gate-ui.contract.test.js
++++ b/test/mbt/unit/operator-customer-pickup-photo-gate-ui.contract.test.js
+@@ -93,7 +93,7 @@
+     source("public/operator.html"),
+     source("public/service-worker.js")
+   ]);
+-  assert.match(html, /operator\.js\?v=20260917-background-photos-v1/u);
+-  assert.match(serviceWorker, /mbbs-yard-operator-20260917-background-photos-v1/u);
+-  assert.match(serviceWorker, /operator\.js\?v=20260917-background-photos-v1/u);
++  assert.match(html, /operator\.js\?v=20260917-load-followup-v1/u);
++  assert.match(serviceWorker, /mbbs-yard-operator-20260917-load-followup-v1/u);
++  assert.match(serviceWorker, /operator\.js\?v=20260917-load-followup-v1/u);
+ });

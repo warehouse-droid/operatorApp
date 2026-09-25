@@ -1,0 +1,19 @@
+--- a/src/delivery-repository.js
++++ b/src/delivery-repository.js
+@@ -2432,7 +2432,6 @@
+                sync_exception, l.synced_at
+         FROM sales_order_lines l
+         JOIN sales_orders o ON o.netsuite_id = l.sales_order_id
+-       WHERE l.sales_order_id = $1
+        UNION ALL
+        SELECT transfer_order_id AS order_id, id, line_id, item_id, item_name, sku,
+               item_description, item_type, item_type_text, quantity, unit,
+@@ -2442,7 +2441,7 @@
+               to_plt, to_lyr, to_sec, to_pcs, loaded_qty, loaded_uom,
+                netsuite_active, sync_exception, synced_at
+        FROM transfer_order_lines
+-       WHERE line_stage = 'outbound' AND transfer_order_id = $1
++       WHERE line_stage = 'outbound'
+      )
+      SELECT delivery_order_source.*,
+             (

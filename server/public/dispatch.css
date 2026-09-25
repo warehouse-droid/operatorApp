@@ -5123,6 +5123,10 @@ button[data-action="enter-edit-mode"]:disabled:hover {
   line-height: 1;
 }
 
+.dispatch-save-notice > div > div + div { margin-top: 8px; }
+.dispatch-draft-actions { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 6px; }
+.route-notice .dispatch-draft-actions button { width: auto; border-radius: 5px; padding: 6px 10px; }
+
 .route-notice.scm-notice {
   display: grid;
   grid-template-columns: minmax(0, 1fr) auto;
@@ -6997,14 +7001,15 @@ button[data-action="enter-edit-mode"]:disabled:hover {
 }
 
 .selected-order-actions {
-  display: grid;
-  grid-template-columns: minmax(0, 1fr) repeat(4, auto);
+  display: flex;
+  flex-wrap: wrap;
   gap: 6px;
   align-items: center;
   padding-top: 2px;
 }
 
 .selected-order-actions span {
+  flex: 1 0 100%;
   min-width: 0;
   overflow: hidden;
   text-overflow: ellipsis;
@@ -7015,6 +7020,8 @@ button[data-action="enter-edit-mode"]:disabled:hover {
 }
 
 .selected-order-actions button {
+  flex: 0 0 auto;
+  white-space: nowrap;
   min-height: 28px;
   padding: 0 7px;
   font-size: 11px;

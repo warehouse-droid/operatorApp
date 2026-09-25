@@ -1,5 +1,8 @@
 // These aliases are supplied only by repository SQL, never by request values.
 // The baseline predates local tracking; current NetSuite and local receipts overlap.
+// Reconciliation allocates source-PO receipts to local split lines without
+// rewriting the child's received counter. That allocation is another cumulative
+// receipt total, not an additional receipt on top of the other evidence.
 export function smartScmSplitRemainingSql(line = "child_line", po = "child_po") {
   const physical = [
     ["received_pallet_qty", "to_plt"], ["received_layer_qty", "to_lyr"],
@@ -17,6 +20,17 @@ export function smartScmSplitRemainingSql(line = "child_line", po = "child_po") 
       ) THEN 0
     ELSE GREATEST(COALESCE(${line}.quantity, 0) - GREATEST(
       COALESCE(${line}.netsuite_received_qty, 0),
+      COALESCE((
+        SELECT SUM(receipt.quantity)
+          FROM dispatch_scm_po_split_lines receipt_ledger
+          JOIN scm_reconciliation_allocations receipt
+            ON receipt.po_split_line_id = receipt_ledger.id
+         WHERE receipt_ledger.split_id = split.id
+           AND receipt_ledger.split_line_id = ${line}.id
+           AND receipt.target_kind = 'po_split'
+           AND receipt.progress_kind = 'received'
+           AND receipt.active = true
+      ), 0),
       GREATEST(COALESCE(${line}.netsuite_received_baseline_qty, 0), 0)
         + CASE WHEN ${line}.confirmed_at IS NOT NULL
                  AND ${line}.confirmed_at <= ${po}.received_at

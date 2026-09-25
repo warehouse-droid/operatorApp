@@ -1,0 +1,30 @@
+{
+  "failedTests": [
+    "/app/test/mbt/integration/local-load-performance.test.js",
+    "/app/test/mbt/integration/operator-background-photos.test.js",
+    "/app/test/mbt/integration/operator-display-settings.test.js",
+    "Control and Admin request the cache-busted thumbnail hydration client",
+    "F06/F16: schema-101 upgrade preserves representative legacy records and is migration-runner idempotent",
+    "F15: all MBT routes render one accessible controlled shell with an explicit controller",
+    "Operator service worker precaches the exact new page assets, preserves Driver caches, and bypasses API requests",
+    "P3.11: the deployment inventory exactly covers every on-disk MBT-era migration",
+    "P3.12: browser specs share one worker-owned database-pool lifecycle",
+    "S11: the guarded client ships in a new atomic Driver shell generation",
+    "S7: Operator cache revision ships the live-policy client once; later toggles are server-only",
+    "a failed staging download leaves the active and non-Driver caches byte-for-byte unchanged",
+    "a fresh Driver shell version evicts older copy-enabled cached assets",
+    "a fresh Driver worker reloads every v41 shell asset and initializes only its scoped sentinel",
+    "a successful repair replaces only the complete Driver shell and preserves offline data sentinels",
+    "operator cache assets advance with the cycle-count pagination release",
+    "page confirmation has a duplicate-click guard and ships in a fresh Operator cache",
+    "quality non-regression: the gauntlet builds and validates the omit-dev runtime",
+    "the reset ships as a new atomic shell generation without forcing a protocol-version cutover",
+    "the updated override policy is atomically included in the Driver PWA shell"
+  ],
+  "counts": {
+    "tests": 2756,
+    "pass": 2735,
+    "fail": 20,
+    "skipped": 1
+  }
+}

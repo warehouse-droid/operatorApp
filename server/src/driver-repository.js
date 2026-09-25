@@ -1,4 +1,8 @@
+import { isSorFeatureEnabled } from './sor-feature-gate.js';
 import crypto from "node:crypto";
+import { decorateSorOrders, getSorSignatureSettings } from "./sor-rental-repository.js";
+import { assertSorReturnReady, getSorReturnReadiness } from "./sor-return-readiness.js";
+import { isSorDeliveryRef, sorSignatureRefs } from "./sor-rental-policy.js";
 import { query, withTransaction } from "./db.js";
 import { assertNoDriverBinMaterialization } from "./mbt/dispatch-bin-safety.js";
 import { config } from "./config.js";
@@ -335,7 +339,12 @@ function expandOrderRefs(plan, refs) {
   refs.forEach((ref) => {
     const order = orderByRef(plan, ref);
     const children = Array.isArray(order?.childOrders) ? order.childOrders : [];
-    if (children.length) {
+    const isCo = canonicalDriverPlanOrderType(order) === "CO" || String(ref).toUpperCase().startsWith("CO-");
+    const coChildren = children.every((child) => canonicalDriverPlanOrderType(orderByRef(plan, child)) === "CO"
+      || String(child).toUpperCase().startsWith("CO-"));
+    // A physical CO can retain its source SO members as cargo references.
+    // Only a wrapper of physical COs expands into separate execution legs.
+    if (children.length && (!isCo || coChildren)) {
       children.forEach(append);
       return;
     }
@@ -554,8 +563,14 @@ function dropLocationForStop(stop = {}, order = {}) {
 
 function dropAddressForStop(stop = {}, order = {}) {
   const location = dropLocationForStop(stop, order);
+  const dropoffs = purchaseOrderRouteProjection(order)?.dropoffs || order.dropoffs || [];
+  const dropoff = dropoffs.find(candidate => candidate.key === stop.dropoffKey)
+    || dropoffs.find(candidate => dispatchLocationsShareYard(candidate.destinationYard, location))
+    || (dropoffs.length === 1 ? dropoffs[0] : null);
   return String(
-    stop.dropAddress
+    dropoff?.address
+    || order.deliveryAddressOverride
+    || stop.dropAddress
     || yardAddress(location)
     || order.address
     || order.dropAddress
@@ -2246,6 +2261,10 @@ async function detailsFromCustomOrder(orderRef, planOrder = null, context = {}) 
 }
 
 async function orderDetails(orderRef, typeHint = "", planOrder = null, context = {}) {
+  if (isSorDeliveryRef(orderRef) && planOrder) {
+    const [order] = await decorateSorOrders([planOrder]);
+    return driverOrderDetailsFromPlan(orderRef, { ...order, items: (order.items || []).filter(item => item.rentalEquipment || ["InvtPart", "NonInvtPart", "Assembly"].includes(item.itemType)) }, context);
+  }
   if (String(typeHint || "").trim().toUpperCase() === "CUSTOM") {
     return detailsFromCustomOrder(orderRef, planOrder, context);
   }
@@ -2406,6 +2425,15 @@ async function materializeDriverJob(plan, job, status = null, { deferDeliveryIns
       lineRowIds: materialized.stopType === "dropoff" ? scope.lineRowIds || [] : []
     });
   }));
+  const signatureRefs = sorSignatureRefs(materialized);
+  delete materialized.customerSignaturePrompt;
+  if (signatureRefs.length && await isSorFeatureEnabled()) {
+    const settings = await getSorSignatureSettings();
+    materialized.customerSignaturePrompt = { terms: settings.terms, revision: settings.revision, orderRefs: signatureRefs };
+  }
+  if (materialized.stopType === 'pickup') {
+    materialized.sorReturnReadiness = await getSorReturnReadiness(materialized.orderRefs || []);
+  }
   if (deferDeliveryInstructions) materialized.deliveryInstructions = { revision: 0, orders: [] };
   else await attachDriverDeliveryInstructions(materialized);
   return materialized;
@@ -2643,6 +2671,7 @@ export async function startDriverJob(driverLogin, jobIdValue, {
   offlineTrace = null
 } = {}) {
   if (!job) throw new Error("Driver job is no longer available.");
+  await assertSorReturnReady(job);
   assertDriverPlanExecutionDate(job.planDate);
   await assertNoClosedNetSuiteOrders(job.orderRefs || [], "start Driver work");
   const result = await query(
@@ -2882,6 +2911,7 @@ export async function endDriverRest(driverLogin, {
 }
 
 export async function recordDriverJobPhotos(driverLogin, jobIdValue, {
+  customerSignature = null,
   photoDataUrls = [],
   job = null,
   occurredAt = null,
@@ -2889,6 +2919,7 @@ export async function recordDriverJobPhotos(driverLogin, jobIdValue, {
   driverRemark = undefined,
   completionContext = null
 } = {}) {
+  await assertSorReturnReady(job);
   await assertNoClosedNetSuiteOrders(job?.orderRefs || [], "be completed by Driver");
   const submittedPhotos = Array.isArray(photoDataUrls) ? photoDataUrls.filter(isPhotoReference) : [];
   const existing = (await query(
@@ -2970,7 +3001,7 @@ export async function recordDriverJobPhotos(driverLogin, jobIdValue, {
       JSON.stringify(photos),
       job?.startedAt || null,
       occurredAt || null,
-      JSON.stringify(driverJobRecordDetails(job || {}, { driverRemark, completionContext }))
+      JSON.stringify({ ...driverJobRecordDetails(job || {}, { driverRemark, completionContext }), ...(customerSignature ? { customerSignature } : {}) })
     ]
   );
   if (offlineTrace?.eventId) {
@@ -3503,10 +3534,25 @@ export async function listDriverJobStatuses({ planId = null, planDate = null, in
             arrival.source AS actual_arrival_source,
             arrival.confidence AS actual_arrival_confidence,
             arrival.algorithm_version AS actual_arrival_algorithm_version,
-            arrival.applied_run_id AS actual_arrival_run_id
+            arrival.applied_run_id AS actual_arrival_run_id,
+            arrival_failure.resolution_status AS actual_arrival_resolution_status,
+            arrival_failure.error AS actual_arrival_error
        FROM driver_job_records record
        LEFT JOIN dispatch_actual_stop_arrivals arrival
          ON arrival.driver_job_record_id = record.id
+       LEFT JOIN LATERAL (
+         SELECT result.resolution_status, result.error
+           FROM dispatch_actual_arrival_runs run
+           JOIN dispatch_actual_arrival_run_stops result ON result.run_id = run.run_id
+          WHERE arrival.driver_job_record_id IS NULL
+            AND run.plan_date = record.plan_date
+            AND lower(run.driver_login) = lower(record.driver_login)
+            AND record.id = ANY(result.driver_job_record_ids)
+            AND date_trunc('milliseconds', result.completed_at) = date_trunc('milliseconds', record.completed_at)
+            AND result.resolution_status = 'unresolved'
+          ORDER BY result.created_at DESC, result.id DESC
+          LIMIT 1
+       ) arrival_failure ON true
       ${where}
       ORDER BY record.plan_date DESC NULLS LAST,
                record.started_at DESC NULLS LAST,
@@ -3644,6 +3690,7 @@ export async function listDriverHistory(driverLogin, { date = "", limit = 100 } 
         stopType: row.stop_type,
         orderRefs: visibleOrderRefs,
         driverRemark: row.job_details?.driverRemark || "",
+        customerSignature: row.job_details?.customerSignature || null,
         startedAt: row.started_at,
         completedAt: row.completed_at
       }

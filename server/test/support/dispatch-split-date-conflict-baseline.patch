@@ -1,0 +1,28 @@
+diff --git b/server/src/server.js a/server/src/server.js
+index be2f86d..a86b5b9 100644
+--- b/server/src/server.js
++++ a/server/src/server.js
+@@ -3196,21 +3196,16 @@ async function findDispatchPlanDateConflictsFromProjection({
+       planId: row.planId,
+       planDate: row.planDate,
+       status: row.status,
+-      refs: new Set(),
+-      wholeOrderRefs: new Set()
++      refs: new Set()
+     });
+     byPlan.get(row.planId).refs.add(row.orderRef.toLowerCase());
+-    // A child's parent alias protects the whole parent, not its sibling splits.
+-    if (row.assignmentKind !== "split_parent_alias") {
+-      byPlan.get(row.planId).wholeOrderRefs.add(row.orderRef.toLowerCase());
+-    }
+   }
+   const conflicts = [];
+   for (const otherPlan of byPlan.values()) {
+     for (const ref of currentRefs) {
+       const key = String(ref || "").trim().toLowerCase();
+       const parent = String(parentRefs.get(key) || "").toLowerCase();
+-      if (!key || (!otherPlan.refs.has(key) && (!parent || !otherPlan.wholeOrderRefs.has(parent)))) continue;
++      if (!key || (!otherPlan.refs.has(key) && (!parent || !otherPlan.refs.has(parent)))) continue;
+       conflicts.push({
+         orderRef: ref,
+         planId: otherPlan.planId,

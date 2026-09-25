@@ -1,5 +1,6 @@
+let specialStageFilter = () => '';
 const dispatchSpecialStockApp = document.getElementById("dispatchSpecialStockApp");
-const dispatchSpecialState = { operator: null, enabled: null, handoffs: [], selected: null, search: "", status: "", loading: true, busy: false, error: "", notice: "" };
+const dispatchSpecialState = { operator: null, enabled: null, handoffs: [], selected: null, search: "", status: "", stages: [], loading: true, busy: false, error: "", notice: "" };
 
 function dispatchSpecialEscape(value) {
   return String(value ?? "").replace(/[&<>"']/g, (character) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[character]));
@@ -26,18 +27,18 @@ function dispatchSpecialHeader() {
 function dispatchSpecialList() {
   if (dispatchSpecialState.loading) return `<div class="stock-request-empty"><strong>Loading handoffs…</strong></div>`;
   if (!dispatchSpecialState.handoffs.length) return `<div class="stock-request-empty"><strong>No Special Item handoffs</strong><span>A handoff appears after SCM links an exclusive PO to an approved SO.</span></div>`;
-  return dispatchSpecialState.handoffs.map((detail) => `<button class="stock-request-card ${detail.id === dispatchSpecialState.selected?.id ? "selected" : ""}" data-dispatch-special-action="select" data-id="${detail.id}" type="button"><span class="stock-request-status-line"><strong>${dispatchSpecialEscape(detail.requestRef)}</strong><span class="stock-request-pill ${dispatchSpecialEscape(detail.handoff?.status)}">${dispatchSpecialEscape(detail.handoff?.status?.replaceAll("_", " "))}</span></span><span>${dispatchSpecialEscape(detail.salesOrderRef)} · ${dispatchSpecialEscape(detail.purchaseOrderRef)}</span><small>${dispatchSpecialEscape(detail.customerName)} · ${dispatchSpecialEscape(detail.vendorName)}</small></button>`).join("");
+  return dispatchSpecialState.handoffs.map((detail) => `<button class="stock-request-card ${detail.id === dispatchSpecialState.selected?.id ? "selected" : ""}" data-dispatch-special-action="select" data-id="${detail.id}" type="button"><span class="stock-request-status-line"><strong>${dispatchSpecialEscape(detail.requestRef)}</strong><span class="stock-request-pill ${dispatchSpecialEscape(detail.handoff?.status)}">${dispatchSpecialEscape(detail.stageLabel)}</span></span><span>${dispatchSpecialEscape(detail.salesOrderRef)} · ${dispatchSpecialEscape(detail.purchaseOrderRef)}</span><small>${dispatchSpecialEscape(detail.customerName)} · ${dispatchSpecialEscape(detail.vendorName)}</small></button>`).join("");
 }
 
 function dispatchSpecialDetail() {
   const detail = dispatchSpecialState.selected;
   if (!detail) return `<div class="stock-request-empty"><strong>Select a handoff</strong><span>Review exact order and route evidence before enabling Planning.</span></div>`;
   const handoff = detail.handoff;
-  const ready = handoff?.status === "ready";
-  return `<div class="stock-request-heading"><div><h2>${dispatchSpecialEscape(detail.requestRef)}</h2><p>${dispatchSpecialEscape(detail.salesOrderRef)} · ${dispatchSpecialEscape(detail.purchaseOrderRef)}</p></div><span class="stock-request-pill ${dispatchSpecialEscape(handoff.status)}">${dispatchSpecialEscape(handoff.status.replaceAll("_", " "))}</span></div>
+  const ready = handoff?.status === "ready" && detail.stage === "dispatch_arrangement";
+  return `<div class="stock-request-heading"><div><h2>${dispatchSpecialEscape(detail.requestRef)}</h2><p>${dispatchSpecialEscape(detail.salesOrderRef)} · ${dispatchSpecialEscape(detail.purchaseOrderRef)}</p></div><span class="stock-request-pill ${dispatchSpecialEscape(handoff.status)}">${dispatchSpecialEscape(detail.stageLabel)}</span></div>
     <div class="stock-request-summary"><span><small>Pickup</small><strong>${dispatchSpecialEscape(handoff.pickupAddress)}</strong></span><span><small>Destination</small><strong>${dispatchSpecialEscape(handoff.destinationAddress)}</strong></span><span><small>Fulfillment</small><strong>${dispatchSpecialEscape(detail.fulfillmentMethod.replaceAll("_", " "))}</strong></span><span><small>Operational yard</small><strong>${dispatchSpecialEscape(String(handoff.operationalYardLocationId))}</strong></span></div>
     <section class="stock-request-section"><h3>Exact accepted materials</h3><div class="stock-request-lines">${detail.lines.filter((line) => line.salesDecision === "accepted").map((line) => `<article class="stock-request-line"><strong>${dispatchSpecialEscape(line.itemResolution?.description || line.productName)}</strong><span>${dispatchSpecialEscape(line.itemResolution?.itemName)} · ${line.itemResolution?.salesQuantity} ${dispatchSpecialEscape(line.itemResolution?.salesUom)}</span></article>`).join("")}</div></section>
-    ${handoff.status === "waiting_route" ? `<div class="stock-request-notice">Choose the physical route. Until then, this page does not provide an active Planning link.</div><div class="stock-request-actions">${detail.fulfillmentMethod === "mbt_delivery" ? `<button class="primary" data-dispatch-special-action="route" data-route="direct" type="button">Direct vendor → customer</button>` : ""}<button class="primary" data-dispatch-special-action="route" data-route="via_yard" type="button">Via MBBS yard</button></div>` : ""}
+    ${handoff.status === "waiting_route" && detail.stage === "dispatch_arrangement" ? `<div class="stock-request-notice">Choose the physical route. Until then, this page does not provide an active Planning link.</div><div class="stock-request-actions">${detail.fulfillmentMethod === "mbt_delivery" ? `<button class="primary" data-dispatch-special-action="route" data-route="direct" type="button">Direct vendor → customer</button>` : ""}<button class="primary" data-dispatch-special-action="route" data-route="via_yard" type="button">Via MBBS yard</button></div>` : ""}
     ${ready ? `<div class="stock-request-notice">Route locked as <strong>${dispatchSpecialEscape(handoff.route.replaceAll("_", " "))}</strong>. The SO remains in the global order pool and can now be searched in Planning.</div><div class="stock-request-actions"><button class="primary" onclick="location.href='/dispatch/planning?search=${encodeURIComponent(detail.salesOrderRef)}'" type="button">Open ${dispatchSpecialEscape(detail.salesOrderRef)} in Planning</button></div>` : ""}`;
 }
 
@@ -46,14 +47,14 @@ function renderDispatchSpecial() {
     dispatchSpecialStockApp.innerHTML = `${dispatchSpecialHeader()}<section class="stock-request-page"><div class="stock-request-empty"><strong>Special Item workflow is off</strong><span>The rollout gate must be enabled before handoffs can be used.</span></div></section>`;
     return;
   }
-  dispatchSpecialStockApp.innerHTML = `${dispatchSpecialHeader()}<section class="stock-request-page"><div class="stock-request-toolbar"><div class="stock-request-actions"><input class="stock-request-search" data-dispatch-special-search value="${dispatchSpecialEscape(dispatchSpecialState.search)}" placeholder="Search SPREQ, SO, or PO" /><select data-dispatch-special-status><option value="">All statuses</option>${["waiting_route", "ready", "planned", "in_progress", "completed", "attention"].map((status) => `<option value="${status}" ${dispatchSpecialState.status === status ? "selected" : ""}>${status.replaceAll("_", " ")}</option>`).join("")}</select><button data-dispatch-special-action="refresh" type="button">Refresh</button></div></div><div class="stock-request-feedback">${dispatchSpecialState.notice ? `<div class="stock-request-notice">${dispatchSpecialEscape(dispatchSpecialState.notice)}</div>` : ""}${dispatchSpecialState.error ? `<div class="stock-request-notice stock-request-error">${dispatchSpecialEscape(dispatchSpecialState.error)}</div>` : ""}</div><div class="stock-request-workspace"><aside class="stock-request-panel stock-request-list">${dispatchSpecialList()}</aside><section class="stock-request-panel stock-request-detail">${dispatchSpecialDetail()}</section></div></section>`;
+  dispatchSpecialStockApp.innerHTML = `${dispatchSpecialHeader()}<section class="stock-request-page"><div class="stock-request-toolbar"><div class="stock-request-actions"><input class="stock-request-search" data-dispatch-special-search value="${dispatchSpecialEscape(dispatchSpecialState.search)}" placeholder="Search SPREQ, SO, or PO" />${specialStageFilter(dispatchSpecialState.stages, "data-dispatch-special-status")}<button data-dispatch-special-action="refresh" type="button">Refresh</button></div></div><div class="stock-request-feedback">${dispatchSpecialState.notice ? `<div class="stock-request-notice">${dispatchSpecialEscape(dispatchSpecialState.notice)}</div>` : ""}${dispatchSpecialState.error ? `<div class="stock-request-notice stock-request-error">${dispatchSpecialEscape(dispatchSpecialState.error)}</div>` : ""}</div><div class="stock-request-workspace"><aside class="stock-request-panel stock-request-list">${dispatchSpecialList()}</aside><section class="stock-request-panel stock-request-detail">${dispatchSpecialDetail()}</section></div></section>`;
 }
 
 async function loadDispatchSpecial(selectedId = dispatchSpecialState.selected?.id) {
   dispatchSpecialState.loading = true;
   renderDispatchSpecial();
   try {
-    const params = new URLSearchParams({ search: dispatchSpecialState.search, status: dispatchSpecialState.status });
+    const params = new URLSearchParams({ search: dispatchSpecialState.search, stages: dispatchSpecialState.stages.join(",") });
     const payload = await dispatchSpecialApi(`/api/dispatch/special-stock-handoffs?${params}`);
     dispatchSpecialState.handoffs = payload.handoffs || [];
     dispatchSpecialState.selected = dispatchSpecialState.handoffs.find((detail) => detail.id === Number(selectedId)) || dispatchSpecialState.handoffs[0] || null;
@@ -72,11 +73,12 @@ dispatchSpecialStockApp.addEventListener("keydown", (event) => {
 
 dispatchSpecialStockApp.addEventListener("change", (event) => {
   if (!event.target.matches("[data-dispatch-special-status]")) return;
-  dispatchSpecialState.status = event.target.value;
+  dispatchSpecialState.stages = [...dispatchSpecialStockApp.querySelectorAll("[data-dispatch-special-status]:checked")].map(input => input.value);
   loadDispatchSpecial(null).catch((error) => { dispatchSpecialState.error = error.message; renderDispatchSpecial(); });
 });
 
 dispatchSpecialStockApp.addEventListener("click", async (event) => {
+  if (event.target.closest('[data-special-clear-stages]')) { dispatchSpecialState.stages = []; await loadDispatchSpecial(null); return; }
   const button = event.target.closest("[data-dispatch-special-action]");
   if (!button || dispatchSpecialState.busy) return;
   try {
@@ -106,6 +108,7 @@ requireDispatchLogin({
   mount: dispatchSpecialStockApp,
   roles: ["admin", "dispatcher"],
   async onReady(operator) {
+    specialStageFilter = (await import("/special-stock-workflow.js")).stageFilterHtml;
     dispatchSpecialState.operator = operator;
     try {
       const policy = await dispatchSpecialApi("/api/dispatch/special-stock-handoffs/policy");

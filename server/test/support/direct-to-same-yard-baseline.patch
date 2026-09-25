@@ -1,0 +1,378 @@
+--- a/public/dispatch.js
++++ b/public/dispatch.js
+@@ -2321,17 +2321,16 @@
+   }
+   const poItems = pickupLocation ? poPickupItemsForLocation(order, pickupLocation) : [];
+   if (poItems.length && !isOwnYardCode(pickupLocation)) return poItems.filter(isOperationalDispatchItem).filter(itemHasQuantity);
+-  const sourceItems = (order.items || [])
++  return (order.items || [])
+     .filter(isOperationalDispatchItem)
+-    .map((item) => pickupLocation ? itemForPickupLocation(item, pickupLocation, order) : item);
+-  // A transit CO can bring the SO to the same yard as its direct TO pickup.
+-  // Keep the residual SO cargo and add that yard's TO cargo back exactly once.
+-  return [...sourceItems, ...directItems].filter(isOperationalDispatchItem).filter(itemHasQuantity);
++    .map((item) => pickupLocation ? itemForPickupLocation(item, pickupLocation, order) : item)
++    .filter(itemHasQuantity);
+ }
+ 
+ function tooltipItemRowsForOrder(order, { pickupLocation = "", stop = null, includeOrderHeader = false } = {}) {
+   const directEntries = pickupLocation ? directPickupEntriesForLocation(order, pickupLocation) : [];
+-  const directRows = directEntries.map((entry) => `
++  if (directEntries.length && !sameDispatchLocation(order.sourceYard || order.outboundLocation, pickupLocation)) {
++    return directEntries.map((entry) => `
+       <div>
+         <b>${escapeHtml(entry.transferOrderRef || order.id)}</b>
+         <span>For ${escapeHtml(entry.salesOrderRef || order.id)}</span>
+@@ -2350,7 +2349,7 @@
+         </div>
+       `).join("")}
+     `).join("");
+-  if (directEntries.length && !sameDispatchLocation(order.sourceYard || order.outboundLocation, pickupLocation)) return directRows;
++  }
+   const poEntries = pickupLocation ? poPickupEntriesForLocation(order, pickupLocation) : [];
+   if (poEntries.length && !isOwnYardCode(pickupLocation)) {
+     return poEntries.map((entry) => `
+@@ -2366,25 +2365,20 @@
+       `).join("")}
+     `).join("");
+   }
+-  const sourceItems = directEntries.length
+-    ? (order.items || []).filter(isOperationalDispatchItem)
+-      .map((item) => itemForPickupLocation(item, pickupLocation, order)).filter(itemHasQuantity)
+-    : tooltipItemsForOrder(order, { pickupLocation, stop });
+-  const rows = sourceItems.map((item) => `
++  const rows = tooltipItemsForOrder(order, { pickupLocation, stop }).map((item) => `
+     <div>
+       <b>${escapeHtml(item.sku)}</b>
+       <span>${escapeHtml(itemQtyText(item))}</span>
+     </div>
+   `).join("");
+-  if (!rows) return directRows;
+-  if (!includeOrderHeader) return rows + directRows;
++  if (!rows) return "";
++  if (!includeOrderHeader) return rows;
+   return `
+     <div>
+       <b>${escapeHtml(order.id)}</b>
+       <span>${escapeHtml(order.customer || movementText(order) || "")}</span>
+     </div>
+     ${rows}
+-    ${directRows}
+   `;
+ }
+ 
+--- a/src/dispatch-load-assignment.js
++++ b/src/dispatch-load-assignment.js
+@@ -465,10 +465,10 @@
+   const poItems = dispatchPoPickupItemsForLocation(order, location);
+   const ownYard = dispatchOwnYardLocationKeys(plan).has(normalizedYardLocationText(location));
+   if (poItems.length && !ownYard) return poItems.filter(dispatchOperationalPickupItem).filter(dispatchItemHasQuantity);
+-  const sourceItems = (order.items || [])
++  return (order.items || [])
+     .filter(dispatchOperationalPickupItem)
+-    .map((item) => dispatchItemForPickupLocation(plan, order, item, location));
+-  return [...sourceItems, ...directItems].filter(dispatchOperationalPickupItem).filter(dispatchItemHasQuantity);
++    .map((item) => dispatchItemForPickupLocation(plan, order, item, location))
++    .filter(dispatchItemHasQuantity);
+ }
+ 
+ function dispatchPickupFootprintForOrderLocation(plan = {}, order = {}, location = "") {
+--- a/src/co-source-packing-handoff.js
++++ /dev/null
+@@ -1,157 +0,0 @@
+-import { query, withTransaction } from "./db.js";
+-import { writeAudit } from "./auth-repository.js";
+-import { lockConsolidatedLoadOrders } from "./consolidation-load-locks.js";
+-import { dispatchLocationsShareYard } from "./dispatch-location.js";
+-import { assertNoActiveOperatorNetSuitePostingClaims } from "./operator-netsuite-posting-repository.js";
+-
+-const ACTIVE_CO_STATUSES = ["pending_load", "preparing", "packed", "planned"];
+-const PACKING_FIELDS = ["packed_pallet_qty", "packed_layer_qty", "packed_section_qty", "packed_piece_qty", "packed_sales_qty"];
+-const CO_SOURCE_SALES_JOIN = `(co.source_order_ref=sales.tranid OR co.details->'childOrderIds' ? sales.tranid)
+-  AND (co.from_location_id=sales.outbound_location_id
+-    OR lower(btrim(split_part(co.from_location,':',1)))=lower(btrim(split_part(sales.outbound_location,':',1))))`;
+-
+-function handoffError(message, code = "CO_SOURCE_PACKING_EXECUTED") {
+-  return Object.assign(new Error(message), { code, status: 409 });
+-}
+-
+-function hasPacking(line) {
+-  return Boolean(line.confirmed || line.confirmed_at || PACKING_FIELDS.some(field => Number(line[field] || 0) > 0));
+-}
+-
+-function sourceRefs(options, existing) {
+-  return [...new Set([
+-    options.sourceOrderRef, ...(options.childRefs || []), existing?.source_order_ref,
+-    ...(existing?.details?.childOrderIds || [])
+-  ].map(value => String(value || "").trim()).filter(Boolean))];
+-}
+-
+-async function lockSourceOrders(options, existing) {
+-  const refs = sourceRefs(options, existing);
+-  const candidates = (await query("SELECT netsuite_id,outbound_location FROM sales_orders WHERE tranid=ANY($1::text[])", [refs])).rows
+-    .filter(row => dispatchLocationsShareYard(row.outbound_location, options.fromYard));
+-  const ids = candidates.map(row => row.netsuite_id);
+-  await lockConsolidatedLoadOrders([...ids, ...(existing?.delivery_order_id ? [existing.delivery_order_id] : [])]);
+-  const orders = (await query("SELECT * FROM sales_orders WHERE netsuite_id=ANY($1::bigint[]) ORDER BY netsuite_id FOR UPDATE", [ids])).rows
+-    .filter(row => dispatchLocationsShareYard(row.outbound_location, options.fromYard));
+-  const lockedIds = orders.map(row => row.netsuite_id);
+-  const lines = (await query("SELECT * FROM sales_order_lines WHERE sales_order_id=ANY($1::bigint[]) ORDER BY id FOR UPDATE", [lockedIds])).rows;
+-  return { orders, lines };
+-}
+-
+-function sourceHasExecution(order, lines) {
+-  return ["loaded", "partial_loaded", "fulfilled"].includes(String(order.operator_status || "").toLowerCase())
+-    || String(order.local_yard_order_status || "").toLowerCase() === "loaded"
+-    || ["fulfilled", "partial_fulfilled"].includes(order.fulfillment_status)
+-    || Boolean(order.fulfilled_at)
+-    || lines.some(line => ["loaded_qty", "fulfilled_pallet_qty", "fulfilled_layer_qty", "fulfilled_section_qty", "fulfilled_piece_qty"]
+-      .some(field => Number(line[field] || 0) > 0));
+-}
+-
+-async function assertUnexecutedSources(orders, lines, coRef) {
+-  for (const order of orders) {
+-    if (sourceHasExecution(order, lines.filter(line => String(line.sales_order_id) === String(order.netsuite_id)))) {
+-      throw handoffError(`${order.tranid} has loading or fulfillment evidence; its packing cannot be released to ${coRef}.`);
+-    }
+-  }
+-  await assertNoActiveOperatorNetSuitePostingClaims({ functionKey: "delivery_prep",
+-    localOrderKeys: orders.map(order => `delivery_prep:sales_order:${order.netsuite_id}`) });
+-  const activity = await query(`SELECT job_id FROM driver_job_records
+-    WHERE order_refs ?| $1::text[] AND status IN ('in_progress','complete','completed') LIMIT 1`,
+-  [[coRef, ...orders.map(order => order.tranid)]]);
+-  if (activity.rowCount) {throw handoffError(`Driver work has started for ${coRef} or its source SO; packing cannot be released.`);}
+-}
+-
+-async function releaseSourcePacking(orders, lines, coRef, requestedBy) {
+-  for (const order of orders) {
+-    const packed = lines.filter(line => String(line.sales_order_id) === String(order.netsuite_id) && hasPacking(line));
+-    const headerHasPacking = ["packed", "confirmed", "preparing"].includes(order.operator_status)
+-      || order.preparing_operator_id || order.preparing_started_at;
+-    if (!packed.length && !headerHasPacking) {continue;}
+-    await query(`UPDATE sales_order_lines SET packed_pallet_qty=0,packed_layer_qty=0,
+-      packed_section_qty=0,packed_piece_qty=0,packed_sales_qty=0,confirmed=false,confirmed_at=null
+-      WHERE id=ANY($1::bigint[])`, [packed.map(line => line.id)]);
+-    await query(`UPDATE sales_orders SET operator_status='open',preparing_operator_id=null,
+-      preparing_started_at=null,status_updated_at=now() WHERE netsuite_id=$1`, [order.netsuite_id]);
+-    await writeAudit({ actorType: "dispatcher", source: "dispatch", action: "delivery.co.source_packing.released",
+-      orderId: order.netsuite_id, details: { coRef, sourceOrderRef: order.tranid, requestedBy,
+-        previousOperatorStatus: order.operator_status, previousPreparingOperatorId: order.preparing_operator_id,
+-        previousPreparingStartedAt: order.preparing_started_at,
+-        lines: packed.map(line => Object.fromEntries(["id", "line_id", "item_id", ...PACKING_FIELDS, "confirmed", "confirmed_at"]
+-          .map(field => [field, line[field]]))) } });
+-  }
+-}
+-
+-function acceptsPackingHandoff(co, options) {
+-  return !co.loaded_at && !co.received_at && (ACTIVE_CO_STATUSES.includes(co.status)
+-    || (co.status === "cancelled" && options.reactivateCancelled === true));
+-}
+-
+-export function withCoSourcePackingHandoff(options, saveCo) {
+-  return withTransaction(async () => {
+-    await query("SELECT pg_advisory_xact_lock(hashtextextended($1,0))", [`co-source-packing:${options.coRef}`]);
+-    const existing = (await query("SELECT * FROM local_co_orders WHERE co_ref=$1", [options.coRef])).rows[0];
+-    if (existing && !acceptsPackingHandoff(existing, options)) {
+-      return saveCo();
+-    }
+-    const { orders, lines } = await lockSourceOrders(options, existing);
+-    if (existing) {
+-      const current = (await query("SELECT * FROM local_co_orders WHERE id=$1 FOR UPDATE", [existing.id])).rows[0];
+-      if (!acceptsPackingHandoff(current, options)) {return saveCo();}
+-    }
+-    if (orders.length) {await assertUnexecutedSources(orders, lines, options.coRef);}
+-    const co = await saveCo();
+-    await releaseSourcePacking(orders, lines, co.co_ref, options.requestedBy || "");
+-    return co;
+-  });
+-}
+-
+-export async function releaseExistingCoSourcePacking(coRef, { requestedBy = "" } = {}) {
+-  return withTransaction(async () => {
+-    await query("SELECT pg_advisory_xact_lock(hashtextextended($1,0))", [`co-source-packing:${coRef}`]);
+-    const co = (await query("SELECT * FROM local_co_orders WHERE co_ref=$1", [String(coRef)])).rows[0];
+-    if (!co) {throw new Error("Local CO order not found.");}
+-    return withCoSourcePackingHandoff({ coRef: co.co_ref, sourceOrderRef: co.source_order_ref,
+-      fromYard: co.from_location, childRefs: co.details?.childOrderIds || [], requestedBy }, async () => co);
+-  });
+-}
+-
+-export async function assertNoCoSourcePacking(order) {
+-  const sources = [order, ...(order?.child_orders || [])]
+-    .filter(row => row?.order_type === "sales_order");
+-  if (!sources.length) {return;}
+-  const result = await query(`SELECT co.co_ref FROM local_co_orders co
+-    JOIN sales_orders source ON (co.source_order_ref=source.tranid OR co.details->'childOrderIds' ? source.tranid)
+-    WHERE source.netsuite_id=ANY($1::bigint[]) AND co.status=ANY($2::text[])
+-      AND co.loaded_at IS NULL AND co.received_at IS NULL
+-      AND (co.from_location_id=source.outbound_location_id
+-        OR lower(btrim(split_part(co.from_location,':',1)))=lower(btrim(split_part(source.outbound_location,':',1))))
+-    ORDER BY co.id LIMIT 1`, [sources.map(row => row.netsuite_id), ACTIVE_CO_STATUSES]);
+-  if (result.rowCount) {
+-    throw handoffError(`Packing has moved to ${result.rows[0].co_ref}. Open that CO to pack or load this cargo.`, "CO_SOURCE_PACKING_HANDOFF");
+-  }
+-}
+-
+-export async function coSourcePackingOrders(salesRefs) {
+-  return (await query(`SELECT DISTINCT co.id,co.delivery_order_id
+-    FROM local_co_orders co JOIN sales_orders sales ON ${CO_SOURCE_SALES_JOIN}
+-    WHERE sales.tranid=ANY($1::text[]) AND co.status<>'cancelled'`, [salesRefs])).rows;
+-}
+-
+-export async function coSourcePackingActivityRefs(salesRefs, salesLineIds = null) {
+-  const result = await query(`SELECT DISTINCT sales.tranid AS ref
+-    FROM local_co_orders co JOIN sales_orders sales ON ${CO_SOURCE_SALES_JOIN}
+-    JOIN sales_order_lines line ON line.sales_order_id=sales.netsuite_id
+-      AND ($2::bigint[] IS NULL OR line.id=ANY($2::bigint[]))
+-    LEFT JOIN local_co_order_lines co_line ON co_line.co_id=co.id AND (
+-      co_line.raw->>'lineRowId'=line.id::text OR co_line.raw->>'line_row_id'=line.id::text
+-      OR (COALESCE(NULLIF(co_line.raw->>'lineRowId',''),NULLIF(co_line.raw->>'line_row_id','')) IS NULL
+-        AND co_line.line_id=line.line_id AND co_line.item_id=line.item_id))
+-    WHERE sales.tranid=ANY($1::text[]) AND co.status<>'cancelled' AND (
+-      co.preparing_operator_id IS NOT NULL OR co.preparing_started_at IS NOT NULL
+-      OR co.status IN ('preparing','loaded','received','completed') OR co.loaded_at IS NOT NULL OR co.received_at IS NOT NULL
+-      OR ($2::bigint[] IS NULL AND co.status='packed') OR co_line.confirmed_at IS NOT NULL
+-      OR COALESCE(co_line.packed_pallet_qty,0)>0 OR COALESCE(co_line.packed_layer_qty,0)>0
+-      OR COALESCE(co_line.packed_section_qty,0)>0 OR COALESCE(co_line.packed_piece_qty,0)>0
+-      OR COALESCE(co_line.packed_sales_qty,0)>0)`, [salesRefs, salesLineIds]);
+-  return result.rows.map(row => row.ref);
+-}
+--- a/src/dispatch-repository.js
++++ b/src/dispatch-repository.js
+@@ -1,5 +1,4 @@
+ import crypto from "node:crypto";
+-import { withCoSourcePackingHandoff } from "./co-source-packing-handoff.js";
+ import { VOYAGE_DISPATCH_YARD } from "./dispatch-sales-order-locations.js";
+ import { pool, query, withTransaction } from "./db.js";
+ import { resumeSmartScmBlanketCoveredPlanningExclusions } from "./smart-scm-planning-exclusion-repository.js";
+@@ -8964,20 +8963,7 @@
+   return [...unique.values()];
+ }
+ 
+-export function upsertLocalCoOrder(options = {}) {
+-  const order = options.order || {};
+-  const sourceRef = String(options.sourceOrderRef || order.id || "").trim();
+-  return withCoSourcePackingHandoff({
+-    coRef: String(order.transitCo?.id || `CO-${sourceRef}`).trim(),
+-    sourceOrderRef: sourceRef,
+-    childRefs: [...(order.childOrders || []), ...(order.childOrderDetails || []).map(child => child.id)],
+-    fromYard: locationTextFromId(options.fromYard || order.sourceYard || order.pickupLocations?.[0]),
+-    reactivateCancelled: options.reactivateCancelled === true,
+-    requestedBy: options.requestedBy || ""
+-  }, () => upsertLocalCoOrderUnlocked(options));
+-}
+-
+-async function upsertLocalCoOrderUnlocked({
++export async function upsertLocalCoOrder({
+   sourceOrderRef,
+   fromYard,
+   toYard,
+--- a/src/delivery-repository.js
++++ b/src/delivery-repository.js
+@@ -1,7 +1,6 @@
+ import { isLocalCoLoaded, projectLoadedCoLine } from "./local-co-loaded-policy.js";
+ import { deliveryPackingRemainder, deliveryPackingRemainderSql, DELIVERY_PACK_ROUNDING_TOLERANCE as LOAD_SALES_QTY_TOLERANCE } from "./delivery-packing-progress.js";
+ import { withConsolidatedLoadMutation } from "./consolidation-load-locks.js";
+-import { assertNoCoSourcePacking } from "./co-source-packing-handoff.js";
+ import { deliveryOrderWithinYards } from "./operator-yard-access.js";
+ import crypto from "node:crypto";
+ import { query, withTransaction } from "./db.js";
+@@ -6503,20 +6502,12 @@
+ }
+ 
+ // Individual, grouped and consolidated operations share the same quantity locks.
+-function withDeliveryPackingMutation(orderId, operation) {
+-  const readOrder = () => getDeliveryOrder(orderId, { includeNetSuiteClosed: true });
+-  return withConsolidatedLoadMutation(readOrder, async () => {
+-    await assertNoCoSourcePacking(await readOrder());
+-    return operation();
+-  });
+-}
+-
+ export async function recordDeliveryLoad(...args) {
+-  return withDeliveryPackingMutation(args[0], () => recordDeliveryLoadUnlocked(...args));
++  return withConsolidatedLoadMutation(() => getDeliveryOrder(args[0], { includeNetSuiteClosed: true }), () => recordDeliveryLoadUnlocked(...args));
+ }
+ 
+ export async function setConsolidationDeliveryLinePackedQuantity(...args) {
+-  return withDeliveryPackingMutation(args[0], () => setConsolidationDeliveryLinePackedQuantityUnlocked(...args));
++  return withConsolidatedLoadMutation(() => getDeliveryOrder(args[0], { includeNetSuiteClosed: true }), () => setConsolidationDeliveryLinePackedQuantityUnlocked(...args));
+ }
+ 
+ export async function releaseCurrentDeliveryDraft(...args) {
+@@ -6524,15 +6515,15 @@
+ }
+ 
+ export async function confirmDeliveryLine(...args) {
+-  return withDeliveryPackingMutation(args[0], () => confirmDeliveryLineUnlocked(...args));
++  return withConsolidatedLoadMutation(() => getDeliveryOrder(args[0], { includeNetSuiteClosed: true }), () => confirmDeliveryLineUnlocked(...args));
+ }
+ 
+ export async function confirmDeliveryLines(...args) {
+-  return withDeliveryPackingMutation(args[0], () => confirmDeliveryLinesUnlocked(...args));
++  return withConsolidatedLoadMutation(() => getDeliveryOrder(args[0], { includeNetSuiteClosed: true }), () => confirmDeliveryLinesUnlocked(...args));
+ }
+ 
+ export async function setDeliveryLinePackedQuantity(...args) {
+-  return withDeliveryPackingMutation(args[0], () => setDeliveryLinePackedQuantityUnlocked(...args));
++  return withConsolidatedLoadMutation(() => getDeliveryOrder(args[0], { includeNetSuiteClosed: true }), () => setDeliveryLinePackedQuantityUnlocked(...args));
+ }
+ 
+ export async function unpackDeliveryLine(...args) {
+@@ -6544,11 +6535,11 @@
+ }
+ 
+ export async function updateDeliveryStatus(...args) {
+-  return withDeliveryPackingMutation(args[0], () => updateDeliveryStatusUnlocked(...args));
++  return withConsolidatedLoadMutation(() => getDeliveryOrder(args[0], { includeNetSuiteClosed: true }), () => updateDeliveryStatusUnlocked(...args));
+ }
+ 
+ export async function markConsolidationDeliveryOrderPacked(...args) {
+-  return withDeliveryPackingMutation(args[0], () => markConsolidationDeliveryOrderPackedUnlocked(...args));
++  return withConsolidatedLoadMutation(() => getDeliveryOrder(args[0], { includeNetSuiteClosed: true }), () => markConsolidationDeliveryOrderPackedUnlocked(...args));
+ }
+ 
+ export async function releaseConsolidationDeliveryOrder(...args) {
+--- a/src/scm-dependency-preview-service.js
++++ b/src/scm-dependency-preview-service.js
+@@ -1,6 +1,5 @@
+ import { query } from "./db.js";
+ import { lockConsolidatedLoadOrders } from "./consolidation-load-locks.js";
+-import { coSourcePackingActivityRefs, coSourcePackingOrders } from "./co-source-packing-handoff.js";
+ import { getDispatchPlan } from "./dispatch-plan-repository.js";
+ import { resolveDispatchSalesTarget } from "./dispatch-order-target-repository.js";
+ import { listClosedNetSuiteOrders } from "./netsuite-closed-order-repository.js";
+@@ -92,11 +91,7 @@
+      UNION SELECT netsuite_id FROM transfer_orders WHERE tranid = ANY($2::text[])`,
+     [salesRefs, transferRefs]
+   );
+-  const sourceCos = await coSourcePackingOrders(salesRefs);
+-  await lockConsolidatedLoadOrders([
+-    ...orders.rows.map((row) => row.netsuite_id),
+-    ...sourceCos.map((row) => row.delivery_order_id).filter(Boolean)
+-  ]);
++  await lockConsolidatedLoadOrders(orders.rows.map((row) => row.netsuite_id));
+   // Advisory locks serialize normal Operator mutations. Row locks also fence
+   // direct canonical-row writers until the dependency transaction commits.
+   for (const [header, lineTable, parent, refs] of [
+@@ -108,20 +103,11 @@
+     await query(`SELECT line.id FROM ${lineTable} line JOIN ${header} header ON header.netsuite_id = line.${parent}
+       WHERE header.tranid = ANY($1::text[]) ORDER BY line.id FOR UPDATE OF line`, [refs]);
+   }
+-  const currentCos = await coSourcePackingOrders(salesRefs);
+-  if (JSON.stringify(currentCos.map(row => [row.id, row.delivery_order_id]).sort())
+-    !== JSON.stringify(sourceCos.map(row => [row.id, row.delivery_order_id]).sort())) {
+-    throw statusError(409, "CO_SOURCE_PACKING_CHANGED", "A source CO changed while linking. Refresh and try again.");
+-  }
+-  const coIds = sourceCos.map((row) => row.id);
+-  await query("SELECT id FROM local_co_orders WHERE id=ANY($1::bigint[]) ORDER BY id FOR UPDATE", [coIds]);
+-  await query("SELECT id FROM local_co_order_lines WHERE co_id=ANY($1::bigint[]) ORDER BY id FOR UPDATE", [coIds]);
+ }
+ 
+ async function operatorActivityRefs({ salesRefs = [], transferRefs = [], salesLineIds = null } = {}) {
+   const refs = [];
+   if (salesRefs.length) {
+-    refs.push(...await coSourcePackingActivityRefs(salesRefs, salesLineIds));
+     const sales = await query(
+       `SELECT DISTINCT sales.tranid AS ref, sales.operator_status,
+               sales.local_yard_order_status, sales.preparing_operator_id,

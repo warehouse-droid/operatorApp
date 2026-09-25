@@ -30,7 +30,9 @@ test("S2/S3/S5: completion route accepts optional input but repository owns live
   const route = server.match(
     /app\.post\("\/api\/customer-pickup\/orders\/:id\/load"[\s\S]*?\n\}\);/u
   )?.[0] || "";
-  assert.match(route, /requiredPhotoDataUrls\(req\.body\?\.photoDataUrls,\s*0\)/u);
+  assert.match(route, /operatorPhotoAction\(req, "customer_pickup"/u);
+  assert.match(route, /minimum: 0/u);
+  assert.match(server, /requiredPhotoDataUrls\(batch \? req\.body\?\.photoRefs : req\.body\?\.photoDataUrls, minimum\)/u);
   assert.doesNotMatch(route, /req\.body\?\.(?:required|requiredPhotoCount|revision)/u);
 
   const completion = repository.slice(
@@ -64,8 +66,9 @@ test("S6/S7: Operator receives a no-store live policy and refreshes it at entry 
   );
   assert.match(start, /refreshCustomerPickupPhotoRequirement/u);
   assert.match(confirm, /refreshCustomerPickupPhotoRequirement/u);
-  assert.match(confirm, /uploadedPhotoRefs\s*=\s*photos\.length/u);
-  assert.match(confirm, /:\s*\[\]/u);
+  assert.match(confirm, /prepareOperatorBackgroundPhotos\(fulfillmentLoadRequestId, photos\)/u);
+  const outbox = await source("public/operator-photo-outbox.js");
+  assert.match(outbox, /if \(!photos\.length [^\n]+return \{ photoDataUrls: photos \}/u);
   assert.doesNotMatch(confirm, /body:[\s\S]{0,180}(?:requiredPhotoCount|photoRequirementRevision)/u);
 });
 
@@ -90,7 +93,7 @@ test("S7: Operator cache revision ships the live-policy client once; later toggl
     source("public/operator.html"),
     source("public/service-worker.js")
   ]);
-  assert.match(html, /operator\.js\?v=20260916-operator-auto-camera-v1/u);
-  assert.match(serviceWorker, /mbbs-yard-operator-v153-auto-camera-v1/u);
-  assert.match(serviceWorker, /operator\.js\?v=20260916-operator-auto-camera-v1/u);
+  assert.match(html, /operator\.js\?v=20260917-load-followup-v1/u);
+  assert.match(serviceWorker, /mbbs-yard-operator-20260917-load-followup-v1/u);
+  assert.match(serviceWorker, /operator\.js\?v=20260917-load-followup-v1/u);
 });

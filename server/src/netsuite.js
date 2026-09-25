@@ -1,6 +1,10 @@
+import { isSorFeatureEnabled } from './sor-feature-gate.js';
+import { getOutboundLocationHierarchy, setOutboundLocationDirectory } from "./outbound-location-domain.js";
 import crypto from "node:crypto";
 import { withNetSuiteOrderLines } from "./netsuite-order-line.js";
 import { operatorPostingTelemetry } from "./operator-netsuite-posting-telemetry.js";
+import { isOperatorNetSuiteRequest } from "./operator-netsuite-request-pool.js";
+import { netSuiteRequestScheduler } from './netsuite-request-scheduler.js';
 import { scmNetSuitePoVersion } from "./scm-netsuite-po-version.js";
 import { config, requireConfig } from "./config.js";
 import { query } from "./db.js";
@@ -74,12 +78,24 @@ async function netsuiteFetch(url, options = {}) {
   }
 }
 
-async function timedNetSuiteTextRequest(url, options, attempt) {
-  return operatorPostingTelemetry.time({ operation: "netsuite.http", method: options.method || "GET",
+async function scheduledNetSuiteRequest(url, options, consume, attempt = 1) {
+  return netSuiteRequestScheduler.run(signal => operatorPostingTelemetry.time({ operation: "netsuite.http", method: options.method || "GET",
     path: new URL(url).pathname, attempt }, async () => {
-    const response = await netsuiteFetch(url, options);
-    return { response, text: await response.text() };
-  });
+    const response = await netsuiteFetch(url, { ...options, signal });
+    return { response, value: await consume(response) };
+  }), { timeoutMs: Number(config.netsuite.requestTimeoutMs || 120000), signal: options.signal });
+}
+
+async function timedNetSuiteTextRequest(url, options, attempt) {
+  const { response, value: text } = await scheduledNetSuiteRequest(url, options, received => received.text(), attempt);
+  return { response, text };
+}
+
+function queueNetSuiteMutation(run) {
+  if (isOperatorNetSuiteRequest()) { return run(); }
+  const result = operatorPostingTelemetry.queued("rest_mutation", restMutationQueue, run);
+  restMutationQueue = result.catch(() => {});
+  return result;
 }
 
 const MBT_NETSUITE_READ_RESPONSE_LIMIT = 1024 * 1024;
@@ -217,7 +233,7 @@ export async function netSuiteReadOnlyGetTransport({ method, path, signal, accep
   }
   const target = mbtNetSuiteReadTarget(path);
   const accessToken = await getUnexpiredMbtNetSuiteAccessToken();
-  const response = await netsuiteFetch(target, {
+  const { response, value: text } = await scheduledNetSuiteRequest(target, {
     method: "GET",
     redirect: "error",
     signal,
@@ -225,14 +241,16 @@ export async function netSuiteReadOnlyGetTransport({ method, path, signal, accep
       "Authorization": `Bearer ${accessToken}`,
       "Accept": acceptedType
     }
+  }, async received => {
+    if (received.redirected) {
+      await cancelResponseBody(received);
+      const error = new Error("NetSuite redirected an MBT readiness metadata request.");
+      error.code = "MBT_NETSUITE_REDIRECT_REFUSED";
+      error.status = 502;
+      throw error;
+    }
+    return boundedMbtResponseText(received);
   });
-  if (response.redirected) {
-    const error = new Error("NetSuite redirected an MBT readiness metadata request.");
-    error.code = "MBT_NETSUITE_REDIRECT_REFUSED";
-    error.status = 502;
-    throw error;
-  }
-  const text = await boundedMbtResponseText(response);
   let body = null;
   if (text) {
     try {
@@ -284,6 +302,12 @@ function purchaseReceivingStatusFilterSql(alias = "t") {
   return `(${alias}.status = 'B' OR ${receivingStatusFilterSql(alias)})`;
 }
 
+function outboundQueryLocationIds(locationId) {
+  const hierarchy = getOutboundLocationHierarchy();
+  const yard = hierarchy.yardFor(locationId);
+  return yard ? hierarchy.locationsFor(yard).join(",") : "0";
+}
+
 function deliveryOrderListQuery(locationId = 1) {
   const id = Number(locationId);
   if (!Number.isInteger(id) || id <= 0) {
@@ -314,7 +338,8 @@ INNER JOIN transactionline tl ON tl.transaction = t.id
 WHERE t.type = 'SalesOrd'
   ${excludedSalesOrderPrefixSql("t")}
   AND tl.item IS NOT NULL
-  AND tl.location = ${id}
+  AND tl.location IN (${id === 50 ? '50' : outboundQueryLocationIds(id)})
+  ${id === 50 ? "AND UPPER(t.tranid) LIKE 'SOR%'" : ''}
   AND tl.mainline = 'F'
   AND tl.taxline = 'F'
   AND ${outboundStatusFilterSql("t")}
@@ -650,6 +675,10 @@ function basicAuth() {
   return `Basic ${Buffer.from(credentials).toString("base64")}`;
 }
 
+function netSuiteRestErrorCodes(data) {
+  return typeof data === "object" ? (data?.["o:errorDetails"] || []).map(detail => detail["o:errorCode"]) : [];
+}
+
 async function netsuiteRest(path, { method = "GET", body = null, headers = {} } = {}) {
   requireConfig(["netsuite.restBaseUrl"]);
   let lastError;
@@ -674,6 +703,8 @@ async function netsuiteRest(path, { method = "GET", body = null, headers = {} } 
       lastError = new Error(`NetSuite REST failed: ${response.status} ${typeof data === "string" ? data : JSON.stringify(data)}`);
       lastError.status = response.status;
       lastError.netsuiteResponseReceived = true;
+      lastError.netsuiteErrorCodes = netSuiteRestErrorCodes(data);
+      lastError.netsuiteErrorDetails = typeof data === "object" ? data?.["o:errorDetails"] || [] : [];
       if (response.status === 401 && !m2mAuthRetry && await isNetSuiteM2mActive()) {
         invalidateNetSuiteM2mAccessToken();
         m2mAuthRetry = true;
@@ -686,7 +717,7 @@ async function netsuiteRest(path, { method = "GET", body = null, headers = {} } 
       throw lastError;
     }
     const location = response.headers.get("location") || "";
-    const idMatch = location.match(/\/(?:itemFulfillment|itemReceipt|transferOrder|intercompanyTransferOrder|purchaseOrder|returnAuthorization|creditMemo)\/(\d+)/i);
+    const idMatch = location.match(/\/(?:itemFulfillment|itemReceipt|inventoryTransfer|transferOrder|intercompanyTransferOrder|purchaseOrder|salesOrder|returnAuthorization|creditMemo)\/(\d+)/i);
     return { status: response.status, location, id: idMatch ? Number(idMatch[1]) : null, data };
   }
   throw lastError;
@@ -701,9 +732,7 @@ export async function transformSalesOrderToItemFulfillment(orderId, payload) {
     method: "POST",
     body: payload
   });
-  const result = operatorPostingTelemetry.queued("rest_mutation", restMutationQueue, run);
-  restMutationQueue = result.catch(() => {});
-  return result;
+  return queueNetSuiteMutation(run);
 }
 
 export async function transformTransferOrderToItemFulfillment(orderId, payload) {
@@ -715,9 +744,7 @@ export async function transformTransferOrderToItemFulfillment(orderId, payload) 
     method: "POST",
     body: payload
   });
-  const result = operatorPostingTelemetry.queued("rest_mutation", restMutationQueue, run);
-  restMutationQueue = result.catch(() => {});
-  return result;
+  return queueNetSuiteMutation(run);
 }
 
 export async function transformPurchaseOrderToItemReceipt(orderId, payload) {
@@ -729,9 +756,7 @@ export async function transformPurchaseOrderToItemReceipt(orderId, payload) {
     method: "POST",
     body: payload
   });
-  const result = operatorPostingTelemetry.queued("rest_mutation", restMutationQueue, run);
-  restMutationQueue = result.catch(() => {});
-  return result;
+  return queueNetSuiteMutation(run);
 }
 
 export async function transformTransferOrderToItemReceipt(orderId, payload) {
@@ -743,9 +768,7 @@ export async function transformTransferOrderToItemReceipt(orderId, payload) {
     method: "POST",
     body: payload
   });
-  const result = operatorPostingTelemetry.queued("rest_mutation", restMutationQueue, run);
-  restMutationQueue = result.catch(() => {});
-  return result;
+  return queueNetSuiteMutation(run);
 }
 
 export async function createTransferOrderInNetSuite(payload, { intercompany = false } = {}) {
@@ -754,9 +777,30 @@ export async function createTransferOrderInNetSuite(payload, { intercompany = fa
     method: "POST",
     body: payload
   });
-  const result = restMutationQueue.then(run, run);
-  restMutationQueue = result.catch(() => {});
-  return result;
+  return queueNetSuiteMutation(run);
+}
+
+export async function inventoryTransferRest(suffix='',options={}) {
+  if(!/^(?:\/\d+(?:\?(?:expandSubResources=true|replace=inventory))?)?$/.test(suffix) || !['GET','POST','PATCH'].includes(options.method || 'GET')) throw new Error('Invalid inventory transfer operation.');
+  return netsuiteRest(`/record/v1/inventoryTransfer${suffix}`,options);
+}
+
+export async function fetchInventoryItemUnitsFromNetSuite(itemId,{queryAll=suiteqlAll}={}) {
+  const id=Number(itemId);
+  if(!Number.isSafeInteger(id) || id<=0) throw new Error('A valid inventory SKU is required.');
+  const rows=await queryAll(`SELECT id,stockunit AS stock_unit_id,BUILTIN.DF(stockunit) AS stock_unit,
+    saleunit AS sales_unit_id,BUILTIN.DF(saleunit) AS sales_unit FROM item WHERE id=${id} AND isinactive='F' AND itemtype='InvtPart'`);
+  const item=rows[0];
+  if(!item || Number(item.id)!==id) throw new Error('This inventory SKU is not available.');
+  const units=[];
+  for(const key of ['sales','stock']) {
+    const unitId=Number(item[`${key}_unit_id`]),label=String(item[`${key}_unit`] || '').trim();
+    if(!unitId && !label) continue;
+    if(!Number.isSafeInteger(unitId) || unitId<=0 || !label) throw new Error('The item has an invalid configured unit.');
+    if(!units.some(unit=>unit.id===String(unitId))) units.push({id:String(unitId),label});
+  }
+  if(!units.length) throw new Error('This inventory SKU has no configured unit.');
+  return units;
 }
 
 export async function updateTransferOrderInNetSuite(orderId, payload, { intercompany = false } = {}) {
@@ -769,9 +813,7 @@ export async function updateTransferOrderInNetSuite(orderId, payload, { intercom
     method: request.method,
     body: request.payload
   });
-  const result = restMutationQueue.then(run, run);
-  restMutationQueue = result.catch(() => {});
-  return result;
+  return queueNetSuiteMutation(run);
 }
 
 export async function createPurchaseOrderInNetSuite(payload) {
@@ -779,9 +821,7 @@ export async function createPurchaseOrderInNetSuite(payload) {
     method: "POST",
     body: payload
   });
-  const result = restMutationQueue.then(run, run);
-  restMutationQueue = result.catch(() => {});
-  return result;
+  return queueNetSuiteMutation(run);
 }
 
 export async function createSalesOrderInNetSuite(payload) {
@@ -789,9 +829,7 @@ export async function createSalesOrderInNetSuite(payload) {
     method: "POST",
     body: payload
   });
-  const result = restMutationQueue.then(run, run);
-  restMutationQueue = result.catch(() => {});
-  return result;
+  return queueNetSuiteMutation(run);
 }
 
 export async function transformEstimateToSalesOrderInNetSuite(estimateId, payload) {
@@ -803,9 +841,7 @@ export async function transformEstimateToSalesOrderInNetSuite(estimateId, payloa
     method: "POST",
     body: payload
   });
-  const result = restMutationQueue.then(run, run);
-  restMutationQueue = result.catch(() => {});
-  return result;
+  return queueNetSuiteMutation(run);
 }
 
 export async function createOrUpdateReturnAuthorizationInNetSuite({
@@ -826,9 +862,7 @@ export async function createOrUpdateReturnAuthorizationInNetSuite({
     method: Number.isInteger(existingId) && existingId > 0 ? "PATCH" : "POST",
     body: payload
   });
-  const result = restMutationQueue.then(run, run);
-  restMutationQueue = result.catch(() => {});
-  return result;
+  return queueNetSuiteMutation(run);
 }
 
 export async function createOrUpdateCreditMemoInNetSuite({
@@ -843,9 +877,12 @@ export async function createOrUpdateCreditMemoInNetSuite({
     method: Number.isInteger(existingId) && existingId > 0 ? "PATCH" : "POST",
     body: payload
   });
-  const result = restMutationQueue.then(run, run);
-  restMutationQueue = result.catch(() => {});
-  return result;
+  return queueNetSuiteMutation(run);
+}
+
+export async function createStandaloneReturnAuthorizationInNetSuite(payload) {
+  const run = () => netsuiteRest("/record/v1/returnAuthorization", { method: "POST", body: payload });
+  return queueNetSuiteMutation(run);
 }
 
 export async function fetchReturnAuthorizationFromNetSuite(returnAuthorizationId) {
@@ -926,6 +963,31 @@ export async function fetchOperatorNetSuiteSourceItemLinesFromNetSuite(
   return items;
 }
 
+/** Read-only evidence for kit-aware SO fulfillment; no transform or generic record access.
+ * @param {unknown} sourceId
+ * @param {{rest?: Function, queryAll?: Function}} [dependencies]
+ */
+export async function fetchOperatorNetSuiteKitEvidenceFromNetSuite(sourceId, { rest = netsuiteRest, queryAll = suiteqlAll } = {}) {
+  const id = Number(sourceId);
+  if (!Number.isSafeInteger(id) || id <= 0) { throw new Error('A positive valid NetSuite sales order ID is required.'); }
+  const [sourceItems, sourceRows] = await Promise.all([
+    fetchOperatorNetSuiteSourceItemLinesFromNetSuite('SO', id, { rest }),
+    queryAll(`SELECT tl.id, tl.uniquekey, tl.item, tl.kitmemberof, tl.quantity,
+                    tl.quantityshiprecv, tl.location, i.itemtype, i.usebins, i.islotitem, i.isserialitem
+               FROM transactionline tl JOIN item i ON i.id = tl.item
+              WHERE tl.transaction = ${id} AND tl.mainline = 'F' AND tl.taxline = 'F'
+              ORDER BY tl.linesequencenumber`)
+  ]);
+  const kitIds = [...new Set(sourceRows.filter(row => row.itemtype === 'Kit').map(row => Number(row.item)))];
+  const kitDefinitions = [];
+  for (const kitId of kitIds) {
+    if (!Number.isSafeInteger(kitId) || kitId <= 0) { throw new Error('A positive valid kit item ID is required.'); }
+    const result = await rest(`/record/v1/kitItem/${kitId}?expandSubResources=true`, { method: 'GET' });
+    kitDefinitions.push(result.data);
+  }
+  return { sourceItems, sourceRows, kitDefinitions };
+}
+
 export async function updateTransferOrderStatusInNetSuite(orderId, { intercompany = false, statusId = "B" } = {}) {
   const id = Number(orderId);
   if (!Number.isInteger(id) || id <= 0) throw new Error("A valid numeric NetSuite transfer order ID is required.");
@@ -934,9 +996,7 @@ export async function updateTransferOrderStatusInNetSuite(orderId, { intercompan
     method: "PATCH",
     body: { orderStatus: { id: String(statusId || "B") } }
   });
-  const result = restMutationQueue.then(run, run);
-  restMutationQueue = result.catch(() => {});
-  return result;
+  return queueNetSuiteMutation(run);
 }
 
 function configuredPickingTicketRestletUrl() {
@@ -963,13 +1023,31 @@ function restletErrorDetail(payload, text) {
   return combined || String(text || "").trim().slice(0, 2000) || "Unknown RESTlet error";
 }
 
+export async function callFieldSalesRestlet(action, payload = {}) {
+  const target = new URL(String(process.env.FIELD_SALES_RESTLET_URL || 'https://invalid.invalid'));
+  if (target.protocol !== 'https:' || !target.hostname.endsWith('.restlets.api.netsuite.com') || target.pathname !== '/app/site/hosting/restlet.nl') {
+    throw Object.assign(new Error('Configure FIELD_SALES_RESTLET_URL for the dedicated NetSuite estimate RESTlet.'), { permanent: true });
+  }
+  const run = async () => {
+    const token = await getAccessToken();
+    const { response, value: result } = await scheduledNetSuiteRequest(target.toString(), {
+      method: 'POST', signal: AbortSignal.timeout(90000),
+      headers: { Authorization: `Bearer ${token}`, Accept: 'application/json', 'Content-Type': 'application/json' },
+      body: JSON.stringify({ action, ...payload, requireSandbox: process.env.FIELD_SALES_NETSUITE_REQUIRE_SANDBOX !== 'false' })
+    }, received => received.json());
+    if (!response.ok || result.ok === false) throw Object.assign(new Error(result.message || `NetSuite estimate request failed (${response.status}).`), { permanent: result.permanent === true });
+    return result;
+  };
+  return queueNetSuiteMutation(run);
+}
+
 async function configuredRestletJson(params = {}) {
   const url = configuredPickingTicketRestletUrl();
   const request = Object.fromEntries(
     Object.entries(params).filter(([, value]) => value !== undefined && value !== null && value !== "")
   );
   const accessToken = await getAccessToken();
-  const response = await netsuiteFetch(url, {
+  const { response, text } = await timedNetSuiteTextRequest(url, {
     method: "POST",
     headers: {
       "Authorization": `Bearer ${accessToken}`,
@@ -978,7 +1056,6 @@ async function configuredRestletJson(params = {}) {
     },
     body: JSON.stringify(request)
   });
-  const text = await response.text();
   const payload = parsedRestletPayload(text);
   if (!response.ok) {
     throw new Error(`NetSuite RESTlet failed: ${response.status} ${restletErrorDetail(payload, text)}`);
@@ -1044,7 +1121,7 @@ export async function fetchPickingTicketFromNetSuite(orderId, { locationId = nul
   };
   if (requestedLocation) request.location = location;
   const accessToken = await getAccessToken();
-  const response = await netsuiteFetch(url, {
+  const { response, value: contents } = await scheduledNetSuiteRequest(url, {
     method: "POST",
     headers: {
       "Authorization": `Bearer ${accessToken}`,
@@ -1052,24 +1129,23 @@ export async function fetchPickingTicketFromNetSuite(orderId, { locationId = nul
       "Content-Type": "application/json"
     },
     body: JSON.stringify(request)
-  });
+  }, received => received.ok && (received.headers.get('content-type') || '').includes('application/pdf')
+    ? received.arrayBuffer() : received.text());
   const contentType = response.headers.get("content-type") || "";
   if (!response.ok) {
-    const text = await response.text();
-    throw new Error(`NetSuite picking ticket failed: ${response.status} ${restletErrorDetail(parsedRestletPayload(text), text)}`);
+    throw new Error(`NetSuite picking ticket failed: ${response.status} ${restletErrorDetail(parsedRestletPayload(contents), contents)}`);
   }
   if (contentType.includes("application/pdf")) {
     return {
-      buffer: verifiedPdfBuffer(Buffer.from(await response.arrayBuffer())),
+      buffer: verifiedPdfBuffer(Buffer.from(contents)),
       contentType: "application/pdf",
       filename: `${prefix}-${id}-picking-ticket.pdf`,
       locationApplied: false
     };
   }
-  const text = await response.text();
-  const payload = parsedRestletPayload(text);
+  const payload = parsedRestletPayload(contents);
   if (!payload) throw new Error("NetSuite picking-ticket RESTlet returned an invalid JSON response.");
-  if (payload.ok === false) throw new Error(`NetSuite picking-ticket RESTlet failed: ${restletErrorDetail(payload, text)}`);
+  if (payload.ok === false) throw new Error(`NetSuite picking-ticket RESTlet failed: ${restletErrorDetail(payload, contents)}`);
   if (payload.entityId !== undefined && Number(payload.entityId) !== id) {
     throw new Error("NetSuite picking-ticket RESTlet returned the wrong transaction identity.");
   }
@@ -1199,9 +1275,7 @@ export async function updatePurchaseOrderHistoryInNetSuite(orderId, {
       lastModifiedBefore: record.lastModifiedDate || null
     };
   };
-  const result = restMutationQueue.then(run, run);
-  restMutationQueue = result.catch(() => {});
-  return result;
+  return queueNetSuiteMutation(run);
 }
 
 export async function resolvePalletItemFromNetSuite() {
@@ -1268,6 +1342,20 @@ export async function fetchItemReceiptFromNetSuite(itemReceiptId) {
   }
 }
 
+async function readOperatorTransactionByExternalId(externalId, transactionType, rest) {
+  const type = transactionType === "IF" ? "itemFulfillment" : "itemReceipt";
+  let record;
+  try {
+    const result = await rest(`/record/v1/${type}/eid:${externalId}?expandSubResources=true`, { method: "GET" });
+    record = result.data;
+  } catch (error) {
+    if (Number(error.status) === 404 && error.netsuiteErrorCodes?.includes("NONEXISTENT_EXTERNAL_ID")) {return null;}
+    throw error;
+  }
+  return { id: Number(record?.id), tranid: record?.tranId, externalid: record?.externalId,
+    createdfrom: record?.createdFrom?.id, record };
+}
+
 /**
  * Locate the unique IF/IR created for an Operator posting command. The caller
  * must still read and verify source and line evidence before accepting it.
@@ -1275,7 +1363,7 @@ export async function fetchItemReceiptFromNetSuite(itemReceiptId) {
  * @param {unknown} externalId
  * @param {unknown} transactionType
  * @param {unknown} sourceNetSuiteId
- * @param {{ queryAll?: Function, fetchItemFulfillment?: Function, fetchItemReceipt?: Function }} [dependencies]
+ * @param {{ queryAll?: Function, fetchItemFulfillment?: Function, fetchItemReceipt?: Function, direct?: boolean, rest?: Function }} [dependencies]
  */
 export async function findOperatorNetSuitePostingTransactionByExternalId(
   externalId,
@@ -1291,6 +1379,9 @@ export async function findOperatorNetSuitePostingTransactionByExternalId(
   }
   if (!Number.isSafeInteger(sourceId) || sourceId <= 0) {
     throw new Error("A valid Operator NetSuite source transaction ID is required for IF/IR recovery.");
+  }
+  if (dependencies.direct === true) {
+    return readOperatorTransactionByExternalId(normalizedExternalId, normalizedType, dependencies.rest || netsuiteRest);
   }
   const netSuiteType = normalizedType === "IF" ? "ItemShip" : "ItemRcpt";
   const queryAll = typeof dependencies.queryAll === "function" ? dependencies.queryAll : suiteqlAll;
@@ -1351,6 +1442,7 @@ export async function findOperatorNetSuitePostingTransactionByExternalId(
 
 export async function suiteql(q, params = [], options = {}) {
   const run = () => runSuiteql(q, params, options);
+  if (isOperatorNetSuiteRequest()) {return run();}
   const result = operatorPostingTelemetry.queued("suiteql", suiteqlQueue, run);
   suiteqlQueue = result.catch(() => {});
   return result;
@@ -1430,6 +1522,8 @@ export async function fetchTransactionReferenceByTranidFromNetSuite(tranid, reco
 }
 
 export async function fetchDeliveryOrdersFromNetSuite(locationId = 1) {
+  if (Number(locationId) === 50 && !await isSorFeatureEnabled()) { return []; }
+  setOutboundLocationDirectory(await activeNetSuiteLocationDirectory());
   return suiteqlAll(deliveryOrderListQuery(locationId));
 }
 
@@ -1526,7 +1620,8 @@ export async function fetchDeliveryOrderFromNetSuite(orderId, locationId = null)
   if (!Number.isInteger(id) || id <= 0) {
     throw new Error("A valid numeric NetSuite sales order ID is required.");
   }
-  const locationFilter = locationId ? `AND tl.location = ${Number(locationId)}` : "";
+  if (locationId) setOutboundLocationDirectory(await activeNetSuiteLocationDirectory());
+  const locationFilter = locationId ? `AND tl.location IN (${outboundQueryLocationIds(locationId)})` : "";
 
   const result = await suiteql(`
     SELECT DISTINCT
@@ -1565,7 +1660,8 @@ export async function fetchDeliveryOrderFromNetSuite(orderId, locationId = null)
 export async function fetchCustomerPickupOrderFromNetSuite(code, locationId = null) {
   const text = String(code || "").trim();
   if (!text) throw new Error("Sales order number is required.");
-  const locationFilter = locationId ? `AND tl.location = ${Number(locationId)}` : "";
+  if (locationId) setOutboundLocationDirectory(await activeNetSuiteLocationDirectory());
+  const locationFilter = locationId ? `AND tl.location IN (${outboundQueryLocationIds(locationId)})` : "";
   const orderFilter = /^\d+$/.test(text)
     ? `t.id = ${Number(text)}`
     : `UPPER(t.tranid) = '${text.replaceAll("'", "''").toUpperCase()}'`;
@@ -2556,17 +2652,20 @@ export async function fetchDeliveryOrderDetailsFromNetSuite(orderId, locationId 
   return (result.items || []).map(normalizeOpenDeliveryLine);
 }
 
-export async function fetchSalesOrderFulfillmentStateFromNetSuite(orderId) {
+export async function fetchSalesOrderFulfillmentStateFromNetSuite(orderId, {
+  query: readQuery = suiteql, fetchItems = fetchOperatorNetSuiteSourceItemLinesFromNetSuite
+} = {}) {
   const id = Number(orderId);
   if (!Number.isInteger(id) || id <= 0) {
     throw new Error("A valid numeric NetSuite sales order ID is required.");
   }
-  const result = await suiteql(`
+  const result = await readQuery(`
     SELECT t.id,
            t.tranid,
            t.status,
            BUILTIN.DF(t.status) AS status_text,
            tl.uniquekey AS order_line,
+           tl.id AS rest_order_line,
            tl.item AS item_id,
            BUILTIN.DF(tl.item) AS item_name,
            i.itemtype AS item_type,
@@ -2588,17 +2687,24 @@ export async function fetchSalesOrderFulfillmentStateFromNetSuite(orderId) {
   `);
   const rows = result.items || [];
   if (!rows.length) return null;
+  const sourceItems = await fetchItems('SO', id);
   const header = rows[0];
   const lines = rows.filter((row) => {
     if (!row.order_line || !["InvtPart", "NonInvtPart"].includes(String(row.item_type || ""))) return false;
     const itemName = String(row.item_name || "").trim().toUpperCase();
     return !itemName.startsWith("DELIVERY CHARGE") && !itemName.startsWith("SALES CREDIT");
   }).map((row) => {
+    const matches = sourceItems.filter(item => Number(item.orderLine ?? item.orderline ?? item.line) === Number(row.rest_order_line)
+      && Number(item.item?.id ?? item.itemId ?? item.item) === Number(row.item_id));
+    if (matches.length !== 1) throw Object.assign(new Error('The Sales Order source line has no unique NetSuite REST orderLine. Refresh before posting.'), {
+      code: 'SALES_ORDER_IF_LINE_MAPPING_UNRESOLVED', status: 409
+    });
     const quantity = Math.abs(Number(row.quantity || 0));
     const fulfilledQuantity = Math.abs(Number(row.fulfilled_quantity || 0));
     const lineClosed = /^(?:t|true|yes|1)$/iu.test(String(row.line_closed || ""));
     return {
-      orderLine: Number(row.order_line),
+      orderLine: Number(matches[0].orderLine ?? matches[0].orderline ?? matches[0].line),
+      sourceLineKey: String(row.order_line),
       itemId: Number(row.item_id),
       quantity: Number(quantity.toFixed(6)),
       fulfilledQuantity: Number(fulfilledQuantity.toFixed(6)),
@@ -3174,6 +3280,9 @@ export async function fetchInventoryBalancesFromNetSuite(locationIds = [1, 28, 1
       i.itemtype AS item_type,
       BUILTIN.DF(i.itemtype) AS item_type_text,
       BUILTIN.DF(i.stockunit) AS stock_unit,
+      i.stockunit AS stock_unit_id,
+      i.saleunit AS sales_unit_id,
+      BUILTIN.DF(i.saleunit) AS sales_unit,
       BUILTIN.DF(i.purchaseunit) AS purchase_unit,
       i.vendor AS vendor_id,
       BUILTIN.DF(i.vendor) AS vendor,
@@ -3216,6 +3325,9 @@ export async function fetchInventoryBalanceForItemFromNetSuite(itemId, locationI
       i.itemtype AS item_type,
       BUILTIN.DF(i.itemtype) AS item_type_text,
       BUILTIN.DF(i.stockunit) AS stock_unit,
+      i.stockunit AS stock_unit_id,
+      i.saleunit AS sales_unit_id,
+      BUILTIN.DF(i.saleunit) AS sales_unit,
       BUILTIN.DF(i.purchaseunit) AS purchase_unit,
       i.vendor AS vendor_id,
       BUILTIN.DF(i.vendor) AS vendor,
@@ -3287,13 +3399,13 @@ export function matchNetSuiteLocation(directory = [], { locationId = null, code 
   return ranked[0].row;
 }
 
-async function activeNetSuiteLocationDirectory() {
+export async function activeNetSuiteLocationDirectory() {
   const key = `${config.netsuite.accountId || ""}|${config.netsuite.restBaseUrl || ""}`;
   if (locationDirectoryCache.key === key && locationDirectoryCache.expiresAt > Date.now()) {
     return locationDirectoryCache.rows;
   }
   const rows = await suiteqlAll(`
-    SELECT l.id, l.name, l.fullname, l.isinactive, l.subsidiary,
+    SELECT l.id, l.name, l.fullname, l.parent, l.isinactive, l.subsidiary,
            BUILTIN.DF(l.subsidiary) AS subsidiary_name
       FROM location l
      WHERE l.isinactive = 'F'
@@ -3628,6 +3740,9 @@ export async function fetchInventoryBalancesForItemsFromNetSuite(itemIds = [], l
       i.itemtype AS item_type,
       BUILTIN.DF(i.itemtype) AS item_type_text,
       BUILTIN.DF(i.stockunit) AS stock_unit,
+      i.stockunit AS stock_unit_id,
+      i.saleunit AS sales_unit_id,
+      BUILTIN.DF(i.saleunit) AS sales_unit,
       BUILTIN.DF(i.purchaseunit) AS purchase_unit,
       i.vendor AS vendor_id,
       BUILTIN.DF(i.vendor) AS vendor,
@@ -3703,4 +3818,27 @@ export async function fetchSmartScmSalesHistoryFromNetSuite({
       AND UPPER(BUILTIN.DF(t.status)) NOT LIKE '%CANCEL%'
     ORDER BY t.trandate, t.id, tl.uniquekey
   `);
+}
+
+// Narrow Special Item boundary; all line identity/verification is implemented in
+// the adapter and can be exercised without sending mutations to NetSuite.
+export async function resolveSpecialOrderUnitsFromNetSuite(lines) {
+  const { resolveSpecialUnits } = await import('./special-stock-netsuite-adapter.js');
+  return resolveSpecialUnits(lines, { rest: netsuiteRest, queryAll: suiteqlAll });
+}
+export async function synchronizeSpecialSalesDescriptionsInNetSuite(input) {
+  const { synchronizeSpecialDescriptions } = await import('./special-stock-netsuite-adapter.js');
+  const run = () => synchronizeSpecialDescriptions(input, { rest: netsuiteRest, queryAll: suiteqlAll });
+  return queueNetSuiteMutation(run);
+}
+export async function prepareSpecialQuantityPlanInNetSuite(input) {
+  const { prepareSpecialQuantityPlan } = await import('./special-stock-quantity-adapter.js');
+  return prepareSpecialQuantityPlan(input, { rest: netsuiteRest, queryAll: suiteqlAll });
+}
+export async function applySpecialQuantityPlanInNetSuite(plan) {
+  const { applySpecialQuantityPlan } = await import('./special-stock-quantity-adapter.js');
+  const run = () => applySpecialQuantityPlan(plan, { rest: netsuiteRest, queryAll: suiteqlAll });
+  const result = restMutationQueue.then(run, run);
+  restMutationQueue = result.catch(() => {});
+  return result;
 }

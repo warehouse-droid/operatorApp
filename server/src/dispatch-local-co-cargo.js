@@ -14,7 +14,8 @@
 export function applyLocalCoCargo(order = {}, record = {}) {
   if (record.cargoLocked || !Array.isArray(record.cargoLines) || !record.cargoLines.length) return order;
   if (String(order.id || "").toLowerCase() !== String(record.coRef || "").toLowerCase()) return order;
-  const items = record.cargoLines.map((line) => ({
+  const items = record.cargoLines.filter(line => [line.quantity, line.pallet_qty, line.layer_qty, line.section_qty, line.piece_qty]
+    .some(value => Number(value || 0) > 0)).map((line) => ({
     // Allocations belong to the source SO, not this CO's independent manifest.
     ...Object.fromEntries(Object.entries(line.raw || {}).filter(([key]) => !key.startsWith("poAllocated"))),
     lineId: Number(line.line_id),

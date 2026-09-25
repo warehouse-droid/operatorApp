@@ -309,11 +309,11 @@ export function reconcileDependencyManagedPickups({
   preservedPoOrderRefs = new Set(),
   activity = []
 } = {}) {
-  const enrichedByRef = orderIndex(enrichedOrders);
+  // Relationship aliases identify related orders, not interchangeable snapshots.
+  // A group or sibling split must never replace another order's own identity.
+  const enrichedByRef = new Map(enrichedOrders.map((order) => [text(order.id).toLowerCase(), order]));
   const orders = (plan.orders || []).map((order) => {
-    const enriched = dispatchDependencyOrderRefs(order)
-      .map((ref) => enrichedByRef.get(ref.toLowerCase()))
-      .find(Boolean);
+    const enriched = enrichedByRef.get(text(order.id).toLowerCase());
     return enriched ? { ...order, ...enriched } : order;
   });
   for (const enriched of enrichedOrders) {

@@ -24,13 +24,16 @@ test("Operator service worker precaches the exact new page assets, preserves Dri
   const waits = [];
   events.get("install")({ waitUntil: (promise) => waits.push(promise) });
   await Promise.all(waits);
-  assert.equal(installed[0].name, "mbbs-yard-operator-v153-auto-camera-v1");
-  for (const asset of ["operator.js", "operator-load-summary.js", "operator.css", "i18n.js"]) {
-    const version = asset === "operator-load-summary.js" ? "20260915-operator-display-v1" : "20260916-operator-auto-camera-v1";
-    const url = `/${asset}?v=${version}`;
-    assert.ok(html.includes(url));
+  assert.match(installed[0].name, /^mbbs-yard-operator-/);
+  assert.notEqual(installed[0].name, "mbbs-yard-operator-old");
+  for (const asset of ["operator.js", "operator-photo-outbox.js", "operator-load-summary.js", "operator.css", "i18n.js", "operator-display-settings.js", "operator-order-keypad.js", "operator-display-settings.css"]) {
+    const url = html.match(new RegExp(`"(/${asset.replaceAll(".", "\\.")}\\?v=[^"]+)"`))?.[1];
+    assert.ok(url, `${asset} has a versioned URL in the Operator page`);
     assert.ok(installed[0].assets.includes(`https://yard.invalid${url}`));
   }
+  const popupCss = "/operator-receiving-confirmation.css?v=20260917-receiving-followup-v1";
+  assert.ok(html.includes(popupCss));
+  assert.ok(installed[0].assets.includes(`https://yard.invalid${popupCss}`));
   events.get("activate")({ waitUntil: (promise) => waits.push(promise) });
   await Promise.all(waits);
   assert.deepEqual(deleted, ["mbbs-yard-operator-old"]);

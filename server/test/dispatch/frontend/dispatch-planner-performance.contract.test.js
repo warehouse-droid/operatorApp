@@ -250,7 +250,7 @@ test("DP-05/DP-16 frontend: normal autosave uses guarded semantic deltas with a 
   assert.match(request, /planDelta:\s*buildDispatchPlanWireDelta/u);
   assert.match(request, /:\s*["']replace_plan["']/u,
     "Turning compact commands off must retain the existing full-board command contract.");
-  assert.match(request, /baseDigest:\s*currentPlan\?\.digest/u);
+  assert.match(request, /baseDigest:\s*payload\.baseDigest/u);
 
   const saveStart = dispatchSource.indexOf("function savePlanToServer(");
   assert.notEqual(saveStart, -1);
@@ -341,7 +341,8 @@ test("DPO-10b: Planning searches split POs by source and displays each correspon
 test("DPO-11 frontend: route estimates never block autosave and confirm uses one budgeted refinement pass", () => {
   const flush = functionBody("flushPlanSaveQueue");
   assert.doesNotMatch(flush, /GoogleRoute|route-estimate|ensureGoogleRoute/u);
-  const confirm = functionBody("confirmCurrentPlanAtomic");
+  assert.match(functionBody("confirmCurrentPlanAtomic"), /serializeDispatchPlanAction\(performDispatchPlanConfirmation\)/u);
+  const confirm = functionBody("performDispatchPlanConfirmation");
   assert.match(confirm, /await\s+refreshGoogleRouteEstimatesForConfirmation\(\)/u);
 });
 

@@ -1,0 +1,17 @@
+import assert from 'node:assert/strict';
+import {writeFileSync} from 'node:fs';
+import {startServer} from '../src/server.js';
+import {query} from '../src/db.js';
+assert.equal(process.env.MBT_TEST_ISOLATED,'1');
+assert.ok(process.env.DATABASE_URL.endsWith('/mbt_test_file_188188188188_rollout'));
+const before=(await query("SELECT count(*)::int AS count FROM dispatch_custom_orders WHERE order_kind='sor_rental_return'")).rows[0].count;
+assert.equal(before,14);
+await query("INSERT INTO sor_return_reconcile_queue(source_ref) VALUES('SOR00188') ON CONFLICT(source_ref) DO UPDATE SET attempts=0,last_error=''");
+await startServer();
+await new Promise(resolve=>setTimeout(resolve,10000));
+assert.equal((await query("SELECT count(*)::int AS count FROM sor_return_reconcile_queue WHERE source_ref='SOR00188'")).rows[0].count,0);
+assert.equal((await query("SELECT count(*)::int AS count FROM dispatch_custom_orders WHERE order_kind='sor_rental_return'")).rows[0].count,before);
+const health=await fetch('http://127.0.0.1:3000/health');assert.equal((await health.json()).ok,true);
+writeFileSync('test-artifacts/sor-rentals/startup-result.json',JSON.stringify({passed:true,backgroundReconciliation:true,noDuplicateReturns:true,health:200}));
+console.log('SOR startup and background reconciliation passed.');
+process.exit(0);

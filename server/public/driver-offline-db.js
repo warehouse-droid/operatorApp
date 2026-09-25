@@ -1166,7 +1166,7 @@
       photoOrdinals.add(ordinal);
       photoRecords.push(existing);
     }
-    if (photoRecords.length < requiredPhotoCount) {
+    if (photoRecords.filter(photo => photo.recordType !== 'driver-customer-signature').length < requiredPhotoCount) {
       transaction.abort();
       throw new Error(`${requiredPhotoCount} saved photo${requiredPhotoCount === 1 ? " is" : "s are"} required before completing this action.`);
     }
@@ -1435,7 +1435,7 @@
       // Nothing is cancelled or rebound until the canonical completion can be
       // made whole. If evidence is still missing it remains untouched for a
       // later retry or Dispatch review.
-      if (canonical && repairablePhotos.length >= requiredPhotoCount) {
+      if (canonical && repairablePhotos.filter(photo => photo.recordType !== 'driver-customer-signature').length >= requiredPhotoCount) {
         const ownerSequence = new Map(duplicateCompletions.map((candidate) => [
           candidate.eventId,
           Number(candidate.clientSequence || 0)

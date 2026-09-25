@@ -356,6 +356,7 @@ function buildVisit(componentRows, allRowsByJobId, provenanceByReference = new M
     remainingPhotoSlots: Math.max(0, DRIVER_COMPLETED_VISIT_MAX_PHOTOS - photos.length),
     photos: publicPhotos(photos, completionSource, provenanceByReference),
     photoReferences: photos,
+    customerSignature: details.find(value => value.customerSignature)?.customerSignature || null,
     consolidatedPhysicalVisit: rows.length > 1,
     declarationValid: declaration.valid,
     blockCode: declaration.code,

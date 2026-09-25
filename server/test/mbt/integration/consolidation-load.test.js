@@ -394,6 +394,7 @@ test("HTTP admission with the native gate enabled posts only TO and resumes the 
     calls.push({ path: url.pathname, method: options.method, body: options.body });
     if (url.pathname.endsWith("/suiteql")) {
       const sql = JSON.parse(options.body).q;
+      if (sql.includes('FROM location l')) return json({ items: [{ id: 1 }, { id: 28 }, { id: 15 }, { id: 26 }], hasMore: false });
       if (sql.includes("next_transaction.id")) return json({ items: savedRecord ? [{ id: savedRecord.id }] : [], hasMore: false });
       if (sql.includes("NextTransactionLineLink")) return json({ items: [], hasMore: false });
       assert.match(sql, /t\.type AS record_type/);

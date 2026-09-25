@@ -1,10 +1,17 @@
+import { filterSorPlanningOrders } from './sor-feature-gate.js';
+import { decorateSorOrders } from "./sor-rental-repository.js";
+import { notifyDispatchPlanMaintenance } from "./dispatch-plan-maintenance.js";
+import { deferDispatchPlanMaintenance, enqueueDispatchPlanMaintenance } from "./dispatch-plan-maintenance-queue.js";
+import { reconcileCoDirectToCargo, restoreCoSourceRequirement } from "./co-direct-to-cargo.js";
 import crypto from "node:crypto";
+import { withCoSourcePackingHandoff } from "./co-source-packing-handoff.js";
 import { VOYAGE_DISPATCH_YARD } from "./dispatch-sales-order-locations.js";
 import { pool, query, withTransaction } from "./db.js";
 import { resumeSmartScmBlanketCoveredPlanningExclusions } from "./smart-scm-planning-exclusion-repository.js";
 import { dispatchLoadAssignment } from "./dispatch-load-assignment.js";
 import { DISPATCH_FLEET_PLANNING_LOCK } from "./dispatch-fleet-status.js";
 import { updateDispatchSalesSplitDetails } from "./dispatch-delivery-group-repository.js";
+import { applyDispatchGroupAction } from "./dispatch-group-action-repository.js";
 import { assertDispatchExecutedPrefixPreserved } from "./dispatch-executed-prefix-repository.js";
 import {
   syncDispatchPlanOrderAssignments,
@@ -288,6 +295,7 @@ function rowToDispatchOrder(row) {
   const items = normalizeDispatchItems(row.items || []);
   const pallets = dispatchOrderPalletQuantity({
     items,
+    specialPalletTotal: row.special_pallet_total,
     reportedPallets: totalPallets,
     fallbackSalesQuantity: fallbackQty,
     preserveReportedPallets: row.source_table === "scm_vrma_orders"
@@ -324,6 +332,7 @@ function rowToDispatchOrder(row) {
     ? uniqueDispatchRefs(row.scm_corresponding_po_refs)
     : [];
   return {
+    specialPalletTotal: row.special_pallet_total == null ? null : Number(row.special_pallet_total),
     id: visibleRef,
     netsuiteId: row.netsuite_id,
     type: row.dispatch_type,
@@ -1659,6 +1668,9 @@ export async function listDispatchOrders({
          )
     )
     SELECT orders.*,
+           (SELECT special.pallet_total FROM sales_special_stock_cases special
+             WHERE (orders.dispatch_type='SO' AND special.sales_order_netsuite_id=orders.netsuite_id)
+                OR (orders.dispatch_type='PO' AND special.purchase_order_netsuite_id=orders.netsuite_id) LIMIT 1) AS special_pallet_total,
            pool_co.created_at AS local_order_created_at,
            pool_co.updated_at AS local_order_updated_at,
            COALESCE(split_lookup.is_split, false) AS scm_is_split,
@@ -1704,7 +1716,8 @@ export async function listDispatchOrders({
     `,
     params
   );
-  return result.rows.map(rowToDispatchOrder);
+  const orders = await decorateSorOrders(result.rows.map(rowToDispatchOrder));
+  return normalizedExactOrderRefs.length ? orders : filterSorPlanningOrders(orders);
 }
 
 export async function searchSalesOrderMethodOverrides({ search = "", limit = 30 } = {}) {
@@ -2088,7 +2101,35 @@ export async function reparseMissingSalesOrderDispatch({ limit = 200, dryRun = f
   };
 }
 
+async function loadGroupActionChildren(refs, type) {
+  const splits = (await query(`SELECT split_ref,full_order FROM dispatch_global_order_splits
+    WHERE split_ref=ANY($1::text[]) AND active=true`, [refs])).rows;
+  const splitRefs = new Set(splits.map(row => row.split_ref));
+  const sourceRefs = refs.filter(ref => !splitRefs.has(ref));
+  const sourceOrders = sourceRefs.length
+    ? await listDispatchOrders({ type, exactOrderRefs: sourceRefs, includeHiddenScm: true }) : [];
+  return [...splits.map(row => row.full_order), ...sourceOrders.filter(order => sourceRefs.includes(order.id))];
+}
+
+async function projectGroupActionRoute(order) {
+  if (order.type !== "PO") return order;
+  const next = { ...order, dropoffs: purchaseOrderDropoffs(order.items, {
+    destinationLocationId: order.destinationLocationId,
+    destinationYard: order.destinationYard,
+    destinationAddress: order.defaultDestinationAddress,
+    destinationAddressOverride: order.deliveryAddressOverride
+  }) };
+  const lineIds = (order.items || []).map(item => item.lineRowId).filter(Boolean);
+  const allocations = await query(`SELECT * FROM dispatch_so_po_allocations
+    WHERE status='active' AND po_line_id=ANY($1::bigint[]) ORDER BY id`, [lineIds]);
+  return projectPurchaseOrderRouteResidual(next, allocations.rows, { force: true });
+}
+
 export async function setPurchaseOrderVendorYard(orderRef, vendorYardId) {
+  const grouped = await applyDispatchGroupAction(orderRef, { types: ["PO"],
+    updateChild: ref => setPurchaseOrderVendorYard(ref, vendorYardId), loadChildren: loadGroupActionChildren,
+    projectGroup: projectGroupActionRoute });
+  if (grouped) return grouped;
   await assertNoClosedNetSuiteOrders([orderRef], "change vendor yard in Dispatch");
   const yard = await query(
     `SELECT id, vendor, yard, day_label, window_start, window_end, instructions, address
@@ -2107,7 +2148,7 @@ export async function setPurchaseOrderVendorYard(orderRef, vendorYardId) {
             dispatch_vendor_yard = $6,
             dispatch_parse_source = 'manual-po-yard',
             dispatch_parsed_at = now()
-      WHERE tranid = $1 OR netsuite_id::text = $1
+      WHERE tranid = $1 OR netsuite_id::text = $1 OR dispatch_ref = $1
       RETURNING netsuite_id, tranid`,
     [
       orderRef,
@@ -2123,6 +2164,10 @@ export async function setPurchaseOrderVendorYard(orderRef, vendorYardId) {
 }
 
 export async function updateDispatchOrderDetails(orderRef, patch = {}) {
+  const grouped = await applyDispatchGroupAction(orderRef, { types: ["SO", "PO", "TO"],
+    updateChild: (ref, type) => updateDispatchOrderDetails(ref, { ...patch, type, sourceTable: "", source_table: "" }),
+    loadChildren: loadGroupActionChildren, projectGroup: projectGroupActionRoute });
+  if (grouped) return grouped;
   await assertNoClosedNetSuiteOrders([orderRef], "change Dispatch details");
   const split = await updateDispatchSalesSplitDetails(orderRef, patch);
   if (split) return split;
@@ -2166,7 +2211,7 @@ export async function updateDispatchOrderDetails(orderRef, patch = {}) {
               dispatch_pickup_address = CASE WHEN $6::boolean THEN $7 ELSE dispatch_pickup_address END,
               dispatch_parse_source = 'manual-dispatch-details',
               dispatch_parsed_at = now()
-        WHERE (tranid = $1 OR netsuite_id::text = $1)
+        WHERE (tranid = $1 OR netsuite_id::text = $1${table === "purchase_orders" ? " OR dispatch_ref = $1" : ""})
         RETURNING netsuite_id, tranid, ${deliveryAddressColumn} AS dispatch_address,
                   ${returnedDeliveryAddress} AS dispatch_delivery_address, dispatch_window_start,
                   dispatch_window_end, expected_delivery_date, dispatch_pickup_address,
@@ -2453,6 +2498,14 @@ function removeRefFromPlanArrays({ orders = [], trucks = [] } = {}, orderRef = "
   return { orders: nextOrders, trucks: nextTrucks };
 }
 
+export function rewriteDispatchSnapshotReference(plan, { oldRef, newRef, remove = false }) {
+  const arrays = remove ? removeRefFromPlanArrays(plan, oldRef) : {
+    orders: replaceRefDeep(plan.orders || [], oldRef, newRef),
+    trucks: replaceRefDeep(plan.trucks || [], oldRef, newRef)
+  };
+  return { ...plan, ...arrays };
+}
+
 async function updateDispatchSnapshotsForRef(executor, { oldRef = "", newRef = "", remove = false } = {}) {
   const ref = String(oldRef || "").trim();
   if (!ref) return { planIds: [] };
@@ -2461,22 +2514,27 @@ async function updateDispatchSnapshotsForRef(executor, { oldRef = "", newRef = "
   const snapshots = await runQuery(
     `SELECT snapshot.plan_id, plan.plan_date::text AS plan_date,
             plan.status, plan.note, plan.revision,
-            snapshot.orders, snapshot.trucks, snapshot.summary
+            snapshot.orders, snapshot.trucks, snapshot.summary, maintenance.requests AS pending_requests
        FROM dispatch_plan_snapshots snapshot
        JOIN dispatch_plans plan ON plan.id = snapshot.plan_id
+       LEFT JOIN dispatch_plan_maintenance maintenance ON maintenance.plan_id=plan.id
       WHERE snapshot.orders::text LIKE $1 OR snapshot.trucks::text LIKE $1
-      ORDER BY snapshot.plan_id
-      FOR UPDATE OF plan, snapshot`,
-    [`%"${ref.replaceAll('"', '\\"')}"%`]
+         OR EXISTS (SELECT 1 FROM jsonb_each(COALESCE(maintenance.requests,'{}'::jsonb)) request
+           WHERE request.value->>'kind'='po_reference' AND request.value->>'newRef'=$2)
+      ORDER BY plan.plan_date, snapshot.plan_id`,
+    [`%"${ref.replaceAll('"', '\\"')}"%`, ref]
   );
   const changedPlans = [];
   for (const row of snapshots.rows) {
-    const next = remove
-      ? removeRefFromPlanArrays({ orders: row.orders || [], trucks: row.trucks || [] }, ref)
-      : {
-          orders: replaceRefDeep(row.orders || [], ref, String(newRef || "").trim()),
-          trucks: replaceRefDeep(row.trucks || [], ref, String(newRef || "").trim())
-        };
+    // A prior rename may still be queued, so this snapshot can contain the
+    // original identity rather than the source's latest reference.
+    if (Object.values(row.pending_requests || {}).some(request => request.kind === "po_reference" && request.newRef === ref)) {
+      await enqueueDispatchPlanMaintenance(row.plan_id, { kind: "po_reference", oldRef: ref, newRef: String(newRef || "").trim(), remove }, runQuery);
+      continue;
+    }
+    const next = rewriteDispatchSnapshotReference({ orders: row.orders || [], trucks: row.trucks || [] }, {
+      oldRef: ref, newRef: String(newRef || "").trim(), remove
+    });
     const previousPlan = {
       id: String(row.plan_id),
       planDate: String(row.plan_date || "").slice(0, 10),
@@ -2493,6 +2551,13 @@ async function updateDispatchSnapshotsForRef(executor, { oldRef = "", newRef = "
       orders: next.orders,
       trucks: next.trucks
     };
+    if (JSON.stringify([previousPlan.orders, previousPlan.trucks]) === JSON.stringify([next.orders, next.trucks])) {continue;}
+    if (await deferDispatchPlanMaintenance(previousPlan, {
+      kind: "po_reference", oldRef: ref, newRef: String(newRef || "").trim(), remove
+    }, runQuery)) {continue;}
+    await runQuery(`SELECT plan.id FROM dispatch_plans plan
+      JOIN dispatch_plan_snapshots snapshot ON snapshot.plan_id=plan.id
+      WHERE plan.id=$1 FOR UPDATE OF plan, snapshot`, [row.plan_id]);
     await assertDispatchExecutedPrefixPreserved({
       previousPlan,
       nextPlan,
@@ -2525,7 +2590,8 @@ async function updateDispatchSnapshotsForRef(executor, { oldRef = "", newRef = "
       await syncDispatchPlanRelationEdges(plan, { execute: runQuery });
     }
   }
-  return { planIds: changedPlans.map((plan) => plan.id) };
+  if (executor === query) {for (const plan of changedPlans) {notifyDispatchPlanMaintenance(plan, [ref, newRef].filter(Boolean));}}
+  return { planIds: changedPlans.map((plan) => plan.id), plans: changedPlans };
 }
 
 export function scmPurchaseOrderListKind(order = {}) {
@@ -6193,6 +6259,7 @@ export async function updateScmPurchaseOrderSplitRef({
       actor: updatedBy
     });
     await client.query("COMMIT");
+    for (const plan of snapshotUpdate.plans || []) {notifyDispatchPlanMaintenance(plan);}
     return {
       splitId: split.id,
       sourcePoRef: split.source_po_ref,
@@ -6677,6 +6744,7 @@ export async function cancelScmPurchaseOrderSplit({
       actor: cancelledBy
     });
     await client.query("COMMIT");
+    for (const plan of snapshotUpdate.plans || []) {notifyDispatchPlanMaintenance(plan);}
     return {
       splitId: split.id,
       sourcePoRef: split.source_po_ref,
@@ -8943,7 +9011,7 @@ function isLocalCoTransportItem(item = {}) {
 
 function localCoSourceItems(order = {}, fromYard = "") {
   const children = Array.isArray(order.childOrderDetails) ? order.childOrderDetails : [];
-  if (!children.length) return (Array.isArray(order.items) ? order.items : []).filter(isLocalCoTransportItem);
+  if (!children.length) return (Array.isArray(order.items) ? order.items : []).map(restoreCoSourceRequirement).filter(isLocalCoTransportItem);
   const fromText = locationTextFromId(fromYard);
   const selectedChildren = children.filter((child) => {
     const yards = localCoChildSourceYards(child);
@@ -8953,8 +9021,8 @@ function localCoSourceItems(order = {}, fromYard = "") {
     Array.isArray(child.items) && child.items.length
       ? child.items
       : Array.isArray(child.raw?.items) ? child.raw.items : []
-  )).filter(isLocalCoTransportItem);
-  if (!childItems.length) return (Array.isArray(order.items) ? order.items : []).filter(isLocalCoTransportItem);
+  )).map(restoreCoSourceRequirement).filter(isLocalCoTransportItem);
+  if (!childItems.length) return (Array.isArray(order.items) ? order.items : []).map(restoreCoSourceRequirement).filter(isLocalCoTransportItem);
   const unique = new Map();
   childItems.forEach((item, index) => {
     const key = String(item.lineRowId || item.line_row_id || item.lineId || item.line_id || `${item.itemId || item.item_id || item.sku || "item"}:${index}`);
@@ -8963,7 +9031,20 @@ function localCoSourceItems(order = {}, fromYard = "") {
   return [...unique.values()];
 }
 
-export async function upsertLocalCoOrder({
+export function upsertLocalCoOrder(options = {}) {
+  const order = options.order || {};
+  const sourceRef = String(options.sourceOrderRef || order.id || "").trim();
+  return withCoSourcePackingHandoff({
+    coRef: String(order.transitCo?.id || `CO-${sourceRef}`).trim(),
+    sourceOrderRef: sourceRef,
+    childRefs: [...(order.childOrders || []), ...(order.childOrderDetails || []).map(child => child.id)],
+    fromYard: locationTextFromId(options.fromYard || order.sourceYard || order.pickupLocations?.[0]),
+    reactivateCancelled: options.reactivateCancelled === true,
+    requestedBy: options.requestedBy || ""
+  }, () => upsertLocalCoOrderUnlocked(options));
+}
+
+async function upsertLocalCoOrderUnlocked({
   sourceOrderRef,
   fromYard,
   toYard,
@@ -9140,10 +9221,12 @@ export async function upsertLocalCoOrder({
     await query(
       `DELETE FROM local_co_order_lines
        WHERE co_id = $1
-         AND NOT (line_id = ANY($2::bigint[]))`,
+         AND NOT (line_id = ANY($2::bigint[]))
+         AND NOT (quantity=0 AND raw ? 'coDirectToRequirement')`,
       [co.id, activeLineIds]
     );
   }
+  await reconcileCoDirectToCargo({ coRefs: [coRef], requestedBy });
   return getLocalCoOrder(coRef);
 }
 

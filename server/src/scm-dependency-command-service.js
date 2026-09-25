@@ -92,6 +92,16 @@ export function scmDependencyPayloadHash(command = {}) {
 }
 
 async function mutateRelationship(command, actor, preview) {
+  const result = await mutateRelationshipOnly(command, actor, preview);
+  if (["link_to", "unlink_to", "change_mode"].includes(command.action)) {
+    await reconcileCoDirectToCargo({ salesRefs: [...new Set([command.targetRef,
+      ...(result.relatedOrderRefs || []), ...(preview.affectedOrderRefs || [])].filter(Boolean))],
+    requestedBy: actor.sessionId || String(actor.id || "") });
+  }
+  return result;
+}
+
+async function mutateRelationshipOnly(command, actor, preview) {
   const payload = command.payload || {};
   switch (command.action) {
     case "link_to": {
@@ -384,6 +394,7 @@ export async function executeScmDependencyCommand(command = {}, actor = {}, port
       ...relationship,
       ...(plan ? { plan, planId: plan.id, planRevision: Number(plan.revision || 0) } : {})
     };
+    if (actor.editLease) {await assertDispatchPlanEditLease(actor.editLease);}
     await requiredPort(ports, "completeReceipt")(command.requestId, result);
     if (typeof ports.markPendingApplied === "function") {
       await ports.markPendingApplied(command.requestId, result);
@@ -394,6 +405,8 @@ export async function executeScmDependencyCommand(command = {}, actor = {}, port
 import crypto from "node:crypto";
 
 import { withTransaction } from "./db.js";
+import { assertDispatchPlanEditLease } from './dispatch-plan-lease-repository.js';
+import { reconcileCoDirectToCargo } from "./co-direct-to-cargo.js";
 import { applyConfirmedDispatchPlanToDelivery } from "./delivery-repository.js";
 import {
   createSalesOrderPoAllocation,

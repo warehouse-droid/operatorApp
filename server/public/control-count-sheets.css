@@ -1,0 +1,22 @@
+.count-sheet-control { display:grid;gap:16px; }
+.count-sheet-control h2,.count-sheet-control h3 { margin:0; }
+.count-sheet-toolbar { display:flex;gap:12px;align-items:center;flex-wrap:wrap; }
+.count-sheet-toolbar>div:first-child { flex:1; }
+.count-sheet-control input,.count-sheet-control select { padding:10px;border:1px solid #b6c9cc;border-radius:6px;min-height:42px; }
+.count-sheet-control-grid { display:grid;grid-template-columns:minmax(200px,30%) minmax(0,1fr);gap:20px; }
+.count-sheet-list { display:flex;flex-direction:column;gap:8px;max-height:75vh;overflow:auto; }
+.count-sheet-list button { flex:0 0 auto;min-height:80px;height:auto;display:grid;text-align:left;gap:6px;padding:12px; }
+.count-sheet-list button.active { background:#e5f4f1;border-color:#006f6b; }
+.count-sheet-editor { display:grid;gap:10px;max-width:950px; }
+.count-sheet-assigned { display:grid;gap:6px;max-height:50vh;overflow:auto; }
+.count-sheet-assigned>div { display:flex;justify-content:space-between;gap:12px;align-items:center;padding:8px;border-bottom:1px solid #d5e0e2; }
+.count-sheet-suggestions { display:grid;max-height:240px;overflow:auto; }
+.count-sheet-suggestions button { text-align:left;min-height:44px; }
+.count-sheet-table { overflow:auto; }
+.count-sheet-table table { width:100%;border-collapse:collapse;margin:12px 0; }
+.count-sheet-table td,.count-sheet-table th { padding:10px;text-align:left;border-bottom:1px solid #d5e0e2; }
+.count-sheet-table small { display:block;color:#53686c; }
+.count-sheet-control details { margin-top:16px; }
+.count-sheet-control summary { cursor:pointer;font-weight:700;padding:8px 0; }
+.count-sheet-error { padding:12px;background:#fff0ed;color:#8a281a;border-radius:6px; }
+@media(max-width:700px) { .count-sheet-control-grid { grid-template-columns:1fr; } .count-sheet-list { max-height:240px; } }

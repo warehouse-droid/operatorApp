@@ -1,6 +1,14 @@
 // @ts-check
 
 import { query } from "./db.js";
+import { config } from "./config.js";
+import { STORED_ORDER_LINE_STRATEGY, storedOperatorPostingLines } from "./operator-netsuite-posting-stored-lines.js";
+import { mapOperatorKitSelections, operatorKitError } from './operator-netsuite-posting-kits.js';
+import { fetchOperatorKitSource } from './operator-netsuite-posting-kit-source.js';
+import { applyVerifiedPoReceiptProgress } from "./receiving-receipt-progress.js";
+import { refreshPoReceiptAvailability } from "./operator-po-receipt-availability.js";
+import { fetchPickupExistingFulfillment } from './operator-pickup-existing-if-source.js';
+import { outboundOrderYards } from './outbound-location-domain.js';
 import { operatorPostingTelemetry as telemetry } from "./operator-netsuite-posting-telemetry.js";
 import {
   buildItemFulfillmentPayload,
@@ -312,15 +320,21 @@ function localLineForPayload(order, functionKey, orderLine) {
   return line;
 }
 
-/** @param {Record<string, any>} order @param {string} functionKey */
-function receivingMemo(order, functionKey) {
-  return functionKey === "receiving" ? { memo: String(order.tranid || "").trim() } : {};
+/** @param {Record<string, any>} order @param {string} functionKey @param {Record<string, any>} source */
+function targetMetadata(order, functionKey, source) {
+  return { ...(functionKey === "receiving" ? { memo: String(order.tranid || "").trim() } : {}),
+    ...(source.postingStrategy ? { postingStrategy: source.postingStrategy } : {}) };
+}
+
+/** @param {any} source */
+function sourceHasLines(source) {
+  return Array.isArray(source.availableLines) && source.availableLines.length > 0;
 }
 
 /**
  * @param {Record<string, any>} order
  * @param {string} functionKey
- * @param {(order: Record<string, any>, context: {functionKey: string}) => Promise<Record<string, any> | null>} resolveRealSource
+ * @param {(order: Record<string, any>, context: {functionKey: string, selectedItems?: Record<string, any>[]}) => Promise<Record<string, any> | null>} resolveRealSource
  */
 async function targetForOrder(order, functionKey, resolveRealSource) {
   const payload = selectedPayload(order, functionKey);
@@ -330,18 +344,29 @@ async function targetForOrder(order, functionKey, resolveRealSource) {
       && positiveNumber(item.quantity) > 0
   ));
   if (!selectedItems.length) {return null;}
-  const source = await resolveRealSource(order, { functionKey });
+  const source = await resolveRealSource(order, { functionKey, selectedItems });
   if (!source
       || !Number.isSafeInteger(Number(source.sourceNetSuiteId))
       || Number(source.sourceNetSuiteId) <= 0
-      || !Array.isArray(source.availableLines)
-      || !source.availableLines.length) {
+      || !sourceHasLines(source)) {
     throw resolutionError(
       "OPERATOR_NETSUITE_POSTING_SOURCE_UNRESOLVED",
       `The positive NetSuite parent and line mapping for ${order.tranid || order.netsuite_id} is unavailable.`
     );
   }
   const orderKey = localOrderKey(functionKey, order);
+  if (source.kitGroups) {
+    const physicalLines = selectedItems.map(item => {
+      const localLine = localLineForPayload(order, functionKey, Number(item.orderLine));
+      return { sourceLineKey: String(localLine.line_id), itemId: Number(localLine.item_id),
+        quantity: Number(item.quantity), location: item.location ?? null,
+        localOrderKey: orderKey, localLineId: String(localLine.id ?? localLine.line_id) };
+    });
+    return { sourceOrderKind: source.sourceOrderKind, sourceNetSuiteId: Number(source.sourceNetSuiteId),
+      sourceOrderRef: String(source.sourceOrderRef), ...targetMetadata(order, functionKey, source),
+      selectedLines: mapOperatorKitSelections({ availableLines: source.availableLines, kitGroups: source.kitGroups }, physicalLines),
+      availableLines: source.availableLines, localPayload: payload };
+  }
   const authoritativeIdentityPresent = source.availableLines.some((/** @type {Record<string, any>} */ line) => (
     line?.sourceLineKey || (Array.isArray(line?.sourceLineAliases) && line.sourceLineAliases.length)
   ));
@@ -349,7 +374,7 @@ async function targetForOrder(order, functionKey, resolveRealSource) {
     sourceOrderKind: source.sourceOrderKind,
     sourceNetSuiteId: Number(source.sourceNetSuiteId),
     sourceOrderRef: String(source.sourceOrderRef || ""),
-    ...receivingMemo(order, functionKey),
+    ...targetMetadata(order, functionKey, source),
     selectedLines: selectedItems.map((/** @type {Record<string, any>} */ item) => {
       const localLine = localLineForPayload(order, functionKey, Number(item.orderLine));
       const sourceLineKey = String(localLine.line_id);
@@ -362,6 +387,11 @@ async function targetForOrder(order, functionKey, resolveRealSource) {
           "OPERATOR_NETSUITE_POSTING_LINE_MAPPING_UNRESOLVED",
           `Local line ${sourceLineKey} did not map uniquely to the NetSuite REST source sublist.`
         );
+      }
+      if (source.postingStrategy === STORED_ORDER_LINE_STRATEGY
+          && Number(candidates[0].itemId) !== Number(localLine.item_id)) {
+        throw resolutionError("OPERATOR_NETSUITE_POSTING_LINE_MAPPING_UNRESOLVED",
+          "The selected item no longer matches its stored source line. Refresh the order before posting.");
       }
       return {
         orderLine: Number(candidates[0].orderLine),
@@ -400,7 +430,7 @@ function localOperation(root, functionKey) {
  * @param {object} dependencies
  * @param {(id: unknown) => Promise<Record<string, any> | null>} dependencies.getDeliveryOrder
  * @param {(id: unknown, orderType?: unknown) => Promise<Record<string, any> | null>} dependencies.getReceivableReceivingOrder
- * @param {(order: Record<string, any>, context: {functionKey: string}) => Promise<Record<string, any> | null>} dependencies.resolveRealSource
+ * @param {(order: Record<string, any>, context: {functionKey: string, selectedItems?: Record<string, any>[]}) => Promise<Record<string, any> | null>} dependencies.resolveRealSource
  */
 export function createOperatorNetSuitePostingTargetResolver({
   getDeliveryOrder: readDeliveryOrder,
@@ -453,10 +483,9 @@ export function createOperatorNetSuitePostingTargetResolver({
         "The grouped Operator order has no current children."
       );
     }
-    const locations = new Set(children
-      .map((/** @type {Record<string, any>} */ order) => orderLocation(order, functionKey))
-      .filter((/** @type {number | null} */ locationId) => locationId !== null));
-    if (locations.size !== 1) {
+    const locations = new Set(children.flatMap((/** @type {Record<string, any>} */ order) =>
+      functionKey === 'receiving' ? [orderLocation(order, functionKey)] : outboundOrderYards(order)));
+    if (locations.size !== 1 || locations.has(null)) {
       throw resolutionError(
         "OPERATOR_NETSUITE_POSTING_MIXED_YARDS",
         "All orders completed together must resolve to one supported yard."
@@ -543,11 +572,11 @@ export function createOperatorNetSuitePostingTargetResolver({
  * SQL selection is intentionally centralized so SO/PO/TO lineage and line
  * offsets cannot diverge across separate production adapters.
  *
- * @param {{query: Function, fetchLiveSource?: Function}} dependencies
+ * @param {{query: Function, fetchLiveSource?: Function, fetchKitSource?: Function, fetchPickupSource?: Function, fetchPoReceiptLines?: Function, useStoredOrderLines?: boolean}} dependencies
  */
-export function createOperatorNetSuitePostingRealSourceResolver({ query: runQuery, fetchLiveSource }) {
+export function createOperatorNetSuitePostingRealSourceResolver({ query: runQuery, fetchLiveSource, fetchKitSource, fetchPickupSource, fetchPoReceiptLines, useStoredOrderLines = false }) {
   // eslint-disable-next-line complexity
-  return async function resolveRealSourceFromDatabase(/** @type {Record<string, any>} */ order, /** @type {{functionKey: string}} */ { functionKey }) {
+  return async function resolveRealSourceFromDatabase(/** @type {Record<string, any>} */ order, /** @type {{functionKey: string, selectedItems?: Record<string, any>[]}} */ { functionKey, selectedItems }) {
   const orderType = String(order?.order_type || "");
   let sourceNetSuiteId = Number(order?.netsuite_id);
   let sourceOrderRef = String(order?.tranid || "");
@@ -584,15 +613,23 @@ export function createOperatorNetSuitePostingRealSourceResolver({ query: runQuer
   }
   if (!Number.isSafeInteger(sourceNetSuiteId) || sourceNetSuiteId <= 0) {return null;}
 
+  if (sourceOrderKind === 'SO' && functionKey === 'customer_pickup' && fetchPickupSource) {
+    const existing = await fetchPickupSource({ order, sourceNetSuiteId, sourceOrderRef, selectedItems });
+    if (existing) {return existing;}
+  }
+
   let rows;
   if (sourceOrderKind === "SO") {
     rows = await runQuery(
       `SELECT line.line_id AS source_line_key,
+              line.netsuite_order_line, line.item_id, line.item_type, line.quantity,
+              line.loaded_qty AS cached_completed_qty, false AS cached_closed,
               COALESCE(line.location_id, parent.outbound_location_id) AS location_id
          FROM sales_order_lines line
          JOIN sales_orders parent ON parent.netsuite_id = line.sales_order_id
         WHERE line.sales_order_id = $1
-          AND line.item_type IN ('InvtPart', 'NonInvtPart')
+          ${useStoredOrderLines ? "AND COALESCE(line.netsuite_active, true) = true" : ""}
+          AND line.item_type IN ('InvtPart', 'NonInvtPart', 'Kit')
           AND line.line_id IS NOT NULL
         ORDER BY line.line_id, line.id`,
       [sourceNetSuiteId]
@@ -600,6 +637,8 @@ export function createOperatorNetSuitePostingRealSourceResolver({ query: runQuer
   } else if (sourceOrderKind === "PO") {
     rows = await runQuery(
       `SELECT line.line_id AS source_line_key,
+              line.netsuite_order_line, line.item_id, line.quantity,
+              line.netsuite_received_qty AS cached_completed_qty, line.netsuite_closed AS cached_closed,
               COALESCE(line.location_id, parent.destination_location_id) AS location_id,
               mapped.local_line_key, mapped.local_line_id
          FROM purchase_order_lines line
@@ -633,16 +672,55 @@ export function createOperatorNetSuitePostingRealSourceResolver({ query: runQuer
     }
   } else {
     const lineStage = functionKey === "receiving" ? "receiving" : "outbound";
+    const withSplit = useStoredOrderLines && Number(order.netsuite_id) < 0;
     rows = await runQuery(
-      `SELECT line.line_id AS source_line_key, NULL::bigint AS location_id
+      `SELECT line.line_id AS source_line_key, NULL::bigint AS location_id,
+              line.netsuite_order_line, line.item_id, line.quantity,
+              CASE WHEN line.line_stage='receiving' THEN line.netsuite_received_qty ELSE line.loaded_qty END AS cached_completed_qty,
+              false AS cached_closed, ${withSplit ? "mapped.local_line_key, mapped.local_line_id" : "NULL AS local_line_key, NULL AS local_line_id"}
          FROM transfer_order_lines line
+         ${withSplit ? `LEFT JOIN LATERAL (
+           SELECT child.line_id AS local_line_key, child.id AS local_line_id
+             FROM dispatch_scm_to_split_lines ledger
+             JOIN dispatch_scm_to_splits split ON split.id=ledger.split_id
+             JOIN transfer_order_lines child ON child.id=ledger.split_line_id
+              AND child.line_stage=ledger.split_line_stage AND child.transfer_order_id=split.split_to_id
+            WHERE ledger.source_line_id=line.id AND ledger.source_line_stage=line.line_stage
+              AND split.source_to_id=line.transfer_order_id AND split.split_to_id=$3 AND split.status='active'
+         ) mapped ON true` : ""}
         WHERE line.transfer_order_id = $1
           AND line.line_stage = $2
+          ${useStoredOrderLines ? "AND COALESCE(line.netsuite_active, true) = true" : ""}
           AND line.item_type IN ('InvtPart', 'NonInvtPart')
           AND line.line_id IS NOT NULL
         ORDER BY line.line_id, line.id`,
-      [sourceNetSuiteId, lineStage]
+      [sourceNetSuiteId, lineStage, ...(withSplit ? [order.netsuite_id] : [])]
     );
+    if (useStoredOrderLines && Number(order.netsuite_id) < 0) {
+      for (const child of (order.receivableLines || order.lines || []).filter(eligibleLine)) {
+        const matches = rows.rows.filter((/** @type {Record<string, any>} */ row) =>
+          String(row.local_line_id) === String(child.id) && String(row.local_line_key) === String(child.line_id));
+        if (matches.length !== 1) {
+          throw resolutionError("OPERATOR_NETSUITE_POSTING_LINE_MAPPING_UNRESOLVED",
+            "The split transfer line has no unique source-line mapping.");
+        }
+      }
+    }
+  }
+  if (sourceOrderKind === 'SO' && (rows.rows || []).some((/** @type {any} */ row) => row.item_type === 'Kit')) {
+    if (typeof fetchKitSource !== 'function') { throw operatorKitError('The authoritative kit reader is unavailable.'); }
+    const source = await fetchKitSource(sourceNetSuiteId);
+    return { ...source, sourceOrderKind, sourceNetSuiteId, sourceOrderRef, postingStrategy: STORED_ORDER_LINE_STRATEGY };
+  }
+  if (useStoredOrderLines) {
+    const sourceRows = sourceOrderKind === "PO"
+      ? await applyVerifiedPoReceiptProgress(runQuery, sourceNetSuiteId, rows.rows || []) : rows.rows || [];
+    const storedLines = storedOperatorPostingLines(sourceRows);
+    const availableLines = sourceOrderKind === "PO" && fetchPoReceiptLines
+      ? refreshPoReceiptAvailability(storedLines, await fetchPoReceiptLines(sourceNetSuiteId)) : storedLines;
+    return { sourceOrderKind, sourceNetSuiteId, sourceOrderRef,
+      postingStrategy: STORED_ORDER_LINE_STRATEGY,
+      availableLines };
   }
   if (typeof fetchLiveSource !== "function") {
     throw resolutionError(
@@ -735,7 +813,11 @@ const fetchLiveSourceFromNetSuite = createOperatorNetSuitePostingLiveSourceFetch
 });
 const resolveRealSourceFromDatabase = createOperatorNetSuitePostingRealSourceResolver({
   query,
-  fetchLiveSource: fetchLiveSourceFromNetSuite
+  fetchLiveSource: fetchLiveSourceFromNetSuite,
+  fetchKitSource: fetchOperatorKitSource,
+  fetchPickupSource: fetchPickupExistingFulfillment,
+  fetchPoReceiptLines: (/** @type {number} */ sourceId) => fetchOperatorNetSuiteSourceItemLinesFromNetSuite("PO", sourceId),
+  useStoredOrderLines: config.netsuite.operatorStoredOrderLinePosting
 });
 const readReceivingOrder = createOperatorNetSuiteReceivingOrderReader({
   getLocalCoReceivingOrder,

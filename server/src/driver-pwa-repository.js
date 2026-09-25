@@ -192,6 +192,7 @@ function mappedStop(row, currentJob = null, validation = null, correction = null
     leaveAt: evidence.completedAt,
     photoCount: evidence.photoDataUrls.length,
     driverRemark: String(evidence.jobDetails?.driverRemark || ""),
+    customerSignature: evidence.jobDetails?.customerSignature || null,
     locationStatus: evidence.locationStatus,
     storedLocation,
     recordedLocation: storedLocation,

@@ -1,0 +1,143 @@
+[
+  {
+    "file": "public/dispatch.js",
+    "lines": [
+      3473,
+      3474,
+      3475,
+      3476,
+      3477,
+      3485,
+      3543,
+      5073,
+      5074,
+      5075,
+      5076,
+      13051,
+      14714,
+      14715,
+      14716,
+      14717,
+      14718,
+      14719,
+      14720,
+      14721,
+      14825,
+      14826,
+      14827,
+      14828,
+      14829,
+      14830,
+      14831,
+      14832,
+      14924,
+      14925,
+      16928,
+      16929,
+      16930,
+      16931,
+      16932,
+      16933,
+      17609
+    ],
+    "sha256": "6e006d775506518b4a1e66c1e68d85ad8f3e5920860b069cbc79057e1d406188",
+    "baselineSha256": "9d6b59f8cd8291879d4f14d5a7ff0128fdc9b05730fd2e86cff2d3525b277929"
+  },
+  {
+    "file": "public/dispatch.html",
+    "lines": [
+      18
+    ],
+    "sha256": "22841d914fe22c698743c1dab182d531050bcfd96cafa46a1f1ec631e9b3ecdb",
+    "baselineSha256": "d9ca0ca8a5662ba15db2a7f292cf494882f65f47fa46503a144bd24d35eb8d01"
+  },
+  {
+    "file": "src/order-dependency-repository.js",
+    "lines": [
+      526,
+      561,
+      562,
+      563,
+      564,
+      565,
+      566,
+      1217,
+      1234,
+      1235,
+      4067,
+      4076,
+      4077,
+      4086,
+      4959,
+      4970
+    ],
+    "sha256": "9a50ffe1b8a4c935e6d229f7c5022960fefe383a3b0ddd37ef620eee75ab749f",
+    "baselineSha256": "54ed43103c47e6f8c4c229fc8e36f57c5d7c5e1da469ac5d4469a690850ce2a2"
+  },
+  {
+    "file": "src/dispatch-delivery-group-repository.js",
+    "lines": [
+      905,
+      906,
+      907,
+      908,
+      909
+    ],
+    "sha256": "5336f479d6bffa2ec861fc1b378dbef526ac5a58117a3cf4403400a5b47ae0ae",
+    "baselineSha256": "acd8facc6d2d5c45211f45ddb1f839c6f395206a2459633852ddc5bb37310989"
+  },
+  {
+    "file": "src/sales-order-reconciliation.js",
+    "lines": [
+      342,
+      343,
+      344,
+      345,
+      346
+    ],
+    "sha256": "b10d9366942c91a799eb31fb6dced495ab56f658443f215bcf4444bce73ac927",
+    "baselineSha256": "cc6cd56d603b7af4972ddee73d096a1a4fe31f4c49d08d64c51aafb9454c6be0"
+  },
+  {
+    "file": "src/yard-dependency-structure.js",
+    "lines": [
+      5,
+      7,
+      8,
+      9,
+      10,
+      11,
+      12,
+      13,
+      14,
+      15,
+      16,
+      17
+    ],
+    "sha256": "aef5e75d7824eecc8c76e256d917734486dc716569b6cc0031d958ab8743e539",
+    "baselineSha256": "642933a17a6573ef58f29ce29191213380b2f43b3d25e25118488ce3363c9c89"
+  },
+  {
+    "file": "src/scm-dependency-preview-service.js",
+    "lines": [
+      361,
+      362,
+      363,
+      364
+    ],
+    "sha256": "daed47c728ed41a2da245ff57806dea5e43b9c8a819926eda26d5cd1e74d1ccb",
+    "baselineSha256": "a10132d845849aa589cc18065624bac929bdf1ea737dfbe15b31310c2ed73ad9"
+  },
+  {
+    "file": "src/server.js",
+    "lines": [
+      6936,
+      6937,
+      6938,
+      6957,
+      6958
+    ],
+    "sha256": "3fba19d444ac5477e1308eda2e16c01b7f74d475360468784453e5815c643a02",
+    "baselineSha256": "440f75b50e23d1ebcfe492d7d9dedf8e3cde92f14312fa2013f45d2c31cae17b"
+  }
+]

@@ -1,6 +1,7 @@
 // @ts-check
 import crypto from "node:crypto";
 import { stableCanonicalJson } from "./operator-netsuite-posting-domain.js";
+import { outboundYardLocationId, outboundOrderYards } from "./outbound-location-domain.js";
 
 const QUANTITIES = ["quantity", "loaded_qty", "packed_pallet_qty", "packed_layer_qty", "packed_section_qty", "packed_piece_qty", "packed_sales_qty", "to_plt", "to_lyr", "to_sec", "to_pcs"];
 const TYPES = new Set(["sales_order", "transfer_order", "co_order", "vrma_order"]);
@@ -37,6 +38,7 @@ function snapshotLine(line) {
     return [field, Number(value.toFixed(6))];
   }));
   return { id: String(line.id), line_id: String(line.line_id), item_id: String(line.item_id || ""),
+    location_id: line.location_id == null ? null : Number(line.location_id),
     item_name: String(line.item_name || line.sku || "Item"), sku: String(line.sku || ""), unit: String(line.unit || ""),
     item_type: String(line.item_type || ""), ...quantities };
 }
@@ -44,7 +46,7 @@ function snapshotLine(line) {
 function requireAssignment(orders) {
   if (!Array.isArray(orders) || !orders.length) throw consolidationError("Select at least one packed order.");
   const first = orders[0], assignment = first.assignment;
-  const locationId = Number(first.outbound_location_id ?? first.source_location_id);
+  const locationId = outboundYardLocationId(first.outbound_location_id ?? first.source_location_id);
   if (!locationId || !assignment?.planId || !assignment.loadId || !assignment.truckPlate || !/^\d{4}-\d{2}-\d{2}$/.test(assignment.planDate || "")) {
     throw consolidationError("Every order must belong to a planned truck load.");
   }
@@ -53,7 +55,7 @@ function requireAssignment(orders) {
 /** @param {any} order @param {number} locationId @param {any} assignment */
 function snapshotOrder(order, locationId, assignment) {
   if (!TYPES.has(order.order_type) || order.vrma_reference_only || order.operator_status !== "packed") throw consolidationError(`${order.tranid} is not ready to load.`);
-  if (Number(order.outbound_location_id ?? order.source_location_id) !== locationId
+  if (!orderAtYard(order, locationId)
       || ["planId", "loadId", "planDate", "truckPlate"].some((field) => String(order.assignment?.[field] || "") !== String(assignment[field]))) {
     throw consolidationError("Select orders from the same yard, planned date, truck and load.");
   }
@@ -82,6 +84,14 @@ export function buildConsolidationSnapshot(orders) {
 /** @param {any} snapshot */
 export function consolidationSnapshotHash(snapshot) { return crypto.createHash("sha256").update(stableCanonicalJson(snapshot)).digest("hex"); }
 
+/** @param {any} order @param {number} yard */
+function orderAtYard(order, yard) {
+  try {
+    const yards = outboundOrderYards(order);
+    return yards.length === 1 && yards[0] === yard;
+  } catch { return false; }
+}
+
 /** @param {any[]} sources @param {number} yard @param {boolean} selected */
 export function originalConsolidationOrders(sources, yard, selected) {
   const originals = new Map();
@@ -89,7 +99,7 @@ export function originalConsolidationOrders(sources, yard, selected) {
     for (const order of root.is_dispatch_group ? root.child_orders || [] : [root]) {
       const id = String(order.netsuite_id);
       if (selected && originals.has(id)) throw consolidationError("A selected group overlaps another selected order.");
-      if (Number(order.outbound_location_id ?? order.source_location_id) !== yard) {
+      if (!orderAtYard(order, yard)) {
         if (selected) throw consolidationError("A selected order is outside this yard.", "OPERATOR_YARD_FORBIDDEN", 403);
         continue;
       }

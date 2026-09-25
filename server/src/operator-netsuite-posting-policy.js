@@ -25,9 +25,16 @@ export const OPERATOR_NETSUITE_YARDS = Object.freeze([
   Object.freeze({ locationId: 26, yardCode: "150" })
 ]);
 
+// Return posting uses its own durable return records; keep the IF/IR command
+// function catalog separate while sharing gate policy and administration.
+export const OPERATOR_NETSUITE_RETURN_FUNCTIONS = Object.freeze([
+  { functionKey: "stock_return", transactionType: "RA", gateSegment: "stock_return_ra" },
+  { functionKey: "pallet_return", transactionType: "RA", gateSegment: "pallet_return_ra" }
+]);
+
 /** @type {Map<string, Record<string, any>>} */
 const FUNCTIONS_BY_KEY = new Map(
-  Object.values(OPERATOR_NETSUITE_POSTING_FUNCTIONS)
+  [...Object.values(OPERATOR_NETSUITE_POSTING_FUNCTIONS), ...OPERATOR_NETSUITE_RETURN_FUNCTIONS]
     .map((details) => [details.functionKey, details])
 );
 /** @type {Map<number, Record<string, any>>} */
@@ -59,6 +66,19 @@ const GATES_BY_IDENTITY = new Map(OPERATOR_NETSUITE_GATE_DEFINITIONS.map((defini
   `${definition.operatorFunction}:${definition.locationId}`,
   definition
 ]));
+
+export const OPERATOR_NETSUITE_RETURN_GATE_DEFINITIONS = Object.freeze(
+  OPERATOR_NETSUITE_YARDS.flatMap((yard) => OPERATOR_NETSUITE_RETURN_FUNCTIONS.map((details) => Object.freeze({
+    flagKey: `operator_netsuite_${details.gateSegment}_${yard.yardCode}`,
+    label: `${yard.yardCode} ${details.functionKey.replaceAll("_", " ")} RA`,
+    description: `Create a Return Authorization on Operator ${details.functionKey.replaceAll("_", " ")} confirmation at ${yard.yardCode}.`,
+    operatorFunction: details.functionKey, transactionType: "RA", locationId: yard.locationId, yardCode: yard.yardCode,
+    configuredDefault: false, requiresNetSuiteDirectAccess: true, independent: true, locked: false, lockReason: null
+  })))
+);
+for (const definition of OPERATOR_NETSUITE_RETURN_GATE_DEFINITIONS) {
+  GATES_BY_IDENTITY.set(`${definition.operatorFunction}:${definition.locationId}`, definition);
+}
 
 /** @param {unknown} value */
 export function normalizeOperatorNetSuiteLocationId(value) {

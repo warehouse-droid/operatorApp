@@ -108,6 +108,15 @@ function assertMatchingLine(orderLine, expected, actual) {
   }
 }
 
+/** @param {any} step @param {number} orderLine @param {any} actual */
+function assertMatchingItem(step, orderLine, actual) {
+  const identities = (step.lineSnapshot || []).filter((/** @type {any} */ line) => line.orderLine === orderLine)
+    .map((/** @type {any} */ line) => line.kit?.definition?.parent?.itemId ?? line.itemId).filter(Boolean);
+  for (const itemId of identities) {
+    if (numberValue(actual?.item) !== itemId) { throw mismatch(`The recovered NetSuite item for line ${orderLine} does not match.`); }
+  }
+}
+
 /**
  * A recovered record is acceptable only when it proves the same source,
  * transaction type, external identity, and exact positive line quantities.
@@ -129,6 +138,7 @@ export function verifyOperatorNetSuitePostingRecord(step, record) {
   }
   for (const [orderLine, expected] of expectedByLine) {
     assertMatchingLine(orderLine, expected, actualByLine.get(orderLine));
+    assertMatchingItem(step, orderLine, actualByLine.get(orderLine));
   }
   return {
     id,

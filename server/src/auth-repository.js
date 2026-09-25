@@ -13,6 +13,7 @@ export const OPERATOR_ROLES = Object.freeze([
   "scm",
   "yard_manager",
   "sales",
+  "field_sales",
   "mbt_frontdesk",
   "mbt_billing"
 ]);
@@ -51,12 +52,18 @@ export function operatorHomeRoute(value) {
   if (role === "scm" || role === "scm_staff") return "/scm";
   if (role === "yard_manager") return "/control";
   if (role === "sales") return "/sales";
+  if (role === "field_sales") return "/field-sales/";
   if (role === "operator" && roles.has("mbt_frontdesk")) return "/mbt/frontdesk";
   if (role === "operator" && roles.has("mbt_billing")) return "/mbt/billing";
   if (role === "operator") return "/operator";
   if (role === "mbt_frontdesk") return "/mbt/frontdesk";
   if (role === "mbt_billing") return "/mbt/billing";
   return "/";
+}
+
+function aggregateAccessSelect(alias = "operators") {
+  return `(SELECT COALESCE(array_agg(a.yard_location_id ORDER BY a.yard_location_id), ARRAY[]::integer[])
+    FROM aggregate_request_yard_assignments a WHERE a.operator_id = ${alias}.id) AS aggregate_request_yard_location_ids`;
 }
 
 function publicOperator(row) {
@@ -71,6 +78,7 @@ function publicOperator(row) {
     homeRoute: operatorHomeRoute(authority),
     yardLocationIds: normalizeYardLocationIds(row.yard_location_ids),
     operatorYardLocationIds: normalizeOperatorYardLocationIds(row.operator_yard_location_ids),
+    aggregateRequestYardLocationIds: row.aggregate_request_yard_location_ids || [],
     active: row.active,
     created_at: row.created_at,
     updated_at: row.updated_at
@@ -113,7 +121,7 @@ export async function createOperator({ username, displayName, password, role = "
   const result = await query(
     `INSERT INTO operators (id, username, display_name, password_hash, password_salt, role, roles, yard_location_ids, operator_yard_location_ids)
      VALUES ($1, $2, $3, $4, $5, $6, $7::text[], $8::integer[], $9::integer[])
-     RETURNING id, username, display_name, role, roles, yard_location_ids, operator_yard_location_ids, active, created_at, updated_at`,
+     RETURNING id, username, display_name, role, roles, yard_location_ids, operator_yard_location_ids, active, created_at, updated_at, ${aggregateAccessSelect()}`,
     [id, cleanUsername, cleanDisplayName, hash, salt, authority.role, authority.roles, yards, operatorYards]
   );
   return publicOperator(result.rows[0]);
@@ -121,7 +129,7 @@ export async function createOperator({ username, displayName, password, role = "
 
 export async function listOperators() {
   const result = await query(
-    `SELECT id, username, display_name, role, roles, yard_location_ids, operator_yard_location_ids, active, created_at, updated_at
+    `SELECT id, username, display_name, role, roles, yard_location_ids, operator_yard_location_ids, active, created_at, updated_at, ${aggregateAccessSelect()}
      FROM operators
      ORDER BY active DESC, display_name ASC`
   );
@@ -134,7 +142,7 @@ export async function setOperatorActive(id, active) {
      SET active = $2,
          updated_at = now()
      WHERE id = $1
-     RETURNING id, username, display_name, role, roles, yard_location_ids, operator_yard_location_ids, active, created_at, updated_at`,
+     RETURNING id, username, display_name, role, roles, yard_location_ids, operator_yard_location_ids, active, created_at, updated_at, ${aggregateAccessSelect()}`,
     [id, Boolean(active)]
   );
   return publicOperator(result.rows[0]);
@@ -149,7 +157,7 @@ export async function updateOperatorPassword(id, password) {
          password_salt = $3,
          updated_at = now()
      WHERE id = $1
-     RETURNING id, username, display_name, role, roles, yard_location_ids, operator_yard_location_ids, active, created_at, updated_at`,
+     RETURNING id, username, display_name, role, roles, yard_location_ids, operator_yard_location_ids, active, created_at, updated_at, ${aggregateAccessSelect()}`,
     [id, hash, salt]
   );
   await query("DELETE FROM operator_sessions WHERE operator_id = $1", [id]);
@@ -173,7 +181,7 @@ export async function updateOperatorRoles(id, { role, roles, yardLocationIds, op
          operator_yard_location_ids = $5::integer[],
          updated_at = now()
      WHERE id = $1
-     RETURNING id, username, display_name, role, roles, yard_location_ids, operator_yard_location_ids, active, created_at, updated_at`,
+     RETURNING id, username, display_name, role, roles, yard_location_ids, operator_yard_location_ids, active, created_at, updated_at, ${aggregateAccessSelect()}`,
     [id, authority.role, authority.roles, yards, operatorYards]
   );
   return publicOperator(result.rows[0]);
@@ -181,7 +189,7 @@ export async function updateOperatorRoles(id, { role, roles, yardLocationIds, op
 
 export async function loginOperator(username, password) {
   const result = await query(
-    `SELECT *
+    `SELECT *, ${aggregateAccessSelect()}
      FROM operators
      WHERE username = $1`,
     [String(username || "").trim().toLowerCase()]
@@ -204,7 +212,7 @@ export async function loginOperator(username, password) {
 export async function getOperatorByToken(token) {
   if (!token) return null;
   const result = await query(
-    `SELECT o.id, o.username, o.display_name, o.role, o.roles, o.yard_location_ids, o.operator_yard_location_ids, o.active, o.created_at, o.updated_at
+    `SELECT o.id, o.username, o.display_name, o.role, o.roles, o.yard_location_ids, o.operator_yard_location_ids, o.active, o.created_at, o.updated_at, ${aggregateAccessSelect("o")}
      FROM operator_sessions s
      INNER JOIN operators o ON o.id = s.operator_id
      WHERE s.token_hash = $1

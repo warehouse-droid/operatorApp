@@ -267,12 +267,13 @@ export async function claimNextActualArrivalRun({ workerId, leaseSeconds = 300 }
               lease_token = $2::uuid,
               lease_owner = $3,
               lease_expires_at = now() + ($4::text || ' seconds')::interval,
+              algorithm_version = $5,
               started_at = COALESCE(started_at, now()),
               error = '',
               updated_at = now()
         WHERE run_id = $1::uuid
         RETURNING *`,
-      [candidate.rows[0].run_id, leaseToken, owner, String(seconds)]
+      [candidate.rows[0].run_id, leaseToken, owner, String(seconds), DISPATCH_ACTUAL_ARRIVAL_ALGORITHM_VERSION]
     );
     return publicRun(claimed.rows[0]);
   });
@@ -296,6 +297,23 @@ export async function listActualArrivalRouteRecords({ planDate, driverLogin } = 
         AND lower(COALESCE(record.stop_type, '')) IN ('pickup', 'dropoff')
       ORDER BY record.completed_at, record.started_at, record.id`,
     [dateOnly(planDate), text(driverLogin)]
+  );
+  return result.rows;
+}
+
+/** @param {Array<{id: number|string}>} records */
+export async function listActualArrivalVerifications(records = []) {
+  if (!records.length) {return [];}
+  const result = await query(
+    `SELECT verification.*, record.id AS driver_job_record_id
+       FROM driver_job_records record
+       JOIN driver_location_verifications verification
+         ON verification.job_id = record.job_id
+        AND lower(verification.driver_login) = lower(record.driver_login)
+        AND verification.checked_at <= record.completed_at
+      WHERE record.id = ANY($1::bigint[])
+      ORDER BY verification.checked_at DESC, verification.verification_id`,
+    [records.map(record => Number(record.id))]
   );
   return result.rows;
 }

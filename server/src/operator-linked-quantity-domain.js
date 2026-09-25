@@ -154,6 +154,11 @@ export function applyOperatorLinkedQuantityProjection(line, linked = {}) {
     linkedDirectTo: linked.linkedDirectTo || {}
   });
   const { original, linkedPo, linkedDirectTo, linkedTotal, operatorRequired } = projection;
+  // A sales-only item's manual pallet annotation is descriptive. Its basis
+  // must not change when allocating the last sales unit reduces the residual to zero.
+  const salesOnly = original.sales > EPSILON
+    && ![line.to_plt, line.to_lyr, line.to_sec, line.to_pcs].some((value) => Number(value || 0) > EPSILON);
+  const noYardLoadRequired = salesOnly ? operatorRequired.sales <= EPSILON : projection.noYardLoadRequired;
   return {
     ...line,
     original_pallet_qty: original.pallets,
@@ -192,8 +197,8 @@ export function applyOperatorLinkedQuantityProjection(line, linked = {}) {
     piece_qty: operatorRequired.pieces,
     quantity: operatorRequired.sales,
     quantity_breakdown: breakdown(original, linkedPo, linkedDirectTo, linkedTotal, operatorRequired),
-    no_yard_load_required: projection.noYardLoadRequired,
-    linked_supply_label: projection.noYardLoadRequired ? "No yard load required—direct supply" : "",
+    no_yard_load_required: noYardLoadRequired,
+    linked_supply_label: noYardLoadRequired ? "No yard load required—direct supply" : "",
     linked_quantity_blocked: projection.blocked,
     linked_quantity_errors: projection.errors
   };

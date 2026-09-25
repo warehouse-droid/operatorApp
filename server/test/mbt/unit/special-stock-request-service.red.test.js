@@ -30,6 +30,8 @@ function harness({ markerRows = [], createResult = { id: 91 }, detail = caseDeta
   let current = detail;
   const service = createSpecialStockRequestService({
     getCase: async () => current,
+    markSubmitted: async () => current,
+    resolveOrderUnits: async lines => lines.map(line => ({ ...line, unitId: 1 })),
     claimOperation: async (_id, input) => {
       calls.push(["claim", input]);
       current = { ...current, revision: current.revision + 1, [`${input.orderKind === "sales_order" ? "salesOrder" : "purchaseOrder"}OperationId`]: input.operationId };
@@ -107,4 +109,27 @@ test("uncertain remote result is marked attention and is never blindly resubmitt
   );
   assert.equal(calls.filter(([name]) => name === "create-so").length, 1);
   assert.equal(calls.filter(([name]) => name === "fail").length, 1);
+});
+
+
+test('a durable prior submission cannot be posted again while its marker is invisible', async () => {
+  for (const orderKind of ['sales_order','purchase_order']) {
+    const sales=orderKind==='sales_order';
+    const {service,calls}=harness({detail:caseDetail({salesOrderId:sales?null:80,salesOrderApproved:true,
+      [sales?'salesOrderSubmissionStartedAt':'purchaseOrderSubmissionStartedAt']:'2026-09-24T12:00:00Z'})});
+    await assert.rejects(()=>service[sales?'createSalesOrder':'createPurchaseOrder'](42,{expectedRevision:7,operationId:'01911111-1111-7111-8111-111111111117'}),error=>error.code==='SPECIAL_REMOTE_OUTCOME_UNCERTAIN');
+    assert.equal(calls.some(([name])=>name==='create-so'||name==='create-po'),false);
+  }
+});
+
+test('SO creation rejects an aged delivery date before claiming, but prior submissions remain recoverable',async()=>{
+  const detail=caseDetail({fulfillmentMethod:'mbt_delivery',deliveryAddress:'TEST address',deliveryDate:'2000-01-01'});
+  const fresh=harness({detail});
+  for(const source of ['standalone','estimate_transform']) {
+    await assert.rejects(()=>fresh.service.createSalesOrder(42,{expectedRevision:7,source}),{code:'SPECIAL_DELIVERY_DATE_TOO_SOON'});
+    assert.deepEqual(fresh.calls,[]);
+  }
+  const recovery=harness({detail:{...detail,salesOrderSubmissionStartedAt:'2000-01-01T12:00:00Z'},markerRows:[{id:88,tranid:'SO88',entity_id:800833,location_id:10}]});
+  assert.equal((await recovery.service.createSalesOrder(42,{expectedRevision:7})).salesOrderId,88);
+  assert.equal(recovery.calls.some(([name])=>name==='create-so'),false);
 });

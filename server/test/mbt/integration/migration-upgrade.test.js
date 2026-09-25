@@ -726,10 +726,15 @@ test("F06/F16: schema-101 upgrade preserves representative legacy records and is
       immutable_trigger: true
     }]);
 
-    assert.equal(receiptsBeforeNoOp.rowCount, 202);
+    const maintenance = await client.query(`SELECT column_name FROM information_schema.columns
+      WHERE table_schema='public' AND table_name='dispatch_plan_maintenance' ORDER BY ordinal_position`);
+    assert.deepEqual(maintenance.rows.map(row => row.column_name), [
+      'plan_id', 'requests', 'generation', 'attempts', 'last_error', 'requested_at', 'available_at'
+    ]);
+    assert.equal(receiptsBeforeNoOp.rowCount, 205);
     assert.equal(
       receiptsBeforeNoOp.rows.at(-1)?.filename,
-      "202_netsuite_order_line.sql"
+      "205_dispatch_plan_maintenance.sql"
     );
     assert.deepEqual(
       receiptsBeforeNoOp.rows

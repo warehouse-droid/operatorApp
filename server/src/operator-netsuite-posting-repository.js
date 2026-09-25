@@ -47,6 +47,7 @@ function publicStep(row) {
       : Number(row.netsuite_transaction_id),
     netSuiteTransactionRef: row.netsuite_transaction_ref,
     response: row.response || {},
+    fulfillmentParts: row.fulfillment_parts || [],
     lastError: row.last_error,
     createdAt: row.created_at,
     updatedAt: row.updated_at,
@@ -101,6 +102,16 @@ async function hydratedCommand(commandId) {
       ORDER BY step_index ASC`,
     [commandId]
   );
+  const partRows = await query(`SELECT plan_external_id, location_id, external_id, status,
+      netsuite_transaction_id, netsuite_transaction_ref, last_error
+    FROM netsuite_item_fulfillment_parts WHERE plan_external_id = ANY($1::text[]) ORDER BY location_id`,
+    [stepResult.rows.map((/** @type {Record<string, any>} */ row) => row.external_id)]);
+  for (const row of stepResult.rows) {row.fulfillment_parts = partRows.rows
+    .filter((/** @type {Record<string, any>} */ part) => part.plan_external_id === row.external_id).map((/** @type {Record<string, any>} */ part) => ({
+      inventoryLocationIds: [Number(part.location_id)], externalId: part.external_id, status: part.status,
+      transactionId: part.netsuite_transaction_id === null || part.netsuite_transaction_id === undefined ? null : Number(part.netsuite_transaction_id),
+      transactionRef: part.netsuite_transaction_ref, lastError: part.last_error
+    }));}
   const claimResult = await query(
     `SELECT local_order_key
        FROM operator_netsuite_posting_order_claims
@@ -460,6 +471,7 @@ export async function startOperatorNetSuitePostingAttempt(input) {
     if (activeAttempt.rows[0]) {
       return {
         attemptNumber: Number(activeAttempt.rows[0].attempt_number),
+        fresh: false,
         step: publicStep(step)
       };
     }
@@ -483,7 +495,7 @@ export async function startOperatorNetSuitePostingAttempt(input) {
         RETURNING *`,
       [stepId, attemptNumber]
     );
-    return { attemptNumber, step: publicStep(updated.rows[0]) };
+    return { attemptNumber, fresh: attemptNumber === 1 && step.status === "pending", step: publicStep(updated.rows[0]) };
   });
 }
 
@@ -563,7 +575,8 @@ export async function recordOperatorNetSuitePostingStepSuccess(input) {
  *   leaseToken: string,
  *   attemptNumber: number,
  *   error: unknown,
- *   uncertain?: boolean
+ *   uncertain?: boolean,
+ *   observedTransaction?: Record<string, any>
  * }} input
  */
 export async function recordOperatorNetSuitePostingStepFailure(input) {
@@ -573,6 +586,7 @@ export async function recordOperatorNetSuitePostingStepFailure(input) {
   const attemptNumber = Number(input?.attemptNumber);
   const message = errorText(input?.error);
   const outcome = input?.uncertain ? "uncertain" : "failed";
+  const observed = input.observedTransaction;
   return withTransaction(async () => {
     await lockedLeasedCommand(commandId, leaseToken);
     const step = await lockedStep(commandId, stepId);
@@ -603,10 +617,11 @@ export async function recordOperatorNetSuitePostingStepFailure(input) {
       `UPDATE operator_netsuite_posting_steps
           SET status = $2,
               last_error = $3,
+              response = response || $4::jsonb,
               updated_at = now()
         WHERE id = $1
         RETURNING *`,
-      [stepId, outcome, message]
+      [stepId, outcome, message, JSON.stringify(observed ? { observedTransaction: observed } : {})]
     );
     return publicStep(updated.rows[0]);
   });

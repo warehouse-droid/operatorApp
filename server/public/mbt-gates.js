@@ -197,7 +197,9 @@ function renderOperatorNetSuiteGateMatrix() {
   const functions = [
     { key: "customer_pickup", label: "Customer Pickup", type: "IF" },
     { key: "receiving", label: "Receiving", type: "IR" },
-    { key: "delivery_prep", label: "Delivery Prep", type: "IF" }
+    { key: "delivery_prep", label: "Delivery Prep", type: "IF" },
+    { key: "stock_return", label: "Stock Return", type: "RA" },
+    { key: "pallet_return", label: "Pallet Return", type: "RA" }
   ];
   const yards = [...new Set(gates.map((gate) => String(gate.yardCode || "")))];
   const table = document.createElement("table");
@@ -296,6 +298,11 @@ function fulfillmentCandidateCard(candidate) {
   const completion = document.createElement("p");
   completion.textContent = `Completion ${candidate.dispatchCompletedAt || "time unavailable"} · ${candidate.completionEvidenceType || "evidence unresolved"} · ${candidate.loadId || "no load"}`;
   copy.append(title, identity, completion);
+  for (const part of candidate.fulfillmentParts || []) {
+    const detail = document.createElement('p');
+    detail.textContent = `${part.transactionRef || part.externalId} · location ${(part.inventoryLocationIds || []).join(' / ')} · ${part.status}${part.lastError ? ` · ${part.lastError}` : ''}`;
+    copy.append(detail);
+  }
   if (candidate.lastError) {
     const error = document.createElement("p");
     error.className = "danger";
@@ -407,7 +414,8 @@ function renderAttentionCommands() {
     detail.textContent = command.lastError || "Verification stopped before local completion.";
     const steps = document.createElement("p");
     steps.textContent = (command.steps || []).map((step) => (
-      `${step.sourceOrderRef || step.sourceNetSuiteId}: ${step.status}`
+      `${step.sourceOrderRef || step.sourceNetSuiteId}: ${step.status}${(step.fulfillmentParts || []).map(part =>
+        ` · ${part.transactionRef || part.externalId} / location ${(part.inventoryLocationIds || []).join(' / ')} / ${part.status}`).join('')}`
     )).join(" · ");
     copy.append(title, identity, detail, steps);
     const button = document.createElement("button");

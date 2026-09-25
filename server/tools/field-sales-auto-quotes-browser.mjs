@@ -1,0 +1,242 @@
+import assert from 'node:assert/strict';
+import { mkdir,writeFile } from 'node:fs/promises';
+import { chromium } from 'playwright';
+import { expect } from '@playwright/test';
+import { httpFixture } from '../test/field-sales/http-fixture.js';
+import { query,closeDb } from '../src/db.js';
+import { randomUUID } from 'node:crypto';
+import sharp from 'sharp';
+const dir=process.env.FIELD_SALES_ARTIFACT_DIR||'test-artifacts/field-sales/auto-quotes';
+await mkdir(dir,{recursive:true});
+const f=await httpFixture({postingEnabled:true}),browser=await chromium.launch({headless:true,args:['--no-sandbox']}),results=[];
+let debugPage;const requests=[];
+try {
+ f.site=(await f.repo.command(f.actors.field_sales.operator,{id:randomUUID(),kind:'jobsite.save',payload:{...f.site,name:'Browser site '+f.actors.field_sales.operator.id}})).jobsite;
+ const settings=await f.repo.settings();
+ for(const [company,id] of [['MBBS','1'],['MBT','3'],['MBR','7']]){Object.assign(settings.data.companies[company],{subsidiaryId:id,salesOrderFormId:'3',customerFormId:'4',customerStatusId:'13',currencyId:'1',taxCodeId:'4',locationId:'1',taxBps:1300,validityDays:company==='MBT'?45:30});}
+ await f.repo.saveSettings(f.actors.admin.operator,{revision:settings.revision,data:{...settings.data,salesOrderPostingEnabled:true}});
+ const page=await browser.newPage({viewport:{width:1440,height:1000}});debugPage=page;page.on('requestfailed',r=>requests.push({url:new URL(r.url()).pathname,failure:r.failure()}));page.on('response',r=>{if(r.url().includes('/api/')){requests.push({url:new URL(r.url()).pathname,status:r.status()});}});
+ await page.coverage.startJSCoverage({resetOnNavigation:false});
+ const coverage=[];
+ const checkpoint=async()=>{coverage.push(...await page.coverage.stopJSCoverage());await page.coverage.startJSCoverage({resetOnNavigation:false});};
+ const errors=[];page.on('pageerror',e=>errors.push(e.message));
+ await page.addInitScript(token=>{
+  localStorage.setItem('mbbs.staff.token',token);
+  Object.defineProperty(globalThis.Crypto.prototype,'randomUUID',{value:undefined,configurable:true});
+ },f.actors.field_sales.token);
+ await page.goto(f.base+'/field-sales/#today');
+ await page.locator('[data-stop-quote]').first().click();
+ await page.locator('#quote-details').waitFor({state:'visible',timeout:4000});
+ assert.equal(await page.evaluate(()=>typeof crypto.randomUUID),'undefined');
+ results.push('Field Sales rep opens a quote without native randomUUID');
+ await checkpoint();
+ await page.goto(f.base+'/field-sales/#customers');
+ await page.locator('#new-customer').click({timeout:4000});
+ await page.locator('#customer-form [name=name]').fill('Browser Builder');
+ await page.locator('#customer-form details').first().locator('summary').click();
+ await page.locator('[name=bill_line1]').fill('1 Browser Road');await page.locator('[name=bill_city]').fill('Toronto');
+ await page.locator('#add-representative').click();
+ await page.locator('[data-representative] [name=repName]').fill('Browser Contact');
+ await page.locator('[data-representative] [name=repEmail]').fill('contact@example.test');
+ await page.locator('#customer-form button[type=submit]').click();
+ await expect(page.locator('#customer-form')).toBeHidden();
+ await page.getByText('Browser Builder',{exact:true}).first().waitFor({timeout:4000});
+ results.push('Customer directory creates a customer with representative');
+ await checkpoint();
+ await expect.poll(async()=>(await query('SELECT count(*)::int AS n FROM field_sales_customers WHERE created_by=$1',[f.actors.field_sales.operator.id])).rows[0].n).toBe(1);
+ const customer=(await query('SELECT id FROM field_sales_customers WHERE created_by=$1 ORDER BY created_at DESC LIMIT 1',[f.actors.field_sales.operator.id])).rows[0];
+ await f.repo.command(f.actors.field_sales.operator,{id:randomUUID(),kind:'customer.link',payload:{customerId:customer.id,jobsiteId:f.site.id,linked:true}});
+ await page.goto(f.base+'/field-sales/#today');await page.locator('#visit-route').selectOption(f.route.id);
+ await page.locator('[data-stop-quote]').first().click();
+ await expect(page.locator('#quote-company')).toHaveCount(0);
+ for(const name of ['billToAddress','shipToAddress','expectedClose','quoteDate','validUntil']){await expect(page.locator(`[name=${name}]`)).toHaveCount(0);}
+ await page.locator('#quote-customer').selectOption(customer.id);
+ await page.locator('#item-autocomplete').fill('FS-BLOCK');
+ await page.locator('#item-suggestions [role=option]').filter({hasText:'MBBS'}).first().click();
+ await page.locator('.quote-line [name=quantity]').fill('120');
+ await page.locator('.quote-line [name=unitRate]').fill('36.99');
+ await page.locator('#quote-memo').fill('看见红单才上货');
+ await page.locator('#save-quote').click();
+ await page.waitForFunction(()=>document.querySelector('#sync')?.textContent==='All changes saved');
+ await page.locator('#refresh-quote').click();
+ assert.match(await page.locator('#quote-totals').innerText(),/4,438.80/);
+ assert.match(await page.locator('.quote-summary-item').innerText(),/FS-BLOCK/);
+ assert.equal(await page.locator('#quote-memo').inputValue(),'看见红单才上货');
+ assert.equal(await page.locator('#publish-quote').count(),0);
+ results.push('Separate company quote saves customer, item summary and Chinese memo');
+ await checkpoint();
+ await page.screenshot({path:dir+'/quote-browser.png',fullPage:true});
+ // Changing today's tax must not recalculate an earlier saved revision.
+ const saved=(await query('SELECT id FROM field_sales_quotes WHERE created_by=$1 ORDER BY created_at DESC LIMIT 1',[f.actors.field_sales.operator.id])).rows[0];
+ const q=await f.repo.getQuote(saved.id);
+ await f.repo.command(f.actors.field_sales.operator,{id:randomUUID(),kind:'quote.save',payload:{...q.snapshot,id:q.id,revision:1,jobsiteId:q.jobsite_id,note:'Revised memo'}});
+ await query(`UPDATE field_sales_settings SET data=jsonb_set(data,'{companies,MBBS,taxBps}','500')`);
+ await page.goto(f.base+'/field-sales/#quotes');await page.reload();
+ await page.locator(`[data-open-quote="${q.id}"]`).click();await page.locator('[data-version="1"]').click();
+ await expect(page.locator('#quote-totals')).toContainText('5,015.84');
+ await expect(page.locator('#quote-memo')).toHaveValue('看见红单才上货');
+ assert.equal(await page.locator('#save-quote').count(),0);
+ results.push('Historical quote displays its saved tax and memo after settings change');
+ await checkpoint();
+ await query(`UPDATE field_sales_settings SET data=jsonb_set(data,'{companies,MBBS,taxBps}','1300')`);
+ await page.setViewportSize({width:390,height:844});
+ assert.equal(await page.evaluate(()=>document.documentElement.scrollWidth<=window.innerWidth+1),true);
+ await page.screenshot({path:dir+'/quote-mobile.png',fullPage:true});
+ results.push('Phone quote layout fits a 390-pixel screen');
+ await checkpoint();
+ // Confirm a saved revision through HTTP; the isolated fixture has no worker or
+ // real NetSuite transport. The durable order intent is the asserted boundary.
+ await page.goto(f.base+'/field-sales/#quotes');await page.reload();
+ await page.locator(`[data-open-quote="${q.id}"]`).click();await page.locator('#confirm-quote').click();
+ await page.locator('[name=confirmedBy]').fill('Browser Contact');
+ const evidence=await sharp({create:{width:12,height:12,channels:3,background:'#aabbcc'}}).png().toBuffer();
+ await page.locator('#confirmation-files').setInputFiles({name:'customer-confirmed.png',mimeType:'image/png',buffer:evidence});
+ await page.locator('#submit-confirmation').click();await expect(page.locator('#copy-quote')).toBeVisible();
+ assert.equal(await page.locator('#save-quote').count(),0);
+ const accepted=await f.repo.getQuote(q.id);assert.equal(accepted.order.state,'pending');assert.equal(accepted.confirmation.evidenceIds.length,1);
+ const evidenceDownload=page.waitForEvent('download');await page.locator('[data-evidence]').click();await (await evidenceDownload).saveAs(dir+'/confirmation-evidence.jpg');
+ await page.locator('#copy-quote').click();await expect(page.locator('#save-quote')).toBeVisible();assert.equal(await page.locator('#copy-quote').count(),0);
+ results.push('Confirmation attaches evidence, queues one Sales Order, locks the quote and allows an independent copy');
+ await checkpoint();
+ // A changed server tax policy must block an old on-device total until review.
+ await page.locator('#quote-memo').fill('Review after tax change');
+ await query(`UPDATE field_sales_settings SET data=jsonb_set(data,'{companies,MBBS,taxBps}','500')`);
+ await page.locator('#save-quote').click();
+ await expect.poll(async()=>page.evaluate(async actor=>{const w=await (await import('/field-sales/offline.js')).openWorkspace(actor);const rows=await w.pending();w.close();return rows.some(r=>r.kind==='quote.save'&&r.status===409&&/tax policy/i.test(r.error));},f.actors.field_sales.operator.id)).toBe(true);
+ await page.locator('#sync').click();await page.locator('[data-fix-quote]').click();await expect(page.locator('#quote-totals')).toContainText('Tax (5%)');await expect(page.locator('#quote-memo')).toHaveValue('Review after tax change');
+ await page.locator('#save-quote').click();await expect(page.locator('#save-quote')).toBeEnabled();await expect(page.locator('#sync')).toHaveText('All changes saved');
+ await query(`UPDATE field_sales_settings SET data=jsonb_set(data,'{companies,MBBS,taxBps}','1300')`);
+ results.push('A stale tax policy requires explicit draft review and preserves the memo');await checkpoint();
+ await page.evaluate(async actor=>{const w=await (await import('/field-sales/offline.js')).openWorkspace(actor);await w.put('catalog:MBT:92000002',{company:'MBT',item_id:'92000002',sku:'FS-BIN',description:'Bin',unit_rate:'100'});w.close();},f.actors.field_sales.operator.id);
+ await page.context().setOffline(true);await page.locator('#item-autocomplete').fill('FS-');await expect(page.locator('#item-suggestions [role=option]')).toHaveCount(2);await expect(page.locator('#item-suggestions')).toContainText('FS-BLOCK');await expect(page.locator('#item-suggestions')).toContainText('FS-BIN');await page.locator('#item-autocomplete').fill('');await page.context().setOffline(false);
+ results.push('Offline autocomplete suggests items from every cached company');await checkpoint();
+ // Compose all three companies without choosing an issuer, then save and edit
+ // offline. The first group acknowledgement must not replace the later edit.
+ await page.goto(f.base+'/field-sales/#today');await page.reload();await page.locator('#visit-route').selectOption(f.route.id);await page.locator('[data-stop-quote]').first().click();
+ await page.locator('#quote-customer').selectOption(customer.id);await expect(page.locator('#item-autocomplete')).toBeEnabled();
+ for(const company of ['MBBS','MBT','MBR']){await page.locator('#item-autocomplete').fill('FS-');await page.locator('#item-suggestions [role=option]').filter({hasText:company}).first().click();}
+ await expect(page.locator('[data-company-total]')).toHaveCount(3);
+ await expect(page.locator('#quote-totals')).toContainText('192.09');
+ for(const company of ['MBBS','MBT','MBR']){await expect(page.locator(`[data-company-total="${company}"] .quote-summary-item`)).toHaveCount(1);}
+ const batchMemo='Automatic batch '+randomUUID();await page.locator('#quote-memo').fill(batchMemo);
+ await page.screenshot({path:dir+'/automatic-quotes-mobile.png',fullPage:true});
+ await page.evaluate(()=>navigator.serviceWorker.ready);await page.waitForFunction(()=>Boolean(navigator.serviceWorker.controller));
+ await page.context().setOffline(true);await page.locator('#save-quote').click();await expect(page.locator('[data-open-company-quote]')).toHaveCount(3);
+ const group=await page.evaluate(async actor=>{const w=await (await import('/field-sales/offline.js')).openWorkspace(actor);const p=await w.pending();w.close();return p;},f.actors.field_sales.operator.id);
+ assert.equal(group.length,1);assert.equal(group[0].kind,'quote.saveGroup');assert.equal(group[0].payload.quotes.length,3);
+ const companyIds=Object.fromEntries(group[0].payload.quotes.map(p=>[p.company,p.id]));
+ await page.locator(`[data-open-company-quote="${companyIds.MBT}"]`).click();await page.locator('#quote-memo').fill('Later offline edit');await page.locator('#save-quote').click();await expect(page.locator('#save-quote')).toBeEnabled();
+ await checkpoint();await page.reload();await page.locator(`[data-open-quote="${companyIds.MBT}"]`).click();await expect(page.locator('#quote-memo')).toHaveValue('Later offline edit');
+ await page.context().setOffline(false);await expect(page.locator('#sync')).toHaveText('All changes saved',{timeout:15000});
+ for(const [company,id] of Object.entries(companyIds)){const savedQuote=await f.repo.getQuote(id);assert.equal(savedQuote.company,company);assert.equal(savedQuote.revision,company==='MBT'?2:1);assert.equal(savedQuote.snapshot.note,company==='MBT'?'Later offline edit':batchMemo);assert.equal(savedQuote.snapshot.lines.length,1);}
+ results.push('Three automatic company quotes survive offline save, reload, later edit and ordered synchronization');await checkpoint();
+ // Add another company's item to an existing quote. An invalid tax expectation
+ // must reject both saves; review keeps the original IDs and both item lists.
+ await page.locator('#back-quotes').click();await page.locator(`[data-open-quote="${companyIds.MBBS}"]`).click();
+ await page.locator('#item-autocomplete').fill('FS-BIN');await page.locator('#item-suggestions [role=option]').filter({hasText:'MBT'}).first().click();
+ await page.locator('#quote-memo').fill('Reviewed mixed edit');
+ await query(`UPDATE field_sales_settings SET data=jsonb_set(data,'{companies,MBT,taxBps}','500')`);
+ await page.locator('#save-quote').click();
+ await expect.poll(async()=>page.evaluate(async actor=>{const w=await (await import('/field-sales/offline.js')).openWorkspace(actor);const p=await w.pending();w.close();return p.some(e=>e.kind==='quote.saveGroup'&&e.status===409);},f.actors.field_sales.operator.id)).toBe(true);
+ assert.equal((await f.repo.getQuote(companyIds.MBBS)).revision,1);
+ await page.locator('#sync').click();await page.locator('[data-fix-quote]').click();await expect(page.locator('[data-company-total]')).toHaveCount(2);await expect(page.locator('[data-company-total="MBT"]')).toContainText('Tax (5%)');await expect(page.locator('#quote-memo')).toHaveValue('Reviewed mixed edit');
+ await page.locator('#save-quote').click();await expect(page.locator('[data-open-company-quote]')).toHaveCount(2);await expect(page.locator('#sync')).toHaveText('All changes saved');
+ assert.equal((await f.repo.getQuote(companyIds.MBBS)).revision,2);
+ await page.locator(`[data-open-company-quote="${companyIds.MBBS}"]`).click();
+ const simplePdf=page.waitForEvent('download');await page.locator('#pdf-quote').click();await (await simplePdf).saveAs(dir+'/automatic-quote.pdf');
+ await query(`UPDATE field_sales_settings SET data=jsonb_set(data,'{companies,MBT,taxBps}','1300')`);
+ results.push('Mixed edits reject partial saves, recover through review, and download an individual company PDF');await checkpoint();
+ // Fill the visit first, then add its customer and representative offline.
+ await page.goto(f.base+'/field-sales/#today');await page.locator('#visit-route').selectOption(f.route.id);
+ await page.locator('[data-record]').first().click();
+ await page.locator('#visit-form [name=outcome]').selectOption('Quote requested');
+ await page.locator('#visit-form [name=note]').fill('Keep note while adding customer');
+ await page.locator('#two-weeks').click();const revisit=await page.locator('#revisit-date').inputValue();assert.match(revisit,/^\d{4}-\d{2}-\d{2}$/);
+ await page.locator('#visit-form [name=revisitPriority]').selectOption('3');
+ const png=await sharp({create:{width:12,height:12,channels:3,background:'#abcdef'}}).png().toBuffer();
+ await page.locator('#visit-photos').setInputFiles({name:'site.png',mimeType:'image/png',buffer:png});
+ await page.context().setOffline(true);
+ await page.locator('#visit-add-customer').click();
+ await page.locator('#customer-form [name=name]').fill('Offline Contractor '+f.actors.field_sales.operator.id);
+ await page.locator('#add-representative').click();await page.locator('[name=repName]').fill('Offline Foreman');await page.locator('[name=repPhone]').fill('416-555-0199');
+ await page.locator('#customer-form button[type=submit]').click();
+ await expect(page.locator('#customer-form')).toHaveCount(0);
+ await expect(page.locator('[data-contact-rep]:checked')).toHaveCount(1);
+ await expect(page.locator('#visit-form [name=note]')).toHaveValue('Keep note while adding customer');
+ await expect(page.locator('#revisit-date')).toHaveValue(revisit);
+ assert.equal(await page.locator('#visit-photos').evaluate(el=>el.files.length),1);
+ await page.locator(`[data-contact-customer="${customer.id}"]`).check();
+ await page.screenshot({path:dir+'/visit-mobile.png',fullPage:true});
+ await page.locator('#visit-submit').click();await expect(page.locator('#visit-form')).toBeHidden();
+ const pending=await page.evaluate(async id=>{const w=await (await import('/field-sales/offline.js')).openWorkspace(id);const p=await w.pending();w.close();return p;},f.actors.field_sales.operator.id);
+ assert.deepEqual(pending.map(p=>p.kind),['customer.save','customer.link','visit.record','photo']);
+ assert.equal(pending[2].payload.note,'Keep note while adding customer');assert.equal(pending[2].payload.contacts.length,2);
+ results.push('Offline inline customer and representative preserve notes, photo, two contacts and revisit');
+ await checkpoint();
+ await page.context().setOffline(false);
+ await expect(page.locator('#sync')).toHaveText('All changes saved',{timeout:15000});
+ const visit=(await query('SELECT * FROM field_sales_visits WHERE route_id=$1',[f.route.id])).rows[0];
+ assert.equal(visit.note,'Keep note while adding customer');assert.equal(visit.data.contacts.length,2);assert.equal(visit.data.contacts.find(c=>c.name.startsWith('Offline Contractor')).representatives[0].phone,'416-555-0199');
+ assert.equal((await query('SELECT count(*)::int AS n FROM field_sales_photos WHERE visit_id=$1',[visit.id])).rows[0].n,1);
+ assert.equal((await query('SELECT priority FROM field_sales_followups WHERE visit_id=$1',[visit.id])).rows[0].priority,3);
+ results.push('Reconnect syncs customer, site link, visit and photo in dependency order');
+ await checkpoint();
+ // Customer type/representative edits and many-to-many site links.
+ await page.goto(f.base+'/field-sales/#customers');await page.locator('#customer-search [name=search]').fill('Browser Builder');await page.locator('#customer-search button').click();
+ await page.locator(`[data-edit-customer="${customer.id}"]`).click();
+ const typeName='Browser type '+randomUUID();await page.locator('#new-type-name').fill(typeName);await page.locator('#add-type').click();
+ await expect(page.locator('#customer-type-options')).toContainText(typeName);
+ await page.locator('#add-representative').click();await page.locator('[data-representative]').last().locator('[name=repName]').fill('Temporary');await page.locator('[data-representative]').last().locator('[data-remove-rep]').click();
+ await query(`INSERT INTO netsuite_customers(netsuite_id,entity_number,legal_name,display_name,currency,source_modified_at,source_version,payload_hash) VALUES(986000003,'FS-EXISTING','Browser NetSuite fixture','Browser NetSuite fixture','CAD',now(),'test',repeat('c',64)) ON CONFLICT DO NOTHING`);
+ await page.locator('#customer-form details').last().locator('summary').click();await page.locator('[data-ns-search="MBT_MBR"]').fill('Browser NetSuite fixture');await page.locator('[data-find-ns="MBT_MBR"]').click();await page.locator('[data-ns-results="MBT_MBR"] [data-ns-id="986000003"]').click();await expect(page.locator('[name=ns_MBT_MBR]')).toHaveValue('986000003');
+ await page.locator('#customer-form [name=phone]').fill('416-555-0111');await page.locator('#customer-form button[type=submit]').click();await expect(page.locator('#customer-form')).toBeHidden();
+ await expect(page.locator('#sync')).toHaveText('All changes saved');
+ assert.equal((await f.repo.getCustomer(customer.id)).netsuiteCustomers.MBT_MBR,'986000003');
+ await page.locator(`[data-sites="${customer.id}"]`).click();await page.locator(`[data-unlink-site="${f.site.id}"]`).click();
+ await expect(page.locator(`[data-unlink-site="${f.site.id}"]`)).toHaveCount(0);
+ await page.locator('#customer-site-search [name=search]').fill(f.site.name);await page.locator('#customer-site-search button').click();await page.locator(`[data-link-site="${f.site.id}"]`).click();await expect(page.locator(`[data-unlink-site="${f.site.id}"]`)).toBeVisible();
+ await page.locator('#dialog [aria-label="Close dialog"]').click();
+ await page.locator('#customer-types').click();await page.locator('#new-type-form [name=name]').fill('Second '+typeName);await page.locator('#new-type-form button').click();await expect(page.locator(`[data-type-form] input[name=name][value="Second ${typeName}"]`)).toBeVisible();
+ const type=(await query('SELECT id FROM field_sales_customer_types WHERE name=$1',[typeName])).rows[0];
+ await page.locator(`[data-type-form="${type.id}"] [name=archived]`).check();await page.locator(`[data-type-form="${type.id}"] button`).click();await expect(page.locator(`[data-type-form="${type.id}"] [name=archived]`)).toBeChecked();await page.locator('#dialog [aria-label="Close dialog"]').click();
+ await page.goto(f.base+'/field-sales/#today');await page.locator('#visit-route').selectOption(f.route.id);await page.locator(`[data-site="${f.site.id}"]`).first().click();
+ await expect(page.locator('#dialog')).toContainText('Offline Foreman');await expect(page.locator('#dialog')).toContainText('Keep note while adding customer');await page.locator('#dialog [aria-label="Close dialog"]').click();
+ results.push('Customer types, representative edits, site unlink/relink and immutable visit contacts remain visible');await checkpoint();
+ // A pending old mixed draft is split explicitly, with both recovery copies and
+ // original payload retained. No legacy estimate or new quote is submitted.
+ await page.context().setOffline(true);
+ const legacyId=randomUUID(),legacy={id:legacyId,jobsiteId:f.site.id,note:'Legacy recovery '+legacyId,lines:[{...q.snapshot.lines[0],company:'MBBS'},{...q.snapshot.lines[0],id:randomUUID(),company:'MBT',itemId:'92000002'}]};
+ await page.evaluate(async({actor,payload})=>{const w=await (await import('/field-sales/offline.js')).openWorkspace(actor),entry={id:crypto.getRandomValues(new Uint32Array(1))[0].toString(),kind:'quote.save',payload};await w.enqueue(entry,[[`quote:${payload.id}`,{id:payload.id,snapshot:payload}],[`editquote:${payload.id}`,payload]]);const legacyEntry=(await w.pending()).find(e=>e.payload.id===payload.id);(await import('/field-sales/quotes.js')).choosePending(legacyEntry);w.close();},{actor:f.actors.field_sales.operator.id,payload:legacy});
+ await page.goto(f.base+'/field-sales/#quotes');await page.locator('#split-drafts').click();await expect(page.locator('#split-drafts')).toBeHidden();
+ const split=await page.evaluate(async({actor,id})=>{const w=await (await import('/field-sales/offline.js')).openWorkspace(actor);const result={pending:await w.pending(),drafts:await w.records('editquote:'),original:await w.get('review:legacy:'+id),recovery:await w.records('review:')};w.close();return result;},{actor:f.actors.field_sales.operator.id,id:legacyId});
+ assert.equal(split.pending.length,0);assert.equal(split.original.note,legacy.note);
+ const drafts=split.drafts.filter(d=>d?.note===legacy.note);assert.deepEqual(drafts.map(d=>d.company).sort(),['MBBS','MBT']);assert.ok(split.recovery.some(r=>r.kind==='quote.save'&&r.payload.id===legacyId));
+ await page.context().setOffline(false);
+ results.push('Legacy pending mixed draft splits into company drafts without losing recovery history');await checkpoint();
+ // If another device confirmed the quote, a pending edit never masquerades
+ // as the accepted revision and remains recoverable for a new quotation.
+ await page.goto(f.base+'/field-sales/#today');
+ const pendingMemo='Unaccepted offline edit';
+ await page.evaluate(async({actor,payload})=>{const w=await (await import('/field-sales/offline.js')).openWorkspace(actor),entry={id:(await import('/field-sales/identity.js')).newId(),kind:'quote.save',payload,status:409,error:'Quote already confirmed'};await w.enqueue(entry);(await import('/field-sales/quotes.js')).choosePending((await w.pending()).find(e=>e.id===entry.id));w.close();},{actor:f.actors.field_sales.operator.id,payload:{...q.snapshot,id:q.id,jobsiteId:q.jobsite_id,revision:1,note:pendingMemo}});
+ await page.goto(f.base+'/field-sales/#quotes');await expect(page.locator('#quote-memo')).toHaveValue(accepted.snapshot.note);assert.equal(await page.locator('#save-quote').count(),0);
+ assert.equal(await page.evaluate(async actor=>{const w=await (await import('/field-sales/offline.js')).openWorkspace(actor);const rows=await w.pending();w.close();return rows[0].payload.note;},f.actors.field_sales.operator.id),pendingMemo);
+ results.push('An edit conflicting with confirmation stays recoverable while the UI shows the accepted revision');await checkpoint();
+ const acceptedGroup={id:randomUUID(),quotes:[{...q.snapshot,id:q.id,jobsiteId:q.jobsite_id,revision:1,note:'Unaccepted group edit'}]};
+ await page.evaluate(async({actor,payload})=>{const w=await (await import('/field-sales/offline.js')).openWorkspace(actor),entry={id:(await import('/field-sales/identity.js')).newId(),kind:'quote.saveGroup',payload,status:409,error:'Quote confirmed'};await w.enqueue(entry);(await import('/field-sales/quotes.js')).choosePending((await w.pending()).find(e=>e.id===entry.id));w.close();},{actor:f.actors.field_sales.operator.id,payload:acceptedGroup});
+ await page.locator('#back-quotes').click();await expect(page.locator('#quote-memo')).toHaveValue(accepted.snapshot.note);assert.equal(await page.locator('#save-quote').count(),0);
+ assert.equal(await page.evaluate(async actor=>{const w=await (await import('/field-sales/offline.js')).openWorkspace(actor);const p=await w.pending();w.close();return p.find(e=>e.kind==='quote.saveGroup').payload.quotes[0].note;},f.actors.field_sales.operator.id),'Unaccepted group edit');
+ results.push('A confirmed member blocks group editing while retaining the full pending group for recovery');await checkpoint();
+ // Templates can be edited and previewed only by an administrator.
+ const adminPage=await browser.newPage({viewport:{width:1440,height:1000}});
+ await adminPage.coverage.startJSCoverage({resetOnNavigation:false});
+ await adminPage.addInitScript(token=>localStorage.setItem('mbbs.staff.token',token),f.actors.admin.token);
+ await adminPage.goto(f.base+'/field-sales/#settings');
+ await adminPage.locator('[name="MBBS.name"]').fill('Template Preview Company');
+ const download=adminPage.waitForEvent('download');await adminPage.locator('[data-template-preview="MBBS"]').click();
+ await (await download).saveAs(dir+'/template-preview.pdf');
+ results.push('Admin can preview the edited company PDF template');
+ assert.deepEqual(errors,[]);
+ await writeFile(dir+'/browser-v8.json',JSON.stringify([...coverage,...(await page.coverage.stopJSCoverage()),...(await adminPage.coverage.stopJSCoverage())]));
+ await writeFile(dir+'/customer-browser.json',JSON.stringify({passed:true,results},null,2));
+ console.log(JSON.stringify({passed:true,results}));
+} catch(error){await writeFile(dir+'/browser-requests.json',JSON.stringify(requests,null,2));if(debugPage){await debugPage.screenshot({path:dir+'/browser-failure.png',fullPage:true});await writeFile(dir+'/browser-failure.txt',await debugPage.locator('body').innerText());await writeFile(dir+'/browser-pending.json',JSON.stringify(await debugPage.evaluate(async actor=>{const w=await (await import('/field-sales/offline.js')).openWorkspace(actor);const pending=await w.pending();w.close();const ctx=(await import('/field-sales/app.js')).ctx;let status;try{status=(await ctx.api('/status')).operator.id;}catch(e){status={message:e.message,status:e.status};}await ctx.sync();return {pending,online:navigator.onLine,operator:ctx.state.operator,status,pendingAfterExplicitSync:(await ctx.state.workspace.pending()).map(e=>({kind:e.kind,error:e.error,status:e.status}))};},f.actors.field_sales.operator.id),null,2));}throw error;} finally {await browser.close();await f.close();await closeDb();}

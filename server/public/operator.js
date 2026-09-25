@@ -29,6 +29,7 @@ const t = (key, fallback) => window.MBBS_I18N?.t(key, fallback) || fallback;
 const tf = (key, fallback, variables = {}) => window.MBBS_I18N?.format(key, fallback, variables) || fallback;
 const localizeMessage = (message) => window.MBBS_I18N?.message(message) || String(message || "");
 const languageToggle = () => window.MBBS_I18N?.toggleHtml() || "";
+const displayUnit = (value) => window.MBBS_I18N?.unit(value) ?? String(value ?? "");
 
 const TOKEN_KEY = "mbbs.operator.token"; // secret-scan: allow -- localStorage key name, not a token.
 const STAFF_TOKEN_KEY = "mbbs.staff.token"; // secret-scan: allow -- localStorage key name, not a token.
@@ -38,6 +39,7 @@ const STATE_KEY = "mbbs.operator.state";
 const CAMERA_FACING_KEY = "mbbs.camera.facingMode";
 const RESTORABLE_MODULES = new Set([
   "menu",
+  "settings",
   "delivery-select",
   "delivery",
   "delivery-consolidation",
@@ -47,7 +49,10 @@ const RESTORABLE_MODULES = new Set([
   "return-select",
   "pallet-return",
   "stock-return",
+  "inventory",
   "cycle-count",
+  "damage",
+  "count-sheets",
   "personal-history",
   "customer-pickup-scan",
   "customer-pickup"
@@ -115,6 +120,7 @@ function restorableModule(value) {
 
 const initialOperatorState = readOperatorState();
 let authToken = readOperatorToken();
+/** @type {any} */
 let operator = null;
 let operatorSessionKey = "";
 let operatorWorkspaceLeaving = false;
@@ -153,9 +159,15 @@ const consolidationLoadState = {
   page: Number.isInteger(initialOperatorState.consolidationLoadPage) ? Math.max(0, initialOperatorState.consolidationLoadPage) : 0,
   batchId: initialOperatorState.consolidationLoadBatchId || "", batch: null, busy: false, error: "", photoRefs: [], uploads: new Map(), request: 0, poll: null
 };
+let pickupLookupBusy = false;
 let compactLineMode = localStorage.getItem("mbbs.operator.compactLineList") === "true";
 let orders = [];
 let deliveryOrderBuckets = { active: null, packed: null };
+const deliveryOrderBucketKeys = { active: "", packed: "" };
+const deliveryOrderBucketScopes = { active: "", packed: "" };
+const operatorPostingPollWakeups = new Map();
+const deliveryRefresh = window.OperatorDeliveryRefresh.create(deliveryRefreshContext);
+let deliveryVisibleContext = "";
 let packedDeliveryPrefetch = null;
 let deliveryNotificationsRequest = null;
 let deliveryOrdersLoadingCount = 0;
@@ -279,6 +291,10 @@ let returnBusy = false;
 let returnDirty = false;
 let returnResult = null;
 let returnValidationMessage = "";
+let returnPostingPolicies = {};
+let returnPostingError = "";
+let returnPostingLoading = false;
+let returnPostingGeneration = 0;
 
 let cycleStep = initialOperatorState.cycleStep || "type";
 let cycleSelection = initialOperatorState.cycleSelection || { productType: "", brand: "", series: "" };
@@ -291,6 +307,7 @@ let cycleDraft = null;
 let cyclePage = Number(initialOperatorState.cyclePage || 0);
 let activeCycleUnit = initialOperatorState.activeCycleUnit || "";
 let cycleValues = {};
+let cycleExpressions = {};
 let cycleConfirming = false;
 
 let receivingStep = initialOperatorState.receivingStep || "type";
@@ -312,20 +329,24 @@ let receivingRequestGeneration = 0;
 let receivingOrdersRequest = 0;
 let receivingDetailRequest = 0;
 let receivingSuggestionsRequest = 0;
+/** @type {Record<string, any> | null} */
 let receiptOrder = null;
 let receiptPhotoDataUrls = [];
 let receiptActivePhotoSlot = 0;
 let receiptSubmitting = false;
+/** @type {Record<string, any> | null} */
 let receiptResult = null;
 let receiptCameraStream = null;
 let receiptCameraActive = false;
 let receiptStatusText = "";
 let receiptJobStage = "";
 let receiptStartedAt = 0;
+/** @type {ReturnType<typeof window.setInterval> | null} */
 let receiptProgressTimer = null;
 let receiptRequestId = "";
 let receiptNetSuitePolicy = null;
 let receiptNetSuitePolicyError = "";
+let receiptServiceWorkerReloadPending = false;
 let personalHistory = [];
 let personalHistoryDate = initialOperatorState.personalHistoryDate || new Intl.DateTimeFormat("en-CA", { timeZone: "America/Toronto" }).format(new Date());
 let selectedHistoryId = initialOperatorState.selectedHistoryId || "";
@@ -382,6 +403,7 @@ function cancelOperatorPhotoCameraOpening(kind) {
 function stopOperatorPhotoCameras() {
   operatorPhotoCamera.key = "";
   stopFulfillmentCamera(); stopReceiptCamera(); stopReturnCamera();
+  operatorInventory.stopCamera();
 }
 
 function syncOperatorPhotoCamera() {
@@ -811,7 +833,7 @@ function dataUrlToFile(dataUrl, filename = "photo.jpg") {
 
 function photoImgAttributes(value) {
   const text = String(value || "");
-  if (!text.startsWith("r2://")) return `src="${escapeHtml(text)}"`;
+  if (!text.startsWith("r2://") && !text.startsWith("operator-photo://")) return `src="${escapeHtml(text)}"`;
   return `data-secure-photo-ref="${escapeHtml(text)}"`;
 }
 
@@ -926,15 +948,6 @@ async function uploadOperatorPhoto(photo, context = {}) {
   return `r2://${payload.key}`;
 }
 
-async function uploadOperatorPhotos(photos, context = {}) {
-  return mapWithConcurrency(photos, 2, (photo, index) => (
-    uploadOperatorPhoto(photo, {
-      ...context,
-      filename: `${context.recordType || "operator-photo"}-${index + 1}.jpg`
-    })
-  ));
-}
-
 async function mapWithConcurrency(items, concurrency, mapper) {
   const values = Array.from(items || []);
   if (!values.length) return [];
@@ -974,6 +987,7 @@ async function publicApi(path, options = {}) {
 }
 
 function markLocalDeliveryMutation(orderId, ttlMs = 4000) {
+  invalidateDeliveryOrders();
   const key = String(orderId || "").trim();
   if (key) localDeliveryMutationRefs.set(key, Date.now() + ttlMs);
 }
@@ -1004,6 +1018,10 @@ function connectEvents() {
       return;
     }
     const payload = event.payload || {};
+    if (event.type === "delivery.order.loaded" || event.type === "receiving.order.received") {
+      const jobId = payload.jobId || payload.result?.operatorNetSuitePosting?.commandId;
+      for (const wake of operatorPostingPollWakeups.get(jobId) || []) { wake(); }
+    }
     if (event.type === "operator.access.updated" || event.type === "connected") {
       refreshOperatorAccess().catch(() => {});
       return;
@@ -1033,10 +1051,7 @@ function connectEvents() {
     const needsReceiving = receivingEvents.includes(event.type);
     if (!needsDelivery && !needsReceiving) return;
     if (needsDelivery && isLocalDeliveryMutationEvent(payload)) return;
-    if (needsDelivery) {
-      deliveryOrderBuckets.active = null;
-      deliveryOrderBuckets.packed = null;
-    }
+    if (needsDelivery) invalidateDeliveryOrders();
     pendingDeliveryEventRefresh ||= needsDelivery;
     pendingReceivingEventRefresh ||= needsReceiving;
     pendingOperatorRequestAlert ||= event.type === "dispatch.operator_request.created";
@@ -1046,66 +1061,75 @@ function connectEvents() {
         if (cleanRef) pendingDeliveryEventAlertRefs.add(cleanRef);
       });
     }
-    window.clearTimeout(eventRefreshTimer);
-    eventRefreshTimer = window.setTimeout(async () => {
-      try {
-        const alertRefs = [...pendingDeliveryEventAlertRefs];
-        pendingDeliveryEventAlertRefs.clear();
-        const refreshDelivery = pendingDeliveryEventRefresh;
-        const refreshReceiving = pendingReceivingEventRefresh;
-        const showOperatorRequestAlert = pendingOperatorRequestAlert;
-        pendingDeliveryEventRefresh = false;
-        pendingReceivingEventRefresh = false;
-        pendingOperatorRequestAlert = false;
-        if (refreshDelivery && currentModule === "delivery-consolidation-load") {
-          await loadConsolidationLoadOrders({ background: true });
-          return;
-        }
-        if (refreshDelivery && currentModule === "delivery-consolidation-load-proof") {
-          await refreshConsolidationLoadBatch();
-          return;
-        }
-        if (refreshDelivery && currentModule === "delivery-consolidation" && !consolidationBusy) {
-          await loadConsolidation({ keepItem: true });
-          return;
-        }
-        if (refreshDelivery && currentModule === "delivery" && !fulfillmentSubmitting) {
-          await loadOrders({ keepSelection: true, alertRefs });
-          showToast("Orders updated");
-          return;
-        }
-        if (refreshDelivery) {
-          await Promise.all([
-            loadDeliveryNotifications({ alertRefs }),
-            loadCurrentDeliveryDraft()
-          ]);
-        }
-        if (refreshDelivery && currentModule === "delivery-select" && !fulfillmentSubmitting) {
-          render();
-          return;
-        }
-        if (refreshReceiving && currentModule === "receiving" && !receiptSubmitting) {
-          await loadReceivingOptions();
-          if (receivingStep === "orders") await loadReceivingOrders({ keepSelection: true });
-          else render();
-          showToast("Receiving updated");
-          return;
-        }
-        if (showOperatorRequestAlert) {
-          showToast("Dispatch request received");
-        } else if (refreshDelivery && currentModule === "menu") {
-          render();
-        }
-      } catch (error) {
-        showToast(error.message);
-      }
-    }, 500);
+    scheduleOperatorEventRefresh();
   });
   eventSource.onerror = () => {
     eventSource?.close();
     eventSource = null;
     if (authToken) window.setTimeout(connectEvents, 3000);
   };
+}
+
+function scheduleOperatorEventRefresh() {
+  window.clearTimeout(eventRefreshTimer);
+  eventRefreshTimer = window.setTimeout(async () => {
+    if (deliveryOrdersLoadingCount) return;
+    try {
+      const alertRefs = [...pendingDeliveryEventAlertRefs];
+      pendingDeliveryEventAlertRefs.clear();
+      const refreshDelivery = pendingDeliveryEventRefresh;
+      const refreshReceiving = pendingReceivingEventRefresh;
+      const showOperatorRequestAlert = pendingOperatorRequestAlert;
+      pendingDeliveryEventRefresh = false;
+      pendingReceivingEventRefresh = false;
+      pendingOperatorRequestAlert = false;
+      if (refreshDelivery && currentModule === "delivery-consolidation-load") {
+        await loadConsolidationLoadOrders({ background: true });
+        return;
+      }
+      if (refreshDelivery && currentModule === "delivery-consolidation-load-proof") {
+        await refreshConsolidationLoadBatch();
+        return;
+      }
+      if (refreshDelivery && currentModule === "delivery-consolidation" && !consolidationBusy) {
+        await loadConsolidation({ keepItem: true });
+        return;
+      }
+      if (refreshDelivery && currentModule === "delivery" && !fulfillmentSubmitting) {
+        await loadOrders({ keepSelection: true, alertRefs });
+        showToast("Orders updated");
+        return;
+      }
+      if (refreshDelivery) {
+        await Promise.all([
+          loadDeliveryNotifications({ alertRefs }),
+          loadCurrentDeliveryDraft()
+        ]);
+      }
+      if (refreshDelivery && currentModule === "delivery-select" && !fulfillmentSubmitting) {
+        render();
+        return;
+      }
+      if (refreshReceiving && currentModule === "receiving" && !receiptSubmitting) {
+        await loadReceivingOptions();
+        if (receivingStep === "orders") await loadReceivingOrders({ keepSelection: true });
+        else render();
+        showToast("Receiving updated");
+        return;
+      }
+      if (refreshReceiving && currentModule === "receiving-receipt" && !receiptSubmitting) {
+        await refreshReceiptPostingStatus();
+        return;
+      }
+      if (showOperatorRequestAlert) {
+        showToast("Dispatch request received");
+      } else if (refreshDelivery && currentModule === "menu") {
+        render();
+      }
+    } catch (error) {
+      showToast(error.message);
+    }
+  }, 500);
 }
 
 function disconnectEvents() {
@@ -1634,11 +1658,11 @@ function isIndependentManualLine(line) {
 }
 
 function shouldUseSalesQuantity(line) {
-  return !lineHasConversion(line) && qty(line.quantity) > 0;
+  return !lineHasConversion(line) && qty(line.original_quantity ?? line.quantity) > 0;
 }
 
 function salesQuantityLabel(line, fallback = "Qty") {
-  return line?.unit || fallback;
+  return displayUnit(line?.unit || fallback);
 }
 
 function lineUnitsToSalesQty(line, values) {
@@ -1806,7 +1830,7 @@ function customerPickupUnavailableMessage(order) {
   const requiredTotal = pickable.reduce((sum, line) => sum + lineRequiredSalesQty(line), 0);
   const loadedTotal = pickable.reduce((sum, line) => sum + qty(line.loaded_qty), 0);
   const uoms = [...new Set(pickable.map((line) => line.unit || "").filter(Boolean))];
-  const uom = uoms.length === 1 ? ` ${uoms[0]}` : "";
+  const uom = uoms.length === 1 ? ` ${displayUnit(uoms[0])}` : "";
   if (requiredTotal > 0 && loadedTotal >= requiredTotal) {
     return `${orderNo} is fully loaded locally. Loaded ${displayQty(loadedTotal)}${uom} of ${displayQty(requiredTotal)}${uom}; no remaining pickup quantity.`;
   }
@@ -1839,6 +1863,7 @@ function canMarkPacked(order = selectedOrder) {
 }
 
 function hasRemainingQty(line) {
+  if (line.no_yard_load_required) return false;
   if (shouldUseSalesQuantity(line)) return remainingValue(line, "sales") > 0;
   return remainingValue(line, "pallets") > 0
     || remainingValue(line, "sections") > 0
@@ -1966,6 +1991,7 @@ function receivingRemainingValue(line, unit) {
 }
 
 function hasReceivingRemainingQty(line) {
+  if (line.netsuite_active === false || line.sync_exception === "line_deleted") return false;
   return receivingRemainingSalesQty(line) > 0;
 }
 
@@ -2132,6 +2158,7 @@ function renderTopbar(title, subtitle, actions = "") {
   const returnLocationLocked = returnModuleActive() && (returnStage !== "lookup" || Boolean(returnDraftId));
   return `
     <header class="topbar">
+      <div class="topbar-start">
       <div class="topbar-location">
         <button class="secondary-button location-button" data-action="toggle-location-dropdown" ${returnLocationLocked || allowedOperatorLocations().length < 2 ? "disabled" : ""} type="button">${t("common.location", "Location")} ${currentLocation()?.text || locationId || ""}${returnLocationLocked ? ` · ${t("operator.locked", "Locked")}` : ""}</button>
         ${locationDropdownOpen && allowedOperatorLocations().length > 1 ? `
@@ -2146,6 +2173,7 @@ function renderTopbar(title, subtitle, actions = "") {
         <p>${t("app.operator", "MBBS Yard Operator Application")}</p>
         <h1>${title}</h1>
         <span>${subtitle}</span>
+      </div>
       </div>
       <div class="topbar-language">${languageToggle()}</div>
       <div class="topbar-actions">${operator ? `${renderReleaseDraftButton()}${renderNotificationButton()}` : ""}${actions}</div>
@@ -2241,6 +2269,10 @@ function saveOperatorState() {
     receivingOrderPage,
     receivingLinePage,
     receivingSelectedLineId,
+    receiptRecovery: receiptOrder?.posting ? {
+      orderId: String(receiptOrder.netsuite_id), orderType: receiptOrder.order_type,
+      orderRef: receiptOrder.tranid
+    } : null,
     cycleStep,
     cycleSelection,
     cycleSearch,
@@ -2260,6 +2292,7 @@ async function restoreOperatorView() {
   if (!allowedOperatorLocations().some((yard) => yard.id === locationId)) return renderLocationSelect();
   currentModule = restorableModule(currentModule);
   try {
+    if (["damage", "count-sheets"].includes(currentModule)) return operatorInventory.open(currentModule);
     if (currentModule === "delivery-consolidation-load-proof" && consolidationLoadState.batchId) {
       await openConsolidationLoadBatch(consolidationLoadState.batchId);
       return;
@@ -2289,6 +2322,7 @@ async function restoreOperatorView() {
       return;
     }
     if (currentModule === "receiving") {
+      if (await restoreReceiptPosting()) return;
       await loadReceivingOptions();
       if (receivingItemSearch.trim()) await loadReceivingItemSuggestions();
       if (receivingStep === "orders") {
@@ -2385,6 +2419,7 @@ function renderDeliveryDetailContent() {
 }
 
 function renderDeliveryPanels({ orderPanel = true, detailPanel = true } = {}) {
+  deliveryRefresh.observe();
   const grid = currentModule === "delivery" ? app.querySelector(".delivery-grid") : null;
   if (!grid) return render();
 
@@ -2413,6 +2448,7 @@ function renderDeliveryPanels({ orderPanel = true, detailPanel = true } = {}) {
 }
 
 function render() {
+  deliveryRefresh.observe();
   if (currentModule !== "receiving") invalidateReceivingRequests();
   if (operatorWorkspaceLeaving || !operator || !allowedOperatorLocations().some((yard) => yard.id === locationId)) stopOperatorPhotoCameras();
   if (operatorWorkspaceLeaving) return;
@@ -2421,6 +2457,10 @@ function render() {
   if (!allowedOperatorLocations().some((yard) => yard.id === locationId)) return renderLocationSelect();
   saveOperatorState();
   if (currentModule === "menu") return renderMenu();
+  if (currentModule === "settings") return operatorDisplaySettings.render();
+  if (!["damage", "count-sheets"].includes(currentModule)) operatorInventory.close();
+  if (["damage", "count-sheets"].includes(currentModule)) return operatorInventory.render();
+  if (currentModule === "inventory") return renderInventoryMenu();
   if (currentModule === "cycle-count") return renderCycleCount();
   if (currentModule === "customer-pickup-scan") return renderCustomerPickupScan();
   if (currentModule === "customer-pickup") return renderCustomerPickupOrder();
@@ -2459,9 +2499,9 @@ function renderMenu() {
         <strong>${t("operator.receiving", "Receiving")}</strong>
         <span>${t("operator.receivingDesc", "Receive PO and yard stock.")}</span>
       </button>
-      <button class="module-tile" data-action="open-module" data-module="cycle-count" type="button">
-        <strong>${t("operator.cycleCount", "Cycle Count")}</strong>
-        <span>${t("operator.cycleCountDesc", "Check inventory by product, brand, series and SKU.")}</span>
+      <button class="module-tile" data-action="open-module" data-module="inventory" type="button">
+        <strong>${t("operator.inventory", "Inventory")}</strong>
+        <span>${t("operator.inventoryDesc", "Aggregate requests, damage, cycle counts and count sheets.")}</span>
       </button>
       <button class="module-tile" data-action="open-module" data-module="delivery" type="button">
         <strong>${t("operator.deliveryPrep", "Delivery Prep")}</strong>
@@ -2477,7 +2517,39 @@ function renderMenu() {
       </button>
     </section>
   `, `
+    <button class="secondary-button display-settings-button" data-action="open-display-settings" type="button" aria-label="${t("operator.displaySettings", "Display and input settings")}" title="${t("operator.displaySettings", "Display and input settings")}">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" aria-hidden="true"><path d="m9.5 3-.6 2-2 .9L5 5l-2 3.5 1.6 1.4-.1 2.2L3 13.5 5 17l2-.7 1.9 1.1.6 2.1h4l.6-2.1 1.9-1.1 2 .7 2-3.5-1.5-1.4-.1-2.2L20 8.5 18 5l-1.9.9-2-.9-.6-2z"/><circle cx="11.5" cy="11.3" r="3.2"/></svg>
+    </button>
     ${renderInstallButton()}
+    <button class="secondary-button" data-action="logout" type="button">${operator.display_name}</button>
+  `);
+}
+
+function renderInventoryMenu() {
+  shell(t("operator.inventory", "Inventory"), `${t("common.location", "Location")} ${currentLocation()?.text || locationId}`, `
+    <section class="module-menu two-up" aria-label="${t("operator.inventory", "Inventory")}">
+      ${operator.aggregateRequestYardLocationIds?.length ? `<a class="module-tile" href="/aggregate-requests" style="text-decoration:none;color:inherit;border:2px solid var(--blue);border-radius:8px;background:white">
+        <strong>${t("operator.aggregateRequests", "Aggregate Requests")}</strong>
+        <span>${t("operator.aggregateRequestsDesc", "Request stock deliveries and dump collections by load.")}</span>
+      </a>` : `<button class="module-tile" type="button" disabled>
+        <strong>${t("operator.aggregateRequests", "Aggregate Requests")}</strong>
+        <span>${t("operator.aggregateAccessRequired", "Ask Admin to assign Aggregate request access.")}</span>
+      </button>`}
+      <button class="module-tile" data-action="open-module" data-module="damage" type="button">
+        <strong>${t("operator.damage", "Damage")}</strong>
+        <span>${t("inventory.damageDesc", "Photograph and report damaged stock.")}</span>
+      </button>
+      <button class="module-tile" data-action="open-module" data-module="cycle-count" type="button">
+        <strong>${t("operator.cycleCount", "Cycle Count")}</strong>
+        <span>${t("operator.cycleCountDesc", "Check inventory by product, brand, series and SKU.")}</span>
+      </button>
+      <button class="module-tile" data-action="open-module" data-module="count-sheets" type="button">
+        <strong>${t("operator.countSheet", "Count Sheet")}</strong>
+        <span>${t("inventory.sheetDesc", "Count the SKUs assigned by Control.")}</span>
+      </button>
+    </section>
+  `, `
+    <button class="secondary-button" data-action="main-menu" type="button">${t("common.menu", "Menu")}</button>
     <button class="secondary-button" data-action="logout" type="button">${operator.display_name}</button>
   `);
 }
@@ -2573,8 +2645,8 @@ function returnLinePolicy(line) {
     .toUpperCase()
     .replaceAll(" ", "_");
   return {
-    effective,
-    requiresApproval: Boolean(policy.requiresApproval ?? policy.requires_approval ?? effective === "APPROVAL_REQUIRED")
+    effective: effective === "APPROVAL_REQUIRED" ? "ALLOWED" : effective,
+    requiresApproval: false
   };
 }
 
@@ -2739,7 +2811,7 @@ function returnLineUnits(line) {
 }
 
 function returnLineSalesUom(line) {
-  return line?.salesUom || line?.sales_uom || line?.unit || line?.uom || t("operator.salesUnit", "Sales UOM");
+  return displayUnit(line?.salesUom || line?.sales_uom || line?.unit || line?.uom || t("operator.salesUnit", "Sales UOM"));
 }
 
 function returnLineRemaining(line) {
@@ -2991,8 +3063,9 @@ function renderReturnLookup() {
         ` : ""}
         <label class="return-field">
           <span>${t("operator.manualInput", "Manual / Zebra input")}</span>
-          <input id="returnOrderLookup" value="${escapeHtml(returnLookupCode)}" placeholder="SOB115976" autocomplete="off" />
+          <input id="returnOrderLookup" inputmode="${operatorDisplaySettings.inputMode()}" spellcheck="false" autocorrect="off" ${returnBusy ? "disabled" : ""} value="${escapeHtml(returnLookupCode)}" placeholder="SOB115976" autocomplete="off" />
         </label>
+        ${window.OperatorOrderKeypad.html("returnOrderLookup")}
         <button class="primary-button" data-action="return-lookup-order" ${returnBusy ? "disabled" : ""} type="button">${returnBusy ? t("common.loading", "Loading") : t("operator.findOrder", "Find Order")}</button>
         ${returnLookupMessage ? `<div class="sync-alert danger"><strong>${t("common.notice", "Notice")}</strong><span>${escapeHtml(localizeMessage(returnLookupMessage))}</span></div>` : ""}
         ${palletMode ? `
@@ -3137,12 +3210,12 @@ function renderReturnUnitInputs(line, values) {
   }
   return returnLineUnits(line).map((unit) => `
     <div class="stepper-field return-unit-field">
-      <span>${unit.label}</span>
+      <span>${escapeHtml(displayUnit(unit.label))}</span>
       ${renderReturnQuantityStepper({
         value: values[unit.key],
         field: unit.key,
         lineId: rowKey,
-        label: unit.label
+        label: displayUnit(unit.label)
       })}
       <small>× ${displayReturnQty(unit.conversion)} ${escapeHtml(returnLineSalesUom(line))}</small>
     </div>
@@ -3515,6 +3588,7 @@ function renderReturnReview() {
           </div>
           <span class="status-pill open">${t("common.review", "Review")}</span>
         </div>
+        <div class="return-posting-policies">${renderReturnPostingPolicies()}</div>
         <div class="return-review-detail-scroll">
           ${renderReturnCustomerSummary()}
           ${renderReturnYardBanner()}
@@ -3549,24 +3623,91 @@ function renderReturnReview() {
       </div>
       <div class="selected-actions return-review-actions">
         <button class="secondary-button" data-action="return-back-to-form" ${returnBusy ? "disabled" : ""} type="button">${t("common.back", "Back")}</button>
-        <button class="primary-button" data-action="return-confirm-submit" ${returnBusy ? "disabled" : ""} type="button">${returnBusy ? t("operator.confirming", "Confirming...") : t("operator.confirmReturn", "Confirm Return")}</button>
+        <button class="primary-button" data-action="return-confirm-submit" ${returnBusy || !returnPostingReady() ? "disabled" : ""} type="button">${returnBusy ? t("operator.confirming", "Confirming...") : t("operator.confirmReturn", "Confirm Return")}</button>
       </div>
     </section>
   `;
 }
+
+function returnNetSuiteResultLabel(record) {
+  if (!(Number(record?.workflowVersion) >= 2)) {return record?.status || "";}
+  const status = record.netSuiteSyncStatus;
+  if (status === "disabled") {return "Local only — return saved";}
+  if (status === "failed") {return "NetSuite RA failed — return saved; contact an administrator";}
+  if (status === "cancelled") {return `NetSuite RA ${record.netSuiteTransactionRef || ""} cancelled`.replace(/ +/g, " ");}
+  if (["succeeded", "manual_linked"].includes(status)) {
+    return record.netSuiteTransactionRef ? `NetSuite RA ${record.netSuiteTransactionRef}` : "NetSuite RA number pending";
+  }
+  return "NetSuite RA pending — return saved";
+}
+
+
+function returnPostingFunctions() {
+  return [returnMode === "stock" && returnSelectedRows().length > 0 && "stock_return",
+    Number(returnPalletQuantity) > 0 && "pallet_return"].filter(Boolean);
+}
+
+
+function returnPostingReady() {
+  return !returnPostingLoading && !returnPostingError && returnPostingFunctions().length > 0
+    && returnPostingFunctions().every(key => Number(returnPostingPolicies[key]?.locationId) === Number(locationId)
+      && Boolean(operatorNetSuitePolicyToken(returnPostingPolicies[key])));
+}
+
+
+async function loadReturnPostingPolicies() {
+  const generation = ++returnPostingGeneration;
+  const yardId = Number(locationId);
+  returnPostingLoading = true;
+  returnPostingError = "";
+  returnPostingPolicies = {};
+  render();
+  try {
+    const entries = await Promise.all(returnPostingFunctions().map(async key => [key, await loadOperatorNetSuitePostingPolicy(key)]));
+    if (generation !== returnPostingGeneration || yardId !== Number(locationId)) {return;}
+    returnPostingPolicies = Object.fromEntries(entries);
+  } catch (error) {
+    if (generation !== returnPostingGeneration || yardId !== Number(locationId)) {return;}
+    returnPostingError = error.message || "Unable to check NetSuite posting mode.";
+  } finally {
+    if (generation === returnPostingGeneration && yardId === Number(locationId)) {
+      returnPostingLoading = false;
+      render();
+    }
+  }
+}
+
+
+function renderReturnPostingPolicies() {
+  if (returnPostingLoading) {return `<div class="sync-alert" role="status">Checking NetSuite posting mode…</div>`;}
+  if (returnPostingError || !returnPostingReady()) {
+    return `<div class="sync-alert danger">${escapeHtml(returnPostingError || "Refresh the posting mode before confirming.")}</div>
+      <button data-action="return-refresh-posting" type="button">Refresh posting mode</button>`;
+  }
+  const enabled = returnPostingFunctions().every(key => returnPostingPolicies[key].effective);
+  return `<div class="sync-alert operator-posting-mode" data-posting-mode="${enabled ? "netsuite" : "local"}">
+    <strong>NetSuite Return Authorization</strong>
+    <span>${enabled ? "Creates one RA for this return, including stock and pallets" : "Local only — NetSuite posting is off for part or all of this return"}</span>
+  </div>`;
+}
+
 
 function renderReturnSuccess() {
   const batch = returnResult?.batchReference || returnResult?.batch_reference || "";
   const stock = returnResult?.stockReturn || returnResult?.stock_return || null;
   const pallet = returnResult?.palletReturn || returnResult?.pallet_return || null;
   const referenceOf = (record) => record?.reference || record?.returnReference || record?.return_reference || "";
-  const statusOf = (record) => record?.status || "";
+  const statusOf = returnNetSuiteResultLabel;
+  const records = [stock, pallet].filter(Boolean);
+  const raNumbers = [...new Set(records.map(record => record.netSuiteTransactionRef).filter(Boolean))];
+  const raPosted = records.every(record => ["succeeded", "manual_linked"].includes(record.netSuiteSyncStatus));
   return `
     <section class="return-success-shell">
       <div class="return-success-mark">✓</div>
       <span>${t("operator.returnRecorded", "Return recorded")}</span>
       <h2>${escapeHtml(batch || referenceOf(stock) || referenceOf(pallet))}</h2>
-      <p>${t("operator.returnRecordedHelp", "The local records are saved in PostgreSQL. Inventory was not changed.")}</p>
+      <p>Your return records are saved. NetSuite results are shown below.</p>
+      ${raNumbers.map(number => `<div class="sync-alert ${raPosted ? "linked-supply-info" : ""}"><span>NetSuite Return Authorization</span><strong>${escapeHtml(number)}</strong></div>`).join("")}
       <div class="return-created-records">
         ${stock ? `<div><span>${t("operator.stockReturn", "Stock Return")}</span><strong>${escapeHtml(referenceOf(stock))}</strong><em>${escapeHtml(localizeMessage(statusOf(stock)))}</em></div>` : ""}
         ${pallet ? `<div><span>${t("operator.palletReturn", "Pallet Return")}</span><strong>${escapeHtml(referenceOf(pallet))}</strong><em>${escapeHtml(localizeMessage(statusOf(pallet)))}</em></div>` : ""}
@@ -3594,6 +3735,7 @@ function renderReturnHistoryDetails(record) {
   const headerPhotos = (record?.photos || []).map(returnSavedPhotoReference).filter(Boolean);
   const palletQuantity = record?.palletQuantity ?? record?.pallet_quantity;
   return `
+    ${Number(record.workflowVersion) >= 2 ? `<div class="sync-alert"><strong>${escapeHtml(returnNetSuiteResultLabel(record))}</strong></div>` : ""}
     ${palletQuantity !== null && palletQuantity !== undefined ? `
       <div class="return-header-note">
         <span>${t("operator.palletQuantity", "PALLET quantity")}</span>
@@ -3615,7 +3757,7 @@ function renderReturnHistoryDetails(record) {
               <span>${escapeHtml(line.reasonLabel || line.reason_label || "")}</span>
               ${line.note ? `<em>${escapeHtml(line.note)}</em>` : ""}
             </div>
-            <b>${displayReturnQty(line.returnedSalesQuantity ?? line.returned_sales_quantity ?? line.salesQuantity ?? line.sales_quantity)} ${escapeHtml(line.salesUom || line.sales_uom || "")}</b>
+            <b>${displayReturnQty(line.returnedSalesQuantity ?? line.returned_sales_quantity ?? line.salesQuantity ?? line.sales_quantity)} ${escapeHtml(displayUnit(line.salesUom || line.sales_uom || ""))}</b>
             <span class="return-policy-pill ${String(line.approvalStatus || line.approval_status || "").includes("pending") ? "approval" : "allowed"}">${escapeHtml(localizeMessage(line.approvalStatus || line.approval_status || ""))}</span>
             <small>${(line.photos || []).length} ${t("common.photos", "photos")}</small>
           </div>
@@ -3648,6 +3790,7 @@ function renderReturnRecordList(records, type) {
           <button class="${String(record.id) === String(selected?.id) ? "active" : ""}" data-action="return-select-${type}" data-record="${escapeHtml(record.id)}" type="button">
             <span>${escapeHtml(record.returnType || record.return_type || record.type || "")}</span>
             <strong>${escapeHtml(returnRecordReference(record))}</strong>
+            ${type === "history" && record.netSuiteTransactionRef ? `<span>${escapeHtml(record.netSuiteTransactionRef)}</span>` : ""}
             <em>${formatDateTime(record.submittedAt || record.submitted_at || record.updatedAt || record.updated_at || record.createdAt || record.created_at)}</em>
             <b>${escapeHtml(localizeMessage(record.status || (type === "draft" ? t("operator.draft", "Draft") : "")))}</b>
           </button>
@@ -3759,11 +3902,12 @@ function renderCustomerPickupScan() {
         <strong>${t("operator.orderNumber", "Order number")}</strong>
         <label class="stepper-field">
           <span>${t("operator.scanOrType", "Scan or type and press Enter")}</span>
-          <input id="customerPickupScan" value="${escapeHtml(customerPickupScan)}" placeholder="SOB104325" autocomplete="off" autofocus />
+          <input id="customerPickupScan" inputmode="${operatorDisplaySettings.inputMode()}" spellcheck="false" autocorrect="off" value="${escapeHtml(customerPickupScan)}" placeholder="SOB104325" autocomplete="off" autofocus ${pickupLookupBusy ? "disabled" : ""} />
         </label>
+        ${window.OperatorOrderKeypad.html("customerPickupScan")}
         ${customerPickupMessage ? `<div class="sync-alert danger"><strong>${t("common.notice", "Notice")}</strong><span>${escapeHtml(localizeMessage(customerPickupMessage))}</span></div>` : ""}
         <div class="selected-actions">
-          <button class="primary-button" data-action="lookup-customer-pickup" type="button">${t("operator.findOrder", "Find Order")}</button>
+          <button class="primary-button" data-action="lookup-customer-pickup" ${pickupLookupBusy ? "disabled" : ""} type="button">${t("operator.findOrder", "Find Order")}</button>
         </div>
       </div>
     </section>
@@ -3984,11 +4128,11 @@ function renderReceivingLine(line) {
       <div class="required-measures">
         ${units.map((unit) => `
           <div class="measure">
-            <span>${t("operator.open", "Open")} ${unit.label}</span>
+            <span>${t("operator.open", "Open")} ${escapeHtml(displayUnit(unit.label))}</span>
             <b>${displayQty(receivingRemainingValue(line, unit.key))}</b>
           </div>
           <div class="measure ${receivingConfirmedValue(line, unit.key) > 0 ? "confirmed-measure" : ""}">
-            <span>${t("operator.confirmed", "Confirmed")} ${unit.label}</span>
+            <span>${t("operator.confirmed", "Confirmed")} ${escapeHtml(displayUnit(unit.label))}</span>
             <b>${displayQty(receivingConfirmedValue(line, unit.key))}</b>
           </div>
         `).join("")}
@@ -4041,16 +4185,16 @@ function renderReceivingSelectedLinePanel(line) {
       <div class="selected-measures">
         ${units.map((unit) => `
           <div class="measure">
-            <span>${t("operator.open", "Open")} ${unit.label}</span>
+            <span>${t("operator.open", "Open")} ${escapeHtml(displayUnit(unit.label))}</span>
             <b>${displayQty(receivingRemainingValue(line, unit.key))}</b>
           </div>
           <div class="measure ${receivingConfirmedValue(line, unit.key) > 0 ? "confirmed-measure" : ""}">
-            <span>${t("operator.confirmed", "Confirmed")} ${unit.label}</span>
+            <span>${t("operator.confirmed", "Confirmed")} ${escapeHtml(displayUnit(unit.label))}</span>
             <b>${displayQty(receivingConfirmedValue(line, unit.key))}</b>
           </div>
         `).join("")}
       </div>
-      ${units.map((unit) => renderStepper(unit.key, tf("operator.receiveUnit", "Receive {unit}", { unit: unit.label }), receivingPanelValue(line, unit.key))).join("")}
+      ${units.map((unit) => renderStepper(unit.key, tf("operator.receiveUnit", "Receive {unit}", { unit: displayUnit(unit.label) }), receivingPanelValue(line, unit.key))).join("")}
       <div class="selected-actions">
         ${hasReceivedQty(line) ? `<button class="secondary-button danger-button" data-action="unconfirm-receiving-line" data-line="${line.id}" type="button">${t("operator.unconfirmLine", "Unconfirm line")}</button>` : ""}
         <button class="primary-button" data-action="confirm-receiving-line" data-line="${line.id}" ${pageConfirming ? "disabled" : ""} type="button">${t("operator.confirmLine", "Confirm line")}</button>
@@ -4096,7 +4240,7 @@ function renderCycleCount() {
       </div>
     </section>
   `, `
-    <button class="secondary-button" data-action="main-menu" type="button">${t("common.menu", "Menu")}</button>
+    <button class="secondary-button" data-action="open-module" data-module="inventory" type="button">${t("operator.inventory", "Inventory")}</button>
     <button class="secondary-button" data-action="logout" type="button">${operator.display_name}</button>
   `);
 }
@@ -4160,7 +4304,7 @@ function renderInventorySkuList() {
             <em class="underpack-note">${item.product_type || ""} | ${item.brand || ""} | ${item.series || ""}</em>
           </div>
           <div class="required-measures">
-            <div class="measure"><span>${t("operator.uom", "UOM")}</span><b>${item.stock_unit || "-"}</b></div>
+            <div class="measure"><span>${t("operator.uom", "UOM")}</span><b>${escapeHtml(displayUnit(item.stock_unit || "-"))}</b></div>
             <div class="measure"><span>${t("operator.count", "Count")}</span><b>${t("operator.blind", "Blind")}</b></div>
           </div>
         </button>
@@ -4184,21 +4328,18 @@ function renderCycleCountPanel(item) {
       <p>${item.item_description || item.display_name || ""}</p>
     </div>
     <div class="selected-measures cycle-conversion-measures">
-      ${countUnits.map((unit) => `<div class="measure"><span>1 ${unit.label}</span><b>${displayQty(unit.conversion)}</b></div>`).join("")}
+      ${countUnits.map((unit) => `<div class="measure"><span>1 ${escapeHtml(displayUnit(unit.label))}</span><b>${displayQty(unit.conversion)}</b></div>`).join("")}
     </div>
     <div class="cycle-count-fields">
       ${countUnits.map((unit) => `
         <button class="cycle-count-field ${activeCycleUnit === unit.key ? "active" : ""}" data-action="select-cycle-unit" data-unit="${unit.key}" type="button">
-          <span>${t("operator.counted", "Counted")} ${unit.label}</span>
+          <span>${t("operator.counted", "Counted")} ${escapeHtml(displayUnit(unit.label))}</span>
           <strong data-cycle-display="${unit.key}">${cycleValues[unit.key] || 0}</strong>
         </button>
       `).join("")}
     </div>
-    <div class="cycle-number-pad">
-      ${["1", "2", "3", "4", "5", "6", "7", "8", "9", "Clear", "0", "Back"].map((key) => `
-        <button data-action="cycle-key" data-key="${key}" type="button">${key === "Clear" ? t("common.clear", "Clear") : key === "Back" ? t("common.backspace", "Back") : key}</button>
-      `).join("")}
-    </div>
+    <output class="count-calculator-expression" data-cycle-expression aria-live="polite">${escapeHtml(cycleExpressions[activeCycleUnit]?.expression || String(cycleValues[activeCycleUnit] || 0))} ${escapeHtml(countUnits.find(unit => unit.key === activeCycleUnit)?.label || "")}</output>
+    ${window.MBBSCountingCalculator.pad()}
     <div class="cycle-variance" data-cycle-variance>
       <div><span>${t("operator.countedTotal", "Counted total")}</span><strong>0</strong></div>
       <div><span>${t("operator.mode", "Mode")}</span><strong>${t("operator.blind", "Blind")}</strong></div>
@@ -4221,7 +4362,7 @@ function renderCycleSummary() {
       ${lines.slice(0, 6).map((line) => `
         <button class="${selectedInventoryItem?.item_id === line.item_id ? "active" : ""}" data-action="edit-cycle-line" data-line="${line.id}" type="button">
           <strong>${line.item_name}</strong>
-          <span>${displayQty(line.counted_pallet_qty)} PLT / ${displayQty(line.counted_layer_qty)} LYR / ${displayQty(line.counted_section_qty)} SEC / ${displayQty(line.counted_piece_qty)} PCS</span>
+          <span>${displayQty(line.counted_pallet_qty)} ${displayUnit("PLT")} / ${displayQty(line.counted_layer_qty)} ${displayUnit("LYR")} / ${displayQty(line.counted_section_qty)} ${displayUnit("SEC")} / ${displayQty(line.counted_piece_qty)} ${displayUnit("PCS")}</span>
           <span>${t("operator.total", "Total")} ${displayQty(line.counted_total_qty)} | ${t("control.variance", "Var")} ${displaySignedQty(line.variance_qty)}</span>
         </button>
       `).join("") || `<span class="muted">${t("operator.noLinesConfirmed", "No lines confirmed yet.")}</span>`}
@@ -4464,6 +4605,8 @@ function renderDetailPanel(order) {
   const directPickupInfo = !isCustomerPickupMode() && order.direct_pickup_only === true && !lines.length;
   const vrmaReferenceOnly = isVrmaReferenceOrder(order);
   const vrmaLocalOnly = isVrmaOrder(order) && !vrmaReferenceOnly;
+  const hasYardPacking = lines.some((line) => !line.no_yard_load_required && !line.linked_quantity_blocked
+    && (hasRemainingQty(line) || hasPackedQty(line)));
   const loadAction = deliveryLoadAction(order, viewMode);
 
   return `
@@ -4484,13 +4627,14 @@ function renderDetailPanel(order) {
         ${vrmaReferenceOnly
           ? `<span class="muted">${t("operator.referenceOnlyNoInventory", "Reference only · No inventory deduction")}</span>`
           : directPickupInfo ? "" : isCustomerPickupMode()
-            ? `<button class="primary-button" data-action="start-fulfill" type="button" ${hasCustomerPickupDraft(order) && !pickupConfirming && !pageConfirming ? "" : "disabled"}>${t("common.load", "Load")}</button>`
+            ? `<button class="primary-button" data-action="start-fulfill" type="button" ${hasCustomerPickupDraft(order) && !pickupConfirming && !pageConfirming && !order.posting?.loadBlocked ? "" : "disabled"}>${t("common.load", "Load")}</button>`
             : loadAction.show
-              ? `<button class="primary-button" data-action="start-fulfill" type="button">${loadAction.label}</button>`
-              : `<button class="secondary-button" data-action="set-preparing" type="button">${t("operator.preparing", "Preparing")}</button>
+              ? `<button class="primary-button" data-action="start-fulfill" type="button" ${order.posting?.loadBlocked ? "disabled" : ""}>${loadAction.label}</button>`
+              : `<button class="secondary-button" data-action="set-preparing" type="button" ${hasYardPacking ? "" : "disabled"}>${t("operator.preparing", "Preparing")}</button>
                  <button class="primary-button" data-action="set-packed" type="button" ${canMarkPacked(order) ? "" : "disabled"}>${t("operator.packed", "Packed")}</button>`}
       </div>
     </div>
+    ${renderLoadPostingStatus(order)}
     <div class="progress-strip">
       <div><span>${vrmaReferenceOnly ? t("operator.referenceLines", "Reference lines") : isCustomerPickupMode() ? t("operator.pickupLines", "Pickup lines") : viewMode === "packed" ? t("operator.packedLines", "Packed lines") : t("operator.openLines", "Open lines")}</span><strong>${vrmaReferenceOnly ? lines.length : confirmed} / ${lines.length}</strong></div>
       <div><span>${t("common.location", "Location")}</span><strong>${currentLocation()?.text}</strong></div>
@@ -4581,8 +4725,8 @@ function renderFulfillmentScreen() {
           <span>${isPickupLoad ? t("operator.pickupStatus", "Pickup Status") : t("operator.localYardStatus", "Local Yard Status")}</span>
           <strong>${isPickupLoad ? (fulfillmentResult.pickupStatus === "partial_loaded" ? t("operator.partialLoaded", "Partial Loaded") : t("common.loaded", "Loaded")) : isReloadLoad ? (fulfillmentResult.completed ? "Re-load Complete" : "Re-load Partially Loaded") : (fulfillmentResult.localYardOrderStatus || t("common.loaded", "Loaded"))}</strong>
           <p>${isConsolidated ? t("operator.consolidationLoadSaved", "Selected packed quantities loaded. Shared photo proof saved on each order.") : isPickupLoad ? (fulfillmentResult.photoEvidenceCount > 0
-            ? tf("operator.photoSavedRemaining", "Photo proof saved. Remaining line count: {count}.", { count: fulfillmentResult.remainingLines || 0 })
-            : tf("operator.pickupSavedNoPhotoRemaining", "Customer Pickup load saved without photo evidence. Remaining line count: {count}.", { count: fulfillmentResult.remainingLines || 0 })) : isReloadLoad ? "This re-load attempt was saved locally. NetSuite fulfillment and Dispatch were not changed." : t("operator.photoSavedHidden", "Photo proof saved. This order is hidden from the operator list.")}</p>
+            ? tf("operator.backgroundPhotosRemaining", "Load saved; photos upload in the background. Remaining line count: {count}.", { count: fulfillmentResult.remainingLines || 0 })
+            : tf("operator.pickupSavedNoPhotoRemaining", "Customer Pickup load saved without photo evidence. Remaining line count: {count}.", { count: fulfillmentResult.remainingLines || 0 })) : isReloadLoad ? "This re-load attempt was saved locally. NetSuite fulfillment and Dispatch were not changed." : t("operator.backgroundPhotosLoadSaved", "Load saved. You can continue; photos upload in the background.")}</p>
         </div>
         ${renderOperatorNetSuitePostingTransactions(fulfillmentResult)}
         <div class="selected-actions">
@@ -4598,6 +4742,7 @@ function renderFulfillmentScreen() {
         localOnly: localOnlyPosting,
         error: fulfillmentNetSuitePolicyError
       })}
+      ${renderLoadPostingStatus(order)}
       <div class="fulfillment-card fulfillment-photo-card">
         <span>${isPickupLoad && requiredPhotoCount === 0
           ? t("operator.customerPickupPhotoOptional", "Customer Pickup photo proof (optional)")
@@ -4638,7 +4783,7 @@ function renderFulfillmentScreen() {
         ${fulfillmentSubmitting ? `<div class="sync-alert"><strong>${localizeMessage(fulfillmentJobStage || t("operator.savingLoadProof", "Saving load proof"))}</strong><span>${localizeMessage(fulfillmentStatusText || t("operator.savingLocalYardStatus", "Saving local yard status..."))}<span data-fulfillment-upload-elapsed>${fulfillmentStartedAt ? ` (${Math.max(1, Math.round((Date.now() - fulfillmentStartedAt) / 1000))}s)` : ""}</span></span></div>` : ""}
         ${!fulfillmentSubmitting && fulfillmentJobStage === "Load failed" ? `<div class="sync-alert danger"><strong>${t("operator.loadFailed", "Load failed")}</strong><span>${escapeHtml(localizeMessage(fulfillmentStatusText))}</span></div>` : ""}
         ${renderLoadValidation(fulfillmentValidation)}
-        <button class="primary-button" data-action="confirm-fulfill" ${(isPickupLoad || fulfillmentPhotoCount >= requiredPhotoCount) && postingModeReady && !fulfillmentSubmitting ? "" : "disabled"} type="button">${fulfillmentSubmitting ? t("operator.loading", "Loading...") : t("common.load", "Load")}</button>
+        <button class="primary-button" data-action="confirm-fulfill" ${(isPickupLoad || fulfillmentPhotoCount >= requiredPhotoCount) && postingModeReady && !fulfillmentSubmitting && !order.posting?.loadBlocked ? "" : "disabled"} type="button">${fulfillmentSubmitting ? t("operator.loading", "Loading...") : t("common.load", "Load")}</button>
       </div>
     </section>
   `, `
@@ -4653,7 +4798,7 @@ function renderLine(line) {
   const underPacked = !isCustomerPickupMode() && isUnderPacked(line);
   const pickupConfirmed = isCustomerPickupMode() && hasPackedQty(line);
   const draftConfirmed = pickupConfirmed || isActiveDraftPackedLine(line);
-  const referenceOnly = line.vrma_reference_only === true || isVrmaReferenceOrder();
+  const referenceOnly = line.no_yard_load_required || line.vrma_reference_only === true || isVrmaReferenceOrder();
   const valueLabel = referenceOnly ? t("operator.reference", "Reference") : isActiveDraftPackedLine(line) ? t("operator.confirmed", "Confirmed") : viewMode === "packed" ? t("operator.packed", "Packed") : t("operator.open", "Open");
   return `
     <button class="line-card ${String(selectedLineId) === String(line.id) ? "active" : ""} ${line.confirmed || pickupConfirmed ? "confirmed" : ""} ${underPacked ? "underpacked" : ""} ${notice ? "exception" : ""}" data-line="${line.id}" type="button">
@@ -4667,7 +4812,7 @@ function renderLine(line) {
         ${underPacked ? `<em class="underpack-note">${t("operator.stillOpenQty", "Still has open qty")}</em>` : ""}
       </div>
       <div class="required-measures">
-        ${isCustomerPickupMode() ? renderPickupMeasures(line, units) : units.map((unit) => `<div class="measure"><span>${valueLabel} ${unit.label}</span><b>${displayQty(panelValue(line, unit.key))}</b></div>`).join("")}
+        ${isCustomerPickupMode() ? renderPickupMeasures(line, units) : units.map((unit) => `<div class="measure"><span>${valueLabel} ${escapeHtml(displayUnit(unit.label))}</span><b>${displayQty(line.no_yard_load_required && unit.key === "sales" ? line.original_quantity : panelValue(line, unit.key))}</b></div>`).join("")}
       </div>
     </button>
   `;
@@ -4676,8 +4821,8 @@ function renderLine(line) {
 function renderPickupMeasures(line, units = deliveryLineUnits(line)) {
   const confirmed = hasPackedQty(line);
   return units.map((unit) => `
-    ${confirmed ? `<div class="measure confirmed-measure"><span>${t("operator.confirmed", "Confirmed")} ${escapeHtml(unit.label)}</span><b>${displayQty(packedValue(line, unit.key))}</b></div>` : ""}
-    <div class="measure remaining-measure"><span>${t("operator.remaining", "Remaining")} ${escapeHtml(unit.label)}</span><b>${displayQty(remainingValue(line, unit.key))}</b></div>
+    ${confirmed ? `<div class="measure confirmed-measure"><span>${t("operator.confirmed", "Confirmed")} ${escapeHtml(displayUnit(unit.label))}</span><b>${displayQty(packedValue(line, unit.key))}</b></div>` : ""}
+    <div class="measure remaining-measure"><span>${t("operator.remaining", "Remaining")} ${escapeHtml(displayUnit(unit.label))}</span><b>${displayQty(remainingValue(line, unit.key))}</b></div>
   `).join("");
 }
 
@@ -4686,13 +4831,13 @@ function renderLinkedSupplyBreakdown(line) {
   const linkedPo = qty(line.linked_po_sales_qty);
   const linkedDirectTo = qty(line.linked_direct_to_sales_qty);
   const residual = qty(line.operator_required_sales_qty ?? line.quantity);
-  const uom = escapeHtml(line.unit || "Qty");
+  const uom = escapeHtml(displayUnit(line.unit || "Qty"));
   return `
     <div class="linked-supply-breakdown">
       <div><span>${t("operator.dispatchTarget", "Dispatch target")}</span><b>${displayQty(original)} ${uom}</b></div>
       <div><span>${t("operator.completedLinkPo", "Link PO")}</span><b>${displayQty(linkedPo)} ${uom}</b></div>
       <div><span>${t("operator.completedDirectTo", "Direct Link TO")}</span><b>${displayQty(linkedDirectTo)} ${uom}</b></div>
-      <div><span>${t("operator.operatorResidual", "Operator residual")}</span><b>${displayQty(residual)} ${uom}</b></div>
+      <div><span>${t("operator.operatorResidual", "Operator residual")}</span><b>${residual.toLocaleString()} ${uom}</b></div>
     </div>
   `;
 }
@@ -4707,7 +4852,7 @@ function renderVrmaReferenceLinePanel(line) {
         <p>${escapeHtml(line.item_description || "")}</p>
       </div>
       <div class="selected-measures">
-        ${units.map((unit) => `<div class="measure"><span>${t("operator.reference", "Reference")} ${unit.label}</span><b>${displayQty(requiredValue(line, unit.key))}</b></div>`).join("")}
+        ${units.map((unit) => `<div class="measure"><span>${t("operator.reference", "Reference")} ${escapeHtml(displayUnit(unit.label))}</span><b>${displayQty(requiredValue(line, unit.key))}</b></div>`).join("")}
       </div>
       <div class="sync-alert">
         <strong>${t("operator.noPackingTransaction", "No packing transaction")}</strong>
@@ -4749,7 +4894,7 @@ function renderSelectedLinePanel(line) {
       ? `<button class="secondary-button danger-button" data-action="unpack-line" data-line="${line.id}" type="button">${t("operator.unpackPackedQty", "Unpack packed qty")}</button>`
       : `<button class="primary-button" data-action="update-packed-line" data-line="${line.id}" type="button">${t("operator.updatePackedQty", "Update packed qty")}</button>
          <button class="secondary-button danger-button" data-action="unpack-line" data-line="${line.id}" type="button">${t("operator.unpackPackedQty", "Unpack packed qty")}</button>`
-    : `<button class="primary-button" data-action="start-fulfill" type="button">${loadAction.label}</button>
+    : `<button class="primary-button" data-action="start-fulfill" type="button" ${selectedOrder?.posting?.loadBlocked ? "disabled" : ""}>${loadAction.label}</button>
        <button class="secondary-button" data-action="edit-reload-packing" type="button">Edit packing</button>`;
   return `
     <aside class="selected-panel" data-selected-line="${line.id}">
@@ -4764,11 +4909,11 @@ function renderSelectedLinePanel(line) {
         <p>${line.item_description || ""}</p>
       </div>
       <div class="selected-measures">
-        ${isCustomerPickupMode() ? renderPickupMeasures(line, units) : units.map((unit) => `<div class="measure"><span>${t("operator.required", "Required")} ${unit.label}</span><b>${displayQty(requiredValue(line, unit.key))}</b></div>`).join("")}
+        ${isCustomerPickupMode() ? renderPickupMeasures(line, units) : units.map((unit) => `<div class="measure"><span>${t("operator.required", "Required")} ${escapeHtml(displayUnit(unit.label))}</span><b>${displayQty(requiredValue(line, unit.key))}</b></div>`).join("")}
       </div>
       ${qty(line.linked_allocated_sales_qty) > 0 ? renderLinkedSupplyBreakdown(line) : ""}
       ${notice ? `<div class="line-alert"><strong>${t("operator.repackNeeded", "Repack needed")}</strong><span>${notice}</span></div>` : ""}
-      ${notice || !loadAction.allowPackedQuantityEdit ? "" : units.map((unit) => renderStepper(unit.key, `${packedReview ? t("operator.packed", "Packed") : t("operator.pack", "Pack")} ${unit.label}`, panelValue(line, unit.key))).join("")}
+      ${notice || !loadAction.allowPackedQuantityEdit ? "" : units.map((unit) => renderStepper(unit.key, `${packedReview ? t("operator.packed", "Packed") : t("operator.pack", "Pack")} ${escapeHtml(displayUnit(unit.label))}`, panelValue(line, unit.key))).join("")}
       ${packedReview
         ? `<div class="selected-actions">${packedActions}</div>`
         : `<div class="selected-actions"><button class="primary-button" data-action="confirm-line" data-line="${line.id}" ${pageConfirming || pickupConfirming ? "disabled" : ""} type="button">${t("operator.confirmLine", "Confirm line")}</button></div>`}
@@ -4793,7 +4938,28 @@ function deliveryOrderKey(order) {
   return String(order?.netsuite_id || order?.id || "");
 }
 
+function deliveryRefreshContext() {
+  return {
+    account: operator?.id || "", session: operatorSessionKey || authToken,
+    yard: String(locationId), module: currentModule, view: viewMode, mode: deliveryPrepMode,
+    batch: deliveryBatchFilter, orderType: deliveryOrderType,
+    date: deliveryLoadViewDate, truck: deliveryLoadViewTruck, leaving: operatorWorkspaceLeaving
+  };
+}
+
+function invalidateDeliveryOrders() {
+  deliveryRefresh.invalidate();
+}
+
+function cacheDeliveryOrders(view, list, key = deliveryRefresh.cacheKey()) {
+  if (key !== deliveryRefresh.cacheKey()) return;
+  deliveryOrderBuckets[view] = list;
+  deliveryOrderBucketKeys[view] = key;
+  deliveryOrderBucketScopes[view] = deliveryRefresh.scopeKey();
+}
+
 function removeDeliveryOrderFromLocalState(order) {
+  invalidateDeliveryOrders();
   const key = deliveryOrderKey(order);
   if (!key) return;
   const withoutOrder = (list) => Array.isArray(list)
@@ -4814,10 +4980,8 @@ function combineDeliveryOrderTypes(source = {}) {
 }
 
 function applyDeliveryBootstrapState(bootstrap, options = {}) {
-  savedDeliveryOrderKeys = new Set((bootstrap.savedOrderKeys || []).map((key) => String(key)));
-  activeDeliveryDraft = bootstrap.activeDraft || null;
-  applyDeliveryNotifications(bootstrap.notifications, options);
-  deliveryOrderBuckets.active = combineDeliveryOrderTypes(bootstrap.orders);
+  applyDeliveryBootstrapMetadata(bootstrap, options);
+  cacheDeliveryOrders("active", combineDeliveryOrderTypes(bootstrap.orders));
 }
 
 async function fetchPackedDeliveryOrders(targetLocationId = locationId) {
@@ -4831,18 +4995,19 @@ async function fetchPackedDeliveryOrders(targetLocationId = locationId) {
 
 async function primePackedDeliveryOrders({ force = false } = {}) {
   if (deliveryPrepMode !== "standard" || !operator || !locationId) return deliveryOrderBuckets.packed;
-  if (!force && Array.isArray(deliveryOrderBuckets.packed)) return deliveryOrderBuckets.packed;
+  const key = deliveryRefresh.cacheKey();
+  if (!force && deliveryOrderBucketKeys.packed === key && Array.isArray(deliveryOrderBuckets.packed)) return deliveryOrderBuckets.packed;
   const prefetchLocationId = String(locationId);
-  if (packedDeliveryPrefetch?.locationId === prefetchLocationId) return packedDeliveryPrefetch.promise;
+  if (packedDeliveryPrefetch?.key === key) return packedDeliveryPrefetch.promise;
   const promise = fetchPackedDeliveryOrders(prefetchLocationId)
     .then((packedOrders) => {
-      if (String(locationId) === prefetchLocationId) deliveryOrderBuckets.packed = packedOrders;
+      cacheDeliveryOrders("packed", packedOrders, key);
       return packedOrders;
     })
     .finally(() => {
       if (packedDeliveryPrefetch?.promise === promise) packedDeliveryPrefetch = null;
     });
-  packedDeliveryPrefetch = { locationId: prefetchLocationId, promise };
+  packedDeliveryPrefetch = { key, locationId: prefetchLocationId, promise };
   return promise;
 }
 
@@ -4889,7 +5054,10 @@ function applyPackedOrderTransition(order) {
       ? upsertDeliveryOrder(deliveryOrderBuckets.active, nextOrder)
       : deliveryOrderBuckets.active.filter((item) => deliveryOrderKey(item) !== key);
   }
-  deliveryOrderBuckets.packed = upsertDeliveryOrder(deliveryOrderBuckets.packed || [], nextOrder);
+  const scope = deliveryRefresh.scopeKey();
+  const packed = deliveryOrderBucketScopes.packed === scope ? deliveryOrderBuckets.packed : [];
+  deliveryOrderBuckets.packed = upsertDeliveryOrder(packed || [], nextOrder);
+  deliveryOrderBucketScopes.packed = scope;
   if (viewMode === "active") {
     orders = stillOpen
       ? upsertDeliveryOrder(orders, nextOrder)
@@ -4904,9 +5072,11 @@ function applyPackedOrderTransition(order) {
 }
 
 async function activateCachedDeliveryView(nextView) {
-  const cached = deliveryOrderBuckets[nextView];
-  if (!Array.isArray(cached)) return false;
   viewMode = nextView;
+  const ticket = deliveryRefresh.begin("orders");
+  const cached = deliveryOrderBuckets[nextView];
+  if (!Array.isArray(cached) || deliveryOrderBucketScopes[nextView] !== deliveryRefresh.scopeKey()) return false;
+  deliveryVisibleContext = JSON.stringify(deliveryRefreshContext());
   orderPage = 0;
   orders = annotateSavedOrders(cached);
   selectedId = filteredDeliveryOrders()[0]?.netsuite_id || null;
@@ -4916,6 +5086,7 @@ async function activateCachedDeliveryView(nextView) {
   if (nextView === "packed") {
     void api(`/api/operator/requests?locationId=${locationId}&status=open`)
       .then((requests) => {
+        if (!deliveryRefresh.current(ticket)) return;
         operatorRequests = requests;
         if (currentModule === "delivery" && viewMode === "packed") {
           renderDeliveryPanels({ detailPanel: false });
@@ -4926,7 +5097,10 @@ async function activateCachedDeliveryView(nextView) {
   const detailId = selectedId;
   if (detailId) {
     await loadDetail(detailId, { silentRender: true });
-    if (String(selectedId) === String(detailId)) renderDeliveryPanels({ orderPanel: false });
+    if (deliveryRefresh.current(ticket) && String(selectedId) === String(detailId)) renderDeliveryPanels({ orderPanel: false });
+  }
+  if (deliveryRefresh.current(ticket) && deliveryOrderBucketKeys[nextView] !== deliveryRefresh.cacheKey()) {
+    void loadOrders({ keepSelection: true }).catch((error) => showToast(error.message));
   }
   return true;
 }
@@ -4943,87 +5117,115 @@ async function activateCachedDeliveryBatch(nextFilter) {
   selectedId = filteredDeliveryOrders()[0]?.netsuite_id || null;
   selectedOrder = null;
 
+  const ticket = deliveryRefresh.begin("orders");
+  deliveryVisibleContext = JSON.stringify(deliveryRefreshContext());
   renderDeliveryPanels();
   const detailId = selectedId;
   if (detailId) {
     await loadDetail(detailId, { silentRender: true });
-    if (String(selectedId) === String(detailId)) renderDeliveryPanels({ orderPanel: false });
+    if (deliveryRefresh.current(ticket) && String(selectedId) === String(detailId)) renderDeliveryPanels({ orderPanel: false });
+  }
+  if (deliveryRefresh.current(ticket) && deliveryOrderBucketKeys[viewMode] !== deliveryRefresh.cacheKey()) {
+    void loadOrders({ keepSelection: true }).catch((error) => showToast(error.message));
   }
 }
 
 async function loadOrders(options = {}) {
+  const request = { ticket: deliveryRefresh.begin("orders"), context: deliveryRefreshContext() };
   deliveryOrdersLoadingCount += 1;
+  const displayContext = JSON.stringify(request.context);
+  if (deliveryVisibleContext !== displayContext) {
+    deliveryVisibleContext = displayContext;
+    orders = [];
+    selectedOrder = null;
+    selectedLineId = null;
+    renderDeliveryPanels();
+  }
   try {
-    return await loadOrdersRequest(options);
+    return await loadOrdersRequest(options, request);
+  } catch (error) {
+    if (deliveryRefresh.current(request.ticket)) throw error;
+    return false;
   } finally {
     deliveryOrdersLoadingCount = Math.max(0, deliveryOrdersLoadingCount - 1);
+    if (!deliveryOrdersLoadingCount && (pendingDeliveryEventRefresh || pendingReceivingEventRefresh)) {
+      scheduleOperatorEventRefresh();
+    }
   }
 }
 
-async function loadOrdersRequest(options = {}) {
-  const status = viewMode === "packed" ? "packed" : "active";
-  const canBootstrap = ["standard", "saved"].includes(deliveryPrepMode) && status === "active";
-  const previousSelectedOrder = selectedOrder;
-  const previousSelectedId = selectedId;
-  if (canBootstrap) {
+function fetchDeliveryOperatorRequests(context) {
+  if (context.mode !== "standard" || (context.view !== "packed" && context.batch === "transfer")) return Promise.resolve([]);
+  const type = context.view === "packed" ? "" : `&orderType=${context.orderType}`;
+  return api(`/api/operator/requests?locationId=${context.yard}&status=open${type}`).catch(() => []);
+}
+
+async function fetchDeliveryOrdersSnapshot(context) {
+  const status = context.view === "packed" ? "packed" : "active";
+  if (["standard", "saved"].includes(context.mode) && status === "active") {
     const [bootstrap, requests] = await Promise.all([
-      api(`/api/delivery/bootstrap?locationId=${locationId}`),
-      deliveryPrepMode === "standard" && deliveryBatchFilter !== "transfer"
-        ? api(`/api/operator/requests?locationId=${locationId}&orderType=${deliveryOrderType}&status=open`).catch(() => [])
-        : Promise.resolve([])
+      api(`/api/delivery/bootstrap?locationId=${context.yard}`), fetchDeliveryOperatorRequests(context)
     ]);
-    applyDeliveryBootstrapState(bootstrap, options);
-    const bootstrappedOrders = deliveryOrderBuckets.active || [];
-    orders = deliveryPrepMode === "saved"
-      ? bootstrappedOrders.filter((order) => savedDeliveryOrderKeys.has(String(order.netsuite_id || "")))
-      : bootstrappedOrders;
-    operatorRequests = requests;
-  } else if (deliveryPrepMode === "standard" && status === "packed") {
-    const [packedOrders, requests] = await Promise.all([
-      primePackedDeliveryOrders({ force: true }),
-      api(`/api/operator/requests?locationId=${locationId}&status=open`).catch(() => [])
-    ]);
-    deliveryOrderBuckets.packed = packedOrders;
-    orders = packedOrders;
-    operatorRequests = requests;
-    void Promise.all([
-      loadDeliveryNotifications(options),
-      loadCurrentDeliveryDraft(),
-      loadSavedDeliveryOrderKeys()
-    ]).then(() => {
-      if (currentModule === "delivery" && viewMode === "packed") {
-        renderDeliveryPanels({ orderPanel: false, detailPanel: false });
-      }
-    }).catch(() => null);
-  } else {
-    await Promise.all([
-      loadDeliveryNotifications(options),
-      loadCurrentDeliveryDraft(),
-      loadSavedDeliveryOrderKeys()
-    ]);
+    const keys = new Set((bootstrap.savedOrderKeys || []).map(String));
+    const list = combineDeliveryOrderTypes(bootstrap.orders);
+    return { bootstrap, requests, list: context.mode === "saved" ? list.filter((order) => keys.has(deliveryOrderKey(order))) : list };
   }
-  if (!canBootstrap && deliveryPrepMode === "saved") {
-    orders = await api(`/api/delivery/saved-orders?locationId=${locationId}`);
-  } else if (!canBootstrap && deliveryPrepMode === "load") {
-    await loadDeliveryLoadTrucks();
-    orders = deliveryLoadViewTruck
-      ? await api(`/api/delivery/load-orders?locationId=${locationId}&status=${status}&planDate=${encodeURIComponent(deliveryLoadViewDate || "")}&truckPlate=${encodeURIComponent(deliveryLoadViewTruck)}`)
-      : await api(`/api/delivery/load-orders?locationId=${locationId}&status=${status}&planDate=${encodeURIComponent(deliveryLoadViewDate || "")}`);
-  } else if (!canBootstrap) {
-    if (deliveryPrepMode === "standard") {
-      const [salesOrders, transferOrders] = await Promise.all([
-        api(`/api/delivery/orders?locationId=${locationId}&status=${status}&orderType=sales_order`),
-        api(`/api/delivery/orders?locationId=${locationId}&status=${status}&orderType=transfer_order`)
-      ]);
-      orders = [...salesOrders, ...transferOrders];
-    } else {
-      orders = await api(`/api/delivery/orders?locationId=${locationId}&status=${status}&orderType=${deliveryOrderType}`);
+  if (context.mode === "standard") {
+    const [list, requests] = await Promise.all([primePackedDeliveryOrders({ force: true }), fetchDeliveryOperatorRequests(context)]);
+    return { list, requests };
+  }
+  if (context.mode === "saved") {
+    return { list: await api(`/api/delivery/saved-orders?locationId=${context.yard}`), requests: [] };
+  }
+  const trucks = context.date
+    ? await api(`/api/delivery/load-trucks?locationId=${context.yard}&planDate=${encodeURIComponent(context.date)}`).catch(() => []) : [];
+  const truck = trucks.some((item) => String(item.truck_plate) === context.truck) ? context.truck : "";
+  const truckFilter = truck ? `&truckPlate=${encodeURIComponent(truck)}` : "";
+  const list = await api(`/api/delivery/load-orders?locationId=${context.yard}&status=${status}&planDate=${encodeURIComponent(context.date)}${truckFilter}`);
+  return { list, requests: [], trucks, truck };
+}
+
+async function refreshDeliveryMetadata(options, ticket, context) {
+  const [notifications, draft, keys] = await Promise.all([
+    api(`/api/delivery/notifications?locationId=${context.yard}`),
+    api(`/api/delivery/current-draft?locationId=${context.yard}`),
+    api(`/api/delivery/saved-order-keys?locationId=${context.yard}`)
+  ]);
+  if (!deliveryRefresh.current(ticket)) return;
+  applyDeliveryBootstrapMetadata({ notifications, activeDraft: draft, savedOrderKeys: keys }, options);
+  if (currentModule === "delivery") renderDeliveryPanels({ orderPanel: false, detailPanel: false });
+}
+
+function applyDeliveryBootstrapMetadata(bootstrap, options) {
+  deliveryRefresh.begin("draft");
+  deliveryRefresh.begin("saved");
+  deliveryRefresh.begin("notifications");
+  savedDeliveryOrderKeys = new Set((bootstrap.savedOrderKeys || []).map(String));
+  activeDeliveryDraft = bootstrap.activeDraft || null;
+  applyDeliveryNotifications(bootstrap.notifications, options);
+}
+
+async function loadOrdersRequest(options, request) {
+  let { ticket } = request;
+  const { context } = request;
+  const snapshot = await fetchDeliveryOrdersSnapshot(context);
+  if (!deliveryRefresh.current(ticket)) return false;
+  if (snapshot.bootstrap) applyDeliveryBootstrapState(snapshot.bootstrap, options);
+  else if (context.mode === "standard") cacheDeliveryOrders("packed", snapshot.list);
+  if (snapshot.trucks) {
+    deliveryLoadTrucks = snapshot.trucks;
+    if (deliveryLoadViewTruck !== snapshot.truck) {
+      deliveryLoadViewTruck = snapshot.truck;
+      localStorage.removeItem("mbbs.operator.deliveryLoadViewTruck");
+      ticket = deliveryRefresh.begin("orders");
+      request.ticket = ticket;
     }
   }
-  if (!canBootstrap) operatorRequests = deliveryPrepMode === "standard" && deliveryBatchFilter !== "transfer"
-    ? await api(`/api/operator/requests?locationId=${locationId}&orderType=${deliveryOrderType}&status=open`).catch(() => [])
-    : [];
-  orders = annotateSavedOrders(orders);
+  const previousSelectedOrder = selectedOrder;
+  const previousSelectedId = selectedId;
+  orders = annotateSavedOrders(snapshot.list);
+  operatorRequests = snapshot.requests;
+  deliveryVisibleContext = JSON.stringify(deliveryRefreshContext());
   const preparing = preparingOrderId();
   const panelOrders = filteredDeliveryOrders();
   if (viewMode === "active" && preparing) selectedId = preparing;
@@ -5031,19 +5233,21 @@ async function loadOrdersRequest(options = {}) {
   if (selectedId && !panelOrders.some((order) => String(order.netsuite_id) === String(selectedId))) {
     selectedId = panelOrders[0]?.netsuite_id || null;
   }
-  const keepCurrentDetail = options.keepSelection
-    && previousSelectedOrder
+  const keepCurrentDetail = options.keepSelection && previousSelectedOrder
     && String(previousSelectedId || "") === String(selectedId || "");
   selectedOrder = keepCurrentDetail ? previousSelectedOrder : null;
+  if (!keepCurrentDetail) { selectedLineId = null; linePage = 0; }
   renderDeliveryPanels({ detailPanel: !keepCurrentDetail });
+  if (!snapshot.bootstrap) void refreshDeliveryMetadata(options, ticket, context).catch(() => null);
   const detailId = selectedId;
   if (detailId) {
     await loadDetail(detailId, { silentRender: true });
-    if (String(selectedId) === String(detailId)) renderDeliveryPanels({ orderPanel: false });
+    if (deliveryRefresh.current(ticket) && String(selectedId) === String(detailId)) renderDeliveryPanels({ orderPanel: false });
   }
-  if (status === "active" && deliveryPrepMode === "standard") {
+  if (deliveryRefresh.current(ticket) && context.view === "active" && context.mode === "standard") {
     void primePackedDeliveryOrders().catch(() => null);
   }
+  return true;
 }
 
 function consolidationDraftKey(allocation) {
@@ -5070,7 +5274,7 @@ function consolidationStatusText(status) {
 function consolidationTotalsText(totals = []) {
   return totals
     .filter((unit) => qty(unit.required) > 0 || qty(unit.confirmed) > 0)
-    .map((unit) => `${displayQty(unit.confirmed)} / ${displayQty(unit.required)} ${escapeHtml(unit.label)}`)
+    .map((unit) => `${displayQty(unit.confirmed)} / ${displayQty(unit.required)} ${escapeHtml(displayUnit(unit.label))}`)
     .join(" | ") || "0";
 }
 
@@ -5141,10 +5345,10 @@ function renderConsolidationAllocation(allocation) {
           const value = qty(draft[unit.key]);
           return `
             <div class="consolidation-unit">
-              <span>${escapeHtml(unit.label)}</span>
+              <span>${escapeHtml(displayUnit(unit.label))}</span>
               <div class="consolidation-required">
                 <span>${t("operator.required", "Required")}</span>
-                <strong>${displayQty(unit.required)} ${escapeHtml(unit.label)}</strong>
+                <strong>${displayQty(unit.required)} ${escapeHtml(displayUnit(unit.label))}</strong>
                 <small>${t("operator.remaining", "Remaining")} ${displayQty(Math.max(0, qty(unit.required) - value))}</small>
               </div>
               <div class="stepper">
@@ -5207,7 +5411,9 @@ function consolidationQtyText(value) {
 }
 
 function consolidationUnitLabel(unit) {
-  return String(unit?.label || "").toUpperCase() === "PCS" ? "PC" : String(unit?.label || "");
+  const raw = String(unit?.label || "");
+  const translated = displayUnit(raw);
+  return translated !== raw ? translated : raw.toUpperCase() === "PCS" ? "PC" : raw;
 }
 
 function selectedConsolidationReviewOrder() {
@@ -5685,22 +5891,35 @@ async function confirmConsolidationLoad() {
   if (fulfillmentSubmitting || !state.batch) return;
   const batchId = state.batch.id;
   const pending = state.batch.status === "pending";
+  if (!pending) {
+    fulfillmentSubmitting = true;
+    try {
+      const latest = await api(`/api/delivery/consolidation-loads/${encodeURIComponent(batchId)}`);
+      if (state.batchId !== batchId) return;
+      state.batch = latest;
+      if (!await confirmMissingLoadLines(latest.confirmationSummaries)) return;
+    } catch (error) { showToast(error.message); return; }
+    finally { fulfillmentSubmitting = false; }
+  }
   const photos = fulfillmentPhotoDataUrls.filter(Boolean);
   if (!pending && photos.length < 2) { showToast(t("operator.takeTwoLoadPhotos", "Take at least 2 photos before confirming load.")); return; }
   fulfillmentSubmitting = true; fulfillmentJobStage = "Saving proof"; fulfillmentStatusText = "Saving the selected load...";
   stopFulfillmentCamera(); render();
   try {
+    const photoInput = pending ? {} : await prepareOperatorBackgroundPhotos(batchId, photos);
     const photoRefs = pending ? state.photoRefs : photos;
     if (state.batchId !== batchId) return;
     state.photoRefs = photoRefs;
-    const batch = await api(`/api/delivery/consolidation-loads/${batchId}/${pending ? "resume" : "submit"}`, { method: "POST", body: JSON.stringify(pending ? {} : { photoRefs }) });
+    const batch = await api(`/api/delivery/consolidation-loads/${batchId}/${pending ? "resume" : "submit"}`, { method: "POST", body: JSON.stringify(pending ? {} : photoInput.backgroundPhotos ? photoInput : { photoRefs: photoInput.photoDataUrls }) });
     if (state.batchId !== batchId) return;
+    resumeOperatorBackgroundPhotos();
     state.batch = batch;
     if (batch.status === "completed") fulfillmentResult = batch.result;
   } catch (error) {
     if (state.batchId !== batchId) return;
     fulfillmentJobStage = "Load failed"; fulfillmentStatusText = error.message; showToast(error.message);
   } finally {
+    resumeOperatorBackgroundPhotos();
     if (state.batchId === batchId) { fulfillmentSubmitting = false; render(); scheduleConsolidationLoadPoll(); }
   }
 }
@@ -5884,29 +6103,6 @@ async function releaseConsolidation() {
   }
 }
 
-async function loadDeliveryLoadTrucks() {
-  if (deliveryPrepMode !== "load" || !deliveryLoadViewDate) {
-    deliveryLoadTrucks = [];
-    return deliveryLoadTrucks;
-  }
-  deliveryLoadTrucks = await api(`/api/delivery/load-trucks?locationId=${locationId}&planDate=${encodeURIComponent(deliveryLoadViewDate)}`).catch(() => []);
-  if (deliveryLoadViewTruck && !deliveryLoadTrucks.some((truck) => String(truck.truck_plate) === String(deliveryLoadViewTruck))) {
-    deliveryLoadViewTruck = "";
-    localStorage.removeItem("mbbs.operator.deliveryLoadViewTruck");
-  }
-  return deliveryLoadTrucks;
-}
-
-async function loadSavedDeliveryOrderKeys() {
-  if (!operator || !locationId) {
-    savedDeliveryOrderKeys = new Set();
-    return savedDeliveryOrderKeys;
-  }
-  const keys = await api(`/api/delivery/saved-order-keys?locationId=${locationId}`).catch(() => []);
-  savedDeliveryOrderKeys = new Set((keys || []).map((key) => String(key)));
-  return savedDeliveryOrderKeys;
-}
-
 function annotateSavedOrders(list) {
   return (list || []).map((order) => ({
     ...order,
@@ -5952,7 +6148,9 @@ async function loadCurrentDeliveryDraft() {
     activeDeliveryDraft = null;
     return null;
   }
-  activeDeliveryDraft = await api(`/api/delivery/current-draft?locationId=${locationId}`).catch(() => null);
+  const ticket = deliveryRefresh.begin("draft");
+  const draft = await api(`/api/delivery/current-draft?locationId=${locationId}`).catch(() => null);
+  if (deliveryRefresh.current(ticket)) activeDeliveryDraft = draft;
   return activeDeliveryDraft;
 }
 
@@ -5961,18 +6159,20 @@ async function loadDeliveryNotifications(options = {}) {
     deliveryNotifications = { total: 0, salesOrder: { dueToday: 0 }, transferOrder: { dueToday: 0 }, items: [] };
     return deliveryNotifications;
   }
+  const ticket = deliveryRefresh.begin("notifications");
+  const key = deliveryRefresh.cacheKey();
   const requestLocationId = String(locationId);
   const previous = deliveryNotifications;
-  if (!deliveryNotificationsRequest || deliveryNotificationsRequest.locationId !== requestLocationId) {
+  if (!deliveryNotificationsRequest || deliveryNotificationsRequest.key !== key) {
     const promise = api(`/api/delivery/notifications?locationId=${requestLocationId}`)
       .catch(() => previous || { total: 0, salesOrder: { dueToday: 0 }, transferOrder: { dueToday: 0 }, items: [] })
       .finally(() => {
         if (deliveryNotificationsRequest?.promise === promise) deliveryNotificationsRequest = null;
       });
-    deliveryNotificationsRequest = { locationId: requestLocationId, promise };
+    deliveryNotificationsRequest = { key, locationId: requestLocationId, promise };
   }
   const nextNotifications = await deliveryNotificationsRequest.promise;
-  if (String(locationId) !== requestLocationId) return deliveryNotifications;
+  if (!deliveryRefresh.current(ticket)) return deliveryNotifications;
   return applyDeliveryNotifications(nextNotifications, options);
 }
 
@@ -6090,6 +6290,7 @@ async function loadReceivingDetail(id, options = {}) {
     const order = await api(`/api/receiving/orders/${encodeURIComponent(id)}?orderType=${encodeURIComponent(orderType)}`);
     if (!receivingRequestIsCurrent(context) || request !== receivingDetailRequest || String(receivingSelectedId) !== String(id)) return null;
     receivingSelectedOrder = order;
+    if (listOrder) listOrder.line_count = (order.lines || []).filter((line) => isPickableLine(line) && hasReceivingRemainingQty(line)).length;
     if (!options.silentRender) render();
     return order;
   } catch (error) {
@@ -6156,13 +6357,13 @@ async function refreshReceiving() {
 }
 
 async function refreshDeliveryOrders() {
-  deliveryOrderBuckets.active = null;
-  deliveryOrderBuckets.packed = null;
+  invalidateDeliveryOrders();
   await loadOrders({ keepSelection: true });
   showToast("Orders refreshed from local DB");
 }
 
 async function lookupCustomerPickup() {
+  if (pickupLookupBusy) return;
   const code = (document.getElementById("customerPickupScan")?.value || customerPickupScan).trim();
   customerPickupScan = code;
   customerPickupMessage = "";
@@ -6170,12 +6371,14 @@ async function lookupCustomerPickup() {
     customerPickupMessage = "Scan or enter a sales order number.";
     return render();
   }
+  pickupLookupBusy = true;
   try {
     const order = await api("/api/customer-pickup/lookup", {
       method: "POST",
       body: JSON.stringify({ code, locationId })
     });
     stopPickupScannerCamera();
+    pickupLookupBusy = false;
     const pickupLines = customerPickupVisibleLines(order);
     if (!pickupLines.length) {
       selectedOrder = null;
@@ -6192,6 +6395,7 @@ async function lookupCustomerPickup() {
     currentModule = "customer-pickup";
     render();
   } catch (error) {
+    pickupLookupBusy = false;
     customerPickupMessage = error.message;
     render();
   }
@@ -6409,8 +6613,15 @@ function pressReceivingKey(key) {
 
 async function loadDetail(id, options = {}) {
   selectedId = id;
-  const order = await api(`/api/delivery/orders/${id}`);
-  if (String(selectedId) !== String(id)) return null;
+  const ticket = deliveryRefresh.begin("detail");
+  let order;
+  try {
+    order = await api(`/api/delivery/orders/${id}`);
+  } catch (error) {
+    if (deliveryRefresh.current(ticket) && String(selectedId) === String(id)) throw error;
+    return null;
+  }
+  if (!deliveryRefresh.current(ticket) || String(selectedId) !== String(id)) return null;
   selectedOrder = order;
   mergeDeliveryOrderIntoState(order);
   const lines = visibleLines(order);
@@ -6444,11 +6655,7 @@ async function setOrderStatus(status) {
         await loadDetail(nextOrderId, { silentRender: true });
         if (String(selectedId) === String(nextOrderId)) renderDeliveryPanels({ orderPanel: false });
       }
-      void primePackedDeliveryOrders({ force: true })
-        .then((packedOrders) => {
-          deliveryOrderBuckets.packed = upsertDeliveryOrder(packedOrders || [], result.order);
-        })
-        .catch(() => null);
+      void primePackedDeliveryOrders({ force: true }).catch(() => null);
     } else {
       acceptRefreshedDeliveryOrder(result.order);
     }
@@ -6539,7 +6746,7 @@ function updatePageConfirmControls() {
   }
   if (currentModule === "customer-pickup") {
     const load = app.querySelector('[data-action="start-fulfill"]');
-    if (load) load.disabled = busy || !hasCustomerPickupDraft();
+    if (load) load.disabled = busy || !hasCustomerPickupDraft() || selectedOrder?.posting?.loadBlocked;
   }
 }
 
@@ -6762,33 +6969,74 @@ function renderOperatorNetSuitePostingTransactions(result) {
       ${transactions.map((transaction) => `
         <strong>${escapeHtml(transaction.transactionType || "Transaction")} ${escapeHtml(transaction.transactionRef || transaction.transactionId || "Verified")}</strong>
         <p>${escapeHtml(transaction.sourceOrderKind || "Order")} ${escapeHtml(transaction.sourceOrderRef || transaction.sourceNetSuiteId || "")}</p>
+        <p>${escapeHtml((transaction.inventoryLocationNames || transaction.inventoryLocationIds || []).join(" / "))}</p>
       `).join("")}
     </div>
   `;
 }
 
+/** @param {string} jobId @param {(progress: Record<string, any>) => void} [onProgress] */
 async function pollOperatorNetSuitePostingJob(jobId, onProgress = () => {}) {
   if (!jobId) throw new Error("Operator NetSuite posting job was not started.");
-  for (let attempt = 0; attempt < 120; attempt += 1) {
-    await new Promise((resolve) => setTimeout(resolve, 1000));
-    const job = await api(`/api/operator/netsuite-posting-jobs/${jobId}`);
-    if (job.status === "completed") return job.result?.localFinalization || job.result;
-    if (job.status === "attention") {
-      const error = new Error("NetSuite verification needs Admin attention. The order was not completed locally.");
-      error.code = "OPERATOR_NETSUITE_POSTING_ATTENTION";
-      error.payload = { posting: job };
-      throw error;
+  const pollingStartedAt = Date.now();
+  const waiter = operatorPostingWaiter(jobId);
+  try {
+    while (true) {
+      const job = await api(`/api/operator/netsuite-posting-jobs/${jobId}`);
+      if (job.status === "completed") return job.result?.localFinalization || job.result;
+      if (job.status === "attention") {
+        const error = new Error("NetSuite verification needs Admin attention. The order was not completed locally.");
+        error.code = "OPERATOR_NETSUITE_POSTING_ATTENTION";
+        error.payload = { posting: job };
+        throw error;
+      }
+      if (job.status === "failed") {
+        const error = new Error(job.lastError || "NetSuite posting failed. The order was not completed locally.");
+        error.payload = { posting: job };
+        throw error;
+      }
+      const postedSteps = (job.steps || []).filter((step) => step.status === "posted").length;
+      const elapsedSeconds = Math.max(1, Math.round((Date.now() - pollingStartedAt) / 1000));
+      onProgress({
+        job,
+        stage: job.status === "finalizing" ? "Finalizing locally" : "Posting to NetSuite",
+        message: `${operatorPostingDelayNotice(elapsedSeconds)}${postedSteps}/${job.steps?.length || 0} NetSuite transaction(s) verified. ${elapsedSeconds}s`
+      });
+      await waiter.wait();
     }
-    if (job.status === "failed") {
-      throw new Error(job.lastError || "NetSuite posting failed. The order was not completed locally.");
-    }
-    const postedSteps = (job.steps || []).filter((step) => step.status === "posted").length;
-    onProgress({
-      stage: job.status === "finalizing" ? "Finalizing locally" : "Posting to NetSuite",
-      message: `${postedSteps}/${job.steps?.length || 0} NetSuite transaction(s) verified. ${attempt + 1}s`
-    });
+  } finally {
+    waiter.close();
   }
-  throw new Error("NetSuite verification is still running. Do not repeat the operation; check Admin attention.");
+}
+
+function operatorPostingWaiter(jobId) {
+  let notified = false;
+  let finish = null;
+  let timer = null;
+  const wake = () => { notified = true; finish?.(); };
+  const listeners = operatorPostingPollWakeups.get(jobId) || new Set();
+  listeners.add(wake);
+  operatorPostingPollWakeups.set(jobId, listeners);
+  return {
+    async wait() {
+      if (!notified) {
+        await new Promise((resolve) => {
+          finish = () => { clearTimeout(timer); finish = null; resolve(); };
+          timer = setTimeout(finish, 1000);
+        });
+      }
+      notified = false;
+    },
+    close() {
+      clearTimeout(timer);
+      listeners.delete(wake);
+      if (!listeners.size) { operatorPostingPollWakeups.delete(jobId); }
+    }
+  };
+}
+
+function operatorPostingDelayNotice(elapsedSeconds) {
+  return elapsedSeconds >= 15 ? "NetSuite is taking longer. Still waiting for confirmation. " : "";
 }
 
 async function editReloadPacking() {
@@ -6813,7 +7061,12 @@ async function editReloadPacking() {
 
 async function startFulfillment() {
   if (!selectedOrder) return;
-  let order = selectedOrder;
+  let order = await api(`/api/delivery/orders/${encodeURIComponent(selectedOrder.netsuite_id)}`);
+  await resumePreviousLoadJournal(order);
+  selectedOrder = order;
+  if (order.posting?.loadBlocked) { render(); return showToast(order.posting.reason); }
+  if (!await confirmMissingLoadLines([order.confirmationSummary])) { return; }
+  order.loadConfirmationAcknowledged = JSON.stringify(order.confirmationSummary);
   if (order.reload_authorized) {
     const refreshed = await api(`/api/delivery/orders/${encodeURIComponent(order.netsuite_id)}`);
     acceptRefreshedDeliveryOrder(refreshed, { renderPanels: false });
@@ -6842,7 +7095,7 @@ async function startFulfillment() {
   fulfillmentJobStage = "";
   fulfillmentStartedAt = 0;
   fulfillmentValidation = null;
-  fulfillmentLoadRequestId = createOperatorUuid();
+  fulfillmentLoadRequestId = loadPostingJournal(order)?.requestId || createOperatorUuid();
   fulfillmentNetSuitePolicy = null;
   fulfillmentNetSuitePolicyError = "";
   const postingFunction = customerPickupLoad ? "customer_pickup" : "delivery_prep";
@@ -6962,7 +7215,24 @@ function readPhotoFile(file) {
 async function confirmFulfillment() {
   if (fulfillmentOrder?.is_consolidation_load) return confirmConsolidationLoad();
   if (!fulfillmentOrder || fulfillmentSubmitting) return;
+  if (fulfillmentOrder.posting?.loadBlocked) return;
   fulfillmentSubmitting = true;
+  if (fulfillmentOrder.confirmationSummary) {
+    try {
+      const latest = await api(`/api/delivery/orders/${encodeURIComponent(fulfillmentOrder.netsuite_id)}`);
+      if (latest.posting?.loadBlocked) {
+        fulfillmentOrder.posting = latest.posting;
+        fulfillmentSubmitting = false; render(); return;
+      }
+      if (JSON.stringify(latest.confirmationSummary) !== fulfillmentOrder.loadConfirmationAcknowledged
+          && !await confirmMissingLoadLines([latest.confirmationSummary])) {
+        fulfillmentSubmitting = false; render(); return;
+      }
+      fulfillmentOrder = { ...latest, loadConfirmationAcknowledged: JSON.stringify(latest.confirmationSummary) };
+    } catch (error) {
+      fulfillmentSubmitting = false; showToast(error.message); render(); return;
+    }
+  }
   const isPickupLoad = currentModule === "customer-pickup-load";
   const postingFunction = isPickupLoad ? "customer_pickup" : "delivery_prep";
   const localOnlyPosting = operatorNetSuitePostingIsLocalOnly(fulfillmentOrder, postingFunction);
@@ -6996,10 +7266,8 @@ async function confirmFulfillment() {
   }
   stopFulfillmentCamera();
   fulfillmentStartedAt = Date.now();
-  fulfillmentJobStage = photos.length ? "Saving proof" : "Saving load";
-  fulfillmentStatusText = photos.length
-    ? "Saving photo proof and local loaded status..."
-    : "Saving local loaded status...";
+  fulfillmentJobStage = "Saving load";
+  fulfillmentStatusText = "Saving local loaded status...";
   fulfillmentValidation = null;
   window.clearInterval(fulfillmentProgressTimer);
   fulfillmentProgressTimer = window.setInterval(() => {
@@ -7008,36 +7276,31 @@ async function confirmFulfillment() {
   render();
   try {
     const deferPhotos = !localOnlyPosting && fulfillmentNetSuitePolicy?.effective;
-    fulfillmentStatusText = photos.length ? "Saving photo proof..." : "Saving local loaded status...";
-    render();
-    const uploadedPhotoRefs = photos.length
-      ? deferPhotos ? photos : await uploadOperatorPhotos(photos, {
-          recordType: isPickupLoad ? "operator-customer-pickup-photo" : "operator-load-photo",
-          orderType: fulfillmentOrder.order_type || deliveryOrderType,
-          orderId: fulfillmentOrder.netsuite_id,
-          orderRef: fulfillmentOrder.tranid
-        })
-      : [];
+    const photoInput = await prepareOperatorBackgroundPhotos(fulfillmentLoadRequestId, photos);
     const path = currentModule === "customer-pickup-load"
       ? `/api/customer-pickup/orders/${fulfillmentOrder.netsuite_id}/load`
       : `/api/delivery/orders/${fulfillmentOrder.netsuite_id}/load`;
     fulfillmentStatusText = fulfillmentNetSuitePolicy?.effective
       ? "Creating and verifying the NetSuite fulfillment..."
       : "Saving local loaded status...";
+    showFulfillmentPostingStage(deferPhotos);
+    rememberFulfillmentPosting({ status: "submitting", loadBlocked: true });
     const started = await api(path, {
       method: "POST",
       body: JSON.stringify({
-        photoDataUrls: uploadedPhotoRefs,
+        ...photoInput,
         requestId: fulfillmentLoadRequestId,
         locationId,
         orderType: fulfillmentOrder.order_type || deliveryOrderType,
         netSuitePostingPolicy: operatorNetSuitePolicyToken(fulfillmentNetSuitePolicy)
       })
     });
+    resumeOperatorBackgroundPhotos();
     if (started.status === "error") throw new Error(started.error || "NetSuite posting could not be verified.");
     if (started.status === "complete" && started.result) {
       fulfillmentResult = started.result;
     } else if (started.status === "running") {
+      rememberFulfillmentPosting({ jobId: started.jobId, status: "posting", loadBlocked: true });
       fulfillmentJobStage = "Posting to NetSuite";
       fulfillmentStatusText = t("operator.waitingNetSuiteVerification", "Waiting for NetSuite transaction verification...");
       render();
@@ -7049,20 +7312,126 @@ async function confirmFulfillment() {
     } else {
       fulfillmentResult = started;
     }
+    rememberFulfillmentPosting(null);
     showToast(fulfillmentNetSuitePolicy?.effective ? "NetSuite verified and order loaded" : "Order loaded locally");
   } catch (error) {
-    fulfillmentJobStage = "Load failed";
+    const job = error.payload?.posting;
+    if (job) rememberFulfillmentPosting(["completed", "failed"].includes(job.status) ? null : postingSummaryFromJob(job));
+    else if (error.status >= 400 && error.status < 500 && !["OPERATOR_NETSUITE_POSTING_IN_PROGRESS", "OPERATOR_NETSUITE_POSTING_ORDER_CLAIMED"].includes(error.payload?.code || error.code)) rememberFulfillmentPosting(null);
+    fulfillmentJobStage = fulfillmentOrder.posting?.loadBlocked ? "Verification pending" : "Load failed";
     fulfillmentValidation = error.payload?.validation || null;
     fulfillmentStatusText = fulfillmentValidation
       ? "Correct the listed packed lines before loading."
       : error.message;
     showToast(error.message);
   } finally {
+    resumeOperatorBackgroundPhotos();
     window.clearInterval(fulfillmentProgressTimer);
     fulfillmentProgressTimer = null;
     fulfillmentSubmitting = false;
     render();
   }
+}
+
+function showFulfillmentPostingStage(deferPhotos) {
+  if (deferPhotos) {fulfillmentJobStage = "Posting to NetSuite";}
+  render();
+}
+
+function postingSummaryFromJob(job) {
+  return { jobId: job.id, status: job.status, loadBlocked: job.status !== "completed" && job.status !== "failed",
+    reason: job.status === "attention" ? "NetSuite verification needs review. This load is held until reconciliation finishes." : "This load is being verified.",
+    transactions: (job.steps || []).flatMap(step => {
+      const id = step.transactionId || step.observedTransaction?.id;
+      return id ? [{ id, ref: step.transactionRef || step.observedTransaction?.tranId || String(id), verified: step.status === "posted" }] : [];
+    }) };
+}
+
+function loadPostingJournalKey(order) {
+  const account = typeof operator === "undefined" ? "" : operator?.id || "";
+  return `mbbs.operator.posting:${account}:${order?.order_type}:${order?.netsuite_id}`;
+}
+
+function loadPostingJournal(order) {
+  try { return JSON.parse(window.localStorage?.getItem(loadPostingJournalKey(order)) || "null"); }
+  catch { return null; }
+}
+
+function rememberFulfillmentPosting(posting) {
+  if (!fulfillmentOrder) return;
+  fulfillmentOrder.posting = posting;
+  try {
+    const key = loadPostingJournalKey(fulfillmentOrder);
+    if (posting) window.localStorage?.setItem(key, JSON.stringify({ requestId: fulfillmentLoadRequestId, ...posting }));
+    else window.localStorage?.removeItem(key);
+  } catch { /* Durable server claims remain authoritative if browser storage is unavailable. */ }
+}
+
+async function resumePreviousLoadJournal(order) {
+  const previous = loadPostingJournal(order);
+  if (!previous || order.posting?.loadBlocked) return;
+  // The request UUID is also the durable command ID, even if admission's
+  // response was lost before the browser learned the job ID.
+  const job = await api(`/api/operator/netsuite-posting-jobs/${encodeURIComponent(previous.jobId || previous.requestId)}`).catch(() => null);
+  if (!job) return;
+  if (["completed", "failed"].includes(job.status)) {
+    try { window.localStorage?.removeItem(loadPostingJournalKey(order)); } catch { /* Server state still prevents duplicate completion. */ }
+  } else order.posting = postingSummaryFromJob(job);
+}
+
+function renderLoadPostingStatus(order) {
+  const posting = order?.posting;
+  if (!posting?.loadBlocked) return "";
+  const references = (posting.transactions || []).map(transaction => transaction.ref).filter(Boolean).join(", ");
+  return `<div class="sync-alert danger" data-load-posting-status role="status">
+    <strong>${posting.status === "attention" ? "Needs review" : "Verification pending"}${references ? ` · ${escapeHtml(references)}` : ""}</strong>
+    <span>${escapeHtml(posting.reason || "The previous load is being checked. Check its status before continuing.")}</span>
+    <button class="secondary-button" data-action="refresh-load-posting" type="button">Check status</button>
+  </div>`;
+}
+
+async function refreshLoadPostingStatus() {
+  const order = fulfillmentOrder || selectedOrder;
+  if (!order) return;
+  const refreshed = await api(`/api/delivery/orders/${encodeURIComponent(order.netsuite_id)}`);
+  if (fulfillmentOrder) {
+    const jobId = refreshed.posting?.jobId || fulfillmentOrder.posting?.jobId || loadPostingJournal(order)?.requestId;
+    if (jobId) {
+      const job = await api(`/api/operator/netsuite-posting-jobs/${encodeURIComponent(jobId)}`).catch(() => null);
+      if (job?.status === "completed") {
+        fulfillmentResult = job.result?.localFinalization || job.result;
+        rememberFulfillmentPosting(null);
+      } else if (job) refreshed.posting = postingSummaryFromJob(job);
+    }
+    fulfillmentOrder = { ...refreshed, loadConfirmationAcknowledged: fulfillmentOrder.loadConfirmationAcknowledged };
+    if (!refreshed.posting?.loadBlocked && !fulfillmentResult && !hasDraftPackedQty(refreshed)) {
+      return finishFulfillment();
+    }
+  } else selectedOrder = refreshed;
+  render();
+}
+
+let loadPartialConfirmation = null;
+function confirmMissingLoadLines(summaries) {
+  const missing = (summaries || []).filter(summary => summary?.missing?.length);
+  if (!missing.length) return Promise.resolve(true);
+  if (loadPartialConfirmation) return Promise.resolve(false);
+  const dialog = document.createElement("dialog");
+  dialog.className = "receiving-confirmation-dialog";
+  dialog.dataset.loadPartialConfirmation = "true";
+  dialog.setAttribute("aria-labelledby", "load-confirmation-title");
+  dialog.innerHTML = `<form method="dialog"><h2 id="load-confirmation-title">Unconfirmed load lines</h2>
+    ${missing.map(summary => `<p><strong>${escapeHtml(summary.orderRef)}</strong></p>
+      <p>${summary.confirmed} of ${summary.total} lines confirmed; ${summary.missing.length} still unconfirmed.</p>
+      <ul>${summary.missing.map(line => `<li>${escapeHtml(line.sku)}</li>`).join("")}</ul>`).join("")}
+    <p>Only confirmed lines will be loaded. Remaining lines stay open and will appear when you scan the order again.</p>
+    <div class="receiving-confirmation-actions"><button class="secondary-button" value="back" autofocus>Go back</button>
+      <button class="primary-button" value="load">Load confirmed lines</button></div></form>`;
+  loadPartialConfirmation = dialog;
+  return new Promise(resolve => {
+    dialog.addEventListener("close", () => { loadPartialConfirmation = null; dialog.remove(); resolve(dialog.returnValue === "load"); }, { once: true });
+    document.body.appendChild(dialog); dialog.showModal();
+  });
 }
 
 async function pollFulfillmentJob(jobId) {
@@ -7116,7 +7485,7 @@ function renderReceiptScreen() {
     currentModule = "receiving";
     return render();
   }
-  const confirmedLines = (order.lines || []).filter((line) => hasReceivedQty(line));
+  const confirmedLines = (order.lines || []).filter((line) => hasReceivedQty(line) && hasReceivingRemainingQty(line));
   const localOnlyPosting = operatorNetSuitePostingIsLocalOnly(order, "receiving");
   const postingModeReady = operatorNetSuitePostingReady(receiptNetSuitePolicy, {
     localOnly: localOnlyPosting,
@@ -7128,8 +7497,8 @@ function renderReceiptScreen() {
       <section class="fulfillment-screen">
         <div class="fulfillment-card success">
           <span>${isLocalCo ? t("operator.localCoReceived", "Local CO Received") : t("operator.itemReceipt", "Item Receipt")}</span>
-          <strong>${receiptResult.itemReceiptTranid || receiptResult.itemReceiptId || t("common.created", "Created")}</strong>
-          <p>${isLocalCo ? t("operator.coReadyForLoading", "CO is now available in Delivery Prep packed orders for loading.") : receiptNetSuitePolicy?.effective ? t("operator.receivingPosted", "Receiving posted to NetSuite and verified.") : t("operator.receivingRecordedLocally", "Receiving recorded locally. No NetSuite Item Receipt was created.")}</p>
+          <strong>${escapeHtml(receiptResult.itemReceiptTranid || receiptResult.itemReceiptId || t("common.created", "Created"))}</strong>
+          <p>${isLocalCo ? t("operator.coReadyForLoading", "CO is now available in Delivery Prep packed orders for loading.") : receiptResult.itemReceiptId || receiptResult.itemReceiptTranid || operatorNetSuitePostingTransactions(receiptResult).length ? t("operator.receivingPosted", "Receiving posted to NetSuite and verified.") : t("operator.receivingRecordedLocally", "Receiving recorded locally. No NetSuite Item Receipt was created.")}</p>
         </div>
         ${renderOperatorNetSuitePostingTransactions(receiptResult)}
         <div class="selected-actions">
@@ -7137,6 +7506,11 @@ function renderReceiptScreen() {
         </div>
       </section>
     `, `<button class="secondary-button" data-action="finish-receive" type="button">${t("operator.receiving", "Receiving")}</button>`);
+  }
+  if (order.posting?.receiveBlocked) {
+    return shell(t("operator.receiveOrder", "Receive Order"), escapeHtml(order.tranid),
+      `<section class="fulfillment-screen">${renderReceiptPostingStatus(order.posting)}</section>`,
+      `<button class="secondary-button" data-action="cancel-receive" type="button">${t("common.back", "Back")}</button>`);
   }
   return shell(t("operator.receiveOrder", "Receive Order"), `${order.tranid} | ${t("common.location", "Location")} ${currentLocation()?.text || ""}`, `
     <section class="fulfillment-screen fulfillment-form-screen">
@@ -7180,7 +7554,7 @@ function renderReceiptScreen() {
               <b>${line.sku || line.item_name}</b>
               <span>${shouldUseSalesQuantity(line)
                 ? `${displayQty(line.received_sales_qty)} ${salesQuantityLabel(line)}`
-                : `${displayQty(line.received_pallet_qty)} PLT / ${displayQty(line.received_section_qty)} SEC / ${displayQty(line.received_layer_qty)} LYR / ${displayQty(line.received_piece_qty)} PCS`}</span>
+                : `${displayQty(line.received_pallet_qty)} ${displayUnit("PLT")} / ${displayQty(line.received_section_qty)} ${displayUnit("SEC")} / ${displayQty(line.received_layer_qty)} ${displayUnit("LYR")} / ${displayQty(line.received_piece_qty)} ${displayUnit("PCS")}`}</span>
             </div>
           `).join("") || `<p class="muted">${t("operator.noConfirmedQty", "No confirmed qty.")}</p>`}
         </div>
@@ -7282,8 +7656,45 @@ async function unconfirmReceivingLine(lineId) {
   render();
 }
 
+let receivingPartialConfirmation = null;
+
+function confirmMissingReceivingLines(order) {
+  const outstanding = (order.lines || []).filter(line => isPickableLine(line) && hasReceivingRemainingQty(line));
+  const missing = outstanding.filter(line => !hasReceivedQty(line));
+  if (!missing.length) {return Promise.resolve(true);}
+  if (receivingPartialConfirmation) {return Promise.resolve(false);}
+  const dialog = document.createElement("dialog");
+  dialog.className = "receiving-confirmation-dialog";
+  dialog.dataset.receivingPartialConfirmation = "true";
+  dialog.setAttribute("aria-labelledby", "receiving-confirmation-title");
+  dialog.innerHTML = `
+    <form method="dialog">
+      <h2 id="receiving-confirmation-title">${t("operator.unconfirmedReceivingLines", "Unconfirmed receiving lines")}</h2>
+      <p><strong>${escapeHtml(order.tranid || "")}</strong></p>
+      <p>${tf("operator.receivingMissingLineCount", "{count} of {total} lines are still unconfirmed.", { count: missing.length, total: outstanding.length })}</p>
+      <ul>${missing.map(line => `<li>${escapeHtml(line.sku || line.item_name || "Item")}</li>`).join("")}</ul>
+      <p>${t("operator.receivingPartialExplanation", "Only confirmed lines will be received. The remaining lines will stay open for a separate receipt.")}</p>
+      <div class="receiving-confirmation-actions">
+        <button class="secondary-button" value="back" autofocus>${t("operator.receivingGoBack", "Go back")}</button>
+        <button class="primary-button" value="receive">${t("operator.receiveConfirmedLines", "Receive confirmed lines")}</button>
+      </div>
+    </form>`;
+  receivingPartialConfirmation = dialog;
+  return new Promise(resolve => {
+    dialog.addEventListener("close", () => {
+      receivingPartialConfirmation = null;
+      dialog.remove();
+      resolve(dialog.returnValue === "receive");
+    }, { once: true });
+    document.body.appendChild(dialog);
+    dialog.showModal();
+  });
+}
+
 async function startReceipt() {
   if (!receivingSelectedOrder) return;
+  if (await resumeReceiptPosting(receivingSelectedOrder)) return;
+  if (!await confirmMissingReceivingLines(receivingSelectedOrder)) {return;}
   receiptOrder = receivingSelectedOrder;
   receiptPhotoDataUrls = [];
   receiptActivePhotoSlot = 0;
@@ -7345,13 +7756,21 @@ async function captureReceiptPhoto() {
 }
 
 async function confirmReceipt() {
-  if (!receiptOrder || receiptPhotoDataUrls.filter(Boolean).length < 2 || receiptSubmitting) return;
+  if (!receiptOrder || receiptSubmitting || receiptResult) return;
+  if (receiptOrder.posting?.receiveBlocked) return refreshReceiptPostingStatus();
+  if (receiptPhotoDataUrls.filter(Boolean).length < 2) return;
+  const activeOrder = receiptOrder;
+  const requestId = receiptRequestId;
+  const isCurrent = () => receiptOrder === activeOrder && receiptRequestId === requestId;
   const localOnlyPosting = operatorNetSuitePostingIsLocalOnly(receiptOrder, "receiving");
   if (!localOnlyPosting) {
     try {
-      receiptNetSuitePolicy = await loadOperatorNetSuitePostingPolicy("receiving");
+      const policy = await loadOperatorNetSuitePostingPolicy("receiving");
+      if (!isCurrent()) return;
+      receiptNetSuitePolicy = policy;
       receiptNetSuitePolicyError = "";
     } catch (error) {
+      if (!isCurrent()) return;
       receiptNetSuitePolicy = null;
       receiptNetSuitePolicyError = error.message || "Could not verify the live NetSuite posting mode.";
       showToast(receiptNetSuitePolicyError);
@@ -7362,27 +7781,24 @@ async function confirmReceipt() {
   stopReceiptCamera();
   receiptSubmitting = true;
   receiptStartedAt = Date.now();
-  receiptJobStage = "Uploading proof";
-  receiptStatusText = "Uploading receiving proof to server...";
-  window.clearInterval(receiptProgressTimer);
+  receiptJobStage = "Saving receiving";
+  receiptStatusText = "Saving receiving confirmation...";
+  window.clearInterval(receiptProgressTimer ?? undefined);
   receiptProgressTimer = window.setInterval(() => {
     if (receiptSubmitting) updateUploadElapsed("[data-receipt-upload-elapsed]", receiptStartedAt);
   }, 1000);
+  const progressTimer = receiptProgressTimer;
   render();
   try {
     const deferPhotos = !localOnlyPosting && receiptNetSuitePolicy?.effective;
-    receiptStatusText = "Saving receiving photos...";
-    render();
-    const uploadedPhotoRefs = deferPhotos ? receiptPhotoDataUrls.filter(Boolean) : await uploadOperatorPhotos(receiptPhotoDataUrls.filter(Boolean), {
-      recordType: (receiptOrder.order_type || receivingOrderType) === "co_order" ? "operator-co-receiving-photo" : "operator-receiving-photo",
-      orderType: receiptOrder.order_type || receivingOrderType,
-      orderId: receiptOrder.netsuite_id,
-      orderRef: receiptOrder.tranid
-    });
+    showReceiptPostingStage(deferPhotos);
+    const photoInput = await prepareOperatorBackgroundPhotos(receiptRequestId, receiptPhotoDataUrls.filter(Boolean));
+    if (!isCurrent()) return;
+    if (deferPhotos) rememberReceiptPosting({ jobId: receiptRequestId, status: "submitting", receiveBlocked: true, transactions: [] });
     const started = await api(`/api/receiving/orders/${receiptOrder.netsuite_id}/receive`, {
       method: "POST",
       body: JSON.stringify({
-        photoDataUrls: uploadedPhotoRefs,
+        ...photoInput,
         requestId: receiptRequestId,
         locationId,
         destinationLocationId: locationId,
@@ -7391,8 +7807,11 @@ async function confirmReceipt() {
         netSuitePostingPolicy: operatorNetSuitePolicyToken(receiptNetSuitePolicy)
       })
     });
+    if (!isCurrent()) return;
+    resumeOperatorBackgroundPhotos();
     if (started.status === "complete" && started.result) {
       receiptResult = started.result;
+      if (receiptOrder.posting) rememberReceiptPosting({ ...receiptOrder.posting, status: "completed", receiveBlocked: false });
       showToast((receiptOrder.order_type || receivingOrderType) === "co_order"
         ? "CO received and moved to packed list"
         : receiptNetSuitePolicy?.effective
@@ -7401,29 +7820,213 @@ async function confirmReceipt() {
       return;
     }
     if (started.status === "error") throw new Error(started.error || "NetSuite posting could not be verified.");
+    if (started.posting) rememberReceiptPosting({ ...receiptOrder.posting, jobId: started.jobId, status: "posting", receiveBlocked: true });
     receiptJobStage = started.posting ? "Posting to NetSuite" : "Queued";
     receiptStatusText = started.posting
       ? t("operator.waitingNetSuiteVerification", "Waiting for NetSuite transaction verification...")
       : "Waiting for local receiving record...";
     render();
-    receiptResult = started.posting
-      ? await pollOperatorNetSuitePostingJob(started.jobId, ({ stage, message }) => {
+    const completed = started.posting
+      ? await pollOperatorNetSuitePostingJob(started.jobId, ({ stage, message, job }) => {
+          if (!isCurrent()) return;
+          if (job) observeReceiptPostingJob(job);
           receiptJobStage = stage;
           receiptStatusText = message;
           render();
         })
       : await pollReceiptJob(started.jobId);
+    if (!isCurrent()) return;
+    receiptResult = completed;
+    if (receiptOrder.posting) rememberReceiptPosting({ ...receiptOrder.posting, status: "completed", receiveBlocked: false });
     showToast(started.posting ? "NetSuite verified and receiving completed" : "Receiving recorded locally");
-  } catch (error) {
-    receiptJobStage = "Receiving failed";
-    receiptStatusText = error.message;
-    showToast(error.message);
+  } catch (caught) {
+    if (!isCurrent()) return;
+    const error = /** @type {Record<string, any>} */ (caught);
+    const job = error.payload?.posting;
+    if (job) observeReceiptPostingJob(job);
+    else if (receiptOrder.posting?.status === "submitting" && error.status >= 400 && error.status < 500
+        && ![408, 429].includes(error.status)
+        && !["OPERATOR_NETSUITE_POSTING_IN_PROGRESS", "OPERATOR_NETSUITE_POSTING_ORDER_CLAIMED"].includes(error.payload?.code || error.code)) {
+      rememberReceiptPosting(null);
+    }
+    if (receiptOrder.posting?.receiveBlocked) {
+      receiptJobStage = "Verification pending";
+      if (!job) {
+        receiptSubmitting = false;
+        await refreshReceiptPostingStatus();
+      }
+    } else if (!receiptResult) {
+      receiptJobStage = "Receiving failed";
+      receiptStatusText = error.message;
+      showToast(error.message);
+    }
   } finally {
-    window.clearInterval(receiptProgressTimer);
-    receiptProgressTimer = null;
-    receiptSubmitting = false;
-    render();
+    resumeOperatorBackgroundPhotos();
+    window.clearInterval(progressTimer);
+    if (isCurrent()) {
+      receiptProgressTimer = null;
+      receiptSubmitting = false;
+      render();
+    }
   }
+}
+
+function showReceiptPostingStage(deferPhotos) {
+  receiptJobStage = deferPhotos ? "Posting to NetSuite" : "Saving receiving";
+  receiptStatusText = deferPhotos
+    ? "Creating and verifying the NetSuite receipt..." : "Saving receiving confirmation...";
+  render();
+}
+
+/** @param {Record<string, any>} order */
+function receiptPostingJournalKey(order) {
+  return `mbbs.operator.receipt:${operator?.id || ""}:${order?.order_type}:${order?.netsuite_id}`;
+}
+
+/** @param {Record<string, any>} order */
+function readReceiptPostingJournal(order) {
+  try {
+    const saved = JSON.parse(window.localStorage?.getItem(receiptPostingJournalKey(order)) || "null");
+    return saved && typeof saved.requestId === "string" && saved.requestId ? saved : null;
+  } catch { return null; }
+}
+
+/** @param {Record<string, any> | null} posting */
+function rememberReceiptPosting(posting) {
+  if (!receiptOrder) return;
+  if (posting?.status === "completed" && receiptResult) {
+    const transactions = operatorNetSuitePostingTransactions(receiptResult)
+      .filter((transaction) => transaction.transactionType === "IR")
+      .map((transaction) => ({ id: transaction.transactionId, ref: transaction.transactionRef || String(transaction.transactionId) }));
+    if (!transactions.length && receiptResult.itemReceiptId) transactions.push({
+      id: receiptResult.itemReceiptId, ref: receiptResult.itemReceiptTranid || String(receiptResult.itemReceiptId)
+    });
+    if (transactions.length) posting = { ...posting, transactions };
+  }
+  receiptOrder.posting = posting;
+  try {
+    const key = receiptPostingJournalKey(receiptOrder);
+    if (posting) window.localStorage?.setItem(key, JSON.stringify({
+      requestId: receiptRequestId, orderRef: receiptOrder.tranid, ...posting
+    }));
+    else window.localStorage?.removeItem(key);
+    saveOperatorState();
+  } catch { /* Keep the in-memory job when browser storage is unavailable. */ }
+}
+
+/** @param {Record<string, any>} job */
+function observeReceiptPostingJob(job) {
+  if (!receiptOrder || job.id !== (receiptOrder.posting?.jobId || receiptRequestId)
+      || (job.functionKey && job.functionKey !== "receiving")) return;
+  const transactions = (job.steps || []).filter((/** @type {Record<string, any>} */ step) => step.transactionType === "IR").flatMap((/** @type {Record<string, any>} */ step) => {
+    const id = step.transactionId || step.observedTransaction?.id;
+    return id ? [{ id, ref: step.transactionRef || step.observedTransaction?.tranId || String(id) }] : [];
+  });
+  rememberReceiptPosting({ jobId: job.id, status: job.status,
+    receiveBlocked: !["completed", "failed"].includes(job.status), transactions });
+  if (job.status === "completed") {
+    receiptResult = job.result?.localFinalization || job.result;
+    receiptStatusText = "";
+    receiptJobStage = "";
+  } else if (job.status === "failed") {
+    rememberReceiptPosting(null);
+    receiptJobStage = "Receiving failed";
+    receiptStatusText = job.lastError || "NetSuite rejected this receipt.";
+  } else {
+    receiptJobStage = "Verification pending";
+    receiptStatusText = "";
+  }
+}
+
+/** @param {Record<string, any>} posting */
+function renderReceiptPostingStatus(posting) {
+  const transactions = posting.transactions || [];
+  const message = posting.status === "attention"
+    ? "Local verification needs review. This screen will update when it finishes."
+    : "Checking the existing receipt. This screen will update when receiving is complete.";
+  return `<div class="fulfillment-card" data-receipt-posting-status role="status">
+    <strong>${transactions.length ? "NetSuite receipt created" : "Checking receipt status"}</strong>
+    ${transactions.map((/** @type {Record<string, any>} */ transaction) => `<p>Item Receipt <strong>${escapeHtml(transaction.ref)}</strong></p>`).join("")}
+    <p>${message}</p>
+    ${receiptStatusText ? `<p>${escapeHtml(receiptStatusText)}</p>` : ""}
+    <button class="secondary-button" data-action="refresh-receipt-posting" ${receiptSubmitting || posting.checking ? "disabled" : ""} type="button">Check status</button>
+  </div>`;
+}
+
+async function refreshReceiptPostingStatus() {
+  const order = receiptOrder;
+  const posting = order?.posting;
+  let requestId = receiptRequestId;
+  if (!order || !posting?.receiveBlocked || posting.checking || receiptSubmitting || receiptResult) return;
+  posting.checking = true;
+  try {
+    if (posting.recoverByOrder) {
+      const recovered = await api(`/api/receiving/orders/${encodeURIComponent(order.netsuite_id)}/posting-status?locationId=${locationId}`);
+      if (receiptOrder !== order || receiptRequestId !== requestId) return;
+      if (!recovered.job) {
+        rememberReceiptPosting(null);
+        receiptOrder = null;
+        currentModule = "receiving";
+        await loadReceivingOptions();
+        await loadReceivingOrders({ keepSelection: true });
+        return;
+      }
+      Object.assign(order, recovered.order);
+      receiptRequestId = requestId = recovered.job.requestId || recovered.job.id;
+      order.posting = { jobId: recovered.job.id };
+      observeReceiptPostingJob(recovered.job);
+      return;
+    }
+    const job = await api(`/api/operator/netsuite-posting-jobs/${encodeURIComponent(posting.jobId || requestId)}`);
+    if (receiptOrder === order && receiptRequestId === requestId) observeReceiptPostingJob(job);
+  } catch {
+    if (receiptOrder === order && receiptRequestId === requestId) {
+      receiptStatusText = "Could not refresh the receipt status. Reconnecting will check the same receipt.";
+    }
+  } finally {
+    posting.checking = false;
+    if (receiptOrder === order && receiptRequestId === requestId) render();
+  }
+}
+
+async function restoreReceiptPosting() {
+  const saved = initialOperatorState.receiptRecovery;
+  const orderId = saved?.orderId || receivingSelectedId;
+  if (!orderId) return false;
+  const order = { netsuite_id: orderId, order_type: saved?.orderType || receivingOrderType,
+    tranid: saved?.orderRef || receivingSearch || String(orderId) };
+  if (readReceiptPostingJournal(order)) return resumeReceiptPosting(order);
+  // New ordinary views explicitly have no pending receipt. Older clients did
+  // not save this marker; recover their selected order from the durable job.
+  if (saved === null) return false;
+  receiptOrder = { ...order, posting: { status: "recovering", recoverByOrder: true, receiveBlocked: true, transactions: [] } };
+  receiptRequestId = "";
+  receiptResult = null;
+  receiptSubmitting = false;
+  receiptStatusText = "";
+  receiptJobStage = "Verification pending";
+  currentModule = "receiving-receipt";
+  render();
+  await refreshReceiptPostingStatus();
+  return true;
+}
+
+/** @param {Record<string, any>} order */
+async function resumeReceiptPosting(order) {
+  const saved = readReceiptPostingJournal(order);
+  if (!saved) return false;
+  receiptOrder = { ...order, tranid: saved.orderRef || order.tranid,
+    posting: { ...saved, receiveBlocked: true, checking: false } };
+  receiptRequestId = saved.requestId;
+  receiptPhotoDataUrls = [];
+  receiptResult = null;
+  receiptSubmitting = false;
+  receiptStatusText = "";
+  receiptJobStage = "Verification pending";
+  currentModule = "receiving-receipt";
+  render();
+  await refreshReceiptPostingStatus();
+  return true;
 }
 
 async function pollReceiptJob(jobId) {
@@ -7442,6 +8045,7 @@ async function pollReceiptJob(jobId) {
 
 async function finishReceipt() {
   stopReceiptCamera();
+  rememberReceiptPosting(null);
   invalidateReceivingRequests();
   const wasLocalCo = (receiptOrder?.order_type || receivingOrderType) === "co_order";
   currentModule = "receiving";
@@ -7468,8 +8072,13 @@ async function finishReceipt() {
     localStorage.setItem("mbbs.operator.deliveryOrderType", deliveryOrderType);
     viewMode = "packed";
     selectedId = null;
+    if (receiptServiceWorkerReloadPending) {
+      saveOperatorState();
+      return window.location.reload();
+    }
     return loadOrders();
   }
+  if (receiptServiceWorkerReloadPending) return window.location.reload();
   await loadReceivingOrders({ keepSelection: false });
 }
 
@@ -7546,7 +8155,7 @@ function renderHistoryLineDetails(record) {
               ? `<em>${escapeHtml(localizeMessage(line.approvalStatus))}</em>`
               : ""}
           </div>
-          ${units.map((unit) => `<span>${unit.label} ${unit.value}</span>`).join("")}
+          ${units.map((unit) => `<span>${escapeHtml(displayUnit(unit.label))} ${unit.value}</span>`).join("")}
         </div>
       `;
       }).join("")}
@@ -7589,6 +8198,7 @@ function renderHistoryDetail(record) {
             : ""}
         </div>
       ` : ""}
+      ${Number(details.workflowVersion) >= 2 ? `<div class="sync-alert"><strong>${escapeHtml(returnNetSuiteResultLabel(details))}</strong></div>` : ""}
       ${renderHistoryPhotos(record)}
       ${renderHistoryLineDetails(record)}
       <div class="history-report-box">
@@ -7643,6 +8253,16 @@ function renderPersonalHistory() {
 }
 
 async function openModule(moduleName) {
+  operatorInventory.close();
+  if (["damage", "count-sheets"].includes(moduleName)) {
+    currentModule = moduleName;
+    saveOperatorState();
+    return operatorInventory.open(moduleName);
+  }
+  if (moduleName === "inventory") {
+    currentModule = "inventory";
+    return render();
+  }
   if (moduleName === "pallet-return" || moduleName === "stock-return") {
     resetReturnWorkflow(moduleName === "stock-return" ? "stock" : "pallet");
     currentModule = moduleName;
@@ -7705,6 +8325,7 @@ async function openModule(moduleName) {
     selectedInventoryItem = null;
     activeCycleUnit = "";
     cycleValues = {};
+    cycleExpressions = {};
     cyclePage = 0;
     await loadCycleData();
     return render();
@@ -7750,6 +8371,10 @@ function resetReturnWorkflow(mode = returnMode || "pallet", { keepResult = false
   returnBusy = false;
   returnValidationMessage = "";
   returnIdempotencyKey = createReturnIdempotencyKey();
+  returnPostingPolicies = {};
+  returnPostingError = "";
+  returnPostingLoading = false;
+  returnPostingGeneration += 1;
   if (!keepResult) returnResult = null;
 }
 
@@ -7775,6 +8400,7 @@ function normalizeReturnLookup(payload = {}) {
 }
 
 async function lookupReturnOrder(code = returnLookupCode) {
+  if (returnBusy) return;
   const clean = normalizedPickupCameraCode(code);
   returnLookupCode = clean;
   returnLookupMessage = "";
@@ -8383,7 +9009,10 @@ function buildReturnPayload({ draft = false } = {}) {
     lines: returnPayloadLines({ includeEmpty: draft }),
     palletQuantity: Number(returnPalletQuantity) || 0,
     palletPhotos: returnPalletPhotos.filter(Boolean),
-    photos: returnRecordPhotos.filter(Boolean)
+    photos: returnRecordPhotos.filter(Boolean),
+    expectedPostingPolicies: draft ? undefined : Object.fromEntries(
+      returnPostingFunctions().map(key => [key, operatorNetSuitePolicyToken(returnPostingPolicies[key])])
+    )
   };
 }
 
@@ -8483,7 +9112,7 @@ async function saveReturnDraft() {
   }
 }
 
-function openReturnReview() {
+async function openReturnReview() {
   const error = validateReturnForReview({ requireVehiclePlate: false, requirePhotos: false });
   returnValidationMessage = error;
   if (error) return render();
@@ -8491,11 +9120,12 @@ function openReturnReview() {
   stopReturnScannerCamera();
   selectReturnReviewPhotoTarget(returnPhotoTarget, { preferMissing: true });
   returnStage = "review";
-  render();
+  await loadReturnPostingPolicies();
 }
 
 async function submitReturn() {
   if (returnBusy) return;
+  if (!returnPostingReady()) {return showToast("Refresh the posting mode before confirming.");}
   const validation = validateReturnForReview();
   if (validation) {
     returnValidationMessage = validation;
@@ -8592,7 +9222,7 @@ async function cycleBack() {
     cycleSelection.brand = "";
     cycleSelection.series = "";
   } else {
-    currentModule = "menu";
+    currentModule = "inventory";
     return render();
   }
   cyclePage = 0;
@@ -8613,6 +9243,9 @@ async function syncInventory() {
 
 async function confirmCycleLine() {
   if (!selectedInventoryItem || cycleConfirming) return;
+  for (const unit of itemCountUnits(selectedInventoryItem)) {
+    cycleValues[unit.key] = window.MBBSCountingCalculator.evaluate(cycleExpressions[unit.key]?.expression || String(cycleValues[unit.key] || 0));
+  }
   const pallets = qty(cycleValues["cycle-pallets"]);
   const layers = qty(cycleValues["cycle-layers"]);
   const sections = qty(cycleValues["cycle-sections"]);
@@ -8636,6 +9269,7 @@ async function confirmCycleLine() {
     selectedInventoryItem = null;
     activeCycleUnit = "";
     cycleValues = {};
+    cycleExpressions = {};
     showToast("Cycle count line confirmed");
   } finally {
     cycleConfirming = false;
@@ -8661,6 +9295,7 @@ function editCycleLine(lineId) {
     to_sec: line.to_sec,
     to_pcs: line.to_pcs
   };
+  cycleExpressions = {};
   cycleValues = {
     "cycle-pallets": qty(line.counted_pallet_qty),
     "cycle-layers": qty(line.counted_layer_qty),
@@ -8692,7 +9327,7 @@ function stepQty(unit, delta) {
 }
 
 function cycleUnitValue(unit) {
-  return qty(app.querySelector(`[data-cycle-display="${unit}"]`)?.textContent);
+  return qty(cycleValues[unit]);
 }
 
 function setCycleUnitValue(unit, value) {
@@ -8702,12 +9337,20 @@ function setCycleUnitValue(unit, value) {
   display.textContent = String(cycleValues[unit]);
 }
 
+function updateCycleExpression() {
+  const output = app.querySelector("[data-cycle-expression]");
+  const unit = itemCountUnits(selectedInventoryItem || {}).find(entry => entry.key === activeCycleUnit);
+  if (output) output.textContent = `${cycleExpressions[activeCycleUnit]?.expression || String(cycleValues[activeCycleUnit] || 0)} ${unit?.label || ""}`;
+}
+
 function pressCycleKey(key) {
   if (!activeCycleUnit) return;
-  const current = String(cycleUnitValue(activeCycleUnit));
-  if (key === "Clear") setCycleUnitValue(activeCycleUnit, 0);
-  else if (key === "Back") setCycleUnitValue(activeCycleUnit, current.length <= 1 ? 0 : current.slice(0, -1));
-  else setCycleUnitValue(activeCycleUnit, Number(`${current === "0" ? "" : current}${key}`));
+  const calc = window.MBBSCountingCalculator;
+  const previous = cycleExpressions[activeCycleUnit] || { expression: String(cycleValues[activeCycleUnit] || 0) };
+  cycleExpressions[activeCycleUnit] = calc.press(previous, key);
+  try { setCycleUnitValue(activeCycleUnit, calc.evaluate(cycleExpressions[activeCycleUnit].expression)); }
+  catch { /* Keep incomplete calculations visible; confirmation validates every unit. */ }
+  updateCycleExpression();
   updateCycleVariancePreview();
 }
 
@@ -8766,6 +9409,10 @@ app.addEventListener("click", async (event) => {
   if (!button) return;
 
   try {
+    if (button.dataset.action === "open-display-settings") {
+      currentModule = "settings";
+      return operatorDisplaySettings.open();
+    }
     if (button.dataset.action === "install-app") {
       if (!installPromptEvent) {
         return showToast("Browser install prompt is not available on this device.");
@@ -8910,6 +9557,7 @@ app.addEventListener("click", async (event) => {
     }
     if (button.dataset.action === "return-save-draft") return saveReturnDraft();
     if (button.dataset.action === "return-open-review") return openReturnReview();
+    if (button.dataset.action === "return-refresh-posting") {return loadReturnPostingPolicies();}
     if (button.dataset.action === "return-back-to-form") {
       stopReturnCamera();
       returnStage = "form";
@@ -9220,8 +9868,12 @@ app.addEventListener("click", async (event) => {
     if (button.dataset.action === "confirm-receiving-line") return confirmReceivingLine(button.dataset.line);
     if (button.dataset.action === "unconfirm-receiving-line") return unconfirmReceivingLine(button.dataset.line);
     if (button.dataset.action === "start-receive") return startReceipt();
+    if (button.dataset.action === "refresh-receipt-posting") return refreshReceiptPostingStatus();
     if (button.dataset.action === "cancel-receive") {
       stopReceiptCamera();
+      window.clearInterval(receiptProgressTimer ?? undefined);
+      receiptProgressTimer = null;
+      receiptSubmitting = false;
       currentModule = "receiving";
       receiptOrder = null;
       receiptPhotoDataUrls = [];
@@ -9267,10 +9919,12 @@ app.addEventListener("click", async (event) => {
       selectedInventoryItem = inventoryItems.find((item) => String(item.item_id) === String(button.dataset.item)) || null;
       activeCycleUnit = itemCountUnits(selectedInventoryItem || {})[0]?.key || "";
       cycleValues = {};
+    cycleExpressions = {};
       return render();
     }
     if (button.dataset.action === "select-cycle-unit") {
       activeCycleUnit = button.dataset.unit;
+      updateCycleExpression();
       app.querySelectorAll(".cycle-count-field").forEach((item) => item.classList.toggle("active", item.dataset.unit === activeCycleUnit));
       return;
     }
@@ -9358,11 +10012,8 @@ app.addEventListener("click", async (event) => {
       selectedOrder = null;
       return loadOrders();
     }
-    if (button.dataset.action === "sync") {
-      return refreshDeliveryOrders();
-    }
-    if (button.dataset.action === "refresh") {
-      return refreshDeliveryOrders();
+    if (["sync", "refresh"].includes(button.dataset.action)) {
+      return await refreshDeliveryOrders();
     }
     if (button.dataset.action === "open-warning-order") {
       selectedId = button.dataset.order;
@@ -9405,8 +10056,9 @@ app.addEventListener("click", async (event) => {
     }
     if (button.dataset.action === "step-qty") return stepQty(button.dataset.unit, button.dataset.delta);
     if (button.dataset.action === "set-preparing") return setOrderStatus("preparing");
-    if (button.dataset.action === "set-packed") return setOrderStatus("packed");
+    if (button.dataset.action === "set-packed") return await setOrderStatus("packed");
     if (button.dataset.action === "edit-reload-packing") return editReloadPacking();
+    if (button.dataset.action === "refresh-load-posting") return refreshLoadPostingStatus();
     if (button.dataset.action === "start-fulfill") return startFulfillment();
     if (button.dataset.action === "cancel-fulfill") {
       stopFulfillmentCamera();
@@ -9620,12 +10272,12 @@ app.addEventListener("keydown", async (event) => {
     await scheduleReceivingSearch({ immediate: true });
     return;
   }
-  if (event.target?.id === "returnOrderLookup" && event.key === "Enter") {
+  if (event.target?.id === "returnOrderLookup" && ["Enter", "Tab"].includes(event.key)) {
     event.preventDefault();
     await lookupReturnOrder(event.target.value);
     return;
   }
-  if (event.target?.id === "customerPickupScan" && event.key === "Enter") {
+  if (event.target?.id === "customerPickupScan" && ["Enter", "Tab"].includes(event.key)) {
     event.preventDefault();
     await submitCustomerPickupScanValue(event.target.value);
   }
@@ -9709,6 +10361,56 @@ app.addEventListener("submit", async (event) => {
   }
 });
 
+/** @type {any} */
+const operatorBackgroundQueue = /** @type {any} */ (window).OperatorPhotoOutbox;
+
+/** @param {string} requestId @param {string[]} photos */
+async function prepareOperatorBackgroundPhotos(requestId, photos) {
+  if (!operatorBackgroundQueue) throw new Error("Refresh Operator to enable background photo uploads.");
+  return operatorBackgroundQueue.prepare({ actorId: operator.id, requestId, photos });
+}
+
+function resumeOperatorBackgroundPhotos() {
+  operatorBackgroundQueue?.resume();
+}
+
+function configureOperatorBackgroundPhotos() {
+  operatorBackgroundQueue?.configure({
+    actorId: () => operator?.id || null,
+    request: (/** @type {string} */ path, /** @type {RequestInit} */ options = {}) => api(path, { ...options, headers: {
+      "Content-Type": "application/json", Authorization: `Bearer ${authToken}`, ...options.headers
+    } }),
+    status: (/** @type {{count: number, retrying: boolean}} */ { count, retrying }) => {
+      let notice = document.getElementById("operatorPhotoStatus");
+      if (!notice) {
+        notice = document.createElement("div"); notice.id = "operatorPhotoStatus";
+        notice.setAttribute("role", "status");
+        notice.style.cssText = "position:fixed;top:4px;left:50%;transform:translateX(-50%);z-index:30;padding:4px 10px;border-radius:8px;background:#e4f4ef;color:#174e42;font-size:12px;max-width:90vw;pointer-events:none";
+        document.body.appendChild(notice);
+      }
+      notice.hidden = !count;
+      notice.textContent = retrying
+        ? `${count} photos waiting. Reopen Operator on this device to resume.`
+        : `${count} photos uploading in background. You can continue.`;
+    }
+  });
+}
+
+const operatorInventory = window.MBBSOperatorInventory.create({
+  root: app, api, escape: escapeHtml, shell,
+  location: () => locationId, actor: () => operator,
+  locationLabel: () => `${t("common.location", "Location")} ${currentLocation()?.text || locationId}`,
+  back: () => openModule("inventory"), toast: showToast,
+  upload: uploadOperatorPhoto, photo: photoImgAttributes, preview: openPhotoLightbox
+});
+window.addEventListener("pagehide", () => operatorInventory.close());
+const operatorDisplaySettings = window.OperatorDisplaySettings.create({
+  app, api, accountId: () => operator?.id,
+  isOpen: () => currentModule === "settings",
+  shell, onClose: () => { currentModule = "menu"; render(); }
+});
+window.OperatorOrderKeypad.install(app);
+
 async function boot() {
   if (!authToken) {
     if (localStorage.getItem("mbbs.driver.token")) {
@@ -9726,7 +10428,9 @@ async function boot() {
       window.location.replace(staffRoleHome(operator.role));
       return;
     }
+    await operatorDisplaySettings.load();
     if (!(await prepareOperatorWorkspace())) return;
+    configureOperatorBackgroundPhotos();
     connectEvents();
     await restoreOperatorView();
   } catch (error) {
@@ -9735,9 +10439,9 @@ async function boot() {
   }
 }
 
-window.addEventListener("focus", () => { refreshOperatorAccess().catch(() => {}); });
+window.addEventListener("focus", () => { refreshOperatorAccess().catch(() => {}); operatorDisplaySettings.refresh()?.catch(() => {}); });
 document.addEventListener("visibilitychange", () => {
-  if (document.visibilityState === "visible") refreshOperatorAccess().catch(() => {});
+  if (document.visibilityState === "visible") { refreshOperatorAccess().catch(() => {}); operatorDisplaySettings.refresh()?.catch(() => {}); }
 });
 window.addEventListener("storage", (event) => {
   if ([STAFF_TOKEN_KEY, TOKEN_KEY].includes(event.key) && readOperatorToken() !== authToken) reloadOperatorWorkspace();
@@ -9761,15 +10465,24 @@ setInterval(() => {
 setInterval(() => {
   if (!operator || !locationId) return;
   if (deliveryOrdersLoadingCount || fulfillmentSubmitting || receiptSubmitting || returnBusy) return;
+  if (currentModule === "receiving-receipt") refreshReceiptPostingStatus().catch(() => {});
   loadDeliveryNotifications().catch(() => {});
 }, 10000);
+
+function requestOperatorServiceWorkerReload() {
+  if (currentModule === "receiving-receipt" && receiptOrder) {
+    receiptServiceWorkerReloadPending = true;
+    return;
+  }
+  window.location.reload();
+}
 
 if ("serviceWorker" in navigator) {
   let serviceWorkerRefreshing = false;
   navigator.serviceWorker.addEventListener("controllerchange", () => {
     if (serviceWorkerRefreshing) return;
     serviceWorkerRefreshing = true;
-    window.location.reload();
+    requestOperatorServiceWorkerReload();
   });
   window.addEventListener("load", () => {
     navigator.serviceWorker.register("/service-worker.js").then((registration) => {

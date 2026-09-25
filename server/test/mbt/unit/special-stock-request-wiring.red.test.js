@@ -44,26 +44,27 @@ test("Sales and SCM Special tabs are real feature-gated interfaces", () => {
   for (const required of ["customerName", "vendorName", "productName", "quantity", "requiredDate"]) {
     assert.match(salesSpecial, new RegExp(required, "u"));
   }
-  for (const required of ["supplyStatus", "availableDate", "unitPurchaseCost", "itemResolution"]) {
+  for (const required of ["supplyStatus", "availableDate", "unitPurchaseCost", "data-special-readiness-form"]) {
     assert.match(scmSpecial, new RegExp(required, "u"));
   }
   assert.match(scmSpecial, /data-special-scm-vendor-search/u);
   assert.doesNotMatch(scmSpecial, /data-special-scm-item-search/u, "SCM's first reply must not own exact item resolution");
-  assert.match(scmSpecial, /data-special-po-link-search/u);
+  assert.match(scmSpecial, /data-special-po-form/u);
   assert.match(salesSpecial, /data-special-so-link-search/u);
   assert.match(salesSpecial, /Case inquiry date/u);
   assert.match(salesSpecial, /NetSuite Quote ID \(optional\)/u);
   assert.match(salesSpecial, /data-special-case-customer-search/u);
   assert.match(salesSpecial, /data-special-case-vendor-search/u);
-  assert.match(salesSpecial, /data-special-decision-item-search/u);
+  assert.doesNotMatch(salesSpecial, /data-special-decision-item-search/u);
+  assert.match(salesSpecial, /Pallets needed/u);
   assert.doesNotMatch(salesSpecial, /<span>Case required date/u);
   assert.doesNotMatch(salesSpecial, /<span>Estimate number/u);
   for (const value of ["PLT", "LYR", "SEC", "PCS", "EACH"]) {
     assert.match(salesSpecial, new RegExp(`\\[\"${value}\"`, "u"));
   }
-  assert.match(scmSpecial, /First SCM response · Availability/u);
-  assert.match(scmSpecial, /Second SCM response · Purchase Order preparation/u);
-  assert.match(scmSpecial, /line\.poReady/u);
+  assert.match(scmSpecial, /SCM stock check/u);
+  assert.match(scmSpecial, /Review and create Purchase Order/u);
+  assert.match(scmSpecial, /data-special-po-form/u);
   assert.match(scmSpecial, /replaceSuggestions/u);
   const scmSearchHandler = scmSpecial.slice(
     scmSpecial.indexOf('mount.addEventListener("input"'),

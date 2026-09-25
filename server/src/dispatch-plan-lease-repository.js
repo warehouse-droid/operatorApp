@@ -3,6 +3,18 @@ import { query, withTransaction } from "./db.js";
 
 export const DISPATCH_PLAN_EDIT_LEASE_SECONDS = 10 * 60;
 
+export async function lockDispatchPlanEditLeaseDate(planDate) {
+  await query('SELECT pg_advisory_xact_lock(hashtext($1))', [`dispatch-edit-lease:${cleanPlanDate(planDate)}`]);
+}
+
+// Caller holds the fleet lock first. Holding this date lock through COMMIT
+// orders a delayed save against release, reacquisition and absent-row inserts.
+export async function lockDispatchPlanEditLease(input) {
+  if (!input) {return;}
+  await lockDispatchPlanEditLeaseDate(input.planDate);
+  return assertDispatchPlanEditLease(input);
+}
+
 function cleanPlanDate(value) {
   const text = String(value || "").slice(0, 10);
   if (!/^\d{4}-\d{2}-\d{2}$/.test(text)) {
@@ -73,9 +85,10 @@ export async function acquireDispatchPlanEditLease({ planDate, operatorId, opera
   const nextTokenHash = tokenHash(nextToken);
 
   return withTransaction(async () => {
+    await lockDispatchPlanEditLeaseDate(cleanDate);
     const existingResult = await query(
       `SELECT plan_date::text, operator_id, operator_name, session_id, token_hash,
-              acquired_at, heartbeat_at, expires_at, expires_at > now() AS active
+              acquired_at, heartbeat_at, expires_at, expires_at > clock_timestamp() AS active
          FROM dispatch_plan_edit_leases
         WHERE plan_date = $1::date
         FOR UPDATE`,
@@ -133,6 +146,8 @@ export async function acquireDispatchPlanEditLease({ planDate, operatorId, opera
 export async function heartbeatDispatchPlanEditLease({ planDate, operatorId, sessionId, token }) {
   const cleanDate = cleanPlanDate(planDate);
   const cleanSession = cleanSessionId(sessionId);
+  return withTransaction(async () => {
+  await lockDispatchPlanEditLeaseDate(cleanDate);
   const result = await query(
     `UPDATE dispatch_plan_edit_leases
         SET heartbeat_at = now(),
@@ -142,7 +157,7 @@ export async function heartbeatDispatchPlanEditLease({ planDate, operatorId, ses
         AND operator_id = $2
         AND session_id = $3
         AND token_hash = $4
-        AND expires_at > now()
+        AND expires_at > clock_timestamp()
       RETURNING plan_date::text, operator_id, operator_name, session_id, acquired_at, heartbeat_at, expires_at`,
     [cleanDate, String(operatorId || ""), cleanSession, tokenHash(token), DISPATCH_PLAN_EDIT_LEASE_SECONDS]
   );
@@ -154,6 +169,7 @@ export async function heartbeatDispatchPlanEditLease({ planDate, operatorId, ses
     });
   }
   return leaseRow(result.rows[0], { active: true });
+  });
 }
 
 export async function assertDispatchPlanEditLease({ planDate, operatorId, sessionId, token }) {
@@ -166,7 +182,7 @@ export async function assertDispatchPlanEditLease({ planDate, operatorId, sessio
         AND operator_id = $2
         AND session_id = $3
         AND token_hash = $4
-        AND expires_at > now()`,
+        AND expires_at > clock_timestamp()`,
     [cleanDate, String(operatorId || ""), cleanSession, tokenHash(token)]
   );
   if (!result.rows[0]) {
@@ -179,6 +195,8 @@ export async function assertDispatchPlanEditLease({ planDate, operatorId, sessio
 export async function releaseDispatchPlanEditLease({ planDate, operatorId, sessionId, token }) {
   const cleanDate = cleanPlanDate(planDate);
   const cleanSession = cleanSessionId(sessionId);
+  return withTransaction(async () => {
+  await lockDispatchPlanEditLeaseDate(cleanDate);
   const result = await query(
     `DELETE FROM dispatch_plan_edit_leases
       WHERE plan_date = $1::date
@@ -189,4 +207,5 @@ export async function releaseDispatchPlanEditLease({ planDate, operatorId, sessi
     [cleanDate, String(operatorId || ""), cleanSession, tokenHash(token)]
   );
   return leaseRow(result.rows[0], { active: false });
+  });
 }

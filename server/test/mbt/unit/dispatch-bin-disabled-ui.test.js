@@ -1,6 +1,8 @@
 import assert from "node:assert/strict";
 import { readFile } from "node:fs/promises";
 import test from "node:test";
+import vm from "node:vm";
+import { parse } from "espree";
 
 const dispatchSource = await readFile(
   new URL("../../../public/dispatch.js", import.meta.url),
@@ -28,9 +30,45 @@ test("P3 compatibility: closed BIN gates preserve the established Dispatch order
     /mbtBinDispatchEnabled\s*\?\s*`<button[\s\S]{0,500}data-type="BIN"[\s\S]{0,500}:\s*""/u,
     "The BIN tab must exist only when the capability is confirmed enabled."
   );
-  assert.match(
-    dispatchSource,
-    /render\(\{\s*save:\s*false\s*\}\);[\s\S]{0,300}connectEvents\(\);[\s\S]{0,600}loadMbtBinDispatchCapability\(\)[\s\S]{0,800}loadMbtBinFrontLegs/u,
-    "Capability discovery and BIN loading must occur after the ordinary board renders."
-  );
+});
+
+test("P3 compatibility: capability discovery and conditional BIN loading follow the ordinary board render", async () => {
+  const declarations = parse(dispatchSource, { ecmaVersion: "latest", sourceType: "script", range: true }).body;
+  for (const enabled of [false, true]) {
+    const events = [];
+    const context = vm.createContext({
+      console, URLSearchParams,
+      currentPlanDate: "2026-09-17", activeOrderType: "SO", searchText: "",
+      mbtBinDispatchEnabled: false, mbtBinDispatchRequestSequence: 0,
+      window: { requestAnimationFrame: () => {}, setTimeout: () => {} },
+      render: () => events.push("render"), connectEvents: () => events.push("connected"),
+      loadDispatchConfig: async () => {}, loadDispatchSetup: async () => {},
+      loadDispatchVendorYards: async () => {}, loadPlanForDate: async (_date, { setupReady }) => { await setupReady; events.push("snapshot"); },
+      scheduleDispatchForecastPolling: () => {}, setInterval: () => {}, pollServerPlan: () => {},
+      fetch: async (url) => {
+        if (url === "/api/mbt/status") {
+          events.push("capability");
+          return { ok: true, json: async () => ({ capabilities: { binDispatch: { enabled } } }) };
+        }
+        assert.match(url, /^\/api\/mbt\/dispatch\/front-legs\?/u);
+        events.push("feed");
+        return { ok: true, json: async () => ({ items: [] }) };
+      }
+    });
+    for (const name of ["initDispatch", "loadMbtBinDispatchCapability", "loadMbtBinFrontLegs"]) {
+      const declaration = declarations.find((node) => node.type === "FunctionDeclaration" && node.id.name === name);
+      assert.ok(declaration, `Missing implementation: ${name}`);
+      vm.runInContext(dispatchSource.slice(...declaration.range), context);
+    }
+    await context.initDispatch();
+    await new Promise((resolve) => setImmediate(resolve));
+    assert.deepEqual(events, enabled
+      ? ["render", "snapshot", "render", "connected", "capability", "feed", "render"]
+      : ["render", "snapshot", "render", "connected", "capability"]);
+    assert.equal(context.mbtBinDispatchEnabled, enabled);
+    if (!enabled) {
+      assert.equal(await context.loadMbtBinFrontLegs(), false);
+      assert.equal(events.includes("feed"), false, "A disabled BIN gate cannot request the feed, even directly.");
+    }
+  }
 });

@@ -33,12 +33,14 @@ export function specialOrderPalletItemQuantity(items = []) {
 
 export function dispatchOrderPalletQuantity({
   items = [],
+  specialPalletTotal = null,
   reportedPallets = 0,
   fallbackSalesQuantity = 0,
   preserveReportedPallets = false
 } = {}) {
   const reported = nonNegativeNumber(reportedPallets);
   if (preserveReportedPallets) return reported;
+  if (specialPalletTotal !== null && specialPalletTotal !== undefined && Number.isFinite(Number(specialPalletTotal))) return nonNegativeNumber(specialPalletTotal);
   const specialPallets = specialOrderPalletItemQuantity(items);
   if (specialPallets !== null) return specialPallets;
   return reported || Math.floor(nonNegativeNumber(fallbackSalesQuantity) / 100);

@@ -6,7 +6,8 @@ import {
 import {
   GOOGLE_MAPS_USAGE_LIMITS,
   googleMapsAdmissionDecision,
-  googleMapsBudgetState
+  googleMapsBudgetState,
+  googleMapsDailyCapacity
 } from "./google-maps-usage-policy.js";
 
 const USAGE_LOCK_KEY = 1_296_125_011;
@@ -37,24 +38,43 @@ export function createGoogleMapsUsageRepository({
   withTransaction = defaultWithIndependentTransaction,
   limits = GOOGLE_MAPS_USAGE_LIMITS
 } = {}) {
+  async function capacityUsage(runQuery, subsystem = "") {
+    const result = await runQuery(
+      `SELECT coalesce(sum(admitted_units), 0)::integer AS rolling_usage,
+              coalesce(sum(admitted_units) FILTER (WHERE subsystem = $2), 0)::integer AS subsystem_usage,
+              coalesce(sum(admitted_units) FILTER (
+                WHERE requested_at >= ((now() AT TIME ZONE 'UTC')::date AT TIME ZONE 'UTC')
+              ), 0)::integer AS daily_usage,
+              to_char(now() AT TIME ZONE 'UTC', 'YYYY-MM-DD') AS day,
+              (((now() AT TIME ZONE 'UTC')::date + 1) AT TIME ZONE 'UTC') AS resets_at,
+              coalesce((SELECT sum(added_units) FROM google_maps_daily_reopens
+                WHERE day = (now() AT TIME ZONE 'UTC')::date), 0)::integer AS daily_extra_units
+         FROM google_maps_usage_ledger
+        WHERE admitted AND requested_at >= now() - ($1::integer * interval '1 day')`,
+      [limits.windowDays, text(subsystem, 60)]
+    );
+    return result.rows[0];
+  }
+
+  function dailyCapacity(row) {
+    return googleMapsDailyCapacity({ day: row.day, resetsAt: row.resets_at,
+      dailyUsage: Number(row.daily_usage), dailyExtraUnits: Number(row.daily_extra_units),
+      rollingUsage: Number(row.rolling_usage), limits });
+  }
+
   async function admit(input = {}) {
     return withTransaction(async (transactionQuery) => {
       const runQuery = typeof transactionQuery === "function" ? transactionQuery : query;
       await runQuery("SELECT pg_advisory_xact_lock($1)", [USAGE_LOCK_KEY]);
-      const usage = await runQuery(
-        `SELECT coalesce(sum(admitted_units), 0)::integer AS rolling_usage,
-                coalesce(sum(admitted_units) FILTER (WHERE subsystem = $2), 0)::integer AS subsystem_usage
-           FROM google_maps_usage_ledger
-          WHERE admitted
-            AND requested_at >= now() - ($1::integer * interval '1 day')`,
-        [limits.windowDays, text(input.subsystem || "support_route", 60)]
-      );
-      const rollingUsage = Number(usage.rows[0]?.rolling_usage || 0);
-      const subsystemUsage = Number(usage.rows[0]?.subsystem_usage || 0);
+      const usage = await capacityUsage(runQuery, input.subsystem || "support_route");
+      const rollingUsage = Number(usage.rolling_usage);
+      const subsystemUsage = Number(usage.subsystem_usage);
       const decision = googleMapsAdmissionDecision({
         ...input,
         rollingUsage,
         subsystemUsage,
+        dailyUsage: Number(usage.daily_usage),
+        dailyExtraUnits: Number(usage.daily_extra_units),
         limits
       });
       const inserted = await runQuery(
@@ -88,6 +108,37 @@ export function createGoogleMapsUsageRepository({
     });
   }
 
+  async function reopenDailyCapacity({ requestId, day, expectedLimit, actorId, mode } = {}) {
+    if (!/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/iu.test(String(requestId || ""))
+        || !String(actorId || "").trim() || !/^\d{4}-\d{2}-\d{2}$/u.test(String(day || ""))
+        || !Number.isSafeInteger(expectedLimit) || expectedLimit <= 0) {
+      throw Object.assign(new Error("A valid request ID, UTC day, current capacity, and admin identity are required."), { status: 400 });
+    }
+    return withTransaction(async (transactionQuery) => {
+      const runQuery = typeof transactionQuery === "function" ? transactionQuery : query;
+      await runQuery("SELECT pg_advisory_xact_lock($1)", [USAGE_LOCK_KEY]);
+      const previous = await runQuery("SELECT id FROM google_maps_daily_reopens WHERE id = $1", [requestId]);
+      if (previous.rowCount) return { reopened: false, addedUnits: 0, reason: "already_reopened" };
+      const usage = await capacityUsage(runQuery);
+      if (day !== usage.day) {
+        throw Object.assign(new Error("The UTC day changed. Refresh usage before reopening capacity."), { status: 409 });
+      }
+      if (mode === "disabled" || Number(usage.rolling_usage) >= limits.hardLimit) {
+        throw Object.assign(new Error("Maps are disabled or the rolling 30-day limit is exhausted."), { status: 409 });
+      }
+      const daily = dailyCapacity(usage);
+      if (!daily.canReopen) return { reopened: false, addedUnits: 0, reason: "daily_capacity_available" };
+      if (expectedLimit !== daily.limit) {
+        throw Object.assign(new Error("Daily capacity changed. Refresh usage before reopening again."), { status: 409 });
+      }
+      await runQuery(
+        "INSERT INTO google_maps_daily_reopens (id, day, added_units, actor_id) VALUES ($1, $2, $3, $4)",
+        [requestId, usage.day, daily.reopenUnits, privateIdentifier(actorId)]
+      );
+      return { reopened: true, addedUnits: daily.reopenUnits };
+    });
+  }
+
   async function recordOutcome({ ledgerId, outcome, httpStatus = null, latencyMs = null } = {}) {
     const normalizedOutcome = OUTCOMES.has(outcome) ? outcome : "failed";
     return withTransaction(async (transactionQuery) => {
@@ -112,7 +163,7 @@ export function createGoogleMapsUsageRepository({
   }
 
   async function summary() {
-    const [totalsResult, dailyResult, actionResult] = await Promise.all([
+    const [totalsResult, dailyResult, actionResult, capacity] = await Promise.all([
       query(
         `WITH filtered AS (
            SELECT *
@@ -183,7 +234,8 @@ export function createGoogleMapsUsageRepository({
           GROUP BY subsystem, api, reason
           ORDER BY admitted_units DESC, attempted_units DESC, subsystem, api, reason`,
         [limits.windowDays]
-      )
+      ),
+      capacityUsage(query)
     ]);
     const totals = totalsResult.rows[0] || {};
     const rolling30Day = Number(totals.rolling_usage || 0);
@@ -202,6 +254,7 @@ export function createGoogleMapsUsageRepository({
       deniedCount30Day: Number(totals.denied_count || 0),
       failedCount30Day: Number(totals.failed_count || 0),
       perSubsystem: totals.per_subsystem || {},
+      dailyCapacity: dailyCapacity(capacity),
       daily,
       actions: actionResult.rows.map((row) => ({
         subsystem: row.subsystem,
@@ -226,5 +279,5 @@ export function createGoogleMapsUsageRepository({
     };
   }
 
-  return Object.freeze({ admit, recordOutcome, summary });
+  return Object.freeze({ admit, recordOutcome, summary, reopenDailyCapacity });
 }

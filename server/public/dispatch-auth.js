@@ -52,7 +52,7 @@ function dispatchAuthHeaders(headers = {}) {
 
 window.fetch = (input, options = {}) => {
   const url = typeof input === "string" ? input : input?.url || "";
-  if (String(url).startsWith("/api/dispatch") || String(url).startsWith("/api/scm") || String(url).startsWith("/api/sales")) {
+  if (String(url).startsWith("/api/dispatch") || String(url).startsWith("/api/scm") || String(url).startsWith("/api/sales") || String(url).startsWith("/api/aggregate-requests")) {
     const headers = DISPATCH_PUBLIC_SALES_PAGE && dispatchAuthOperator?.publicSales
       ? { ...(options.headers || {}), [DISPATCH_PUBLIC_SALES_HEADER]: "1" }
       : dispatchAuthHeaders(options.headers || {});
@@ -78,6 +78,7 @@ function dispatchRoleHome(role) {
   if (clean === "dispatcher") return "/dispatch";
   if (clean === "scm" || clean === "scm_staff") return "/scm";
   if (clean === "yard_manager") return "/control";
+  if (clean === "field_sales") return "/field-sales/";
   if (clean === "sales") return "/sales";
   if (clean === "operator") return "/operator";
   return "/";

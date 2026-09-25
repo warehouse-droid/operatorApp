@@ -1,0 +1,40 @@
+name: Dispatch save reliability
+on:
+  pull_request:
+    paths:
+      - 'server/src/dispatch-*.js'
+      - 'server/src/scm-dependency-*.js'
+      - 'server/src/server.js'
+      - 'server/public/dispatch*'
+      - 'server/test/dispatch/**'
+      - 'server/tools/dispatch-save-*'
+      - '.github/workflows/dispatch-save.yml'
+  workflow_dispatch:
+  schedule:
+    - cron: '30 7 * * 1'
+permissions:
+  contents: read
+jobs:
+  isolated-save-tests:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 180
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          persist-credentials: false # secret-scan: allow non-secret GitHub setting
+          fetch-depth: 0
+      - name: Preserve comparison source
+        env:
+          DISPATCH_BASE_REF: ${{ github.event.pull_request.base.sha || 'HEAD^' }}
+        run: |
+          mkdir -p "$RUNNER_TEMP/dispatch-save-baseline"
+          git archive "$DISPATCH_BASE_REF" server/src server/public server/package.json server/package-lock.json | tar -x -C "$RUNNER_TEMP/dispatch-save-baseline"
+          echo "DISPATCH_SAVE_BASELINE_SOURCE=$RUNNER_TEMP/dispatch-save-baseline/server" >> "$GITHUB_ENV"
+      - name: Build pinned test environment
+        run: docker build --file server/Dockerfile.test --target test-e2e --tag dispatch-save-ci server
+      - name: Run save gates
+        env:
+          DISPATCH_SAVE_RELIABILITY_TEST_IMAGE: dispatch-save-ci
+          DISPATCH_SAVE_BROWSER_IMAGE: dispatch-save-ci
+          DISPATCH_SAVE_SUITE: ${{ github.event_name == 'pull_request' && 'pr' || 'full' }}
+        run: bash server/tools/dispatch-save-gauntlet.sh "$DISPATCH_SAVE_SUITE"

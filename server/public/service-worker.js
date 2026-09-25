@@ -1,14 +1,23 @@
-const CACHE_NAME = "mbbs-yard-operator-v153-auto-camera-v1";
+const CACHE_NAME = "mbbs-yard-operator-20260925-receipt-confirmation-v1";
 const OPERATOR_CACHE_PREFIX = "mbbs-yard-operator-";
 const APP_SHELL = [
   "/operator",
   "/operator.html",
-  "/operator.css?v=20260916-operator-auto-camera-v1",
+  "/operator-inventory.css?v=20260923-operator-inventory-v1",
+  "/counting-calculator.js?v=20260923-operator-inventory-v1",
+  "/operator-inventory.js?v=20260923-control-damage-v1",
+  "/operator-display-settings.css?v=20260918-operator-topbar-v2",
+  "/operator-display-settings.js?v=20260918-operator-topbar-v2",
+  "/operator-order-keypad.js?v=20260918-operator-display-settings-v1",
+  "/operator.css?v=20260916-operator-bottom-inset-v1",
+  "/operator-receiving-confirmation.css?v=20260917-receiving-followup-v1",
   "/i18n.css?v=20260701-i18n-v2",
   "/vendor/quagga2/quagga.min.js?v=1.12.1",
-  "/i18n.js?v=20260916-operator-auto-camera-v1",
-  "/operator-load-summary.js?v=20260915-operator-display-v1",
-  "/operator.js?v=20260916-operator-auto-camera-v1",
+  "/i18n.js?v=20260923-control-damage-v1",
+  "/operator-load-summary.js?v=20260918-operator-display-settings-v1",
+  "/operator-photo-outbox.js?v=20260917-background-photos-v1",
+  "/operator-delivery-refresh.js?v=20260924-operator-responsiveness-v1",
+  "/operator.js?v=20260925-receipt-confirmation-v1",
   "/manifest.webmanifest",
   "/icons/mbbs-yard-192.png",
   "/icons/mbbs-yard-512.png",
@@ -65,6 +74,7 @@ self.addEventListener("notificationclick", (event) => {
 
 self.addEventListener("fetch", (event) => {
   const url = new URL(event.request.url);
+  if (url.pathname === "/field-sales" || url.pathname.startsWith("/field-sales/")) return;
   if (url.protocol !== "http:" && url.protocol !== "https:") return;
   const driverAsset = url.pathname === "/driver"
     || url.pathname === "/driver.html"

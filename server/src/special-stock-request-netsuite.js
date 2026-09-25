@@ -25,9 +25,12 @@ function itemPayload(line, { purchase = false } = {}) {
     quantity: finite(line.quantity, "Order quantity"),
     description: String(line.description || "").trim()
   };
+  if (line.unitId) payload.units = reference(line.unitId);
   const rate = purchase ? line.unitPurchaseCost ?? line.rate : line.rate;
   if (rate !== undefined && rate !== null && String(rate).trim() !== "") {
-    payload.rate = finite(rate, "Order rate", { allowNegative: !purchase });
+    const amount = Number(rate);
+    if (!Number.isFinite(amount) || (purchase && amount < 0)) throw remoteError('Order rate is invalid.', 'SPECIAL_REMOTE_PAYLOAD_INVALID', 400);
+    payload.rate = amount;
   }
   return payload;
 }
@@ -49,10 +52,11 @@ export function buildSpecialSalesOrderPayload({
   const instructions = delivery
     ? [
         `Delivery Address: ${String(draft.deliveryAddress || "").trim()}`,
-        `Delivery Date: ${draft.deliveryDate}`,
-        `Delivery Time: ${draft.windowStart}-${draft.windowEnd}`,
-        `Drop-off Loc: ${draft.deliveryInstructions}`
-      ].join("\n")
+        draft.deliveryDate ? `Delivery Date: ${draft.deliveryDate}` : null,
+        draft.windowStart ? `Delivery Time: ${draft.windowStart}-${draft.windowEnd}` : null,
+        `Contact: ${draft.deliveryContactName || ""} ${draft.deliveryContactPhone || ""}`,
+        draft.deliveryInstructions ? `Drop-off Loc: ${draft.deliveryInstructions}` : null
+      ].filter(Boolean).join("\n")
     : "";
   const payload = {
     entity: reference(draft.customerId),
@@ -69,7 +73,7 @@ export function buildSpecialSalesOrderPayload({
   }
   if (subsidiaryId) payload.subsidiary = reference(subsidiaryId);
   if (delivery) {
-    payload.custbody4 = draft.deliveryDate;
+    if (draft.deliveryDate) payload.custbody4 = draft.deliveryDate;
     payload.custbody7 = instructions;
     // `shipAddress` is the rendered summary returned by NetSuite. A custom
     // transaction address is written through the shippingAddress subrecord.

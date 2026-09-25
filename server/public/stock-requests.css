@@ -274,6 +274,43 @@
   grid-template-columns: repeat(3, minmax(0, 1fr));
 }
 
+.special-stock-page .stock-request-line-fields {
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 12px;
+  align-items: start;
+}
+
+.special-stock-page button:disabled {
+  cursor: not-allowed;
+  background: #e5e7eb;
+  border-color: #c4cbd1;
+  color: #5b6570;
+}
+
+.special-stock-page .special-so-material-fields {
+  grid-template-columns: repeat(5, minmax(0, 1fr));
+}
+
+.special-so-material-fields > label:not(.stock-request-wide) {
+  grid-template-rows: minmax(30px, auto) auto;
+  align-content: start;
+}
+
+.special-so-material-fields output {
+  display: flex;
+  align-items: center;
+  min-height: 39px;
+}
+
+.special-stock-page .stock-request-line > header > div {
+  display: grid;
+  gap: 4px;
+}
+
+.special-stock-page [hidden] {
+  display: none !important;
+}
+
 .special-case-line-note {
   grid-column: span 2;
 }
@@ -569,9 +606,16 @@
   .special-case-initial-grid {
     grid-template-columns: repeat(2, minmax(0, 1fr));
   }
+
+  .special-stock-page .stock-request-line-fields {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
 }
 
 @media (max-width: 600px) {
+  .special-stock-page .stock-request-line-fields {
+    grid-template-columns: minmax(0, 1fr);
+  }
   .special-case-initial-grid {
     grid-template-columns: minmax(0, 1fr);
   }
@@ -580,3 +624,12 @@
     grid-column: auto;
   }
 }
+
+.special-stage-filter { position: relative; min-width: 180px; }
+.special-stage-filter summary { cursor: pointer; padding: .7rem; border: 1px solid #ccd4dc; border-radius: 8px; background: #fff; }
+.special-stage-filter > div { position: absolute; z-index: 30; min-width: 280px; padding: .8rem; background: #fff; border: 1px solid #ccd4dc; box-shadow: 0 8px 24px #0002; border-radius: 8px; }
+.special-stage-filter label { display: flex; gap: .5rem; align-items: center; padding: .35rem; }
+.special-stage-filter input { width: auto; }
+.stock-request-pill.wait_for_production { background: #fff1cb; color: #694a00; }
+.stock-request-pill.dispatch_arrangement { background: #dfedff; color: #174776; }
+.stock-request-pill.completed { background: #e0f5e8; color: #19653a; }

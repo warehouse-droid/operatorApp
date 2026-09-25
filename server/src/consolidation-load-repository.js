@@ -32,7 +32,12 @@ export async function getConsolidatedLoad(operator, id, { lock = false } = {}) {
   if (!row) throw consolidationError("Consolidation Load not found.", "CONSOLIDATION_LOAD_NOT_FOUND", 404);
   if (String(row.operator_id) !== String(operator.id)) throw consolidationError("This load belongs to another operator.", "OPERATOR_YARD_FORBIDDEN", 403);
   assertOperatorYard(operator, row.location_id);
-  return publicBatch(row);
+  const batch = publicBatch(row);
+  if (batch.status === 'draft') {
+    const orders = await Promise.all(batch.snapshot.orders.map(order => getDeliveryOrder(order.netsuite_id)));
+    return { ...batch, confirmationSummaries: orders.filter(Boolean).map(order => order.confirmationSummary) };
+  }
+  return batch;
 }
 /** @param {any} operator @param {unknown} locationId */
 export async function listPendingConsolidatedLoads(operator, locationId) {

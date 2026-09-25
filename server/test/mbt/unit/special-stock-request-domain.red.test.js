@@ -10,15 +10,18 @@ import {
   normalizeSpecialCaseDraft,
   normalizeSpecialHandoffRoute,
   normalizeSpecialSalesDecision,
-  normalizeSpecialSalesOrderDraft,
+  normalizeSpecialSalesOrderDraft as normalizeSoWithClock,
   normalizeSpecialSupplyResponse,
   normalizeSpecialVendorPickupCompletion,
   specialPurchaseOrderMarker,
   specialSalesOrderMarker
 } from "../../../src/special-stock-request-domain.js";
 
+const normalizeSpecialSalesOrderDraft = input => normalizeSoWithClock(input, {now:new Date('2026-08-21T12:00:00Z')});
+
 const baseCase = () => ({
   storeLocationId: 1,
+  fulfillmentMethod: "yard_pickup",
   inquiryDate: "2026-08-21",
   customerName: "Landscape Customer",
   customerPhone: "416 555 0100",
@@ -32,7 +35,7 @@ const baseCase = () => ({
       color: "Caffe Crema",
       size: "180mm",
       quantity: 24,
-      uom: "PLT",
+      uom: "PLT", rate: 120,
       requiredDate: "2026-09-01",
       customerNote: "Full pallets only"
     },
@@ -42,7 +45,7 @@ const baseCase = () => ({
       color: "Caffe Crema",
       size: "60mm",
       quantity: 10,
-      uom: "PLT",
+      uom: "PLT", rate: 120,
       requiredDate: "2026-09-01"
     }
   ]
@@ -53,12 +56,13 @@ const baseOrderDraft = () => ({
   operationalYardLocationId: 15,
   fulfillmentMethod: "mbt_delivery",
   deliveryAddress: "37 Sunmount Rd, Scarborough, ON M1T 2A4",
+  deliveryContactName: "Site contact", deliveryContactPhone: "416-555-0100", palletTotal: 0,
   deliveryDate: "2026-09-10",
   windowStart: "09:00",
   windowEnd: "12:00",
   deliveryInstructions: "Call the site contact before unloading.",
   media: [{ id: "01911111-1111-7111-8111-111111111111", mimeType: "image/jpeg", byteSize: 1024 }],
-  materialLines: [{ caseLineId: 1, itemId: 2055, quantity: 768, uom: "PC", rate: 4.25 }],
+  materialLines: [{ caseLineId: 1, itemId: 2055, description: "Special item", quantity: 768, uom: "PC", rate: 4.25 }],
   ancillaryLines: [{ itemId: 1987, quantity: 1, rate: 250 }]
 });
 
@@ -99,9 +103,9 @@ test("case validation rejects hostile quantities, unauthorized stores, and missi
   }
 });
 
-test("initial lines use only the approved UOMs and a three-working-day minimum", () => {
-  assert.equal(minimumSpecialCaseRequiredDate(new Date("2026-08-21T15:00:00.000Z")), "2026-08-26");
-  assert.equal(minimumSpecialCaseRequiredDate(new Date("2026-08-23T15:00:00.000Z")), "2026-08-26");
+test("initial lines use only the approved UOMs and a requested-date minimum of today", () => {
+  assert.equal(minimumSpecialCaseRequiredDate(new Date("2026-08-21T15:00:00.000Z")), "2026-08-21");
+  assert.equal(minimumSpecialCaseRequiredDate(new Date("2026-08-23T15:00:00.000Z")), "2026-08-23");
   for (const uom of ["PLT", "LYR", "SEC", "PCS", "EACH"]) {
     const draft = baseCase();
     draft.lines[0].uom = uom;
@@ -238,7 +242,7 @@ test("Sales decisions are explicit and non-acceptance requires a reason", () => 
       palletQuantity: null
     }
   });
-  errorCode(() => normalizeSpecialSalesDecision({ decision: "accepted" }), "SPECIAL_DECISION_ITEM_REQUIRED");
+  assert.equal(normalizeSpecialSalesDecision({ decision: "accepted" }).itemResolution, null);
   for (const decision of ["request_update", "declined", "closed"]) {
     errorCode(() => normalizeSpecialSalesDecision({ decision }), "SPECIAL_DECISION_REASON_REQUIRED");
     assert.equal(normalizeSpecialSalesDecision({ decision, reason: "Customer requested this." }).decision, decision);
@@ -285,7 +289,7 @@ test("all lines resolve before release and only accepted lines enter the SO", ()
   );
 });
 
-test("delivery SO draft requires customer, yard, address, date, Toronto window, text, and valid media", () => {
+test("delivery SO draft requires address, keeps contacts optional and validates supplied windows and media", () => {
   const input = baseOrderDraft();
   const normalized = normalizeSpecialSalesOrderDraft(input);
   assert.equal(normalized.deliveryDate, "2026-09-10");
@@ -294,8 +298,9 @@ test("delivery SO draft requires customer, yard, address, date, Toronto window, 
   assert.equal(normalized.materialLines[0].caseLineId, 1);
   assert.equal(normalized.ancillaryLines[0].itemId, 1987);
 
-  for (const key of ["deliveryAddress", "deliveryDate", "windowStart", "windowEnd", "deliveryInstructions"]) {
-    errorCode(() => normalizeSpecialSalesOrderDraft({ ...input, [key]: "" }), "SPECIAL_SO_DELIVERY_REQUIRED");
+  errorCode(() => normalizeSpecialSalesOrderDraft({ ...input, deliveryAddress: "" }), "SPECIAL_SO_DELIVERY_REQUIRED");
+  for (const key of ["deliveryContactName", "deliveryContactPhone"]) {
+    assert.equal(normalizeSpecialSalesOrderDraft({ ...input, [key]: "" })[key], "");
   }
   errorCode(
     () => normalizeSpecialSalesOrderDraft({ ...input, windowStart: "13:00", windowEnd: "12:00" }),
@@ -323,26 +328,24 @@ test("SO draft rejects malformed fulfillment, yard, order-line, and media shapes
 test("customer pickup methods do not invent delivery requirements", () => {
   const common = {
     customerId: 800833,
+    palletTotal: 0,
     operationalYardLocationId: 15,
-    materialLines: [{ caseLineId: 1, itemId: 2055, quantity: 10, uom: "PC", rate: 4.25 }]
+    materialLines: [{ caseLineId: 1, itemId: 2055, description: "Special item", quantity: 10, uom: "PC", rate: 4.25 }]
   };
   assert.equal(normalizeSpecialSalesOrderDraft({ ...common, fulfillmentMethod: "vendor_pickup" }).deliveryDate, null);
   assert.equal(normalizeSpecialSalesOrderDraft({ ...common, fulfillmentMethod: "yard_pickup" }).deliveryDate, null);
 });
 
-test("case stage is derived from evidence and never hides reconciliation", () => {
-  assert.equal(deriveSpecialCaseStage({ submitted: false }), "draft");
-  assert.equal(deriveSpecialCaseStage({ submitted: true, hasPendingPurchaseResponse: true }), "awaiting_purchase");
-  assert.equal(deriveSpecialCaseStage({ submitted: true, hasPendingSalesDecision: true }), "awaiting_sales");
-  assert.equal(deriveSpecialCaseStage({ submitted: true, linesResolved: true, salesOrderId: null }), "awaiting_so");
-  assert.equal(deriveSpecialCaseStage({ submitted: true, linesResolved: true, salesOrderId: 10, salesOrderApproved: false }), "awaiting_so_approval");
-  assert.equal(deriveSpecialCaseStage({ submitted: true, linesResolved: true, salesOrderId: 10, salesOrderApproved: true }), "awaiting_po");
-  assert.equal(deriveSpecialCaseStage({ submitted: true, salesOrderId: 10, salesOrderApproved: true, purchaseOrderId: 20, needsDispatchRoute: true }), "awaiting_route");
-  assert.equal(deriveSpecialCaseStage({ submitted: true, purchaseOrderId: 20, operationallyComplete: true, remotelyReconciled: false }), "operationally_complete");
-  assert.equal(deriveSpecialCaseStage({ submitted: true, purchaseOrderId: 20, operationallyComplete: true, remotelyReconciled: true }), "completed");
-  assert.equal(deriveSpecialCaseStage({ attention: true, operationallyComplete: true }), "attention");
-  assert.equal(deriveSpecialCaseStage({ closed: true }), "closed");
-  assert.equal(deriveSpecialCaseStage({ purchaseOrderId: 20 }), "in_progress");
+test("case stage uses seven operational stages independently of approval and reconciliation flags", () => {
+  assert.equal(deriveSpecialCaseStage({ submitted: true, hasPendingPurchaseResponse: true }), 'new_enquiry');
+  assert.equal(deriveSpecialCaseStage({ hasPendingSalesDecision: true }), 'await_customer_confirmation');
+  assert.equal(deriveSpecialCaseStage({ linesResolved: true }), 'await_customer_confirmation');
+  for (const salesOrderApproved of [true, false]) assert.equal(deriveSpecialCaseStage({ salesOrderId: 10, salesOrderApproved }), 'confirmed');
+  assert.equal(deriveSpecialCaseStage({ salesOrderId: 10, purchaseOrderId: 20, fulfillmentMethod:'mbt_delivery' }), 'dispatch_arrangement');
+  assert.equal(deriveSpecialCaseStage({ salesOrderId: 10, purchaseOrderId: 20, fulfillmentMethod:'vendor_pickup' }), 'confirmed');
+  for (const remotelyReconciled of [true, false]) assert.equal(deriveSpecialCaseStage({ operationallyComplete:true, attention:true, remotelyReconciled }), 'completed');
+  assert.equal(deriveSpecialCaseStage({ waitingForProduction:true, salesOrderId:10, purchaseOrderId:20 }), 'wait_for_production');
+  assert.equal(deriveSpecialCaseStage({ closed:true }), 'closed');
 });
 
 test("handoff route follows fulfillment constraints", () => {

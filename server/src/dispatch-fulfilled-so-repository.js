@@ -17,7 +17,7 @@ export async function listFulfilledSalesDeliveryStates(candidateRefs = []) {
            EXISTS (SELECT 1 FROM operator_reload_cycles cycle
                     WHERE cycle.sales_order_id IN (candidate.netsuite_id, source_order.netsuite_id)
                       AND cycle.status IN ('authorized','preparing','packed','in_progress')) AS active_reload,
-           EXISTS (SELECT 1 FROM dispatch_order_completion_events completion
+           EXISTS (SELECT 1 FROM dispatch_effective_order_completion_events completion
                     WHERE completion.order_kind = 'SO'
                       AND lower(btrim(completion.order_ref)) IN (lower(btrim(candidate.tranid)), lower(btrim(source_order.tranid)))
                       AND completion.completion_evidence_type IN ('driver_job','manual_dispatch','direct_dependency')) AS operationally_completed

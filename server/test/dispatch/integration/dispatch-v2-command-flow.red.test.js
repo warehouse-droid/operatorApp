@@ -43,7 +43,7 @@ async function command(boot, planId, lease, commandId, commandType, payload) {
       commandId,
       baseRevision: boot.plan.revision,
       baseDigest: boot.plan.digest,
-      sessionId: "dispatch-v2-command-flow",
+      sessionId: fixture.leaseSession(lease),
       commandType,
       payload
     }

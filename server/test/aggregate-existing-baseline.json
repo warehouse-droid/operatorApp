@@ -1,0 +1,73 @@
+{
+  "files": 555,
+  "tests": 2884,
+  "passes": 2859,
+  "failures": {
+    "test/mbt/infrastructure/p3-gauntlet-contract.test.js": [
+      "P3.12: browser specs share one worker-owned database-pool lifecycle"
+    ],
+    "test/mbt/integration/feature-gate-admin-http.test.js": [
+      "P3-F29 Admin gate inventory is private, complete, and keeps live integrations locked"
+    ],
+    "test/mbt/integration/http-capabilities.test.js": [
+      "F01/F16: MBT status is authenticated, fail-closed, and reports the Phase 1 safety boundary",
+      "F01: the database cannot enable NetSuite writes while the environment write gate is false"
+    ],
+    "test/mbt/integration/http-role-matrix.test.js": [
+      "F02/F15: Front Desk sees its exact controlled server gate state"
+    ],
+    "test/mbt/integration/http-shell.test.js": [
+      "F15: all MBT routes render one accessible controlled shell with an explicit controller"
+    ],
+    "test/mbt/integration/local-load-performance.test.js": [
+      "test/mbt/integration/local-load-performance.test.js"
+    ],
+    "test/mbt/integration/migration-upgrade.test.js": [
+      "F06/F16: schema-101 upgrade preserves representative legacy records and is migration-runner idempotent"
+    ],
+    "test/mbt/integration/operator-background-photos.test.js": [
+      "test/mbt/integration/operator-background-photos.test.js"
+    ],
+    "test/mbt/integration/operator-display-settings.test.js": [
+      "test/mbt/integration/operator-display-settings.test.js"
+    ],
+    "test/mbt/integration/p3-predeploy-readiness.test.js": [
+      "P3.11: the deployment inventory exactly covers every on-disk MBT-era migration"
+    ],
+    "test/mbt/integration/stock-return-draft-insert.test.js": [
+      "normal stock draft preserves every line field and consumes the draft only on success"
+    ],
+    "test/mbt/unit/control-yard-photo-thumbnail.test.js": [
+      "Control and Admin request the cache-busted thumbnail hydration client"
+    ],
+    "test/mbt/unit/driver-camera-ordinary-upload.test.js": [
+      "a fresh Driver shell version evicts older copy-enabled cached assets"
+    ],
+    "test/mbt/unit/driver-plan-date-execution-wiring.contract.test.js": [
+      "S11: the guarded client ships in a new atomic Driver shell generation"
+    ],
+    "test/mbt/unit/driver-pwa-cache-repair.test.js": [
+      "a failed staging download leaves the active and non-Driver caches byte-for-byte unchanged",
+      "a fresh Driver worker reloads every v41 shell asset and initializes only its scoped sentinel",
+      "a successful repair replaces only the complete Driver shell and preserves offline data sentinels"
+    ],
+    "test/mbt/unit/driver-pwa-site-reset.test.js": [
+      "the reset ships as a new atomic shell generation without forcing a protocol-version cutover"
+    ],
+    "test/mbt/unit/driver-pwa-ux-regressions.test.js": [
+      "the updated override policy is atomically included in the Driver PWA shell"
+    ],
+    "test/mbt/unit/operations-navigation-enhancements.test.js": [
+      "operator cache assets advance with the cycle-count pagination release"
+    ],
+    "test/mbt/unit/operator-customer-pickup-photo-gate-ui.contract.test.js": [
+      "S7: Operator cache revision ships the live-policy client once; later toggles are server-only"
+    ],
+    "test/mbt/unit/operator-page-confirm-ui.contract.test.js": [
+      "page confirmation has a duplicate-click guard and ships in a fresh Operator cache"
+    ],
+    "test/mbt/unit/operator-yard-assets.test.js": [
+      "Operator service worker precaches the exact new page assets, preserves Driver caches, and bypasses API requests"
+    ]
+  }
+}

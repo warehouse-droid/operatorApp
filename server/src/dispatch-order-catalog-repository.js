@@ -1,4 +1,5 @@
 import crypto from "node:crypto";
+import { decorateSorOrders } from "./sor-rental-repository.js";
 
 import { query, withTransaction } from "./db.js";
 import { overlayDispatchOrderCompletionStatuses } from "./dispatch-completion-repository.js";
@@ -241,7 +242,8 @@ export async function getDispatchOrderCatalogOrder(ref) {
       LIMIT 1`,
     [cleanRef]
   );
-  const order = result.rows[0]?.full_order || null;
+  const savedOrder = result.rows[0]?.full_order || null;
+  const order = savedOrder ? (await decorateSorOrders([savedOrder]))[0] : null;
   if (!order) return null;
   const canonical = order.type === "CO"
     ? (await reconcileDispatchPlanLocalCos({ orders: [order], trucks: [] })).orders
@@ -403,7 +405,23 @@ export async function listDispatchOrderPool({
      ), visible_catalog AS (
        SELECT candidate.*
          FROM pool_catalog candidate
-        WHERE NOT EXISTS (
+        WHERE (EXISTS (SELECT 1 FROM mbt_feature_flags WHERE flag_key='sor_rental_workflow' AND enabled=true)
+          OR (candidate.order_ref !~* '^SOR[0-9]'
+            AND candidate.card->>'orderKind' IS DISTINCT FROM 'sor_rental_return'
+            AND NOT jsonb_path_exists(candidate.card, '$.childOrders[*] ? (@ like_regex "^SOR[0-9]" flag "i")')
+            AND NOT jsonb_path_exists(candidate.card, '$.**.id ? (@ like_regex "^SOR[0-9]" flag "i")')))
+          AND (candidate.card->>'orderKind' IS DISTINCT FROM 'sor_rental_return' OR EXISTS (
+          SELECT 1 FROM dispatch_custom_orders sor_return
+          WHERE lower(sor_return.ref_number)=lower(candidate.order_ref)
+            AND sor_return.order_kind='sor_rental_return' AND sor_return.status='open'
+        )) AND NOT EXISTS (
+          SELECT 1
+            FROM sales_orders source_order
+           WHERE candidate.order_type = 'SO'
+             AND lower(source_order.tranid) = lower(candidate.order_ref)
+             AND source_order.sales_order_type = 'Pick-Up'
+        )
+          AND NOT EXISTS (
           SELECT 1
             FROM dispatch_global_order_group_members member
             JOIN dispatch_global_order_groups global_group
@@ -438,7 +456,8 @@ export async function listDispatchOrderPool({
           LIMIT 1
        ) assignment ON true
       WHERE catalog.eligible = true
-        AND ($1 = '' OR catalog.order_type = $1 OR ($1 = 'TO' AND catalog.order_type = 'CUSTOM'))
+        AND ($1 = '' OR catalog.order_type = $1 OR ($1 = 'TO' AND catalog.order_type = 'CUSTOM')
+          OR ($1 = 'SO' AND catalog.card->>'orderKind' = 'sor_rental_return'))
         AND (
           $2 = ''
           OR lower(catalog.order_ref) = $2
@@ -476,7 +495,7 @@ export async function listDispatchOrderPool({
     getDispatchOrderCatalogState()
   ]);
   return {
-    orders,
+    orders: await decorateSorOrders(orders),
     nextCursor: hasMore && last ? encodeCursor({
       e: Number(last.exact_rank || 0),
       d: new Date(last.activity_at).toISOString(),

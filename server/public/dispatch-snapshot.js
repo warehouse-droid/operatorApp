@@ -1,3 +1,4 @@
+let pendingSnapshotRestore = null;
 const snapshotApp = document.getElementById("dispatchSnapshotApp");
 const st = (key, fallback) => window.MBBS_I18N?.t ? window.MBBS_I18N.t(key, fallback) : fallback;
 
@@ -39,7 +40,7 @@ function snapshotApi(path, options = {}) {
       ...(token ? { Authorization: `Bearer ${token}` } : {})
     }
   }).then(async (response) => {
-    if (!response.ok) throw new Error(await response.text());
+    if (!response.ok) {throw Object.assign(new Error(await response.text()), { status: response.status });}
     return response.json();
   });
 }
@@ -80,6 +81,7 @@ async function enterSnapshotEditMode() {
 }
 
 async function releaseSnapshotEditMode() {
+  if (pendingSnapshotRestore) {throw new Error("Retry the pending restore before leaving Edit Mode.");}
   if (!snapshotCanEdit()) return;
   await snapshotApi("/api/dispatch/plan-edit-lease/release", {
     method: "POST",
@@ -224,22 +226,27 @@ async function restoreSelectedSnapshot() {
   snapshotLoading = true;
   renderSnapshotApp();
   try {
-    const current = snapshots.find((snapshot) => snapshot.current) || {};
-    const restored = await snapshotApi(`/api/dispatch/plan-snapshots/${encodeURIComponent(selectedSnapshot.id)}/restore`, {
-      method: "POST",
+    const current = pendingSnapshotRestore ? null : await snapshotApi(`/api/dispatch/plans/${encodeURIComponent(selectedSnapshot.planId)}/revision`);
+    pendingSnapshotRestore ||= {
+      snapshotId: selectedSnapshot.id,
       body: JSON.stringify({
-        planDate: selectedSnapshot.planDate,
-        sessionId: snapshotSessionId,
-        editLeaseToken: snapshotLeaseToken,
-        expectedRevision: current.revision,
-        expectedDigest: current.digest || "",
+        planDate: selectedSnapshot.planDate, sessionId: snapshotSessionId, editLeaseToken: snapshotLeaseToken,
+        expectedRevision: current.revision, expectedDigest: current.digest,
+        commandId: `dispatch-restore:${snapshotSessionId}:${selectedSnapshot.id}:${current.revision}:${current.digest}`,
         audit: { sessionId: snapshotSessionId }
       })
+    };
+    if (pendingSnapshotRestore.snapshotId !== selectedSnapshot.id) {throw new Error('Retry the pending restore before restoring another snapshot.');}
+    const restored = await snapshotApi(`/api/dispatch/plan-snapshots/${encodeURIComponent(selectedSnapshot.id)}/restore`, {
+      method: "POST",
+      body: pendingSnapshotRestore.body
     });
+    pendingSnapshotRestore = null;
     selectedSnapshotId = `current-${restored.plan?.id || selectedSnapshot.planId}`;
     snapshotNotice = "Snapshot restored. Planning screens will refresh.";
     await loadSnapshots({ keepSelection: true });
   } catch (error) {
+    if (error.status >= 400 && error.status < 500) {pendingSnapshotRestore = null;}
     snapshotNotice = `Restore failed: ${error.message}`;
   } finally {
     snapshotLoading = false;
@@ -256,9 +263,14 @@ snapshotApp.addEventListener("click", (event) => {
     return;
   }
   if (action === "load-snapshots") {
-    releaseSnapshotEditMode().catch(() => {});
-    snapshotDate = document.getElementById("snapshotDate")?.value || snapshotDate;
-    loadSnapshots();
+    const nextDate = document.getElementById("snapshotDate")?.value || snapshotDate;
+    releaseSnapshotEditMode().then(() => {
+      snapshotDate = nextDate;
+      return loadSnapshots();
+    }).catch(error => {
+      snapshotNotice = error.message;
+      renderSnapshotApp();
+    });
     return;
   }
   if (action === "select-snapshot") {

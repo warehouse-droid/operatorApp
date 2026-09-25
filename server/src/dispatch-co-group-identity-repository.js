@@ -1,3 +1,5 @@
+import { deferDispatchPlanMaintenance, enqueueDispatchPlanMaintenance } from "./dispatch-plan-maintenance-queue.js";
+import { notifyDispatchPlanMaintenance } from "./dispatch-plan-maintenance.js";
 import { query, withTransaction } from "./db.js";
 import { writeDispatchAudit } from "./dispatch-audit-repository.js";
 import {
@@ -33,9 +35,8 @@ export async function repairDispatchCoGroupIdentities({ planIds = [], limit = 50
          FROM dispatch_plans p
          JOIN dispatch_plan_snapshots s ON s.plan_id = p.id
         WHERE (cardinality($1::bigint[]) = 0 OR p.id = ANY($1::bigint[]))
-        ORDER BY p.id
-        LIMIT $2
-        FOR UPDATE OF p, s`,
+        ORDER BY p.plan_date, p.id
+        LIMIT $2`,
       [selectedPlanIds, safeLimit]
     );
     const repairedPlanIds = [];
@@ -56,15 +57,22 @@ export async function repairDispatchCoGroupIdentities({ planIds = [], limit = 50
       };
       const mappings = dispatchCoGroupIdentityMappings(current);
       if (!mappings.length) continue;
+      if (await deferDispatchPlanMaintenance(current, { kind: "co_identity" })) {
+        deferredPlanIds.push(text(row.id));
+        continue;
+      }
+      await query("SELECT id FROM dispatch_plans WHERE id=$1 FOR UPDATE", [row.id]);
       const canonical = buildCompactDispatchSnapshot(canonicalizeDispatchCoGroupIdentities(current));
       const executionPolicy = await evaluateDispatchExecutedPrefixPreservation({
         previousPlan: current,
         nextPlan: canonical
       });
       if (!executionPolicy.allowed) {
+        await enqueueDispatchPlanMaintenance(row.id, { kind: "co_identity" });
         deferredPlanIds.push(text(row.id));
         continue;
       }
+      canonical.revision = Number((await query("UPDATE dispatch_plans SET revision=revision+1,updated_at=now() WHERE id=$1 RETURNING revision", [row.id])).rows[0].revision);
       const board = dispatchPlanBoard(canonical);
       await query(
         `UPDATE dispatch_plan_snapshots
@@ -75,7 +83,8 @@ export async function repairDispatchCoGroupIdentities({ planIds = [], limit = 50
                 order_count = $6,
                 truck_count = $7,
                 load_count = $8,
-                stop_count = $9
+                stop_count = $9,
+                saved_at = now()
           WHERE plan_id = $1`,
         [
           row.id,
@@ -105,7 +114,8 @@ export async function repairDispatchCoGroupIdentities({ planIds = [], limit = 50
           after: { orderRef: mapping.newRef },
           details: {
             reason: "canonicalize_grouped_internal_co_identity",
-            preservedRevision: current.revision
+            previousRevision: current.revision,
+            revision: canonical.revision
           }
         });
         repairedMappings.push({
@@ -114,6 +124,7 @@ export async function repairDispatchCoGroupIdentities({ planIds = [], limit = 50
           newRef: mapping.newRef
         });
       }
+      notifyDispatchPlanMaintenance(canonical, mappings.flatMap(mapping => [mapping.oldRef, mapping.newRef]));
       repairedPlanIds.push(text(row.id));
     }
     return {

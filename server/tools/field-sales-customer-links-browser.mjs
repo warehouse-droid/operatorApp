@@ -1,0 +1,77 @@
+import assert from 'node:assert/strict';
+import {mkdir,writeFile} from 'node:fs/promises';
+import {randomUUID} from 'node:crypto';
+import {chromium} from 'playwright';
+import {expect} from '@playwright/test';
+import sharp from 'sharp';
+import {httpFixture} from '../test/field-sales/http-fixture.js';
+import {query,closeDb} from '../src/db.js';
+
+const dir=process.env.FIELD_SALES_ARTIFACT_DIR||'test-artifacts/field-sales/customer-links';await mkdir(dir,{recursive:true});
+const f=await httpFixture(),browser=await chromium.launch({headless:true,args:['--no-sandbox']}),results=[],errors=[];
+const actor=f.actors.field_sales.operator,tag=Date.now(),cmd=(kind,payload)=>f.repo.command(actor,{id:randomUUID(),kind,payload});
+const makeCustomer=async(name,phone,email,rep='Contact')=>(await cmd('customer.save',{id:randomUUID(),name:`${name} ${tag}`,phone:`${phone} ext ${tag}`,email:email.replace('@',`.${tag}@`),representatives:[{id:randomUUID(),name:rep,phone:'416-555-0123',email:'rep@example.test'}]})).customer;
+let page;
+try{
+ const alpha=await makeCustomer('Linked Builder','416-555-1001','linked@example.test','Original Contact');
+ const beta=await makeCustomer('Search Builder','416-555-2002','second@example.test','Second Contact');
+ const gamma=await makeCustomer('Search Builder','416-555-3003','third@example.test','Third Contact');
+ const delta=await makeCustomer('Offline Builder','416-555-4004','offline@example.test','Offline Contact');
+ const archived=await makeCustomer('Archived Builder','416-555-5005','archived@example.test');await cmd('customer.save',{...archived,archived:true});
+ const other=(await cmd('jobsite.save',{id:randomUUID(),address:'3445 Kennedy Road'})).jobsite;
+ for(const site of [f.site,other]){await cmd('customer.link',{customerId:alpha.id,jobsiteId:site.id,linked:true});}
+ const historicalId=randomUUID();await cmd('visit.record',{id:historicalId,jobsiteId:f.site.id,outcome:'Quote requested',occurredAt:new Date().toISOString(),contacts:[{customerId:alpha.id,representativeIds:[alpha.representatives[0].id]}]});
+ page=await browser.newPage({viewport:{width:1440,height:1000}});page.on('pageerror',e=>errors.push(e.message));
+ await page.addInitScript(token=>localStorage.setItem('mbbs.staff.token',token),f.actors.field_sales.token);
+ await page.goto(f.base+'/field-sales/#today');await page.locator('#visit-route').selectOption(f.route.id);await page.locator('[data-record]').first().click();
+ await expect(page.locator('#site-customer-search')).toBeVisible();await expect(page.locator('#site-customer-add')).toBeDisabled();
+ await expect(page.locator('#visit-customers input[type=checkbox],#site-existing-customer,#search-existing-customer')).toHaveCount(0);
+ await expect(page.locator('[data-linked-customer]')).toHaveCount(1);await expect(page.locator('#site-linked-customers')).toContainText('Original Contact');await expect(page.locator('#site-linked-customers')).toContainText('rep@example.test');
+ results.push('One autocomplete and Add button replace both old controls; linked customers and representatives have no checkboxes');
+ await page.locator('#visit-form [name=outcome]').selectOption('Quote requested');await page.locator('#visit-form [name=note]').fill('Keep these visit notes');await page.locator('#two-weeks').click();
+ const revisit=await page.locator('#revisit-date').inputValue();
+ const photo=await sharp({create:{width:10,height:10,channels:3,background:'#aabbcc'}}).png().toBuffer();await page.locator('#visit-photos').setInputFiles({name:'site.png',mimeType:'image/png',buffer:photo});
+ const input=page.locator('#site-customer-search'),suggestions=page.locator('#site-customer-suggestions [role=option]');
+ await input.fill(beta.name);await expect(suggestions).toHaveCount(2);await suggestions.filter({hasText:beta.email}).click();
+ await expect(page.locator('#site-customer-add')).toBeEnabled();await expect(page.locator('[data-linked-customer]')).toHaveCount(1);
+ await expect(page.locator('#visit-form')).toBeVisible();assert.equal((await f.repo.getCustomer(beta.id)).jobsites.length,0);
+ await page.locator('#site-customer-add').evaluate(b=>{b.click();b.click();});await expect(page.locator(`[data-linked-customer="${beta.id}"]`)).toBeVisible();await expect(page.locator('#sync')).toHaveText('All changes saved');
+ assert.equal((await query('SELECT count(*)::int n FROM field_sales_customer_sites WHERE customer_id=$1 AND jobsite_id=$2',[beta.id,f.site.id])).rows[0].n,1);
+ results.push('Suggestions distinguish duplicate names; selection alone does not link, and submit links once');
+ await input.fill(beta.email);await expect(page.locator('#site-customer-status')).toContainText('No matching');await expect(suggestions).toHaveCount(0);
+ await input.fill(archived.name);await expect(page.locator('#site-customer-status')).toContainText('No matching');await expect(suggestions).toHaveCount(0);
+ results.push('Already linked and archived customers are excluded from suggestions');
+ await input.fill(gamma.phone);await expect(suggestions).toHaveCount(1);await input.press('ArrowDown');await input.press('Enter');await expect(page.locator('#site-customer-add')).toBeEnabled();await expect(page.locator('[data-linked-customer]')).toHaveCount(2);
+ await input.fill('unselected text');await expect(page.locator('#site-customer-add')).toBeDisabled();await input.press('Enter');await expect(page.locator('#visit-form')).toBeVisible();
+ await input.fill(gamma.email);await expect(suggestions).toHaveCount(1);await input.press('ArrowDown');await input.press('Enter');await input.press('Enter');await expect(page.locator(`[data-linked-customer="${gamma.id}"]`)).toBeVisible();
+ results.push('Phone/email search and keyboard selection work without accidentally submitting the visit; edited text clears selection');
+ await page.locator(`[data-remove-site-customer="${alpha.id}"]`).click();await expect(page.locator(`[data-linked-customer="${alpha.id}"]`)).toHaveCount(0);await expect(page.locator('#sync')).toHaveText('All changes saved');
+ const retained=await f.repo.getCustomer(alpha.id);assert.deepEqual(retained.jobsites.map(s=>s.id),[other.id]);assert.equal(retained.representatives[0].id,alpha.representatives[0].id);
+ assert.equal((await query('SELECT data FROM field_sales_visits WHERE id=$1',[historicalId])).rows[0].data.contacts[0].name,alpha.name);
+ results.push('Remove unlinks only this site and retains the customer, other site links, representatives and previous visit history');
+ await page.locator(`[data-edit-contact="${beta.id}"]`).click();await page.locator('[data-representative] [name=repPhone]').fill('416-555-9999');await page.locator('#customer-form button[type=submit]').click();await expect(page.locator('#customer-form')).toHaveCount(0);
+ await expect(page.locator(`[data-linked-customer="${beta.id}"]`)).toContainText('416-555-9999');
+ await expect(page.locator('#visit-form [name=note]')).toHaveValue('Keep these visit notes');await expect(page.locator('#revisit-date')).toHaveValue(revisit);assert.equal(await page.locator('#visit-photos').evaluate(el=>el.files.length),1);
+ results.push('Adding, removing and editing contacts preserve visit notes, revisit date and the selected photo');
+ // Cache this directory entry before exercising the offline link command.
+ await input.fill(delta.email);await expect(suggestions).toHaveCount(1);await input.press('Escape');
+ await expect(page.locator('#sync')).toHaveText('All changes saved');await page.context().setOffline(true);
+ await page.locator(`[data-remove-site-customer="${gamma.id}"]`).click();await expect(page.locator(`[data-linked-customer="${gamma.id}"]`)).toHaveCount(0);
+ await input.fill(delta.email);await expect(suggestions).toHaveCount(1);await suggestions.click();await page.locator('#site-customer-add').click();await expect(page.locator(`[data-linked-customer="${delta.id}"]`)).toBeVisible();
+ await page.setViewportSize({width:390,height:844});assert.equal(await page.evaluate(()=>document.documentElement.scrollWidth<=window.innerWidth+1),true);await page.screenshot({path:dir+'/customer-links-mobile.png',fullPage:true});
+ await page.locator('#visit-submit').click();await expect(page.locator('#visit-form')).toBeHidden();
+ const queued=await page.evaluate(async id=>{const w=await (await import('/field-sales/offline.js')).openWorkspace(id);const p=await w.pending();w.close();return p;},actor.id);
+ assert.deepEqual(queued.map(e=>e.kind),['customer.link','customer.link','visit.record','photo']);
+ assert.deepEqual(queued[2].payload.contacts.map(c=>c.customerId).sort(),[beta.id,delta.id].sort());assert.ok(queued[2].payload.contacts.every(c=>c.representativeIds.length===1));
+ await page.context().setOffline(false);await expect(page.locator('#sync')).toHaveText('All changes saved',{timeout:15000});
+ const saved=(await query('SELECT * FROM field_sales_visits WHERE route_id=$1',[f.route.id])).rows[0];assert.equal(saved.note,'Keep these visit notes');assert.deepEqual(saved.data.contacts.map(c=>c.customerId).sort(),[beta.id,delta.id].sort());assert.equal((await query('SELECT count(*)::int n FROM field_sales_photos WHERE visit_id=$1',[saved.id])).rows[0].n,1);
+ assert.ok(!(await f.repo.getCustomer(gamma.id)).jobsites.some(s=>s.id===f.site.id));assert.ok((await f.repo.getCustomer(delta.id)).jobsites.some(s=>s.id===f.site.id));
+ results.push('Offline remove/add operations sync before the visit and photo, with the visible customer list recorded automatically');
+ await page.locator('[data-stop-quote]').first().click();await page.locator('#quote-manage-customers').click();await expect(page.locator('#quote-site-customers input[type=checkbox]')).toHaveCount(0);
+ await page.locator('#site-customer-search').fill(alpha.email);await expect(suggestions).toHaveCount(1);await suggestions.click();await page.locator('#site-customer-add').click();await expect(page.locator(`[data-linked-customer="${alpha.id}"]`)).toBeVisible();
+ await page.setViewportSize({width:1440,height:1000});await page.screenshot({path:dir+'/customer-links-desktop.png',fullPage:true});
+ await page.getByRole('button',{name:'Done',exact:true}).click();await expect(page.locator(`#quote-customer option[value="${alpha.id}"]`)).toHaveCount(1);
+ results.push('The quote customer popup shares the same autocomplete/list and refreshes its customer choices after linking');
+ assert.deepEqual(errors,[]);await writeFile(dir+'/customer-links-browser.json',JSON.stringify({passed:true,results},null,2));console.log(JSON.stringify({passed:true,results}));
+}catch(error){if(page){await page.screenshot({path:dir+'/customer-links-failure.png',fullPage:true});await writeFile(dir+'/customer-links-failure.txt',await page.locator('body').innerText());}throw error;}
+finally{await browser.close();await f.close();await closeDb();}

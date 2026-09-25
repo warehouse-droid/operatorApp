@@ -1,4 +1,5 @@
 // @ts-check
+import { outboundOrderYards } from './outbound-location-domain.js';
 /** @typedef {{ id?: string, role?: string, roles?: string[], yardLocationIds?: number[], operatorYardLocationIds?: number[] }} OperatorYardAccount */
 
 export const OPERATOR_YARD_LOCATION_IDS = Object.freeze([1, 28, 15, 26]);
@@ -46,6 +47,7 @@ export function assertOperatorYard(operator, locationId) {
 
 /** @param {any} order @param {number[] | null} [allowedYards] */
 export function deliveryOrderWithinYards(order, allowedYards = null) {
-  return allowedYards === null || [order, ...(order.child_orders || [])]
-    .every((child) => allowedYards.includes(Number(child.outbound_location_id ?? child.source_location_id)));
+  if (allowedYards === null) return true;
+  try { return outboundOrderYards(order).every(yard => allowedYards.includes(yard)); }
+  catch { return false; }
 }

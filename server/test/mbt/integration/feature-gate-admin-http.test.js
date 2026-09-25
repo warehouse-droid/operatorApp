@@ -20,11 +20,13 @@ const USERS = Object.freeze({
   dispatcher: `mbt-gates-dispatcher-${RUN_ID}`
 });
 const EXPECTED_FLAGS = Object.freeze([
+  "sor_rental_workflow",
   "driver_offline_mode",
   "driver_yard_dependency_soft_mode",
   "operator_customer_pickup_photo_required",
   "sales_stock_request_over_availability",
   "special_stock_request_workflow",
+  "special_stock_request_test_skip_orders",
   "dispatch_optimized_order_pool",
   "operator_netsuite_customer_pickup_if_3445",
   "operator_netsuite_receiving_ir_3445",
@@ -38,6 +40,14 @@ const EXPECTED_FLAGS = Object.freeze([
   "operator_netsuite_customer_pickup_if_150",
   "operator_netsuite_receiving_ir_150",
   "operator_netsuite_delivery_prep_if_150",
+  "operator_netsuite_stock_return_ra_3445",
+  "operator_netsuite_pallet_return_ra_3445",
+  "operator_netsuite_stock_return_ra_2967",
+  "operator_netsuite_pallet_return_ra_2967",
+  "operator_netsuite_stock_return_ra_12441",
+  "operator_netsuite_pallet_return_ra_12441",
+  "operator_netsuite_stock_return_ra_150",
+  "operator_netsuite_pallet_return_ra_150",
   "dispatch_netsuite_sales_order_if_3445",
   "dispatch_netsuite_sales_order_if_2967",
   "dispatch_netsuite_sales_order_if_12441",

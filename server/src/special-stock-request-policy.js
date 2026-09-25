@@ -1,18 +1,27 @@
 import { query } from "./db.js";
 
 export const SPECIAL_STOCK_REQUEST_FLAG_KEY = "special_stock_request_workflow";
+export const SPECIAL_STOCK_TEST_SKIP_FLAG_KEY = 'special_stock_request_test_skip_orders';
 
 function policyError(message, status = 404, code = "SPECIAL_STOCK_DISABLED") {
   return Object.assign(new Error(message), { status, code });
 }
 
 export async function getSpecialStockRequestPolicy({ queryFn = query } = {}) {
+  return getFlagPolicy(SPECIAL_STOCK_REQUEST_FLAG_KEY, queryFn);
+}
+
+export async function getSpecialStockTestSkipPolicy({ queryFn = query } = {}) {
+  return getFlagPolicy(SPECIAL_STOCK_TEST_SKIP_FLAG_KEY, queryFn);
+}
+
+async function getFlagPolicy(flagKey, queryFn) {
   const result = await queryFn(
     `SELECT enabled, revision, updated_at
        FROM mbt_feature_flags
       WHERE flag_key = $1
       LIMIT 1`,
-    [SPECIAL_STOCK_REQUEST_FLAG_KEY]
+    [flagKey]
   );
   const row = result.rows?.[0];
   return {
@@ -22,21 +31,31 @@ export async function getSpecialStockRequestPolicy({ queryFn = query } = {}) {
   };
 }
 
+export function assertSpecialStockRemoteOrderAllowed(detail) {
+  if (detail?.salesOrderSkipped || detail?.purchaseOrderSkipped) {
+    throw policyError('This request contains a skipped test order. NetSuite order actions are unavailable.', 409, 'SPECIAL_TEST_ORDER_REMOTE_BLOCKED');
+  }
+  return true;
+}
+
 export function assertSpecialStockRequestEnabled(policy) {
   if (policy?.enabled === true) return true;
   throw policyError("The Special Item stock-request workflow is not enabled.");
 }
 
 function omitRestrictedFields(value) {
-  if (!value || typeof value !== "object" || Array.isArray(value)) return value;
+  if (value instanceof Date) return value;
+  if (Array.isArray(value)) return value.map(omitRestrictedFields);
+  if (!value || typeof value !== "object") return value;
   const {
     unitPurchaseCost: _unitPurchaseCost,
     unit_purchase_cost: _unitPurchaseCostSnake,
     scmInternalNote: _scmInternalNote,
     scm_internal_note: _scmInternalNoteSnake,
+    quantityReviewPlan: _quantityReviewPlan,
     ...visible
   } = value;
-  return visible;
+  return Object.fromEntries(Object.entries(visible).map(([key, entry]) => [key, omitRestrictedFields(entry)]));
 }
 
 export function projectSpecialStockCase(detail, audience = "sales") {

@@ -13,6 +13,7 @@ const MIN_INTERVAL_MINUTES = 5;
 const MAX_INTERVAL_MINUTES = 43200;
 
 const PHOTO_REFERENCE_TARGETS = [
+  { table: "operator_background_photos", column: "r2_ref", kind: "text" },
   { table: "operator_load_records", column: "photo_data_url", kind: "text" },
   { table: "operator_load_records", column: "photo_data_urls", kind: "jsonb" },
   { table: "customer_pickup_load_records", column: "photo_data_url", kind: "text" },
@@ -24,9 +25,11 @@ const PHOTO_REFERENCE_TARGETS = [
   { table: "driver_day_records", column: "pre_dvir_photo_data_urls", kind: "jsonb" },
   { table: "driver_day_records", column: "post_dvir_photo_data_urls", kind: "jsonb" },
   { table: "driver_job_records", column: "photo_data_urls", kind: "jsonb" },
+  { table: "driver_job_records", column: "job_details", kind: "jsonb_deep" },
   { table: "driver_job_photo_addition_events", column: "photo_references", kind: "jsonb" },
   { table: "return_drafts", column: "payload", kind: "jsonb_deep" },
   { table: "return_photos", column: "photo_reference", kind: "text" },
+  { table: "inventory_damage_photos", column: "photo_reference", kind: "text" },
   { table: "sales_order_delivery_instruction_media", column: "object_reference", kind: "text" }
 ];
 

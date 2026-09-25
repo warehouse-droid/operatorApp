@@ -10,7 +10,7 @@
   let offlineReviewRefreshTimer = null;
   let offlineReviewEventSource = null;
   let sidebarOperator = null;
-  if (!path.startsWith("/admin") && !path.startsWith("/control") && !path.startsWith("/dispatch") && !path.startsWith("/scm") && !path.startsWith("/sales") && !path.startsWith("/mbt")) return;
+  if (!path.startsWith("/admin") && !path.startsWith("/control") && !path.startsWith("/dispatch") && !path.startsWith("/scm") && !path.startsWith("/sales") && !path.startsWith("/mbt") && !path.startsWith("/aggregate-requests")) return;
 
   function t(key, fallback) {
     return window.MBBS_I18N?.t?.(key, fallback) || fallback;
@@ -53,7 +53,9 @@
     { label: "Dispatch", href: "/dispatch", icon: "DP", authorities: ["admin", "dispatcher"] },
     { label: "SCM", href: "/scm", icon: "SC", authorities: ["admin", "dispatcher", "scm", "scm_staff", "yard_manager"] },
     { label: "Sales", href: "/sales", icon: "SA", authorities: ["admin", "sales"] },
+    { label: "Field Sales", href: "/field-sales/", icon: "FS", authorities: ["admin", "field_sales"] },
     { label: "MBT", href: "/mbt", icon: "MB", authorities: ["admin", "dispatcher", "mbt_frontdesk", "mbt_billing"] },
+    { label: "Aggregate Requests", href: "/aggregate-requests", icon: "AG", staffOnly: true, authorities: ["admin", "sales", "operator", "yard_manager"] },
     { label: "Operator", href: "/operator", icon: "OP", authorities: ["admin", "operator", "yard_manager"] }
   ];
 
@@ -109,11 +111,14 @@
     { label: "Vendor Mapping", href: "/control/vendor-mapping", controlSection: "vendor-mapping", icon: "VM" },
     { label: "Operator Warnings", href: "/control/operator-warnings", controlSection: "warnings", icon: "WN" },
     { label: "In/Outbound Record", href: "/control/yard-in-outbound", controlSection: "loaded-export", icon: "IR" },
+    { label: "Count Sheets", href: "/control/count-sheets", controlSection: "count-sheets", icon: "CS" },
+    { label: "Damage Stock", href: "/control/damage-stock", controlSection: "damage-stock", icon: "DS" },
     { label: "Cycle Count Review", href: "/control/cycle-count-review", controlSection: "cycle-count", icon: "CC" },
     { label: "Operator Load Records", href: "/control/operator-load-records", controlSection: "fulfillment", icon: "LD" }
   ];
 
   const adminItems = [
+    { label: "SOR Auto Returns", href: "/admin/sor-auto-returns", controlSection: "sor-auto-returns", icon: "SR" },
     { label: "Overview", href: "/admin", controlSection: "dashboard", icon: "OV" },
     { label: "Accounts", href: "/admin/accounts", controlSection: "operators", icon: "AC" },
     { label: "Sync", href: "/admin/sync", controlSection: "sync", icon: "SY" },
@@ -168,7 +173,11 @@
 
   function visibleMainItems() {
     const roles = staffRoleSet();
-    return mainItems.filter((item) => itemAllowedByAuthority(item, roles));
+    const operator = window.MBBS_DISPATCH_OPERATOR || sidebarOperator;
+    const aggregateAccess = operator?.aggregateRequestYardLocationIds?.length
+      && ["operator", "sales", "yard_manager"].some(role => roles.has(role));
+    return mainItems.filter((item) => (!item.staffOnly || !operator?.publicSales)
+      && (item.href !== "/aggregate-requests" || aggregateAccess) && itemAllowedByAuthority(item, roles));
   }
 
   function visibleMbtItems() {
@@ -182,6 +191,9 @@
   }
 
   function currentItems() {
+    if (path.startsWith("/aggregate-requests")) return {
+      title: "Aggregate Requests", items: [{ label: "Requests", href: "/aggregate-requests", icon: "AG" }]
+    };
     if (path.startsWith("/mbt")) return { title: "MBT Bin Operations", items: visibleMbtItems() };
     if (path.startsWith("/admin")) return { title: "Admin", items: adminItems };
     if (path.startsWith("/dispatch")) return { title: "Dispatch", items: dispatchItems };
@@ -677,6 +689,9 @@
   }
 
   function init() {
+    const aggregateAlert = document.createElement("script");
+    aggregateAlert.src = "/scm-aggregate-alert.js?v=20260925-aggregate-alert-v1";
+    document.head.appendChild(aggregateAlert);
     installStyle();
     render();
     void refreshSidebarAuthority();

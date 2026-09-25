@@ -4,6 +4,7 @@ import { performance } from "node:perf_hooks";
 import {
   actualArrivalDistanceMeters,
   actualArrivalHistoryWindows,
+  DISPATCH_ACTUAL_ARRIVAL_MAX_POINT_GAP_MS,
   findFinalDestinationCluster
 } from "./dispatch-actual-arrival-policy.js";
 import {
@@ -12,6 +13,7 @@ import {
   claimNextActualArrivalRun,
   getActualArrivalRun,
   listActualArrivalRouteRecords,
+  listActualArrivalVerifications,
   localActualArrivalPoints,
   markActualArrivalRun,
   replaceActualArrivalRunResults
@@ -23,6 +25,7 @@ import {
   listSamsaraVehicleGpsHistory,
   listSamsaraVehicleTrips
 } from "./samsara.js";
+import { arrivalFailureSummary, arrivalVerificationPoint, expectedArrivalPoint } from "./dispatch-actual-arrival-evidence.js";
 
 const SAMSARA_STOP_HISTORY_BUDGET_MS = 10_000;
 
@@ -137,13 +140,11 @@ function pointFromObject(value = {}) {
   return latitude === null || longitude === null ? null : { latitude, longitude };
 }
 
+/** @param {{records?: Array<{location_details?: object}>, destinationAddress?: string}} visit */
 function pointFromRecordEvidence(visit = {}) {
   for (const record of visit.records || []) {
     const details = record.location_details || {};
-    const point = pointFromObject({
-      latitude: details.expectedLatitude ?? details.expected?.latitude,
-      longitude: details.expectedLongitude ?? details.expected?.longitude
-    });
+    const point = expectedArrivalPoint(details, visit.destinationAddress);
     if (point) {return { ...point, source: "driver_location_evidence" };}
   }
   return null;
@@ -196,9 +197,16 @@ function ownYardPoint(visit = {}, ownYards = []) {
   return null;
 }
 
-async function destinationPoint(visit, planPoints, ownYards) {
+/** @param {any[]} verifications */
+async function destinationPoint(visit, planPoints, ownYards, verifications = []) {
   const evidence = pointFromRecordEvidence(visit);
   if (evidence) {return evidence;}
+  for (const record of visit.records || []) {
+    for (const verification of verifications) {
+      const point = arrivalVerificationPoint(record, verification, visit.destinationAddress);
+      if (point) {return point;}
+    }
+  }
   for (const stopId of visit.stopIds || []) {
     const point = planPoints.get(`${visit.planId}|${visit.loadId}|${stopId}`);
     if (point) {return point;}
@@ -358,9 +366,6 @@ async function resolveVisit({
   if (!Number.isFinite(start) || !Number.isFinite(end) || end <= start) {
     return unresolvedResult(visit, previous, sequence, "invalid_time_window", { destination });
   }
-  if (!destination) {
-    return unresolvedResult(visit, previous, sequence, "destination_coordinates_unavailable");
-  }
   if (samePhysicalPlace(previous, visit, previousDestination, destination)) {
     return {
       ...base,
@@ -368,9 +373,12 @@ async function resolveVisit({
       resolutionStatus: "same_site",
       source: "same_site_sequence",
       confidence: "high",
-      evidence: { distanceMeters: previousDestination ? Math.round(actualArrivalDistanceMeters(previousDestination, destination)) : 0 },
+      evidence: { distanceMeters: previousDestination && destination ? Math.round(actualArrivalDistanceMeters(previousDestination, destination)) : null },
       error: ""
     };
+  }
+  if (!destination) {
+    return unresolvedResult(visit, previous, sequence, "destination_coordinates_unavailable");
   }
 
   const localStarted = performance.now();
@@ -395,6 +403,7 @@ async function resolveVisit({
       confidence: localResolution.confidence,
       evidence: {
         destinationSource: destination.source || "",
+        destinationVerificationId: destination.verificationId || "",
         localPointCount: localPoints.length,
         calculationMs: Number(localCalculationMs.toFixed(3)),
         ...localResolution
@@ -474,7 +483,12 @@ async function resolveVisit({
     windowEnd: visit.completedAt
   });
   let calculationMs = performance.now() - calculationStarted;
-  if (resolution.status !== "resolved" && windows[1]) {
+  const clusterStart = epoch(resolution.clusterStartAt);
+  const primaryStart = epoch(windows[0]?.startTime);
+  const clusterTouchesWindowStart = resolution.status === "resolved"
+    && clusterStart !== null && primaryStart !== null
+    && clusterStart <= primaryStart + DISPATCH_ACTUAL_ARRIVAL_MAX_POINT_GAP_MS;
+  if (windows[1] && (resolution.status !== "resolved" || clusterTouchesWindowStart)) {
     try {
       const expanded = await listSamsaraVehicleGpsHistory({
         vehicleId: vehicle.id,
@@ -496,9 +510,15 @@ async function resolveVisit({
         windowStart: previous.completedAt,
         windowEnd: visit.completedAt
       });
+      if (clusterTouchesWindowStart && expanded.truncated) {
+        resolution = { status: "unresolved", reason: "gps_history_incomplete" };
+      }
       calculationMs += performance.now() - calculationStarted;
     } catch (error) {
       requestEvidence.push({ kind: "expanded", error: text(error?.message || error) });
+      if (clusterTouchesWindowStart) {
+        resolution = { status: "unresolved", reason: "gps_history_incomplete" };
+      }
     }
   }
   const tripHints = tripOutcome.status === "fulfilled"
@@ -506,6 +526,7 @@ async function resolveVisit({
     : 0;
   const evidence = {
     destinationSource: destination.source || "",
+    destinationVerificationId: destination.verificationId || "",
     vehicleId: text(vehicle.id),
     vehicleName: text(vehicle.name),
     localPointCount: localPoints.length,
@@ -551,9 +572,10 @@ export async function executeActualArrivalRun(run, {
     });
   }
   const planPoints = await planStopPoints(visits);
+  const verifications = await listActualArrivalVerifications(records);
   const destinations = new Map();
   for (const visit of visits) {
-    destinations.set(visit.visitKey, await destinationPoint(visit, planPoints, ownYards));
+    destinations.set(visit.visitKey, await destinationPoint(visit, planPoints, ownYards, verifications));
   }
   let selected = visits;
   if (current.mode === "automatic") {
@@ -597,9 +619,9 @@ export async function executeActualArrivalRun(run, {
     return replaceActualArrivalRunResults(current.runId, results, {
       status: exhausted ? "needs_review" : "retry_wait",
       nextAttemptAt: exhausted ? null : nextTorontoElevenPm(),
-      error: exhausted
-        ? "Samsara did not produce a qualified destination cluster after the nightly retry."
-        : "Samsara did not produce a qualified destination cluster; retry scheduled for 11:00 PM Toronto time."
+      error: `${arrivalFailureSummary(results)}. ${exhausted
+        ? "The nightly retry is exhausted; arrival remains unresolved."
+        : "Retry scheduled for 11:00 PM Toronto time."}`
     });
   }
   await replaceActualArrivalRunResults(current.runId, results, { status: "running" });

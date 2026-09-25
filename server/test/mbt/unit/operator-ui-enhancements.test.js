@@ -12,7 +12,7 @@ function pickupUi(line, viewMode = "active") {
     currentModule: "customer-pickup", viewMode, selectedOrder: { lines: [line] },
     selectedLineId: line.id, compactLineMode: false,
     qty: (value) => Number(value) || 0, displayQty: String,
-    t: (_key, fallback) => fallback, escapeHtml: String,
+    t: (_key, fallback) => fallback, escapeHtml: String, displayUnit: String,
     isVrmaReferenceOrder: () => false, orderLocksCurrentOperator: () => false
   });
   vm.runInContext(between("function isCustomerPickupMode", "function receivingRemainingSalesQty"), context);
