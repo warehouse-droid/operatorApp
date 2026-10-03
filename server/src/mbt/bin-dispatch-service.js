@@ -2,7 +2,11 @@
 
 import crypto from "node:crypto";
 
-import { query } from "../db.js";
+import { query, withTransaction } from "../db.js";
+import { reserveResumedPlanningAsset } from "./bin-planning-reservations.js";
+import { validatePlanningAssignment, publishPlanningAssignments, pendingPlanningReturns } from "./bin-planning-assignments.js";
+import { readPlanningPlan, assertPlanningSchedule, syncPlanningProjections } from "./bin-planning-repository.js";
+import { assertPlanningCapacity } from "./bin-planning-capacity.js";
 import { assertDispatchExecutedPrefixPreserved } from "../dispatch-executed-prefix-repository.js";
 import { DISPATCH_FLEET_PLANNING_LOCK } from "../dispatch-fleet-status.js";
 import { confirmValidatedBinDispatchPlan } from "../dispatch-plan-repository.js";
@@ -421,6 +425,47 @@ async function projectFrontLeg(visit, timelineVisits) {
       timeline: timelineFor(timelineVisits)
     }
   };
+}
+
+/** A planner card keeps a blocked visit visible instead of failing the pool.
+ * @param {Record<string, any>} visit */
+export async function projectMbtBinPlanningCard(visit) {
+  const visits = await selectContractVisits(String(visit.contract_id), { serviceLineId: visit.service_line_id });
+  try {
+    if (!visit.dispatch_plan_id) {await assertPlanningCardAssets(visit);}
+    const card = await projectFrontLeg(visit, visits);
+    card.mbt.status = visit.status;
+    return card;
+  } catch (error) {
+    if (!(error instanceof MbtError) || error.status >= 500) {throw error;}
+    const customer = objectValue(visit.customer_snapshot);
+    const site = objectValue(visit.site_snapshot);
+    return {
+      id: String(visit.visit_reference), type: "BIN", serviceAction: visit.service_action,
+      customer: String(customer.displayName || customer.companyName || "BIN customer"),
+      address: [site.addressLine1, site.city, site.region].filter(Boolean).join(", "),
+      scheduledWindow: { startAt: isoTimestamp(visit.scheduled_start_at), endAt: isoTimestamp(visit.scheduled_end_at) },
+      stops: await stopsForVisit(visit), blockedReason: error.message,
+      mbt: { visitId: String(visit.service_visit_id), contractId: String(visit.contract_id),
+        serviceLineId: visit.service_line_id, visitReference: visit.visit_reference,
+        visitRevision: Number(visit.revision), status: visit.status,
+        frontLeg: { dispatchable: false }, timeline: timelineFor(visits), assetRequirements: [], assetChoices: [] }
+    };
+  }
+}
+
+/** @param {Record<string, any>} visit */
+async function assertPlanningCardAssets(visit) {
+  const requirements = exactVisitAssetRequirements(visit);
+  if (!requirements.length) {return;}
+  const assets = await query(`SELECT a.asset_id,a.active,a.under_maintenance,
+      EXISTS(SELECT 1 FROM mbt_bin_asset_reservations r WHERE r.asset_id=a.asset_id
+        AND r.released_at IS NULL AND r.visit_id<>$2) AS held
+    FROM mbt_bin_assets a WHERE a.asset_id=ANY($1::uuid[])`,
+  [requirements.map(r => r.assetId), visit.service_visit_id]);
+  if (assets.rowCount !== requirements.length || assets.rows.some((/** @type {any} */ a) => !a.active || a.under_maintenance || a.held)) {
+    throw mbtError(409, "MBT_BIN_ASSET_UNAVAILABLE", "The required bin is unavailable or reserved by another visit.");
+  }
 }
 
 /**
@@ -1413,7 +1458,7 @@ async function validateLockedBinConfirmation(locked) {
   const selected = await query(
     `SELECT service_visit_id::text, contract_id::text, service_line_id::text,
             predecessor_visit_id::text, service_action, status,
-            revision::int, dispatch_plan_id, dispatch_plan_revision::int,
+            revision::int, planning_generation::int, dispatch_plan_id, dispatch_plan_revision::int,
             dispatch_load_id, dispatch_assignment_snapshot,
             planned_truck_id::text, planned_driver_id::text,
             scheduled_start_at, scheduled_end_at,
@@ -1423,7 +1468,7 @@ async function validateLockedBinConfirmation(locked) {
             bin_type_id::text, expected_asset_id::text,
             outgoing_asset_id::text, incoming_asset_id::text,
             customer_site_profile_id::text, dump_site_id::text,
-            material_id::text,
+            material_id::text, actual_started_at,
             service_snapshot
        FROM mbt_service_visits
       WHERE dispatch_plan_id = $1
@@ -1434,20 +1479,18 @@ async function validateLockedBinConfirmation(locked) {
   if (selected.rowCount !== groups.size) {
     throw confirmationInvalid("visit_group_set_mismatch");
   }
-  const expectedLatestAssignmentRevision = String(locked.status) === "confirmed"
-    ? Number(locked.revision) - 1
-    : Number(locked.revision);
-  const latestAssignmentRevision = Math.max(...selected.rows.map(
-    (/** @type {Record<string, any>} */ visit) => Number(objectValue(visit.dispatch_assignment_snapshot).planRevision)
-  ));
-  if (latestAssignmentRevision !== expectedLatestAssignmentRevision) {
-    throw confirmationInvalid("visit_assignment_mismatch");
-  }
   const validations = [];
+  let hasPlanningAssignments = false;
   for (const visit of selected.rows) {
     const group = groups.get(String(visit.service_visit_id));
     if (!group) {throw confirmationInvalid("visit_group_set_mismatch");}
     const assignmentSnapshot = objectValue(visit.dispatch_assignment_snapshot);
+    if (Number(visit.planning_generation) > 0) {
+      await validatePlanningAssignment(visit, group, plan);
+      await validatePlanningVisitDetails(visit, group);
+      hasPlanningAssignments = true;
+      continue;
+    }
     if (String(visit.scheduled_plan_date || "") !== String(plan.planDate)) {
       throw confirmationInvalid("visit_plan_date_mismatch", {
         visitId: String(visit.service_visit_id)
@@ -1469,7 +1512,39 @@ async function validateLockedBinConfirmation(locked) {
     validations.push({ truck, requiredWeightLbs: reservation.requiredWeightLbs });
   }
   assertAggregateTruckCapacity(validations);
+  if (hasPlanningAssignments) {
+    assertPlanningSchedule(plan, true);
+    await assertPlanningCapacity(plan);
+  }
   return true;
+}
+
+/** @param {Record<string, any>} visit @param {Record<string, any>} group */
+async function validatePlanningVisitDetails(visit, group) {
+  const assignment = objectValue(visit.dispatch_assignment_snapshot);
+  const truck = await assertCurrentTruckCapability(visit, group);
+  const template = await templateForVisit(visit, true);
+  await assertLockedDumpMaterial(visit, assignment, template);
+  if (visit.status === "completed") {return;}
+  await assertCurrentFrontLeg(visit, assignment);
+  if (!visit.actual_started_at) {await assertLockedReservations(visit, assignment);}
+  const completed = await query("SELECT action_code FROM mbt_visit_steps WHERE service_visit_id=$1 AND status IN ('completed','skipped')", [visit.service_visit_id]);
+  const completedActions = new Set(completed.rows.map((/** @type {any} */ s) => s.action_code));
+  const expected = (await materializedStops(visit, {
+    binTypeCode: truck.binTypeCode, baseYardId: truck.yard.yardId, baseYardCode: truck.yard.yardCode
+  }, true)).filter(s => !completedActions.has(s.actionCode))
+    .map(stop => ({ ...stop, loadId: String(group.load.id) }));
+  const remaining = arrayValue(assignment.stops).map(raw => {
+    const stop = objectValue(raw);
+    // Timing and the address derived from the visit are planner metadata.
+    // Step identity, action, location roles and evidence retain template checks.
+    const { stopTimeOverrideMinutes: _override, timing: _timing, planningAddress: _address, ...identity } = stop;
+    const { planningGeneration: _generation, driverReleased: _released, ...mbt } = objectValue(stop.mbt);
+    return { ...identity, id: String(stop.id).replace(/:mbt-g\d+$/u, ""), mbt };
+  });
+  if (!sameCanonicalValue(expected, remaining)) {
+    throw confirmationInvalid("visit_assignment_mismatch", { visitId: String(visit.service_visit_id) });
+  }
 }
 
 /**
@@ -1485,15 +1560,22 @@ export async function confirmMbtBinDispatchPlan(input, { capability, hooks = {} 
   assertDispatcherActor(input?.actor);
   const planId = requiredText(input?.planId, "plan ID");
   const note = String(input?.note || "").trim();
-  return confirmValidatedBinDispatchPlan(planId, {
-    note,
-    validate: validateLockedBinConfirmation,
-    hooks
+  return withTransaction(async () => {
+    await query("SELECT pg_advisory_xact_lock(hashtext($1))", [DISPATCH_FLEET_PLANNING_LOCK]);
+    const before = await readPlanningPlan(planId);
+    const confirmed = await confirmValidatedBinDispatchPlan(planId, {
+      note, validate: validateLockedBinConfirmation, hooks
+    });
+    const pending = await query("SELECT 1 FROM mbt_bin_planning_assignments WHERE plan_id=$1 AND withdrawn_at IS NULL AND released_at IS NULL LIMIT 1", [planId]);
+    if (!pending.rowCount && !pendingPlanningReturns(confirmed).length) {return confirmed;}
+    const plan = await publishPlanningAssignments(planId, String(input.actor.operatorId), before.revision);
+    await syncPlanningProjections(plan);
+    return plan;
   });
 }
 
-/** @param {Record<string, any>} input @param {{capability: unknown, hooks?: {afterReservation?: Function}}} boundary */
-export async function assignMbtBinFrontLeg(input, { capability, hooks = {} }) {
+/** @param {Record<string, any>} input @param {{capability: unknown, hooks?: {afterReservation?: Function}, planning?: boolean}} boundary */
+export async function assignMbtBinFrontLeg(input, { capability, hooks = {}, planning = false }) {
   assertCapability(capability);
   assertDispatcherActor(input?.actor);
   const normalized = {
@@ -1516,8 +1598,10 @@ export async function assignMbtBinFrontLeg(input, { capability, hooks = {} }) {
     // Atomic eligibility checks stay beside the writes they protect.
     // eslint-disable-next-line complexity
     mutation: async () => {
+      const plan = await lockPlan(normalized.planId);
       const visit = await lockVisit(normalized.visitId);
-      if (String(visit.status) !== "ready" || visit.dispatch_plan_id) {
+      const resuming = planning && Boolean(visit.actual_started_at) && STARTED_VISIT_STATUSES.has(String(visit.status));
+      if ((!resuming && String(visit.status) !== "ready") || visit.dispatch_plan_id) {
         const isDirectRaceLoser = Number(visit.revision) === normalized.expectedVisitRevision + 1
           && Number(visit.dispatch_plan_revision) === normalized.expectedPlanRevision + 1;
         if (isDirectRaceLoser) {
@@ -1525,7 +1609,6 @@ export async function assignMbtBinFrontLeg(input, { capability, hooks = {} }) {
         }
         throw mbtError(409, "MBT_BIN_DISPATCH_STALE_REVISION", "The BIN leg or plan changed. Refresh before retrying.");
       }
-      const plan = await lockPlan(normalized.planId);
       if (Number(visit.revision) !== normalized.expectedVisitRevision
           || Number(plan.revision) !== normalized.expectedPlanRevision
           || String(plan.plan_date) !== normalized.planDate) {
@@ -1549,18 +1632,23 @@ export async function assignMbtBinFrontLeg(input, { capability, hooks = {} }) {
       );
       const assetReservations = [];
       for (const assetAssignment of assetAssignments) {
-        const reservation = await reserveAsset(ambientDatabase, {
+        const reservationTime = planning ? (await query(`SELECT GREATEST(now(),m.occurred_at) AS at
+          FROM mbt_bin_asset_state s JOIN mbt_bin_movements m ON m.movement_id=s.last_movement_id
+          WHERE s.asset_id=$1`, [assetAssignment.assetId])).rows[0]?.at : visit.scheduled_start_at;
+        const reservation = resuming
+          ? await reserveResumedPlanningAsset(visit, assetAssignment, truckId, input)
+          : await reserveAsset(ambientDatabase, {
           assetId: assetAssignment.assetId,
           contractId: String(visit.contract_id),
           visitId: normalized.visitId,
           reservationSlot: assetAssignment.reservationSlot,
-          reservedFrom: visit.scheduled_start_at,
-          reservedUntil: visit.scheduled_end_at,
+          reservedFrom: planning ? input.reservationStartAt : visit.scheduled_start_at,
+          reservedUntil: planning ? input.reservationEndAt : visit.scheduled_end_at,
           reservedBy: String(input.actor.operatorId),
           source: BIN_COMMAND_SOURCE,
           actorType: "operator",
           actorId: String(input.actor.operatorId),
-          occurredAt: visit.scheduled_start_at,
+          occurredAt: reservationTime,
           allowedLifecycleStatuses: allowedReservationStatuses(visit, assetAssignment),
           reservationMode: reservationMode(visit, assetAssignments, assetAssignment)
         });
@@ -1606,7 +1694,7 @@ export async function assignMbtBinFrontLeg(input, { capability, hooks = {} }) {
       await persistPlan(plan, nextPlanRevision, trucks);
       await query(
         `UPDATE mbt_service_visits
-            SET status = 'planned', planned_truck_id = $2,
+            SET status = CASE WHEN actual_started_at IS NULL THEN 'planned' ELSE status END, planned_truck_id = $2,
                 planned_driver_id = $3, dispatch_plan_id = $4,
                 dispatch_plan_revision = $5, dispatch_load_id = $6,
                 dispatch_assignment_snapshot = $7::jsonb,

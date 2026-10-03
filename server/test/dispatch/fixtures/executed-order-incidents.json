@@ -1,0 +1,1531 @@
+{
+  "previousPlan": {
+    "id": "331",
+    "orders": [
+      {
+        "id": "GOA-8930-8931",
+        "type": "SO",
+        "items": [
+          {
+            "sku": "UNI-WIN70S-RDM-CG",
+            "unit": "SQFT",
+            "itemId": 3634,
+            "layers": 0,
+            "lineId": 4978669,
+            "pieces": 0,
+            "pallets": 21,
+            "itemName": "UNI-WIN70S-RDM-CG",
+            "itemType": "InvtPart",
+            "quantity": 1929.48,
+            "sections": 0,
+            "description": "Windermere 70mm S Rdm - Cliffside Grey 91.88sqft/plt, 10.21sqft/lyr, 9lyrs/plt  **NEW Format**  **PROMOTION**"
+          },
+          {
+            "sku": "UNI-WIN70S-0714-DC-2026",
+            "unit": "SQFT",
+            "itemId": 8472,
+            "layers": 4,
+            "lineId": 4978670,
+            "pieces": 0,
+            "pallets": 2,
+            "itemName": "UNI-WIN70S-0714-DC-2026",
+            "itemType": "InvtPart",
+            "quantity": 245,
+            "sections": 0,
+            "description": "Windermere 70mm S 7x14 - Dark Charcoal  \n98 sqft/plt, 12.25 sqft/lyr, 8lyr/plt \n**2026 PACKAGING**"
+          },
+          {
+            "sku": "BWS-PW-REG-BM",
+            "unit": "PC",
+            "itemId": 1187,
+            "layers": 0,
+            "lineId": 4978671,
+            "pieces": 0,
+            "pallets": 2,
+            "itemName": "BWS-PW-REG-BM",
+            "itemType": "InvtPart",
+            "quantity": 120,
+            "sections": 0,
+            "description": "Parkwall Regular Beige Mix           60pcs/plt"
+          },
+          {
+            "sku": "BWS-PW-COR-BM",
+            "unit": "PC",
+            "itemId": 1201,
+            "layers": 0,
+            "lineId": 4978672,
+            "pieces": 7,
+            "pallets": 0,
+            "itemName": "BWS-PW-COR-BM",
+            "itemType": "InvtPart",
+            "quantity": 7,
+            "sections": 0,
+            "description": "Parkwall Corner Beige Mix           24pcs/plt"
+          },
+          {
+            "sku": "BWS-PW-COP-BM",
+            "unit": "PC",
+            "itemId": 1242,
+            "layers": 0,
+            "lineId": 4978673,
+            "pieces": 14,
+            "pallets": 0,
+            "itemName": "BWS-PW-COP-BM",
+            "itemType": "InvtPart",
+            "quantity": 14,
+            "sections": 0,
+            "description": "Parkwall Coping Beige Mix           32pcs/plt"
+          },
+          {
+            "sku": "Gift for Pallet - Grey",
+            "unit": null,
+            "itemId": 10126,
+            "layers": 0,
+            "lineId": 4978674,
+            "pieces": 0,
+            "pallets": 0,
+            "itemName": "Gift for Pallet - Grey",
+            "itemType": "Kit",
+            "quantity": 10,
+            "sections": 0,
+            "description": "Buy 1 Pallet paver get 1 bag Supersand  free"
+          },
+          {
+            "sku": "Alliance Supersand Grey",
+            "unit": null,
+            "itemId": 599,
+            "layers": 0,
+            "lineId": 4978675,
+            "pieces": 10,
+            "pallets": 0,
+            "itemName": "Alliance Supersand Grey",
+            "itemType": "InvtPart",
+            "quantity": 10,
+            "sections": 0,
+            "description": "Alliance Supersand Grey          70bags/plt"
+          },
+          {
+            "sku": "Alliance Supersand Grey",
+            "unit": "EACH",
+            "itemId": 599,
+            "layers": 0,
+            "lineId": 4978676,
+            "pieces": 15,
+            "pallets": 0,
+            "itemName": "Alliance Supersand Grey",
+            "itemType": "InvtPart",
+            "quantity": 15,
+            "sections": 0,
+            "description": "Alliance Supersand Grey          70bags/plt"
+          },
+          {
+            "sku": "PALLET",
+            "unit": "EACH",
+            "itemId": 1784,
+            "layers": 0,
+            "lineId": 4978699,
+            "pieces": 0,
+            "pallets": 0,
+            "itemName": "PALLET",
+            "itemType": "InvtPart",
+            "quantity": 28,
+            "sections": 0,
+            "description": "**PALLET DEPOSIT** INTERLOCK,CEMENT, CONCRETE"
+          },
+          {
+            "sku": "Delivery Charge",
+            "unit": null,
+            "itemId": 1987,
+            "layers": 0,
+            "lineId": 4978700,
+            "pieces": 0,
+            "pallets": 0,
+            "itemName": "Delivery Charge",
+            "itemType": "OthCharge",
+            "quantity": 1,
+            "sections": 0,
+            "description": null
+          }
+        ],
+        "layers": 4,
+        "pieces": 0,
+        "weight": 78891.169,
+        "address": "15 Snowy Meadow Ave, Richmond Hill, ON L4E 3V3",
+        "pallets": 25,
+        "salesQty": 2379.48,
+        "sections": 0,
+        "sourceYard": "3445",
+        "childOrders": [
+          "SOA08930",
+          "SOA08931"
+        ],
+        "pickupLocations": [
+          "3445"
+        ],
+        "childOrderDetails": [
+          {
+            "id": "SOA08930",
+            "type": "SO",
+            "items": [
+              {
+                "sku": "UNI-WIN70S-RDM-CG",
+                "unit": "SQFT",
+                "itemId": 3634,
+                "layers": 0,
+                "lineId": 4978669,
+                "pieces": 0,
+                "pallets": 21,
+                "itemName": "UNI-WIN70S-RDM-CG",
+                "itemType": "InvtPart",
+                "quantity": 1929.48,
+                "sections": 0,
+                "description": "Windermere 70mm S Rdm - Cliffside Grey 91.88sqft/plt, 10.21sqft/lyr, 9lyrs/plt  **NEW Format**  **PROMOTION**"
+              },
+              {
+                "sku": "UNI-WIN70S-0714-DC-2026",
+                "unit": "SQFT",
+                "itemId": 8472,
+                "layers": 4,
+                "lineId": 4978670,
+                "pieces": 0,
+                "pallets": 2,
+                "itemName": "UNI-WIN70S-0714-DC-2026",
+                "itemType": "InvtPart",
+                "quantity": 245,
+                "sections": 0,
+                "description": "Windermere 70mm S 7x14 - Dark Charcoal  \n98 sqft/plt, 12.25 sqft/lyr, 8lyr/plt \n**2026 PACKAGING**"
+              },
+              {
+                "sku": "BWS-PW-REG-BM",
+                "unit": "PC",
+                "itemId": 1187,
+                "layers": 0,
+                "lineId": 4978671,
+                "pieces": 0,
+                "pallets": 2,
+                "itemName": "BWS-PW-REG-BM",
+                "itemType": "InvtPart",
+                "quantity": 120,
+                "sections": 0,
+                "description": "Parkwall Regular Beige Mix           60pcs/plt"
+              },
+              {
+                "sku": "BWS-PW-COR-BM",
+                "unit": "PC",
+                "itemId": 1201,
+                "layers": 0,
+                "lineId": 4978672,
+                "pieces": 7,
+                "pallets": 0,
+                "itemName": "BWS-PW-COR-BM",
+                "itemType": "InvtPart",
+                "quantity": 7,
+                "sections": 0,
+                "description": "Parkwall Corner Beige Mix           24pcs/plt"
+              },
+              {
+                "sku": "BWS-PW-COP-BM",
+                "unit": "PC",
+                "itemId": 1242,
+                "layers": 0,
+                "lineId": 4978673,
+                "pieces": 14,
+                "pallets": 0,
+                "itemName": "BWS-PW-COP-BM",
+                "itemType": "InvtPart",
+                "quantity": 14,
+                "sections": 0,
+                "description": "Parkwall Coping Beige Mix           32pcs/plt"
+              },
+              {
+                "sku": "Gift for Pallet - Grey",
+                "unit": null,
+                "itemId": 10126,
+                "layers": 0,
+                "lineId": 4978674,
+                "pieces": 0,
+                "pallets": 0,
+                "itemName": "Gift for Pallet - Grey",
+                "itemType": "Kit",
+                "quantity": 10,
+                "sections": 0,
+                "description": "Buy 1 Pallet paver get 1 bag Supersand  free"
+              },
+              {
+                "sku": "Alliance Supersand Grey",
+                "unit": null,
+                "itemId": 599,
+                "layers": 0,
+                "lineId": 4978675,
+                "pieces": 10,
+                "pallets": 0,
+                "itemName": "Alliance Supersand Grey",
+                "itemType": "InvtPart",
+                "quantity": 10,
+                "sections": 0,
+                "description": "Alliance Supersand Grey          70bags/plt"
+              },
+              {
+                "sku": "Alliance Supersand Grey",
+                "unit": "EACH",
+                "itemId": 599,
+                "layers": 0,
+                "lineId": 4978676,
+                "pieces": 15,
+                "pallets": 0,
+                "itemName": "Alliance Supersand Grey",
+                "itemType": "InvtPart",
+                "quantity": 15,
+                "sections": 0,
+                "description": "Alliance Supersand Grey          70bags/plt"
+              }
+            ],
+            "layers": 4,
+            "weight": 77771.169,
+            "address": "15 Snowy Meadow Ave, Richmond Hill, ON L4E 3V3",
+            "pallets": 25,
+            "salesQty": 2350.48,
+            "sourceYard": "3445",
+            "childOrders": [],
+            "pickupLocations": [
+              "3445"
+            ],
+            "childOrderDetails": [],
+            "destinationAddress": "15 Snowy Meadow Ave, Richmond Hill, ON L4E 3V3"
+          },
+          {
+            "id": "SOA08931",
+            "type": "SO",
+            "items": [
+              {
+                "sku": "PALLET",
+                "unit": "EACH",
+                "itemId": 1784,
+                "layers": 0,
+                "lineId": 4978699,
+                "pieces": 0,
+                "pallets": 0,
+                "itemName": "PALLET",
+                "itemType": "InvtPart",
+                "quantity": 28,
+                "sections": 0,
+                "description": "**PALLET DEPOSIT** INTERLOCK,CEMENT, CONCRETE"
+              },
+              {
+                "sku": "Delivery Charge",
+                "unit": null,
+                "itemId": 1987,
+                "layers": 0,
+                "lineId": 4978700,
+                "pieces": 0,
+                "pallets": 0,
+                "itemName": "Delivery Charge",
+                "itemType": "OthCharge",
+                "quantity": 1,
+                "sections": 0,
+                "description": null
+              }
+            ],
+            "layers": 0,
+            "weight": 1120,
+            "address": "15 Snowy Meadow Ave, Richmond Hill, ON L4E 3V3",
+            "pallets": 0,
+            "salesQty": 29,
+            "sourceYard": "3445",
+            "childOrders": [],
+            "pickupLocations": [
+              "3445"
+            ],
+            "childOrderDetails": [],
+            "destinationAddress": "15 Snowy Meadow Ave, Richmond Hill, ON L4E 3V3"
+          }
+        ],
+        "destinationAddress": "15 Snowy Meadow Ave, Richmond Hill, ON L4E 3V3"
+      },
+      {
+        "id": "TOB01111",
+        "type": "TO",
+        "items": [
+          {
+            "sku": "PER-MM60S-2237-AB",
+            "unit": "SQFT",
+            "itemId": 4785,
+            "layers": 4,
+            "lineId": 4977202,
+            "pieces": 0,
+            "pallets": 2,
+            "itemName": "PER-MM60S-2237-AB",
+            "itemType": "InvtPart",
+            "quantity": 256.52,
+            "sections": 0,
+            "description": "Mega Melville 60 S 22x37Inch Amber Beige 104.94sqft/plt, 11.66sqft/lyr, 9lyrs/plt"
+          },
+          {
+            "sku": "PER-MM60S-2237-NG",
+            "unit": "SQFT",
+            "itemId": 4788,
+            "layers": 5,
+            "lineId": 4977205,
+            "pieces": 0,
+            "pallets": 1,
+            "itemName": "PER-MM60S-2237-NG",
+            "itemType": "InvtPart",
+            "quantity": 163.24,
+            "sections": 0,
+            "description": "Mega Melville 60 S 22x37Inch Newport Grey 104.94sqft/plt, 11.66sqft/lyr, 9lyrs/plt"
+          },
+          {
+            "sku": "PER-MM60S-2237-SCG",
+            "unit": "SQFT",
+            "itemId": 4790,
+            "layers": 0,
+            "lineId": 4977208,
+            "pieces": 0,
+            "pallets": 15,
+            "itemName": "PER-MM60S-2237-SCG",
+            "itemType": "InvtPart",
+            "quantity": 1574.1,
+            "sections": 0,
+            "description": "Mega Melville 60 S 22x37Inch Scandina Grey 104.94sqft/plt, 11.66sqft/lyr, 9lyrs/plt"
+          },
+          {
+            "sku": "PER-MM80S-2237-NG",
+            "unit": "SQFT",
+            "itemId": 4771,
+            "layers": 0,
+            "lineId": 4977211,
+            "pieces": 0,
+            "pallets": 5,
+            "itemName": "PER-MM80S-2237-NG",
+            "itemType": "InvtPart",
+            "quantity": 408.1,
+            "sections": 0,
+            "description": "Mega Melville 80 S 22x37inch Newport Grey 81.62sqft/plt, 11.66sqft/lyr, 7lyrs/plt"
+          },
+          {
+            "sku": "PER-MM80S-2237-SCG",
+            "unit": "SQFT",
+            "itemId": 4773,
+            "layers": 0,
+            "lineId": 4977214,
+            "pieces": 0,
+            "pallets": 4,
+            "itemName": "PER-MM80S-2237-SCG",
+            "itemType": "InvtPart",
+            "quantity": 326.48,
+            "sections": 0,
+            "description": "Mega Melville 80 S 22x37Inch Scandina Grey 81.62sqft/plt, 11.66sqft/lyr, 7lyrs/plt"
+          },
+          {
+            "sku": "PALLET",
+            "unit": "EACH",
+            "itemId": 1784,
+            "layers": 0,
+            "lineId": 4977427,
+            "pieces": 0,
+            "pallets": 0,
+            "itemName": "PALLET",
+            "itemType": "InvtPart",
+            "quantity": 29,
+            "sections": 0,
+            "description": "**PALLET DEPOSIT** INTERLOCK,CEMENT, CONCRETE"
+          }
+        ],
+        "layers": 9,
+        "weight": 88975.891,
+        "address": "2967 Kennedy Road, Toronto, ON",
+        "pallets": 27,
+        "salesQty": 2757.44,
+        "sourceYard": "150",
+        "childOrders": [],
+        "pickupLocations": [
+          "150"
+        ],
+        "childOrderDetails": [],
+        "destinationAddress": "2967 Kennedy Road, Toronto, ON"
+      }
+    ],
+    "trucks": [
+      {
+        "id": "T4",
+        "plate": "BC71838",
+        "loads": [
+          {
+            "id": "T4-L1789819075855-88b3d3b6e48e9",
+            "name": "Load 3",
+            "start": "",
+            "stops": [
+              {
+                "id": "stop-c34f4e46-5422-408c-9192-f984b58c6c17",
+                "type": "pick",
+                "loadId": "T4-L1789819075855-88b3d3b6e48e9",
+                "timing": {
+                  "depart": 745,
+                  "arrival": 715
+                },
+                "orderId": "GOA-8930-8931",
+                "location": "3445",
+                "orderRefs": [
+                  "GOA-8930-8931"
+                ]
+              },
+              {
+                "id": "T4-L1789819075855-88b3d3b6e48e9-GOA-8930-8931-1789819075856-78fe0428624388",
+                "type": "drop",
+                "loadId": "T4-L1789819075855-88b3d3b6e48e9",
+                "timing": {
+                  "depart": 820,
+                  "arrival": 784
+                },
+                "orderId": "GOA-8930-8931",
+                "location": "3445"
+              }
+            ],
+            "timing": {
+              "start": 676,
+              "finish": 820,
+              "restBefore": 0,
+              "switchStart": 676,
+              "startClamped": false,
+              "handoffTravel": null,
+              "previousFinish": 676,
+              "scheduledStart": 676
+            },
+            "truckId": "T4",
+            "startMode": "auto",
+            "driverName": "Dao",
+            "switchYard": "3445",
+            "truckPlate": "BC71838",
+            "driverLogin": "dao",
+            "parkingSpot": "",
+            "driverSequence": 2,
+            "handoffTravelTo": "",
+            "minutesPerPallet": 1,
+            "handoffTravelFrom": "",
+            "plannedStartMinute": 676,
+            "truckSwitchMinutes": 10,
+            "vendorFixedMinutes": 30,
+            "ownYardFixedMinutes": 30,
+            "plannedFinishMinute": 820,
+            "deliveryFixedMinutes": 10,
+            "handoffTravelMinutes": 0,
+            "pickupVisitSchemaVersion": 1
+          }
+        ]
+      },
+      {
+        "id": "T5",
+        "plate": "CC46868",
+        "loads": [
+          {
+            "id": "T5-L1789766949416-6077ed2d88e44",
+            "name": "Load 2",
+            "start": "",
+            "stops": [
+              {
+                "id": "stop-5186f5c2-45c7-45d9-bd16-cfa84ed7c2ce",
+                "type": "pick",
+                "loadId": "T5-L1789766949416-6077ed2d88e44",
+                "timing": {
+                  "depart": 768,
+                  "arrival": 728
+                },
+                "orderId": "TOB01111",
+                "location": "150",
+                "orderRefs": [
+                  "TOB01111",
+                  "TOB01114"
+                ]
+              },
+              {
+                "id": "T5-L1789766949416-6077ed2d88e44-TOB01111-1789766949416-74ac532c25f9b8",
+                "type": "drop",
+                "loadId": "T5-L1789766949416-6077ed2d88e44",
+                "timing": {
+                  "depart": 857,
+                  "arrival": 817
+                },
+                "orderId": "TOB01111",
+                "location": "150"
+              },
+              {
+                "id": "T5-L1789766949416-6077ed2d88e44-TOB01114-1789819024609-cd5f2ce4f88608",
+                "type": "drop",
+                "loadId": "T5-L1789766949416-6077ed2d88e44",
+                "timing": {
+                  "depart": 857,
+                  "arrival": 817
+                },
+                "orderId": "TOB01114",
+                "location": "150"
+              }
+            ],
+            "timing": {
+              "start": 689,
+              "finish": 857,
+              "restBefore": 0,
+              "switchStart": 689,
+              "startClamped": false,
+              "handoffTravel": null,
+              "previousFinish": 689,
+              "scheduledStart": 689
+            },
+            "truckId": "T5",
+            "startMode": "auto",
+            "driverName": "Li",
+            "endingTrip": false,
+            "switchYard": "3445",
+            "truckPlate": "CC46868",
+            "driverLogin": "li",
+            "parkingSpot": "",
+            "driverSequence": 1,
+            "handoffTravelTo": "",
+            "minutesPerPallet": 2,
+            "handoffTravelFrom": "",
+            "plannedStartMinute": 689,
+            "truckSwitchMinutes": 10,
+            "vendorFixedMinutes": 70,
+            "ownYardFixedMinutes": 40,
+            "plannedFinishMinute": 857,
+            "deliveryFixedMinutes": 10,
+            "handoffTravelMinutes": 0,
+            "pickupVisitSchemaVersion": 1
+          }
+        ]
+      }
+    ]
+  },
+  "failedDraft": {
+    "id": "331",
+    "orders": [
+      {
+        "id": "GOA-8930-8931",
+        "type": "SO",
+        "items": [
+          {
+            "sku": "UNI-WIN70S-RDM-CG",
+            "unit": "SQFT",
+            "itemId": 3634,
+            "layers": 0,
+            "lineId": 4978669,
+            "pieces": 0,
+            "pallets": 21,
+            "itemName": "UNI-WIN70S-RDM-CG",
+            "itemType": "InvtPart",
+            "quantity": 1929.48,
+            "sections": 0,
+            "description": "Windermere 70mm S Rdm - Cliffside Grey 91.88sqft/plt, 10.21sqft/lyr, 9lyrs/plt  **NEW Format**  **PROMOTION**"
+          },
+          {
+            "sku": "UNI-WIN70S-0714-DC-2026",
+            "unit": "SQFT",
+            "itemId": 8472,
+            "layers": 4,
+            "lineId": 4978670,
+            "pieces": 0,
+            "pallets": 2,
+            "itemName": "UNI-WIN70S-0714-DC-2026",
+            "itemType": "InvtPart",
+            "quantity": 245,
+            "sections": 0,
+            "description": "Windermere 70mm S 7x14 - Dark Charcoal  \n98 sqft/plt, 12.25 sqft/lyr, 8lyr/plt \n**2026 PACKAGING**"
+          },
+          {
+            "sku": "BWS-PW-REG-BM",
+            "unit": "PC",
+            "itemId": 1187,
+            "layers": 0,
+            "lineId": 4978671,
+            "pieces": 0,
+            "pallets": 2,
+            "itemName": "BWS-PW-REG-BM",
+            "itemType": "InvtPart",
+            "quantity": 120,
+            "sections": 0,
+            "description": "Parkwall Regular Beige Mix           60pcs/plt"
+          },
+          {
+            "sku": "BWS-PW-COR-BM",
+            "unit": "PC",
+            "itemId": 1201,
+            "layers": 0,
+            "lineId": 4978672,
+            "pieces": 7,
+            "pallets": 0,
+            "itemName": "BWS-PW-COR-BM",
+            "itemType": "InvtPart",
+            "quantity": 7,
+            "sections": 0,
+            "description": "Parkwall Corner Beige Mix           24pcs/plt"
+          },
+          {
+            "sku": "BWS-PW-COP-BM",
+            "unit": "PC",
+            "itemId": 1242,
+            "layers": 0,
+            "lineId": 4978673,
+            "pieces": 14,
+            "pallets": 0,
+            "itemName": "BWS-PW-COP-BM",
+            "itemType": "InvtPart",
+            "quantity": 14,
+            "sections": 0,
+            "description": "Parkwall Coping Beige Mix           32pcs/plt"
+          },
+          {
+            "sku": "Gift for Pallet - Grey",
+            "unit": null,
+            "itemId": 10126,
+            "layers": 0,
+            "lineId": 4978674,
+            "pieces": 0,
+            "pallets": 0,
+            "itemName": "Gift for Pallet - Grey",
+            "itemType": "Kit",
+            "quantity": 10,
+            "sections": 0,
+            "description": "Buy 1 Pallet paver get 1 bag Supersand  free"
+          },
+          {
+            "sku": "Alliance Supersand Grey",
+            "unit": null,
+            "itemId": 599,
+            "layers": 0,
+            "lineId": 4978675,
+            "pieces": 10,
+            "pallets": 0,
+            "itemName": "Alliance Supersand Grey",
+            "itemType": "InvtPart",
+            "quantity": 10,
+            "sections": 0,
+            "description": "Alliance Supersand Grey          70bags/plt"
+          },
+          {
+            "sku": "Alliance Supersand Grey",
+            "unit": "EACH",
+            "itemId": 599,
+            "layers": 0,
+            "lineId": 4978676,
+            "pieces": 15,
+            "pallets": 0,
+            "itemName": "Alliance Supersand Grey",
+            "itemType": "InvtPart",
+            "quantity": 15,
+            "sections": 0,
+            "description": "Alliance Supersand Grey          70bags/plt"
+          },
+          {
+            "sku": "PALLET",
+            "unit": "EACH",
+            "itemId": 1784,
+            "layers": 0,
+            "lineId": 4978699,
+            "pieces": 0,
+            "pallets": 0,
+            "itemName": "PALLET",
+            "itemType": "InvtPart",
+            "quantity": 28,
+            "sections": 0,
+            "description": "**PALLET DEPOSIT** INTERLOCK,CEMENT, CONCRETE"
+          },
+          {
+            "sku": "Delivery Charge",
+            "unit": null,
+            "itemId": 1987,
+            "layers": 0,
+            "lineId": 4978700,
+            "pieces": 0,
+            "pallets": 0,
+            "itemName": "Delivery Charge",
+            "itemType": "OthCharge",
+            "quantity": 1,
+            "sections": 0,
+            "description": null
+          }
+        ],
+        "layers": 4,
+        "pieces": 0,
+        "weight": 78891.169,
+        "address": "",
+        "pallets": 25,
+        "salesQty": 2379.48,
+        "sections": 0,
+        "sourceYard": "3445",
+        "childOrders": [
+          "SOA08930",
+          "SOA08931"
+        ],
+        "pickupLocations": [
+          "3445"
+        ],
+        "childOrderDetails": [
+          {
+            "id": "SOA08930",
+            "type": "SO",
+            "items": [
+              {
+                "sku": "UNI-WIN70S-RDM-CG",
+                "unit": "SQFT",
+                "itemId": 3634,
+                "layers": 0,
+                "lineId": 4978669,
+                "pieces": 0,
+                "pallets": 21,
+                "itemName": "UNI-WIN70S-RDM-CG",
+                "itemType": "InvtPart",
+                "quantity": 1929.48,
+                "sections": 0,
+                "description": "Windermere 70mm S Rdm - Cliffside Grey 91.88sqft/plt, 10.21sqft/lyr, 9lyrs/plt  **NEW Format**  **PROMOTION**"
+              },
+              {
+                "sku": "UNI-WIN70S-0714-DC-2026",
+                "unit": "SQFT",
+                "itemId": 8472,
+                "layers": 4,
+                "lineId": 4978670,
+                "pieces": 0,
+                "pallets": 2,
+                "itemName": "UNI-WIN70S-0714-DC-2026",
+                "itemType": "InvtPart",
+                "quantity": 245,
+                "sections": 0,
+                "description": "Windermere 70mm S 7x14 - Dark Charcoal  \n98 sqft/plt, 12.25 sqft/lyr, 8lyr/plt \n**2026 PACKAGING**"
+              },
+              {
+                "sku": "BWS-PW-REG-BM",
+                "unit": "PC",
+                "itemId": 1187,
+                "layers": 0,
+                "lineId": 4978671,
+                "pieces": 0,
+                "pallets": 2,
+                "itemName": "BWS-PW-REG-BM",
+                "itemType": "InvtPart",
+                "quantity": 120,
+                "sections": 0,
+                "description": "Parkwall Regular Beige Mix           60pcs/plt"
+              },
+              {
+                "sku": "BWS-PW-COR-BM",
+                "unit": "PC",
+                "itemId": 1201,
+                "layers": 0,
+                "lineId": 4978672,
+                "pieces": 7,
+                "pallets": 0,
+                "itemName": "BWS-PW-COR-BM",
+                "itemType": "InvtPart",
+                "quantity": 7,
+                "sections": 0,
+                "description": "Parkwall Corner Beige Mix           24pcs/plt"
+              },
+              {
+                "sku": "BWS-PW-COP-BM",
+                "unit": "PC",
+                "itemId": 1242,
+                "layers": 0,
+                "lineId": 4978673,
+                "pieces": 14,
+                "pallets": 0,
+                "itemName": "BWS-PW-COP-BM",
+                "itemType": "InvtPart",
+                "quantity": 14,
+                "sections": 0,
+                "description": "Parkwall Coping Beige Mix           32pcs/plt"
+              },
+              {
+                "sku": "Gift for Pallet - Grey",
+                "unit": null,
+                "itemId": 10126,
+                "layers": 0,
+                "lineId": 4978674,
+                "pieces": 0,
+                "pallets": 0,
+                "itemName": "Gift for Pallet - Grey",
+                "itemType": "Kit",
+                "quantity": 10,
+                "sections": 0,
+                "description": "Buy 1 Pallet paver get 1 bag Supersand  free"
+              },
+              {
+                "sku": "Alliance Supersand Grey",
+                "unit": null,
+                "itemId": 599,
+                "layers": 0,
+                "lineId": 4978675,
+                "pieces": 10,
+                "pallets": 0,
+                "itemName": "Alliance Supersand Grey",
+                "itemType": "InvtPart",
+                "quantity": 10,
+                "sections": 0,
+                "description": "Alliance Supersand Grey          70bags/plt"
+              },
+              {
+                "sku": "Alliance Supersand Grey",
+                "unit": "EACH",
+                "itemId": 599,
+                "layers": 0,
+                "lineId": 4978676,
+                "pieces": 15,
+                "pallets": 0,
+                "itemName": "Alliance Supersand Grey",
+                "itemType": "InvtPart",
+                "quantity": 15,
+                "sections": 0,
+                "description": "Alliance Supersand Grey          70bags/plt"
+              }
+            ],
+            "layers": 4,
+            "weight": 77771.169,
+            "address": "",
+            "pallets": 25,
+            "salesQty": 2350.48,
+            "sourceYard": "3445",
+            "childOrders": [],
+            "pickupLocations": [
+              "3445"
+            ],
+            "childOrderDetails": [],
+            "destinationAddress": ""
+          },
+          {
+            "id": "SOA08931",
+            "type": "SO",
+            "items": [
+              {
+                "sku": "PALLET",
+                "unit": "EACH",
+                "itemId": 1784,
+                "layers": 0,
+                "lineId": 4978699,
+                "pieces": 0,
+                "pallets": 0,
+                "itemName": "PALLET",
+                "itemType": "InvtPart",
+                "quantity": 28,
+                "sections": 0,
+                "description": "**PALLET DEPOSIT** INTERLOCK,CEMENT, CONCRETE"
+              },
+              {
+                "sku": "Delivery Charge",
+                "unit": null,
+                "itemId": 1987,
+                "layers": 0,
+                "lineId": 4978700,
+                "pieces": 0,
+                "pallets": 0,
+                "itemName": "Delivery Charge",
+                "itemType": "OthCharge",
+                "quantity": 1,
+                "sections": 0,
+                "description": null
+              }
+            ],
+            "layers": 0,
+            "weight": 1120,
+            "address": "15 Snowy Meadow Ave, Richmond Hill, ON L4E 3V3",
+            "pallets": 0,
+            "salesQty": 29,
+            "sourceYard": "3445",
+            "childOrders": [],
+            "pickupLocations": [
+              "3445"
+            ],
+            "childOrderDetails": [],
+            "destinationAddress": "15 Snowy Meadow Ave, Richmond Hill, ON L4E 3V3"
+          }
+        ],
+        "destinationAddress": ""
+      },
+      {
+        "id": "TOB01111",
+        "type": "TO",
+        "items": [
+          {
+            "sku": "PER-MM60S-2237-AB",
+            "unit": "SQFT",
+            "itemId": 4785,
+            "layers": 4,
+            "lineId": 4977202,
+            "pieces": 0,
+            "pallets": 2,
+            "itemName": "PER-MM60S-2237-AB",
+            "itemType": "InvtPart",
+            "quantity": 256.52,
+            "sections": 0,
+            "description": "Mega Melville 60 S 22x37Inch Amber Beige 104.94sqft/plt, 11.66sqft/lyr, 9lyrs/plt"
+          },
+          {
+            "sku": "PER-MM60S-2237-NG",
+            "unit": "SQFT",
+            "itemId": 4788,
+            "layers": 5,
+            "lineId": 4977205,
+            "pieces": 0,
+            "pallets": 1,
+            "itemName": "PER-MM60S-2237-NG",
+            "itemType": "InvtPart",
+            "quantity": 163.24,
+            "sections": 0,
+            "description": "Mega Melville 60 S 22x37Inch Newport Grey 104.94sqft/plt, 11.66sqft/lyr, 9lyrs/plt"
+          },
+          {
+            "sku": "PER-MM60S-2237-SCG",
+            "unit": "SQFT",
+            "itemId": 4790,
+            "layers": 0,
+            "lineId": 4977208,
+            "pieces": 0,
+            "pallets": 15,
+            "itemName": "PER-MM60S-2237-SCG",
+            "itemType": "InvtPart",
+            "quantity": 1574.1,
+            "sections": 0,
+            "description": "Mega Melville 60 S 22x37Inch Scandina Grey 104.94sqft/plt, 11.66sqft/lyr, 9lyrs/plt"
+          },
+          {
+            "sku": "PER-MM80S-2237-NG",
+            "unit": "SQFT",
+            "itemId": 4771,
+            "layers": 0,
+            "lineId": 4977211,
+            "pieces": 0,
+            "pallets": 5,
+            "itemName": "PER-MM80S-2237-NG",
+            "itemType": "InvtPart",
+            "quantity": 408.1,
+            "sections": 0,
+            "description": "Mega Melville 80 S 22x37inch Newport Grey 81.62sqft/plt, 11.66sqft/lyr, 7lyrs/plt"
+          },
+          {
+            "sku": "PALLET",
+            "unit": "EACH",
+            "itemId": 1784,
+            "layers": 0,
+            "lineId": 4977427,
+            "pieces": 0,
+            "pallets": 25,
+            "itemName": "PALLET",
+            "itemType": "InvtPart",
+            "quantity": 25,
+            "sections": 0,
+            "description": "**PALLET DEPOSIT** INTERLOCK,CEMENT, CONCRETE"
+          }
+        ],
+        "layers": 9,
+        "weight": 76380.268,
+        "address": "2967 Kennedy Road, Toronto, ON",
+        "pallets": 48,
+        "salesQty": 2426.96,
+        "sourceYard": "150",
+        "childOrders": [],
+        "pickupLocations": [
+          "150"
+        ],
+        "childOrderDetails": [],
+        "destinationAddress": "2967 Kennedy Road, Toronto, ON"
+      }
+    ],
+    "trucks": [
+      {
+        "id": "T4",
+        "plate": "BC71838",
+        "loads": [
+          {
+            "id": "T4-L1789819075855-88b3d3b6e48e9",
+            "name": "Load 3",
+            "start": "",
+            "stops": [
+              {
+                "id": "stop-c34f4e46-5422-408c-9192-f984b58c6c17",
+                "type": "pick",
+                "loadId": "T4-L1789819075855-88b3d3b6e48e9",
+                "timing": {
+                  "depart": 745,
+                  "arrival": 715
+                },
+                "orderId": "GOA-8930-8931",
+                "location": "3445",
+                "orderRefs": [
+                  "GOA-8930-8931"
+                ]
+              },
+              {
+                "id": "T4-L1789819075855-88b3d3b6e48e9-GOA-8930-8931-1789819075856-78fe0428624388",
+                "type": "drop",
+                "loadId": "T4-L1789819075855-88b3d3b6e48e9",
+                "timing": {
+                  "depart": 781,
+                  "arrival": 745
+                },
+                "orderId": "GOA-8930-8931",
+                "location": "3445"
+              }
+            ],
+            "timing": {
+              "start": 676,
+              "finish": 781,
+              "restBefore": 0,
+              "switchStart": 676,
+              "startClamped": false,
+              "handoffTravel": null,
+              "previousFinish": 676,
+              "scheduledStart": 676
+            },
+            "truckId": "T4",
+            "startMode": "auto",
+            "driverName": "Dao",
+            "switchYard": "3445",
+            "truckPlate": "BC71838",
+            "driverLogin": "dao",
+            "parkingSpot": "",
+            "driverSequence": 2,
+            "handoffTravelTo": "",
+            "minutesPerPallet": 1,
+            "handoffTravelFrom": "",
+            "plannedStartMinute": 676,
+            "truckSwitchMinutes": 10,
+            "vendorFixedMinutes": 30,
+            "ownYardFixedMinutes": 30,
+            "plannedFinishMinute": 781,
+            "deliveryFixedMinutes": 10,
+            "handoffTravelMinutes": 0,
+            "pickupVisitSchemaVersion": 1
+          }
+        ]
+      },
+      {
+        "id": "T5",
+        "plate": "CC46868",
+        "loads": [
+          {
+            "id": "T5-L1789766949416-6077ed2d88e44",
+            "name": "Load 2",
+            "start": "",
+            "stops": [
+              {
+                "id": "stop-5186f5c2-45c7-45d9-bd16-cfa84ed7c2ce",
+                "type": "pick",
+                "loadId": "T5-L1789766949416-6077ed2d88e44",
+                "timing": {
+                  "depart": 768,
+                  "arrival": 728
+                },
+                "orderId": "TOB01111",
+                "location": "150",
+                "orderRefs": [
+                  "TOB01111",
+                  "TOB01114"
+                ]
+              },
+              {
+                "id": "T5-L1789766949416-6077ed2d88e44-TOB01111-1789766949416-74ac532c25f9b8",
+                "type": "drop",
+                "loadId": "T5-L1789766949416-6077ed2d88e44",
+                "timing": {
+                  "depart": 857,
+                  "arrival": 817
+                },
+                "orderId": "TOB01111",
+                "location": "150"
+              },
+              {
+                "id": "T5-L1789766949416-6077ed2d88e44-TOB01114-1789819024609-cd5f2ce4f88608",
+                "type": "drop",
+                "loadId": "T5-L1789766949416-6077ed2d88e44",
+                "timing": {
+                  "depart": 857,
+                  "arrival": 817
+                },
+                "orderId": "TOB01114",
+                "location": "150"
+              }
+            ],
+            "timing": {
+              "start": 689,
+              "finish": 857,
+              "restBefore": 0,
+              "switchStart": 689,
+              "startClamped": false,
+              "handoffTravel": null,
+              "previousFinish": 689,
+              "scheduledStart": 689
+            },
+            "truckId": "T5",
+            "startMode": "auto",
+            "driverName": "Li",
+            "endingTrip": false,
+            "switchYard": "3445",
+            "truckPlate": "CC46868",
+            "driverLogin": "li",
+            "parkingSpot": "",
+            "driverSequence": 1,
+            "handoffTravelTo": "",
+            "minutesPerPallet": 2,
+            "handoffTravelFrom": "",
+            "plannedStartMinute": 689,
+            "truckSwitchMinutes": 10,
+            "vendorFixedMinutes": 70,
+            "ownYardFixedMinutes": 40,
+            "plannedFinishMinute": 857,
+            "deliveryFixedMinutes": 10,
+            "handoffTravelMinutes": 0,
+            "pickupVisitSchemaVersion": 1
+          }
+        ]
+      }
+    ]
+  },
+  "activity": [
+    {
+      "status": "complete",
+      "load_id": "T4-L1789819075855-88b3d3b6e48e9",
+      "stop_id": "travel-48 Chalmers Cr., Ajax, ON L1S 5Z7-3445",
+      "stop_type": "travel",
+      "order_refs": [],
+      "job_details": {
+        "toStopId": ""
+      }
+    },
+    {
+      "status": "complete",
+      "load_id": "T4-L1789819075855-88b3d3b6e48e9",
+      "stop_id": "stop-c34f4e46-5422-408c-9192-f984b58c6c17",
+      "stop_type": "pickup",
+      "order_refs": [
+        "SOA08930",
+        "SOA08931"
+      ],
+      "job_details": {
+        "toStopId": ""
+      }
+    },
+    {
+      "status": "complete",
+      "load_id": "T4-L1789819075855-88b3d3b6e48e9",
+      "stop_id": "T4-L1789819075855-88b3d3b6e48e9-GOA-8930-8931-1789819075856-78fe0428624388",
+      "stop_type": "dropoff",
+      "order_refs": [
+        "SOA08930",
+        "SOA08931"
+      ],
+      "job_details": {
+        "toStopId": ""
+      }
+    },
+    {
+      "status": "complete",
+      "load_id": "T5-L1789766949416-6077ed2d88e44",
+      "stop_id": "travel-72842 Archambault St, Zurich, ON N0M 2T0-150",
+      "stop_type": "travel",
+      "order_refs": [],
+      "job_details": {
+        "toStopId": ""
+      }
+    },
+    {
+      "status": "complete",
+      "load_id": "T5-L1789766949416-6077ed2d88e44",
+      "stop_id": "stop-5186f5c2-45c7-45d9-bd16-cfa84ed7c2ce",
+      "stop_type": "pickup",
+      "order_refs": [
+        "TOB01111",
+        "TOB01114"
+      ],
+      "job_details": {
+        "toStopId": ""
+      }
+    },
+    {
+      "status": "complete",
+      "load_id": "T5-L1789766949416-6077ed2d88e44",
+      "stop_id": "T5-L1789766949416-6077ed2d88e44-TOB01111-1789766949416-74ac532c25f9b8",
+      "stop_type": "dropoff",
+      "order_refs": [
+        "TOB01111"
+      ],
+      "job_details": {
+        "toStopId": ""
+      }
+    },
+    {
+      "status": "complete",
+      "load_id": "T5-L1789766949416-6077ed2d88e44",
+      "stop_id": "T5-L1789766949416-6077ed2d88e44-TOB01114-1789819024609-cd5f2ce4f88608",
+      "stop_type": "dropoff",
+      "order_refs": [
+        "TOB01114"
+      ],
+      "job_details": {
+        "toStopId": ""
+      }
+    }
+  ],
+  "sourceOrders": [
+    {
+      "id": "TOB01111",
+      "type": "TO",
+      "items": [
+        {
+          "sku": "PER-MM60S-2237-AB",
+          "unit": "SQFT",
+          "itemId": 4785,
+          "layers": 4,
+          "lineId": 4977202,
+          "pieces": 0,
+          "pallets": 2,
+          "itemName": "PER-MM60S-2237-AB",
+          "itemType": "InvtPart",
+          "quantity": 256.52,
+          "sections": 0,
+          "description": "Mega Melville 60 S 22x37Inch Amber Beige 104.94sqft/plt, 11.66sqft/lyr, 9lyrs/plt"
+        },
+        {
+          "sku": "PER-MM60S-2237-NG",
+          "unit": "SQFT",
+          "itemId": 4788,
+          "layers": 5,
+          "lineId": 4977205,
+          "pieces": 0,
+          "pallets": 1,
+          "itemName": "PER-MM60S-2237-NG",
+          "itemType": "InvtPart",
+          "quantity": 163.24,
+          "sections": 0,
+          "description": "Mega Melville 60 S 22x37Inch Newport Grey 104.94sqft/plt, 11.66sqft/lyr, 9lyrs/plt"
+        },
+        {
+          "sku": "PER-MM60S-2237-SCG",
+          "unit": "SQFT",
+          "itemId": 4790,
+          "layers": 0,
+          "lineId": 4977208,
+          "pieces": 0,
+          "pallets": 15,
+          "itemName": "PER-MM60S-2237-SCG",
+          "itemType": "InvtPart",
+          "quantity": 1574.1,
+          "sections": 0,
+          "description": "Mega Melville 60 S 22x37Inch Scandina Grey 104.94sqft/plt, 11.66sqft/lyr, 9lyrs/plt"
+        },
+        {
+          "sku": "PER-MM80S-2237-NG",
+          "unit": "SQFT",
+          "itemId": 4771,
+          "layers": 0,
+          "lineId": 4977211,
+          "pieces": 0,
+          "pallets": 5,
+          "itemName": "PER-MM80S-2237-NG",
+          "itemType": "InvtPart",
+          "quantity": 408.1,
+          "sections": 0,
+          "description": "Mega Melville 80 S 22x37inch Newport Grey 81.62sqft/plt, 11.66sqft/lyr, 7lyrs/plt"
+        },
+        {
+          "sku": "PALLET",
+          "unit": "EACH",
+          "itemId": 1784,
+          "layers": 0,
+          "lineId": 4977427,
+          "pieces": 0,
+          "pallets": 25,
+          "itemName": "PALLET",
+          "itemType": "InvtPart",
+          "quantity": 25,
+          "sections": 0,
+          "description": "**PALLET DEPOSIT** INTERLOCK,CEMENT, CONCRETE"
+        }
+      ],
+      "layers": 9,
+      "weight": 76380.268,
+      "address": "2967 Kennedy Road, Toronto, ON",
+      "pallets": 48,
+      "salesQty": 2426.96,
+      "sourceYard": "150",
+      "childOrders": [],
+      "pickupLocations": [
+        "150"
+      ],
+      "childOrderDetails": [],
+      "destinationAddress": "2967 Kennedy Road, Toronto, ON"
+    },
+    {
+      "id": "SOA08930",
+      "type": "SO",
+      "items": [
+        {
+          "sku": "UNI-WIN70S-RDM-CG",
+          "unit": "SQFT",
+          "itemId": 3634,
+          "layers": 0,
+          "lineId": 4978669,
+          "pieces": 0,
+          "pallets": 21,
+          "itemName": "UNI-WIN70S-RDM-CG",
+          "itemType": "InvtPart",
+          "quantity": 1929.48,
+          "sections": 0,
+          "description": "Windermere 70mm S Rdm - Cliffside Grey 91.88sqft/plt, 10.21sqft/lyr, 9lyrs/plt  **NEW Format**  **PROMOTION**"
+        },
+        {
+          "sku": "UNI-WIN70S-0714-DC-2026",
+          "unit": "SQFT",
+          "itemId": 8472,
+          "layers": 4,
+          "lineId": 4978670,
+          "pieces": 0,
+          "pallets": 2,
+          "itemName": "UNI-WIN70S-0714-DC-2026",
+          "itemType": "InvtPart",
+          "quantity": 245,
+          "sections": 0,
+          "description": "Windermere 70mm S 7x14 - Dark Charcoal  \n98 sqft/plt, 12.25 sqft/lyr, 8lyr/plt \n**2026 PACKAGING**"
+        },
+        {
+          "sku": "BWS-PW-REG-BM",
+          "unit": "PC",
+          "itemId": 1187,
+          "layers": 0,
+          "lineId": 4978671,
+          "pieces": 0,
+          "pallets": 2,
+          "itemName": "BWS-PW-REG-BM",
+          "itemType": "InvtPart",
+          "quantity": 120,
+          "sections": 0,
+          "description": "Parkwall Regular Beige Mix           60pcs/plt"
+        },
+        {
+          "sku": "BWS-PW-COR-BM",
+          "unit": "PC",
+          "itemId": 1201,
+          "layers": 0,
+          "lineId": 4978672,
+          "pieces": 7,
+          "pallets": 0,
+          "itemName": "BWS-PW-COR-BM",
+          "itemType": "InvtPart",
+          "quantity": 7,
+          "sections": 0,
+          "description": "Parkwall Corner Beige Mix           24pcs/plt"
+        },
+        {
+          "sku": "BWS-PW-COP-BM",
+          "unit": "PC",
+          "itemId": 1242,
+          "layers": 0,
+          "lineId": 4978673,
+          "pieces": 14,
+          "pallets": 0,
+          "itemName": "BWS-PW-COP-BM",
+          "itemType": "InvtPart",
+          "quantity": 14,
+          "sections": 0,
+          "description": "Parkwall Coping Beige Mix           32pcs/plt"
+        },
+        {
+          "sku": "Gift for Pallet - Grey",
+          "unit": null,
+          "itemId": 10126,
+          "layers": 0,
+          "lineId": 4978674,
+          "pieces": 0,
+          "pallets": 0,
+          "itemName": "Gift for Pallet - Grey",
+          "itemType": "Kit",
+          "quantity": 10,
+          "sections": 0,
+          "description": "Buy 1 Pallet paver get 1 bag Supersand  free"
+        },
+        {
+          "sku": "Alliance Supersand Grey",
+          "unit": null,
+          "itemId": 599,
+          "layers": 0,
+          "lineId": 4978675,
+          "pieces": 10,
+          "pallets": 0,
+          "itemName": "Alliance Supersand Grey",
+          "itemType": "InvtPart",
+          "quantity": 10,
+          "sections": 0,
+          "description": "Alliance Supersand Grey          70bags/plt"
+        },
+        {
+          "sku": "Alliance Supersand Grey",
+          "unit": "EACH",
+          "itemId": 599,
+          "layers": 0,
+          "lineId": 4978676,
+          "pieces": 15,
+          "pallets": 0,
+          "itemName": "Alliance Supersand Grey",
+          "itemType": "InvtPart",
+          "quantity": 15,
+          "sections": 0,
+          "description": "Alliance Supersand Grey          70bags/plt"
+        }
+      ],
+      "layers": 4,
+      "weight": 77771.169,
+      "address": "15 Snowy Meadow Ave, Richmond Hill, ON L4E 3V3",
+      "pallets": 25,
+      "salesQty": 2350.48,
+      "sourceYard": "3445",
+      "childOrders": [],
+      "pickupLocations": [
+        "3445"
+      ],
+      "childOrderDetails": [],
+      "destinationAddress": "15 Snowy Meadow Ave, Richmond Hill, ON L4E 3V3"
+    },
+    {
+      "id": "SOA08931",
+      "type": "SO",
+      "items": [
+        {
+          "sku": "PALLET",
+          "unit": "EACH",
+          "itemId": 1784,
+          "layers": 0,
+          "lineId": 4978699,
+          "pieces": 0,
+          "pallets": 0,
+          "itemName": "PALLET",
+          "itemType": "InvtPart",
+          "quantity": 28,
+          "sections": 0,
+          "description": "**PALLET DEPOSIT** INTERLOCK,CEMENT, CONCRETE"
+        },
+        {
+          "sku": "Delivery Charge",
+          "unit": null,
+          "itemId": 1987,
+          "layers": 0,
+          "lineId": 4978700,
+          "pieces": 0,
+          "pallets": 0,
+          "itemName": "Delivery Charge",
+          "itemType": "OthCharge",
+          "quantity": 1,
+          "sections": 0,
+          "description": null
+        }
+      ],
+      "layers": 0,
+      "weight": 1120,
+      "address": "15 Snowy Meadow Ave, Richmond Hill, ON L4E 3V3",
+      "pallets": 0,
+      "salesQty": 29,
+      "sourceYard": "3445",
+      "childOrders": [],
+      "pickupLocations": [
+        "3445"
+      ],
+      "childOrderDetails": [],
+      "destinationAddress": "15 Snowy Meadow Ave, Richmond Hill, ON L4E 3V3"
+    }
+  ]
+}

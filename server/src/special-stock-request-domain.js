@@ -1,13 +1,16 @@
+import { normalizeSpecialExpiry } from '../public/special-stock-expiry.js';
+import { normalizeSpecialSalesInternalRemark } from '../public/special-stock-internal-remark.js';
 import { specialStage } from '../public/special-stock-workflow.js';
-import { normalizeSpecialRate, normalizeSpecialDiscount, assertSpecialDeliveryDate, specialLineSubtotal } from '../public/special-stock-pricing.js';
+import { normalizeSpecialDeliveryFee, specialDeliveryFeeLine } from '../public/special-stock-delivery-fee.js';
+import { normalizeSpecialRate, normalizeSpecialDiscount, specialPalletQuantity, assertSpecialDeliveryDate, specialDiscountLineSubtotal as specialLineSubtotal } from '../public/special-stock-pricing.js';
 export const SPECIAL_CASE_MAX_LINES = 100;
 export const SPECIAL_CASE_MAX_QUANTITY = 1_000_000_000;
 export const SPECIAL_MEDIA_MAX_BYTES = 25 * 1024 * 1024;
-export const SPECIAL_CASE_UOMS = Object.freeze(["PLT", "LYR", "SEC", "PCS", "EACH"]);
+export const SPECIAL_CASE_UOMS = Object.freeze(["PLT", "LYR", "SEC", "PCS", "EACH", "SQFT"]);
 
 const SPECIAL_YARD_LOCATION_IDS = new Set([1, 28, 15, 26]);
 const SPECIAL_CASE_UOM_SET = new Set(SPECIAL_CASE_UOMS);
-const SUPPLY_STATUSES = new Set(["in_stock", "vendor_transfer", "production", "allocation", "no_stock"]);
+const SUPPLY_STATUSES = new Set(["in_stock", "low_inventory", "vendor_transfer", "production", "allocation", "no_stock"]);
 const AVAILABILITY_MODES = new Set(["dated", "no_projection"]);
 const SALES_DECISIONS = new Set(["accepted", "request_update", "declined", "closed"]);
 const TERMINAL_SALES_DECISIONS = new Set(["accepted", "declined", "closed"]);
@@ -117,7 +120,7 @@ function normalizeCaseLine(line, index, { minimumRequiredDate }) {
   }).toUpperCase();
   if (!SPECIAL_CASE_UOM_SET.has(uom)) {
     throw domainError(
-      `Line ${index + 1} UOM must be Plt, lyr, Sec, Pcs, or Each.`,
+      `Line ${index + 1} UOM must be PLT, LYR, SEC, PCS, EACH, or SQFT.`,
       "SPECIAL_CASE_UOM_INVALID"
     );
   }
@@ -142,6 +145,8 @@ function normalizeCaseLine(line, index, { minimumRequiredDate }) {
     }),
     color: text(line.color, { max: 200 }),
     size: text(line.size, { max: 200 }),
+    detailSpec: text(line.detailSpec, { max: 2000 }),
+    ...Object.fromEntries(["palletQty", "layerQty", "sectionQty", "pieceQty"].map(field => [field, finiteNumber(line[field] ?? 0, field, {allowZero:true,code:"SPECIAL_PACK_QUANTITY_INVALID"})])),
     quantity: finiteNumber(line.quantity, `Line ${index + 1} quantity`, {
       maximum: SPECIAL_CASE_MAX_QUANTITY,
       code: "SPECIAL_CASE_QUANTITY_INVALID"
@@ -154,6 +159,31 @@ function normalizeCaseLine(line, index, { minimumRequiredDate }) {
     estimateLineReference: text(line.estimateLineReference, { max: 200 }),
     customerNote: text(line.customerNote, { max: 4_000 })
   };
+}
+
+/** @param {unknown} lines @param {{existingLineCount:number,minimumRequiredDate?:string}} options @returns {Array<Record<string,any>>} */
+export function normalizeSpecialAdditionalLines(lines, {
+  existingLineCount,
+  minimumRequiredDate = minimumSpecialCaseRequiredDate()
+}) {
+  if (!Number.isSafeInteger(existingLineCount) || existingLineCount < 1
+      || !Array.isArray(lines) || lines.length < 1 || existingLineCount + lines.length > SPECIAL_CASE_MAX_LINES) {
+    throw domainError(`A case requires 1 to ${SPECIAL_CASE_MAX_LINES} line items.`, 'SPECIAL_CASE_LINES_INVALID');
+  }
+  const earliestRequiredDate = isoDate(minimumRequiredDate, {
+    required: true, label: 'Minimum required date', code: 'SPECIAL_CASE_REQUIRED_DATE_INVALID'
+  });
+  return lines.map((line,index) => normalizeCaseLine(line,existingLineCount + index,{minimumRequiredDate:earliestRequiredDate}));
+}
+
+/** @param {{palletTotal?:unknown,palletRate?:unknown}} input */
+export function normalizeSpecialQuotePallet(input = {}) {
+  const palletTotal = specialPalletQuantity(input.palletTotal ?? 0);
+  const value = input.palletRate;
+  const palletRate = value == null || (typeof value === 'string' && value.trim() === '') ? null : normalizeSpecialRate(value);
+  if (palletTotal > 0 && palletRate === null) throw domainError('Review the pallet rate.', 'SPECIAL_PALLET_RATE_REQUIRED');
+  if (palletTotal > 0) specialLineSubtotal(palletTotal, palletRate, 0);
+  return { palletTotal, palletRate };
 }
 
 export function normalizeSpecialCaseDraft(input = {}, {
@@ -179,9 +209,15 @@ export function normalizeSpecialCaseDraft(input = {}, {
     label: "Minimum required date",
     code: "SPECIAL_CASE_REQUIRED_DATE_INVALID"
   });
+  const salesInternalRemark = /** @type {{salesInternalRemark?:unknown}} */ (input).salesInternalRemark;
   return {
     storeLocationId,
+    expiresOn: normalizeSpecialExpiry(input.expiresOn, earliestRequiredDate),
+    netsuiteSalesRepId: optionalPositiveId(input.netsuiteSalesRep?.id, "NetSuite Sales Rep"),
+    netsuiteSalesRepName: text(input.netsuiteSalesRep?.name, {max:500}),
     ...normalizeSpecialFulfillment(input),
+    ...normalizeSpecialQuotePallet(input),
+    deliveryFeeRate: normalizeSpecialDeliveryFee(input),
     inquiryDate: isoDate(input.inquiryDate, {
       required: true,
       label: "Inquiry date",
@@ -206,6 +242,7 @@ export function normalizeSpecialCaseDraft(input = {}, {
     estimateId: optionalPositiveId(input.estimateId, "Estimate", "SPECIAL_CASE_ESTIMATE_INVALID"),
     estimateNumber: text(input.estimateNumber, { max: 100 }),
     remarks: text(input.remarks, { max: 8_000 }),
+    salesInternalRemark: normalizeSpecialSalesInternalRemark(salesInternalRemark === undefined ? '' : salesInternalRemark),
     lines: input.lines.map((line, index) => normalizeCaseLine(line, index, {
       minimumRequiredDate: earliestRequiredDate
     }))
@@ -266,6 +303,9 @@ export function normalizeSpecialSupplyResponse(input = {}) {
     throw domainError("Select a dated projection or no projection.", "SPECIAL_RESPONSE_AVAILABILITY_INVALID");
   }
   const suppliedDate = text(input.availableDate);
+  if (supplyStatus === 'vendor_transfer' && (availabilityMode !== 'dated' || !suppliedDate)) {
+    throw domainError('An ETA is required for stock waiting for transfer.', 'SPECIAL_RESPONSE_DATE_REQUIRED');
+  }
   if (availabilityMode === "dated" && !suppliedDate) {
     throw domainError("An estimated available date is required.", "SPECIAL_RESPONSE_DATE_REQUIRED");
   }
@@ -273,7 +313,11 @@ export function normalizeSpecialSupplyResponse(input = {}) {
     throw domainError("Remove the estimated date when no projection is selected.", "SPECIAL_RESPONSE_DATE_CONFLICT");
   }
   const itemResolution = normalizeItemResolution(input.itemResolution, { required: false });
+  const productName = /** @type {{productName?: unknown}} */ (input).productName;
   return {
+    ...(productName === undefined ? {} : { productName: text(productName, {
+      required: true, label: 'Item name', max: 500, code: 'SPECIAL_RESPONSE_PRODUCT_REQUIRED'
+    }) }),
     supplyStatus,
     availabilityMode,
     availableDate: availabilityMode === "dated"
@@ -469,7 +513,10 @@ export function normalizeSpecialSalesOrderDraft(input = {}, { now = new Date() }
   if (new Set(identities).size !== identities.length) throw domainError('Use distinct descriptions for otherwise identical product lines so each SO line can be verified.', 'SPECIAL_ORDER_LINE_AMBIGUOUS');
   const ancillaryInput = input.ancillaryLines ?? [];
   if (!Array.isArray(ancillaryInput)) throw domainError("Ancillary order lines are invalid.", "SPECIAL_SO_LINE_INVALID");
-  const ancillaryLines = ancillaryInput.map((line, index) => normalizeOrderLine(line, index, { material: false }));
+  const deliveryFeeRate = normalizeSpecialDeliveryFee({ ...input, fulfillmentMethod });
+  const ancillaryLines = ancillaryInput.filter(line => Number(line?.itemId) !== 1987
+    || (fulfillmentMethod === 'mbt_delivery' && deliveryFeeRate == null))
+    .map((line, index) => normalizeOrderLine(line, index, { material: false }));
   if (!['number', 'string'].includes(typeof input.palletTotal) || input.palletTotal === undefined || input.palletTotal === null || String(input.palletTotal).trim() === ''
       || !Number.isSafeInteger(Number(input.palletTotal)) || Number(input.palletTotal) < 0 || Number(input.palletTotal) > SPECIAL_CASE_MAX_QUANTITY) {
     throw domainError('Pallets needed must be a whole number of zero or more.', 'SPECIAL_PALLET_TOTAL_INVALID');
@@ -483,6 +530,7 @@ export function normalizeSpecialSalesOrderDraft(input = {}, { now = new Date() }
     ancillaryLines.push({ itemId: 1784, description: 'PALLET', quantity: palletTotal, uom: 'EACH', rate: palletRate });
   }
   const mediaInput = input.media ?? [];
+  if (deliveryFeeRate != null) ancillaryLines.push(specialDeliveryFeeLine(deliveryFeeRate));
   if (!Array.isArray(mediaInput)) throw domainError("Delivery media is invalid.", "SPECIAL_SO_MEDIA_INVALID");
   const media = mediaInput.map(normalizeStagedMedia);
 
@@ -495,6 +543,7 @@ export function normalizeSpecialSalesOrderDraft(input = {}, { now = new Date() }
     ...fulfillment,
     palletTotal,
     palletRate,
+    deliveryFeeRate,
     media,
     materialLines,
     ancillaryLines
@@ -550,7 +599,7 @@ function normalizedOrderDescription(value, itemName = "") {
  * created NetSuite order reaches the canonical mirror. It deliberately
  * rejects extras: an operator must review every commercial line in the case.
  */
-export function matchSpecialOrderCoverage(expectedLines = [], canonicalLines = [], { orderKind = "order" } = {}) {
+export function matchSpecialOrderCoverage(expectedLines = [], canonicalLines = [], { orderKind = "order", reviewedDescriptionChanges = [] } = {}) {
   if (!Array.isArray(expectedLines) || !expectedLines.length) {
     throw domainError(`Save the reviewed ${orderKind} lines before linking.`, "SPECIAL_ORDER_DRAFT_REQUIRED", 409);
   }
@@ -561,17 +610,26 @@ export function matchSpecialOrderCoverage(expectedLines = [], canonicalLines = [
   const mappings = [];
   for (const expected of [...expectedLines].sort((left, right) => Number(left.id) - Number(right.id))) {
     const expectedDescription = normalizedOrderDescription(expected.description, expected.itemName);
+    // A pending SCM review is an alternative complete tuple only for this
+    // already-linked special-item line. Never accept a mix of old/new values.
+    const reviewedChange = Number(expected.itemId) === 2055 && Number(expected.remoteLineId) > 0
+      ? reviewedDescriptionChanges.find(change => Number(change.expectedLineId) === Number(expected.id)
+        && Number(change.remoteLineId) === Number(expected.remoteLineId)) : null;
+    const reviewedDescription = normalizedOrderDescription(reviewedChange?.description, expected.itemName);
     const matches = candidates.map((candidate, index) => ({ candidate, index })).filter(({ candidate }) => {
       if (expected.remoteLineId && Number(candidate.lineId) !== Number(expected.remoteLineId)) return false;
       if (candidate.used || Number(candidate.itemId) !== Number(expected.itemId)) return false;
       if (!Number.isSafeInteger(Number(candidate.id)) || Number(candidate.id) <= 0
           || !Number.isSafeInteger(Number(candidate.lineId)) || Number(candidate.lineId) <= 0) return false;
-      if (Math.abs(Number(candidate.quantity) - Number(expected.quantity)) > 0.000001) return false;
-      const expectedUom = normalizedOrderText(expected.uom);
       const candidateUom = normalizedOrderText(candidate.uom);
-      if (expectedUom && expectedUom !== candidateUom) return false;
       const candidateDescription = normalizedOrderDescription(candidate.description, candidate.itemName);
-      return !expectedDescription || expectedDescription === candidateDescription;
+      const tupleMatches = (quantity, uom, description) => Number.isFinite(Number(candidate.quantity))
+        && Math.abs(Number(candidate.quantity) - Number(quantity)) <= 0.000001
+        && (!normalizedOrderText(uom) || normalizedOrderText(uom) === candidateUom)
+        && (!description || description === candidateDescription);
+      return tupleMatches(expected.quantity, expected.uom, expectedDescription)
+        || (Boolean(reviewedDescription) && tupleMatches(reviewedChange.quantity ?? expected.quantity,
+          reviewedChange.uom ?? expected.uom, reviewedDescription));
     });
     if (matches.length > 1) throw domainError('The reviewed order has indistinguishable lines; verify their identities before linking.', 'SPECIAL_ORDER_LINE_AMBIGUOUS', 409);
     const index = matches[0]?.index ?? -1;

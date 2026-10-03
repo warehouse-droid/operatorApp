@@ -1,0 +1,30 @@
+{
+  "production": [
+    "src/server.js",
+    "src/dispatch-plan-repository.js",
+    "src/dispatch-planner-v2-repository.js",
+    "src/dispatch-executed-prefix-repository.js",
+    "src/dispatch-planner-performance.js",
+    "src/dispatch-delivery-group-repository.js",
+    "src/dispatch-repository.js",
+    "src/dispatch-executed-order-review.js",
+    "src/dispatch-executed-order-review-repository.js",
+    "src/dispatch-address-guard.js",
+    "public/dispatch-address-guard.js",
+    "public/dispatch.js",
+    "public/dispatch.css",
+    "public/dispatch.html",
+    "migrations/212_dispatch_executed_order_reviews.sql"
+  ],
+  "tests": [
+    "test/dispatch/unit/dispatch-executed-order-review.test.js",
+    "test/dispatch/unit/dispatch-executed-order-incidents.test.js",
+    "test/dispatch/property/dispatch-executed-order-review.test.js",
+    "test/dispatch/integration/dispatch-executed-order-review.test.js",
+    "test/dispatch/frontend/dispatch-executed-order-review.browser.test.mjs",
+    "test/dispatch/unit/dispatch-split-address.test.js",
+    "test/dispatch/frontend/dispatch-stale-address.test.js",
+    "test/dispatch/fixtures/executed-order-incidents.json",
+    "test/dispatch-executed-order-review-spec.md"
+  ]
+}

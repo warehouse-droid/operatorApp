@@ -102,3 +102,36 @@ export function specialNativePricing({ quantity, rate, discountPercent = 0, conv
   }
   return { packageQuantity, conversionToPc: conversion, quantity: nativeQuantity, uom: 'PC', rate: nativeRate, subtotal };
 }
+
+/** Gross material pricing for a separate, adjacent NetSuite discount item.
+ * @param {{quantity:unknown,rate:unknown,discountPercent?:unknown,conversionToPc:unknown}} input */
+export function specialNativeLinePricing(input) {
+  const gross = specialNativePricing({ ...input, discountPercent: 0 });
+  const discountPercent = normalizeSpecialDiscount(input.discountPercent);
+  const subtotal = specialDiscountLineSubtotal(input.quantity,input.rate,discountPercent);
+  return { ...gross, discountPercent, subtotal };
+}
+
+/** NetSuite's adjacent discount is its own rounded currency amount.
+ * @param {unknown} quantity @param {unknown} rate @param {unknown} [discountPercent] */
+export function specialDiscountLineSubtotal(quantity,rate,discountPercent=0) {
+  const grossCents = BigInt(Math.round(specialLineSubtotal(quantity,rate,0) * 100));
+  const normalizedPercent = normalizeSpecialDiscount(discountPercent);
+  const percent = BigInt(normalizedPercent.toFixed(4).replace('.', ''));
+  const discountCents = (grossCents * percent + 500_000n) / 1_000_000n;
+  return Number(grossCents - discountCents)/100;
+}
+
+/** Numeric REST discount, calculated from the rounded gross material amount.
+ * @param {unknown} quantity @param {unknown} rate @param {unknown} discountPercent */
+export function specialDiscountLineAmount(quantity, rate, discountPercent) {
+  const grossCents = BigInt(Math.round(specialLineSubtotal(quantity, rate, 0) * 100));
+  const percent = BigInt(normalizeSpecialDiscount(discountPercent).toFixed(4).replace('.', ''));
+  const discountCents = (grossCents * percent + 500_000n) / 1_000_000n;
+  return discountCents === 0n ? 0 : -Number(discountCents) / 100;
+}
+
+/** @param {unknown} value */
+export function specialPalletQuantity(value) {
+  return decimal(value, 1e9, 0, 'PALLET quantity', 'SPECIAL_PALLET_INVALID');
+}

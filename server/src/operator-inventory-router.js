@@ -2,8 +2,10 @@ import express from 'express';
 import {query} from './db.js';
 import {INVENTORY_YARDS,inventoryDate,inventoryYards,assertInventoryYard,inventoryError} from './inventory-workflow-domain.js';
 import {createCountSheet,listCountSheets,getCountSheet,changeCountSheet} from './count-sheet-repository.js';
+import {refreshCountSheetInventory} from './count-sheet-stock-refresh.js';
 import {CONFIRMED_RETURN_REASONS} from './return-netsuite.js';
 import {getDamageItem} from './inventory-damage-netsuite.js';
+import {listDamageReports} from './inventory-damage-repository.js';
 import {submitDamageReport,getDamageReport,processDamageReport,reviewDamageMonth,retryDamageReport} from './inventory-damage-service.js';
 const handler=fn=>(req,res,next)=>Promise.resolve().then(()=>fn(req,res)).catch(next);
 function router() {
@@ -20,7 +22,7 @@ export async function catalog(actor,input,{management=false,damage=false}={}) {
     AND (i.item_name ILIKE $2 OR i.item_description ILIKE $2 OR i.display_name ILIKE $2)
     ORDER BY i.item_name,i.item_id LIMIT 50 OFFSET $4`,[yard,`%${search}%`,damage,offset])).rows;
 }
-export function createCountSheetRouter({management=false}={}) {
+export function createCountSheetRouter({management=false,fetchCountSheetBalances}={}) {
   const result=router();
   result.get('/config',handler(async(req,res)=>res.json({yards:INVENTORY_YARDS.filter(y=>inventoryYards(req.operator,management).includes(y.id))})));
   result.get('/',handler(async(req,res)=>res.json(await listCountSheets(req.operator,{management,locationId:req.query.locationId}))));
@@ -30,6 +32,9 @@ export function createCountSheetRouter({management=false}={}) {
   }
   result.get('/:id',handler(async(req,res)=>res.json(await getCountSheet(req.operator,req.params.id,{management}))));
   result.post('/:id/:action',handler(async(req,res)=>{
+    if(!management && req.params.action==='refresh-inventory') {
+      return res.json(await refreshCountSheetInventory(req.operator,req.params.id,{fetchBalances:fetchCountSheetBalances}));
+    }
     const actions=management?['edit','reset','cancel']:['take','line','submit'];
     if(!actions.includes(req.params.action)) {throw inventoryError('Invalid count-sheet action.');}
     res.json(await changeCountSheet(req.operator,req.params.id,req.params.action,req.body || {},{management}));
@@ -44,7 +49,11 @@ export function createInventoryDamageRouter({getItem=getDamageItem,verifyPhotos,
   result.get('/items/:id',handler(async(req,res)=>{
     const yard=assertInventoryYard(req.operator,req.query.locationId);res.json(await getItem(req.params.id,yard));
   }));
-  result.get('/reports',handler(async(req,res)=>res.json(await reviewDamageMonth(req.operator,req.query.locationId,req.query.month || inventoryDate().slice(0,7),{remote}))));
+  result.get('/reports',handler(async(req,res)=>{
+    const month=req.query.month || inventoryDate().slice(0,7);
+    res.json(req.query.local==='true'?{month,reports:await listDamageReports(req.operator,req.query.locationId,month),transfers:[],syncError:null}
+      :await reviewDamageMonth(req.operator,req.query.locationId,month,{remote}));
+  }));
   result.get('/reports/:id',handler(async(req,res)=>res.json(await getDamageReport(req.operator,req.params.id))));
   result.post('/reports',handler(async(req,res)=>{
     const report=await submitDamageReport(req.operator,req.body || {},{getItem,verifyPhotos});

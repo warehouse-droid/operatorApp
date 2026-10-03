@@ -48,6 +48,11 @@ function orderRef(order = {}) {
   return text(order.id || order.orderId || order.orderRef || order.tranid || order.refNumber);
 }
 
+export function dispatchPickupOverridesMatch(left, right) {
+  const key = (order) => text(order?.pickupAddressOverride).toLowerCase().replace(/[^a-z0-9]/gu, "");
+  return key(left) === key(right);
+}
+
 function visitStopId(stop = {}) {
   return text(stop.id || stop.stopId || stop.stop_id);
 }
@@ -80,12 +85,33 @@ function manifestPickupLocations(order = {}) {
   ].map((entry) => text(entry?.location)).filter(Boolean);
 }
 
+function groupedPickupChildren(order = {}) {
+  // A CO carries its own manifest. A CO for an entire group supersedes the
+  // children's earlier pickup locations; child-specific COs remain effective.
+  if (!["SO", "TO"].includes(text(order.type).toUpperCase()) || order.transitCo
+    || !(order.childOrders || []).length) { return []; }
+  const children = Array.isArray(order.childOrderDetails) ? order.childOrderDetails : [];
+  const configured = Array.isArray(order.pickupLocations) && order.pickupLocations.length
+    ? order.pickupLocations : [order.sourceYard || order.outboundLocation || "3445"];
+  const parentLocations = new Set([...configured,...manifestPickupLocations(order)].map(locationKey));
+  return children.map(child => {
+    const source = child.transitCo?.toYard || child.sourceYard || child.outboundLocation || "3445";
+    const keep = location => parentLocations.has(locationKey(location)) || locationKey(location) === locationKey(source);
+    // Child source yards and transit arrivals remain physical requirements.
+    // Extra vendor pickups must still belong to the parent's current manifest.
+    return {...child,pickupLocations: (child.pickupLocations || [source]).filter(keep),
+      poPickupManifest: (child.poPickupManifest || []).filter(entry => keep(entry.location)),
+      directPickupManifest: (child.directPickupManifest || []).filter(entry => keep(entry.location))};
+  });
+}
+
 function configuredPickupVisitLocations(order = {}) {
   const configured = Array.isArray(order.pickupLocations) && order.pickupLocations.length
     ? order.pickupLocations
     : [order.sourceYard || order.outboundLocation || "3445"];
   const seen = new Set();
-  return [...configured, ...manifestPickupLocations(order)].filter((location) => {
+  return [...configured, ...manifestPickupLocations(order),
+    ...groupedPickupChildren(order).flatMap(configuredPickupVisitLocations)].filter((location) => {
     const key = locationKey(location);
     if (!key || seen.has(key)) return false;
     seen.add(key);
@@ -98,7 +124,15 @@ export function dispatchRequiredPickupVisitLocations(order = {}, plan = {}) {
   // Missing legacy item details are unknown, not evidence that a pickup is
   // empty. Detailed orders use the same location-scoped cargo rule as the UI.
   if (!Array.isArray(order.items)) return pickupLocations;
-  return dispatchRequiredPickupLocations(plan, { ...order, pickupLocations });
+  const required = [...dispatchRequiredPickupLocations(plan, { ...order, pickupLocations }),
+    ...groupedPickupChildren(order).flatMap(child => dispatchRequiredPickupVisitLocations(child, plan))];
+  const seen = new Set();
+  return required.filter(location => {
+    const key = locationKey(location);
+    if (seen.has(key)) { return false; }
+    seen.add(key);
+    return true;
+  });
 }
 
 function orderRequiresLocation(order = {}, location = "") {
@@ -568,6 +602,7 @@ export function insertDispatchLateOrder({
       .filter(({ stop, index }) =>
         pickupStop(stop)
         && locationKey(stop.location || stop.yard) === locationKey(location)
+        && dispatchPickupOverridesMatch(orderByRef(next, stop.orderId || stop.orderRefs?.[0]), order)
         && index >= lowerInsertionIndex
         && index < pickupAnchor
       );
@@ -704,6 +739,9 @@ export function splitDispatchPickupVisit({
       || target.index <= source.index
       || target.index >= earliestDelivery
       || locationKey(target.stop.location || target.stop.yard) !== locationKey(source.stop.location || source.stop.yard)
+      || !requested.every(ref => dispatchPickupOverridesMatch(
+        orderByRef(next, target.stop.orderId || target.stop.orderRefs?.[0]), orderByRef(next, ref)
+      ))
     ) {
       throw Object.assign(new Error("The target pickup visit is not a legal future visit for these orders."), {
         status: 409,

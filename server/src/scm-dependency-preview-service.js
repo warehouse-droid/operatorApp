@@ -121,7 +121,37 @@ async function lockDependencyOperatorOrders(salesRefs, transferRefs) {
   await query("SELECT id FROM local_co_order_lines WHERE co_id=ANY($1::bigint[]) ORDER BY id FOR UPDATE", [coIds]);
 }
 
-async function operatorActivityRefs({ salesRefs = [], transferRefs = [], salesLineIds = null, allowReceivedCo = false } = {}) {
+async function operatorActivityRefs({ salesRefs = [], transferRefs = [], salesLineIds = null, allowReceivedCo = false, ignorePacking = false } = {}) {
+  if (ignorePacking) {
+    // A dependency describes supply and routing. Operator preparation,
+    // confirmation and packing do not constitute execution of that route.
+    const execution = await query(`
+      SELECT sales.tranid AS ref FROM sales_orders sales
+       WHERE sales.tranid = ANY($1::text[]) AND (
+         LOWER(COALESCE(sales.operator_status, '')) IN ('loaded','partial_loaded','fulfilled','shipped','received','complete','completed')
+         OR LOWER(COALESCE(sales.local_yard_order_status, '')) = 'loaded'
+         OR LOWER(COALESCE(sales.fulfillment_status, '')) IN ('fulfilled','partial_fulfilled','shipped')
+         OR EXISTS (SELECT 1 FROM sales_order_lines line
+           WHERE line.sales_order_id=sales.netsuite_id AND COALESCE(line.loaded_qty,0)>0))
+      UNION
+      SELECT transfer.tranid FROM transfer_orders transfer
+       WHERE transfer.tranid = ANY($2::text[]) AND (
+         LOWER(COALESCE(transfer.outbound_operator_status, '')) IN ('loaded','partial_loaded','fulfilled','shipped')
+         OR LOWER(COALESCE(transfer.local_yard_order_status, '')) = 'loaded'
+         OR LOWER(COALESCE(transfer.fulfillment_status, '')) IN ('loaded','fulfilled','partial_fulfilled','shipped')
+         OR EXISTS (SELECT 1 FROM transfer_order_lines line
+           WHERE line.transfer_order_id=transfer.netsuite_id AND line.line_stage='outbound'
+             AND COALESCE(line.loaded_qty,0)>0))
+      UNION
+      SELECT sales.tranid FROM local_co_orders co JOIN sales_orders sales
+        ON co.source_order_ref=sales.tranid OR co.details->'childOrderIds' ? sales.tranid
+       WHERE sales.tranid = ANY($1::text[]) AND co.status <> 'cancelled'
+         AND (co.loaded_at IS NOT NULL OR co.received_at IS NOT NULL
+           OR co.status IN ('loaded','received','completed'))
+         AND NOT ($3::boolean AND co.status='completed' AND ${completedCoArrivalSql("co")} IS NOT NULL)`,
+    [salesRefs,transferRefs,allowReceivedCo]);
+    return [...new Set(execution.rows.map(row => text(row.ref)).filter(Boolean))];
+  }
   const refs = [];
   if (salesRefs.length) {
     refs.push(...await coSourcePackingActivityRefs(salesRefs, salesLineIds, { allowReceivedCo }));
@@ -244,7 +274,7 @@ async function dependencyExecutionIds({ dependencyIds = [], transferRefs = [] } 
           OR dependency.transfer_order_ref = ANY($2::text[])
         )
         AND (
-          dependency.status NOT IN ('active', 'attention', 'cancelled')
+          dependency.status NOT IN ('active', 'attention', 'packed', 'cancelled')
           OR COALESCE(line.loaded_quantity, 0) > 0
           OR COALESCE(line.delivered_quantity, 0) > 0
           OR COALESCE(line.locally_received_quantity, 0) > 0
@@ -436,7 +466,8 @@ export async function previewScmDependencyMutation(command = {}, actor = {}, { l
   if (lock && salesLineIds) {await lockDependencyOperatorOrders(memberRefs, guardedTransferRefs);}
   const closed = await closedOrderRefs(guardedRefs);
   const operatorRefs = await operatorActivityRefs({ salesRefs: memberRefs, transferRefs: guardedTransferRefs, salesLineIds,
-    allowReceivedCo: action === "link_to" && Boolean(salesLineIds?.length) });
+    allowReceivedCo: action === "link_to" && Boolean(salesLineIds?.length),
+    ignorePacking: ["link_to", "unlink_to", "change_mode", "link_po", "unlink_po"].includes(action) });
   const receivingRefs = await receivingActivityRefs({ purchaseRefs, transferRefs: guardedTransferRefs });
   const executionIds = completedUnlink ? [] : await dependencyExecutionIds({ dependencyIds, transferRefs });
   const jobIds = await driverActivity({ refs: guardedRefs });

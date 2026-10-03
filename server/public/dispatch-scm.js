@@ -728,6 +728,7 @@ function renderOrderList() {
     const plannedLabel = scmPlannedLabel(order);
     const completed = String(order.scm?.status || "").trim().toLowerCase() === "completed"
       || order.dispatchCompleted === true;
+    const currentStatus = completed ? "Completed" : String(order.scm?.status || "Queued").trim();
     const pickupPoint = scmDefaultPickupPoint(order) || "";
     const destinationYards = [...new Set([
       order.destinationYard,
@@ -745,10 +746,10 @@ function renderOrderList() {
           <span class="scm-card-qty">${escapeHtml(quantityLabel || "-")}</span>
           <span class="scm-card-weight">${t("dispatch.orderWeight", "Order weight")}: ${escapeHtml(scmWeightLabel(order.weight))}</span>
         </div>
-        ${plannedLabel || completed ? `<div class="scm-card-plan-side">
-          <span class="scm-planned-badge${completed ? " scm-completed-badge" : ""}">${completed ? "Completed" : "Planned"}</span>
+        <div class="scm-card-plan-side">
+          <span class="scm-planned-badge${completed ? " scm-completed-badge" : ""}">${escapeHtml(currentStatus)}</span>
           ${plannedLabel ? `<span class="scm-card-plan">${escapeHtml(plannedLabel)}</span>` : ""}
-        </div>` : ""}
+        </div>
       </button>
     `;
   }).join("");
@@ -881,6 +882,7 @@ function renderSelectedOrder() {
   `;
 }
 
+/** @param {{scm?:any,notes?:string,[key:string]:any}} order */
 function renderScmScheduleMiniPanel(order = {}) {
   const scm = order.scm || {};
   const isSplit = scmOrderIsSplit(order);
@@ -891,6 +893,7 @@ function renderScmScheduleMiniPanel(order = {}) {
   const orderKind = order.type === "TO" ? "TO" : "PO";
   const statusIsManual = SCM_MANUAL_STATUSES.includes(currentStatus);
   const remarkOverride = String(scm.remarkOverride || "");
+  const remark = remarkOverride || String(scm.netSuiteMemo || "");
   const savedDestinationOverride = String(scm.dropoffPoint || "").trim();
   const effectiveDestination = order.destinationYard
     || SCM_DESTINATION_YARDS.find((yard) => yard.id === scmDefaultDestinationLocationId(order))?.text
@@ -918,7 +921,8 @@ function renderScmScheduleMiniPanel(order = {}) {
         </div>
         <div class="scm-mini-row scm-mini-notes-row">
           ${destinationOverrideControl}
-          <label class="scm-remark-field"><span>Remark</span><textarea data-scm-field="remarkOverride" rows="2" maxlength="2000" placeholder="Add remark">${escapeHtml(remarkOverride)}</textarea><small>${remarkOverride ? "Local remark" : "Shared with PO / TO Schedule"}</small></label>
+          <label class="scm-remark-field"><span>Remark</span><textarea data-scm-field="remarkOverride" data-scm-remark-value="${escapeHtml(remark)}" data-scm-remark-override="${escapeHtml(remarkOverride)}" rows="2" maxlength="2000">${escapeHtml(remark)}</textarea><small>Clear to use the PO remark. Shared with PO / TO Schedule.</small></label>
+          <label class="scm-note-field"><span>Note</span><textarea data-scm-field="notes" rows="2" ${splitLocked ? "disabled" : ""}>${escapeHtml(scm.notes ?? order.notes ?? "")}</textarea></label>
           <div class="scm-mini-actions">
             <button data-action="save-scm-schedule" data-kind="${escapeHtml(orderKind)}" type="button" ${scmLoading || splitLocked ? "disabled" : ""}>${scmLoading ? "Saving..." : "Save Schedule"}</button>
             ${splitLocked ? `<button data-action="save-scm-remark" data-kind="${escapeHtml(orderKind)}" type="button" ${scmLoading ? "disabled" : ""}>${scmLoading ? "Saving..." : "Save Remark"}</button>` : ""}
@@ -1323,7 +1327,16 @@ async function unsplitScmOrder() {
   }
 }
 
+/** @param {HTMLInputElement|HTMLSelectElement|HTMLTextAreaElement} field */
+function scmScheduleFieldValue(field) {
+  if (field.dataset.scmField === "remarkOverride" && field.value === field.dataset.scmRemarkValue) {
+    return field.dataset.scmRemarkOverride || "";
+  }
+  return 'checked' in field && field.type === "checkbox" ? field.checked : field.value;
+}
+
 function collectScmSchedulePatch(order = scmSelectedOrder()) {
+  /** @type {{orderKind:string,expectedUpdatedAt:any,expectedSplitRevision:any,[key:string]:unknown}} */
   const patch = {
     orderKind: order?.type === "TO" ? "TO" : "PO",
     expectedUpdatedAt: order?.scm?.updatedAt || null,
@@ -1332,7 +1345,9 @@ function collectScmSchedulePatch(order = scmSelectedOrder()) {
       : undefined
   };
   scmApp.querySelectorAll("[data-scm-field]").forEach((field) => {
-    patch[field.dataset.scmField] = field.type === "checkbox" ? field.checked : field.value;
+    const input = /** @type {HTMLInputElement|HTMLSelectElement|HTMLTextAreaElement} */ (field);
+    const name = input.dataset.scmField;
+    if (name && !input.disabled) patch[name] = scmScheduleFieldValue(input);
   });
   return patch;
 }
@@ -1362,8 +1377,9 @@ function applyAuthoritativeScmScheduleRow(row = null, orderRef = "") {
         etaDate: value("etaDate", current.etaDate || ""),
         etaTime: value("etaTime", current.etaTime || ""),
         driver: value("driver", current.driver || ""),
-        notes: value("notes", current.notes || ""),
+        notes: value("notes", current.notes || "") || order.notes || "",
         remarkOverride: value("remarkOverride", current.remarkOverride || ""),
+        netSuiteMemo: value("netSuiteMemo", current.netSuiteMemo || ""),
         updatedAt: value("updatedAt", current.updatedAt || null)
       }
     };
@@ -1456,8 +1472,8 @@ async function saveScmScheduleForSelected() {
 async function saveScmRemarkForSelected() {
   const order = scmSelectedOrder();
   if (!order || scmLoading) return;
-  const remarkField = scmApp.querySelector('[data-scm-field="remarkOverride"]');
-  const remarkOverride = String(remarkField?.value || "");
+  const remarkField = /** @type {HTMLTextAreaElement|null} */ (scmApp.querySelector('[data-scm-field="remarkOverride"]'));
+  const remarkOverride = remarkField ? scmScheduleFieldValue(remarkField) : "";
   scmLoading = true;
   scmNotice = "Saving remark...";
   renderScm();

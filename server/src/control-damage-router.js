@@ -1,4 +1,5 @@
 import express from 'express';
+import {operatorNetSuitePriority} from './operator-netsuite-priority-middleware.js';
 import {INVENTORY_YARDS,inventoryDate,inventoryYards,assertInventoryYard,inventoryId,inventoryError} from './inventory-workflow-domain.js';
 import {CONFIRMED_RETURN_REASONS} from './return-netsuite.js';
 import {catalog} from './operator-inventory-router.js';
@@ -20,7 +21,7 @@ export function createControlDamageRouter({remote=controlDamageNetSuite}={}) {
     if(!item || item.item_type!=='InvtPart') {throw inventoryError('Choose an active inventory SKU at this yard.');}
     res.json({...item,units:await remote.itemUnits(id)});
   }));
-  router.get('/review',handler(async(req,res)=>res.json(await reviewControlDamageMonth(req.operator,req.query.locationId,req.query.month || inventoryDate().slice(0,7),{remote}))));
+  router.get('/review',operatorNetSuitePriority,handler(async(req,res)=>res.json(await reviewControlDamageMonth(req.operator,req.query.locationId,req.query.month || inventoryDate().slice(0,7),{remote}))));
   router.post('/adjustments',handler(async(req,res)=>{
     const adjustment=await queueDamageAdjustment(req.operator,req.body || {},{remote});
     res.status(adjustment.status==='posted'?200:202).json(adjustment);

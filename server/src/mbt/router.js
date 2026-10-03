@@ -558,6 +558,8 @@ function mbtErrorHandler(error, req, res, _next) {
  * @param {FrontdeskService} [dependencies.frontdeskService]
  * @param {CustomerChargeService} [dependencies.customerChargeService]
  * @param {BinDispatchService} [dependencies.binDispatchService]
+ * @param {(change: Record<string, any>) => void} [dependencies.planningChanged]
+ * @param {import("express").RequestHandler} [dependencies.confirmPlanningDay]
  * @param {ShadowBillingService} [dependencies.billingService]
  * @param {MbbsBillingCandidateService} [dependencies.billingCandidateService]
  * @param {PilotReconciliationService} [dependencies.reconciliationService]
@@ -2605,6 +2607,24 @@ export function createMbtRouter(dependencies = {}) {
     };
   }
 
+  router.get("/planning", requireMbtSurface("dispatcher", "Dispatcher"), async (req, res, next) => {
+    try {
+      const capability = await binDispatchCapability(req);
+      const service = await import("./bin-planning-service.js");
+      const result = await service.getMbtBinPlanning(req.query, { capability });
+      noStore(res); res.json(result);
+    } catch (error) {next(error);}
+  });
+  router.get("/planning/visits/:visitId", requireMbtSurface("dispatcher", "Dispatcher"), async (req, res, next) => {
+    try {
+      const capability = await binDispatchCapability(req);
+      const service = await import("./bin-planning-service.js");
+      const result = await service.getMbtBinPlanningVisit({ visitId: req.params.visitId }, { capability });
+      noStore(res); res.json(result);
+    } catch (error) {next(error);}
+  });
+  router.post("/planning/commands", requireMbtSurface("dispatcher", "Dispatcher"), binDispatchMutation(""));
+
   router.get(
     "/dispatch/front-legs",
     requireMbtSurface("dispatcher", "Dispatcher"),
@@ -2643,30 +2663,44 @@ export function createMbtRouter(dependencies = {}) {
     }
   );
 
-  /** @param {"assign" | "move" | "recover" | "advance"} action */
+  /** @type {import("express").RequestHandler} */
+  function confirmPlanningDay(req, res, next) {
+    requiredRequestText(req.get("idempotency-key"), "MBT_IDEMPOTENCY_KEY_REQUIRED", "An Idempotency-Key header is required.");
+    if (!dependencies.confirmPlanningDay) {throw new Error("Shared Dispatch confirmation is not configured.");}
+    return dependencies.confirmPlanningDay(req, res, error => {
+      if (error?.status && error?.code) {
+        next(new MbtError({ status: error.status, code: error.code, message: error.message,
+          details: { ...(error.details || {}), conflicts: error.conflicts || [] } }));
+      } else {next(error);}
+    });
+  }
+
+  /** @param {string} action */
   function binDispatchMutation(action) {
     /** @type {import("express").RequestHandler} */
     return async (req, res, next) => {
       try {
         const capability = await binDispatchCapability(req);
         const body = requestObject(req.body);
-        const service = await resolveBinDispatchService();
-        const operation = action === "assign"
-          ? service.assignMbtBinFrontLeg
-          : action === "move"
-            ? service.moveMbtBinFrontLegAssignment
-            : action === "recover"
-              ? service.recoverMbtBinFrontLegAssignment
-              : service.advanceMbtBinContractLeg;
-        const routeIdentity = action === "move" || action === "recover"
+        if (!action && body.action === "confirm") {
+          return confirmPlanningDay(req, res, next);
+        }
+        const service = await import("./bin-planning-service.js");
+        const routeIdentity = ["move", "recover"].includes(action)
           ? { visitId: req.params.visitId }
           : action === "advance"
             ? { contractId: req.params.contractId }
             : {};
-        const result = await operation({
+        const actor = commandActor(req);
+        const result = await service.runMbtBinPlanningCommand({
           ...body,
           ...routeIdentity,
-          actor: commandActor(req),
+          action: action || String(body.action || ""),
+          actor,
+          editLease: {
+            planDate: String(body.planDate || ""), operatorId: actor.operatorId,
+            sessionId: String(body.sessionId || ""), token: String(body.editLeaseToken || req.get("x-dispatch-edit-lease") || "")
+          },
           idempotencyKey: requiredRequestText(
             req.get("idempotency-key"),
             "MBT_IDEMPOTENCY_KEY_REQUIRED",
@@ -2674,7 +2708,7 @@ export function createMbtRouter(dependencies = {}) {
           ),
           correlationId: correlationId(req),
           requestId: requestId(req)
-        }, { capability });
+        }, { capability, onCommitted: dependencies.planningChanged });
         noStore(res);
         res.setHeader("x-mbt-idempotent-replay", String(result.replayed));
         res.status(result.status).json(result.body);

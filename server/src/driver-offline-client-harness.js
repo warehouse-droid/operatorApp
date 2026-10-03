@@ -1303,14 +1303,15 @@ for (const asset of [
   "driver-location-override.js",
   "driver.js"
 ]) {
-  assert.ok(driverHtml.includes(`/${asset}?v=20260910-route-prefix-cursor-v1`));
-  assert.ok(driverWorker.includes(`/${asset}?v=20260910-route-prefix-cursor-v1`));
+  const assetVersion = ["driver.js", "i18n.js"].includes(asset) ? "20260918-operator-display-settings-v1" : "20260910-route-prefix-cursor-v1";
+  assert.ok(driverHtml.includes(`/${asset}?v=${assetVersion}`));
+  assert.ok(driverWorker.includes(`/${asset}?v=${assetVersion}`));
 }
-assert.match(driverWorker, /DRIVER_CACHE_NAME = `\$\{DRIVER_CACHE_PREFIX\}v41`/);
-assert.match(driverWorker, /DRIVER_REFRESH_CACHE_NAME = `\$\{DRIVER_CACHE_PREFIX\}refresh-v41`/);
+assert.match(driverWorker, /DRIVER_CACHE_NAME = `\$\{DRIVER_CACHE_PREFIX\}v42`/);
+assert.match(driverWorker, /DRIVER_REFRESH_CACHE_NAME = `\$\{DRIVER_CACHE_PREFIX\}refresh-v42`/);
 assert.match(
   driverSource,
-  /serviceWorker\.register\("\/driver-service-worker\.js\?v=20260910-route-prefix-cursor-v1"/
+  /serviceWorker\.register\("\/driver-service-worker\.js\?v=20260918-operator-display-settings-v1"/
 );
 assert.match(
   offlineSyncSource,

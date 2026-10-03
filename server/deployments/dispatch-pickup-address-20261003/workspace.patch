@@ -1,0 +1,140 @@
+--- a/public/dispatch.html
++++ b/public/dispatch.html
+@@ -15,6 +15,6 @@
+     <script src="/dispatch-auth.js?v=20261003-staff-reset-1"></script>
+     <script src="/delivery-instruction-upload.js?v=20260812-delivery-image-720p-v1"></script>
+     <script src="/dispatch-address-guard.js?v=20260920-executed-review-v1"></script>
+-    <script src="/dispatch.js?v=20261002-history-cargo-v1"></script>
++    <script src="/dispatch.js?v=20261003-pickup-address-1"></script>
+   </body>
+ </html>
+--- a/public/dispatch.js
++++ b/public/dispatch.js
+@@ -2163,6 +2163,8 @@
+ }
+ 
+ function orderPickupText(order) {
++  const override = String(order?.pickupAddressOverride || "").trim();
++  if (override) { return override; }
+   const locations = order?.pickupLocations?.length ? order.pickupLocations : order?.sourceYard ? [order.sourceYard] : [];
+   return locations.length ? locations.join(", ") : "--";
+ }
+@@ -2376,6 +2378,11 @@
+     refs.push(ref);
+   }
+   return refs;
++}
++
++function pickupStopMatchesOrder(stop, order) {
++  const overrideKey = (value) => String(value?.pickupAddressOverride || "").toLowerCase().replace(/[^a-z0-9]/g, "");
++  return overrideKey(stopOrder(stop)) === overrideKey(order);
+ }
+ 
+ function pickupStopIncludesOrder(load, stop, orderId) {
+@@ -9479,6 +9486,7 @@
+     const reusable = load.stops.find((stop, index) =>
+       stop.type === "pick"
+       && normalizedPickupLocation(stop.location) === normalizedPickupLocation(location)
++      && pickupStopMatchesOrder(stop, order)
+       && index > boundary
+       && index <= pickupLimit
+       && !stopHasDriverActivity(load, stop)
+@@ -9524,6 +9532,7 @@
+       candidate === stop
+       || candidate.type !== "pick"
+       || !sameDispatchLocation(candidate.location, stop.location)
++      || !pickupStopMatchesOrder(candidate, stopOrder(stop))
+       || stopHasDriverActivity(load, candidate)
+       || index <= sourceIndex
+       || index > lastLegalIndex
+@@ -9566,7 +9575,8 @@
+     : -1;
+   const targetIndex = target ? load.stops.indexOf(target) : insertionIndex;
+   const invalidDestination = target
+-    ? target.type !== "pick" || !sameDispatchLocation(target.location, source.location) || stopHasDriverActivity(load, target)
++    ? target.type !== "pick" || !sameDispatchLocation(target.location, source.location)
++      || !pickupStopMatchesOrder(target, stopOrder(source)) || stopHasDriverActivity(load, target)
+     : !Number.isInteger(insertionIndex);
+   const movedDropIndexes = movedRefs.map((ref) => load.stops.findIndex((candidate) =>
+     candidate.type === "drop" && String(candidate.orderId || "").toLowerCase() === String(ref).toLowerCase()
+@@ -9718,14 +9728,15 @@
+         stop.type !== "drop" || Boolean(stopOrder(stop)) || stopHasDriverActivity(load, stop)
+       );
+       materializePickupVisitOrderRefs(load);
+-      load.stops = load.stops.filter((stop) => {
+-        if (stop.type !== "pick" || stopHasDriverActivity(load, stop)) return true;
++      const boundary = dispatchEditableRouteBoundary(load);
++      load.stops = load.stops.filter((stop, index) => {
++        if (stop.type !== "pick" || index <= boundary || stopHasDriverActivity(load, stop)) return true;
+         const validRefs = pickupStopOrderRefs(load, stop).filter((ref) => {
+           const matchingDrop = load.stops.find((candidate) =>
+             candidate.type === "drop" && String(candidate.orderId || "").toLowerCase() === String(ref).toLowerCase()
+           );
+           const order = matchingDrop ? stopOrder(matchingDrop) : null;
+-          return Boolean(order && orderRequiresPickupLocation(order, stop.location));
++          return Boolean(order && orderRequiresPickupLocation(order, stop.location) && pickupStopMatchesOrder(stop, order));
+         });
+         stop.orderRefs = validRefs;
+         if (validRefs.length) stop.orderId = validRefs[0];
+--- a/src/dispatch-pickup-visits.js
++++ b/src/dispatch-pickup-visits.js
+@@ -46,6 +46,11 @@
+ 
+ function orderRef(order = {}) {
+   return text(order.id || order.orderId || order.orderRef || order.tranid || order.refNumber);
++}
++
++export function dispatchPickupOverridesMatch(left, right) {
++  const key = (order) => text(order?.pickupAddressOverride).toLowerCase().replace(/[^a-z0-9]/gu, "");
++  return key(left) === key(right);
+ }
+ 
+ function visitStopId(stop = {}) {
+@@ -597,6 +602,7 @@
+       .filter(({ stop, index }) =>
+         pickupStop(stop)
+         && locationKey(stop.location || stop.yard) === locationKey(location)
++        && dispatchPickupOverridesMatch(orderByRef(next, stop.orderId || stop.orderRefs?.[0]), order)
+         && index >= lowerInsertionIndex
+         && index < pickupAnchor
+       );
+@@ -733,6 +739,9 @@
+       || target.index <= source.index
+       || target.index >= earliestDelivery
+       || locationKey(target.stop.location || target.stop.yard) !== locationKey(source.stop.location || source.stop.yard)
++      || !requested.every(ref => dispatchPickupOverridesMatch(
++        orderByRef(next, target.stop.orderId || target.stop.orderRefs?.[0]), orderByRef(next, ref)
++      ))
+     ) {
+       throw Object.assign(new Error("The target pickup visit is not a legal future visit for these orders."), {
+         status: 409,
+--- a/src/scm-dependency-plan-reconciler.js
++++ b/src/scm-dependency-plan-reconciler.js
+@@ -1,5 +1,5 @@
+ import { dispatchDependencyOrderRefs } from "./yard-dependency-structure.js";
+-import { dispatchLoadProtectedBoundary, dispatchRequiredPickupVisitLocations } from "./dispatch-pickup-visits.js";
++import { dispatchLoadProtectedBoundary, dispatchPickupOverridesMatch, dispatchRequiredPickupVisitLocations } from "./dispatch-pickup-visits.js";
+ 
+ function text(value) {
+   return String(value ?? "").trim();
+@@ -274,9 +274,10 @@
+     const isSov = dispatchDependencyOrderRefs(order).some(ref => /^SOV/iu.test(ref));
+     for (const location of locations) {
+       const priorPickup = stops.slice(0, index).find((stop) => stop?.type === "pick" && samePlace(stop.location, location)
++        && dispatchPickupOverridesMatch(ordersByRef.get(text(stop.orderId || stop.orderRefs?.[0]).toLowerCase()), order)
+         && (!isSov || !protectedIds.has(text(stop.id)) || refs(stop.orderRefs || [stop.orderId]).includes(targetRef)));
+       if (priorPickup) {
+-        if (isSov && !protectedIds.has(text(priorPickup.id)) && Array.isArray(priorPickup.orderRefs)) {
++        if ((isSov || text(order.pickupAddressOverride)) && !protectedIds.has(text(priorPickup.id)) && Array.isArray(priorPickup.orderRefs)) {
+           priorPickup.orderRefs = refs([...priorPickup.orderRefs, targetRef]);
+         }
+         if (protectedIds.has(text(priorPickup.id))) {continue;}
+@@ -289,7 +290,7 @@
+         id: `scm-dependency-pick-${safeIdPart(targetRef)}-${safeIdPart(location)}-${index}`,
+         type: "pick",
+         orderId: targetRef,
+-        ...(isSov ? { orderRefs: [targetRef] } : {}),
++        ...(isSov || text(order.pickupAddressOverride) ? { orderRefs: [targetRef] } : {}),
+         location,
+         dependencyManaged: true,
+         dependencySource: "scm-dependency-management",

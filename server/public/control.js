@@ -4,6 +4,7 @@ const STAFF_TOKEN_KEY = "mbbs.staff.token"; // secret-scan: allow non-secret bro
 const STAFF_ROLE_KEY = "mbbs.staff.role";
 const STAFF_ROLES_KEY = "mbbs.staff.roles";
 const ACCOUNT_ROLE_OPTIONS = [
+  { value: "boss", labelKey: "control.roleBoss", label: "BOSS" },
   { value: "operator", labelKey: "control.roleOperator", label: "Operator" },
   { value: "dispatcher", labelKey: "control.roleDispatcher", label: "Dispatcher" },
   { value: "scm", labelKey: "control.roleScm", label: "SCM Staff" },
@@ -167,6 +168,7 @@ function renderSalesYardChoices(selectedYards, attributeName) {
 
 function roleHomeRoute(role) {
   const clean = normalizedRole(role);
+  if (clean === "boss") return "/boss";
   if (clean === "admin") return "/admin";
   if (clean === "dispatcher") return "/dispatch";
   if (clean === "scm" || clean === "scm_staff") return "/scm";
@@ -480,6 +482,25 @@ function photoImgAttributes(value, { thumbnail = false, lazy = false } = {}) {
   const loadingAttributes = lazy ? ' loading="lazy" decoding="async"' : "";
   if (!text.startsWith("r2://") && !text.startsWith("operator-photo://")) return `src="${escapeHtml(text)}"${loadingAttributes}`;
   return `data-secure-photo-ref="${escapeHtml(text)}"${thumbnail ? ' data-secure-photo-variant="thumbnail"' : ""}${loadingAttributes}`;
+}
+
+async function readOriginalDamagePhoto(ref) {
+  const response = await fetch(`/api/photo-upload/preview?${new URLSearchParams({ ref })}`, {
+    headers: token ? { Authorization: `Bearer ${token}` } : {},
+    cache: "no-store",
+    signal: AbortSignal.timeout(60000)
+  });
+  if (response.status === 401) {
+    clearStaffSession();
+    operator = null;
+    renderLogin("Please login again.");
+    throw new Error("Login required");
+  }
+  if (!response.ok) {
+    const payload = await response.json().catch(() => null);
+    throw new Error(payload?.error || "Photo download failed");
+  }
+  return response.blob();
 }
 
 function releaseSecurePhotoImage(image) {
@@ -1517,6 +1538,10 @@ async function pollPhotoArchiveStatus() {
 }
 
 function renderLogin(message = "") {
+  if (!bootstrapNeeded) {
+    window.location.replace('/login.html?next=' + encodeURIComponent(location.pathname + location.search + location.hash));
+    return;
+  }
   clearSyncPoll();
   clearScmReconciliationPoll();
   clearPhotoArchivePoll();
@@ -2865,6 +2890,15 @@ async function downloadLoadedCsv() {
   URL.revokeObjectURL(url);
 }
 
+function loadedDocumentLabel(order) {
+  return (order.documents || []).map((document) => `${document.type}: ${document.ref}`).join(" · ");
+}
+
+function loadedMovementStatus(order) {
+  return order.waitingForDriverCompletion ? "waiting for driver completion"
+    : order.movement_status || t("yard.processed", "Processed");
+}
+
 function renderLoadedOrderList() {
   const orders = visibleLoadedOrders();
   const searchActive = isLoadedSearchActive();
@@ -2880,7 +2914,8 @@ function renderLoadedOrderList() {
           <strong>${escapeHtml(order.tranid || order.order_id)}</strong>
           <span class="movement-badges"><i class="movement-badge ${escapeHtml(order.direction)}">${t(`yard.${order.direction}`, order.direction)}</i><i class="movement-badge type">${movementTypeCode(order.order_type)}</i>${order.driver_only ? `<i class="movement-badge type">${t("yard.driverOnly", "Driver only")}</i>` : ""}</span>
         </div>
-        <span>${escapeHtml(order.yard_location || t("common.yard", "Yard"))} | ${escapeHtml(order.movement_status || t("yard.processed", "Processed"))}</span>
+        <span>${escapeHtml(order.yard_location || t("common.yard", "Yard"))} | ${escapeHtml(loadedMovementStatus(order))}</span>
+        ${loadedDocumentLabel(order) ? `<span class="movement-documents">${escapeHtml(loadedDocumentLabel(order))}</span>` : ""}
         <em>${formatDate(order.last_activity_at || order.last_processed_at)} | ${t("yard.yardActivities", "Yard")} ${order.yard_activity_count || order.process_count || 0} | ${t("yard.driverActivities", "Driver")} ${order.driver_activity_count || 0} | ${order.photo_count || 0} ${t("common.photos", "photos")}</em>
         ${order.party ? `<small>${escapeHtml(order.party)}</small>` : ""}
       </button>
@@ -3017,7 +3052,8 @@ function renderLoadedOrderDetail() {
     <div class="loaded-detail-head">
       <div>
         <div class="movement-detail-title"><h3>${escapeHtml(order.tranid || order.order_id)}</h3><span class="movement-badges"><i class="movement-badge ${escapeHtml(order.direction)}">${t(`yard.${order.direction}`, order.direction)}</i><i class="movement-badge type">${movementTypeCode(order.order_type)}</i>${order.driver_only ? `<i class="movement-badge type">${t("yard.driverOnly", "Driver only")}</i>` : ""}</span></div>
-        <p class="muted">${escapeHtml(movementTypeLabel(order.order_type))} | ${escapeHtml(order.yard_location || "")} | ${escapeHtml(order.movement_status || t("yard.processed", "Processed"))}</p>
+        <p class="muted">${escapeHtml(movementTypeLabel(order.order_type))} | ${escapeHtml(order.yard_location || "")} | ${escapeHtml(loadedMovementStatus(order))}</p>
+        ${loadedDocumentLabel(order) ? `<p class="movement-documents"><strong>${escapeHtml(loadedDocumentLabel(order))}</strong></p>` : ""}
         ${route ? `<p class="muted">${escapeHtml(route)}</p>` : ""}
         ${order.party ? `<p class="muted">${escapeHtml(order.party)}</p>` : ""}
         ${order.delivery_at ? `<p class="muted"><strong>${t("yard.deliveryTime", "Delivered")}:</strong> ${formatDate(order.delivery_at)}</p>` : ""}
@@ -4298,6 +4334,7 @@ function renderOperatorsSection() {
       </section>
       <div class="account-management-layout">
         <aside class="panel account-master-panel">
+          <p><a href="/admin/boss-approvals">BOSS approval setup</a></p>
           <div class="account-master-head">
             <div>
               <h2>${t("control.users", "Users")}</h2>
@@ -4348,6 +4385,7 @@ function renderNewOperatorDetail() {
       <div class="account-form-grid">
         <label><span>${t("common.username", "Username")}</span><input id="newUsername" autocomplete="off" required /></label>
         <label><span>${t("control.displayName", "Display name")}</span><input id="newDisplayName" required /></label>
+        <label><span>Email</span><input id="newEmail" type="email" maxlength="254" autocomplete="email" /></label>
         <label><span>${t("common.password", "Password")}</span><input id="newPassword" type="password" minlength="6" autocomplete="new-password" required /></label>
         <label>
           <span>${t("control.primaryRole", "Primary role")}</span>
@@ -4416,6 +4454,10 @@ function renderOperatorDetail(item) {
           <label><span>${t("common.username", "Username")}</span><input value="${escapeHtml(item.username)}" readonly /></label>
           <label><span>${t("control.displayName", "Display name")}</span><input value="${escapeHtml(item.display_name)}" readonly /></label>
         </div>
+        <form data-form="account-email" data-id="${escapeHtml(item.id)}">
+          <label><span>Email</span><input name="email" type="email" maxlength="254" autocomplete="email" value="${escapeHtml(item.email || '')}" /></label>
+          <div class="account-detail-actions"><button class="primary" type="submit">Save email</button></div>
+        </form>
       </section>
       <section class="account-detail-card account-access-editor">
         <div>
@@ -4543,7 +4585,7 @@ function renderCycleCountSection() {
       <div class="section-heading">
         <div>
           <h2>${t("control.cycleCountReview", "Cycle Count Review")}</h2>
-          <p class="muted">${t("control.cycleCountHelp", "Review submitted blind counts with system quantities and variance.")}</p>
+          <p class="muted">${t("inventory.packedCycleHelp", "Actual on hand = On hand − Packed. Var = Counted − Actual on hand.")}</p>
         </div>
         <button data-action="refresh">${t("common.refresh", "Refresh")}</button>
       </div>
@@ -4563,11 +4605,13 @@ function renderCycleCountSection() {
                   <tr>
                     <th>SKU</th>
                     <th>${t("common.location", "Location")}</th>
+                    <th>${t("control.countDetails", "Count details")}</th>
+                    <th>${t("operator.uom", "UOM")}</th>
+                    <th>${t("control.onHand", "On hand")}</th>
+                    <th>${t("inventory.packed", "Packed")}</th>
+                    <th>${t("inventory.actualOnHand", "Actual on hand")}</th>
                     <th>${t("control.counted", "Counted")}</th>
-                    <th>${t("control.countedTotal", "Counted Total")}</th>
-                    <th>${t("control.systemOnHand", "System On Hand")}</th>
-                    <th>${t("control.available", "Available")}</th>
-                    <th>${t("control.variance", "Variance")}</th>
+                    <th>${t("inventory.var", "Var")}</th>
                     <th>${t("control.conversion", "Conversion")}</th>
                   </tr>
                 </thead>
@@ -4577,9 +4621,11 @@ function renderCycleCountSection() {
                       <td><strong>${line.item_name}</strong><br><span class="muted">${line.brand || ""} ${line.series || ""}</span></td>
                       <td>${line.location || line.location_id}</td>
                       <td>${valueText(line.counted_pallet_qty)} PLT / ${valueText(line.counted_layer_qty)} LYR / ${valueText(line.counted_section_qty)} SEC / ${valueText(line.counted_piece_qty)} PCS</td>
-                      <td>${valueText(line.counted_total_qty)}</td>
+                      <td>${escapeHtml(line.stock_unit || '')}</td>
                       <td>${valueText(line.system_on_hand_qty)}</td>
-                      <td>${valueText(line.system_available_qty)}</td>
+                      <td>${(line.system_packed_qty === null || line.system_packed_qty === undefined) ? '—' : valueText(line.system_packed_qty)}</td>
+                      <td>${(line.actual_on_hand_qty === null || line.actual_on_hand_qty === undefined) ? '—' : valueText(line.actual_on_hand_qty)}</td>
+                      <td>${valueText(line.counted_total_qty)}</td>
                       <td><strong class="${Number(line.variance_qty) === 0 ? "" : Number(line.variance_qty) > 0 ? "bad" : "warn"}">${valueText(line.variance_qty)}</strong></td>
                       <td>PLT ${valueText(line.to_plt)} / LYR ${valueText(line.to_lyr)} / SEC ${valueText(line.to_sec)} / PCS ${valueText(line.to_pcs)}</td>
                     </tr>
@@ -4678,11 +4724,11 @@ function renderAudit() {
         ${audit.map((row) => `
           <tr>
             <td>${formatDate(row.created_at)}</td>
-            <td>${row.display_name || row.actor_type}</td>
-            <td><strong>${row.action}</strong><br><span class="muted">${row.source}</span></td>
+            <td>${escapeHtml(row.display_name || row.actor_type)}</td>
+            <td><strong>${escapeHtml(row.action)}</strong><br><span class="muted">${escapeHtml(row.source)}</span></td>
             <td><strong>${escapeHtml(row.tranid || "")}</strong></td>
             <td>${row.order_id || ""}${row.line_id ? `<br><span class="muted">${t("control.line", "Line")} ${row.line_id}</span>` : ""}</td>
-            <td><pre>${JSON.stringify(row.details || {}, null, 2)}</pre></td>
+            <td><pre>${escapeHtml(JSON.stringify(row.details || {}, null, 2))}</pre></td>
           </tr>
         `).join("") || `<tr><td colspan="6" class="muted">${t("control.noAuditRows", "No audit rows match the filters.")}</td></tr>`}
       </tbody>
@@ -4905,22 +4951,6 @@ app.addEventListener("submit", async (event) => {
       }
       return;
     }
-    if (form.dataset.form === "login") {
-      const result = await request("/api/auth/login", {
-        method: "POST",
-        body: JSON.stringify({
-          username: document.getElementById("username").value,
-          password: document.getElementById("password").value
-        })
-      });
-      operator = result.operator;
-      storeStaffSession(result.token, operator);
-      if (!canAccessCurrentPage(operator)) {
-        window.location.replace(roleHomeRoute(operator.role));
-        return;
-      }
-      return loadControlData();
-    }
     if (form.dataset.form === "bootstrap") {
       await request("/api/auth/bootstrap", {
         method: "POST",
@@ -4943,6 +4973,7 @@ app.addEventListener("submit", async (event) => {
         body: JSON.stringify({
           username: document.getElementById("newUsername").value,
           displayName: document.getElementById("newDisplayName").value,
+          email: document.getElementById("newEmail").value,
           password: document.getElementById("newPassword").value,
           role: primaryRole,
           roles,
@@ -4952,6 +4983,12 @@ app.addEventListener("submit", async (event) => {
       });
       selectedOperatorId = created.id;
       localStorage.setItem(ACCOUNT_SELECTION_KEY, selectedOperatorId);
+      return loadControlData();
+    }
+    if (form.dataset.form === "account-email") {
+      await request(`/api/operators/${encodeURIComponent(form.dataset.id)}/email`, {
+        method: "PUT", body: JSON.stringify({ email: form.querySelector('[name="email"]').value })
+      });
       return loadControlData();
     }
     if (form.dataset.form === "reset-password") {
@@ -5877,7 +5914,7 @@ app.addEventListener("input", (event) => {
 });
 
 const controlCountSheets = window.MBBSControlCountSheets?.create({root:app, request, escape:escapeHtml, render});
-const controlDamage = window.MBBSControlDamage?.create({root:app, request, escape:escapeHtml, render, photo:photoImgAttributes, preview:openPhotoLightbox, active:()=>activeSection==="damage-stock"});
+const controlDamage = window.MBBSControlDamage?.create({root:app, request, escape:escapeHtml, render, photo:photoImgAttributes, preview:openPhotoLightbox, readPhoto:readOriginalDamagePhoto, active:()=>activeSection==="damage-stock"});
 
 async function boot() {
   const bootstrap = await request("/api/auth/bootstrap-needed");
@@ -5885,10 +5922,6 @@ async function boot() {
   if (!token) {
     if (bootstrapNeeded && !IS_ADMIN_PAGE) {
       window.location.replace("/admin");
-      return;
-    }
-    if (localStorage.getItem("mbbs.driver.token")) {
-      window.location.replace("/driver");
       return;
     }
     return renderLogin();

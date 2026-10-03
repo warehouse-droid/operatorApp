@@ -1,3 +1,5 @@
+import { dispatchOrderFirstSeenAt, dispatchOrderSourceDate } from "./dispatch-order-recency.js";
+
 const DISPATCH_PLANNER_MODES = new Set(["off", "shadow", "on"]);
 const CARD_ITEM_LIMIT = 8;
 
@@ -98,6 +100,10 @@ export function compactDispatchOrderCard(order = {}) {
   if (transitCo) {card.transitCo = transitCo;}
   card.id = identity(order);
   card.type = text(order.type).toUpperCase();
+  const firstSeenAt = dispatchOrderFirstSeenAt(order);
+  if (firstSeenAt) {card.firstSeenAt = firstSeenAt;}
+  const sourceDate = dispatchOrderSourceDate(order);
+  if (sourceDate) {card.sourceOrderDate = ["SO", "PO", "TO"].includes(card.type) ? sourceDate.slice(0, 10) : sourceDate;}
   card.items = (Array.isArray(order.items) ? order.items : [])
     .slice(0, CARD_ITEM_LIMIT)
     .map(compactCardItem);

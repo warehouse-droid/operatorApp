@@ -1,3 +1,4 @@
+import {deliveryProgress} from './regular-stock-delivery-progress.js';
 import { config } from "./config.js";
 import { upsertInventoryBalances } from "./inventory-repository.js";
 import {
@@ -126,9 +127,10 @@ export function buildStockRequestTransferPayload({ transfer, locations }) {
     throw new Error("The official PALLET item is required for this Transfer Order.");
   }
   const payload = {
+    ...(transfer.workflowVersion===2?{externalId:`MBBS_REGULAR_STOCK_${transfer.requestId}_${transfer.id}`}:{ }),
     location: { id: String(locations.source.netsuiteLocationId) },
     transferLocation: { id: String(locations.destination.netsuiteLocationId) },
-    memo: `Sales stock request ${transfer.transferRef || transfer.id} | ${stockRequestMemoMarker(transfer.id)}`,
+    memo: transfer.deliverySalesOrderRef || `Sales stock request ${transfer.transferRef || transfer.id} | ${stockRequestMemoMarker(transfer.id)}`,
     item: {
       items: [
         ...materialItems,
@@ -159,6 +161,7 @@ async function recoverRemoteTransfer(transfer, locations, findRemoteByMarker, {
   for (let attempt = 1; attempt <= attempts; attempt += 1) {
     const rows = await findRemoteByMarker({
       transferId: transfer.id,
+      ...(transfer.deliverySalesOrderRef ? { requestId: transfer.requestId } : {}),
       sourceLocationId: locations.source.netsuiteLocationId,
       destinationLocationId: locations.destination.netsuiteLocationId
     });
@@ -212,6 +215,7 @@ export async function confirmStockTransferWorkflow({
   let remoteRef = transfer?.netsuiteTransferOrderRef || null;
   let recovered = false;
   try {
+    await deliveryProgress('checking_to');
     await ensurePrinter(transfer.sourceLocationId);
     const locations = await resolveLocations(transfer);
     let remote = null;
@@ -225,6 +229,7 @@ export async function confirmStockTransferWorkflow({
       } else {
         let createError = null;
         try {
+          await deliveryProgress('creating_to');
           remote = await createRemote(buildStockRequestTransferPayload({ transfer, locations }), {
             intercompany: locations.intercompany
           });
@@ -245,6 +250,7 @@ export async function confirmStockTransferWorkflow({
     remoteId = positiveId(remote.id, "NetSuite Transfer Order");
     remoteRef = remote.tranid || remoteRef || null;
     await recordRemote(transfer.id, { ...remote, id: remoteId, recovered }, { operatorId, requestId });
+    await deliveryProgress('approving_to');
     await approveRemote(remoteId, { intercompany: locations.intercompany, statusId: "B" });
     const hydrated = await hydrateRemote(remoteId, transfer, locations);
     remoteRef = hydrated.tranid || remoteRef || `TO-${remoteId}`;
@@ -252,10 +258,12 @@ export async function confirmStockTransferWorkflow({
       throw new Error(`${remoteRef} exists but did not reach Pending Fulfillment.`);
     }
     await recordApproved(transfer.id, hydrated, { operatorId, requestId });
+    await deliveryProgress('preparing_print');
     const document = await fetchTicket(remoteId, {
       locationId: locations.source.netsuiteLocationId,
       filenamePrefix: remoteRef
     });
+    await deliveryProgress('queueing_print');
     const printClaim = await claimPrint(transfer.id, { operatorId, requestId });
     const printJob = await queuePrint({
       transfer,
@@ -287,6 +295,24 @@ export async function refreshStockRequestItemAvailability(itemId, dependencies =
   return getAvailability(id);
 }
 
+export async function refreshPurchaseStockAvailability(itemId, locationId, dependencies = {}) {
+  const id=positiveId(itemId,'inventory item');
+  const yard=STOCK_REQUEST_YARDS.find(row=>row.locationId===Number(locationId));
+  if(!yard)throw Object.assign(new Error('Select a supported current yard.'),{status:400});
+  const resolved=await (dependencies.resolveYards||resolveNetSuiteYardLocations)([{locationId:yard.locationId,code:yard.yardCode}]);
+  const remote=resolved[0];
+  if(!remote)throw new Error('The current yard could not be resolved in NetSuite.');
+  const rows=await (dependencies.fetchBalances||fetchInventoryBalancesForItemsFromNetSuite)([id],[remote.netsuiteLocationId]);
+  const row=rows.find(value=>Number(value.item_id)===id&&String(value.location_id)===String(remote.netsuiteLocationId));
+  if(!row)throw new Error('Current-yard stock information is unavailable.');
+  await (dependencies.upsertBalances||upsertInventoryBalances)([{...row,item_id:id,location_id:yard.locationId,location:yard.yardCode}]);
+  const availability=await getStockRequestItemAvailability(id,{locationId:yard.locationId});
+  const {getPurchaseStockEvidence}=await import('./regular-stock-purchase-repository.js');
+  const stock=await getPurchaseStockEvidence(id,yard.locationId);
+  availability.yards[0].preferredStock=stock.preferredStock;
+  return availability;
+}
+
 export async function refreshStockRequestItemsAvailability(itemIds = [], dependencies = {}) {
   const ids = [...new Set((itemIds || []).map(Number).filter((id) => Number.isInteger(id) && id > 0))];
   if (!ids.length) return [];
@@ -309,6 +335,8 @@ export async function convertStockRequestLines(requestId, input = {}, operator =
   const refreshAvailability = dependencies.refreshAvailability || refreshStockRequestItemsAvailability;
   const convertLines = dependencies.convertLines || convertSalesStockRequestLines;
   const request = await getRequest(requestId);
+  if(request.regular?.deliveryMethod==='waitlist')throw Object.assign(new Error('Use the Waitlist allocation workspace.'),{status:409,code:'WAITLIST_WORKFLOW_ONLY'});
+  if(request.regular?.stockingType==='purchase')throw Object.assign(new Error('Stocking Purchase quantities must be added to PO proposals after SCM review.'),{status:409});
   const selected = new Set((input.lineIds || []).map(Number));
   const itemIds = request.lines.filter((line) => selected.has(line.id)).map((line) => line.itemId);
   if (itemIds.length) await refreshAvailability(itemIds);

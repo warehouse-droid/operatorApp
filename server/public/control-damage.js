@@ -3,11 +3,11 @@
   const t=(key,fallback)=>root.MBBS_I18N?.t(`damageControl.${key}`,fallback) || fallback;
   const qty=value=>Number(value || 0).toLocaleString(undefined,{maximumFractionDigits:6});
   const date=value=>value?new Date(value).toLocaleString(undefined,{timeZone:'America/Toronto'}):'—';
-  const status=value=>t(`status.${value}`,({pending:'Syncing with NetSuite…',posting:'Syncing with NetSuite…',posted:'Saved to NetSuite',attention:'Needs attention',conflict:'Refresh and review changes'})[value] || value);
+  const status=value=>t(`status.${value}`,({pending:'Syncing with NetSuite…',posting:'Syncing with NetSuite…',posted:'Saved to NetSuite',attention:'Needs attention',superseded:'Superseded by another report',conflict:'Refresh and review changes'})[value] || value);
   function create(ctx) {
     const esc=ctx.escape;
     let config={yards:[],reasons:[]},locationId='',month='',review={transfers:[],reports:[],history:[]},transfer=null;
-    let draft=[],selected='',editor=null,note='',busy=false,error='',command=null,submission=null,suggestions=[],searchTimer,pollTimer,searchVersion=0;
+    let draft=[],selected='',editor=null,note='',busy=false,error='',command=null,submission=null,suggestions=[],searchTimer,pollTimer,searchVersion=0,downloadProgress='';
     const api=(path,body)=>ctx.request(`/api/control/damage${path}`,body===undefined?undefined:{method:'POST',body:JSON.stringify(body)});
     const action=(name,label,extra='',disabled=false)=>`<button type="button" data-cd-action="${name}" ${extra} ${disabled?'disabled':''}>${label}</button>`;
     const fields=row=>({itemId:Number(row.itemId),quantity:Number(row.quantity),unitId:Number(row.unitId),reasonId:Number(row.reasonId)});
@@ -58,7 +58,8 @@
       return `<section class="panel control-damage"><div class="control-damage-toolbar"><div><h2 data-control-damage-title>${t('title','Damage stock')}</h2><p>${t('help','Review monthly damage transfers and save corrections to NetSuite.')}</p></div>
         <label>${t('yard','Yard')}<select data-cd-yard ${lockFilters?'disabled':''}>${config.yards.map(yard=>`<option value="${yard.id}" ${String(yard.id)===locationId?'selected':''}>${esc(yard.name)}</option>`).join('')}</select></label>
         <label>${t('month','Month')}<input type="month" data-cd-month value="${esc(month)}" ${lockFilters?'disabled':''}></label>
-        ${action('refresh',t('refresh','Refresh'),'',lockFilters)}</div>
+        ${action('refresh',t('refresh','Refresh'),'',lockFilters)}
+        ${action('download-photos',esc(downloadProgress || t('downloadPhotos','Download all photos (ZIP)')),'aria-live="polite"',busy || !root.MBBSDamagePhotoDownload.entriesForReview(review).length)}</div>
         ${error?`<p class="control-damage-error" data-cd-error role="alert">${esc(error)}</p>`:''}
         ${review.syncError?`<p class="control-damage-error">${esc(review.syncError)}</p>`:''}
         ${command?`<div class="control-damage-status" data-cd-posting-status role="status"><strong>${esc(status(command.status))}</strong>${command.last_error?`<p>${esc(command.last_error)}</p>`:''}
@@ -140,9 +141,23 @@
       else if(['attention','conflict'].includes(command.status)) {submission=null;}
       schedulePoll();
     }
+    async function downloadPhotos() {
+      const downloads=root.MBBSDamagePhotoDownload,entries=downloads.entriesForReview(review);
+      if(!entries.length) {return;}
+      try {
+        const blob=await downloads.archive(entries,ctx.readPhoto,(done,total)=>{
+          downloadProgress=t('downloadProgress','Preparing photos {done}/{total}…').replace('{done}',done).replace('{total}',total);
+          const button=ctx.root.querySelector('[data-cd-action="download-photos"]');if(button) {button.textContent=downloadProgress;}
+        });
+        const yard=config.yards.find(row=>String(row.id)===locationId),url=URL.createObjectURL(blob),link=document.createElement('a');
+        link.href=url;link.download=`Damage-stock_${downloads.safeName(yard?.name,locationId)}_${month}.zip`;
+        document.body.append(link);link.click();link.remove();setTimeout(()=>URL.revokeObjectURL(url),60000);
+      } finally {downloadProgress='';}
+    }
     async function run(name,target) {
       const row=draft.find(line=>line.key===selected);
       if(name==='refresh') {command=null;await refreshReview();schedulePoll();}
+      else if(name==='download-photos') {await downloadPhotos();}
       else if(name==='select') {selected=target.dataset.key;editor=null;searchVersion++;}
       else if(name==='photo') {ctx.preview(target.dataset.ref,t('photo','Damage photo'));}
       else if(name==='add') {editor={key:`new-${crypto.randomUUID()}`,added:true,itemId:'',itemName:'',search:'',quantity:'',unitId:'',reasonId:'',units:[]};suggestions=[];}

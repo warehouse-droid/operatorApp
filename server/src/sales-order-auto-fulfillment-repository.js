@@ -7,6 +7,7 @@ import { stableCanonicalJson } from "./operator-netsuite-posting-domain.js";
 import { buildSalesOrderCompletionSnapshot } from "./sales-order-auto-fulfillment-domain.js";
 import { outboundYardLocationId, outboundOrderYards } from './outbound-location-domain.js';
 import { ensureOutboundLocationDirectory } from './outbound-location-runtime.js';
+import { isFulfillableNetSuiteLine } from './netsuite-fulfillable-items.js';
 
 const TERMINAL_STATUSES = new Set(["historical", "gate_disabled", "completed", "reconciled", "closed", "skipped"]);
 /** @typedef {Record<string, any>} LooseRecord */
@@ -380,7 +381,16 @@ async function directToExecutionEvidence(source, lines) {
 
 /** @param {LooseRecord} row @param {LooseRecord} source @param {LooseRecord} decision */
 async function materializeCandidate(row, source, decision) {
-  const lines = await sourceLines(source);
+  const allLines = await sourceLines(source);
+  const lines = allLines.filter(isFulfillableNetSuiteLine);
+  if (!lines.length && allLines.length) {
+    await query(`UPDATE dispatch_sales_order_if_candidates
+      SET status='skipped', last_error=NULL, resolution_action='automatic', updated_at=now(),
+          result=jsonb_build_object('reason','non_inventory_fulfillment_not_required'),
+          gate_key=$2, gate_revision=$3, activation_event_id=$4 WHERE id=$1`,
+    [row.id, decision.gateKey, decision.gateRevision, decision.activationEventId]);
+    return;
+  }
   if (!lines.length) {throw failure("SALES_ORDER_IF_LINES_UNAVAILABLE", "No fulfillable Sales Order lines belong to this completed Dispatch target.");}
   const yards = outboundOrderYards({ outbound_location_id: source.outbound_location_id, lines });
   if (yards.length !== 1) {throw failure('SALES_ORDER_IF_MIXED_YARDS', 'The completed SO spans different outbound yards.');}

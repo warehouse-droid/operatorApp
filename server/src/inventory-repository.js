@@ -3,6 +3,7 @@ import { writeAudit } from "./auth-repository.js";
 import { enqueueNetSuiteMirrorInventoryEvent } from "./netsuite-mirror-repository.js";
 import { defaultReturnPolicy, normalizeReturnPolicy } from "./return-policy.js";
 import { enqueuePurchaseOrderWeightRefreshes } from "./purchase-order-weight-refresh.js";
+import { packedInventorySnapshot } from './inventory-packed-stock.js';
 
 function normalizeNumber(value) {
   if (value === null || value === undefined || value === "") return 0;
@@ -596,14 +597,17 @@ export async function confirmCycleCountLine(operatorId, values, { yardLocationId
   const toLyr = normalizeNumber(conversion.to_lyr);
   const toSec = normalizeNumber(conversion.to_sec);
   const toPcs = normalizeNumber(conversion.to_pcs) || 1;
-  const countedTotal = (pallets * toPlt) + (layers * toLyr) + (sections * toSec) + (pieces * toPcs);
-  const variance = countedTotal - normalizeNumber(conversion.quantity_on_hand);
+  const countedTotal = Number(((pallets * toPlt) + (layers * toLyr) + (sections * toSec) + (pieces * toPcs)).toFixed(6));
+  const packed = (await packedInventorySnapshot([itemId], locationId)).get(itemId).quantity;
+  const actualOnHand = Number((normalizeNumber(conversion.quantity_on_hand) - packed).toFixed(6));
+  const variance = Number((countedTotal - actualOnHand).toFixed(6));
   await query(
     `INSERT INTO cycle_count_lines (
        record_id, item_id, location_id, counted_pallet_qty, counted_layer_qty,
        counted_section_qty, counted_piece_qty, counted_total_qty, variance_qty,
-       system_on_hand_qty, system_available_qty, to_plt, to_lyr, to_sec, to_pcs, confirmed_at
-     ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, now())
+       system_on_hand_qty, system_available_qty, to_plt, to_lyr, to_sec, to_pcs, confirmed_at,
+       system_packed_qty, actual_on_hand_qty, packed_snapshot_at
+     ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, now(),$16,$17,clock_timestamp())
      ON CONFLICT (record_id, item_id, location_id) DO UPDATE SET
        counted_pallet_qty = EXCLUDED.counted_pallet_qty,
        counted_layer_qty = EXCLUDED.counted_layer_qty,
@@ -613,6 +617,9 @@ export async function confirmCycleCountLine(operatorId, values, { yardLocationId
        variance_qty = EXCLUDED.variance_qty,
        system_on_hand_qty = EXCLUDED.system_on_hand_qty,
        system_available_qty = EXCLUDED.system_available_qty,
+       system_packed_qty = EXCLUDED.system_packed_qty,
+       actual_on_hand_qty = EXCLUDED.actual_on_hand_qty,
+       packed_snapshot_at = EXCLUDED.packed_snapshot_at,
        to_plt = EXCLUDED.to_plt,
        to_lyr = EXCLUDED.to_lyr,
        to_sec = EXCLUDED.to_sec,
@@ -633,7 +640,9 @@ export async function confirmCycleCountLine(operatorId, values, { yardLocationId
       toPlt,
       toLyr,
       toSec,
-      toPcs
+      toPcs,
+      packed,
+      actualOnHand
     ]
   );
   await query("UPDATE cycle_count_records SET updated_at = now() WHERE id = $1", [recordId]);
@@ -713,6 +722,7 @@ export async function listCycleCountRecords({ limit = 50 } = {}) {
   const lines = await query(
     `SELECT l.*,
             i.item_name,
+            i.stock_unit,
             i.display_name,
             i.product_type,
             i.brand,

@@ -48,6 +48,7 @@
   }
 
   const mainItems = [
+    { label: "BOSS approvals", href: "/boss", icon: "BO", authorities: ["boss"] },
     { label: "Admin", href: "/admin", icon: "AD", authorities: ["admin"] },
     { label: "Control", href: "/control", icon: "CT", authorities: ["admin", "yard_manager"] },
     { label: "Dispatch", href: "/dispatch", icon: "DP", authorities: ["admin", "dispatcher"] },
@@ -63,6 +64,7 @@
     { label: "Menu", href: "/dispatch", icon: "MN" },
     { label: "Planning", href: "/dispatch/planning", icon: "PL" },
     { label: "Custom Orders", href: "/dispatch/custom-orders", icon: "CU" },
+    { label: "Sp. O", href: "/dispatch/special-stock", icon: "SP" },
     { label: "Monitor", href: "/dispatch/monitor", icon: "MO" },
     { label: "Statistics", href: "/dispatch/statistics", icon: "ST" },
     { label: "DVIR", href: "/dispatch/dvir", icon: "DV" },
@@ -118,6 +120,7 @@
   ];
 
   const adminItems = [
+    { label: "BOSS setup", href: "/admin/boss-approvals", icon: "BO" },
     { label: "SOR Auto Returns", href: "/admin/sor-auto-returns", controlSection: "sor-auto-returns", icon: "SR" },
     { label: "Overview", href: "/admin", controlSection: "dashboard", icon: "OV" },
     { label: "Accounts", href: "/admin/accounts", controlSection: "operators", icon: "AC" },
@@ -689,9 +692,18 @@
   }
 
   function init() {
+    const regularAlert = document.createElement("script");
+    regularAlert.src = "/regular-stock-alert.js?v=20260929";
+    document.head.appendChild(regularAlert);
     const aggregateAlert = document.createElement("script");
     aggregateAlert.src = "/scm-aggregate-alert.js?v=20260925-aggregate-alert-v1";
     document.head.appendChild(aggregateAlert);
+    const specialAlert = document.createElement("script");
+    specialAlert.src = "/scm-special-alert.js?v=20260928-special-alert-v1";
+    document.head.appendChild(specialAlert);
+    const salesSpecialAlert = document.createElement("script");
+    salesSpecialAlert.src = "/sales-special-alert.js?v=20261002-stock-updates-v1";
+    document.head.appendChild(salesSpecialAlert);
     installStyle();
     render();
     void refreshSidebarAuthority();

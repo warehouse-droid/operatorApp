@@ -1,5 +1,6 @@
 import { query } from "./db.js";
 import { writeAudit } from "./auth-repository.js";
+import { movementRecordEvidence } from "./movement-record-evidence.js";
 
 const HISTORY_ACTIONS = ["delivery.line.confirm", "receiving.line.confirm"];
 
@@ -301,6 +302,8 @@ export async function listOperatorHistory({ operatorId, date = "", limit = 100, 
                   'countedTotal', l.counted_total_qty,
                   'systemOnHand', l.system_on_hand_qty,
                   'systemAvailable', l.system_available_qty,
+                  'packed', l.system_packed_qty,
+                  'actualOnHand', l.actual_on_hand_qty,
                   'variance', l.variance_qty
                 )
                 ORDER BY l.confirmed_at DESC
@@ -390,9 +393,14 @@ export async function listOperatorHistory({ operatorId, date = "", limit = 100, 
   );
   records.push(...returns.rows.map(normalizeRecord));
 
-  return records
+  const visible = records
     .sort((a, b) => new Date(b.createdAt) - new Date(a.createdAt))
     .slice(0, safeLimit);
+  const evidence = await movementRecordEvidence({
+    loadIds: visible.filter((record) => record.id.startsWith("load-")).map((record) => record.details.recordId),
+    receiptIds: visible.filter((record) => record.id.startsWith("receipt-")).map((record) => record.details.recordId)
+  });
+  return visible.map((record) => ({ ...record, ...evidence.get(record.id) }));
 }
 
 export async function findOperatorHistoryRecord(operatorId, recordId, yardLocationIds = null) {

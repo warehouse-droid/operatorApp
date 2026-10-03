@@ -14,6 +14,8 @@ function postingStep(candidate, payload = candidate?.payload) {
     sourceNetSuiteId: candidate.sourceSalesOrderId,
     sourceOrderKind: "SO",
     transactionType: "IF",
+    dispatchAutoFulfillment: true,
+    lineSnapshot: candidate.lineSnapshot,
     payload
   };
 }
@@ -24,6 +26,7 @@ export async function fetchLiveSalesOrderAutoFulfillmentState(candidate) {
   if (!live) {
     return { closed: true, missing: true, lines: [] };
   }
+  if (live.fulfillmentComplete) {return {...live,closed:isNetSuiteOrderClosed(live)};}
   const selected = new Set((candidate.lineSnapshot || []).map((/** @type {LooseRecord} */ line) => Number(line.orderLine)));
   const yards = outboundOrderYards({ outbound_location_id: candidate.canonicalLocationId,
     lines: live.lines.filter((/** @type {LooseRecord} */ line) => selected.has(line.orderLine))

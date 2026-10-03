@@ -57,6 +57,17 @@ button:disabled {
   overflow: hidden;
 }
 
+/* Keep the working launch height when Android later expands the viewport
+   behind its navigation bar. The normal 15px gap stays above that boundary. */
+html[data-android-viewport="true"] .tablet-shell {
+  position: fixed;
+  top: 0;
+  left: 0;
+  right: 0;
+  height: min(var(--operator-visible-height, 100dvh), calc(100dvh - env(safe-area-inset-bottom, 0px)));
+  padding-bottom: 15px;
+}
+
 .topbar {
   flex: 0 0 auto;
   min-height: 64px;
@@ -2282,6 +2293,51 @@ label span {
   grid-template-rows: auto minmax(0, 1fr) auto;
 }
 
+.fulfillment-load-screen {
+  grid-template-areas: "notices notices" "photos summary" "actions actions";
+}
+
+.fulfillment-load-screen > .fulfillment-notices {
+  grid-area: notices;
+  min-width: 0;
+  display: grid;
+  gap: 6px;
+  align-self: start;
+}
+
+.fulfillment-notices > .sync-alert {
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+
+.fulfillment-notices > [data-load-posting-status] {
+  grid-template-columns: minmax(0, 1fr) auto;
+  align-items: center;
+  column-gap: 12px;
+}
+
+.fulfillment-notices > [data-load-posting-status] > :is(strong, span) {
+  grid-column: 1;
+}
+
+.fulfillment-notices > [data-load-posting-status] > button {
+  grid-column: 2;
+  grid-row: 1 / 3;
+  padding: 6px 12px;
+}
+
+.fulfillment-load-screen > .fulfillment-photo-card {
+  grid-area: photos;
+}
+
+.fulfillment-load-screen > .fulfillment-summary-card {
+  grid-area: summary;
+}
+
+.fulfillment-load-screen > .selected-actions {
+  grid-area: actions;
+}
+
 .fulfillment-lines.compact-load-summary > .fulfillment-summary-row {
   display: grid;
   grid-template-columns: minmax(0, 1fr) max-content;
@@ -2491,6 +2547,10 @@ label span {
 
   .fulfillment-photo-card .photo-placeholder {
     min-height: 180px;
+  }
+
+  .fulfillment-load-screen {
+    grid-template-areas: "notices" "photos" "summary" "actions";
   }
 
   .reload-fulfillment-screen {

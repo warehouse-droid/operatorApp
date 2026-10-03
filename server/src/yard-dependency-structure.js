@@ -18,6 +18,9 @@ export function dependencyBlocksDispatchStructureChange(dependency = {}, { allow
 }
 
 export function dispatchDependencyOrderRefs(order = {}) {
+  const ownRefs = [order.id, order.tranid].map(text).filter(Boolean);
+  const coOrder = text(order.type).toUpperCase() === 'CO'
+    || ownRefs.some((ref) => /^CO-/iu.test(ref));
   return [...new Set([
     order.id,
     order.tranid,
@@ -26,7 +29,8 @@ export function dispatchDependencyOrderRefs(order = {}) {
     ...(Array.isArray(order.childOrderDetails)
       ? order.childOrderDetails.flatMap((child) => [child?.id, child?.originalOrderId])
       : [])
-  ].map(text).filter(Boolean))];
+  ].map(text).filter((ref) => Boolean(ref)
+    && (!coOrder || ownRefs.includes(ref) || /^CO-/iu.test(ref))))];
 }
 
 export function everySalesAssignmentFollowsTransfer(

@@ -1,4 +1,11 @@
+import { normalizeNetSuiteTransactionUnits } from './netsuite-transaction-units.js';
+import { createBossNetSuiteAdapter } from './boss-approval-netsuite.js';
+
+export function createBossApprovalNetSuite() {
+  return createBossNetSuiteAdapter({rest:netsuiteRest,queryAll:suiteqlAll,mutate:queueNetSuiteMutation});
+}
 import { isSorFeatureEnabled } from './sor-feature-gate.js';
+import { isFulfillableNetSuiteLine, isCompletedNetSuitePostingOrder } from './netsuite-fulfillable-items.js';
 import { getOutboundLocationHierarchy, setOutboundLocationDirectory } from "./outbound-location-domain.js";
 import crypto from "node:crypto";
 import { withNetSuiteOrderLines } from "./netsuite-order-line.js";
@@ -16,6 +23,7 @@ import {
 } from "./netsuite-m2m-runtime.js";
 import { normalizeSalesOrderReconciliationType } from "./sales-order-reconciliation.js";
 import { buildTransferDependencyUpdateRequest } from "./transfer-dependency-netsuite.js";
+import { fetchNetSuiteOrderPdf } from './netsuite-order-pdf.js';
 
 let suiteqlQueue = Promise.resolve();
 let restMutationQueue = Promise.resolve();
@@ -364,6 +372,7 @@ SELECT DISTINCT
   t.status,
   BUILTIN.DF(t.status) AS status_text,
   t.memo,
+  t.custbody7 AS netsuite_note,
   COALESCE(NULLIF(BUILTIN.DF(v.defaultbillingaddress), ''), NULLIF(BUILTIN.DF(t.billingaddress), '')) AS vendor_address,
   t.foreigntotal,
   tl.location AS destination_location_id,
@@ -526,6 +535,7 @@ function deriveQuantitiesFromSalesQuantity(line, quantity) {
 }
 
 function normalizeOpenDeliveryLine(line) {
+  line = normalizeNetSuiteTransactionUnits(line);
   const orderedQuantity = toNumber(line.quantity);
   return deriveQuantitiesFromSalesQuantity(line, orderedQuantity);
 }
@@ -973,8 +983,9 @@ export async function fetchOperatorNetSuiteKitEvidenceFromNetSuite(sourceId, { r
   const [sourceItems, sourceRows] = await Promise.all([
     fetchOperatorNetSuiteSourceItemLinesFromNetSuite('SO', id, { rest }),
     queryAll(`SELECT tl.id, tl.uniquekey, tl.item, tl.kitmemberof, tl.quantity,
-                    tl.quantityshiprecv, tl.location, i.itemtype, i.usebins, i.islotitem, i.isserialitem
+                    tl.quantityshiprecv, tl.units AS unit_id, uom.conversionrate AS unit_conversion_rate, tl.location, i.itemtype, i.usebins, i.islotitem, i.isserialitem
                FROM transactionline tl JOIN item i ON i.id = tl.item
+               LEFT JOIN UnitsTypeUom uom ON uom.internalid = tl.units
               WHERE tl.transaction = ${id} AND tl.mainline = 'F' AND tl.taxline = 'F'
               ORDER BY tl.linesequencenumber`)
   ]);
@@ -985,7 +996,7 @@ export async function fetchOperatorNetSuiteKitEvidenceFromNetSuite(sourceId, { r
     const result = await rest(`/record/v1/kitItem/${kitId}?expandSubResources=true`, { method: 'GET' });
     kitDefinitions.push(result.data);
   }
-  return { sourceItems, sourceRows, kitDefinitions };
+  return { sourceItems, sourceRows: sourceRows.map(normalizeNetSuiteTransactionUnits), kitDefinitions };
 }
 
 export async function updateTransferOrderStatusInNetSuite(orderId, { intercompany = false, statusId = "B" } = {}) {
@@ -1160,24 +1171,21 @@ export async function fetchPickingTicketFromNetSuite(orderId, { locationId = nul
 }
 
 export async function fetchPurchaseOrderPdfFromNetSuite(orderId, { filenamePrefix = "PO" } = {}) {
-  const id = Number(orderId);
-  if (!Number.isInteger(id) || id <= 0) throw new Error("A valid numeric NetSuite purchase order ID is required.");
-  const prefix = String(filenamePrefix || "PO").trim().replace(/[^a-zA-Z0-9_-]+/g, "-") || "PO";
-  const payload = await configuredRestletJson({
-    action: "purchaseOrderPdf",
-    entityId: id,
-    includeContent: true
-  });
-  if (payload.action !== "purchaseOrderPdf" || Number(payload.entityId) !== id) {
-    throw new Error("NetSuite purchase-order PDF RESTlet returned the wrong transaction identity.");
-  }
-  const base64 = payload.contentBase64 || payload.base64 || payload.contents || "";
-  if (!base64) throw new Error("NetSuite purchase-order PDF RESTlet returned no PDF content.");
-  return {
-    buffer: verifiedPdfBuffer(base64, "purchase-order PDF"),
-    contentType: payload.contentType || "application/pdf",
-    filename: String(payload.filename || `${prefix}-${id}.pdf`).replace(/[^a-zA-Z0-9_.-]+/g, "-")
-  };
+  return fetchNetSuiteOrderPdf('purchase_order', orderId, { filenamePrefix, restlet: configuredRestletJson });
+}
+
+export async function fetchSalesOrderPdfFromNetSuite(orderId, { filenamePrefix = "SO" } = {}) {
+  return fetchNetSuiteOrderPdf('sales_order', orderId, { filenamePrefix, restlet: configuredRestletJson });
+}
+
+export async function prepareSpecialClosurePlanInNetSuite(input, boundary = { rest: netsuiteRest, queryAll: suiteqlAll }) {
+  const { prepareSpecialClosurePlan } = await import('./special-stock-closure-adapter.js');
+  return prepareSpecialClosurePlan(input, boundary);
+}
+
+export async function applySpecialClosurePlanInNetSuite(plan, boundary = { rest: netsuiteRest, queryAll: suiteqlAll }) {
+  const { applySpecialClosurePlan } = await import('./special-stock-closure-adapter.js');
+  return queueNetSuiteMutation(() => applySpecialClosurePlan(plan, boundary));
 }
 
 export function buildPurchaseOrderHistoryRestPayload({ header = {}, lines = [] } = {}) {
@@ -1579,6 +1587,26 @@ export async function fetchTransferDeliveryOrdersFromNetSuite(locationId = 1) {
   }));
 }
 
+export async function readRegularStockSalesOrderFromNetSuite(reference) {
+  const { readRegularSalesOrder } = await import('./regular-stock-netsuite-adapter.js');
+  return readRegularSalesOrder(reference, { rest: netsuiteRest, queryAll: suiteqlAll, resolveYards: resolveNetSuiteYardLocations });
+}
+
+export async function readDeliveryInstructionFromNetSuite(orderId) {
+  const { readDeliveryNetSuite } = await import('./delivery-instruction-netsuite.js');
+  return readDeliveryNetSuite(orderId, { rest: netsuiteRest });
+}
+
+export async function updateDeliveryInstructionInNetSuite(input) {
+  const { updateDeliveryNetSuite } = await import('./delivery-instruction-netsuite.js');
+  return queueNetSuiteMutation(() => updateDeliveryNetSuite(input, { rest: netsuiteRest }));
+}
+
+export async function applyRegularStockSalesOrderLocationInNetSuite(input) {
+  const { applyRegularSalesOrderLocation } = await import('./regular-stock-netsuite-adapter.js');
+  return queueNetSuiteMutation(() => applyRegularSalesOrderLocation(input, { rest: netsuiteRest, queryAll: suiteqlAll, resolveYards: resolveNetSuiteYardLocations }));
+}
+
 export async function fetchSalesOrderReferenceFromNetSuite(orderId) {
   const id = Number(orderId);
   if (!Number.isInteger(id) || id <= 0) throw new Error("A valid numeric NetSuite sales order ID is required.");
@@ -1801,6 +1829,7 @@ export async function fetchTransactionProgressFromNetSuite(orderId, recordType =
       tl.quantity,
       tl.quantityshiprecv AS netsuite_received_qty,
       BUILTIN.DF(tl.units) AS unit,
+      tl.units AS unit_id, uom.conversionrate AS unit_conversion_rate,
       i.weight AS item_weight,
       tl.location AS location_id,
       BUILTIN.DF(tl.location) AS location,
@@ -1815,6 +1844,7 @@ export async function fetchTransactionProgressFromNetSuite(orderId, recordType =
     FROM transaction t
     INNER JOIN transactionline tl ON tl.transaction = t.id
     LEFT JOIN item i ON i.id = tl.item
+    LEFT JOIN UnitsTypeUom uom ON uom.internalid = tl.units
     WHERE t.id = ${id}
       AND t.type = '${type}'
       AND tl.item IS NOT NULL
@@ -1822,7 +1852,7 @@ export async function fetchTransactionProgressFromNetSuite(orderId, recordType =
       AND ${taxFilter}
     ORDER BY tl.uniquekey
   `);
-  const rows = result.items || [];
+  const rows = (result.items || []).map(normalizeNetSuiteTransactionUnits);
   if (!rows.length) {
     const status = await fetchTransactionStatusFromNetSuite(id, type);
     return status ? { ...status, record_type: type, lines: [] } : null;
@@ -2276,6 +2306,7 @@ async function fetchScmReconciliationOrdersBatch(options = {}) {
       tl.quantitycommitted AS netsuite_committed_qty,
       tl.quantitybackordered AS netsuite_backordered_qty,
       BUILTIN.DF(tl.units) AS unit,
+      tl.units AS unit_id, uom.conversionrate AS unit_conversion_rate,
       tl.location AS line_location_id,
       BUILTIN.DF(tl.location) AS line_location,
       i.weight AS item_weight,
@@ -2290,6 +2321,7 @@ async function fetchScmReconciliationOrdersBatch(options = {}) {
     FROM transaction t
     INNER JOIN transactionline tl ON tl.transaction = t.id
     LEFT JOIN item i ON i.id = tl.item
+    LEFT JOIN UnitsTypeUom uom ON uom.internalid = tl.units
     WHERE ${filter.sql}
       AND tl.item IS NOT NULL
       AND tl.mainline = 'F'
@@ -2297,7 +2329,7 @@ async function fetchScmReconciliationOrdersBatch(options = {}) {
     ORDER BY t.id, tl.id, tl.uniquekey
   `);
   const orders = new Map();
-  for (const row of rows) {
+  for (const row of rows.map(normalizeNetSuiteTransactionUnits)) {
     const id = Number(row.id);
     const kind = String(row.record_type) === "SalesOrd"
       ? "SO"
@@ -2501,7 +2533,8 @@ export async function fetchPoToLinkedTransactionsFromNetSuite(orderIds = []) {
         event_line.item AS item_id,
         BUILTIN.DF(event_line.item) AS item_name,
         ABS(NVL(event_line.quantity, 0)) AS quantity,
-        BUILTIN.DF(event_line.units) AS unit,
+        BUILTIN.DF(source_line.units) AS unit,
+        source_line.units AS unit_id, uom.conversionrate AS unit_conversion_rate,
         event_line.location AS location_id,
         BUILTIN.DF(event_line.location) AS location
       FROM NextTransactionLineLink link
@@ -2513,13 +2546,14 @@ export async function fetchPoToLinkedTransactionsFromNetSuite(orderIds = []) {
       INNER JOIN transactionline event_line
         ON event_line.transaction = link.nextdoc
        AND event_line.id = link.nextline
+      LEFT JOIN UnitsTypeUom uom ON uom.internalid = source_line.units
       WHERE link.previousdoc IN (${chunk.join(",")})
         AND event_t.type IN ('ItemShip', 'ItemRcpt')
         AND event_line.item IS NOT NULL
         AND (event_line.taxline = 'F' OR event_line.taxline IS NULL)
       ORDER BY link.previousdoc, event_t.id, event_line.id
     `);
-    allRows.push(...rows);
+    allRows.push(...rows.map(normalizeNetSuiteTransactionUnits));
   }
   const mapped = allRows.map((row) => ({
     sourceOrderId: Number(row.source_order_id),
@@ -2620,6 +2654,7 @@ export async function fetchDeliveryOrderDetailsFromNetSuite(orderId, locationId 
       tl.quantitybackordered AS netsuite_backordered_qty,
       tl.quantityshiprecv AS netsuite_received_qty,
       BUILTIN.DF(tl.units) AS unit,
+      tl.units AS unit_id, uom.conversionrate AS unit_conversion_rate,
       i.weight AS item_weight,
       tl.location AS location_id,
       BUILTIN.DF(tl.location) AS location,
@@ -2633,6 +2668,7 @@ export async function fetchDeliveryOrderDetailsFromNetSuite(orderId, locationId 
       i.custitem_topcs AS to_pcs
     FROM transactionline tl
     LEFT JOIN item i ON i.id = tl.item
+    LEFT JOIN UnitsTypeUom uom ON uom.internalid = tl.units
     WHERE tl.transaction = ${id}
       AND EXISTS (
         SELECT 1
@@ -2669,7 +2705,8 @@ export async function fetchSalesOrderFulfillmentStateFromNetSuite(orderId, {
            tl.item AS item_id,
            BUILTIN.DF(tl.item) AS item_name,
            i.itemtype AS item_type,
-           tl.quantity,
+           i.isfulfillable AS is_fulfillable,
+           tl.quantity, tl.units AS unit_id, uom.conversionrate AS unit_conversion_rate,
            tl.quantityshiprecv AS fulfilled_quantity,
            tl.location AS location_id,
            BUILTIN.DF(tl.location) AS location,
@@ -2681,18 +2718,21 @@ export async function fetchSalesOrderFulfillmentStateFromNetSuite(orderId, {
        AND tl.mainline = 'F'
        AND tl.taxline = 'F'
       LEFT JOIN item i ON i.id = tl.item
+      LEFT JOIN UnitsTypeUom uom ON uom.internalid = tl.units
      WHERE t.id = ${id}
        AND t.type = 'SalesOrd'
      ORDER BY tl.uniquekey
   `);
-  const rows = result.items || [];
+  const rows = (result.items || []).map(normalizeNetSuiteTransactionUnits);
   if (!rows.length) return null;
-  const sourceItems = await fetchItems('SO', id);
   const header = rows[0];
+  if (isCompletedNetSuitePostingOrder('SO', {status:header.status,statusText:header.status_text})) {
+    return {id:Number(header.id),tranid:String(header.tranid || ''),status:String(header.status || ''),
+      statusText:String(header.status_text || ''),fulfillmentComplete:true,lines:[]};
+  }
+  const sourceItems = await fetchItems('SO', id);
   const lines = rows.filter((row) => {
-    if (!row.order_line || !["InvtPart", "NonInvtPart"].includes(String(row.item_type || ""))) return false;
-    const itemName = String(row.item_name || "").trim().toUpperCase();
-    return !itemName.startsWith("DELIVERY CHARGE") && !itemName.startsWith("SALES CREDIT");
+    return Boolean(row.order_line) && isFulfillableNetSuiteLine(row);
   }).map((row) => {
     const matches = sourceItems.filter(item => Number(item.orderLine ?? item.orderline ?? item.line) === Number(row.rest_order_line)
       && Number(item.item?.id ?? item.itemId ?? item.item) === Number(row.item_id));
@@ -2755,6 +2795,7 @@ export async function fetchDeliveryOrderDetailsBatchFromNetSuite(orderIds) {
         tl.quantitybackordered AS netsuite_backordered_qty,
         tl.quantityshiprecv AS netsuite_received_qty,
         BUILTIN.DF(tl.units) AS unit,
+      tl.units AS unit_id, uom.conversionrate AS unit_conversion_rate,
         i.weight AS item_weight,
         tl.location AS location_id,
         BUILTIN.DF(tl.location) AS location,
@@ -2768,6 +2809,7 @@ export async function fetchDeliveryOrderDetailsBatchFromNetSuite(orderIds) {
         i.custitem_topcs AS to_pcs
       FROM transactionline tl
       LEFT JOIN item i ON i.id = tl.item
+    LEFT JOIN UnitsTypeUom uom ON uom.internalid = tl.units
       WHERE tl.transaction IN (${chunk.join(",")})
         AND EXISTS (
           SELECT 1
@@ -2811,6 +2853,7 @@ export async function fetchTransferOrderDetailsFromNetSuite(orderId, locationId 
       tl.quantity,
       tl.quantityshiprecv AS netsuite_received_qty,
       BUILTIN.DF(tl.units) AS unit,
+      tl.units AS unit_id, uom.conversionrate AS unit_conversion_rate,
       i.weight AS item_weight,
       tl.location AS location_id,
       BUILTIN.DF(tl.location) AS location,
@@ -2824,6 +2867,7 @@ export async function fetchTransferOrderDetailsFromNetSuite(orderId, locationId 
       i.custitem_topcs AS to_pcs
     FROM transactionline tl
     LEFT JOIN item i ON i.id = tl.item
+    LEFT JOIN UnitsTypeUom uom ON uom.internalid = tl.units
     WHERE tl.transaction = ${id}
       AND tl.item IS NOT NULL
       AND tl.mainline = 'F'
@@ -2867,7 +2911,7 @@ export async function fetchTransferOrderVerificationLinesFromNetSuite(orderId, s
 
 export async function fetchPurchaseOrdersFromNetSuite(locationId = 1) {
   const result = await suiteqlAll(purchaseOrderListQuery(locationId));
-  return result.map((order) => ({ ...order, order_type: "purchase_order" }));
+  return result.map((order) => ({ ...order, netsuite_note: String(order.netsuite_note ?? ""), order_type: "purchase_order" }));
 }
 
 export async function fetchPurchaseOrderFromNetSuite(orderId, locationId = null) {
@@ -2886,6 +2930,7 @@ export async function fetchPurchaseOrderFromNetSuite(orderId, locationId = null)
       t.status,
       BUILTIN.DF(t.status) AS status_text,
       t.memo,
+      t.custbody7 AS netsuite_note,
       COALESCE(NULLIF(BUILTIN.DF(v.defaultbillingaddress), ''), NULLIF(BUILTIN.DF(t.billingaddress), '')) AS vendor_address,
       t.foreigntotal,
       tl.location AS destination_location_id,
@@ -2904,7 +2949,7 @@ export async function fetchPurchaseOrderFromNetSuite(orderId, locationId = null)
     ORDER BY t.trandate DESC
   `);
   const order = result.items?.[0];
-  return order ? { ...order, order_type: "purchase_order" } : null;
+  return order ? { ...order, netsuite_note: String(order.netsuite_note ?? ""), order_type: "purchase_order" } : null;
 }
 
 export async function fetchPurchaseOrderReferenceFromNetSuite(orderId) {
@@ -2920,6 +2965,7 @@ export async function fetchPurchaseOrderReferenceFromNetSuite(orderId) {
       t.status,
       BUILTIN.DF(t.status) AS status_text,
       t.memo,
+      t.custbody7 AS netsuite_note,
       COALESCE(NULLIF(BUILTIN.DF(v.defaultbillingaddress), ''), NULLIF(BUILTIN.DF(t.billingaddress), '')) AS vendor_address,
       t.foreigntotal,
       tl.location AS destination_location_id,
@@ -2937,7 +2983,7 @@ export async function fetchPurchaseOrderReferenceFromNetSuite(orderId) {
     FETCH FIRST 1 ROWS ONLY
   `);
   const order = result.items?.[0];
-  return order ? { ...order, order_type: "purchase_order" } : null;
+  return order ? { ...order, netsuite_note: String(order.netsuite_note ?? ""), order_type: "purchase_order" } : null;
 }
 
 export async function fetchPurchaseOrderDetailsFromNetSuite(orderId, locationId = null) {
@@ -2960,6 +3006,7 @@ export async function fetchPurchaseOrderDetailsFromNetSuite(orderId, locationId 
       tl.quantity,
       tl.quantityshiprecv AS netsuite_received_qty,
       BUILTIN.DF(tl.units) AS unit,
+      tl.units AS unit_id, uom.conversionrate AS unit_conversion_rate,
       i.weight AS item_weight,
       tl.location AS location_id,
       BUILTIN.DF(tl.location) AS location,
@@ -2973,6 +3020,7 @@ export async function fetchPurchaseOrderDetailsFromNetSuite(orderId, locationId 
       i.custitem_topcs AS to_pcs
     FROM transactionline tl
     LEFT JOIN item i ON i.id = tl.item
+    LEFT JOIN UnitsTypeUom uom ON uom.internalid = tl.units
     WHERE tl.transaction = ${id}
       AND tl.item IS NOT NULL
       AND tl.mainline = 'F'
@@ -2997,6 +3045,7 @@ export function purchaseOrderHistorySnapshotFromRows(rows) {
     status: first.status || "",
     statusText: first.status_text || "",
     memo: first.memo || "",
+    note: String(first.netsuite_note ?? ""),
     vendorReference: first.vendor_reference || "",
     expectedDeliveryDate: first.expected_delivery_date || null,
     foreignTotal: first.foreigntotal === null || first.foreigntotal === undefined ? null : Number(first.foreigntotal),
@@ -3045,6 +3094,7 @@ export async function fetchPurchaseOrderHistorySnapshotsFromNetSuite(orderIds = 
       t.status,
       BUILTIN.DF(t.status) AS status_text,
       t.memo,
+      t.custbody7 AS netsuite_note,
       t.otherrefnum AS vendor_reference,
       t.custbody4 AS expected_delivery_date,
       t.foreigntotal,
@@ -3061,6 +3111,7 @@ export async function fetchPurchaseOrderHistorySnapshotsFromNetSuite(orderIds = 
       ABS(NVL(tl.foreignamount, 0)) AS amount,
       tl.isclosed AS line_closed,
       BUILTIN.DF(tl.units) AS unit,
+      tl.units AS unit_id, uom.conversionrate AS unit_conversion_rate,
       i.weight AS item_weight,
       tl.location AS location_id,
       BUILTIN.DF(tl.location) AS location,
@@ -3079,12 +3130,13 @@ export async function fetchPurchaseOrderHistorySnapshotsFromNetSuite(orderIds = 
      AND tl.mainline = 'F'
      AND (tl.taxline = 'F' OR tl.taxline IS NULL)
     LEFT JOIN item i ON i.id = tl.item
+    LEFT JOIN UnitsTypeUom uom ON uom.internalid = tl.units
     WHERE t.id IN (${ids.join(", ")})
       AND t.type = 'PurchOrd'
     ORDER BY t.id, tl.uniquekey
   `);
   const byId = new Map();
-  for (const row of rows) {
+  for (const row of rows.map(normalizeNetSuiteTransactionUnits)) {
     const id = Number(row.id);
     if (!byId.has(id)) byId.set(id, []);
     byId.get(id).push(row);
@@ -3609,10 +3661,12 @@ export async function findTransferOrdersBySmartScmMarkerFromNetSuite({
 
 export async function findTransferOrdersByStockRequestMarkerFromNetSuite({
   transferId,
+  requestId = null,
   sourceLocationId,
   destinationLocationId
 } = {}) {
   const transfer = Number(transferId);
+  const request = Number(requestId);
   const source = Number(sourceLocationId);
   const destination = Number(destinationLocationId);
   if (!Number.isInteger(transfer) || transfer <= 0) {
@@ -3621,7 +3675,12 @@ export async function findTransferOrdersByStockRequestMarkerFromNetSuite({
   if (!Number.isInteger(source) || source <= 0 || !Number.isInteger(destination) || destination <= 0) {
     throw new Error("Valid NetSuite transfer locations are required to recover a Sales stock-request TO.");
   }
+  if (requestId !== null && (!Number.isSafeInteger(request) || request <= 0)) {
+    throw new Error("A valid local stock request ID is required.");
+  }
   const marker = `MBBS-STOCK-REQUEST-TO:${transfer}`.toUpperCase();
+  // Delivery memos show the SO number; retain marker recovery for older TOs.
+  const externalIdFilter = requestId === null ? '' : `UPPER(t.externalid) = 'MBBS_REGULAR_STOCK_${request}_${transfer}' OR`;
   const result = await suiteql(`
     SELECT DISTINCT
       t.id,
@@ -3645,6 +3704,7 @@ export async function findTransferOrdersByStockRequestMarkerFromNetSuite({
     WHERE t.type = 'TrnfrOrd'
       AND t.transferlocation = ${destination}
       AND (
+        ${externalIdFilter}
         UPPER(COALESCE(t.memo, '')) LIKE '%${marker} |%'
         OR UPPER(COALESCE(t.memo, '')) LIKE '%${marker}'
       )
@@ -3822,10 +3882,68 @@ export async function fetchSmartScmSalesHistoryFromNetSuite({
 
 // Narrow Special Item boundary; all line identity/verification is implemented in
 // the adapter and can be exercised without sending mutations to NetSuite.
+// Native special PO operations use the SO's exact line links for recovery.
+export async function findSpecialStockOrdersWithNativeLinkFromNetSuite(input, { findMarkers = findSpecialStockOrdersByMarkerFromNetSuite, rest = netsuiteRest } = {}) {
+  const rows = await findMarkers(input);
+  if (input.orderKind === 'purchase_order' && rows.length === 1 && input.salesOrderId) {
+    const record = (await rest(`/record/v1/purchaseOrder/${Number(rows[0].id)}`)).data;
+    if (record?.createdFrom?.id) rows[0].nativeLink = true;
+  }
+  return rows;
+}
+
+export async function findSpecialLinkedPurchaseOrderInNetSuite(input, boundary = { rest: netsuiteRest, queryAll: suiteqlAll }) {
+  const { findLinkedSpecialPurchaseOrder } = await import('./special-stock-native-po-adapter.js');
+  return findLinkedSpecialPurchaseOrder(input, boundary);
+}
+
+export async function assertSpecialNativePurchaseReady({restlet=configuredRestletJson}={}) {
+  const health=await restlet({action:'health',requireSandbox:false});
+  if(health.ok!==true || health.capabilities?.createSpecialPurchaseOrder!==true) throw Object.assign(
+    Error('Update the MBBS NetSuite RESTlet to version 3.3.0 or later before creating the linked Special Order PO.'),
+    {code:'SPECIAL_NATIVE_PO_SETUP_REQUIRED',status:503});
+}
+
+export async function createSpecialNativePurchase(request, {restlet=configuredRestletJson}={}) {
+  const result=await restlet({action:'createSpecialPurchaseOrder',...request});
+  if(result.ok!==true || result.action!=='createSpecialPurchaseOrder' || Number(result.entityId)!==request.entityId
+    || !Number.isSafeInteger(Number(result.purchaseOrderId)) || Number(result.purchaseOrderId)<=0) {
+    throw Object.assign(Error('NetSuite did not confirm the native PO link. Recover the existing operation.'),{code:'SPECIAL_REMOTE_OUTCOME_UNCERTAIN',status:409});
+  }
+  return result;
+}
+
+export async function createSpecialLinkedPurchaseOrderInNetSuite(payload, input, { rest = netsuiteRest, queryAll = suiteqlAll, mutate = queueNetSuiteMutation, createNative = createSpecialNativePurchase, createStandalone = createPurchaseOrderInNetSuite } = {}) {
+  if (!input?.salesOrderId) return createStandalone(payload);
+  const { createLinkedSpecialPurchaseOrder } = await import('./special-stock-native-po-adapter.js');
+  return mutate(() => createLinkedSpecialPurchaseOrder({ ...input, payload }, { rest, queryAll, createNative }));
+}
+
+export async function finalizeSpecialLinkedPurchaseOrderInNetSuite(input, { rest = netsuiteRest, queryAll = suiteqlAll, mutate = queueNetSuiteMutation } = {}) {
+  const { finalizeLinkedSpecialPurchaseOrder } = await import('./special-stock-native-po-adapter.js');
+  return mutate(() => finalizeLinkedSpecialPurchaseOrder(input, { rest, queryAll }));
+}
+
 export async function resolveSpecialOrderUnitsFromNetSuite(lines) {
   const { resolveSpecialUnits } = await import('./special-stock-netsuite-adapter.js');
   return resolveSpecialUnits(lines, { rest: netsuiteRest, queryAll: suiteqlAll });
 }
+
+/** @param {typeof netsuiteRest} rest @returns {import('./special-stock-purchase-order-note-adapter.js').Boundary} */
+function specialPurchaseOrderNoteBoundary(rest) {
+  return {rest:(path,options)=>rest(path,/** @type {any} */ (options))};
+}
+/** @param {import('./special-stock-purchase-order-note-adapter.js').Identity} input */
+export async function readSpecialPurchaseOrderNoteFromNetSuite(input, { rest = netsuiteRest } = {}) {
+  const { readSpecialPurchaseOrderNote } = await import('./special-stock-purchase-order-note-adapter.js');
+  return readSpecialPurchaseOrderNote(input, specialPurchaseOrderNoteBoundary(rest));
+}
+/** @param {import('./special-stock-purchase-order-note-adapter.js').Edit} input */
+export async function updateSpecialPurchaseOrderNoteInNetSuite(input, { rest = netsuiteRest, mutate = queueNetSuiteMutation } = {}) {
+  const { updateSpecialPurchaseOrderNote } = await import('./special-stock-purchase-order-note-adapter.js');
+  return mutate(() => updateSpecialPurchaseOrderNote(input, specialPurchaseOrderNoteBoundary(rest)));
+}
+
 export async function synchronizeSpecialSalesDescriptionsInNetSuite(input) {
   const { synchronizeSpecialDescriptions } = await import('./special-stock-netsuite-adapter.js');
   const run = () => synchronizeSpecialDescriptions(input, { rest: netsuiteRest, queryAll: suiteqlAll });
@@ -3835,10 +3953,44 @@ export async function prepareSpecialQuantityPlanInNetSuite(input) {
   const { prepareSpecialQuantityPlan } = await import('./special-stock-quantity-adapter.js');
   return prepareSpecialQuantityPlan(input, { rest: netsuiteRest, queryAll: suiteqlAll });
 }
+
+export async function assertSpecialDiscountRestReady({queryAll=suiteqlAll}={}) {
+  const items=await queryAll("SELECT id FROM item WHERE id=10716 AND itemid='Custom Discount%' AND itemtype='Discount' AND isinactive='F'");
+  if(items.length!==1)throw Object.assign(Error('The active Custom Discount% item is unavailable in NetSuite.'),{status:409,code:'SPECIAL_DISCOUNT_ITEM_REQUIRED'});
+}
+export async function verifySpecialDiscountSalesOrderInNetSuite(orderId,payload,{rest=netsuiteRest,queryAll=suiteqlAll}={}) {
+  const {verifySpecialRestSalesOrder}=await import('./special-stock-rest-orders.js');
+  return verifySpecialRestSalesOrder(orderId,payload,{rest,queryAll});
+}
+export async function createSpecialDiscountSalesOrderInNetSuite(payload,{estimateId=null,rest=netsuiteRest,mutate=queueNetSuiteMutation}={}) {
+  const {assertSpecialRestSalesPayload}=await import('./special-stock-rest-orders.js');
+  assertSpecialRestSalesPayload(payload);
+  if(estimateId!==null && (!Number.isSafeInteger(Number(estimateId)) || Number(estimateId)<=0))throw new Error('A valid estimate ID is required.');
+  const path=estimateId===null ? '/record/v1/salesOrder' : `/record/v1/estimate/${Number(estimateId)}/!transform/salesOrder?replace=item`;
+  return mutate(()=>rest(path,{method:'POST',body:payload}));
+}
+export async function prepareSpecialAdjustmentPlanInNetSuite(input,{rest=netsuiteRest,queryAll=suiteqlAll}={}) {
+  await assertSpecialDiscountRestReady({queryAll});
+  const {prepareSpecialRestAdjustmentPlan}=await import('./special-stock-rest-orders.js');
+  return prepareSpecialRestAdjustmentPlan(input,{rest,queryAll});
+}
+export async function applySpecialAdjustmentPlanInNetSuite(plan,{rest=netsuiteRest,queryAll=suiteqlAll,mutate=queueNetSuiteMutation}={}) {
+  if(plan.transport!=='restRecord' || plan.discountMode!=='amount')throw Object.assign(Error('This adjustment predates the REST amount-discount workflow and requires reconciliation before retrying.'),{status:409,code:'SPECIAL_ADJUSTMENT_CONFLICT'});
+  const {applySpecialAdjustmentPlan}=await import('./special-stock-adjustment-adapter.js');
+  const {createSpecialRestOrderBoundary}=await import('./special-stock-rest-orders.js');
+  return mutate(()=>applySpecialAdjustmentPlan(plan,createSpecialRestOrderBoundary({rest,queryAll})));
+}
 export async function applySpecialQuantityPlanInNetSuite(plan) {
   const { applySpecialQuantityPlan } = await import('./special-stock-quantity-adapter.js');
-  const run = () => applySpecialQuantityPlan(plan, { rest: netsuiteRest, queryAll: suiteqlAll });
-  const result = restMutationQueue.then(run, run);
-  restMutationQueue = result.catch(() => {});
-  return result;
+  return queueNetSuiteMutation(() => applySpecialQuantityPlan(plan, { rest: netsuiteRest, queryAll: suiteqlAll }));
+}
+
+export async function prepareSpecialFulfillmentInNetSuite(input,{rest=netsuiteRest,queryAll=suiteqlAll,config=configSpecialFulfillment()}={}) {
+  const {prepareSpecialFulfillmentPlan}=await import('./special-stock-fulfillment-adapter.js');
+  return prepareSpecialFulfillmentPlan(input,{rest,queryAll,config});
+}
+function configSpecialFulfillment() { return config.specialStock; }
+export async function applySpecialFulfillmentInNetSuite(plan,{rest=netsuiteRest,queryAll=suiteqlAll,mutate=queueNetSuiteMutation}={}) {
+  const {applySpecialFulfillmentPlan}=await import('./special-stock-fulfillment-adapter.js');
+  return mutate(()=>applySpecialFulfillmentPlan(plan,{rest,queryAll}));
 }

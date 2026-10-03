@@ -342,6 +342,15 @@ async function downloadLoadedCsv() {
   URL.revokeObjectURL(url);
 }
 
+function loadedDocumentLabel(order) {
+  return (order.documents || []).map((document) => `${document.type}: ${document.ref}`).join(" · ");
+}
+
+function loadedMovementStatus(order, driverOnly) {
+  return order.waitingForDriverCompletion ? "waiting for driver completion"
+    : order.movement_status || (driverOnly ? loadedT("yard.driverComplete", "Driver complete") : loadedT("yard.processed", "Processed"));
+}
+
 function renderLoadedList() {
   const orders = visibleLoadedOrders();
   return `
@@ -357,7 +366,8 @@ function renderLoadedList() {
       const lastActivityAt = loadedField(order, "last_activity_at", "lastActivityAt", "last_processed_at", "lastProcessedAt");
       return `<button class="dispatch-loaded-order ${loadedOrderKey(order) === loadedState.selectedKey ? "active" : ""}" data-action="select-loaded-order" data-key="${loadedEscape(loadedOrderKey(order))}" type="button">
         <div class="dispatch-movement-card-head"><strong>${loadedEscape(order.tranid || order.order_id)}</strong><span class="dispatch-movement-badges"><i class="dispatch-movement-badge ${loadedEscape(order.direction)}">${loadedT(`yard.${order.direction}`, order.direction)}</i><i class="dispatch-movement-badge type">${movementTypeCode(order.order_type)}</i>${driverOnly ? `<i class="dispatch-movement-badge type">${loadedT("yard.driverOnly", "Driver only")}</i>` : ""}</span></div>
-        <span>${loadedEscape(order.yard_location || loadedT("common.yard", "Yard"))} | ${loadedEscape(order.movement_status || (driverOnly ? loadedT("yard.driverComplete", "Driver complete") : loadedT("yard.processed", "Processed")))}</span>
+        <span>${loadedEscape(order.yard_location || loadedT("common.yard", "Yard"))} | ${loadedEscape(loadedMovementStatus(order, driverOnly))}</span>
+        ${loadedDocumentLabel(order) ? `<span class="movement-documents">${loadedEscape(loadedDocumentLabel(order))}</span>` : ""}
         <em>${deliveryAt ? `${loadedT("yard.deliveryTime", "Delivered")} ${loadedFormatDate(deliveryAt)}` : loadedFormatDate(lastActivityAt)} | ${loadedT("yard.yardActivities", "Yard")} ${yardActivities} · ${loadedT("yard.driverActivities", "Driver")} ${driverActivities} | ${yardPhotos + driverPhotos} ${loadedT("common.photos", "photos")}</em>
         ${order.party ? `<small>${loadedEscape(order.party)}</small>` : ""}
       </button>`;
@@ -483,7 +493,7 @@ function renderLoadedDetail() {
   const route = [order.source_location, order.destination_location].filter(Boolean).join(" → ");
   return `
     <div class="dispatch-loaded-detail-head">
-      <div><div class="dispatch-movement-detail-title"><h2>${loadedEscape(order.tranid || order.order_id)}</h2><span class="dispatch-movement-badges"><i class="dispatch-movement-badge ${loadedEscape(order.direction)}">${loadedT(`yard.${order.direction}`, order.direction)}</i><i class="dispatch-movement-badge type">${movementTypeCode(order.order_type)}</i>${driverOnly ? `<i class="dispatch-movement-badge type">${loadedT("yard.driverOnly", "Driver only")}</i>` : ""}</span></div><p>${loadedEscape(movementTypeLabel(order.order_type))} | ${loadedEscape(order.yard_location || "")} | ${loadedEscape(order.movement_status || (driverOnly ? loadedT("yard.driverComplete", "Driver complete") : loadedT("yard.processed", "Processed")))}</p>${route ? `<p>${loadedEscape(route)}</p>` : ""}${order.party ? `<p>${loadedEscape(order.party)}</p>` : ""}${deliveryAt ? `<p><strong>${loadedT("yard.deliveryTime", "Delivered")}:</strong> ${loadedFormatDate(deliveryAt)}</p>` : ""}${activityRange ? `<p>${loadedT("yard.activityRange", "Activity")}: ${activityRange}</p>` : ""}</div>
+      <div><div class="dispatch-movement-detail-title"><h2>${loadedEscape(order.tranid || order.order_id)}</h2><span class="dispatch-movement-badges"><i class="dispatch-movement-badge ${loadedEscape(order.direction)}">${loadedT(`yard.${order.direction}`, order.direction)}</i><i class="dispatch-movement-badge type">${movementTypeCode(order.order_type)}</i>${driverOnly ? `<i class="dispatch-movement-badge type">${loadedT("yard.driverOnly", "Driver only")}</i>` : ""}</span></div><p>${loadedEscape(movementTypeLabel(order.order_type))} | ${loadedEscape(order.yard_location || "")} | ${loadedEscape(loadedMovementStatus(order, driverOnly))}</p>${loadedDocumentLabel(order) ? `<p class="movement-documents"><strong>${loadedEscape(loadedDocumentLabel(order))}</strong></p>` : ""}${route ? `<p>${loadedEscape(route)}</p>` : ""}${order.party ? `<p>${loadedEscape(order.party)}</p>` : ""}${deliveryAt ? `<p><strong>${loadedT("yard.deliveryTime", "Delivered")}:</strong> ${loadedFormatDate(deliveryAt)}</p>` : ""}${activityRange ? `<p>${loadedT("yard.activityRange", "Activity")}: ${activityRange}</p>` : ""}</div>
       <strong>${lines.length} ${loadedT("control.lines", "line(s)")} · ${loadedT("yard.yardActivities", "Yard")} ${yardActivities} · ${loadedT("yard.driverActivities", "Driver")} ${driverActivities}</strong>
     </div>
     <div class="dispatch-loaded-lines">${lines.map((line) => `<div class="dispatch-loaded-line">

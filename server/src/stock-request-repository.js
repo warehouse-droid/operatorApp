@@ -1,4 +1,7 @@
 import { query, withTransaction } from "./db.js";
+import { parseYardIds } from '../public/stock-request-yard-filter.js';
+import { dependencyQuantityConversionDisplay } from './order-dependency-quantity.js';
+import {isWaitlist,waitlistError,waitlistQuantity} from './regular-waitlist-domain.js';
 import {
   STOCK_REQUEST_YARDS,
   assertStockRequestDestinationAccess,
@@ -15,7 +18,7 @@ import {
 
 const YARD_BY_LOCATION_ID = new Map(STOCK_REQUEST_YARDS.map((yard) => [yard.locationId, yard]));
 const EDITABLE_LINE_STATUSES = new Set(["submitted", "changes_requested"]);
-const TERMINAL_LINE_STATUSES = new Set(["received", "rejected", "cancelled", "closed"]);
+const TERMINAL_LINE_STATUSES = new Set(["received", "rejected", "cancelled", "closed", "fulfilled"]);
 
 function stockRequestError(message, status = 400, code = "STOCK_REQUEST_INVALID") {
   return Object.assign(new Error(message), { status, code });
@@ -107,7 +110,9 @@ function addStockRequestListFilters({
   vendor,
   requestDate,
   sourceLocationId,
-  destinationLocationId
+  destinationLocationId,
+  sourceLocationIds,
+  destinationLocationIds
 }) {
   const normalizedVendor = cleanSearch(vendor);
   const normalizedDate = optionalRequestDate(requestDate);
@@ -139,6 +144,17 @@ function addStockRequestListFilters({
     params.push(normalizedDestination);
     clauses.push(`request.destination_location_id = $${params.length}`);
   }
+  const sources = parseYardIds(sourceLocationIds).map(id => optionalFilterYard(id, 'source'));
+  const destinations = parseYardIds(destinationLocationIds).map(id => optionalFilterYard(id, 'destination'));
+  if (sources.length) {
+    params.push(sources);
+    clauses.push(`EXISTS (SELECT 1 FROM sales_stock_request_lines source_line
+      WHERE source_line.request_id = request.id AND source_line.source_location_id = ANY($${params.length}::bigint[]))`);
+  }
+  if (destinations.length) {
+    params.push(destinations);
+    clauses.push(`request.destination_location_id = ANY($${params.length}::bigint[])`);
+  }
 }
 
 function mapLine(row = {}) {
@@ -148,7 +164,8 @@ function mapLine(row = {}) {
     itemId: Number(row.item_id),
     itemName: row.item_name || "",
     itemDescription: row.item_description || "",
-    sourceLocationId: Number(row.source_location_id),
+    sourceLocationId: row.source_location_id == null ? null : Number(row.source_location_id),
+    stockingType: row.stocking_type || 'transfer',
     sourceName: row.source_name || "",
     destinationLocationId: Number(row.destination_location_id),
     destinationName: row.destination_name || "",
@@ -164,6 +181,8 @@ function mapLine(row = {}) {
     toSec: nullableNumeric(row.to_sec),
     toPcs: nullableNumeric(row.to_pcs),
     status: row.status || "submitted",
+    decision: row.regular_decision || null,
+    approvalEvidence: row.approval_evidence || {},
     decisionReason: row.decision_reason || "",
     decidedBy: row.decided_by || null,
     decidedAt: row.decided_at || null,
@@ -186,6 +205,8 @@ function mapLine(row = {}) {
 
 function mapTransfer(row = {}) {
   return {
+    workflowVersion:Number(row.request_workflow_version||1),
+    deliverySalesOrderRef: row.delivery_sales_order_ref || null,
     id: Number(row.id),
     transferRef: row.transfer_ref || "",
     requestId: Number(row.request_id),
@@ -235,6 +256,9 @@ function mapRequest(row = {}) {
     id: Number(row.id),
     requestRef: row.request_ref || "",
     requestType: row.request_type || "regular",
+    workflowVersion: Number(row.workflow_version || 1),
+    regular: row.regular_details || {},
+    manualDecisionEventId: Number(row.manual_decision_event_id || 0),
     destinationLocationId: Number(row.destination_location_id),
     destinationName: row.destination_name || "",
     status: row.status || "submitted",
@@ -361,10 +385,10 @@ async function assertCachedAvailability(lines, { allowOverAvailability = false }
   }
 }
 
-function normalizeLineInput(input, item, destinationLocationId) {
+function normalizeLineInput(input, item, destinationLocationId, stockingType = 'transfer') {
   const normalizedDestinationLocationId = normalizeStockRequestYardId(destinationLocationId, "destination yard");
-  const sourceLocationId = sourceLocation(input.sourceLocationId, normalizedDestinationLocationId);
-  const quantity = normalizeStockRequestQuantity(input, {
+  const sourceLocationId = ['purchase','waitlist'].includes(stockingType) ? null : sourceLocation(input.sourceLocationId, normalizedDestinationLocationId);
+  const quantity = stockingType === 'waitlist' ? {salesQty:waitlistQuantity(input.salesQty),salesUom:item.stock_unit,mode:'sales',pallets:null,layers:null,sections:null,pieces:null} : normalizeStockRequestQuantity(input, {
     stockUnit: item.stock_unit,
     toPlt: item.to_plt,
     toLyr: item.to_lyr,
@@ -377,7 +401,8 @@ function normalizeLineInput(input, item, destinationLocationId) {
     itemName: item.item_name || item.display_name || String(item.item_id),
     itemDescription: item.item_description || "",
     sourceLocationId,
-    sourceName: YARD_BY_LOCATION_ID.get(sourceLocationId).yardCode,
+    sourceName: sourceLocationId === null ? null : YARD_BY_LOCATION_ID.get(sourceLocationId).yardCode,
+    stockingType,
     destinationLocationId: normalizedDestinationLocationId,
     destinationName: YARD_BY_LOCATION_ID.get(normalizedDestinationLocationId).yardCode,
     salesQty: quantity.salesQty,
@@ -394,7 +419,7 @@ function normalizeLineInput(input, item, destinationLocationId) {
   };
 }
 
-async function normalizeLines(lines, destinationLocationId, { allowOverAvailability = false } = {}) {
+async function normalizeLines(lines, destinationLocationId, { allowOverAvailability = false, stockingType = 'transfer' } = {}) {
   if (!Array.isArray(lines) || !lines.length || lines.length > 100) {
     throw stockRequestError("A stock request requires between 1 and 100 lines.");
   }
@@ -402,9 +427,9 @@ async function normalizeLines(lines, destinationLocationId, { allowOverAvailabil
   const normalized = lines.map((line) => {
     const item = items.get(Number(line.itemId));
     if (!item) throw stockRequestError("Inventory item was not found.", 404, "STOCK_REQUEST_ITEM_NOT_FOUND");
-    return normalizeLineInput(line, item, destinationLocationId);
+    return normalizeLineInput(line, item, destinationLocationId, stockingType);
   });
-  await assertCachedAvailability(normalized, { allowOverAvailability });
+  if (!['purchase','waitlist'].includes(stockingType)) await assertCachedAvailability(normalized, { allowOverAvailability });
   return normalized;
 }
 
@@ -415,17 +440,17 @@ async function insertLine(requestId, line, { status = "submitted" } = {}) {
        source_location_id, source_name, destination_location_id, destination_name,
        sales_qty, sales_uom, quantity_mode,
        pallet_qty, layer_qty, section_qty, piece_qty,
-       to_plt, to_lyr, to_sec, to_pcs, status
+       to_plt, to_lyr, to_sec, to_pcs, status, stocking_type
      ) VALUES (
        $1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,
-       $12,$13,$14,$15,$16,$17,$18,$19,$20
+       $12,$13,$14,$15,$16,$17,$18,$19,$20,$21
      ) RETURNING *`,
     [
       requestId, line.itemId, line.itemName, line.itemDescription,
       line.sourceLocationId, line.sourceName, line.destinationLocationId, line.destinationName,
       line.salesQty, line.salesUom, line.quantityMode,
       line.pallets, line.layers, line.sections, line.pieces,
-      line.toPlt, line.toLyr, line.toSec, line.toPcs, status
+      line.toPlt, line.toLyr, line.toSec, line.toPcs, status, line.stockingType || 'transfer'
     ]
   );
   return result.rows[0];
@@ -479,6 +504,7 @@ async function requestDetailRows(requestId) {
     );
   const transferResult = await query(
       `SELECT transfer.*,
+            (SELECT workflow_version FROM sales_stock_requests WHERE id=transfer.request_id) AS request_workflow_version,
               print_job.status AS print_status,
               canonical.dispatch_planned,
               canonical.dispatch_plan_date,
@@ -531,7 +557,15 @@ async function requestDetailRows(requestId) {
     details: row.details || {},
     createdAt: row.created_at
   }));
+  if (request.regular?.stockingType === 'purchase') {
+    const { decoratePurchaseStockRequest } = await import('./regular-stock-purchase-repository.js');
+    await decoratePurchaseStockRequest(request);
+  }
   request.bucket = stockRequestBucket(request);
+  if (isWaitlist(request)) {
+    const {decorateWaitlistRequest}=await import('./regular-waitlist-repository.js');
+    await decorateWaitlistRequest(request);
+  }
   return request;
 }
 
@@ -568,11 +602,12 @@ export async function searchStockRequestItems({ search = "", limit = 30 } = {}) 
   }));
 }
 
-export async function getStockRequestItemAvailability(itemId) {
+export async function getStockRequestItemAvailability(itemId, {locationId=null} = {}) {
   const id = requiredId(itemId, "inventory item");
   const items = await inventoryItems([id]);
   const item = items.get(id);
-  const locationIds = STOCK_REQUEST_YARDS.map((yard) => yard.locationId);
+  const yards=locationId===null?STOCK_REQUEST_YARDS:STOCK_REQUEST_YARDS.filter(yard=>yard.locationId===normalizeStockRequestYardId(locationId));
+  const locationIds = yards.map((yard) => yard.locationId);
   const [balanceResult, reservations] = await Promise.all([
     query(
       `SELECT location_id, location, quantity_on_hand, quantity_available, synced_at
@@ -597,7 +632,7 @@ export async function getStockRequestItemAvailability(itemId) {
       toSec: nullableNumeric(item.to_sec),
       toPcs: nullableNumeric(item.to_pcs)
     },
-    yards: STOCK_REQUEST_YARDS.map((yard) => {
+    yards: yards.map((yard) => {
       const balance = balanceByLocation.get(yard.locationId);
       const activeReserved = reservations.get(`${id}:${yard.locationId}`) || 0;
       const liveAvailable = numeric(balance?.quantity_available);
@@ -626,7 +661,8 @@ export async function createSalesStockRequest(input = {}, {
       authorizedDestinationLocationIds
     );
     const remarks = cleanRemark(input.remarks);
-    const lines = await normalizeLines(input.lines, destinationLocationId, { allowOverAvailability });
+    const stockingType = input.deliveryMethod === 'waitlist' ? 'waitlist' : input.deliveryMethod === 'stocking' && input.stockingType === 'purchase' ? 'purchase' : 'transfer';
+    const lines = await normalizeLines(input.lines, destinationLocationId, { allowOverAvailability, stockingType });
     const inserted = await query(
       `INSERT INTO sales_stock_requests (
          destination_location_id, destination_name, requested_by, remarks
@@ -650,12 +686,62 @@ export async function createSalesStockRequest(input = {}, {
   });
 }
 
+// Only the server's verified SO snapshot supplies these quantities. Pickup and
+// Stocking continue to use their existing conversion-input validation above.
+export async function calculateDeliveryStockRequest(route, materials) {
+  return withTransaction(async () => {
+    const {deliveryQuantities} = await import('./regular-stock-delivery-domain.js');
+    const items = await inventoryItems(materials.map(line => line.itemId), {forShare:true});
+    const availability = await conversionAvailabilitySnapshot(materials.map(line => ({
+      item_id:line.itemId,source_location_id:route.sourceLocationId,sales_qty:line.quantity
+    })));
+    const calculated = deliveryQuantities(materials,availability);
+    const lines = calculated.map(material => {
+      const item = items.get(material.itemId);
+      if (String(item.stock_unit).trim().toUpperCase() !== String(material.uom).trim().toUpperCase()) {
+        throw stockRequestError('The SO and item master units differ. Refresh the item before retrying.', 409, 'REGULAR_SO_MISMATCH');
+      }
+      const line = normalizeLineInput({itemId:material.itemId,sourceLocationId:route.sourceLocationId,salesQty:material.quantity},
+        {...item,to_plt:null,to_lyr:null,to_sec:null,to_pcs:null}, route.destinationLocationId);
+      const packing = dependencyQuantityConversionDisplay(line.salesQty, Object.fromEntries(
+        ['to_plt','to_lyr','to_sec','to_pcs'].map(key => [key, Math.max(0,numeric(item[key]))])
+      ));
+      return {...line,pallets:packing.palletQty,layers:packing.layerQty,sections:packing.sectionQty,pieces:packing.pieceQty,
+        remoteLineId:material.remoteLineId,soQuantity:material.soQuantity,backorderedQuantity:material.backorderedQuantity,
+        quantityBasis:material.quantityBasis,toPlt:nullableNumeric(item.to_plt),toLyr:nullableNumeric(item.to_lyr),toSec:nullableNumeric(item.to_sec),toPcs:nullableNumeric(item.to_pcs)};
+    });
+    const pallet = stockRequestPalletQuantity(lines);
+    if (pallet.requiresManualQuantity) throw stockRequestError('PALLET cannot be calculated. Update the missing item pallet conversion and retry.',409,'REGULAR_DELIVERY_PALLET_CONVERSION');
+    return {lines,palletQuantity:pallet.automaticQuantity};
+  });
+}
+
+export async function createDeliveryStockRequestFromOrder(route, materials, context) {
+  if (!context.operatorId) throw stockRequestError('A staff Sales operator is required.', 403);
+  return withTransaction(async () => {
+    const destination = assertStockRequestDestinationAccess(route.destinationLocationId, context.authorizedDestinationLocationIds);
+    const calculated = await calculateDeliveryStockRequest(route,materials);
+    const {lines} = calculated;
+    const request = (await query(`INSERT INTO sales_stock_requests(destination_location_id,destination_name,requested_by)
+      VALUES($1,$2,$3) RETURNING id`, [destination,route.destinationName,context.operatorId])).rows[0];
+    for (const line of lines) await insertLine(request.id, line);
+    await recordEvent({requestId:request.id,eventType:'request_submitted',actorId:context.operatorId,details:{lineCount:lines.length,source:'sales_order'}});
+    return {...await requestDetailRows(request.id),deliveryCalculation:calculated};
+  });
+}
+
 export async function getSalesStockRequest(requestId, { authorizedDestinationLocationIds } = {}) {
   const detail = await requestDetailRows(requiredId(requestId, "stock request"));
   if (!detail) throw stockRequestError("Stock request was not found.", 404, "STOCK_REQUEST_NOT_FOUND");
   assertSalesScope(detail, authorizedDestinationLocationIds);
+  if(isWaitlist(detail))return detail;
   const itemIds = [...new Set(detail.lines.map((line) => line.itemId))];
-  detail.availability = await Promise.all(itemIds.map(getStockRequestItemAvailability));
+  if(detail.regular?.stockingType==='purchase'){
+    const {getPurchaseStockEvidence}=await import('./regular-stock-purchase-repository.js');
+    detail.availability=await Promise.all(itemIds.map(id=>getStockRequestItemAvailability(id,{locationId:detail.destinationLocationId})));
+    const stocks=await Promise.all(itemIds.map(id=>getPurchaseStockEvidence(id,detail.destinationLocationId)));
+    detail.currentEvidence=detail.lines.map(line=>({lineId:line.id,...stocks[itemIds.indexOf(line.itemId)],unit:line.salesUom}));
+  }else detail.availability = await Promise.all(itemIds.map(getStockRequestItemAvailability));
   return detail;
 }
 
@@ -666,6 +752,7 @@ export async function listSalesStockRequests({
   vendor = "",
   requestDate = "",
   sourceLocationId = "",
+  sourceLocationIds = undefined,
   limit = 40,
   offset = 0
 } = {}) {
@@ -695,19 +782,19 @@ export async function listSalesStockRequests({
          AND bucket_line.status IN ('submitted', 'changes_requested')
     )`);
   } else if (requestedBucket === "accepted") {
-    clauses.push(`EXISTS (
+    clauses.push(`(EXISTS (
       SELECT 1 FROM sales_stock_transfers bucket_transfer
        WHERE bucket_transfer.request_id = request.id
          AND (
            bucket_transfer.status <> 'cancelled'
            OR bucket_transfer.netsuite_transfer_order_id IS NOT NULL
          )
-    )`);
+    ) OR EXISTS (SELECT 1 FROM sales_stock_request_lines approved_line WHERE approved_line.request_id=request.id AND approved_line.status='approved'))`);
   } else if (requestedBucket === "completed") {
     clauses.push(`NOT EXISTS (
       SELECT 1 FROM sales_stock_request_lines bucket_line
        WHERE bucket_line.request_id = request.id
-         AND bucket_line.status NOT IN ('received', 'rejected', 'cancelled', 'closed')
+         AND bucket_line.status NOT IN ('received', 'rejected', 'cancelled', 'closed', 'fulfilled')
     )`);
   }
   if (normalizedSearch) {
@@ -724,6 +811,7 @@ export async function listSalesStockRequests({
     vendor,
     requestDate,
     sourceLocationId,
+    sourceLocationIds,
     destinationLocationId: null
   });
   params.push(Math.min(200, boundedLimit * 3), boundedOffset);
@@ -755,6 +843,7 @@ export async function updateSalesStockRequest(requestId, input = {}, {
   return withTransaction(async () => {
     const request = await lockRequest(requestId);
     assertSalesScope(request, authorizedDestinationLocationIds);
+    if(isWaitlist(request))throw waitlistError('Waitlist details are fixed. Close this request and submit a correction.','WAITLIST_WORKFLOW_ONLY',409);
     const expected = requiredRevision(input.expectedRevision);
     if (Number(request.revision) !== expected) {
       throw stockRequestError("This stock request changed after the screen loaded. Reload and try again.", 409, "STOCK_REQUEST_REVISION_CONFLICT");
@@ -770,7 +859,9 @@ export async function updateSalesStockRequest(requestId, input = {}, {
         input.destinationLocationId ?? request.destination_location_id,
         authorizedDestinationLocationIds
       );
-    const normalized = await normalizeLines(input.lines, destinationLocationId, { allowOverAvailability });
+    const stockingType = input.stockingType ?? request.regular_details?.stockingType ?? 'transfer';
+    if (hasDecision && stockingType !== (request.regular_details?.stockingType || 'transfer')) throw stockRequestError('The Stocking type cannot change after SCM review.',409);
+    const normalized = await normalizeLines(input.lines, destinationLocationId, { allowOverAvailability, stockingType });
     const existingById = new Map(existing.map((line) => [Number(line.id), line]));
     if (hasDecision) {
       for (const line of normalized) {
@@ -797,14 +888,14 @@ export async function updateSalesStockRequest(requestId, input = {}, {
                 sales_qty = $10, sales_uom = $11, quantity_mode = $12,
                 pallet_qty = $13, layer_qty = $14, section_qty = $15, piece_qty = $16,
                 to_plt = $17, to_lyr = $18, to_sec = $19, to_pcs = $20,
-                updated_at = now()
+                stocking_type = $21, updated_at = now()
           WHERE id = $1 AND request_id = $2`,
         [
           line.id, request.id, line.itemId, line.itemName, line.itemDescription,
           line.sourceLocationId, line.sourceName, line.destinationLocationId, line.destinationName,
           line.salesQty, line.salesUom, line.quantityMode,
           line.pallets, line.layers, line.sections, line.pieces,
-          line.toPlt, line.toLyr, line.toSec, line.toPcs
+          line.toPlt, line.toLyr, line.toSec, line.toPcs, stockingType
         ]
       );
     }
@@ -842,6 +933,7 @@ export async function cancelSalesStockRequest(requestId, input = {}, {
   return withTransaction(async () => {
     const request = await lockRequest(requestId);
     assertSalesScope(request, authorizedDestinationLocationIds);
+    if(isWaitlist(request))throw waitlistError('Use Close to return unused waitlist allocations.','WAITLIST_WORKFLOW_ONLY',409);
     const expected = requiredRevision(input.expectedRevision);
     if (Number(request.revision) !== expected) {
       throw stockRequestError("This stock request changed after the screen loaded. Reload and try again.", 409, "STOCK_REQUEST_REVISION_CONFLICT");
@@ -850,6 +942,10 @@ export async function cancelSalesStockRequest(requestId, input = {}, {
       throw stockRequestError("A stock request cannot be cancelled after the first SCM decision.", 409, "STOCK_REQUEST_LOCKED");
     }
     if (request.status !== "submitted") throw stockRequestError("This stock request cannot be cancelled.", 409);
+    if(request.regular_details?.deliveryVersion===1){
+      await query('DELETE FROM regular_stock_so_line_owners WHERE request_id=$1',[request.id]);
+      await query("DELETE FROM regular_stock_handoffs WHERE request_id=$1 AND status='ready'",[request.id]);
+    }
     await query(
       `UPDATE sales_stock_requests
           SET status = 'cancelled', revision = revision + 1,
@@ -875,6 +971,7 @@ export async function resubmitSalesStockRequest(requestId, input = {}, {
   return withTransaction(async () => {
     const request = await lockRequest(requestId);
     assertSalesScope(request, authorizedDestinationLocationIds);
+    if(isWaitlist(request))throw waitlistError('Waitlist requests return to Waiting automatically.','WAITLIST_WORKFLOW_ONLY',409);
     const expected = requiredRevision(input.expectedRevision);
     if (Number(request.revision) !== expected) {
       throw stockRequestError("This stock request changed after the screen loaded. Reload and try again.", 409, "STOCK_REQUEST_REVISION_CONFLICT");
@@ -921,6 +1018,7 @@ async function updateStoredRequestStatus(requestId) {
 export async function decideSalesStockRequestLines(requestId, input = {}, { operatorId } = {}) {
   return withTransaction(async () => {
     const request = await lockRequest(requestId);
+    if(isWaitlist(request))throw waitlistError('Use the Waitlist allocation workspace.','WAITLIST_WORKFLOW_ONLY',409);
     const expected = requiredRevision(input.expectedRevision);
     if (Number(request.revision) !== expected) {
       throw stockRequestError("This stock request changed after the screen loaded. Reload and try again.", 409, "STOCK_REQUEST_REVISION_CONFLICT");
@@ -1040,9 +1138,13 @@ async function localPalletItem() {
   return result.rows[0] || null;
 }
 
-export async function convertSalesStockRequestLines(requestId, input = {}, { operatorId } = {}) {
+export async function convertSalesStockRequestLines(requestId, input = {}, { operatorId, approvedHandoff = false } = {}) {
   return withTransaction(async () => {
     const request = await lockRequest(requestId);
+    if(isWaitlist(request))throw waitlistError('Waitlist allocations create a new Sales Order.','WAITLIST_WORKFLOW_ONLY',409);
+    if (Number(request.workflow_version) === 2 && !approvedHandoff) {
+      throw stockRequestError("Approved regular requests execute after Sales links the SO.", 409);
+    }
     const expected = requiredRevision(input.expectedRevision);
     if (Number(request.revision) !== expected) {
       throw stockRequestError("This stock request changed after the screen loaded. Reload and try again.", 409, "STOCK_REQUEST_REVISION_CONFLICT");
@@ -1056,8 +1158,31 @@ export async function convertSalesStockRequestLines(requestId, input = {}, { ope
         FOR UPDATE`,
       [request.id, lineIds]
     );
-    if (locked.rowCount !== lineIds.length || locked.rows.some((line) => !EDITABLE_LINE_STATUSES.has(line.status))) {
+    if (locked.rowCount !== lineIds.length || locked.rows.some((line) => Number(request.workflow_version) === 2 ? line.status !== 'approved' : !EDITABLE_LINE_STATUSES.has(line.status))) {
       throw stockRequestError("Only submitted or returned lines can be converted.", 409, "STOCK_REQUEST_LINE_LOCKED");
+    }
+    if (request.regular_details?.deliveryVersion === 1) {
+      const handoff = (await query('SELECT plan FROM regular_stock_handoffs WHERE request_id=$1 FOR UPDATE',[request.id])).rows[0];
+      const plan = handoff.plan;
+      const materials = plan.order.lines.filter(line=>plan.materialLineIds.includes(line.remoteLineId));
+      const calculated = await calculateDeliveryStockRequest({sourceLocationId:Number(locked.rows[0].source_location_id),
+        destinationLocationId:Number(request.destination_location_id)},materials);
+      for (const line of calculated.lines) {
+        const mapping = plan.mappings.find(entry=>entry.remoteLineId===line.remoteLineId);
+        const row = locked.rows.find(entry=>Number(entry.id)===mapping.requestLineId);
+        row.sales_qty = line.salesQty;
+        // Keep the selected quantity, packing counts and conversion snapshot together.
+        for (const [key,value] of Object.entries({pallet_qty:line.pallets,layer_qty:line.layers,section_qty:line.sections,piece_qty:line.pieces,
+          to_plt:line.toPlt,to_lyr:line.toLyr,to_sec:line.toSec,to_pcs:line.toPcs})) row[key]=value;
+        mapping.quantity = line.salesQty;
+        await query(`UPDATE sales_stock_request_lines SET sales_qty=$2,to_plt=$3,to_lyr=$4,to_sec=$5,to_pcs=$6,
+          pallet_qty=$7,layer_qty=$8,section_qty=$9,piece_qty=$10,updated_at=now() WHERE id=$1`,
+          [row.id,line.salesQty,line.toPlt,line.toLyr,line.toSec,line.toPcs,line.pallets,line.layers,line.sections,line.pieces]);
+      }
+      plan.groups = groupStockRequestLinesForTransfer(locked.rows);
+      await query('UPDATE regular_stock_handoffs SET plan=$2::jsonb WHERE request_id=$1',[request.id,JSON.stringify(plan)]);
+      await query(`UPDATE sales_stock_requests SET regular_details=regular_details||$2::jsonb WHERE id=$1`,
+        [request.id,JSON.stringify({palletQuantity:calculated.palletQuantity})]);
     }
     const availability = await conversionAvailabilitySnapshot(locked.rows);
     const groups = groupStockRequestLinesForTransfer(locked.rows.map((line) => ({
@@ -1109,7 +1234,7 @@ export async function convertSalesStockRequestLines(requestId, input = {}, { ope
             line.to_plt, line.to_lyr, line.to_sec, line.to_pcs
           ]
         );
-        await query(
+        if (Number(request.workflow_version) !== 2) await query(
           `INSERT INTO sales_stock_transfer_reservations (
              transfer_line_id, item_id, source_location_id, reserved_sales_quantity
            ) VALUES ($1,$2,$3,$4)`,
@@ -1164,30 +1289,40 @@ export async function listScmStockRequests({
   requestDate = "",
   sourceLocationId = "",
   destinationLocationId = "",
+  sourceLocationIds = undefined,
+  destinationLocationIds = undefined,
   limit = 40,
   offset = 0
 } = {}) {
   const normalizedQueue = String(queue || "request").trim().toLowerCase();
-  if (!new Set(["request", "pending_to", "rejected", "closed"]).has(normalizedQueue)) {
+  if (!new Set(["request", "approved", "pending_to", "rejected", "closed"]).has(normalizedQueue)) {
     throw stockRequestError("SCM stock-request queue must be Request, Pending TO, Rejected, or Closed.");
   }
   const boundedLimit = normalizeStockRequestListLimit(limit);
   const boundedOffset = Math.min(Math.max(Math.trunc(Number(offset)) || 0, 0), 10_000);
   const normalizedSearch = cleanSearch(search);
   const params = [];
-  const clauses = ["request.request_type = 'regular'"];
+  const clauses = ["request.request_type = 'regular'", "COALESCE(request.regular_details->>'deliveryMethod','')<>'waitlist'"];
   if (normalizedQueue === "request") {
     clauses.push(`EXISTS (
       SELECT 1 FROM sales_stock_request_lines line
        WHERE line.request_id = request.id
-         AND line.status IN ('submitted', 'changes_requested')
+         AND (line.status IN ('submitted', 'changes_requested') OR
+           (line.status='approved' AND request.workflow_version=2 AND request.regular_details->>'deliveryMethod'='stocking'
+             AND COALESCE(request.regular_details->>'stockingType','transfer')<>'purchase'
+             AND NOT request.regular_details ? 'pickupTransfer' AND NOT request.regular_details ? 'handoffStatus'))
     )`);
+  } else if (normalizedQueue === "approved") {
+    clauses.push("EXISTS(SELECT 1 FROM sales_stock_request_lines line WHERE line.request_id=request.id AND line.status='approved')");
+    clauses.push("COALESCE(request.regular_details->>'deliveryVersion','')<>'1'");
+    clauses.push("NOT (request.workflow_version=2 AND COALESCE(request.regular_details->>'deliveryMethod','')='stocking' AND COALESCE(request.regular_details->>'stockingType','transfer')<>'purchase' AND NOT request.regular_details ? 'handoffStatus')");
   } else if (normalizedQueue === "pending_to") {
-    clauses.push(`EXISTS (
+    clauses.push(`(EXISTS (
       SELECT 1 FROM sales_stock_transfers transfer
        WHERE transfer.request_id = request.id
          AND transfer.status NOT IN ('received', 'cancelled', 'closed')
-    )`);
+    ) OR (request.regular_details->>'deliveryVersion'='1' AND request.regular_details->>'deliveryApproval'='approved'
+      AND request.status='active' AND COALESCE(request.regular_details->>'handoffStatus','')<>'complete'))`);
   } else if (normalizedQueue === "rejected") {
     clauses.push(`EXISTS (
       SELECT 1 FROM sales_stock_request_lines line
@@ -1195,11 +1330,11 @@ export async function listScmStockRequests({
          AND line.status = 'rejected'
     )`);
   } else {
-    clauses.push(`EXISTS (
+    clauses.push(`(request.status = 'completed' OR EXISTS (
       SELECT 1 FROM sales_stock_transfers transfer
        WHERE transfer.request_id = request.id
          AND transfer.status = 'closed'
-    )`);
+    ))`);
   }
   if (normalizedSearch) {
     params.push(`%${normalizedSearch}%`);
@@ -1215,7 +1350,9 @@ export async function listScmStockRequests({
     vendor,
     requestDate,
     sourceLocationId,
-    destinationLocationId
+    destinationLocationId,
+    sourceLocationIds,
+    destinationLocationIds
   });
   params.push(boundedLimit, boundedOffset);
   const result = await query(
@@ -1263,14 +1400,23 @@ export async function listStockRequestFilterOptions({ authorizedDestinationLocat
 export async function getScmStockRequest(requestId) {
   const detail = await requestDetailRows(requiredId(requestId, "stock request"));
   if (!detail) throw stockRequestError("Stock request was not found.", 404, "STOCK_REQUEST_NOT_FOUND");
+  if(isWaitlist(detail))return detail;
   const itemIds = [...new Set(detail.lines.map((line) => line.itemId))];
-  detail.availability = await Promise.all(itemIds.map(getStockRequestItemAvailability));
+  if(detail.regular?.stockingType==='purchase') {
+    const {getPurchaseStockEvidence}=await import('./regular-stock-purchase-repository.js');
+    detail.availability=await Promise.all(itemIds.map(id=>getStockRequestItemAvailability(id,{locationId:detail.destinationLocationId})));
+    const stocks=await Promise.all(itemIds.map(id=>getPurchaseStockEvidence(id,detail.destinationLocationId)));
+    detail.currentEvidence=detail.lines.map(line=>({lineId:line.id,...stocks[itemIds.indexOf(line.itemId)],unit:line.salesUom}));
+  }else detail.availability = await Promise.all(itemIds.map(getStockRequestItemAvailability));
   return detail;
 }
 
 export async function getStockTransfer(transferId, { forUpdate = false } = {}) {
   const result = await query(
     `SELECT transfer.*,
+            (SELECT workflow_version FROM sales_stock_requests WHERE id=transfer.request_id) AS request_workflow_version,
+            (SELECT CASE WHEN regular_details->>'deliveryVersion'='1' THEN regular_details->>'salesOrderRef' END
+               FROM sales_stock_requests WHERE id=transfer.request_id) AS delivery_sales_order_ref,
             print_job.status AS print_status,
             canonical.dispatch_planned,
             canonical.dispatch_plan_date,
@@ -1311,6 +1457,7 @@ export async function rejectPendingStockTransfer(transferId, input = {}, { opera
   return withTransaction(async () => {
     const transfer = await getStockTransfer(transferId, { forUpdate: true });
     const request = await lockRequest(transfer.requestId);
+    if(Number(request.workflow_version)===2)throw stockRequestError('This transfer is part of an approved SO handoff and cannot be rejected independently.',409,'REGULAR_TRANSFER_LOCKED');
     const expectedTransferRevision = requiredRevision(input.expectedRevision);
     const expectedRequestRevision = requiredRevision(input.expectedRequestRevision);
     if (transfer.revision !== expectedTransferRevision) {
@@ -1398,9 +1545,55 @@ export async function recordStockRequestEvent(values) {
   return recordEvent(values);
 }
 
+// Preview and confirmation use the same authoritative item conversions. No edits are saved here.
+export async function normalizePickupStockRequestDraft(request, input) {
+  const lines = input.lines;
+  if (!Array.isArray(lines) || !lines.length || lines.length > 100) throw stockRequestError('Include between 1 and 100 Stocking items.');
+  if (lines.some(line => !line || typeof line !== 'object' || Array.isArray(line))) throw stockRequestError('Every Stocking item must be a valid request line.');
+  const editable = request.lines.filter(line => ['submitted', 'approved'].includes(line.status));
+  const existingIds = lines.filter(line => line.id !== undefined && line.id !== null).map(line => requiredId(line.id, 'stock-request line'));
+  if (new Set(existingIds).size !== existingIds.length || existingIds.length !== editable.length
+    || editable.some(line => !existingIds.includes(line.id))) {
+    throw stockRequestError('Include every actionable request line exactly once. Rejected items cannot be converted.');
+  }
+  if (request.lines.length + lines.length - existingIds.length > 100) throw stockRequestError('A request can contain at most 100 items.');
+  const items = await inventoryItems(lines.map(line => line.itemId), { forShare: true });
+  return lines.map(line => {
+    const item = items.get(Number(line.itemId));
+    if (!item) throw stockRequestError('Inventory item was not found.', 404, 'STOCK_REQUEST_ITEM_NOT_FOUND');
+    if (line.id != null && editable.find(existing => existing.id === Number(line.id))?.itemId !== Number(line.itemId)) {
+      throw stockRequestError('An existing request item cannot be replaced. Add the item as a new line.');
+    }
+    if (String(item.item_name).trim().toUpperCase() === 'PALLET') throw stockRequestError('Set PALLET quantities for each transfer route instead of adding a stock line.');
+    return normalizeLineInput(line, item, request.destinationLocationId);
+  });
+}
+
+// The caller holds the request lock and saves the approval and transfer records in this transaction.
+export async function savePickupStockRequestDraft(request, lines, operatorId) {
+  const saved = [];
+  for (const line of lines) {
+    let id = line.id;
+    if (id) {
+      await query(`UPDATE sales_stock_request_lines SET source_location_id=$3,source_name=$4,
+        sales_qty=$5,sales_uom=$6,quantity_mode=$7,pallet_qty=$8,layer_qty=$9,section_qty=$10,piece_qty=$11,
+        to_plt=$12,to_lyr=$13,to_sec=$14,to_pcs=$15,updated_at=now() WHERE request_id=$1 AND id=$2`,
+      [request.id,id,line.sourceLocationId,line.sourceName,line.salesQty,line.salesUom,line.quantityMode,
+        line.pallets,line.layers,line.sections,line.pieces,line.toPlt,line.toLyr,line.toSec,line.toPcs]);
+    } else id = Number((await insertLine(request.id, line)).id);
+    await query(`UPDATE sales_stock_request_lines SET status='approved',regular_decision='stock',
+      decision_reason=NULL,decided_by=$2,decided_at=now(),updated_at=now() WHERE id=$1`, [id,operatorId]);
+    saved.push({ ...line, id });
+  }
+  return saved;
+}
+
 export async function updateScmStockRequestLine(requestId, lineId, input = {}, { operatorId } = {}) {
   return withTransaction(async () => {
     const request = await lockRequest(requestId);
+    if(isWaitlist(request))throw waitlistError('Use the Waitlist allocation workspace.','WAITLIST_WORKFLOW_ONLY',409);
+    if(request.regular_details?.stockingType==='purchase')throw stockRequestError('Review the Purchase quantity when adding it to PO/TO proposals.',409);
+    if(request.regular_details?.deliveryVersion===1)throw stockRequestError('Delivery items and routing come from the saved SO and cannot be edited here.',409,'REGULAR_DELIVERY_LOCKED');
     const expected = requiredRevision(input.expectedRevision);
     if (Number(request.revision) !== expected) {
       throw stockRequestError("This stock request changed after the screen loaded. Reload and try again.", 409, "STOCK_REQUEST_REVISION_CONFLICT");
@@ -1635,9 +1828,10 @@ export async function failStockTransferConfirmation(transferId, failure = {}, { 
           SET netsuite_transfer_order_id = COALESCE($2, netsuite_transfer_order_id),
               netsuite_transfer_order_ref = COALESCE($3, netsuite_transfer_order_ref),
               confirmation_status = 'attention', confirmation_error = $4,
-              status = 'attention', updated_at = now()
+              status = CASE WHEN $5 AND status='pending_fulfillment' AND confirmation_status IN ('hydrating','printing')
+                THEN 'pending_fulfillment' ELSE 'attention' END, updated_at = now()
         WHERE id = $1`,
-      [transfer.id, remoteId || null, remoteRef, message]
+      [transfer.id, remoteId || null, remoteRef, message,transfer.workflowVersion===2]
     );
     await recordEvent({
       requestId: transfer.requestId,
@@ -1909,6 +2103,10 @@ async function reviseLocalStockTransferStructure({
 export async function reviseStockTransferQuantities(transferId, input = {}, { operatorId = null } = {}) {
   return withTransaction(async () => {
     const transfer = await getStockTransfer(transferId, { forUpdate: true });
+    if (transfer.workflowVersion===2 && (await query("SELECT regular_details ? 'pickupTransfer' AS pickup FROM sales_stock_requests WHERE id=$1",[transfer.requestId])).rows[0]?.pickup) {
+      throw stockRequestError('Pickup TO quantities are locked once conversion starts. Resume the saved conversion.',409,'REGULAR_PICKUP_LOCKED');
+    }
+    if(transfer.workflowVersion===2 && Array.isArray(input.lines) && input.lines.length)throw stockRequestError('SO-linked stock-request material quantities are locked after approval.',409,'REGULAR_TRANSFER_LOCKED');
     const expected = requiredRevision(input.expectedRevision);
     const revisionRequestId = String(input.requestId || "").trim();
     if (!revisionRequestId || revisionRequestId.length > 200) throw stockRequestError("A stable requestId is required for a TO quantity revision.");

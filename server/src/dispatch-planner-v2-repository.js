@@ -1,4 +1,5 @@
 import crypto from "node:crypto";
+import { preserveOrdinaryDispatchBins } from "./mbt/bin-planning-domain.js";
 import { applyPendingDispatchPlanMaintenance } from "./dispatch-plan-maintenance.js";
 
 import { query, withTransaction } from "./db.js";
@@ -16,10 +17,13 @@ import {
   reconcileDispatchPlanLocalCos
 } from "./dispatch-co-lifecycle.js";
 import { DISPATCH_FLEET_PLANNING_LOCK } from "./dispatch-fleet-status.js";
+import { prepareDispatchExecutedOrderComparison } from "./dispatch-executed-order-review-repository.js";
+import { preserveDispatchPlanAddresses } from "./dispatch-address-guard.js";
 import { dispatchLoadAssignment } from "./dispatch-load-assignment.js";
 import { materializeDispatchPickupVisits } from "./dispatch-pickup-visits.js";
 import {
   dispatchPlannedAssignmentMap,
+  assertSpecialStockHandoffPlanning,
   dispatchPlanV2Summary,
   refreshDispatchPlanAuthoritativeOrderProjection,
   scrubBilledSalesOrderFamiliesFromPlan
@@ -32,8 +36,10 @@ import {
 } from "./dispatch-planner-optimization.js";
 import {
   assertHistoricalInactiveSalesOrdersReconciled,
-  assertNoDriverPwaCompletedDispatchRefs
+  assertNoDriverPwaCompletedDispatchRefs,
+  retainsHistoricalDispatchBoard
 } from "./dispatch-history-mode.js";
+import { hydrateHistoricalDispatchPlanOrders } from "./dispatch-historical-order-snapshots.js";
 import {
   assertNoClosedNetSuiteOrders,
   scrubClosedNetSuiteOrdersFromOperationalPlan
@@ -142,13 +148,14 @@ function slimAssignedOrder(order = {}) {
     "customer", "customerName", "address", "pickupAddress", "pickupAddressOverride",
     "sourceAddress", "defaultSourceAddress", "dropoffLocation", "pickupLocation",
     "pickupLocations", "sourceYard", "destinationYard", "destinationAddress", "destinationLocationId",
+    "dropoffs", "defaultDestinationAddress", "deliveryAddressOverride",
     "expectedDeliveryDate", "windowStart", "windowEnd", "items", "pallets", "layers",
     "salesQty", "salesQuantities", "committedQty", "packed", "weight", "totalWeightLbs",
     "unloadMinutes", "travelMinutes", "stopMinutes", "instructions", "notes",
     "originalOrderId", "sourceOrderId", "relatedSoId", "originalPoRef", "sourcePoRef",
     "sourcePoRefs", "correspondingPoRefs", "childOrders",
     "childOrderDetails", "groupAliases", "transitCo", "transitOriginalPickupLocations",
-    "transitOriginalSourceYard", "directPickupManifest", "poPickupManifest", "poRouteProjection", "orderDependencies", "dependencyLabels",
+    "transitOriginalSourceYard", "directPickupManifest", "poPickupManifest", "poRouteProjection", "toRouteProjection", "orderDependencies", "dependencyLabels",
     "dependencyDirectPickup", "dependencyWaitingForTransfer", "dependencyAttention",
     "dependencyUncovered", "dependencyUncoveredQuantity", "planOwned", "isSplit", "isGrouped",
     "groupPlanId", "groupPlanDate",
@@ -869,6 +876,7 @@ async function activityForPlan(planId) {
        FROM driver_job_records
       WHERE plan_id = $1
         AND status IN ('in_progress', 'complete')
+        AND mbt_assignment_withdrawn_at IS NULL
       ORDER BY id`,
     [planId]
   );
@@ -943,8 +951,15 @@ export async function applyDispatchV2Command({ planId, command = {}, actorId = n
       };
     }
     assertDispatchPlanFence(persistedPlan, command, { required: Boolean(editLease), computedDigest: persistedPlan.digest });
-    const plan = (await scrubClosedNetSuiteOrdersFromOperationalPlan(await reconcileCancelledLocalCos(persistedPlan))).plan;
-    await assertNoClosedNetSuiteOrders(commandOrderRefs({ ...command, commandType }, plan), "be changed in Dispatch");
+    const retainedHistory = retainsHistoricalDispatchBoard(persistedPlan, { ...command, commandType });
+    const historicalOrders = retainedHistory ? await hydrateHistoricalDispatchPlanOrders(persistedPlan) : null;
+    // An unchanged archived board is already recorded evidence. Today's source
+    // retirement, billing or packing must not rewrite that board on a save.
+    const plan = retainedHistory ? historicalOrders.plan
+      : (await scrubClosedNetSuiteOrdersFromOperationalPlan(await reconcileCancelledLocalCos(persistedPlan))).plan;
+    if (!retainedHistory) {
+      await assertNoClosedNetSuiteOrders(commandOrderRefs({ ...command, commandType }, plan), "be changed in Dispatch");
+    }
     try {
       await assertAssignmentDateAvailable(plan, { ...command, commandType });
     } catch (error) {
@@ -961,6 +976,11 @@ export async function applyDispatchV2Command({ planId, command = {}, actorId = n
       plan,
       command: { ...command, type: commandType }
     });
+    if (retainedHistory && historicalOrders.reconstructed.length) {
+      const known = new Set((result.plan.orders || []).map(order => text(order.id).toLowerCase()));
+      result.plan.orders.push(...plan.orders.filter(order => !known.has(text(order.id).toLowerCase())));
+    }
+    result.plan = preserveOrdinaryDispatchBins(persistedPlan, result.plan);
     const commandReactivatedRefs = [
       ...(Array.isArray(command.payload?.reactivatedGlobalOrderRefs)
         ? command.payload.reactivatedGlobalOrderRefs
@@ -972,16 +992,20 @@ export async function applyDispatchV2Command({ planId, command = {}, actorId = n
         ? (result.patch?.split?.parts || []).map((part) => part?.refNumber || part?.id)
         : [])
     ].map(text).filter(Boolean);
-    result.plan = await reconcileCancelledLocalCos(result.plan, {
-      reactivatedGlobalOrderRefs: commandReactivatedRefs,
-      rejectRetiredGlobalOrderRefs: true
-    });
-    result.plan = await applyPendingDispatchPlanMaintenance(result.plan);
-    result.plan = await scrubBilledSalesOrderFamiliesFromPlan(result.plan);
-    // Global definitions can replace hydrated group lines with raw allocation
-    // quantities. Refresh relationships after that replacement, just as a full
-    // save does, before deciding which physical pickups are actually required.
-    result.plan = await refreshDispatchPlanAuthoritativeOrderProjection(result.plan);
+    result.plan = preserveDispatchPlanAddresses(persistedPlan, result.plan);
+    if (!retainedHistory) {
+      result.plan = await reconcileCancelledLocalCos(result.plan, {
+        reactivatedGlobalOrderRefs: commandReactivatedRefs,
+        rejectRetiredGlobalOrderRefs: true
+      });
+      result.plan = await applyPendingDispatchPlanMaintenance(result.plan);
+      result.plan = await scrubBilledSalesOrderFamiliesFromPlan(result.plan);
+      // Global definitions can replace hydrated group lines with raw allocation
+      // quantities. Refresh relationships after that replacement, just as a full
+      // save does, before deciding which physical pickups are actually required.
+      result.plan = await refreshDispatchPlanAuthoritativeOrderProjection(result.plan);
+      await prepareDispatchExecutedOrderComparison({ previousPlan: plan, nextPlan: result.plan });
+    }
     const pickupVisits = materializeDispatchPickupVisits(result.plan, {
       previousPlan: plan,
       allowLegacyPassthrough: true
@@ -995,15 +1019,22 @@ export async function applyDispatchV2Command({ planId, command = {}, actorId = n
       previousSummary: plan.summary || {},
       source: SNAPSHOT_SUMMARY_SAVE_SOURCE
     });
+    result.plan = preserveDispatchPlanAddresses(persistedPlan, result.plan);
+    const reviewedPreviousPlan = retainedHistory ? plan
+      : await prepareDispatchExecutedOrderComparison({ previousPlan: plan, nextPlan: result.plan });
+    result.plan = preserveOrdinaryDispatchBins(persistedPlan, result.plan);
     const policy = evaluateExecutedPrefixPolicy({
-      previousPlan: plan,
+      previousPlan: reviewedPreviousPlan,
       nextPlan: result.plan,
       activity: await activityForPlan(plan.id)
     });
     if (!policy.allowed) {
       throw commandError(policy.conflicts[0].message, policy.conflicts[0].code, 409, { conflicts: policy.conflicts });
     }
-    await assertActiveDispatchCosForPlan(result.plan);
+    if (!retainedHistory) {
+      await assertSpecialStockHandoffPlanning(result.plan, { previousPlan: persistedPlan });
+      await assertActiveDispatchCosForPlan(result.plan);
+    }
     if (plan.savedAt && command.compactReceipt !== true) {
       const previousCounts = snapshotCounts(persistedPlan);
       await query(
@@ -1086,10 +1117,12 @@ export async function applyDispatchV2Command({ planId, command = {}, actorId = n
     if (command.compactReceipt === true) {await recordDispatchCommandCheckpointState(plan, result.plan);}
     // Operator reads this projection instead of the plan JSON. Keep it in the
     // command transaction so a refresh cannot resurrect a just-ungrouped order.
-    await syncDispatchDeliveryGroupsFromPlan(result.plan, {
-      reactivatedGlobalOrderRefs: commandReactivatedRefs,
-      rejectRetiredGlobalOrderRefs: true
-    });
+    if (!retainedHistory) {
+      await syncDispatchDeliveryGroupsFromPlan(result.plan, {
+        reactivatedGlobalOrderRefs: commandReactivatedRefs,
+        rejectRetiredGlobalOrderRefs: true
+      });
+    }
     const retainedRefs = new Set((result.plan.orders || [])
       .map((order) => text(order?.id).toLowerCase())
       .filter(Boolean));

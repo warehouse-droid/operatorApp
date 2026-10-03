@@ -6,6 +6,13 @@ const salesDeliveryInstructionState = {
   orders: [],
   selectedId: Number(localStorage.getItem("mbbs.sales.deliveryInstructions.selected")) || null,
   detail: null,
+  netSuite: null,
+  netSuiteDraft: null,
+  additionalDraft: null,
+  netSuiteError: "",
+  loadingNetSuite: false,
+  savingNetSuite: false,
+  detailGeneration: 0,
   search: "",
   loadingList: true,
   loadingDetail: false,
@@ -50,12 +57,54 @@ async function salesDeliveryInstructionApi(path, options = {}) {
   const contentType = response.headers.get("content-type") || "";
   const payload = contentType.includes("application/json") ? await response.json() : await response.text();
   if (!response.ok) {
-    const error = new Error(payload?.error || payload || `Request failed (${response.status})`);
+    const message = typeof payload === "string" ? payload : typeof payload?.error === "string" ? payload.error : payload?.error?.message || payload?.message;
+    const error = new Error(message || `Request failed (${response.status})`);
     error.status = response.status;
     error.code = payload?.code || "";
     throw error;
   }
   return payload;
+}
+
+function salesDeliveryInstructionBusyControls() {
+  const busy = salesDeliveryInstructionState.saving || salesDeliveryInstructionState.loadingNetSuite || salesDeliveryInstructionState.loadingDetail || salesDeliveryInstructionState.loadingList;
+  salesDeliveryInstructionApp.setAttribute("aria-busy", String(busy));
+  const sidebar = document.querySelector(".app-sidebar");
+  if (sidebar) sidebar.inert = busy;
+  for (const control of document.querySelectorAll("button, input, textarea, select")) {
+    if (busy) {
+      if (control.dataset.deliveryBusy === undefined) control.dataset.deliveryBusy = String(control.disabled);
+      control.disabled = true;
+    } else if (control.dataset.deliveryBusy !== undefined) {
+      control.disabled = control.dataset.deliveryBusy === "true";
+      delete control.dataset.deliveryBusy;
+    }
+  }
+}
+
+function salesDeliveryInstructionNetSuiteHtml(detail) {
+  const state = salesDeliveryInstructionState;
+  const values = state.netSuiteDraft || { memo: "", shipDate: "", deliverByDate: "" };
+  const editable = detail.editable && state.netSuite?.editable;
+  const disabled = editable ? "" : "disabled";
+  return `<p class="delivery-instruction-muted">${deliveryInstructionEscape(deliveryInstructionT("deliveryInstruction.netsuiteHelp", "Changes here are saved to this Sales Order in NetSuite."))}</p>
+    ${state.loadingNetSuite || state.savingNetSuite ? `<div role="status" class="delivery-instruction-notice delivery-instruction-busy">${deliveryInstructionEscape(state.savingNetSuite ? deliveryInstructionT("deliveryInstruction.savingNetSuite", "Saving to NetSuite… Please wait.") : deliveryInstructionT("deliveryInstruction.loadingNetSuite", "Loading NetSuite values… Please wait."))}</div>` : ""}
+    ${state.netSuiteError ? `<div role="alert" class="delivery-instruction-notice error">${deliveryInstructionEscape(state.netSuiteError)}</div>` : ""}
+    ${state.netSuite?.lockReason ? `<div class="delivery-instruction-notice">${deliveryInstructionEscape(state.netSuite.lockReason)}</div>` : ""}
+    <label for="salesDeliveryInstructionMemo">${deliveryInstructionEscape(deliveryInstructionT("deliveryInstruction.netsuiteMemo", "NetSuite memo instruction"))}</label>
+    <textarea id="salesDeliveryInstructionMemo" maxlength="5000" ${disabled}>${deliveryInstructionEscape(values.memo)}</textarea>
+    <div class="delivery-instruction-date-fields">
+      <label for="salesDeliveryInstructionShipDate">${deliveryInstructionEscape(deliveryInstructionT("deliveryInstruction.shipDate", "Ship Date"))}
+        <input id="salesDeliveryInstructionShipDate" type="date" min="1000-01-01" max="9999-12-31" value="${deliveryInstructionEscape(values.shipDate)}" ${disabled} />
+      </label>
+      <label for="salesDeliveryInstructionDeliverByDate">${deliveryInstructionEscape(deliveryInstructionT("deliveryInstruction.deliverByDate", "To be delivered by"))}
+        <input id="salesDeliveryInstructionDeliverByDate" type="date" min="1000-01-01" max="9999-12-31" value="${deliveryInstructionEscape(values.deliverByDate)}" ${disabled} />
+      </label>
+    </div>
+    <div class="delivery-instruction-actions">
+      <button class="primary" type="button" data-delivery-instruction-action="save-netsuite" ${disabled}>${deliveryInstructionEscape(deliveryInstructionT("deliveryInstruction.saveNetSuite", "Save to NetSuite"))}</button>
+      <button type="button" data-delivery-instruction-action="reload-netsuite">${deliveryInstructionEscape(deliveryInstructionT("deliveryInstruction.reloadNetSuite", "Reload NetSuite values"))}</button>
+    </div>`;
 }
 
 function deliveryInstructionContentUrl(media) {
@@ -95,6 +144,7 @@ function salesDeliveryInstructionRenderList() {
   if (!list) return;
   if (salesDeliveryInstructionState.loadingList) {
     list.innerHTML = `<div class="delivery-instruction-empty">${deliveryInstructionEscape(deliveryInstructionT("deliveryInstruction.loading", "Loading delivery orders…"))}</div>`;
+    salesDeliveryInstructionBusyControls();
     return;
   }
   if (!salesDeliveryInstructionState.orders.length) {
@@ -107,6 +157,7 @@ function salesDeliveryInstructionRenderList() {
       <span>${deliveryInstructionEscape(order.customer || deliveryInstructionT("deliveryInstruction.noCustomer", "Customer not available"))}</span>
       <small>${deliveryInstructionEscape(deliveryInstructionDate(order.orderDate))} · ${deliveryInstructionEscape(order.status || "—")}</small>
     </button>`).join("");
+  salesDeliveryInstructionBusyControls();
 }
 
 function deliveryInstructionMediaHtml(media, editable) {
@@ -130,6 +181,7 @@ function salesDeliveryInstructionRenderDetail() {
   if (!editor) return;
   if (salesDeliveryInstructionState.loadingDetail) {
     editor.innerHTML = `<div class="delivery-instruction-empty">${deliveryInstructionEscape(deliveryInstructionT("deliveryInstruction.loadingDetail", "Loading instructions…"))}</div>`;
+    salesDeliveryInstructionBusyControls();
     return;
   }
   const detail = salesDeliveryInstructionState.detail;
@@ -140,7 +192,7 @@ function salesDeliveryInstructionRenderDetail() {
   const automaticText = detail.automatic?.text || "";
   const phones = Array.isArray(detail.automatic?.phones) ? detail.automatic.phones : [];
   const media = Array.isArray(detail.media) ? detail.media : [];
-  const busy = salesDeliveryInstructionState.saving;
+  const busy = salesDeliveryInstructionState.saving || salesDeliveryInstructionState.loadingNetSuite;
   const mediaUploadEnabled = detail.editable && !busy && media.length < 5;
   editor.innerHTML = `<div class="delivery-instruction-editor-grid">
     <div class="delivery-instruction-heading-line">
@@ -153,13 +205,16 @@ function salesDeliveryInstructionRenderDetail() {
     ${detail.editable ? "" : `<div class="delivery-instruction-notice">${deliveryInstructionEscape(detail.lockReason || deliveryInstructionT("deliveryInstruction.completedLock", "This completed order is retained for reference and cannot be edited."))}</div>`}
     <section class="delivery-instruction-section">
       <h3>${deliveryInstructionEscape(deliveryInstructionT("deliveryInstruction.netsuiteMemo", "NetSuite memo instruction"))}</h3>
+      ${salesDeliveryInstructionNetSuiteHtml(detail)}
+      <h4>${deliveryInstructionEscape(deliveryInstructionT("deliveryInstruction.driverPreview", "Driver instruction preview"))}</h4>
       <p class="delivery-instruction-muted">${deliveryInstructionEscape(deliveryInstructionT("deliveryInstruction.automaticHelp", "Address and planned date/time are omitted when confidently recognized. Ambiguous notes remain complete."))}</p>
       <p class="delivery-instruction-automatic">${deliveryInstructionEscape(automaticText || deliveryInstructionT("deliveryInstruction.noAutomatic", "No memo delivery instruction."))}</p>
       ${phones.length ? `<div class="delivery-instruction-phone-list">${phones.map((phone) => `<a href="tel:${deliveryInstructionEscape(phone.href)}">☎ ${deliveryInstructionEscape(phone.display)}</a>`).join("")}</div>` : ""}
     </section>
     <section class="delivery-instruction-section">
       <h3>${deliveryInstructionEscape(deliveryInstructionT("deliveryInstruction.additionalText", "Additional delivery text"))}</h3>
-      <textarea id="salesDeliveryInstructionText" maxlength="5000" ${detail.editable && !busy ? "" : "disabled"} placeholder="${deliveryInstructionEscape(deliveryInstructionT("deliveryInstruction.additionalPlaceholder", "Add call-ahead, gate, placement, access, or other driver instructions"))}">${deliveryInstructionEscape(detail.additionalText || "")}</textarea>
+      <p class="delivery-instruction-muted">${deliveryInstructionEscape(deliveryInstructionT("deliveryInstruction.appTextHelp", "Additional text and media are shared with Dispatch and drivers in this app."))}</p>
+      <textarea id="salesDeliveryInstructionText" maxlength="5000" ${detail.editable && !busy ? "" : "disabled"} placeholder="${deliveryInstructionEscape(deliveryInstructionT("deliveryInstruction.additionalPlaceholder", "Add call-ahead, gate, placement, access, or other driver instructions"))}">${deliveryInstructionEscape(salesDeliveryInstructionState.additionalDraft ?? detail.additionalText ?? "")}</textarea>
       <div class="delivery-instruction-actions">
         <button class="primary" type="button" data-delivery-instruction-action="save-text" ${detail.editable && !busy ? "" : "disabled"}>${deliveryInstructionEscape(busy ? deliveryInstructionT("deliveryInstruction.saving", "Saving…") : deliveryInstructionT("deliveryInstruction.saveText", "Save text"))}</button>
       </div>
@@ -177,9 +232,11 @@ function salesDeliveryInstructionRenderDetail() {
       </div>
     </section>
   </div>`;
+  salesDeliveryInstructionBusyControls();
 }
 
 async function salesDeliveryInstructionLoadList({ preserveSelection = true } = {}) {
+  if (salesDeliveryInstructionState.saving || salesDeliveryInstructionState.loadingNetSuite) return;
   const generation = ++salesDeliveryInstructionState.listGeneration;
   salesDeliveryInstructionState.loadingList = true;
   salesDeliveryInstructionRenderList();
@@ -199,19 +256,61 @@ async function salesDeliveryInstructionLoadList({ preserveSelection = true } = {
 }
 
 async function salesDeliveryInstructionLoadDetail(orderId) {
+  if (salesDeliveryInstructionState.saving || salesDeliveryInstructionState.loadingNetSuite) return;
+  const generation = ++salesDeliveryInstructionState.detailGeneration;
+  salesDeliveryInstructionState.netSuite = null;
+  salesDeliveryInstructionState.netSuiteDraft = null;
+  salesDeliveryInstructionState.additionalDraft = null;
+  salesDeliveryInstructionState.netSuiteError = "";
   salesDeliveryInstructionState.loadingDetail = true;
   salesDeliveryInstructionState.error = "";
   salesDeliveryInstructionState.notice = "";
   salesDeliveryInstructionRenderDetail();
   try {
-    salesDeliveryInstructionState.detail = await salesDeliveryInstructionApi(`/api/sales/delivery-instructions/orders/${encodeURIComponent(orderId)}`);
+    const detail = await salesDeliveryInstructionApi(`/api/sales/delivery-instructions/orders/${encodeURIComponent(orderId)}`);
+    if (generation !== salesDeliveryInstructionState.detailGeneration) return;
+    salesDeliveryInstructionState.detail = detail;
     salesDeliveryInstructionState.selectedId = Number(salesDeliveryInstructionState.detail.orderId);
     localStorage.setItem("mbbs.sales.deliveryInstructions.selected", String(salesDeliveryInstructionState.selectedId));
   } finally {
-    salesDeliveryInstructionState.loadingDetail = false;
-    salesDeliveryInstructionRenderList();
-    salesDeliveryInstructionRenderDetail();
+    if (generation === salesDeliveryInstructionState.detailGeneration) {
+      salesDeliveryInstructionState.loadingDetail = false;
+      salesDeliveryInstructionRenderList();
+      salesDeliveryInstructionRenderDetail();
+    }
   }
+  await salesDeliveryInstructionLoadNetSuite();
+}
+
+async function salesDeliveryInstructionLoadNetSuite() {
+  const state = salesDeliveryInstructionState, detail = state.detail;
+  if (!detail || state.saving || state.loadingNetSuite) return;
+  const generation = state.detailGeneration;
+  state.loadingNetSuite = true; state.netSuiteError = ""; state.notice = "";
+  salesDeliveryInstructionRenderDetail();
+  try {
+    const loaded = await salesDeliveryInstructionApi(`/api/sales/delivery-instructions/orders/${detail.orderId}/netsuite`);
+    if (generation !== state.detailGeneration) return;
+    state.detail = loaded; state.netSuite = loaded.netSuite; state.netSuiteDraft = { ...loaded.netSuite.values };
+  } catch (error) { state.netSuiteError = error.message; }
+  finally { state.loadingNetSuite = false; salesDeliveryInstructionRenderDetail(); }
+}
+
+async function salesDeliveryInstructionSaveNetSuite() {
+  const state = salesDeliveryInstructionState, detail = state.detail;
+  if (!detail?.editable || !state.netSuite?.editable || state.saving || state.loadingNetSuite || state.loadingList) return;
+  if (!["salesDeliveryInstructionShipDate", "salesDeliveryInstructionDeliverByDate"].every(id => document.getElementById(id).reportValidity())) return;
+  window.clearTimeout(state.searchTimer); state.listGeneration += 1;
+  state.saving = true; state.savingNetSuite = true; state.netSuiteError = ""; state.notice = "";
+  salesDeliveryInstructionRenderDetail();
+  try {
+    const saved = await salesDeliveryInstructionApi(`/api/sales/delivery-instructions/orders/${detail.orderId}/netsuite`, {
+      method: "PUT", body: JSON.stringify({ expectedRevision: detail.revision, expected: state.netSuite, values: state.netSuiteDraft })
+    });
+    state.detail = saved; state.netSuite = saved.netSuite; state.netSuiteDraft = { ...saved.netSuite.values };
+    state.notice = deliveryInstructionT("deliveryInstruction.savedNetSuite", "Saved to NetSuite.");
+  } catch (error) { state.netSuiteError = error.message; }
+  finally { state.saving = false; state.savingNetSuite = false; salesDeliveryInstructionRenderDetail(); }
 }
 
 async function salesDeliveryInstructionSaveText() {
@@ -340,6 +439,15 @@ async function salesDeliveryInstructionDeleteMedia(mediaId) {
 }
 
 salesDeliveryInstructionApp.addEventListener("input", (event) => {
+  const fields = { salesDeliveryInstructionMemo: "memo", salesDeliveryInstructionShipDate: "shipDate", salesDeliveryInstructionDeliverByDate: "deliverByDate" };
+  if (fields[event.target.id] && salesDeliveryInstructionState.netSuiteDraft) {
+    salesDeliveryInstructionState.netSuiteDraft[fields[event.target.id]] = event.target.value;
+    return;
+  }
+  if (event.target.id === "salesDeliveryInstructionText") {
+    salesDeliveryInstructionState.additionalDraft = event.target.value;
+    return;
+  }
   if (event.target.id !== "salesDeliveryInstructionSearch") return;
   salesDeliveryInstructionState.search = event.target.value;
   window.clearTimeout(salesDeliveryInstructionState.searchTimer);
@@ -385,8 +493,10 @@ salesDeliveryInstructionApp.addEventListener("drop", (event) => {
 
 salesDeliveryInstructionApp.addEventListener("click", async (event) => {
   const button = event.target.closest("[data-delivery-instruction-action]");
-  if (!button) return;
+  if (!button || button.disabled || salesDeliveryInstructionState.saving || salesDeliveryInstructionState.loadingNetSuite) return;
   try {
+    if (button.dataset.deliveryInstructionAction === "save-netsuite") return salesDeliveryInstructionSaveNetSuite();
+    if (button.dataset.deliveryInstructionAction === "reload-netsuite") return salesDeliveryInstructionLoadNetSuite();
     if (button.dataset.deliveryInstructionAction === "refresh") return salesDeliveryInstructionLoadList({ preserveSelection: true });
     if (button.dataset.deliveryInstructionAction === "select") return salesDeliveryInstructionLoadDetail(button.dataset.id);
     if (button.dataset.deliveryInstructionAction === "save-text") return salesDeliveryInstructionSaveText();

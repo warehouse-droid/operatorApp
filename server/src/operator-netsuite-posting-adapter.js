@@ -117,6 +117,29 @@ function assertMatchingItem(step, orderLine, actual) {
   }
 }
 
+/** @param {Record<string, any>} step @param {number} orderLine @param {Record<string, any>} actual */
+function assertConfirmedNonInventoryLine(step, orderLine, actual) {
+  const snapshots = (step.lineSnapshot || []).filter((/** @type {any} */ line) =>
+    line.autoIncludedNonInventory === true && Number(line.orderLine) === orderLine);
+  if (step.sourceOrderKind !== 'SO' || step.transactionType !== 'IF' || !snapshots.length) {
+    throw mismatch('The recovered NetSuite transaction contains an unexpected positive line.');
+  }
+  const expected = snapshots[0];
+  const units = String(actual.unitsDisplay ?? actual.units?.refName ?? '').trim().toUpperCase();
+  const localLines = new Set();
+  for (const line of snapshots) {
+    const key = `${line.localOrderKey}:${line.localLineId}`;
+    if (localLines.has(key) || !Number.isFinite(line.quantity) || line.quantity <= 0
+        || !line.salesUom || units !== line.salesUom || line.itemId !== expected.itemId
+        || line.location !== expected.location) {
+      throw mismatch(`The recovered NetSuite sales quantity or UOM for line ${orderLine} does not match.`);
+    }
+    localLines.add(key);
+  }
+  assertMatchingLine(orderLine, { ...expected, quantity: snapshots.reduce((/** @type {number} */ sum, /** @type {any} */ line) => sum + line.quantity, 0) }, actual);
+  assertMatchingItem(step, orderLine, actual);
+}
+
 /**
  * A recovered record is acceptable only when it proves the same source,
  * transaction type, external identity, and exact positive line quantities.
@@ -127,14 +150,18 @@ function assertMatchingItem(step, orderLine, actual) {
 export function verifyOperatorNetSuitePostingRecord(step, record) {
   const id = assertRecordIdentity(step, record);
   const expectedItems = /** @type {Record<string, any>[]} */ (step?.payload?.item?.items || []).filter(receivedItem);
-  const actualItems = recordItems(record).filter(receivedItem);
+  const sourceItems = recordItems(record);
+  if (sourceItems.some((/** @type {Record<string, any>} */ item) => item.itemReceive !== false && item.itemreceive !== false && !Number.isFinite(Number(item.quantity)))) {
+    throw mismatch('The recovered NetSuite transaction contains an invalid quantity.');
+  }
+  const actualItems = sourceItems.filter(receivedItem);
   if (!expectedItems.length || !actualItems.length) {
     throw mismatch("The recovered NetSuite transaction has no verifiable positive lines.");
   }
   const expectedByLine = itemsByUniqueLine(expectedItems, "expected");
   const actualByLine = itemsByUniqueLine(actualItems, "recovered");
-  if (expectedByLine.size !== actualByLine.size) {
-    throw mismatch("The recovered NetSuite transaction contains an unexpected positive line.");
+  for (const [orderLine, actual] of actualByLine) {
+    if (!expectedByLine.has(orderLine)) {assertConfirmedNonInventoryLine(step, orderLine, actual);}
   }
   for (const [orderLine, expected] of expectedByLine) {
     assertMatchingLine(orderLine, expected, actualByLine.get(orderLine));

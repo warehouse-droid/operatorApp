@@ -8,6 +8,7 @@ import { assertOperatorYard, deliveryOrderWithinYards, operatorYardLocationIds, 
 import { operatorRequestPath, operatorRouteId } from "./operator-yard-route.js";
 import { outboundOrderYards, outboundYardLocationId } from './outbound-location-domain.js';
 import { ensureOutboundLocationDirectory } from './outbound-location-runtime.js';
+import { receivingOrderYards, scopeReceivingOrderYard } from './receiving-yard-scope.js';
 
 /** @param {any} row */
 function found(row) {
@@ -15,30 +16,44 @@ function found(row) {
   return row;
 }
 
-/** @param {import("./operator-yard-access.js").OperatorYardAccount} operator @param {any} id */
-export async function assertOperatorOrderYard(operator, id, { receiving = false, orderType = "" } = {}) {
+/** @param {import("./operator-yard-access.js").OperatorYardAccount} operator @param {any} id
+ * @param {{receiving?: boolean, orderType?: string, destinationLocationId?: unknown}} [options] */
+export async function assertOperatorOrderYard(operator, id, { receiving = false, orderType = "", destinationLocationId = null } = {}) {
   let order;
   if (receiving) {
-    const local = orderType === "co_order" || String(id).startsWith("CO-");
-    order = local ? await getLocalCoReceivingOrder(id) : await getReceivingOrder(id, { includeNetSuiteClosed: true });
-    // SCM split POs and TOs also use negative IDs. Resolve those before the
-    // legacy local CO fallback, matching the receiving detail route.
-    if (!order && !local && Number(id) < 0) {
-      order = await getLocalCoReceivingOrder(id);
-    }
+    order = await readReceivingIdentity(id, orderType);
   } else {
     await ensureOutboundLocationDirectory();
     order = await getDeliveryOrder(id, { includeNetSuiteClosed: true });
   }
   found(order);
   if (receiving) {
-    assertOperatorYard(operator, order.destination_location_id);
+    order = receivingOrderForOperator(operator, order, destinationLocationId);
     assertOperatorChildOrderYards(operator, order);
   } else {
     if (!deliveryOrderWithinYards(order, operatorYardLocationIds(operator))) throw operatorYardForbidden();
     for (const yard of outboundOrderYards(order)) assertOperatorYard(operator, yard);
   }
   return order;
+}
+
+/** @param {any} id @param {string} orderType */
+async function readReceivingIdentity(id, orderType) {
+  const local = orderType === 'co_order' || String(id).startsWith('CO-');
+  const order = local ? await getLocalCoReceivingOrder(id) : await getReceivingOrder(id, { includeNetSuiteClosed: true });
+  // Resolve canonical split POs and TOs before the legacy negative CO fallback.
+  return !order && !local && Number(id) < 0 ? getLocalCoReceivingOrder(id) : order;
+}
+
+/** @param {import("./operator-yard-access.js").OperatorYardAccount} operator
+ * @param {any} order @param {unknown} destinationLocationId */
+function receivingOrderForOperator(operator, order, destinationLocationId) {
+  const allowed = operatorYardLocationIds(operator);
+  const candidates = receivingOrderYards(order).filter(yard => allowed.includes(yard));
+  const yard = destinationLocationId ?? (candidates.includes(Number(order.destination_location_id))
+    ? Number(order.destination_location_id) : candidates.length === 1 ? candidates[0] : null);
+  assertOperatorYard(operator, yard);
+  return scopeReceivingOrderYard(order, yard);
 }
 
 /** @param {import("./operator-yard-access.js").OperatorYardAccount} operator @param {any} order */
@@ -60,7 +75,8 @@ export async function assertOperatorUploadYard(operator, body = {}) {
   if (body.recordType === "operator-return-photo" || body.recordType === "operator-damage-photo") return assertOperatorYard(operator, body.locationId);
   if (!body.orderId) throw Object.assign(new Error("An order is required for this photo."), { status: 400 });
   const order = await assertOperatorOrderYard(operator, body.orderId, {
-    receiving: String(body.recordType).includes("receiving"), orderType: body.orderType
+    receiving: String(body.recordType).includes("receiving"), orderType: body.orderType,
+    destinationLocationId: body.destinationLocationId ?? body.locationId ?? null
   });
   return String(body.recordType).includes('receiving') ? Number(order.destination_location_id)
     : outboundYardLocationId(order.outbound_location_id ?? order.source_location_id);
@@ -235,13 +251,34 @@ async function authorizeOperatorRequest(req, pathname, jobs) {
   if (pathname.startsWith("/api/returns/")) return authorizeReturnRequest(req, pathname);
   const order = pathname.match(/^\/api\/(delivery|receiving|customer-pickup)\/orders\/([^/]+)/);
   if (order) {
-    return assertOperatorOrderYard(req.operator, operatorRouteId(order[2]), { receiving: order[1] === "receiving", orderType: req.body?.orderType || req.query.orderType });
+    return authorizeOrderRequest(req, pathname, order);
   }
   const consolidation = pathname.match(/^\/api\/delivery\/consolidation\/(orders|batches)\/([^/]+)/);
   if (consolidation) return assertConsolidationYard(req, consolidation[1] || "", operatorRouteId(consolidation[2]));
   const job = pathname.match(/^\/api\/(delivery\/fulfillment-jobs|receiving\/receipt-jobs|operator\/netsuite-posting-jobs)\/([^/]+)/);
   if (job) return authorizeJobRequest(req, job, jobs);
   return authorizeListRequest(req, pathname);
+}
+
+/** @param {any} req @param {string} pathname @param {RegExpMatchArray} match */
+async function authorizeOrderRequest(req, pathname, match) {
+  const authorized = await assertOperatorOrderYard(req.operator, operatorRouteId(match[2]), {
+    receiving: match[1] === 'receiving', orderType: req.body?.orderType || req.query.orderType,
+    destinationLocationId: req.body?.destinationLocationId ?? req.body?.locationId
+      ?? req.query?.destinationLocationId ?? req.query?.locationId ?? null
+  });
+  if (match[1] === 'receiving') {assertReceivingRequestLines(req, pathname, authorized);}
+  return authorized;
+}
+
+/** @param {any} req @param {string} pathname @param {any} order */
+function assertReceivingRequestLines(req, pathname, order) {
+  if (order.order_type !== 'purchase_order') {return;}
+  const single = pathname.match(/\/lines\/([^/]+)\/(?:confirm|unconfirm)$/);
+  const ids = single ? [operatorRouteId(single[1])]
+    : pathname.endsWith('/lines/confirm-page') ? (req.body?.lines || []).map((/** @type {any} */ line) => line.lineId || line.id) : [];
+  const own = new Set((order.lines || []).map((/** @type {any} */ line) => String(line.id)));
+  if (ids.some((/** @type {any} */ id) => !own.has(String(id)))) {throw operatorYardForbidden();}
 }
 
 export function createOperatorYardGuard({ receivingJobs = new Map(), fulfillmentJobs = new Map() } = {}) {

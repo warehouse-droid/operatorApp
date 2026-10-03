@@ -1,3 +1,4 @@
+import {lockPurchaseStock,reconcilePurchaseStockAllocations,retirePurchaseStockProposals} from './regular-stock-purchase-repository.js';
 import { randomUUID } from "node:crypto";
 import { query, withTransaction } from "./db.js";
 import { smartScmSplitRemainingSql } from "./smart-scm-split-inbound-sql.js";
@@ -77,6 +78,9 @@ function hasExecutionReference(proposal) {
 
 function assertEditableProposal(proposal) {
   if (!proposal) throw Object.assign(new Error("Smart SCM proposal was not found."), { status: 404 });
+  if (proposal.regular_replenishment_id) {
+    throw Object.assign(new Error("Stock request replenishment loads keep their item, source and calculated quantity. Release the priority requirement separately when finished."), {status:409});
+  }
   if (proposal.proposal_origin === "blanket") {
     throw Object.assign(new Error("Blanket pool proposals must be edited from the Blanket order tab so their source allocation stays exact."), { status: 409 });
   }
@@ -154,6 +158,7 @@ function combineLines(lines, next) {
     || smartScmLineOverridesSourceStockFloor(next);
   existing.reason = {
     ...(existing.reason || {}),
+    ...((existing.reason?.purchaseDemandIds || next.reason?.purchaseDemandIds) ? {purchaseDemandIds:[...new Set([...(existing.reason?.purchaseDemandIds||[]),...(next.reason?.purchaseDemandIds||[])])]} : {}),
     ...(manualSourceFloorOverride ? { manualSourceFloorOverride: true } : {}),
     urgent: existing.urgent,
     urgencyLevel: existing.urgencyLevel,
@@ -613,6 +618,7 @@ export async function groupSmartScmProposals(proposalIds = [], operatorId = null
   if (ids.length < 2) throw Object.assign(new Error("Select at least two loads to group."), { status: 400 });
   if (ids.length > 20) throw Object.assign(new Error("Group no more than 20 loads at once."), { status: 400 });
   const outcome = await withTransaction(async () => {
+    await lockPurchaseStock();
     const selectedResult = await query(
       "SELECT * FROM scm_smart_proposals WHERE id = ANY($1::bigint[]) FOR UPDATE",
       [ids]
@@ -672,14 +678,21 @@ export async function groupSmartScmProposals(proposalIds = [], operatorId = null
       throw Object.assign(new Error(`A grouped PO truck from ${first.source_name || "this source"} may have at most ${maximumDrops} destination${maximumDrops === 1 ? "" : "s"}. Select fewer combined drops.`), { status: 409 });
     }
     const weightedCombined = applyPalletOverrideWeight(calculatedCombined, palletProfile, settings.physical_pallet_weight_lbs);
-    const allocations = smartScmAllocateProRata(weightedCombined, settings.truck_capacity_lbs);
+    const purchaseLinked=rawLines.some(line=>line.reason?.purchaseDemandIds?.length);
+    if(purchaseLinked&&rawLines.some(line=>rawLines.some(other=>Number(line.item_id)===Number(other.item_id)
+      && Number(line.destination_location_id)===Number(other.destination_location_id)
+      && (Number(line.to_plt)!==Number(other.to_plt)||line.unit!==other.unit)))){
+      throw Object.assign(new Error('Matching Stocking Purchase items must use the same sales unit and pallet conversion before grouping.'),{status:409});
+    }
+    const allocations = purchaseLinked ? smartScmPackWholePalletLines(weightedCombined,settings.truck_capacity_lbs,{proposalType:'PO',sourceName:first.source_name,routeRule:{...routeRule,partialRedirectEnabled:false},allowPartialPallets:true}).map(load=>load.lines) : smartScmAllocateProRata(weightedCombined, settings.truck_capacity_lbs);
     const allocationOverrides = distributePalletOverrides(palletProfile, allocations);
     const deferredPallets = round(allocations.flat().reduce(
       (sum, line) => sum + positive(line.reason?.groupingDeferredPallets), 0
     ));
     const capacityLimited = deferredPallets > EPSILON;
     const namespace = `${Date.now()}-${ids.join("-")}`;
-    await query("DELETE FROM scm_smart_proposals WHERE id = ANY($1::bigint[])", [ids]);
+    const preserved=await retirePurchaseStockProposals(ids);
+    await query("DELETE FROM scm_smart_proposals WHERE id = ANY($1::bigint[]) AND NOT(id=ANY($2::bigint[]))", [ids,preserved]);
     const createdIds = [];
     for (let index = 0; index < allocations.length; index += 1) {
       const lines = allocations[index];
@@ -721,6 +734,7 @@ export async function groupSmartScmProposals(proposalIds = [], operatorId = null
         operatorId
       }));
     }
+    await reconcilePurchaseStockAllocations();
     const revision = await recordRevision(first.run_id, "Manual proposal load grouping", {
       groupedProposalIds: ids,
       createdProposalIds: createdIds,
@@ -742,6 +756,7 @@ export async function groupSmartScmProposals(proposalIds = [], operatorId = null
 export async function recalculateSmartScmPoProposal(proposalId, operatorId = null) {
   const id = Number(proposalId);
   const outcome = await withTransaction(async () => {
+    await lockPurchaseStock();
     const proposal = await rawProposal(id, { lock: true });
     assertEditableProposal(proposal);
     if (proposal.proposal_type !== "PO") {
@@ -753,7 +768,7 @@ export async function recalculateSmartScmPoProposal(proposalId, operatorId = nul
     const sourceLines = sourceRows.map((line) => draftLine(line, settings.physical_pallet_weight_lbs));
     if (!sourceLines.length) throw Object.assign(new Error("This PO proposal has no lines to recalculate."), { status: 409 });
     const normalizedLines = sourceLines.map((line) => {
-      const pallets = wholePalletQuantity(line.proposedPallets);
+      const pallets = line.reason?.purchaseDemandIds?.length ? positive(line.proposedPallets) : wholePalletQuantity(line.proposedPallets);
       if (pallets <= 0) throw Object.assign(new Error("Every PO line must contain at least one whole pallet."), { status: 409 });
       return {
         ...line,
@@ -772,13 +787,16 @@ export async function recalculateSmartScmPoProposal(proposalId, operatorId = nul
     const routeRule = await getSmartScmRouteRule(proposal.source_name);
     const weightedLines = applyPalletOverrideWeight(normalizedLines, palletProfile, settings.physical_pallet_weight_lbs);
     const packed = smartScmPackWholePalletLines(weightedLines, settings.truck_capacity_lbs, {
-      proposalType: "PO", sourceName: proposal.source_name, maxStops: 2, routeRule
+      proposalType: "PO", sourceName: proposal.source_name, maxStops: 2,
+      routeRule:sourceRows.some(line=>line.reason?.purchaseDemandIds?.length)?{...routeRule,partialRedirectEnabled:false}:routeRule,
+      allowPartialPallets:sourceRows.some(line=>line.reason?.purchaseDemandIds?.length)
     });
     if (!packed.length) throw Object.assign(new Error("The PO recalculation did not produce a load."), { status: 409 });
     const beforePallets = round(weightedLines.reduce((sum, line) => sum + line.proposedPallets, 0));
     const afterPallets = round(packed.flatMap((load) => load.lines).reduce((sum, line) => sum + positive(line.proposedPallets), 0));
     if (beforePallets !== afterPallets) throw new Error("PO recalculation did not preserve the whole-pallet purchase quantity.");
-    await query("DELETE FROM scm_smart_proposals WHERE id = $1", [id]);
+    const preserved=await retirePurchaseStockProposals([id]);
+    if(!preserved.length)await query("DELETE FROM scm_smart_proposals WHERE id = $1", [id]);
     const namespace = `${Date.now()}-${id}`;
     const packedOverrides = distributePalletOverrides(palletProfile, packed.map((load) => load.lines));
     const createdIds = [];
@@ -818,6 +836,7 @@ export async function recalculateSmartScmPoProposal(proposalId, operatorId = nul
         operatorId
       }));
     }
+    await reconcilePurchaseStockAllocations();
     const revision = await recordRevision(proposal.run_id, "PO proposal loads recalculated", {
       originalProposalId: id,
       createdProposalIds: createdIds,
@@ -837,7 +856,7 @@ export async function recalculateSmartScmPoProposal(proposalId, operatorId = nul
   return getSmartScmPlanningRun(outcome.runId);
 }
 
-async function itemPolicy(itemId, destinationLocationId, { allowExcluded = false } = {}) {
+async function itemPolicy(itemId, destinationLocationId, { allowExcluded = false, allowForcedPurchase = false } = {}) {
   const result = await query(
     `SELECT item.item_id, item.item_name, item.item_description, item.stock_unit, item.vendor_id,
             COALESCE(NULLIF(item.vendor, ''), NULLIF(policy.vendor, '')) AS vendor,
@@ -862,7 +881,7 @@ async function itemPolicy(itemId, destinationLocationId, { allowExcluded = false
        JOIN scm_smart_item_policies policy ON policy.item_id = item.item_id
        JOIN scm_smart_item_yard_policies yard ON yard.item_id = item.item_id AND yard.location_id = $2 AND yard.eligible = true
        LEFT JOIN dispatch_vendor_yards vendor_yard ON vendor_yard.id = policy.vendor_yard_id
-      WHERE item.item_id = $1 AND policy.planning_enabled = true AND policy.inactive = false AND policy.discontinued = false
+      WHERE item.item_id = $1 AND (policy.planning_enabled = true OR $4::boolean) AND policy.inactive = false AND policy.discontinued = false
         AND ($3::boolean OR NOT EXISTS (
           SELECT 1
             FROM scm_smart_planning_exclusions exclusion
@@ -871,7 +890,7 @@ async function itemPolicy(itemId, destinationLocationId, { allowExcluded = false
              AND (exclusion.expires_at IS NULL OR exclusion.expires_at > now())
         ))
       FOR KEY SHARE OF policy`,
-    [Number(itemId), Number(destinationLocationId), allowExcluded]
+    [Number(itemId), Number(destinationLocationId), allowExcluded, allowForcedPurchase]
   );
   return result.rows[0] || null;
 }
@@ -1006,6 +1025,9 @@ async function linesWithCalculatedUrgency(lines = [], {
   return lines.map((line) => {
     const state = stateByKey.get(planningStateKey(line.itemId, line.destinationLocationId));
     if (!state) {
+      // SCM accepted these quantities explicitly; automatic planning can be
+      // disabled or paused for the item without removing the purchase demand.
+      if (line.reason?.purchaseDemandIds?.length) return line;
       throw Object.assign(
         new Error(`${line.itemName || "This item"} has no current Smart SCM policy state at ${line.destinationName || "the destination yard"}. Refresh inventory and forecast data before editing the load.`),
         { status: 409 }
@@ -1452,6 +1474,7 @@ export async function updateSmartScmProposalLine(proposalId, lineId, values = {}
   const destinationWasProvided = Object.prototype.hasOwnProperty.call(values, "destinationLocationId");
   if (!Number.isInteger(pallets) || pallets <= 0) throw Object.assign(new Error("Proposed pallets must be a positive whole number; use Remove for this line."), { status: 400 });
   const outcome = await withTransaction(async () => {
+    await lockPurchaseStock();
     const proposal = await rawProposal(id, { lock: true });
     assertEditableProposal(proposal);
     const lineResult = await query("SELECT * FROM scm_smart_proposal_lines WHERE id = $1 AND proposal_id = $2 FOR UPDATE", [targetLineId, id]);
@@ -1466,6 +1489,7 @@ export async function updateSmartScmProposalLine(proposalId, lineId, values = {}
     if (proposal.proposal_type !== "PO" && destinationChanged) {
       throw Object.assign(new Error("A TO line destination is fixed by its transfer route. Edit PO line destinations only."), { status: 409 });
     }
+    if(line.reason?.purchaseDemandIds?.length&&destinationLocationId!==Number(line.destination_location_id))throw Object.assign(new Error('Purchase request quantities must remain at their requesting yard.'),{status:409});
     let destinationName = line.destination_name;
     let toPlt = positive(line.to_plt);
     let toLyr = positive(line.to_lyr);
@@ -1480,7 +1504,7 @@ export async function updateSmartScmProposalLine(proposalId, lineId, values = {}
     };
     if (proposal.proposal_type === "PO") {
       const yard = YARD_BY_ID.get(destinationLocationId);
-      const policy = await itemPolicy(line.item_id, destinationLocationId, { allowExcluded: true });
+      const policy = await itemPolicy(line.item_id, destinationLocationId, { allowExcluded: true,allowForcedPurchase:Boolean(line.reason?.purchaseDemandIds?.length) });
       if (!policy) {
         throw Object.assign(new Error(`${line.item_name} is not enabled for Smart SCM planning at ${yard.code}.`), { status: 409 });
       }
@@ -1598,6 +1622,7 @@ export async function updateSmartScmProposalLine(proposalId, lineId, values = {}
         urgencyScore(calculatedLine.urgencyScore, calculatedLine.urgent)]
     );
     await updateDerivedProposal(id);
+    await reconcilePurchaseStockAllocations();
     const revision = await recordRevision(proposal.run_id, "Proposal line adjusted", {
       proposalId: id,
       lineId: targetLineId,
@@ -1627,6 +1652,7 @@ export async function removeSmartScmProposalLine(proposalId, lineId, operatorId 
   const id = Number(proposalId);
   const targetLineId = Number(lineId);
   const outcome = await withTransaction(async () => {
+    await lockPurchaseStock();
     const proposal = await rawProposal(id, { lock: true });
     assertEditableProposal(proposal);
     const removed = await query("DELETE FROM scm_smart_proposal_lines WHERE id = $1 AND proposal_id = $2 RETURNING item_id, proposed_pallets", [targetLineId, id]);
@@ -1635,6 +1661,7 @@ export async function removeSmartScmProposalLine(proposalId, lineId, operatorId 
     const deletedProposal = Number(remaining.rows[0]?.count || 0) === 0;
     if (deletedProposal) await query("DELETE FROM scm_smart_proposals WHERE id = $1", [id]);
     else await updateDerivedProposal(id);
+    await reconcilePurchaseStockAllocations();
     const revision = await recordRevision(proposal.run_id, "Proposal line removed", { proposalId: id, lineId: targetLineId, deletedProposal }, operatorId);
     return { runId: Number(proposal.run_id), revision, deletedProposal, removed: removed.rows[0] };
   });
@@ -1650,6 +1677,7 @@ export async function splitSmartScmProposalLine(proposalId, lineId, _values = {}
     throw Object.assign(new Error("Select a valid proposal line to split."), { status: 400 });
   }
   const outcome = await withTransaction(async () => {
+    await lockPurchaseStock();
     const proposal = await rawProposal(id, { lock: true });
     assertEditableProposal(proposal);
     const lineResult = await query(
@@ -1737,6 +1765,7 @@ export async function splitSmartScmProposalLine(proposalId, lineId, _values = {}
       await updateDerivedProposal(id);
     }
     await updateDerivedProposal(createdProposalId);
+    await reconcilePurchaseStockAllocations();
     const revision = await recordRevision(proposal.run_id, "Proposal item line moved into a separate load", {
       proposalId: id,
       lineId: targetLineId,

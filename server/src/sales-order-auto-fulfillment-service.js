@@ -140,6 +140,9 @@ export function createSalesOrderAutoFulfillmentProcessor({
     if (!preRecoveredRecord && comparison.state === "closed") {
       return repository.closed({ candidateId: candidate.id, liveOrder, issues: comparison.issues });
     }
+    if (!preRecoveredRecord && liveOrder.fulfillmentComplete === true) {
+      return repository.reconciled({ candidateId:candidate.id,liveOrder });
+    }
     if (!preRecoveredRecord && !splitRecovery && comparison.state === "reconciled") {
       return repository.reconciled({ candidateId: candidate.id, liveOrder });
     }

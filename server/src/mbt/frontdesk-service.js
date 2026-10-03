@@ -3,6 +3,7 @@
 import crypto from "node:crypto";
 
 import { query } from "../db.js";
+import { DISPATCH_FLEET_PLANNING_LOCK } from "../dispatch-fleet-status.js";
 import { createDispatchCustomOrder } from "../dispatch-custom-order-repository.js";
 import { executeMbtCommand } from "./command-repository.js";
 import {
@@ -3779,6 +3780,7 @@ export async function extendFrontdeskContract(input) {
     correlationId: requiredText(input.correlationId, "Correlation ID"),
     requestId: requiredText(input.requestId, "Request ID"),
     mutation: async () => {
+      await query("SELECT pg_advisory_xact_lock(hashtext($1))", [DISPATCH_FLEET_PLANNING_LOCK]);
       const contractResult = await query(
         "SELECT * FROM mbt_contracts WHERE contract_id = $1::uuid FOR UPDATE",
         [contractId]
@@ -3817,7 +3819,7 @@ export async function extendFrontdeskContract(input) {
       if (!deliveryRow || !returnRow) {
         throw failure(422, "MBT_FRONTDESK_CONTRACT_INCOMPLETE", "The contract delivery and return visit chain is incomplete.");
       }
-      if (returnRow.status !== "tentative" || returnRow.actual_started_at) {
+      if (!isUnassignedReturnEditable(returnRow)) {
         throw failure(409, "MBT_FRONTDESK_RETURN_STARTED", "A return visit that has started cannot be extended.");
       }
       if (deliveryRow.scheduled_start_at && startAt <= new Date(deliveryRow.scheduled_start_at)) {
@@ -3950,6 +3952,7 @@ function assertDispatcherOrAdminActor(actor) {
 
 /** @param {string} contractId @param {string} serviceLineId @param {number} expectedRevision */
 async function lockContractServiceLine(contractId, serviceLineId, expectedRevision) {
+  await query("SELECT pg_advisory_xact_lock(hashtext($1))", [DISPATCH_FLEET_PLANNING_LOCK]);
   const contractResult = await query(
     "SELECT * FROM mbt_contracts WHERE contract_id = $1::uuid FOR UPDATE",
     [contractId]
@@ -3991,10 +3994,15 @@ async function lockReturnVisitForLine(serviceLineId) {
   if (!result.rowCount) {
     throw failure(422, "MBT_FRONTDESK_CONTRACT_INCOMPLETE", "The physical-bin line has no pending collection visit.");
   }
-  if (result.rows[0].status !== "tentative" || result.rows[0].actual_started_at) {
+  if (!isUnassignedReturnEditable(result.rows[0])) {
     throw failure(409, "MBT_FRONTDESK_RETURN_STARTED", "A collection visit that has started cannot be changed.");
   }
   return result.rows[0];
+}
+
+/** @param {Record<string, any>} visit */
+function isUnassignedReturnEditable(visit) {
+  return ["tentative", "ready"].includes(visit.status) && !visit.actual_started_at && !visit.dispatch_plan_id;
 }
 
 /** @param {string} contractId */
@@ -4338,7 +4346,7 @@ export async function exchangeFrontdeskServiceLine(input) {
       );
       await query(
         `UPDATE mbt_service_visits
-            SET predecessor_visit_id = NULL, visit_number = $2,
+            SET predecessor_visit_id = NULL, visit_number = $2, status = 'tentative',
                 revision = revision + 1, updated_by = $3, updated_at = now()
           WHERE service_visit_id = $1::uuid`,
         [returnVisit.service_visit_id, exchangeVisitNumber + 1, String(actor.operatorId)]

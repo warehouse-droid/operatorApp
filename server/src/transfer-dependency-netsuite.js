@@ -1,4 +1,5 @@
 import { config } from "./config.js";
+import { smartScmLineKey, smartScmOrderedPayload } from "./smart-scm-line-order.js";
 
 function quantity(value) {
   const parsed = Number(value);
@@ -86,10 +87,10 @@ export function buildTransferDependencyRestPayload({
   memoOverride = ""
 }) {
   const palletItemId = Number(proposal.palletItemId);
-  const materialItems = (proposal.lines || [])
+  const materialLines = (proposal.lines || [])
     .filter((line) => String(line.itemId) !== String(palletItemId)
-      && String(line.sku || line.itemName || "").trim().toUpperCase() !== "PALLET")
-    .map((line) => ({
+      && String(line.sku || line.itemName || "").trim().toUpperCase() !== "PALLET");
+  const materialItems = materialLines.map((line) => ({
       item: { id: String(line.itemId) },
       quantity: quantity(line.proposedQuantity),
       ...transferUnitFields(line)
@@ -107,7 +108,7 @@ export function buildTransferDependencyRestPayload({
     transferLocation: { id: String(locations.destination.netsuiteLocationId) },
     memo,
     item: {
-      items: [
+      items: smartScmOrderedPayload([
         ...materialItems,
         ...(palletQuantity > 0 ? [{
           item: { id: String(palletItemId) },
@@ -117,7 +118,7 @@ export function buildTransferDependencyRestPayload({
           custcol_sec: 0,
           custcol_pcs: palletQuantity
         }] : [])
-      ]
+      ], [...materialLines.map(smartScmLineKey), `pallet:${proposal.destinationLocationId}`], proposal.lineOrder)
     },
     subsidiary: { id: String(locations.source.subsidiaryId) }
   };

@@ -42,7 +42,7 @@ export function resolveScmScheduleRemark({
       netSuiteMemo: memo
     };
   }
-  if (String(orderKind || "").trim().toUpperCase() === "TO" && memo) {
+  if (["PO", "TO"].includes(String(orderKind || "").trim().toUpperCase()) && memo) {
     return {
       remark: memo,
       remarkSource: "netsuite",

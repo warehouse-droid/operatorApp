@@ -1,6 +1,7 @@
 import {createHash} from 'node:crypto';
 import {query,withTransaction} from './db.js';
 import {inventoryError,inventoryId,inventoryYards,assertInventoryYard,quantitySnapshot,countSheetCommand} from './inventory-workflow-domain.js';
+import {packedInventorySnapshot} from './inventory-packed-stock.js';
 
 const header=`SELECT s.*,o.display_name AS owner_name,
  (SELECT count(*)::int FROM inventory_count_sheet_items WHERE sheet_id=s.id) AS total,
@@ -76,12 +77,14 @@ async function saveLine(sheet,actor,input) {
     WHERE si.sheet_id=$1 AND si.item_id=$2`,[sheet.id,inventoryId(input.itemId),sheet.location_id])).rows[0];
   if(!item) {throw inventoryError('This SKU is not assigned to the sheet.');}
   const count=quantitySnapshot(item,input.values);
-  await query(`INSERT INTO inventory_count_sheet_counts(sheet_id,attempt,item_id,operator_id,quantity,unit,values,conversions,system_on_hand,system_available,variance,inventory_synced_at)
-    VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$5::numeric-$9::numeric,$11)
+  const packed=(await packedInventorySnapshot([Number(item.item_id)],sheet.location_id)).get(Number(item.item_id));
+  await query(`INSERT INTO inventory_count_sheet_counts(sheet_id,attempt,item_id,operator_id,quantity,unit,values,conversions,system_on_hand,system_available,variance,inventory_synced_at,packed_qty,actual_on_hand,packed_snapshot_at)
+    VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$5::numeric-($9::numeric-$12::numeric),$11,$12,$9::numeric-$12::numeric,clock_timestamp())
     ON CONFLICT(sheet_id,attempt,item_id) DO UPDATE SET quantity=EXCLUDED.quantity,unit=EXCLUDED.unit,values=EXCLUDED.values,
     conversions=EXCLUDED.conversions,system_on_hand=EXCLUDED.system_on_hand,system_available=EXCLUDED.system_available,
-    variance=EXCLUDED.variance,inventory_synced_at=EXCLUDED.inventory_synced_at,confirmed_at=now()`,
-  [sheet.id,sheet.attempt,item.item_id,actor.id,count.quantity,count.unit,JSON.stringify(count.values),JSON.stringify(count.conversions),item.quantity_on_hand,item.quantity_available,item.synced_at]);
+    variance=EXCLUDED.variance,inventory_synced_at=EXCLUDED.inventory_synced_at,packed_qty=EXCLUDED.packed_qty,
+    actual_on_hand=EXCLUDED.actual_on_hand,packed_snapshot_at=EXCLUDED.packed_snapshot_at,comparison_basis='confirmation',confirmed_at=now()`,
+  [sheet.id,sheet.attempt,item.item_id,actor.id,count.quantity,count.unit,JSON.stringify(count.values),JSON.stringify(count.conversions),item.quantity_on_hand,item.quantity_available,item.synced_at,packed.quantity]);
   await event(sheet,actor,'line',{itemId:Number(item.item_id),quantity:count.quantity});
 }
 async function managementCommand(sheet,actor,action,input) {

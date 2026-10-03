@@ -1,6 +1,6 @@
 import {activeNetSuiteLocationDirectory,fetchInventoryBalanceForItemFromNetSuite,inventoryTransferRest,suiteqlAll} from './netsuite.js';
 import {upsertInventoryBalances} from './inventory-repository.js';
-import {damageDestination,damageMemoMonth,inventoryError,inventoryId} from './inventory-workflow-domain.js';
+import {damageDestination,damageMemo,damageMemoMonth,inventoryError,inventoryId,inventoryMonth} from './inventory-workflow-domain.js';
 
 export async function getDamageItem(itemId,locationId,{fetchItem=fetchInventoryBalanceForItemFromNetSuite,saveItems=upsertInventoryBalances}={}) {
   const rows=await fetchItem(itemId,locationId);
@@ -24,14 +24,21 @@ export function createDamageNetSuite({rest=inventoryTransferRest,directory=activ
     return rows.length ? get(rows[0].id) : null;
   }
   async function findMonthly({locationId,month}) {
-    const destination=damageDestination(await directory(),locationId);
-    const rows=await sql("SELECT id,memo FROM transaction WHERE type='InvTrnfr' AND LOWER(memo) LIKE '%damage%' ORDER BY id DESC");
+    const yard=inventoryId(locationId),acceptedMonth=inventoryMonth(month),year=acceptedMonth.slice(0,4);
+    const namedMonth=damageMemo(yard,acceptedMonth).split(' ')[2].toLowerCase();
+    const rowsRead=sql(`SELECT id,memo FROM transaction WHERE type='InvTrnfr' AND LOWER(memo) LIKE '%damage%'
+      AND (memo LIKE '%${acceptedMonth}%' OR LOWER(memo) LIKE '%${year}%${namedMonth}%') ORDER BY id DESC`);
+    const locationsRead=Promise.allSettled([Promise.resolve().then(directory)]);
+    const rows=await rowsRead,ids=[...new Set(rows.filter(row=>damageMemoMonth(row.memo)===acceptedMonth).map(row=>String(row.id)))];
     const result=[];
-    for(const row of rows.filter(r=>damageMemoMonth(r.memo)===month)) {
-      const record=await get(row.id);
-      if(Number(record.location?.id)===Number(locationId) && Number(record.transferLocation?.id)===destination.destinationId) {result.push(record);}
+    for(let index=0;index<ids.length;index+=3) {
+      const records=await Promise.all(ids.slice(index,index+3).map(get));
+      result.push(...records);
     }
-    return result;
+    const [locations]=await locationsRead;
+    if(locations.status==='rejected') {throw locations.reason;}
+    const destination=damageDestination(locations.value,yard);
+    return result.filter(record=>Number(record.location?.id)===yard && Number(record.transferLocation?.id)===destination.destinationId);
   }
   async function units(record) {
     const rows=await sql(`SELECT DISTINCT tl.units AS unit_id,BUILTIN.DF(tl.units) AS unit FROM transactionline tl WHERE tl.transaction=${inventoryId(record.id)} AND tl.units IS NOT NULL`);
@@ -43,7 +50,7 @@ export function createDamageNetSuite({rest=inventoryTransferRest,directory=activ
       try {return await (result.id ? get(result.id) : findExternal(payload.externalId));}
       catch(error) {error.damageWriteAcknowledged=true;throw error;}
     },
-    async append(id,line) {await rest(`/${inventoryId(id)}`,{method:'PATCH',body:{inventory:{items:[line]}}});}
+    async append(id,line,{memo}={}) {await rest(`/${inventoryId(id)}`,{method:'PATCH',body:{...(memo===undefined?{}:{memo}),inventory:{items:[line]}}});}
   };
 }
 export const damageNetSuite=createDamageNetSuite();

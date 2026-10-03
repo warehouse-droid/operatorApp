@@ -1,10 +1,21 @@
+import {reconcilePurchaseStockAllocations} from './regular-stock-purchase-repository.js';
 import { writeAudit } from "./auth-repository.js";
-import { query } from "./db.js";
+import { query, afterTransactionCommit, hasActiveTransaction } from "./db.js";
 import { readNetSuiteOrderLine } from "./netsuite-order-line.js";
 import { enrichPurchaseOrderDispatch, enrichSalesOrderDispatch, enrichTransferDispatch } from "./dispatch-enrichment.js";
 import { syncOrderDependenciesForTransferOrder } from "./order-dependency-repository.js";
 import { enqueueNetSuiteMirrorOrderEvent } from "./netsuite-mirror-repository.js";
 import { resumeSmartScmBlanketCoveredPlanningExclusions } from "./smart-scm-planning-exclusion-repository.js";
+
+async function reconcilePurchaseOrderRequests(orderId, {linesSynced=false}={}) {
+  if(linesSynced)await query(`UPDATE scm_smart_proposal_lines l SET reason=reason||'{"purchasePoLinesSynced":true}'::jsonb
+    FROM scm_smart_proposals p WHERE l.proposal_id=p.id AND p.netsuite_purchase_order_id=$1 AND l.reason ? 'purchaseDemandIds'`,[orderId]);
+  const linked=await query(`SELECT 1 FROM scm_smart_proposals p JOIN scm_smart_proposal_lines l ON l.proposal_id=p.id WHERE p.netsuite_purchase_order_id=$1 AND l.reason ? 'purchaseDemandIds' LIMIT 1`,[orderId]);
+  if(linked.rowCount){
+    if(hasActiveTransaction())afterTransactionCommit(()=>reconcilePurchaseStockAllocations());
+    else await reconcilePurchaseStockAllocations();
+  }
+}
 
 function normalizeNetSuiteDate(value) {
   const text = String(value ?? "").trim();
@@ -1176,7 +1187,7 @@ export async function updatePurchaseOrderNetSuiteStatus(orderId, patch = {}) {
     [orderId, patch.status || null, patch.statusText || patch.status_text || null]
   );
   const updated = result.rows[0] || null;
-  if (updated) await enqueueNetSuiteMirrorOrderEvent("purchase_order", orderId, { changeType: "status" });
+  if (updated) {await enqueueNetSuiteMirrorOrderEvent("purchase_order", orderId, { changeType: "status" });await reconcilePurchaseOrderRequests(orderId);}
   return updated;
 }
 
@@ -1204,17 +1215,18 @@ export async function updateTransferOrderNetSuiteStatus(orderId, patch = {}) {
 export async function upsertPurchaseOrders(orders = []) {
   for (const order of orders || []) {
     const dispatch = await enrichPurchaseOrderDispatch(order);
-    const normalized = normalizeOrderDates({ ...normalizeReceivingOrder(order, "purchase_order"), ...dispatch });
+    const normalized = normalizeOrderDates({ ...normalizeReceivingOrder(order, "purchase_order"), ...dispatch, netsuite_note: order.netsuite_note ?? null });
     const existing = await query(
       `SELECT tranid, trandate, vendor_id, vendor, status, status_text,
               foreign_total, source_location_id, source_location, destination_location_id,
-              destination_location, memo, vendor_address, dispatch_address, dispatch_window_start,
+              destination_location, memo, netsuite_note, vendor_address, dispatch_address, dispatch_window_start,
               dispatch_window_end, dispatch_instructions, dispatch_vendor_yard,
               dispatch_parse_source, dispatch_note_hash
          FROM purchase_orders
         WHERE netsuite_id = $1`,
       [normalized.netsuite_id]
     );
+    normalized.netsuite_note ??= existing.rows[0]?.netsuite_note ?? null;
     await query(
       `INSERT INTO purchase_orders (
          netsuite_id, tranid, trandate, vendor_id, vendor, status, status_text,
@@ -1223,12 +1235,12 @@ export async function upsertPurchaseOrders(orders = []) {
          dispatch_window_end, dispatch_instructions, receipt_status, initial_scm_status,
          netsuite_active, netsuite_missing_at, synced_at, source_location_id,
          source_location, expected_delivery_date, dispatch_parse_source,
-         dispatch_note_hash, dispatch_parsed_at, status_updated_at
+         dispatch_note_hash, dispatch_parsed_at, status_updated_at, netsuite_note
        ) VALUES (
          $1, $2, $3, $4, $5, $6, $7,
          $8, $9, $10, $11, $12, $13, $14, $15, $16,
          $17, 'not_received', 'Hold', true, null, now(), $18, $19, $20,
-         $21, $22, now(), now()
+         $21, $22, now(), now(), $23
        )
        ON CONFLICT (netsuite_id) DO UPDATE SET
          tranid = EXCLUDED.tranid,
@@ -1247,6 +1259,7 @@ export async function upsertPurchaseOrders(orders = []) {
          destination_location_id = EXCLUDED.destination_location_id,
          destination_location = EXCLUDED.destination_location,
          memo = EXCLUDED.memo,
+         netsuite_note = COALESCE(EXCLUDED.netsuite_note, purchase_orders.netsuite_note),
          vendor_address = EXCLUDED.vendor_address,
          dispatch_vendor_yard = EXCLUDED.dispatch_vendor_yard,
          dispatch_address = EXCLUDED.dispatch_address,
@@ -1287,7 +1300,8 @@ export async function upsertPurchaseOrders(orders = []) {
         normalized.source_location,
         normalized.expected_delivery_date,
         normalized.dispatch_parse_source,
-        normalized.dispatch_note_hash
+        normalized.dispatch_note_hash,
+        normalized.netsuite_note
       ]
     );
     await auditSyncChange({
@@ -1297,7 +1311,7 @@ export async function upsertPurchaseOrders(orders = []) {
       fields: [
         "tranid", "trandate", "vendor_id", "vendor", "status",
         "status_text", "foreign_total", "source_location_id", "source_location",
-        "destination_location_id", "destination_location", "memo",
+        "destination_location_id", "destination_location", "memo", "netsuite_note",
         "vendor_address", "dispatch_address", "dispatch_window_start", "dispatch_window_end",
         "dispatch_instructions", "dispatch_vendor_yard", "dispatch_parse_source",
         "dispatch_note_hash"
@@ -1305,6 +1319,7 @@ export async function upsertPurchaseOrders(orders = []) {
       detailsKey: "order"
     });
     await enqueueNetSuiteMirrorOrderEvent("purchase_order", normalized.netsuite_id);
+    await reconcilePurchaseOrderRequests(normalized.netsuite_id);
   }
 }
 
@@ -1431,6 +1446,7 @@ export async function upsertPurchaseOrderLines(orderId, lines = []) {
   }
   await resumeSmartScmBlanketCoveredPlanningExclusions({ sourcePoId: orderId });
   await enqueueNetSuiteMirrorOrderEvent("purchase_order", orderId);
+  await reconcilePurchaseOrderRequests(orderId,{linesSynced:true});
 }
 
 export async function upsertInboundTransferOrders(orders = []) {
@@ -1672,4 +1688,5 @@ export async function markMissingInboundOrderLines(orderId, activeLineIds = []) 
     });
   }
   await enqueueNetSuiteMirrorOrderEvent(orderType, orderId, { changeType: result.rowCount ? "missing" : "upsert" });
+  if(orderType==='purchase_order')await reconcilePurchaseOrderRequests(orderId,{linesSynced:true});
 }

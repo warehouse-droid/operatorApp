@@ -258,7 +258,7 @@ export function createDelayedStatusRefreshWorker(dependencies = {}) {
     let lines = [];
     let allocationRefresh = null;
     let allocationRefreshError = "";
-    if (job.orderType === "sales_order") {
+    if (job.orderType === "sales_order" && await (dependencies.shouldRefreshSalesOrderLines?.(job) ?? true)) {
       try {
         lines = await fetchSalesOrderLines(job.netsuiteOrderId);
         allocationRefresh = summarizeSalesOrderAllocationRefresh(lines);
@@ -351,6 +351,16 @@ export function createDelayedStatusRefreshWorker(dependencies = {}) {
       });
       if (!committed) {
         throw new Error("Delayed status refresh lease was lost during finalization.");
+      }
+      // Intake is committed atomically with a successful status observation, even
+      // when Pending Approval means the existing refresh job must retry.
+      if (!operationError && remoteStatus && statusCode(remoteStatus) && dependencies.onStatusObserved) {
+        await dependencies.onStatusObserved({
+          orderType: job.orderType,
+          netsuiteOrderId: job.netsuiteOrderId,
+          tranid: String(remoteStatus.tranid || job.tranid || ""),
+          status: statusCode(remoteStatus)
+        });
       }
       await safeSupplementalAudit({
         withTransaction: runInTransaction,

@@ -1,0 +1,15 @@
+.scm-pickup-dialog{border:0;border-radius:18px;padding:24px;width:min(880px,calc(100vw - 32px));max-height:88vh;box-shadow:0 24px 80px #102b4d55;color:#17304d;background:#fff}
+.scm-pickup-dialog::backdrop{background:#10223bb3;backdrop-filter:blur(3px)}
+.scm-pickup-dialog header,.scm-pickup-dialog footer{display:flex;gap:16px;align-items:center;justify-content:space-between}
+.scm-pickup-dialog h2{margin:0;font-size:1.4rem}.scm-pickup-dialog p{line-height:1.5}
+.scm-pickup-dialog button{padding:10px 16px;border:1px solid #ced7e1;border-radius:9px;background:#f5f8fc;color:#17304d;cursor:pointer}
+.scm-pickup-dialog button.primary{background:#1b559b;color:#fff;border-color:#1b559b}.scm-pickup-dialog button:disabled{opacity:.5;cursor:wait}
+.pickup-line{margin:16px 0;padding:16px;border:1px solid #d5dfe9;border-radius:12px;background:#f8fafc}
+.pickup-line header p{font-size:.85rem;margin:6px 0;color:#53687e}.pickup-line [data-pickup-total]{font-weight:600}
+.pickup-fields{display:flex;gap:12px;flex-wrap:wrap;margin-top:14px}.pickup-fields label{flex:1 1 130px}
+.scm-pickup-dialog label{display:flex;flex-direction:column;gap:6px;font-weight:600}.scm-pickup-dialog label small{font-weight:400;color:#53687e}
+.scm-pickup-dialog input,.scm-pickup-dialog select{font:inherit;padding:10px;border:1px solid #bbcbdc;border-radius:8px;min-width:0;width:100%;box-sizing:border-box}
+[data-pickup-results]{max-height:230px;overflow:auto;margin:6px 0 16px}[data-pickup-results] button{display:flex;flex-direction:column;width:100%;text-align:left;gap:5px;margin-bottom:4px}[data-pickup-results] span{font-size:.85rem}
+.scm-pickup-dialog footer{position:sticky;bottom:-24px;background:#fff;border-top:1px solid #d5dfe9;padding:16px 0;margin-top:20px;justify-content:flex-end}
+.scm-pickup-dialog [hidden]{display:none!important}.regular-pickup-action{white-space:pre-line}
+@media(max-width:600px){.scm-pickup-dialog{padding:16px}.scm-pickup-dialog h2{font-size:1.15rem}.pickup-fields label{flex-basis:100px}.scm-pickup-dialog footer{bottom:-16px}}

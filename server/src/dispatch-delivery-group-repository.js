@@ -1,4 +1,5 @@
 import { query, withTransaction } from "./db.js";
+import { assertDispatchAddressPatch, preserveDispatchOrderAddress } from "./dispatch-address-guard.js";
 import { DISPATCH_FLEET_PLANNING_LOCK } from "./dispatch-fleet-status.js";
 import { dispatchLoadAssignment } from "./dispatch-load-assignment.js";
 import {
@@ -14,7 +15,7 @@ const GLOBAL_GROUP_ORDER_TYPES = new Set(["SO", "PO", "TO", "CO"]);
 const GLOBAL_DERIVED_ORDER_TYPES = new Set(["SO", "PO", "TO", "CO", "CUSTOM"]);
 const NETSUITE_DISPATCH_SOURCE_TABLES = new Set(["sales_orders", "purchase_orders", "transfer_orders"]);
 const SPLIT_LIVE_SOURCE_FIELDS = Object.freeze([
-  "sourceTable", "netsuiteId", "dispatchRef", "customer", "customerName",
+  "sourceTable", "firstSeenAt", "sourceOrderDate", "netsuiteId", "dispatchRef", "customer", "customerName",
   "address", "pickupAddress", "pickupAddressOverride", "sourceAddress",
   "defaultSourceAddress", "pickupLocation", "pickupLocations", "sourceYard",
   "destinationYard", "destinationAddress", "defaultDestinationAddress",
@@ -882,7 +883,7 @@ function groupedSalesOrderDeliveryFields(order = {}, children = []) {
   // Grouping inherits the first selected member's address. Keep deliberate
   // group-only edits while refreshing inherited addresses with their source.
   const manuallyChanged = prior && currentAddress !== text(prior.address);
-  const address = manuallyChanged ? currentAddress : text(representative.address);
+  const address = (manuallyChanged ? currentAddress : text(representative.address)) || currentAddress || text(prior?.address);
   return {
     address,
     destinationAddress: address,
@@ -891,6 +892,7 @@ function groupedSalesOrderDeliveryFields(order = {}, children = []) {
 }
 
 export function aggregateGlobalGroup(order = {}, childOrderDetails = [], { preserveTransitCo = false } = {}) {
+  childOrderDetails = preserveDispatchOrderAddress(order, { ...order, childOrderDetails }).order.childOrderDetails;
   // A CO for a grouped SO/TO owns its persisted manifest. Source children are
   // informational and may be incomplete cards, not constituent CO cargo.
   if (text(order.type).toUpperCase() === "CO" && order.sourceTable === "local_co_orders"
@@ -960,7 +962,7 @@ function applySplitDispatchDetails(order = {}) {
   const details = order.dispatchDetailsOverride;
   if (!details || typeof details !== "object" || Array.isArray(details)) return order;
   const next = { ...order };
-  if (Object.hasOwn(details, "address")) {
+  if (Object.hasOwn(details, "address") && text(details.address)) {
     next.address = text(details.address);
     next.destinationAddress = next.address;
     next.defaultDestinationAddress = next.address;
@@ -986,12 +988,13 @@ export async function updateDispatchSalesSplitDetails(orderRef, patch = {}) {
         FOR UPDATE`, [orderRef]
     )).rows[0];
     if (!row) return null;
+    assertDispatchAddressPatch(orderRef, patch);
     if (!row.active) throw Object.assign(new Error("This split was retired. Reload Dispatch before editing it."), {
       status: 409, code: "DISPATCH_DERIVED_ORDER_RETIRED"
     });
     const details = {
       ...row.full_order.dispatchDetailsOverride,
-      address: text(patch.address),
+      address: Object.hasOwn(patch, "address") ? text(patch.address) : text(row.full_order.address),
       expectedDeliveryDate: text(patch.expectedDeliveryDate ?? patch.expected_delivery_date),
       windowStart: text(patch.windowStart ?? patch.window_start),
       windowEnd: text(patch.windowEnd ?? patch.window_end)
@@ -1040,7 +1043,7 @@ function splitWithFreshSource(split = {}, source = {}, { activeBySource, allByRe
   next.originalOrderId = splitParentRef(split);
   next.globalOrderDefinition = true;
   next.globalOrderDefinitionKind = text(split.globalOrderDefinitionKind || "split");
-  return applyActiveTransitCoMetadata(applySplitDispatchDetails(next), activeBySource);
+  return preserveDispatchOrderAddress(split, applyActiveTransitCoMetadata(applySplitDispatchDetails(next), activeBySource)).order;
 }
 
 function groupWithFreshSources(group = {}, freshByRef = new Map(), { activeBySource, allByRef } = {}) {
@@ -1054,7 +1057,7 @@ function groupWithFreshSources(group = {}, freshByRef = new Map(), { activeBySou
     // NetSuite source refreshes may update the source lifecycle, but they must
     // not replace the local CO wrapper or turn one member into a mixed type.
     if (direct && !(candidateType === "CO" && directType !== "CO")) {
-      return cloneOrder(direct);
+      return preserveDispatchOrderAddress(candidate, cloneOrder(direct)).order;
     }
     const children = Array.isArray(candidate.childOrderDetails) ? candidate.childOrderDetails : [];
     if (!children.length) return candidate;
@@ -1342,7 +1345,7 @@ export async function reconcileDispatchPlanGlobalOrderDefinitions(plan, {
           delete reconciled[field];
         }
       }
-      return reconciled;
+      return preserveDispatchOrderAddress(order, reconciled).order;
     })
   };
 }

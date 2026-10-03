@@ -228,6 +228,10 @@ export async function overlayDispatchOrderCompletionStatuses(orders = []) {
     return {
       ...order,
       ...(scm ? { scm } : {}),
+      ...(kind === "PO" && completion.completionEvidenceType === "driver_job" ? {
+        dispatchPlanningRestricted: true,
+        dispatchPlanningRestrictionReason: `${reference} was completed in Driver PWA and cannot be planned again.`
+      } : {}),
       dispatchCompletionStatus: completion.dispatchCompletionStatus,
       dispatchCompletedAt: completion.dispatchCompletedAt,
       completionEvidenceType: completion.completionEvidenceType,

@@ -1,6 +1,7 @@
 import crypto from "node:crypto";
 import { config, isNetSuiteSandboxEnvironment } from "./config.js";
 import { query, withTransaction } from "./db.js";
+import { projectDirectTransferResidual } from "./dispatch-to-route-projection.js";
 import { completedTransferUnlinkAllowed } from "./scm-dependency-management-policy.js";
 import { writeDispatchAudit } from "./dispatch-audit-repository.js";
 import { resolveDispatchSalesTarget } from "./dispatch-order-target-repository.js";
@@ -424,6 +425,7 @@ function serializeDependency(row = {}, lines = []) {
     transferStatusText: row.transfer_status_text,
     transferDispatchPlanned: Boolean(row.transfer_dispatch_planned),
     transferDispatchPlanDate: dateText(row.transfer_dispatch_plan_date),
+    transferHasResidual: Boolean(row.transfer_has_residual),
     transferApplicationStatus: row.transfer_application_status,
     transferReconciliationStatus: row.transfer_reconciliation_status,
     transferReceived: transferDependencyReceiptComplete(row),
@@ -445,6 +447,7 @@ async function loadDependencies({ salesOrderRef = "", transferOrderRef = "", inc
   if (!includeCancelled) clauses.push("d.status <> 'cancelled'");
   const rows = await query(
     `SELECT d.*,
+            dispatch_direct_to_has_residual(d.transfer_order_id) AS transfer_has_residual,
             transit_co.co_ref AS transit_co_ref,
             transit_co.from_location_id AS transit_from_location_id,
             transit_co.from_location AS transit_from_location,
@@ -1190,11 +1193,7 @@ export async function syncDirectDependencyOperatorProgress(transferOrderId) {
         [dependency.id]
       );
       const loadedQuantity = number(progress.rows[0]?.loaded_quantity);
-      const nextStatus = loadedQuantity > EPSILON
-        ? "loaded"
-        : String(dependency.outbound_operator_status || "").toLowerCase() === "packed"
-          ? "packed"
-          : "active";
+      const nextStatus = loadedQuantity > EPSILON ? "loaded" : "active";
       const result = await query(
         `UPDATE order_dependencies
             SET status = $2, updated_at = now()
@@ -4123,7 +4122,7 @@ export async function createOrderDependency({
         }
       );
     }
-    if (existingDependency && existingDependency.status !== "active") {
+    if (existingDependency && !["active", "packed"].includes(existingDependency.status)) {
       throw Object.assign(
         new Error(`${transferOrderRef} is ${existingDependency.status} and cannot accept more linked quantity.`),
         { status: 409, code: "DEPENDENCY_NOT_EXTENDABLE" }
@@ -4150,11 +4149,16 @@ export async function createOrderDependency({
       throw new Error(`${transferOrderRef} is already planned. Unplan it before linking as a direct pickup.`);
     }
     if (normalizedMode === "direct_to_customer"
-      && ["packed", "loaded", "fulfilled", "shipped"].includes(String(transfer.rows[0].outbound_operator_status || transfer.rows[0].fulfillment_status || "").toLowerCase())) {
+      && [transfer.rows[0].outbound_operator_status, transfer.rows[0].fulfillment_status]
+        .some(status => ["loaded", "partial_loaded", "fulfilled", "shipped"].includes(String(status || "").toLowerCase()))) {
       throw new Error(`${transferOrderRef} has already started and cannot be linked.`);
     }
     const transferLines = await transferLinesForOrder(transfer.rows[0].netsuite_id);
     const outboundLines = transferLines.filter((line) => line.line_stage === "outbound");
+    if (outboundLines.some(line => number(line.loaded_qty) > EPSILON)) {
+      throw Object.assign(new Error(`${transferOrderRef} has loading evidence and cannot accept a new dependency allocation.`),
+        { status: 409, code: "DEPENDENCY_EXECUTION_STARTED" });
+    }
     const receivingLines = transferLines.filter((line) => line.line_stage === "receiving");
     const requested = allocations.length ? allocations : [];
     if (!requested.length) throw new Error("Select at least one matched Transfer Order line quantity.");
@@ -4453,7 +4457,7 @@ export async function updateOrderDependencyMode(
           SET dependency_mode = $2, same_load_required = ($2 = 'direct_to_customer'),
               updated_by = $3, updated_at = now()
         WHERE id = $1
-          AND status IN ('active', 'attention')
+          AND status IN ('active', 'attention', 'packed')
           AND NOT EXISTS (
             SELECT 1 FROM order_dependency_lines l
              WHERE l.dependency_id = order_dependencies.id
@@ -4486,7 +4490,7 @@ export async function cancelOrderDependency(
       `UPDATE order_dependencies
           SET status = 'cancelled', updated_by = $2, updated_at = now()
         WHERE id = $1
-          AND ($3 OR (status IN ('active', 'attention')
+          AND ($3 OR (status IN ('active', 'attention', 'packed')
           AND NOT EXISTS (
             SELECT 1 FROM order_dependency_lines l
              WHERE l.dependency_id = order_dependencies.id
@@ -4594,10 +4598,11 @@ export async function enrichDispatchOrdersWithDependencies(orders = []) {
     }
     if (transferDependency) {
       const directLink = transferDependency.mode === "direct_to_customer";
+      const projected = projectDirectTransferResidual(order, transferDependency);
       return {
-        ...order,
+        ...projected,
         orderDependency: transferDependency,
-        dependencyHidden: directLink,
+        dependencyHidden: directLink && !projected.toRouteProjection?.hasResidual,
         dependencyDirectPickup: directLink,
         dependentSalesOrderRef: transferDependency.salesOrderRef,
         dependencyLabels: directLink
@@ -4890,10 +4895,10 @@ export async function validateDispatchPlanDependencies(plan = {}) {
         conflicts.push(`${plannedSalesRef} requires direct pickup ${dependency.transferOrderRef} at ${dependency.sourceLocation} before the customer drop.`);
       }
       const row = transferById.get(String(dependency.transferOrderId));
-      if (current.has(dependency.transferOrderRef)) {
+      if (current.has(dependency.transferOrderRef) && !dependency.transferHasResidual) {
         conflicts.push(`${dependency.transferOrderRef} is a direct pickup for ${plannedSalesRef} and cannot be planned independently.`);
       }
-      if (row?.dispatch_planned && String(row.dispatch_plan_date || "") !== String(plan.planDate || "")) {
+      if (!dependency.transferHasResidual && row?.dispatch_planned && String(row.dispatch_plan_date || "") !== String(plan.planDate || "")) {
         conflicts.push(`${dependency.transferOrderRef} is planned independently. Unplan it before direct pickup with ${plannedSalesRef}.`);
       }
       const remainsOnPlannedAssignment = directDependencyRemainsOnPlannedAssignment(
@@ -4905,7 +4910,7 @@ export async function validateDispatchPlanDependencies(plan = {}) {
         ["loaded", "fulfilled", "shipped"].includes(
           String(row?.fulfillment_status || "").toLowerCase()
         )
-        && dependency.status === "active"
+        && ["active", "packed"].includes(dependency.status)
         && !remainsOnPlannedAssignment
       ) {
         conflicts.push(`${dependency.transferOrderRef} has already started and cannot be attached as a new direct pickup.`);
@@ -4957,7 +4962,7 @@ export async function syncOrderDependenciesFromDispatchPlan(plan = {}, {
         && dependency.dispatchTargetKind === "normal"
         && currentTargetRef === canonicalRef
         && ["yard_replenishment", "direct_to_customer"].includes(dependency.mode)
-        && ["active", "attention"].includes(dependency.status)
+        && ["active", "attention", "packed"].includes(dependency.status)
         && !hasExecutionProgress
       ) {
         const moved = await query(
@@ -4968,7 +4973,7 @@ export async function syncOrderDependenciesFromDispatchPlan(plan = {}, {
               AND sales_order_ref = $4
               AND dispatch_target_kind = 'normal'
               AND dependency_mode IN ('yard_replenishment', 'direct_to_customer')
-              AND status IN ('active', 'attention')
+              AND status IN ('active', 'attention', 'packed')
               AND NOT EXISTS (
                 SELECT 1
                   FROM order_dependency_lines progress_line
@@ -5029,7 +5034,7 @@ export async function syncOrderDependenciesFromDispatchPlan(plan = {}, {
         && establishedUngroupTargets.get(canonicalRef) === currentTargetRef
         && dependency.dispatchTargetKind === "group"
         && dependency.mode === "yard_replenishment"
-        && ["active", "attention"].includes(dependency.status)
+        && ["active", "attention", "packed"].includes(dependency.status)
         && !hasExecutionProgress
       ) {
         const releasedTarget = await query(
@@ -5040,7 +5045,7 @@ export async function syncOrderDependenciesFromDispatchPlan(plan = {}, {
               AND sales_order_ref = $2
               AND dispatch_target_kind = 'group'
               AND dependency_mode = 'yard_replenishment'
-              AND status IN ('active', 'attention')
+              AND status IN ('active', 'attention', 'packed')
               AND NOT EXISTS (
                 SELECT 1
                   FROM order_dependency_lines progress_line
@@ -5145,7 +5150,7 @@ export async function completeDirectDependenciesForSalesOrderDrop({
   if (!refs.length || !text(driverJobId)) return { completed: [], alreadyCompleted: [] };
   return withTransaction(async () => {
     const completedJob = await query(
-      `SELECT job_id, plan_id, plan_date, truck_plate, load_id, load_name, stop_type, order_refs
+      `SELECT job_id, plan_id, plan_date, truck_plate, load_id, load_name, stop_type, order_refs, completed_at
          FROM driver_job_records
         WHERE job_id = $1 AND status = 'complete'
         ORDER BY completed_at DESC NULLS LAST, created_at DESC
@@ -5153,7 +5158,7 @@ export async function completeDirectDependenciesForSalesOrderDrop({
         FOR UPDATE`,
       [text(driverJobId)]
     );
-    if (!completedJob.rowCount || completedJob.rows[0].stop_type !== "dropoff") {
+    if (!completedJob.rowCount || completedJob.rows[0].stop_type !== "dropoff" || !completedJob.rows[0].completed_at) {
       throw new Error("Direct dependency receipt requires a completed customer drop job.");
     }
     const completedRefs = new Set((completedJob.rows[0].order_refs || []).map(text));
@@ -5197,44 +5202,79 @@ export async function completeDirectDependenciesForSalesOrderDrop({
           FOR UPDATE OF dl`,
         [dependency.id]
       );
+      const currentDependency = (await loadDependencies({ transferOrderRef: dependency.transfer_order_ref }))
+        .find(entry => String(entry.id) === String(dependency.id));
+      const effectiveLines = new Map((currentDependency?.lines || []).map(line => [String(line.id), line]));
       let receivedQuantity = 0;
       for (const line of lines.rows) {
-        const remaining = Math.max(0, number(line.allocated_quantity) - number(line.locally_received_quantity));
+        const effective = effectiveLines.get(String(line.id));
+        const allocated = number(effective?.effectiveAllocatedQuantity ?? line.allocated_quantity);
+        const display = {
+          palletQty: number(effective?.effectivePalletQty ?? line.pallet_qty),
+          layerQty: number(effective?.effectiveLayerQty ?? line.layer_qty),
+          sectionQty: number(effective?.effectiveSectionQty ?? line.section_qty),
+          pieceQty: number(effective?.effectivePieceQty ?? line.piece_qty)
+        };
+        const remaining = Math.max(0, allocated - number(line.locally_received_quantity));
         if (remaining <= EPSILON) continue;
         await query(
           `UPDATE order_dependency_lines
-              SET delivered_quantity = allocated_quantity,
-                  locally_received_quantity = allocated_quantity,
-                  locally_received_pallet_qty = pallet_qty,
-                  locally_received_layer_qty = layer_qty,
-                  locally_received_section_qty = section_qty,
-                  locally_received_piece_qty = piece_qty,
+              SET delivered_quantity = $2,
+                  locally_received_quantity = $2,
+                  locally_received_pallet_qty = $3,
+                  locally_received_layer_qty = $4,
+                  locally_received_section_qty = $5,
+                  locally_received_piece_qty = $6,
                   updated_at = now()
             WHERE id = $1`,
-          [line.id]
+          [line.id, allocated, display.palletQty, display.layerQty, display.sectionQty, display.pieceQty]
         );
         if (line.transfer_receiving_line_id) {
-          await query(
-            `UPDATE transfer_order_lines
+          const receivingLines = await query(
+            `SELECT * FROM transfer_order_lines WHERE transfer_order_id=$1 AND item_id=$2
+              AND line_stage='receiving' AND COALESCE(netsuite_active,true)
+              ORDER BY (id=$3) DESC,id FOR UPDATE`,
+            [dependency.transfer_order_id,line.item_id,line.transfer_receiving_line_id]
+          );
+          let incoming = remaining;
+          for (const receivingLine of receivingLines.rows) {
+            const available = Math.max(0, number(receivingLine.quantity)
+              - Math.max(receivedBaseQuantity(receivingLine),number(receivingLine.netsuite_received_qty)));
+            const applied = Math.min(incoming,available);
+            if (applied <= EPSILON) {continue;}
+            const hasConversion = ["to_plt","to_lyr","to_sec","to_pcs"].some(field => number(receivingLine[field]) > 0);
+            const received = hasConversion ? conversionDisplay(applied,receivingLine)
+              : Object.fromEntries(Object.entries(display).map(([key,value]) => [key,value * applied / allocated]));
+            await query(`UPDATE transfer_order_lines
                 SET received_pallet_qty = COALESCE(received_pallet_qty, 0) + $2,
                     received_layer_qty = COALESCE(received_layer_qty, 0) + $3,
                     received_section_qty = COALESCE(received_section_qty, 0) + $4,
                     received_piece_qty = COALESCE(received_piece_qty, 0) + $5,
                     confirmed = false, confirmed_at = null, confirmed_by = null
               WHERE id = $1 AND line_stage = 'receiving'`,
-            [line.transfer_receiving_line_id, number(line.pallet_qty), number(line.layer_qty),
-              number(line.section_qty), number(line.piece_qty)]
-          );
+              [receivingLine.id,received.palletQty,received.layerQty,received.sectionQty,received.pieceQty]);
+            incoming -= applied;
+          }
         }
         receivedQuantity += remaining;
       }
       const allTransferLines = await query(
-        `SELECT * FROM transfer_order_lines
-          WHERE transfer_order_id = $1 AND line_stage = 'receiving' AND COALESCE(netsuite_active, true)`,
+        `SELECT line.item_id,SUM(COALESCE(line.quantity,0)) AS quantity,
+                SUM(GREATEST(COALESCE(line.netsuite_received_qty,0),
+                  COALESCE(line.received_pallet_qty,0)*COALESCE(line.to_plt,0)
+                  +COALESCE(line.received_layer_qty,0)*COALESCE(line.to_lyr,0)
+                  +COALESCE(line.received_section_qty,0)*COALESCE(line.to_sec,0)
+                  +COALESCE(line.received_piece_qty,0)*COALESCE(NULLIF(line.to_pcs,0),1))) AS received,
+                (SELECT COALESCE(SUM(dl.locally_received_quantity),0) FROM order_dependency_lines dl
+                  JOIN order_dependencies d ON d.id=dl.dependency_id WHERE d.transfer_order_id=$1
+                    AND d.status<>'cancelled' AND dl.item_id=line.item_id) AS direct_received
+           FROM transfer_order_lines line
+          WHERE line.transfer_order_id=$1 AND line.line_stage='receiving' AND COALESCE(line.netsuite_active,true)
+          GROUP BY line.item_id`,
         [dependency.transfer_order_id]
       );
       const fullyReceived = allTransferLines.rows.length > 0 && allTransferLines.rows.every((line) =>
-        receivedBaseQuantity(line) + EPSILON >= number(line.quantity)
+        Math.max(number(line.received),number(line.direct_received)) + EPSILON >= number(line.quantity)
       );
       const receivingStatus = fullyReceived ? "received" : "partial_received";
       await query(
@@ -5248,10 +5288,10 @@ export async function completeDirectDependenciesForSalesOrderDrop({
       );
       await query(
         `UPDATE order_dependencies
-            SET status = 'received_local', local_completed_at = now(), direct_received_at = now(),
+            SET status = 'received_local', local_completed_at = $3, direct_received_at = $3,
                 direct_receipt_job_id = $2, reconciliation_status = 'required', updated_at = now()
           WHERE id = $1`,
-        [dependency.id, text(driverJobId)]
+        [dependency.id, text(driverJobId), completedJob.rows[0].completed_at]
       );
       const result = {
         dependencyId: dependency.id,

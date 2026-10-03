@@ -1,8 +1,11 @@
-const scmStockRequestApp = document.getElementById("scmStockRequestApp");
+/* global HTMLInputElement, HTMLFormElement */
+const scmStockYardFilterReady = import('/stock-request-yard-filter.js?v=20260927');
+let scmStockYardFilterHtml = () => '';
+const scmStockRequestApp = /** @type {HTMLElement} */ (document.getElementById("scmStockRequestApp"));
 
 const scmStockState = {
   operator: null,
-  queue: localStorage.getItem("mbbs.scm.stockRequests.queue") || "request",
+  queue: new URLSearchParams(location.search).get("review") === "1" ? "request" : localStorage.getItem("mbbs.scm.stockRequests.queue") || "request",
   search: "",
   vendorFilter: "",
   requestDateFilter: "",
@@ -13,6 +16,9 @@ const scmStockState = {
   selectedId: Number(localStorage.getItem("mbbs.scm.stockRequests.selected")) || null,
   selectedTransferId: null,
   detail: null,
+  resolveDraft: /** @type {import('../tools/regular-stock-resolution-globals.js').RegularResolutionDraft|null} */ (null),
+  purchaseReviewQuantities: /** @type {Record<number,string>} */ ({}),
+  purchaseReleaseReasons: /** @type {Record<number,string>} */ ({}),
   selectedLineIds: new Set(),
   pendingDecision: null,
   loading: true,
@@ -58,10 +64,7 @@ async function scmStockApi(path, options = {}) {
   const contentType = response.headers.get("content-type") || "";
   const payload = contentType.includes("application/json") ? await response.json() : await response.text();
   if (!response.ok) {
-    const error = new Error(payload?.error || payload || `Request failed (${response.status})`);
-    error.status = response.status;
-    error.code = payload?.code || "";
-    throw error;
+    throw window.RegularStockUI.apiError(payload,response.status);
   }
   return payload;
 }
@@ -87,7 +90,9 @@ function scmStockList() {
     const pendingTransfers = request.transfers.filter((transfer) => !["received", "cancelled", "closed"].includes(transfer.status)).length;
     const rejectedLines = request.lines.filter((line) => line.status === "rejected").length;
     const closedTransfers = request.transfers.filter((transfer) => transfer.status === "closed").length;
-    const countLabel = scmStockState.queue === "request"
+    const countLabel = window.RegularPurchaseUI?.purchase(request)
+      ?window.RegularStockUI.t(`Purchase · ${pendingLines} pending item(s)`,`采购 · ${pendingLines} 行待审核`)
+      :scmStockState.queue === "request"
       ? `${pendingLines} actionable line(s)`
       : scmStockState.queue === "pending_to"
         ? `${pendingTransfers} pending TO(s)`
@@ -97,6 +102,7 @@ function scmStockList() {
     return `<button class="stock-request-card ${Number(request.id) === Number(scmStockState.selectedId) ? "selected" : ""}" data-scm-stock-action="select" data-id="${Number(request.id)}" type="button">
       <span class="stock-request-status-line"><strong>${scmStockEscape(request.requestRef)}</strong>${scmStockPill(request.bucket || request.status)}</span>
       <span>To ${scmStockEscape(request.destinationName)} · ${countLabel}</span>
+      ${window.RegularStockUI.customer(request)}
       <small>${scmStockEscape(request.requestedByName || request.requestedBy || "")} · ${scmStockDate(request.updatedAt)}</small>
     </button>`;
   }).join("");
@@ -126,6 +132,7 @@ function scmStockAvailabilityMatrix(itemId) {
 }
 
 function scmStockSourceOptions(line) {
+  if(scmStockState.detail?.workflowVersion===2 && scmStockState.detail.status==='completed')return `<option value="${Number(line.sourceLocationId)}">${scmStockEscape(line.sourceName)}</option>`;
   const availability = scmStockAvailability(line.itemId);
   if (!availability) return `<option value="${Number(line.sourceLocationId)}">${scmStockEscape(line.sourceName)}</option>`;
   return availability.yards.filter((yard) => Number(yard.locationId) !== Number(line.destinationLocationId)).map((yard) => `<option value="${Number(yard.locationId)}" ${Number(yard.locationId) === Number(line.sourceLocationId) ? "selected" : ""}>${scmStockEscape(yard.yardCode)} · ${scmStockNumber(yard.requestableAvailable)} available</option>`).join("");
@@ -177,18 +184,20 @@ function scmStockQuantityInputs(line, prefix = "line", disabled = false) {
 }
 
 function scmStockRequestLine(line) {
-  const actionable = line.status === "submitted" || line.status === "changes_requested";
+  const actionable = scmStockActionable(line);
   const editable = line.status === "submitted";
+  const snapshot=scmStockState.detail.workflowVersion===2 && (!!scmStockState.detail.regular?.pickupTransfer || scmStockState.detail.regular?.handoffStatus==='complete' || scmStockState.detail.status==='completed');
   return `<article class="stock-request-line" data-scm-stock-line-id="${Number(line.id)}">
     <header>
       <div class="stock-request-status-line">${actionable ? `<input data-scm-stock-select-line type="checkbox" ${scmStockState.selectedLineIds.has(line.id) ? "checked" : ""} aria-label="Select ${scmStockEscape(line.itemName)}" />` : ""}<div><strong>${scmStockEscape(line.itemName)}</strong><div class="stock-request-muted">${scmStockEscape(line.itemDescription || "")}</div></div></div>
       ${scmStockPill(line.status)}
     </header>
     <div class="stock-request-line-fields">
-      <label><span>Source yard</span><select data-scm-stock-source ${editable ? "" : "disabled"}>${scmStockSourceOptions(line)}</select></label>
+      <label><span>Source yard</span><select data-scm-stock-source ${editable ? "" : "disabled"}>${snapshot?`<option>${scmStockEscape(line.sourceName)}</option>`:scmStockSourceOptions(line)}</select></label>
       ${scmStockQuantityInputs(line, "line", !editable)}
     </div>
-    ${scmStockAvailabilityMatrix(line.itemId)}
+    ${snapshot?'':scmStockAvailabilityMatrix(line.itemId)}
+    ${window.RegularStockUI.safety(scmStockState.detail,line)}
     ${line.decisionReason ? `<div class="stock-request-notice"><strong>Decision reason:</strong> ${scmStockEscape(line.decisionReason)}</div>` : ""}
     ${editable ? `<div class="stock-request-actions"><button data-scm-stock-action="save-line" type="button">Save line adjustment</button></div>` : ""}
   </article>`;
@@ -198,12 +207,13 @@ function scmStockDecisionEditor() {
   const pending = scmStockState.pendingDecision;
   if (!pending) return "";
   const isReject = pending.decision === "reject";
-  const label = isReject ? "Reject" : "Request Changes";
-  const title = isReject ? "Reject stock-request lines" : "Request changes for stock-request lines";
+  const approval=["stock","po"].includes(pending.decision);
+  const label = approval ? window.RegularStockDelivery.simple(scmStockState.detail)?window.RegularStockUI.t('Approve and create TO','批准并建立调货单'):window.RegularStockUI.decision(pending.decision) : isReject ? "Reject" : "Request Changes";
+  const title = approval ? label : isReject ? "Reject stock-request lines" : "Request changes for stock-request lines";
   return `<section class="stock-request-section stock-request-form stock-request-decision-editor" role="dialog" aria-labelledby="scmStockDecisionTitle">
     <h3 id="scmStockDecisionTitle">${title}</h3>
-    <p>${pending.lineIds.length} line(s) will be updated. Enter the required reason before confirming.</p>
-    <label><span>${label} reason</span><textarea data-scm-stock-decision-reason maxlength="1000" rows="3" required>${scmStockEscape(pending.reason || "")}</textarea></label>
+    <p>${pending.lineIds.length} ${window.RegularStockUI.t("line(s) will be updated.","行将被更新。")} ${approval ? window.RegularStockUI.t("Notes are optional.","备注选填。") : "Enter the required reason before confirming."}</p>
+    <label><span>${label} reason</span><textarea data-scm-stock-decision-reason maxlength="1000" rows="3" ${approval?"":"required"}>${scmStockEscape(pending.reason || "")}</textarea></label>
     <div class="stock-request-actions">
       <button data-scm-stock-action="cancel-decision" type="button">Cancel</button>
       <button class="${isReject ? "danger" : "primary"}" data-scm-stock-action="confirm-decision" type="button">Confirm ${label}</button>
@@ -211,12 +221,24 @@ function scmStockDecisionEditor() {
   </section>`;
 }
 
+function scmStockActionable(line) {
+  return line.status==='submitted' || line.status==='changes_requested' || (line.status==='approved' && !window.RegularPurchaseUI?.purchase(scmStockState.detail) && window.RegularStockUI.stocking(scmStockState.detail) && !scmStockState.detail.regular.pickupTransfer);
+}
+
+function scmStockPickupButton(request) {
+  if(!window.RegularStockUI.stocking(request) || request.regular.pickupTransfer?.status==='complete')return '';
+  return `<button class="primary" data-scm-stock-action="pickup-convert" type="button">${request.regular.pickupTransfer?window.RegularStockUI.t('Retry / check TO creation','重试 / 查看调货单'):window.RegularStockUI.t('Convert to TO','转换为调货单')}</button>`;
+}
+
 function scmStockRequestDetail() {
   const request = scmStockState.detail;
   if (!request) return `<div class="stock-request-empty"><strong>Select a request</strong><span>All-yard availability and line decisions will appear here.</span></div>`;
-  const selectable = request.lines.filter((line) => line.status === "submitted" || line.status === "changes_requested");
+  if(window.RegularPurchaseUI?.purchase(request))return window.RegularPurchaseUI.detail(request,true,{selectedLineIds:scmStockState.selectedLineIds,reviewedQuantities:scmStockState.purchaseReviewQuantities||{},releaseReasons:scmStockState.purchaseReleaseReasons||{},resolveDraft:scmStockState.resolveDraft,busy:scmStockState.busy})+scmStockDecisionEditor();
+  if(window.RegularStockDelivery.simple(request))return window.RegularStockDelivery.scm(request,scmStockDecisionEditor());
+  const selectable = request.lines.filter(scmStockActionable);
   const selected = request.lines.filter((line) => scmStockState.selectedLineIds.has(line.id));
   const canRequestChanges = selected.length > 0 && selected.every((line) => line.status === "submitted");
+  const snapshot=request.workflowVersion===2 && (!!request.regular?.pickupTransfer || request.regular?.handoffStatus==='complete' || request.status==='completed');
   return `<div class="stock-request-heading">
       <div><h2>${scmStockEscape(request.requestRef)}</h2><p>${scmStockEscape(request.requestedByName || request.requestedBy || "")} · destination ${scmStockEscape(request.destinationName)}</p></div>
       ${scmStockPill(request.bucket || request.status)}
@@ -227,16 +249,21 @@ function scmStockRequestDetail() {
       <span><small>Submitted</small><strong>${scmStockDate(request.createdAt)}</strong></span>
       <span><small>First SCM decision</small><strong>${scmStockDate(request.firstScmDecisionAt)}</strong></span>
     </div>
+    ${window.RegularStockUI.summary(request)}
+    ${window.RegularStockUI.stocking(request)?window.RegularStockUI.stockingResult(request):''}
+    ${request.regular?.pickupTransfer?scmStockPickupButton(request):''}
     ${request.remarks ? `<div class="stock-request-notice"><strong>Sales remark:</strong> ${scmStockEscape(request.remarks)}</div>` : ""}
     ${scmStockBackorderNotice(selectable)}
-    <div class="stock-request-actions">
+    <div class="stock-request-actions" ${snapshot?'hidden':''}>
       <button data-scm-stock-action="select-all" type="button" ${selectable.length ? "" : "disabled"}>Select actionable lines</button>
-      <button class="primary" data-scm-stock-action="convert" type="button" ${scmStockState.selectedLineIds.size ? "" : "disabled"}>Convert to TO</button>
-      <button data-scm-stock-action="request-changes" type="button" ${canRequestChanges ? "" : "disabled"}>Request Changes</button>
+      ${request.workflowVersion===2 ? `<button data-scm-stock-action="refresh-evidence" type="button">${window.RegularStockUI.t('Refresh stock evidence','刷新库存数据')}</button>${window.RegularStockUI.stocking(request)?scmStockPickupButton(request):`<button class="primary" data-scm-stock-action="approve-stock" type="button" ${canRequestChanges?'':'disabled'}>${window.RegularStockUI.t('Approve · TO / location change','批准 · 调货 / 更改地点')}</button><button data-scm-stock-action="approve-po" type="button" ${canRequestChanges?'':'disabled'}>${window.RegularStockUI.t('Approve · source replenishment PO','批准 · 原货场采购补货')}</button>`}` : `<button class="primary" data-scm-stock-action="convert" type="button" ${scmStockState.selectedLineIds.size ? "" : "disabled"}>Convert to TO</button>
+      <button data-scm-stock-action="request-changes" type="button" ${canRequestChanges ? "" : "disabled"}>Request Changes</button>`}
       <button class="danger" data-scm-stock-action="reject" type="button" ${selectable.length ? "" : "disabled"}>${selected.length ? "Reject selected" : "Reject all actionable"}</button>
+      ${window.RegularStockResolution?.button(request,scmStockState.busy)||''}
     </div>
     ${scmStockDecisionEditor()}
-    <section class="stock-request-section"><h3>Request lines and all-yard availability</h3><div class="stock-request-lines">${request.lines.map(scmStockRequestLine).join("")}</div></section>`;
+    ${window.RegularStockResolution?.editor(request,scmStockState.resolveDraft,scmStockState.busy)||''}
+    <section class="stock-request-section"><h3>${snapshot?window.RegularStockUI.t('Request lines · saved decision snapshot','申请商品 · 已保存的审核记录'):'Request lines and all-yard availability'}</h3><div class="stock-request-lines">${request.lines.map(scmStockRequestLine).join("")}</div></section>`;
 }
 
 function scmStockSelectedTransfer() {
@@ -279,11 +306,11 @@ function scmStockPendingToDetail() {
   if (!request.transfers.length) return `<div class="stock-request-empty"><strong>No pending TO on this request</strong></div>`;
   const transfer = scmStockSelectedTransfer();
   scmStockState.selectedTransferId = transfer.id;
-  const canEdit = !["partially_fulfilled", "pending_receipt", "received", "cancelled", "closed"].includes(transfer.status);
-  const canEditStructure = scmStockCanRestructureTransfer(transfer);
-  const canConfirm = ["pending_local", "attention"].includes(transfer.status);
+  const canEdit = request.workflowVersion !== 2 && !["partially_fulfilled", "pending_receipt", "received", "cancelled", "closed"].includes(transfer.status);
+  const canEditStructure = request.workflowVersion !== 2 && scmStockCanRestructureTransfer(transfer);
+  const canConfirm = !window.RegularStockDelivery.simple(request) && !request.regular?.pickupTransfer && ["pending_local", "attention"].includes(transfer.status);
   const hasPrinted = Boolean(transfer.printJobId || transfer.printGeneration);
-  const canRejectPending = transfer.status === "pending_local"
+  const canRejectPending = request.workflowVersion !== 2 && transfer.status === "pending_local"
     && transfer.confirmationStatus === "idle"
     && !transfer.confirmationRequestId
     && !transfer.netsuiteTransferOrderId
@@ -295,6 +322,9 @@ function scmStockPendingToDetail() {
       ${scmStockPill(transfer.status)}
     </div>
     ${scmStockTransferList(request)}
+    ${window.RegularStockUI.customer(request)}
+    ${window.RegularStockDelivery.simple(request)?window.RegularStockDelivery.summary(request)+window.RegularStockDelivery.progress(request,true):''}
+    ${request.regular?.pickupTransfer?window.RegularStockUI.stockingResult(request)+scmStockPickupButton(request):''}
     <div class="stock-request-summary">
       <span><small>From location</small><strong>${scmStockEscape(transfer.sourceName)}</strong></span>
       <span><small>To location</small><strong>${scmStockEscape(transfer.destinationName)}</strong></span>
@@ -308,7 +338,8 @@ function scmStockPendingToDetail() {
     ${transfer.confirmationError ? `<div class="stock-request-notice stock-request-error"><strong>Attention:</strong> ${scmStockEscape(transfer.confirmationError)}</div>` : ""}
     ${transfer.printInvalidatedAt ? `<div class="stock-request-notice">The prior ticket was invalidated by a quantity change. Save/sync, then use Re-print.</div>` : ""}
     ${request.remarks ? `<div class="stock-request-notice"><strong>Sales remark:</strong> ${scmStockEscape(request.remarks)}</div>` : ""}
-    ${scmStockBackorderNotice(transfer.lines, { transfer })}
+    ${request.status==='completed'?'':scmStockBackorderNotice(transfer.lines, { transfer })}
+    ${request.workflowVersion===2 && (request.regular?.pickupTransfer || request.status==='completed')?`<section class="stock-request-section"><h3>${window.RegularStockUI.t('Request lines · saved decision snapshot','申请商品 · 已保存的审核记录')}</h3>${request.lines.map(line=>`<article class="stock-request-line"><strong>${scmStockEscape(line.itemName)} · ${scmStockEscape(line.sourceName)}</strong>${window.RegularStockUI.safety(request,line)}</article>`).join('')}</section>`:''}
     <section class="stock-request-section"><h3>TO material lines</h3>
       ${canEditStructure ? `<div class="stock-request-notice">Change a line's outbound location to move it into a separate local Pending TO for that route. Remove a line to return it to the Request queue. These route changes are available before Confirm TO + Print.</div>` : ""}
       <div class="stock-request-lines">${transfer.lines.map((line) => scmStockTransferLine(line, { canEditQuantities: canEdit, canEditStructure })).join("")}</div>
@@ -326,15 +357,18 @@ function scmStockPendingToDetail() {
 
 function scmStockFocusSnapshot() {
   const active = document.activeElement;
-  if (!active || !scmStockRequestApp.contains(active) || !active.matches("[data-scm-stock-search]")) return null;
-  return { selectionStart: active.selectionStart, selectionEnd: active.selectionEnd };
+  if (!(active instanceof HTMLInputElement) || !scmStockRequestApp.contains(active)) return null;
+  const selector=active.matches('[data-scm-stock-search]')?'[data-scm-stock-search]':
+    ['regularResolvePo','regularResolveEta'].includes(active.id)?'#'+active.id:null;
+  if(!selector)return null;
+  return { selector,selectionStart: active.selectionStart, selectionEnd: active.selectionEnd };
 }
 
 function scmStockRestoreFocus(snapshot) {
   if (!snapshot) return;
-  const input = scmStockRequestApp.querySelector("[data-scm-stock-search]");
+  const input = /** @type {HTMLInputElement|null} */ (scmStockRequestApp.querySelector(snapshot.selector));
   input?.focus();
-  if (typeof input?.setSelectionRange === "function") {
+  if (typeof input?.setSelectionRange === "function" && input.type!=='date') {
     input.setSelectionRange(snapshot.selectionStart ?? input.value.length, snapshot.selectionEnd ?? input.value.length);
   }
 }
@@ -361,6 +395,7 @@ function renderScmStockRequests() {
       <div class="stock-request-toolbar">
         <div class="stock-request-tabs" role="tablist" aria-label="Regular stock request queue">
           <button data-scm-stock-action="queue" data-queue="request" aria-selected="${scmStockState.queue === "request"}" type="button">Request</button>
+          <button data-scm-stock-action="queue" data-queue="approved" aria-selected="${scmStockState.queue === 'approved'}" type="button">${window.RegularStockUI.t("Accepted / Awaiting SO","已接受 / 待销售订单")}</button>
           <button data-scm-stock-action="queue" data-queue="pending_to" aria-selected="${scmStockState.queue === "pending_to"}" type="button">Pending TO</button>
           <button data-scm-stock-action="queue" data-queue="rejected" aria-selected="${scmStockState.queue === "rejected"}" type="button">Rejected</button>
           <button data-scm-stock-action="queue" data-queue="closed" aria-selected="${scmStockState.queue === "closed"}" type="button">Closed</button>
@@ -369,8 +404,8 @@ function renderScmStockRequests() {
         <div class="stock-request-filters">
           <label><span>Item vendor</span><select name="vendor" data-scm-stock-filter="vendorFilter"><option value="">All vendors</option>${scmStockFilterOptions("vendors", scmStockState.vendorFilter)}</select></label>
           <label><span>Request date</span><input name="requestDate" data-scm-stock-filter="requestDateFilter" type="date" value="${scmStockEscape(scmStockState.requestDateFilter)}" /></label>
-          <label><span>From yard</span><select name="sourceLocationId" data-scm-stock-filter="sourceLocationFilter"><option value="">All source yards</option>${scmStockFilterOptions("sourceYards", scmStockState.sourceLocationFilter)}</select></label>
-          <label><span>To yard</span><select name="destinationLocationId" data-scm-stock-filter="destinationLocationFilter"><option value="">All destination yards</option>${scmStockFilterOptions("destinationYards", scmStockState.destinationLocationFilter)}</select></label>
+          ${scmStockYardFilterHtml(scmStockState.filterOptions.sourceYards || [], scmStockState.sourceLocationFilter, {label: "From yard", name: "sourceLocationId", attribute: 'data-scm-stock-filter="sourceLocationFilter"'})}
+          ${scmStockYardFilterHtml(scmStockState.filterOptions.destinationYards || [], scmStockState.destinationLocationFilter, {label: "To yard", name: "destinationLocationId", attribute: 'data-scm-stock-filter="destinationLocationFilter"'})}
           <button data-scm-stock-action="clear-filters" type="button">Clear filters</button>
         </div>
       </div>
@@ -380,7 +415,7 @@ function renderScmStockRequests() {
       </div>
       <div class="stock-request-workspace">
         <aside class="stock-request-panel stock-request-list">${scmStockList()}</aside>
-        <section class="stock-request-panel stock-request-detail">${["pending_to", "closed"].includes(scmStockState.queue) ? scmStockPendingToDetail() : scmStockRequestDetail()}</section>
+        <section class="stock-request-panel stock-request-detail">${["pending_to", "closed"].includes(scmStockState.queue) && scmStockState.detail?.transfers?.length ? scmStockPendingToDetail() : scmStockRequestDetail()}</section>
       </div>
     </section>`;
   scmStockRestoreFocus(focusSnapshot);
@@ -416,8 +451,8 @@ async function scmStockLoad({ preserveSelection = true } = {}) {
   if (scmStockState.search.trim()) params.set("search", scmStockState.search.trim());
   if (scmStockState.vendorFilter) params.set("vendor", scmStockState.vendorFilter);
   if (scmStockState.requestDateFilter) params.set("requestDate", scmStockState.requestDateFilter);
-  if (scmStockState.sourceLocationFilter) params.set("sourceLocationId", scmStockState.sourceLocationFilter);
-  if (scmStockState.destinationLocationFilter) params.set("destinationLocationId", scmStockState.destinationLocationFilter);
+  if (scmStockState.sourceLocationFilter) params.set("sourceLocationIds", scmStockState.sourceLocationFilter);
+  if (scmStockState.destinationLocationFilter) params.set("destinationLocationIds", scmStockState.destinationLocationFilter);
   const payload = await scmStockApi(`/api/scm/stock-requests?${params}`);
   if (generation !== scmStockState.loadGeneration) return;
   const requests = payload.requests || [];
@@ -479,12 +514,13 @@ async function scmStockSaveLine(button) {
     method: "PATCH",
     body: JSON.stringify(body)
   });
+  if(scmStockState.detail.workflowVersion===2)await scmStockLoadDetail(scmStockState.detail.id);
   renderScmStockRequests();
 }
 
 function scmStockOpenDecision(decision) {
   const allowedStatuses = decision === "reject"
-    ? new Set(["submitted", "changes_requested"])
+    ? new Set(window.RegularStockUI.stocking(scmStockState.detail)&&!window.RegularPurchaseUI.purchase(scmStockState.detail)?["submitted", "changes_requested", "approved"]:["submitted", "changes_requested"])
     : new Set(["submitted"]);
   const eligible = (scmStockState.detail?.lines || []).filter((line) => allowedStatuses.has(line.status));
   const selected = eligible.filter((line) => scmStockState.selectedLineIds.has(line.id));
@@ -500,13 +536,16 @@ function scmStockOpenDecision(decision) {
   scmStockRequestApp.querySelector("[data-scm-stock-decision-reason]")?.focus();
 }
 
-async function scmStockDecision(decision, { lineIds, reason } = {}) {
+async function scmStockDecision(decision, { lineIds, reason } = {}, operation) {
   const label = decision === "reject" ? "Reject" : "Request Changes";
   const normalizedReason = String(reason || "").trim();
-  if (!normalizedReason) throw new Error(`${label} requires a reason.`);
+  if (["reject","request_changes"].includes(decision) && !normalizedReason) throw new Error(`${label} requires a reason.`);
   const selectedLineIds = [...new Set((lineIds || []).map(Number))];
   if (!selectedLineIds.length) throw new Error("Select at least one stock-request line.");
-  scmStockState.detail = await scmStockApi(`/api/scm/stock-requests/${scmStockState.detail.id}/line-decisions`, {
+  scmStockState.detail = window.RegularStockDelivery.simple(scmStockState.detail)
+    ? await window.RegularStockDelivery.run(scmStockApi,'decision',{expectedRevision:scmStockState.detail.revision,lineIds:selectedLineIds,decision,reason:normalizedReason},
+      {audience:'scm',requestId:scmStockState.detail.id,dialog:operation})
+    : await scmStockApi(`/api/scm/stock-requests/${scmStockState.detail.id}/line-decisions`, {
     method: "POST",
     body: JSON.stringify({
       expectedRevision: scmStockState.detail.revision,
@@ -517,7 +556,7 @@ async function scmStockDecision(decision, { lineIds, reason } = {}) {
   });
   scmStockState.pendingDecision = null;
   scmStockState.error = "";
-  scmStockState.notice = decision === "reject"
+  scmStockState.notice = ["stock","po"].includes(decision) ? window.RegularStockDelivery.simple(scmStockState.detail)?window.RegularStockUI.t('Delivery approved. Check TO and printing progress below.','送货申请已批准，请查看下方调货单及打印进度。'):window.RegularStockUI.decision(decision) : decision === "reject"
     ? "Selected request line(s) were rejected."
     : "Changes were requested. Convert and Reject remain available until Sales submits a newer revision.";
   if (decision === "reject") {
@@ -527,6 +566,7 @@ async function scmStockDecision(decision, { lineIds, reason } = {}) {
   } else {
     scmStockState.selectedLineIds = new Set(selectedLineIds);
   }
+  if(["stock","po"].includes(decision)&&!scmStockState.detail.lines.some(line=>line.status==='submitted'))scmStockState.queue=window.RegularStockDelivery.simple(scmStockState.detail)?'pending_to':'approved';
   await scmStockLoad({ preserveSelection: decision !== "reject" });
 }
 
@@ -550,6 +590,26 @@ function scmStockTransferPayload() {
 }
 
 scmStockRequestApp.addEventListener("input", (event) => {
+  const target=/** @type {HTMLInputElement} */ (event.target);
+  const draft=scmStockState.resolveDraft;
+  const request=/** @type {import('../tools/regular-stock-resolution-globals.js').RegularResolutionRequest|null} */ (scmStockState.detail);
+  if(target.matches('[data-regular-resolution-field]')&&draft&&draft.requestId===request?.id){
+    const field=target.dataset.regularResolutionField;
+    if(field==='purchaseOrderRef'||field==='eta')draft[field]=target.value;
+    return;
+  }
+  if(event.target.dataset.purchaseReleaseReason){
+    (scmStockState.purchaseReleaseReasons ||= {})[Number(event.target.dataset.purchaseReleaseReason)]=event.target.value;
+    return;
+  }
+  if(event.target.dataset.purchaseReviewLine){
+    const id=Number(event.target.dataset.purchaseReviewLine),line=scmStockState.detail.lines.find(row=>row.id===id);
+    (scmStockState.purchaseReviewQuantities ||= {})[id]=event.target.value;
+    const preview=scmStockRequestApp.querySelector(`[data-purchase-rounded-line="${id}"]`);
+    if(preview)preview.textContent=`${window.RegularStockUI.number(window.RegularPurchaseUI.rounded(event.target.value,line))} ${line.salesUom}`;
+    return;
+  }
+
   if (!event.target.matches("[data-scm-stock-search]")) return;
   scmStockState.search = event.target.value;
   window.clearTimeout(scmStockState.refreshTimer);
@@ -571,8 +631,15 @@ scmStockRequestApp.addEventListener("change", (event) => {
     return;
   }
   if (event.target.matches("[data-scm-stock-filter]")) {
-    scmStockState[event.target.dataset.scmStockFilter] = event.target.value;
-    scmStockLoad({ preserveSelection: false }).catch((error) => {
+    const filterName = event.target.dataset.scmStockFilter;
+    const yardName = event.target.type === 'checkbox' ? event.target.name : null;
+    scmStockState[filterName] = yardName
+      ? [...scmStockRequestApp.querySelectorAll(`[name="${yardName}"]:checked`)].map(input => input.value).join(',')
+      : event.target.value;
+    scmStockLoad({ preserveSelection: false }).then(() => {
+      const filter = yardName && scmStockRequestApp.querySelector(`[data-yard-filter="${yardName}"]`);
+      if (filter) filter.open = true;
+    }).catch((error) => {
       scmStockState.loading = false;
       scmStockState.error = error.message;
       renderScmStockRequests();
@@ -586,13 +653,40 @@ scmStockRequestApp.addEventListener("change", (event) => {
   renderScmStockRequests();
 });
 
+scmStockRequestApp.addEventListener('submit',async(event)=>{
+  const form=event.target;
+  if(!(form instanceof HTMLFormElement)||!form.matches('[data-regular-resolution-form]'))return;
+  event.preventDefault();
+  if(scmStockState.busy||!form.reportValidity())return;
+  const request=/** @type {import('../tools/regular-stock-resolution-globals.js').RegularResolutionRequest|null} */ (scmStockState.detail),draft=scmStockState.resolveDraft;
+  if(!request||!draft||draft.requestId!==request.id)return;
+  scmStockState.busy=true;scmStockState.error='';renderScmStockRequests();
+  try{
+    scmStockState.detail=await scmStockApi(`/api/scm/stock-requests/${request.id}/resolve`,{method:'POST',body:JSON.stringify({expectedRevision:draft.expectedRevision,purchaseOrderRef:draft.purchaseOrderRef,eta:draft.eta})});
+    scmStockState.resolveDraft=null;scmStockState.pendingDecision=null;scmStockState.selectedLineIds.clear();
+    scmStockState.queue='closed';localStorage.setItem('mbbs.scm.stockRequests.queue','closed');
+    scmStockState.notice=window.RegularStockUI.t('Request resolved. Sales will see one notification with the PO and ETA.','申请已解决。销售将收到包含采购订单和预计到达日期的一次通知。');
+    await scmStockLoad({preserveSelection:true});
+  }catch(error){scmStockState.error=error instanceof Error?error.message:String(error);}
+  finally{scmStockState.busy=false;renderScmStockRequests();}
+});
+
 scmStockRequestApp.addEventListener("click", async (event) => {
-  const button = event.target.closest("[data-scm-stock-action]");
-  if (!button || scmStockState.busy) return;
+  const button = event.target.closest('[data-scm-stock-action], [data-yard-filter-clear="sourceLocationId"], [data-yard-filter-clear="destinationLocationId"]');
+  if (!button || scmStockState.busy || window.RegularStockDialog.isBusy()) return;
   const action = button.dataset.scmStockAction;
+  let operation;
   try {
+    if(['purchase-add','purchase-release','refresh-evidence','confirm-decision','save-line','convert','save-transfer','confirm-print','reprint','delivery-retry'].includes(action)){
+      operation=window.RegularStockDialog.begin(window.RegularStockUI.t('Checking stock and processing your action…','正在检查库存并处理您的操作…'),{lockFields:window.RegularStockDelivery.simple(scmStockState.detail)});
+    }
+    if (button.dataset.yardFilterClear) {
+      scmStockState[button.dataset.yardFilterClear === 'sourceLocationId' ? 'sourceLocationFilter' : 'destinationLocationFilter'] = '';
+      return scmStockLoad({preserveSelection: false});
+    }
     if (action === "special") return window.MBBSSCMSpecialStock?.open({ operator: scmStockState.operator });
     if (action === "queue") {
+      scmStockState.resolveDraft=null;
       scmStockState.pendingDecision = null;
       scmStockState.queue = button.dataset.queue;
       localStorage.setItem("mbbs.scm.stockRequests.queue", scmStockState.queue);
@@ -609,6 +703,7 @@ scmStockRequestApp.addEventListener("click", async (event) => {
       return scmStockLoad({ preserveSelection: false });
     }
     if (action === "select") {
+      scmStockState.resolveDraft=null;
       scmStockState.pendingDecision = null;
       scmStockState.selectedId = Number(button.dataset.id);
       localStorage.setItem("mbbs.scm.stockRequests.selected", String(scmStockState.selectedId));
@@ -620,23 +715,65 @@ scmStockRequestApp.addEventListener("click", async (event) => {
       scmStockState.selectedTransferId = Number(button.dataset.transferId);
       return renderScmStockRequests();
     }
+    if(action==='resolve'){
+      const request=/** @type {import('../tools/regular-stock-resolution-globals.js').RegularResolutionRequest|null} */ (scmStockState.detail);
+      if(!request)return;
+      scmStockState.pendingDecision=null;
+      scmStockState.resolveDraft={requestId:request.id,expectedRevision:request.revision,purchaseOrderRef:'',eta:''};
+      renderScmStockRequests();
+      const input=/** @type {HTMLInputElement|null} */ (scmStockRequestApp.querySelector('#regularResolvePo'));
+      input?.focus();return;
+    }
+    if(action==='cancel-resolve'){scmStockState.resolveDraft=null;scmStockState.error='';renderScmStockRequests();return;}
     if (action === "select-all") {
-      scmStockState.selectedLineIds = new Set(scmStockState.detail.lines.filter((line) => ["submitted", "changes_requested"].includes(line.status)).map((line) => line.id));
+      scmStockState.selectedLineIds = new Set(scmStockState.detail.lines.filter(scmStockActionable).map((line) => line.id));
       return renderScmStockRequests();
     }
-    if (action === "save-line") return scmStockSaveLine(button);
+    if (action === "save-line") return await scmStockSaveLine(button);
+    if(action==='refresh-evidence'){
+      button.disabled=true;
+      scmStockState.detail=await scmStockApi(`/api/scm/stock-requests/${scmStockState.detail.id}/evidence`,{method:'POST',body:'{}'});
+      return renderScmStockRequests();
+    }
+    if(action==='purchase-add'||action==='purchase-release'){
+      const request=scmStockState.detail;
+      const body=action==='purchase-add'?{expectedRevision:request.revision,lines:request.lines.filter(line=>line.status==='submitted'&&scmStockState.selectedLineIds.has(line.id)).map(line=>({lineId:line.id,reviewedSalesQty:Number(scmStockState.purchaseReviewQuantities?.[line.id]??line.salesQty)}))}
+        :{expectedRevision:request.revision,lineIds:[Number(button.dataset.lineId)],reason:scmStockState.purchaseReleaseReasons?.[button.dataset.lineId]||''};
+      scmStockState.busy=true;
+      scmStockState.detail=await scmStockApi(`/api/scm/stock-requests/${request.id}/${action==='purchase-add'?'purchase-proposals':'purchase-release'}`,{method:'POST',body:JSON.stringify(body)});
+      scmStockState.selectedLineIds.clear();
+      if(!scmStockState.detail.lines.some(line=>line.status==='submitted')){
+        scmStockState.queue=scmStockState.detail.bucket==='completed'?'closed':'approved';
+        localStorage.setItem('mbbs.scm.stockRequests.queue',scmStockState.queue);
+      }
+      scmStockState.notice=window.RegularStockUI.t(action==='purchase-add'?'Purchase quantities added to PO/TO proposals.':'Remaining Purchase demand released.',action==='purchase-add'?'采购数量已加入采购 / 调货建议。':'剩余采购需求已释放。');
+      await scmStockLoad({preserveSelection:true});return;
+    }
+    if(action==='approve-stock')return scmStockOpenDecision('stock');
+    if(action==='pickup-convert')return window.RegularPickupUI.open(scmStockState.detail,{api:scmStockApi,onComplete:async()=>{
+      scmStockState.queue='pending_to';localStorage.setItem('mbbs.scm.stockRequests.queue','pending_to');
+      scmStockState.notice=window.RegularStockUI.t('SCM approved the Stocking request and created its Transfer Orders.','SCM 已批准备货申请并建立调货单。');
+      await scmStockLoad({preserveSelection:true});
+    }});
+    if(action==='approve-po')return scmStockOpenDecision('po');
     if (action === "request-changes") return scmStockOpenDecision("request_changes");
     if (action === "reject") return scmStockOpenDecision("reject");
     if (action === "cancel-decision") {
       scmStockState.pendingDecision = null;
       return renderScmStockRequests();
     }
+    if(action==='delivery-retry'){
+      scmStockState.busy=true;
+      scmStockState.detail=await window.RegularStockDelivery.run(scmStockApi,'retry',{},{audience:'scm',requestId:scmStockState.detail.id,dialog:operation});
+      if(scmStockState.detail.transfers.length)scmStockState.queue='pending_to';
+      await scmStockLoad({preserveSelection:true});return;
+    }
     if (action === "confirm-decision") {
       const pending = scmStockState.pendingDecision;
       if (!pending) throw new Error("The SCM decision is no longer available. Open it again.");
       pending.reason = scmStockRequestApp.querySelector("[data-scm-stock-decision-reason]")?.value || "";
       scmStockState.busy = true;
-      await scmStockDecision(pending.decision, pending);
+      await scmStockDecision(pending.decision, pending, operation);
       return;
     }
     if (action === "convert") {
@@ -724,6 +861,7 @@ scmStockRequestApp.addEventListener("click", async (event) => {
     renderScmStockRequests();
   } finally {
     scmStockState.busy = false;
+    if(operation){renderScmStockRequests();operation.close();}
   }
 });
 
@@ -734,6 +872,7 @@ function scmStockConnectEvents() {
     let event;
     try { event = JSON.parse(message.data || "{}"); } catch { return; }
     if (event.type !== "stock-request.updated" && event.type !== "dispatch.orders.updated" && event.type !== "driver.job.completed") return;
+    if(window.MBBSStockRequestTabs?.isActive('waitlist')){window.SCMWaitlist.refresh();return;}
     window.clearTimeout(scmStockState.refreshTimer);
     scmStockState.refreshTimer = window.setTimeout(() => scmStockLoad({ preserveSelection: true }).catch(() => {}), 400);
   });
@@ -749,14 +888,25 @@ window.addEventListener("pagehide", () => {
   scmStockState.eventSource = null;
 });
 
+let scmPrintRefreshing=false;
+window.setInterval(async()=>{
+  if(scmPrintRefreshing||scmStockState.busy||scmStockState.pendingDecision||window.RegularStockDialog.isBusy()||!window.RegularStockDelivery.printing(scmStockState.detail))return;
+  scmPrintRefreshing=true;
+  try{await scmStockLoadDetail(scmStockState.selectedId);renderScmStockRequests();}catch{/* Refresh remains available when the connection returns. */}
+  finally{scmPrintRefreshing=false;}
+},3000);
+
 requireDispatchLogin({
   mount: scmStockRequestApp,
   roles: ["admin", "scm", "scm_staff"],
   async onReady(operator) {
     scmStockState.operator = operator;
+    window.RegularStockDelivery.configure(operator.id);
     try {
+      ({yardFilterHtml: scmStockYardFilterHtml} = await scmStockYardFilterReady);
       if (window.MBBSStockRequestTabs) {
         window.MBBSStockRequestTabs.onOpen = async (type) => {
+          if (type === 'waitlist') return window.SCMWaitlist.open({mount:scmStockRequestApp,operator,api:scmStockApi});
           if (type === "aggregate") return window.MBBSAggregateRequests.open({ mount: scmStockRequestApp, operator, scm: true });
           if (type === "special") return window.MBBSSCMSpecialStock.open({ operator });
           return scmStockLoad({ preserveSelection: true }).catch((error) => {
@@ -768,6 +918,10 @@ requireDispatchLogin({
         await window.MBBSStockRequestTabs.open(window.MBBSStockRequestTabs.active);
       } else {
         await scmStockLoad({ preserveSelection: true });
+      }
+      if(!window.MBBSStockRequestTabs||window.MBBSStockRequestTabs.active==='regular'){
+        const resumed=await window.RegularStockDelivery.resume(scmStockApi,'scm');
+        if(resumed){scmStockState.selectedId=resumed.id;await scmStockLoad({preserveSelection:true});}
       }
       scmStockConnectEvents();
     } catch (error) {

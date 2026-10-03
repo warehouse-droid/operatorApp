@@ -1,11 +1,13 @@
-.control-damage { min-width: 0; }
+.control-damage { min-width: 0; grid-template-columns: minmax(0,1fr); }
 .control-damage-toolbar,.control-damage-transfer { display: flex; gap: 16px; align-items: end; justify-content: space-between; flex-wrap: wrap; margin-bottom: 18px; }
-.control-damage-toolbar > div:first-child { flex: 1; min-width: 220px; }
+.control-damage-toolbar > div:first-child { flex: 1 1 220px; min-width: 0; }
+.control-damage-toolbar > label,.control-damage-toolbar > button { min-width: 0; max-width: 100%; }
+.control-damage-transfer > div { min-width: 0; overflow-wrap: anywhere; }
 .control-damage h2,.control-damage h3 { margin: 0 0 8px; }
 .control-damage p { margin: 6px 0 12px; }
 .control-damage label { display: grid; gap: 7px; font-weight: 600; margin-bottom: 12px; }
-.control-damage input,.control-damage select,.control-damage textarea { width: 100%; min-height: 42px; border: 1px solid #cbd5e1; border-radius: 8px; padding: 10px; font: inherit; box-sizing: border-box; background: white; }
-.control-damage button { min-height: 42px; white-space: normal; }
+.control-damage input,.control-damage select,.control-damage textarea { width: 100%; min-width: 0; min-height: 42px; border: 1px solid #cbd5e1; border-radius: 8px; padding: 10px; font: inherit; box-sizing: border-box; background: white; }
+.control-damage button { min-height: 42px; white-space: normal; max-width: 100%; overflow-wrap: anywhere; }
 .control-damage-grid { display: grid; grid-template-columns: minmax(0,2fr) minmax(0,3fr); gap: 24px; }
 .control-damage-lines { display: flex; flex-direction: column; gap: 8px; max-height: 65vh; overflow: auto; }
 .control-damage-lines > button { display: grid; gap: 6px; text-align: left; padding: 14px; border: 1px solid #d9e2ec; border-radius: 10px; background: #f8fafc; color: #172033; height: auto; flex-shrink: 0; }
@@ -18,7 +20,7 @@
 .control-damage-fields { display: grid; grid-template-columns: 1fr 1fr; gap: 14px; }
 .control-damage-suggestions { display: grid; gap: 6px; max-height: 220px; overflow: auto; margin-bottom: 12px; }
 .control-damage-suggestions button { text-align: left; height: auto; padding: 12px; }
-.control-damage-photos { display: grid; grid-template-columns: repeat(auto-fit,minmax(110px,1fr)); gap: 10px; margin-top: 16px; }
+.control-damage-photos { display: grid; grid-template-columns: repeat(auto-fit,minmax(min(110px,100%),1fr)); gap: 10px; margin-top: 16px; }
 .control-damage-photos button { padding: 0; border: 0; background: transparent; max-width: 220px; height: 140px; }
 .control-damage-photos img { display: block; width: 100%; height: 100%; object-fit: cover; border-radius: 8px; }
 .control-damage-error { color: #9f1239; background: #fff1f2; border-radius: 8px; padding: 12px; overflow-wrap: anywhere; }

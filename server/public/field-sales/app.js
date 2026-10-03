@@ -123,7 +123,7 @@ async function reviewQueue() {
 function shell() {
   const nav=[['prospects','⌖','Prospects'],['routes','↝','Routes'],['today','◉','Visiting'],['followups','↻','Follow-ups'],['quotes','▤','Quotes'],['customers','♙','Customers'],...(isAdmin(state.operator)?[['settings','⚙','Settings']]:[])];
   $('#app').innerHTML=`<div class="shell"><aside class="rail"><div class="brand"><img src="/field-sales/icon.svg" alt=""><div>Field Sales<small>MBBS · MBR · MBT</small></div></div><nav class="nav">${nav.map(([id,icon,label])=>`<a href="#${id}" data-page="${id}" class="${id==='settings'?'settings-nav':''}"><span class="symbol">${icon}</span>${label}</a>`).join('')}</nav><div class="rail-footer"><span class="user-label">${escape(state.operator.display_name)}</span><a href="${escape(state.operator.homeRoute==='/field-sales/'?'/':state.operator.homeRoute||'/')}">Operations ↗</a><button id="logout">Sign out</button></div></aside><main class="workspace"><header class="topbar"><span class="eyebrow">Toronto · Field operations</span><button id="sync" class="quiet sync">Checking saved work…</button></header><div id="view" class="page"></div></main></div>`;
-  on('#sync','click',reviewQueue);on('#logout','click',async()=>{await state.workspace.close();state.workspace=null;token='';for(const key of [TOKEN,SESSION,'mbbs.dispatch.token','mbbs.control.token','mbbs.operator.token','mbbs.staff.role','mbbs.staff.roles']){localStorage.removeItem(key);}login();});
+  on('#sync','click',reviewQueue);on('#logout','click',async()=>{await api('/api/auth/logout',{}).catch(()=>{});await state.workspace.close();state.workspace=null;token='';for(const key of [TOKEN,SESSION,'mbbs.dispatch.token','mbbs.control.token','mbbs.operator.token','mbbs.staff.role','mbbs.staff.roles']){localStorage.removeItem(key);}login();});
 }
 export const ctx={state,api,read,load,list,save,replaceQuote,replaceQuoteGroup,sync,updateSync,isAdmin:()=>isAdmin(state.operator),today:torontoDate,render:()=>renderPage(),routePayload:r=>({...r.data,id:r.id,revision:r.revision,date:r.date,name:r.name,status:r.status,ownerId:r.owner_id})};
 async function renderPage() {
@@ -145,10 +145,9 @@ async function ready(operator,status,verified=true) {
   shell();await updateSync();await renderPage();void sync();
   if('serviceWorker' in navigator){navigator.serviceWorker.register('/field-sales/service-worker.js',{scope:'/field-sales/'}).catch(()=>notify('Offline app installation failed; keep this page open until it is available.'));}
 }
-function login(message='') {
+function login() {
   state.operator=null;
-  $('#app').innerHTML=`<form class="login" id="login"><img src="/field-sales/icon.svg" alt=""><div><h1>Field Sales</h1><p class="muted">Your territory. Your next opportunity.</p></div><label>Username<input name="username" required autocomplete="username"></label><label>Password<input name="password" type="password" required autocomplete="current-password"></label><button class="primary">Sign in</button><small>${escape(message||'Use your Field Sales or administrator account.')}</small></form>`;
-  on('#login','submit',async(e,form)=>{e.preventDefault();const result=await api('/api/auth/login',values(form));requireFieldSales(result.operator);token=result.token;localStorage.setItem(TOKEN,token);localStorage.setItem('mbbs.staff.role',result.operator.role);localStorage.setItem('mbbs.staff.roles',JSON.stringify(result.operator.roles));await ready(result.operator,await api('/status'));});
+  window.location.replace('/login.html?next=' + encodeURIComponent(location.pathname + location.search + location.hash));
 }
 async function boot() {
   if(!token){return login();}

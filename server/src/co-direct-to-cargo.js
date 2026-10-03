@@ -5,7 +5,6 @@ import { dispatchLocationsShareYard } from "./dispatch-location.js";
 
 const FIELDS = ["quantity", "pallet_qty", "layer_qty", "section_qty", "piece_qty"];
 const ITEM_FIELDS = ["quantity", "pallets", "layers", "sections", "pieces"];
-const PACKED = ["packed_sales_qty", "packed_pallet_qty", "packed_layer_qty", "packed_section_qty", "packed_piece_qty"];
 
 function conflict(message) {
   return Object.assign(new Error(message), { code: "CO_DIRECT_TO_CARGO_CONFLICT", status: 409 });
@@ -44,13 +43,6 @@ function sourceLineFor(line, sources) {
   return matches[0];
 }
 
-function assertCargoEditable(co, line) {
-  if (co.preparing_operator_id || co.preparing_started_at || co.status === "preparing"
-    || line.confirmed_at || PACKED.some(field => quantity(line[field]) > 0)) {
-    throw conflict(`${co.co_ref} has operator work on affected cargo. Release that work before changing its TO link.`);
-  }
-}
-
 async function reconcileCo(co, requestedBy) {
   const lines = (await query("SELECT * FROM local_co_order_lines WHERE co_id=$1 ORDER BY id FOR UPDATE", [co.id])).rows;
   const sources = (await query(`SELECT line.*,sales.outbound_location FROM sales_order_lines line
@@ -71,7 +63,8 @@ async function reconcileCo(co, requestedBy) {
     if (!allocated && !line.raw?.coDirectToRequirement) {continue;}
     const { base, required } = coDirectToRequirement(line, allocated);
     const changed = FIELDS.some(field => quantity(line[field]) !== required[field]);
-    if (changed) {assertCargoEditable(co, line);}
+    // Dispatch changes the required route cargo independently of Operator
+    // preparation and packing. Keep the recorded packing quantities intact.
     if (!changed && line.raw?.coDirectToRequirement) {continue;}
     await query(`UPDATE local_co_order_lines SET quantity=$2,pallet_qty=$3,layer_qty=$4,section_qty=$5,piece_qty=$6,
       raw=COALESCE(raw,'{}'::jsonb)||jsonb_build_object('coDirectToRequirement',$7::jsonb) WHERE id=$1`,

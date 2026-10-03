@@ -1,4 +1,5 @@
 import { query } from "./db.js";
+import { isDeepStrictEqual } from "node:util";
 
 const DISPATCH_COMPANY_TIME_ZONE = "America/Toronto";
 
@@ -27,6 +28,17 @@ export function historicalDispatchPlanDate(value, { today = dispatchCompanyDate(
   const parsed = new Date(`${candidate}T00:00:00.000Z`);
   if (Number.isNaN(parsed.getTime()) || parsed.toISOString().slice(0, 10) !== candidate) return "";
   return candidate < today ? candidate : "";
+}
+
+export function retainsHistoricalDispatchBoard(previousPlan = {}, command = {}) {
+  if (!historicalDispatchPlanDate(previousPlan.planDate)) { return false; }
+  if ((command.commandType || command.type) !== "replace_plan") { return false; }
+  const payload = command.payload || {};
+  if (payload.planDelta || payload.retiredGlobalOrderRefs?.length || payload.reactivatedGlobalOrderRefs?.length
+    || payload.safeUngroupTargets?.length) { return false; }
+  return isDeepStrictEqual(payload.orders, previousPlan.orders || [])
+    && isDeepStrictEqual(payload.trucks, previousPlan.trucks || [])
+    && isDeepStrictEqual(payload.summary || {}, previousPlan.summary || {});
 }
 
 export async function listCompletedReconciliationDispatchRefs() {
@@ -394,6 +406,20 @@ export async function listDriverPwaCompletedDispatchRefs({ candidateRefs = [] } 
             $2::boolean
             OR LOWER(BTRIM(ref.value)) IN (SELECT order_ref FROM candidate_sources)
           )
+       UNION
+       -- Linked and remaining-cargo PO drops can use different references.
+       -- Canonical Driver proof protects every retained PO alias.
+       SELECT DISTINCT LOWER(BTRIM(ref.value)) AS order_ref
+         FROM dispatch_order_completion_status completion
+         LEFT JOIN purchase_orders po
+           ON po.netsuite_id::text = completion.metadata->>'poOrderId'
+           OR lower(btrim(completion.order_ref)) IN (lower(btrim(po.tranid)),lower(btrim(po.dispatch_ref)))
+         CROSS JOIN LATERAL UNNEST(ARRAY[completion.order_ref, po.tranid, po.dispatch_ref]) ref(value)
+        WHERE completion.order_kind = 'PO'
+          AND completion.dispatch_completion_status = 'completed'
+          AND completion.completion_evidence_type = 'driver_job'
+          AND COALESCE(BTRIM(ref.value), '') <> ''
+          AND ($2::boolean OR LOWER(BTRIM(ref.value)) IN (SELECT order_ref FROM candidate_sources))
      ),
      completed_closure(order_ref) AS (
        SELECT order_ref

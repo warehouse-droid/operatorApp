@@ -3,6 +3,8 @@
 import crypto from "node:crypto";
 
 import { query, withTransaction } from "../db.js";
+import { DISPATCH_FLEET_PLANNING_LOCK } from "../dispatch-fleet-status.js";
+import { releaseMbtBinSuccessorToPool } from "./bin-planning-repository.js";
 import { compareDriverPwaVersions } from "../driver-client-version.js";
 import { recordDriverJobPhotos, startDriverJob } from "../driver-repository.js";
 import { recordAssetMovement } from "./asset-service.js";
@@ -439,6 +441,7 @@ function materializedMbtSnapshot(input) {
     contractNumber: String(visit.contract_number),
     visitId: String(visit.service_visit_id),
     visitReference: String(visit.visit_reference),
+    ...(assignmentSnapshot.generation ? { planningGeneration: Number(assignmentSnapshot.generation) } : {}),
     visitNumber: Number(visit.visit_number),
     issuedVisitRevision: Number(valueOrFallback(assignmentSnapshot.visitRevision, visit.revision)),
     serviceAction: String(visit.service_action),
@@ -922,6 +925,7 @@ export async function startMbtDriverBinJob(input, { capability }) {
     throw failure(400, "MBT_DRIVER_BIN_INPUT_INVALID", "A BIN job-start event is required.");
   }
   return withTransaction(async () => {
+    await query("SELECT pg_advisory_xact_lock(hashtext($1))", [DISPATCH_FLEET_PLANNING_LOCK]);
     await lockApplicationIdentity(normalized);
     const replay = await existingApplication(normalized);
     if (replay) {return replay;}
@@ -1780,6 +1784,7 @@ async function finishStepAndVisit(context) {
         WHERE visit_id = $1 AND released_at IS NULL`,
       [context.rows.visit.service_visit_id, context.normalized.occurredAt, context.normalized.driverLogin]
     );
+    await releaseMbtBinSuccessorToPool(String(context.rows.visit.service_visit_id), `driver:${context.normalized.driverLogin}`);
   }
   return visitCompleted;
 }
@@ -1825,6 +1830,7 @@ export async function completeMbtDriverBinJob(input, { capability, hooks = {} })
     throw failure(400, "MBT_DRIVER_BIN_INPUT_INVALID", "A BIN job-completion event is required.");
   }
   return withTransaction(async () => {
+    await query("SELECT pg_advisory_xact_lock(hashtext($1))", [DISPATCH_FLEET_PLANNING_LOCK]);
     await lockApplicationIdentity(normalized);
     const replay = await existingApplication(normalized);
     if (replay) {return replay;}

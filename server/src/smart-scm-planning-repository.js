@@ -1,3 +1,7 @@
+import {syncPurchaseStockDemand} from './regular-stock-purchase-service.js';
+import {reconcilePurchaseStockAllocations} from './regular-stock-purchase-repository.js';
+import { smartScmOrderedLines, smartScmLineKey } from "./smart-scm-line-order.js";
+import { syncRegularReplenishments, creditRegularReplenishments, listRegularReplenishments } from './regular-stock-replenishment.js';
 import { hasActiveTransaction, query, withTransaction } from "./db.js";
 import { smartScmSplitRemainingSql } from "./smart-scm-split-inbound-sql.js";
 import { writeAudit } from "./auth-repository.js";
@@ -371,6 +375,7 @@ export async function listSmartScmBlanketPlanningPauses({ search = "" } = {}) {
 
 export async function loadSmartScmPlanningPolicies({
   includeTemporarilyExcluded = false,
+  includePausedItemIds = [],
   blanketBalanceByItem = null
 } = {}) {
   const [result, resolvedBlanketBalanceByItem] = await Promise.all([query(
@@ -420,12 +425,12 @@ export async function loadSmartScmPlanningPolicies({
           LIMIT 1
        ) active_exclusion ON true
       WHERE y.eligible = true
-        AND p.planning_enabled = true
+        AND (p.planning_enabled = true OR p.item_id = ANY($2::bigint[]))
         AND p.inactive = false
         AND p.discontinued = false
         AND ($1::boolean OR active_exclusion.item_id IS NULL)
       ORDER BY p.item_id, y.location_id`,
-    [includeTemporarilyExcluded]
+    [includeTemporarilyExcluded,includePausedItemIds]
   ), blanketBalanceByItem instanceof Map
     ? Promise.resolve(blanketBalanceByItem)
     : smartScmAvailableBlanketBalanceByItem()]);
@@ -1118,6 +1123,7 @@ function combineLoadLine(lines, next) {
   existing.provisional = Boolean(existing.provisional || next.provisional);
   existing.reason = {
     ...(existing.reason || {}),
+    ...((existing.reason?.purchaseDemandIds || next.reason?.purchaseDemandIds) ? {purchaseDemandIds:[...new Set([...(existing.reason?.purchaseDemandIds||[]),...(next.reason?.purchaseDemandIds||[])])]} : {}),
     urgent: existing.urgent,
     urgencyLevel: existing.urgencyLevel,
     urgencyScore: existing.urgencyScore,
@@ -1381,17 +1387,17 @@ function criticalAffinityProposalLoads(baselineLoads = [], truckCapacity = 0, ma
   }));
 }
 
-export function smartScmPackWholePalletLines(lines = [], truckCapacityLbs = 0, { proposalType = "PO", sourceName = "", maxStops = 2, routeRule } = {}) {
+export function smartScmPackWholePalletLines(lines = [], truckCapacityLbs = 0, { proposalType = "PO", sourceName = "", maxStops = 2, routeRule, allowPartialPallets = false } = {}) {
   const truckCapacity = positive(truckCapacityLbs);
   if (truckCapacity <= EPSILON) throw new Error("Truck capacity must be greater than zero.");
   if (!lines.length) return [];
   if (lines.some((line) => positive(line.palletWeight) <= EPSILON || positive(line.proposedPallets) <= EPSILON)) {
     throw new Error("Every packed line needs a positive pallet quantity and pallet weight.");
   }
-  if (lines.some((line) => Math.abs(positive(line.proposedPallets) - Math.round(positive(line.proposedPallets))) > EPSILON)) {
+  if (!allowPartialPallets && lines.some((line) => Math.abs(positive(line.proposedPallets) - Math.round(positive(line.proposedPallets))) > EPSILON)) {
     throw new Error("PO recalculation requires whole-pallet quantities.");
   }
-  const units = lines.flatMap((line) => palletUnits({ proposalType, lines: [{ ...line, proposedPallets: Math.round(positive(line.proposedPallets)) }] }))
+  const units = lines.flatMap((line) => palletUnits({ proposalType, lines: [{ ...line, proposedPallets: allowPartialPallets ? positive(line.proposedPallets) : Math.round(positive(line.proposedPallets)) }] }))
     .sort(proposalUnitSort);
   const routing = activeRouteRule(sourceName, maxStops, routeRule);
   const stopLimit = proposalType === "PO" ? routing.maxDrops : 1;
@@ -1428,12 +1434,15 @@ export function consolidateCompatibleDrafts(drafts = [], settings = {}, namespac
     const phase = group.some((draft) => draft.phase === "direct_vendor")
       ? "direct_vendor"
       : base.phase;
-    const routeRule = routeRules.get?.(smartScmRouteRuleKey(base.sourceName));
+    const purchaseGroup=group.every(draft=>draft.lines.every(line=>line.reason?.stockingPurchase));
+    const configuredRule = routeRules.get?.(smartScmRouteRuleKey(base.sourceName));
+    const routeRule=purchaseGroup?{...(configuredRule||smartScmBuiltInRouteRule(base.sourceName)),partialRedirectEnabled:false}:configuredRule;
     const loads = smartScmPackWholePalletLines(group.flatMap((draft) => draft.lines), truckCapacity, {
       proposalType: base.proposalType,
       sourceName: base.sourceName,
       maxStops: base.proposalType === "PO" ? 2 : 1,
-      routeRule
+      routeRule,
+      allowPartialPallets: purchaseGroup
     });
     loads.forEach((load, index) => {
       const totalPallets = round(load.lines.reduce((sum, line) => sum + positive(line.proposedPallets), 0));
@@ -1636,6 +1645,31 @@ export function smartScmBuildPlanningDrafts({ states, supplyMap, settings }) {
     });
   }
   return { drafts, exceptions };
+}
+
+export async function persistRegularReplenishmentDraft({runId,group,state,quantity,settings}) {
+  const line=smartScmProposalLineForState(state,quantity/state.toPlt,{regularReplenishmentId:Number(group.id),stockRequestReplenishment:true});
+  const draft=createDraft({type:'PO',phase:'direct_vendor',sourceKind:'vendor',sourceVendorYardId:state.policy.vendor_yard_id,
+    sourceName:state.policy.vendor_yard||state.policy.plant||state.policy.vendor||'Vendor',destinationLocationId:Number(group.source_location_id),
+    destinationName:state.policy.yard_code,vendor:state.policy.vendor,plant:state.policy.plant,line,status:line.manualPlanningRequired?'attention':'held',keySuffix:`regular-${group.id}-${group.revision}`},settings);
+  draft.memo=`Stock request replenishment · ${state.policy.item_name}`;
+  let proposalId=group.current_proposal_id;
+  if(proposalId){
+    await query(`UPDATE scm_smart_proposals SET total_pallets=$2,total_weight_lbs=$3,utilization=$4,status=$5,memo=$6,updated_at=now() WHERE id=$1`,
+      [proposalId,draft.totalPallets,draft.totalWeight,draft.utilization,draft.status,draft.memo]);
+    await query(`UPDATE scm_smart_proposal_lines SET required_pallets=$2,proposed_pallets=$2,residual_pallets=$2,sales_quantity=$3,
+      line_weight_lbs=$4,reason=$5::jsonb,manual_planning_required=$6,updated_at=now() WHERE proposal_id=$1`,
+      [proposalId,line.proposedPallets,line.salesQuantity,line.lineWeight,JSON.stringify(line.reason),line.manualPlanningRequired]);
+  }else{
+    await insertDrafts(runId,[draft]);
+    proposalId=Number((await query('SELECT id FROM scm_smart_proposals WHERE run_id=$1 AND proposal_key=$2',[runId,draft.proposalKey])).rows[0].id);
+    await query('UPDATE scm_smart_proposals SET regular_replenishment_id=$2 WHERE id=$1',[proposalId,group.id]);
+  }
+  return proposalId;
+}
+
+export async function persistPurchaseStockDrafts(runId, drafts) {
+  await insertDrafts(runId,drafts);
 }
 
 async function insertDrafts(runId, drafts = []) {
@@ -1938,7 +1972,7 @@ export function smartScmPhysicalPalletLines(proposal = {}, palletItem = null) {
 }
 
 function publicProposal(row) {
-  const lines = Array.isArray(row.lines) ? row.lines.map(publicProposalLine) : [];
+  const lines = smartScmOrderedLines(Array.isArray(row.lines) ? row.lines.map(publicProposalLine) : [], row.line_order);
   const palletQuantityOverrides = smartScmNormalizePalletQuantityOverrides(row.pallet_quantity_overrides);
   const physicalPalletLines = smartScmPhysicalPalletLines({
     id: row.id,
@@ -1957,6 +1991,8 @@ function publicProposal(row) {
   return {
     id: Number(row.id),
     runId: Number(row.run_id),
+    purchaseRequests: row.purchase_stock_requests || [],
+    regularReplenishmentId: row.regular_replenishment_id ? Number(row.regular_replenishment_id) : null,
     proposalKey: row.proposal_key,
     proposalType: row.proposal_type,
     proposalOrigin: row.proposal_origin || "inventory",
@@ -2017,7 +2053,8 @@ function publicProposal(row) {
     createdAt: row.created_at,
     updatedAt: row.updated_at,
     lines,
-    physicalPalletLines
+    physicalPalletLines,
+    lineOrder: smartScmOrderedLines([...lines, ...physicalPalletLines], row.line_order).map(smartScmLineKey)
   };
 }
 
@@ -2028,11 +2065,12 @@ async function proposalRows({ proposalId = null, runId = null, status = "", stat
     params.push(Number(proposalId));
     clauses.push(`p.id = $${params.length}`);
   } else {
-    clauses.push("p.vendor_resolution_kind IS NULL");
+    clauses.push("(p.vendor_resolution_kind IS NULL OR (p.regular_replenishment_id IS NOT NULL OR EXISTS(SELECT 1 FROM scm_smart_proposal_lines link WHERE link.proposal_id=p.id AND link.reason ? 'purchaseDemandIds')) AND p.vendor_resolution_kind='netsuite_po_review')");
+    clauses.push("NOT(p.status='superseded' AND EXISTS(SELECT 1 FROM scm_smart_proposal_lines link WHERE link.proposal_id=p.id AND link.reason ? 'purchaseDemandIds'))");
   }
   if (runId) {
     params.push(Number(runId));
-    clauses.push(`p.run_id = $${params.length}`);
+    clauses.push(`(p.run_id = $${params.length} OR EXISTS(SELECT 1 FROM regular_stock_purchase_runs carry WHERE carry.proposal_id=p.id AND carry.run_id=$${params.length} AND p.status NOT IN ('cancelled','superseded')) OR EXISTS (SELECT 1 FROM regular_stock_replenishments g JOIN regular_stock_replenishment_runs carry ON carry.replenishment_id=g.id WHERE g.released_at IS NULL AND g.id=p.regular_replenishment_id AND p.status NOT IN ('cancelled','superseded') AND carry.run_id=$${params.length}))`);
   }
   if (status) {
     params.push(String(status));
@@ -2058,6 +2096,7 @@ async function proposalRows({ proposalId = null, runId = null, status = "", stat
   params.push(Math.min(2000, Math.max(1, Number(limit) || 500)));
   const result = await query(
     `SELECT p.*,
+            COALESCE((SELECT jsonb_agg(DISTINCT jsonb_build_object('requestId',r.id,'requestRef',r.request_ref,'lineId',l.id,'itemId',l.item_id,'approvedQuantity',d.approved_quantity)) FROM regular_stock_purchase_allocations a JOIN regular_stock_purchase_demands d ON d.id=a.demand_id JOIN sales_stock_request_lines l ON l.id=d.request_line_id JOIN sales_stock_requests r ON r.id=l.request_id WHERE a.proposal_id=p.id AND a.active),'[]') AS purchase_stock_requests,
             planning_run.started_at AS planning_run_created_at,
             planning_run.completed_at AS planning_run_completed_at,
             planning_run.settings_snapshot AS planning_run_settings,
@@ -2090,7 +2129,7 @@ async function proposalRows({ proposalId = null, runId = null, status = "", stat
        FROM scm_smart_proposals p
        LEFT JOIN scm_smart_planning_runs planning_run ON planning_run.id = p.run_id
       ${clauses.length ? `WHERE ${clauses.join(" AND ")}` : ""}
-      ORDER BY ${vendorQueue ? "p.order_requested_at DESC NULLS LAST, p.id DESC" : `p.run_id DESC,
+      ORDER BY (p.regular_replenishment_id IS NOT NULL) DESC, ${vendorQueue ? "p.order_requested_at DESC NULLS LAST, p.id DESC" : `p.run_id DESC,
         CASE p.urgency_level
           WHEN 'ultimate_urgent' THEN 3
           WHEN 'super_urgent' THEN 2
@@ -2108,7 +2147,8 @@ export async function loadSmartScmPlanningDemandStates({
   forecastRunId = null,
   includeTemporarilyExcluded = true,
   excludeTransferOrderIds = [],
-  settingsOverride = null
+  settingsOverride = null,
+  includePausedItemIds = []
 } = {}) {
   const selectedForecastRunId = forecastRunId || await latestSmartScmForecastRunId();
   const settings = settingsOverride || await settingsRow();
@@ -2116,6 +2156,7 @@ export async function loadSmartScmPlanningDemandStates({
   const blanketBalanceByItem = smartScmBlanketBalanceByItem(blanketPoolRows);
   const policies = await loadSmartScmPlanningPolicies({
     includeTemporarilyExcluded,
+    includePausedItemIds,
     blanketBalanceByItem
   });
   const inventory = await inventoryState({
@@ -2158,8 +2199,10 @@ export async function loadSmartScmPlanningDemandStates({
 
 export async function runSmartScmPlan({ triggerSource = "manual", operatorId = null, forecastRunId = null } = {}) {
   await resumeSmartScmBlanketCoveredPlanningExclusions({ operatorId });
+  const forcedItemIds=(await query("SELECT DISTINCT item_id FROM regular_stock_replenishments WHERE released_at IS NULL")).rows.map(row=>Number(row.item_id));
   const planning = await loadSmartScmPlanningDemandStates({
     forecastRunId,
+    includePausedItemIds: forcedItemIds,
     includeTemporarilyExcluded: true
   });
   const selectedForecastRunId = planning.forecastRunId;
@@ -2183,18 +2226,24 @@ export async function runSmartScmPlan({ triggerSource = "manual", operatorId = n
   );
   const run = created.rows[0];
   try {
-    const calculated = smartScmBuildPlanningDrafts({ states, supplyMap, settings });
-    const phaseOneDrafts = smartScmPlanningPhaseOneDrafts(calculated.drafts, { mode: planningMode });
-    const drafts = consolidateCompatibleDrafts(phaseOneDrafts, settings, "initial", routeRules);
-    const { exceptions } = calculated;
+    let drafts, exceptions;
     await withTransaction(async () => {
+      const coverage = await syncRegularReplenishments({runId:run.id,planning});
+      const purchaseCoverage=await syncPurchaseStockDemand({runId:run.id});
+      for(const [key,value] of purchaseCoverage)coverage.set(key,(coverage.get(key)||0)+value);
+      const calculated = smartScmBuildPlanningDrafts({ states: creditRegularReplenishments(states.filter(state=>state.policy.planning_enabled!==false),coverage), supplyMap, settings });
+      const phaseOneDrafts = smartScmPlanningPhaseOneDrafts(calculated.drafts, { mode: planningMode });
+      drafts = consolidateCompatibleDrafts(phaseOneDrafts, settings, "initial", routeRules);
+      exceptions = calculated.exceptions;
       await insertDrafts(run.id, drafts);
+      const priority = await listRegularReplenishments({runId:run.id});
       const totals = {
         shortageLines: states.filter((state) => state.requiredPallets > 0).length,
         zeroDemandCoverageLines: states.filter((state) => state.coverageCausedNeed && state.requiredPallets > 0).length,
         zeroDemandReviewLines: states.filter((state) => state.coverageReviewRequired && state.requiredPallets > 0).length,
-        proposals: drafts.length,
-        poProposals: drafts.filter((draft) => draft.proposalType === "PO").length,
+        proposals: drafts.length + priority.filter(group=>group.currentProposalId).length,
+        regularReplenishments: priority.length,
+        poProposals: drafts.filter((draft) => draft.proposalType === "PO").length + priority.filter(group=>group.currentProposalId).length,
         toProposals: drafts.filter((draft) => draft.proposalType === "TO").length,
         urgent: drafts.filter((draft) => draft.urgent).length,
         held: drafts.filter((draft) => draft.status === "held").length,
@@ -2275,12 +2324,16 @@ export async function approveSmartScmPoPhase(runId, operatorId = null) {
         }
         const planning = await loadSmartScmPlanningDemandStates({
           forecastRunId: run.forecast_run_id,
+          includePausedItemIds: (await query("SELECT DISTINCT item_id FROM regular_stock_replenishments WHERE released_at IS NULL")).rows.map(row=>Number(row.item_id)),
           includeTemporarilyExcluded: true,
           settingsOverride: run.settings_snapshot
         });
         const evidence = await smartScmExpectedPoEvidence();
+        const priorityCoverage=await syncRegularReplenishments({runId:id,planning});
+        const purchaseCoverage=await syncPurchaseStockDemand({runId:id});
+        for(const [key,value] of purchaseCoverage)priorityCoverage.set(key,(priorityCoverage.get(key)||0)+value);
         const calculated = smartScmBuildTransferPhaseDrafts({
-          states: planning.states,
+          states: creditRegularReplenishments(planning.states.filter(state=>state.policy.planning_enabled!==false),priorityCoverage),
           settings: run.settings_snapshot
         });
         const coverageSnapshot = smartScmBlanketCoverageSnapshot(planning.states);
@@ -2427,6 +2480,7 @@ export async function getSmartScmPlanningRun(id) {
     startedAt: row.started_at,
     completedAt: row.completed_at,
     proposals,
+    regularReplenishments: await listRegularReplenishments({runId:row.id}),
     revisions: revisions.rows.map((revision) => ({
       id: Number(revision.id),
       revision: Number(revision.revision),
@@ -2580,6 +2634,14 @@ export async function setSmartScmPalletQuantityOverride(proposalId, destinationL
 }
 
 export async function updateSmartScmProposal(proposalId, patch = {}, operatorId = null) {
+  return withTransaction(async()=>{
+    const {lockRegularReplenishments} = await import('./regular-stock-replenishment.js');
+    await lockRegularReplenishments();
+    return updateSmartScmProposalLocked(proposalId,patch,operatorId);
+  });
+}
+
+async function updateSmartScmProposalLocked(proposalId, patch, operatorId) {
   const currentResult = await query("SELECT * FROM scm_smart_proposals WHERE id = $1", [Number(proposalId)]);
   if (!currentResult.rowCount) throw Object.assign(new Error("Smart SCM proposal was not found."), { status: 404 });
   const current = currentResult.rows[0];
@@ -2592,6 +2654,10 @@ export async function updateSmartScmProposal(proposalId, patch = {}, operatorId 
     throw Object.assign(new Error("This proposal already has an execution reference and cannot be changed."), { status: 409 });
   }
   const nextStatus = patch.status ? String(patch.status) : current.status;
+  if(current.regular_replenishment_id && nextStatus !== 'cancelled') {
+    const group=(await query('SELECT evidence FROM regular_stock_replenishments WHERE id=$1',[current.regular_replenishment_id])).rows[0];
+    if(group?.evidence?.error)throw Object.assign(new Error(group.evidence.error),{status:409});
+  }
   let result;
   if (current.proposal_type === "PO") {
     const transitions = {
@@ -2635,6 +2701,7 @@ export async function updateSmartScmProposal(proposalId, patch = {}, operatorId 
     action: nextStatus === "order_requested" ? "smart_scm.purchase.order_requested" : "smart_scm.proposal.update",
     details: { proposalId: Number(proposalId), beforeStatus: current.status, status: nextStatus, memo: patch.memo }
   });
+  await reconcilePurchaseStockAllocations();
   return (await proposalRows({ runId: result.rows[0].run_id, limit: 2000 })).map(publicProposal).find((proposal) => proposal.id === Number(proposalId));
 }
 
@@ -3041,12 +3108,13 @@ export async function prepareSmartScmTransferExecution(proposalId, operatorId = 
       memo: proposal.memo,
       totalPallets: positive(proposal.total_pallets),
       palletTransferQuantity,
+      lineOrder: Array.isArray(proposal.line_order) ? proposal.line_order : [],
       grossWeightLbs: grossWeight,
       automaticGrossWeightLbs: automaticGrossWeight,
       truckCapacityLbs,
       overCapacity,
       manualCapacityOverride: overCapacity && (manualCapacityOverride || palletOverrideMakesOverCapacity),
-      lines: proposal.lines.map((line) => ({
+      lines: smartScmOrderedLines(proposal.lines, proposal.line_order).map((line) => ({
         id: Number(line.id),
         itemId: Number(line.item_id),
         itemName: line.item_name,

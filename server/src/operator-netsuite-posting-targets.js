@@ -7,11 +7,13 @@ import { mapOperatorKitSelections, operatorKitError } from './operator-netsuite-
 import { fetchOperatorKitSource } from './operator-netsuite-posting-kit-source.js';
 import { applyVerifiedPoReceiptProgress } from "./receiving-receipt-progress.js";
 import { refreshPoReceiptAvailability } from "./operator-po-receipt-availability.js";
+import { receivingOrderYards, scopeReceivingOrderYard } from './receiving-yard-scope.js';
 import { fetchPickupExistingFulfillment } from './operator-pickup-existing-if-source.js';
 import { outboundOrderYards } from './outbound-location-domain.js';
 import { operatorPostingTelemetry as telemetry } from "./operator-netsuite-posting-telemetry.js";
 import {
   buildItemFulfillmentPayload,
+  fulfillmentLineQuantity,
   getDeliveryOrder,
   isPickupDeliveryMethod
 } from "./delivery-repository.js";
@@ -245,6 +247,8 @@ export function createOperatorNetSuitePostingLiveSourceFetcher({
       sourceOrderKind: kind,
       sourceNetSuiteId: id,
       sourceOrderRef: String(order.tranid || ""),
+      status: order.status,
+      statusText: order.statusText,
       lines,
       linkedTransactions: linkedRows || []
     };
@@ -266,6 +270,24 @@ function hasPackedQuantity(line) {
 function eligibleLine(line) {
   return ["InvtPart", "NonInvtPart"].includes(String(line?.item_type || ""))
     && String(line?.line_id ?? "").trim() !== "";
+}
+
+/** @param {Record<string, any>} order @param {string} functionKey */
+function hasIgnoredPackedFulfillment(order, functionKey) {
+  return functionKey !== "receiving" && (order.lines || []).some((/** @type {Record<string, any>} */ line) =>
+    line.item_type === "NonInvtPart" && eligibleLine(line) && hasPackedQuantity(line));
+}
+
+/** @param {Record<string, any>} order @param {Record<string, any>} source @param {string} orderKey */
+function ignoredKitComponentSelections(order, source, orderKey) {
+  const memberKeys = new Set(source.kitGroups.flatMap((/** @type {Record<string, any>} */ group) =>
+    group.members.map((/** @type {Record<string, any>} */ member) => String(member.sourceLineKey))));
+  // A kit posts its parent only. Retain ignored components solely as membership evidence.
+  return (order.lines || []).filter((/** @type {Record<string, any>} */ line) => line.item_type === "NonInvtPart"
+    && eligibleLine(line) && hasPackedQuantity(line) && memberKeys.has(String(line.line_id)))
+    .map((/** @type {Record<string, any>} */ line) => ({ sourceLineKey: String(line.line_id), itemId: Number(line.item_id),
+      quantity: fulfillmentLineQuantity(line), location: Number(line.location_id || order.outbound_location_id),
+      localOrderKey: orderKey, localLineId: String(line.id ?? line.line_id) }));
 }
 
 /** @param {Record<string, any>} order */
@@ -323,7 +345,30 @@ function localLineForPayload(order, functionKey, orderLine) {
 /** @param {Record<string, any>} order @param {string} functionKey @param {Record<string, any>} source */
 function targetMetadata(order, functionKey, source) {
   return { ...(functionKey === "receiving" ? { memo: String(order.tranid || "").trim() } : {}),
-    ...(source.postingStrategy ? { postingStrategy: source.postingStrategy } : {}) };
+    ...(source.postingStrategy ? { postingStrategy: source.postingStrategy } : {}),
+    confirmedNonInventoryLines: confirmedNonInventoryLines(order, functionKey, source) };
+}
+
+/** Capture evidence separately from the inventory-only transform payload.
+ * @param {Record<string, any>} order @param {string} functionKey @param {Record<string, any>} source */
+function confirmedNonInventoryLines(order, functionKey, source) {
+  if (functionKey === 'receiving' || source.sourceOrderKind !== 'SO') {return [];}
+  const memberKeys = new Set((source.kitGroups || []).flatMap((/** @type {any} */ group) =>
+    group.members.map((/** @type {any} */ member) => String(member.sourceLineKey))));
+  return (order.lines || []).filter((/** @type {any} */ line) => line.item_type === 'NonInvtPart'
+    && line.confirmed === true && line.netsuite_active !== false && hasPackedQuantity(line)
+    && !memberKeys.has(String(line.line_id))).flatMap((/** @type {any} */ line) => {
+    const matches = (source.nonInventoryLines || []).filter((/** @type {any} */ row) =>
+      String(row.source_line_key) === String(line.line_id) && Number(row.item_id) === Number(line.item_id));
+    const row = matches[0], quantity = fulfillmentLineQuantity(line);
+    const salesUom = String(line.unit || '').trim().toUpperCase();
+    if (matches.length !== 1 || !positiveInteger(row.netsuite_order_line) || !salesUom
+        || salesUom !== String(row.unit || '').trim().toUpperCase() || !(quantity > 0)) {return [];}
+    return [{ orderLine: Number(row.netsuite_order_line), itemId: Number(line.item_id), quantity,
+      salesUom, location: Number(line.location_id || order.outbound_location_id),
+      sourceLineKey: String(line.line_id), localOrderKey: localOrderKey(functionKey, order),
+      localLineId: String(line.id), autoIncludedNonInventory: true }];
+  });
 }
 
 /** @param {any} source */
@@ -362,6 +407,7 @@ async function targetForOrder(order, functionKey, resolveRealSource) {
         quantity: Number(item.quantity), location: item.location ?? null,
         localOrderKey: orderKey, localLineId: String(localLine.id ?? localLine.line_id) };
     });
+    physicalLines.push(...ignoredKitComponentSelections(order, source, orderKey));
     return { sourceOrderKind: source.sourceOrderKind, sourceNetSuiteId: Number(source.sourceNetSuiteId),
       sourceOrderRef: String(source.sourceOrderRef), ...targetMetadata(order, functionKey, source),
       selectedLines: mapOperatorKitSelections({ availableLines: source.availableLines, kitGroups: source.kitGroups }, physicalLines),
@@ -456,7 +502,7 @@ export function createOperatorNetSuitePostingTargetResolver({
         400
       );
     }
-    const root = functionKey === "receiving"
+    let root = functionKey === "receiving"
       ? await getReceivingOrderById(orderId, orderType)
       : await readDeliveryOrder(orderId);
     if (!root) {
@@ -465,6 +511,14 @@ export function createOperatorNetSuitePostingTargetResolver({
         "The current Operator order was not found.",
         404
       );
+    }
+    if (functionKey === 'receiving' && root.order_type === 'purchase_order'
+        && clientLocationId !== null && clientLocationId !== undefined && clientLocationId !== '') {
+      if (!receivingOrderYards(root).includes(normalizeOperatorNetSuiteLocationId(clientLocationId))) {
+        throw resolutionError('OPERATOR_NETSUITE_POSTING_LOCATION_MISMATCH',
+          'The selected yard does not match the server-owned order yard. Refresh before confirming.');
+      }
+      root = scopeReceivingOrderYard(root, clientLocationId, { keepAllLines: true });
     }
     if (functionKey === "customer_pickup"
         && (root.order_type !== "sales_order" || !isPickupDeliveryMethod(root.delivery_method))) {
@@ -531,7 +585,8 @@ export function createOperatorNetSuitePostingTargetResolver({
         const target = await targetForOrder(child, functionKey, resolveRealSource);
         if (target) {targets.push(target);}
       }
-      const localOnly = targets.length === 0 && localChildren.length > 0;
+      const localOnly = targets.length === 0 && (localChildren.length > 0
+        || postingChildren.some((/** @type {Record<string, any>} */ child) => hasIgnoredPackedFulfillment(child, functionKey)));
       if (!targets.length && !localOnly) {
         throw resolutionError(
           "OPERATOR_NETSUITE_POSTING_NO_LINES",
@@ -622,7 +677,7 @@ export function createOperatorNetSuitePostingRealSourceResolver({ query: runQuer
   if (sourceOrderKind === "SO") {
     rows = await runQuery(
       `SELECT line.line_id AS source_line_key,
-              line.netsuite_order_line, line.item_id, line.item_type, line.quantity,
+              line.netsuite_order_line, line.item_id, line.item_type, line.quantity, line.unit,
               line.loaded_qty AS cached_completed_qty, false AS cached_closed,
               COALESCE(line.location_id, parent.outbound_location_id) AS location_id
          FROM sales_order_lines line
@@ -675,7 +730,7 @@ export function createOperatorNetSuitePostingRealSourceResolver({ query: runQuer
     const withSplit = useStoredOrderLines && Number(order.netsuite_id) < 0;
     rows = await runQuery(
       `SELECT line.line_id AS source_line_key, NULL::bigint AS location_id,
-              line.netsuite_order_line, line.item_id, line.quantity,
+              line.netsuite_order_line, line.item_id, line.item_type, line.quantity,
               CASE WHEN line.line_stage='receiving' THEN line.netsuite_received_qty ELSE line.loaded_qty END AS cached_completed_qty,
               false AS cached_closed, ${withSplit ? "mapped.local_line_key, mapped.local_line_id" : "NULL AS local_line_key, NULL AS local_line_id"}
          FROM transfer_order_lines line
@@ -697,7 +752,8 @@ export function createOperatorNetSuitePostingRealSourceResolver({ query: runQuer
       [sourceNetSuiteId, lineStage, ...(withSplit ? [order.netsuite_id] : [])]
     );
     if (useStoredOrderLines && Number(order.netsuite_id) < 0) {
-      for (const child of (order.receivableLines || order.lines || []).filter(eligibleLine)) {
+      for (const child of (order.receivableLines || order.lines || []).filter((/** @type {Record<string, any>} */ line) =>
+        eligibleLine(line) && (lineStage === "receiving" || line.item_type !== "NonInvtPart"))) {
         const matches = rows.rows.filter((/** @type {Record<string, any>} */ row) =>
           String(row.local_line_id) === String(child.id) && String(row.local_line_key) === String(child.line_id));
         if (matches.length !== 1) {
@@ -707,10 +763,19 @@ export function createOperatorNetSuitePostingRealSourceResolver({ query: runQuer
       }
     }
   }
+  const nonInventoryLines = functionKey !== 'receiving' && sourceOrderKind === 'SO'
+    ? (rows.rows || []).filter((/** @type {any} */ row) => row.item_type === 'NonInvtPart') : [];
+  const ignoredSourceKeys = new Set(functionKey === "receiving" ? [] : (rows.rows || [])
+    .filter((/** @type {Record<string, any>} */ row) => row.item_type === "NonInvtPart")
+    .map((/** @type {Record<string, any>} */ row) => String(row.source_line_key)));
+  rows = { ...rows, rows: (rows.rows || []).filter((/** @type {Record<string, any>} */ row) =>
+    !ignoredSourceKeys.has(String(row.source_line_key))) };
   if (sourceOrderKind === 'SO' && (rows.rows || []).some((/** @type {any} */ row) => row.item_type === 'Kit')) {
     if (typeof fetchKitSource !== 'function') { throw operatorKitError('The authoritative kit reader is unavailable.'); }
     const source = await fetchKitSource(sourceNetSuiteId);
-    return { ...source, sourceOrderKind, sourceNetSuiteId, sourceOrderRef, postingStrategy: STORED_ORDER_LINE_STRATEGY };
+    return { ...source, nonInventoryLines, availableLines: source.availableLines.filter((/** @type {Record<string, any>} */ line) =>
+      !ignoredSourceKeys.has(String(line.sourceLineKey))),
+      sourceOrderKind, sourceNetSuiteId, sourceOrderRef, postingStrategy: STORED_ORDER_LINE_STRATEGY };
   }
   if (useStoredOrderLines) {
     const sourceRows = sourceOrderKind === "PO"
@@ -718,7 +783,7 @@ export function createOperatorNetSuitePostingRealSourceResolver({ query: runQuer
     const storedLines = storedOperatorPostingLines(sourceRows);
     const availableLines = sourceOrderKind === "PO" && fetchPoReceiptLines
       ? refreshPoReceiptAvailability(storedLines, await fetchPoReceiptLines(sourceNetSuiteId)) : storedLines;
-    return { sourceOrderKind, sourceNetSuiteId, sourceOrderRef,
+    return { sourceOrderKind, sourceNetSuiteId, sourceOrderRef, nonInventoryLines,
       postingStrategy: STORED_ORDER_LINE_STRATEGY,
       availableLines };
   }
@@ -732,7 +797,8 @@ export function createOperatorNetSuitePostingRealSourceResolver({ query: runQuer
   const expectedStage = functionKey === "receiving" ? "receiving" : "outbound";
   const relevantLines = (live?.lines || []).filter((/** @type {Record<string, any>} */ line) => (
     !line.stage || line.stage === expectedStage
-  ));
+  ) && (functionKey === "receiving" || (line.itemType !== "NonInvtPart"
+    && !ignoredSourceKeys.has(String(line.sourceLineKey)))));
   const unresolved = relevantLines.some((/** @type {Record<string, any>} */ line) => (
     line.identityStatus !== "exact" || !positiveInteger(line.restOrderLine)
   ));
@@ -806,7 +872,7 @@ export function createOperatorNetSuiteReceivingOrderReader({
   };
 }
 
-const fetchLiveSourceFromNetSuite = createOperatorNetSuitePostingLiveSourceFetcher({
+export const fetchLiveSourceFromNetSuite = createOperatorNetSuitePostingLiveSourceFetcher({
   fetchReconciliationOrders: fetchScmReconciliationOrdersFromNetSuite,
   fetchSourceItemLines: fetchOperatorNetSuiteSourceItemLinesFromNetSuite,
   fetchLinkedTransactions: fetchPoToLinkedTransactionsFromNetSuite

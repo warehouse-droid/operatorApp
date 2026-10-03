@@ -182,6 +182,10 @@ function smartConnectEvents() {
     } catch {
       return;
     }
+    if (event?.type === "scm.smart.line-order.updated") {
+      smartReceiveLineOrder(event.payload || {});
+      return;
+    }
     if (event?.type !== "scm.smart.updated" || smartState.tab !== "vendors") return;
     clearTimeout(smartVendorEventRefreshTimer);
     smartVendorEventRefreshTimer = setTimeout(async () => {
@@ -740,6 +744,9 @@ function smartSettings() {
     <form class="smart-section" id="smartSettingsForm">
       <div class="smart-section-head"><div><h2>Smart SCM controls</h2><p>Live execution is guarded by both this setting and a server environment flag. Daily planning uses the configured Toronto-local schedule.</p></div>${smartCanWrite() ? `<button class="smart-button primary" type="submit">Save settings</button>` : ""}</div>
       <div class="smart-section-body smart-form-grid">
+        <label class="smart-field"><span>${window.RegularStockUI.t('Stock request auto-approval','库存申请自动批准')}</span><input name="regularStockAutoApprovalEnabled" type="checkbox" ${settings.regularStockAutoApprovalEnabled!==false?'checked':''} ${smartCanWrite()?'':'disabled'} /><small>${window.RegularStockUI.t('Stocking always requires SCM review. When off, Pickup and Delivery also require SCM review.','备货申请始终须 SCM 审核。关闭后，自取和送货申请也须 SCM 审核。')}</small></label>
+        <label class="smart-field"><span>${window.RegularStockUI.t('Stock request approval validity (minutes)','库存申请批准有效期（分钟）')}</span><input name="regularStockApprovalMinutes" type="number" min="1" max="10080" step="1" required value="${smartEscape(settings.regularStockApprovalMinutes ?? 15)}" ${smartCanWrite()?'':'disabled'} /><small>${window.RegularStockUI.t('Default 15. Starts after all items are reviewed; applies to new approvals. Sales can re-raise an expired request.','默认 15。所有商品审核完成后开始计时，适用于新的批准。销售可重新提交已过期的申请。')}</small></label>
+        <label class="smart-field"><span>${window.RegularStockUI.t('Stock request auto-approval lead time (hours)','库存申请自动批准提前时间（小时）')}</span><input name="regularStockLeadHours" type="number" min="0" max="87600" step="any" required value="${smartEscape(settings.regularStockLeadHours ?? 5)}" ${smartCanWrite()?'':'disabled'} /><small>${window.RegularStockUI.t('Delivery only; Pickup has no minimum lead time. Default 5. Earlier deliveries require SCM review. Zero disables this restriction; new submissions only.','仅适用于送货；自取无需最短提前时间。默认 5。更早送货须 SCM 审核，设为 0 关闭限制；仅适用于新申请。')}</small></label>
         <label class="smart-field"><span>Execution mode</span><select name="executionMode" ${smartCanWrite() ? "" : "disabled"}><option value="mock" ${settings.executionMode === "mock" ? "selected" : ""}>Mock — no NetSuite write</option><option value="live" ${settings.executionMode === "live" ? "selected" : ""}>Live — guarded NetSuite PO + TO</option></select><small>Live mode inserts confirmed POs and TOs into NetSuite; TO confirmation also queues the NetSuite picking ticket.</small></label>
         <label class="smart-field"><span>Forecast mode</span><select name="forecastMode" ${smartCanWrite() ? "" : "disabled"}><option value="formula" ${settings.forecastMode === "formula" ? "selected" : ""}>Formula only</option><option value="shadow" ${settings.forecastMode === "shadow" ? "selected" : ""}>Formula + shadow comparison</option><option value="hybrid" ${settings.forecastMode === "hybrid" ? "selected" : ""}>Promoted prediction segments</option></select><small>Hybrid uses prediction only for explicitly promoted yard/series segments.</small></label>
         <label class="smart-field"><span>Daily run time</span><input name="dailyTime" type="time" value="${smartEscape(settings.dailyTime || "06:00")}" ${smartCanWrite() ? "" : "disabled"} /><small>${smartEscape(settings.timeZone || "America/Toronto")}</small></label>
@@ -1378,6 +1385,9 @@ smartScmApp.addEventListener("submit", async (event) => {
     await smartWork("Saving Smart SCM settings", () => smartApi("/api/scm/smart/settings", {
       method: "PUT",
       body: {
+        regularStockLeadHours: Number(fields.get("regularStockLeadHours")),
+        regularStockAutoApprovalEnabled: fields.get("regularStockAutoApprovalEnabled") === "on",
+        regularStockApprovalMinutes: Number(fields.get("regularStockApprovalMinutes")),
         executionMode: fields.get("executionMode"),
         forecastMode: fields.get("forecastMode"),
         dailyEnabled: fields.get("dailyEnabled") === "on",

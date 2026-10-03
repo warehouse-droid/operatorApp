@@ -1083,3 +1083,7 @@ body {
     grid-template-columns: 1fr;
   }
 }
+
+.regular-priority-loads {border:2px solid #b45309!important;padding:16px;background:#fffbeb!important;margin:18px 0}
+.regular-priority-card {border-top:1px solid #fcd34d;padding:12px 0}
+.regular-priority-banner {background:#92400e;color:white;padding:10px 16px;border-radius:8px;font-weight:700;margin-top:12px}

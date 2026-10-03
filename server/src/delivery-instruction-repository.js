@@ -11,6 +11,60 @@ import {
 } from "./delivery-instruction-domain.js";
 import { salesStoreLocationIdSql } from "./sales-store.js";
 import { netSuiteClosedOrderFamilySql } from "./netsuite-closed-order-policy.js";
+import { normalizeDeliveryNetSuiteValues } from './delivery-instruction-netsuite.js';
+import { readDeliveryInstructionFromNetSuite, updateDeliveryInstructionInNetSuite } from './netsuite.js';
+
+const deliveryNetSuite = { read: readDeliveryInstructionFromNetSuite, update: updateDeliveryInstructionInNetSuite };
+
+function assertNetSuiteSalesContext(context) {
+  if (context.source !== 'sales' || !normalizedAuthorizedYards(context.authorizedOrderingLocationIds)?.length) {
+    throw repositoryError('An authorized staff Sales account is required to edit NetSuite delivery instructions.', 403, 'DELIVERY_INSTRUCTION_FORBIDDEN');
+  }
+}
+
+function assertRemoteDeliveryIdentity(row, netSuite, context) {
+  const identity = netSuite?.identity;
+  if (!identity || !Number.isSafeInteger(identity.orderId) || typeof identity.orderRef !== 'string'
+    || !Number.isSafeInteger(identity.locationId)) {
+    throw repositoryError('A complete NetSuite snapshot is required. Reload NetSuite values before saving.', 400);
+  }
+  if (identity.orderId !== Number(row.order_id) || identity.orderRef !== row.order_ref
+    || identity.locationId !== Number(row.ordering_location_id)) {
+    throw repositoryError('The Sales Order identity or yard changed in NetSuite. Refresh the order before editing.', 409);
+  }
+  assertOrderYardAccess({ ordering_location_id: identity.locationId }, context.authorizedOrderingLocationIds);
+}
+
+export async function getDeliveryInstructionNetSuite(identifier, context = {}, remote = deliveryNetSuite) {
+  assertNetSuiteSalesContext(context);
+  const row = await findOrderRow(identifier);
+  assertOrderYardAccess(row, context.authorizedOrderingLocationIds);
+  const netSuite = await remote.read(Number(row.order_id));
+  assertRemoteDeliveryIdentity(row, netSuite, context);
+  return { ...await getDeliveryInstruction(row.order_id, context), netSuite };
+}
+
+export async function saveDeliveryInstructionNetSuite(identifier, input = {}, context = {}, remote = deliveryNetSuite) {
+  assertNetSuiteSalesContext(context);
+  const values = normalizeDeliveryNetSuiteValues(input.values);
+  normalizeDeliveryNetSuiteValues(input.expected?.values);
+  return withTransaction(async () => {
+    const row = await lockOrderState(identifier, context);
+    assertEditable(row);
+    assertDeliveryInstructionRevision(input.expectedRevision, row.revision);
+    assertRemoteDeliveryIdentity(row, input.expected, context);
+    const netSuite = await remote.update({ orderId: Number(row.order_id), expected: input.expected, values });
+    assertRemoteDeliveryIdentity(row, netSuite, context);
+    const automatic = deriveMemoDeliveryInstruction(netSuite.values.memo);
+    await query(`UPDATE sales_orders SET memo=$2, expected_delivery_date=$3::date,
+      dispatch_instructions=$4, dispatch_instruction_details=$5::jsonb,
+      dispatch_instruction_parse_version=2, dispatch_instruction_parsed_at=now()
+      WHERE netsuite_id=$1`, [row.order_id, netSuite.values.memo, netSuite.values.deliverByDate || null,
+      automatic.text, JSON.stringify(automatic)]);
+    await incrementRevision(row, { operatorId: context.operatorId, source: 'sales' });
+    return { ...await getDeliveryInstruction(row.order_id, context), netSuite };
+  });
+}
 
 const EFFECTIVE_ORDERING_LOCATION_SQL = `COALESCE(
   so.order_location_id,

@@ -44,8 +44,8 @@ test("SA-1 the actual details acknowledgement separates Valleymede from Estoril"
   assert.equal(visitsFor([order, other], stops).length, 1);
 });
 
-test("SA-1 local edits and acknowledged empty addresses cannot retain stale aliases", () => {
-  for (const [payload, entered, expected] of [[{}, newAddress, newAddress], [{ updated: { dispatch_address: "" } }, oldAddress, ""]]) {
+test("SA-1 valid edits replace aliases and an empty acknowledgement preserves the known address", () => {
+  for (const [payload, entered, expected] of [[{}, newAddress, newAddress], [{ updated: { dispatch_address: "" } }, oldAddress, oldAddress]]) {
     const order = { type: "SO", address: oldAddress, destinationAddress: oldAddress, defaultDestinationAddress: oldAddress };
     saveAcknowledgement(order, payload, { address: entered });
     for (const field of ["address", "destinationAddress", "defaultDestinationAddress"]) {assert.equal(order[field], expected);}

@@ -74,6 +74,7 @@ function dispatchCanAccess(operator, roles = ["dispatcher", "admin"]) {
 
 function dispatchRoleHome(role) {
   const clean = String(role || "").trim().toLowerCase().replaceAll("-", "_").replaceAll(" ", "_");
+  if (clean === "boss") return "/boss";
   if (clean === "admin") return "/admin";
   if (clean === "dispatcher") return "/dispatch";
   if (clean === "scm" || clean === "scm_staff") return "/scm";
@@ -119,29 +120,6 @@ async function dispatchCheckSession(roles, { redirectOnForbidden = true } = {}) 
   return payload.operator;
 }
 
-function renderDispatchLogin(mount, message = "") {
-  mount.innerHTML = `
-    <section class="dispatch-login-panel">
-      <div>
-        <p>MBBS Transportation</p>
-        <h1>Dispatch Login</h1>
-      </div>
-      ${message ? `<div class="route-notice auth-notice">${message}</div>` : ""}
-      <form class="dispatch-login-form" data-form="dispatch-login">
-        <label>
-          <span>Username</span>
-          <input name="username" autocomplete="username" required />
-        </label>
-        <label>
-          <span>Password</span>
-          <input name="password" type="password" autocomplete="current-password" required />
-        </label>
-        <button class="primary-action" type="submit">Login</button>
-      </form>
-    </section>
-  `;
-}
-
 async function dispatchPublicSalesSession() {
   if (!DISPATCH_PUBLIC_SALES_PAGE) return null;
   const response = await dispatchNativeFetch("/api/sales/public-access", {
@@ -167,40 +145,7 @@ async function requireDispatchLogin({ mount, onReady, roles = ["dispatcher", "ad
     window.location.replace(dispatchRoleHome(existing.operator?.role));
     return;
   }
-  if (localStorage.getItem("mbbs.driver.token")) {
-    window.location.replace("/driver");
-    return;
-  }
-
-  renderDispatchLogin(mount);
-  mount.addEventListener("submit", async (event) => {
-    const form = event.target.closest("[data-form='dispatch-login']");
-    if (!form) return;
-    event.preventDefault();
-    const data = Object.fromEntries(new FormData(form).entries());
-    try {
-      const response = await dispatchNativeFetch("/api/auth/login", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify(data)
-      });
-      if (!response.ok) throw new Error(await response.text());
-      const payload = await response.json();
-      if (!dispatchCanAccess(payload.operator, roles)) {
-        storeDispatchStaffSession(payload.token, payload.operator);
-        window.location.replace(dispatchRoleHome(payload.operator?.role));
-        return;
-      }
-      storeDispatchStaffSession(payload.token, payload.operator);
-      dispatchAuthTokenKey = DISPATCH_AUTH_TOKEN_KEY;
-      setDispatchAuthOperator(payload.operator);
-      await onReady(payload.operator);
-    } catch (error) {
-      clearDispatchAuthToken();
-      setDispatchAuthOperator(null);
-      renderDispatchLogin(mount, error.message);
-    }
-  });
+  window.location.replace('/login.html?next=' + encodeURIComponent(location.pathname + location.search + location.hash));
 }
 
 function dispatchLogout() {

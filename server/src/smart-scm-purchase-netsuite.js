@@ -1,4 +1,5 @@
 import { config } from "./config.js";
+import { smartScmLineKey, smartScmOrderedPayload } from "./smart-scm-line-order.js";
 
 function quantity(value) {
   const parsed = Number(value);
@@ -116,6 +117,7 @@ export function buildSmartScmPurchaseOrderRestPayload({ proposal, locations = []
       if (pieceQty !== undefined) payloadLine.custcol_pcs = pieceQty;
       return payloadLine;
     });
+  const lineKeys = materialLines.map(smartScmLineKey);
   const palletsByDestination = new Map();
   for (const line of materialLines) {
     const destinationLocationId = Number(line.destinationLocationId || proposal.destinationLocationId);
@@ -159,13 +161,14 @@ export function buildSmartScmPurchaseOrderRestPayload({ proposal, locations = []
       rate: palletRate,
       custcol_pcs: palletQuantity
     });
+    lineKeys.push(`pallet:${destinationLocationId}`);
   }
   if (!lines.length) throw new Error("The Smart SCM PO has no confirmed line quantity.");
   const payload = {
     entity: { id: String(proposal.vendorId) },
     location: { id: String(defaultLocation.netsuiteLocationId) },
     memo: smartScmPurchaseOrderMemo({ proposal, materialLines, locations }),
-    item: { items: lines }
+    item: { items: smartScmOrderedPayload(lines, lineKeys, proposal.lineOrder) }
   };
   if (defaultLocation.subsidiaryId) payload.subsidiary = { id: String(defaultLocation.subsidiaryId) };
   const employeeId = String(config.transferDependency.employeeId || "").trim();

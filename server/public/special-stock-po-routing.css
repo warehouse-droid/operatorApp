@@ -1,0 +1,48 @@
+.special-po-routing .scm-mini-routing-row {
+  grid-template-columns: minmax(0, .8fr) minmax(0, .9fr) minmax(0, 1.4fr) 58px minmax(0, 1fr);
+}
+.special-po-routing .scm-mini-notes-row {
+  grid-template-columns: minmax(0, .8fr) repeat(2, minmax(0, 1.2fr)) max-content;
+}
+.special-po-routing .scm-mini-row > label {
+  min-width: 0;
+}
+.special-po-routing fieldset {
+  border: 0;
+  padding: 0;
+  min-width: 0;
+}
+.special-po-routing .scm-pickup-yard-field {
+  min-width: 0;
+  grid-column: auto;
+}
+.special-po-routing .scm-mini-method-field,
+.special-po-routing .scm-mini-status-field,
+.special-po-routing .scm-mini-reference-field {
+  grid-column: auto;
+}
+.special-po-routing .scm-remark-field,
+.special-po-routing .scm-note-field {
+  grid-column: auto;
+}
+.special-po-routing .scm-mini-special-field {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+.special-po-routing .scm-mini-special-field input {
+  width: auto;
+}
+
+@media (max-width: 600px) {
+  .special-po-routing .scm-mini-routing-row,
+  .special-po-routing .scm-mini-notes-row {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+
+  .special-po-routing .scm-mini-reference-field,
+  .special-po-routing .scm-remark-field,
+  .special-po-routing .scm-note-field {
+    grid-column: 1 / -1;
+  }
+}

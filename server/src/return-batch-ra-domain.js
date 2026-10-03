@@ -100,7 +100,7 @@ export function buildReturnBatchPayload(intent) {
       ...(split ? { description: `Return from SO ${intent.sourceSalesOrderId}; source line ${line.sourceSalesOrderLineId}; reason ${line.reasonId}; row ${index + 1}` } : {}),
       item: { id: String(line.itemId) }, quantity: line.returnedSalesQuantity, rate: line.rate,
       location: { id: String(intent.receivingLocationId) },
-      ...(line.salesUomId ? { units: { id: String(line.salesUomId) } } : {}),
+      ...(line.salesUomId ? { units: String(line.salesUomId) } : {}),
       custcol_atlas_rc_so: { id: String(line.reasonId) }
     };
   });

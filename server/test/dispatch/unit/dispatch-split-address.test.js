@@ -13,7 +13,7 @@ test("explicit details are idempotent, retain cargo and identity, and survive co
           address, pickupAddress, windowStart: "08:00", windowEnd: "", expectedDeliveryDate: "2096-11-13" } };
       const before = structuredClone(order);
       const applied = applySplitDispatchDetails(order);
-      for (const field of ["address", "destinationAddress", "defaultDestinationAddress"]) {assert.equal(applied[field], address.trim());}
+      for (const field of ["address", "destinationAddress", "defaultDestinationAddress"]) {assert.equal(applied[field], address.trim() || order[field]);}
       assert.equal(applied.sourceAddress, pickupAddress.trim() || "yard");
       assert.equal(applied.pieces, pieces);
       assert.equal(applied.id, order.id);
@@ -22,7 +22,7 @@ test("explicit details are idempotent, retain cargo and identity, and survive co
       assert.deepEqual(applySplitDispatchDetails(applied), applied);
       const card = JSON.parse(JSON.stringify(compactDispatchOrderCard(applied)));
       assert.deepEqual(card.dispatchDetailsOverride, order.dispatchDetailsOverride);
-      assert.equal(applySplitDispatchDetails(card).destinationAddress, address.trim());
+      assert.equal(applySplitDispatchDetails(card).destinationAddress, address.trim() || order.destinationAddress);
     }), { seed: 8748, numRuns: 150 });
 });
 
@@ -33,7 +33,7 @@ test("unmarked, partial, or malformed overrides preserve inherited fields", () =
   }
   const order = { address: "parent", destinationAddress: "parent", sourceAddress: "pickup", windowEnd: "10:00",
     dispatchDetailsOverride: { address: "" } };
-  assert.deepEqual(applySplitDispatchDetails(order), { ...order, address: "", destinationAddress: "", defaultDestinationAddress: "" });
+  assert.deepEqual(applySplitDispatchDetails(order), order);
 });
 
 test("the refreshed split address produces two physical visits for Mossbrook and Heatherside", () => {

@@ -18,6 +18,7 @@ const RELATIONSHIP_ORDER_FIELDS = Object.freeze([
   "dependentSalesOrderRef",
   "dependencyLabels",
   "poRouteProjection",
+  "toRouteProjection",
   "po_route_projection"
 ]);
 
@@ -170,6 +171,7 @@ function relationshipProjectionEvidence(order = {}) {
     dependentSalesOrderRef: order.dependentSalesOrderRef || "",
     dependencyLabels: order.dependencyLabels || [],
     poRouteProjection: order.poRouteProjection || null,
+    toRouteProjection: order.toRouteProjection || null,
     items: (order.items || []).map(projectedItemEvidence),
     childOrderDetails: (order.childOrderDetails || []).map(relationshipProjectionEvidence)
   };

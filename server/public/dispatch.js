@@ -541,6 +541,14 @@ let loadPreviewOpen = false;
 let sequenceCollapsed = false;
 let lastSavedAt = "";
 let routeNotice = "";
+let executedOrderReviews = [];
+let executedOrderReviewPlanId = "";
+let executedOrderReviewError = "";
+let executedOrderReviewLoadedAt = 0;
+let executedOrderReviewConfirming = "";
+const executedOrderReviewExpanded = new Set();
+const DISMISSED_SOURCE_REVIEWS_KEY = "mbbs.dispatch.dismissedSourceReviews.v1";
+let dismissedExecutedOrderReviews = readDismissedExecutedOrderReviews();
 let dispatchDateFilter = "";
 let dispatchConfig = { googleMapsApiKey: "", googleMapsEnabled: false, googleMapsMode: "conserve" };
 let dispatchSetupLoaded = false;
@@ -571,6 +579,7 @@ let backgroundRoutesRunning = false;
 let backgroundRouteRunPromise = null;
 let backgroundRouteRenderQueued = false;
 let backgroundRouteInFlight = new Set();
+const backgroundRouteRequests = new Map();
 let orderListScrollTop = 0;
 let loadPreviewWidth = Number(dispatchStorageGet("mbbs.dispatch.previewWidth", "520"));
 let isResizingPreview = false;
@@ -630,7 +639,9 @@ const HISTORY_LIMIT = 20;
 const HISTORY_MEMORY_LIMIT_BYTES = 32 * 1024 * 1024;
 const DISPATCH_PLAN_KEY = DISPATCH_PLAN_CACHE_KEY;
 const DISPATCH_PLAN_DATE_KEY = "mbbs.dispatch.planDate";
-let currentPlanDate = dispatchStorageGet(DISPATCH_PLAN_DATE_KEY, "") || todayLocalDate();
+const sharedPlanningDate = new URLSearchParams(window.location.search).get("planDate") || "";
+let currentPlanDate = /^\d{4}-\d{2}-\d{2}$/.test(sharedPlanningDate)
+  ? sharedPlanningDate : dispatchStorageGet(DISPATCH_PLAN_DATE_KEY, "") || todayLocalDate();
 let currentPlan = null;
 let dispatchPlannerSnapshotState = "loading";
 let dispatchPlannerSnapshotError = "";
@@ -1143,15 +1154,28 @@ function isDispatchHistoryEditMode() {
   return isDispatchPlanEditor() && isHistoricalDispatchPlanDate(currentPlanDate);
 }
 
-function dispatchOrderFeedRequest({ sync = false, search = "" } = {}) {
+function dispatchOrderFeedRequest({ sync = false, search = "", versioned = false, type = "", cursor = "" } = {}) {
   const params = new URLSearchParams();
   const searchTerm = String(search || "").trim();
   if (searchTerm) params.set("search", searchTerm);
-  if (isDispatchHistoryEditMode()) params.set("historyPlanDate", currentPlanDate);
+  if (versioned && !sync) {
+    const poolParams = { type, limit: "200", cursor };
+    for (const [key, value] of Object.entries(poolParams)) {
+      if (value) params.set(key, value);
+    }
+  }
+  const historyEditMode = isDispatchHistoryEditMode();
+  if (historyEditMode) {
+    params.set("historyPlanDate", currentPlanDate);
+    params.set("sessionId", dispatchSessionId);
+  }
+  const endpoint = sync ? "/api/dispatch/sync" : versioned ? "/api/dispatch/v2/order-pool" : "/api/dispatch/orders";
   const query = params.toString();
+  /** @type {Record<string, string>} */
+  const headers = historyEditMode ? { "x-dispatch-edit-lease": planEditLeaseToken } : {};
   return {
-    url: `${sync ? "/api/dispatch/sync" : "/api/dispatch/orders"}${query ? `?${query}` : ""}`,
-    headers: isDispatchHistoryEditMode() ? { "x-dispatch-edit-lease": planEditLeaseToken } : {}
+    url: `${endpoint}${query ? `?${query}` : ""}`,
+    headers
   };
 }
 
@@ -1344,6 +1368,7 @@ function effectiveTruckForLoad(truck, load) {
 }
 
 function assignLoadFields(truck, load, { driver = null, sequence = null } = {}) {
+  if (isMbtPlanningLoad(load) !== Boolean(globalThis.MbbsBinPlanning)) return load;
   const assignedDriver = driver || loadDriver(truck, load);
   load.driverLogin = assignedDriver ? driverKey(assignedDriver) : loadDriverKey(truck, load);
   load.driverName = assignedDriver?.name || load.driverName || load.driver || truck.driver || "";
@@ -1803,6 +1828,7 @@ function makeTruckFromFleet(vehicle, index, saved = {}) {
       ...(Array.isArray(saved.supportedBinTypeCodes) ? saved.supportedBinTypeCodes : [])
     ].map((code) => String(code || "").trim().toUpperCase()).filter(Boolean))],
     driverLogin: savedDriverKey || "",
+    ...(saved.driverId ? { driverId: saved.driverId } : {}),
     driver: driver.name || saved.driver || "Unassigned",
     license: driver.license || saved.license || "-",
     base: saved.base ?? vehicle.baseYard ?? "",
@@ -1878,8 +1904,9 @@ function moveTruckInPlan(truckId, delta) {
 }
 
 function poRouteProjectionForOrder(order = {}) {
-  const projection = order?.poRouteProjection;
-  return String(order?.type || "").toUpperCase() === "PO"
+  const kind = String(order?.type || "").toUpperCase();
+  const projection = kind === "TO" ? order?.toRouteProjection : order?.poRouteProjection;
+  return ["PO", "TO"].includes(kind)
     && projection
     && Number(projection.version || 0) >= 1
     ? projection
@@ -2136,6 +2163,8 @@ function orderUnitText(order) {
 }
 
 function orderPickupText(order) {
+  const override = String(order?.pickupAddressOverride || "").trim();
+  if (override) { return override; }
   const locations = order?.pickupLocations?.length ? order.pickupLocations : order?.sourceYard ? [order.sourceYard] : [];
   return locations.length ? locations.join(", ") : "--";
 }
@@ -2177,9 +2206,29 @@ function isOwnYardCode(value) {
   return Boolean(ownYardForLocation(value));
 }
 
+function retainedDirectPickupManifest(order = {}) {
+  if (order.directPickupManifest?.length) {return order.directPickupManifest;}
+  if (order.type === "CO") {return [];}
+  return (order.orderDependencies || [])
+    .filter(dependency => dependency.mode === "direct_to_customer" && dependency.status !== "cancelled")
+    .map(dependency => ({ dependencyId: dependency.id, salesOrderRef: dependency.salesOrderRef,
+      transferOrderRef: dependency.transferOrderRef, location: dependency.sourceLocation,
+      items: (dependency.lines || []).map(line => ({ ...line, quantity: Number(line.allocatedQuantity || 0) })) }))
+    .filter(entry => entry.items.some(item => item.quantity > 0));
+}
+
+function groupPickupSourceItems(order = {}, location = "") {
+  if (order.type === "CO" || order.transitCo?.toYard || !(order.childOrderDetails || []).some(child => child.items?.length)) {return null;}
+  const identity = item => item.lineRowId ? `row:${item.lineRowId}` : item.lineId ? `line:${item.lineId}` : `item:${item.itemId || item.sku}`;
+  const selected = new Set((order.childOrderDetails || [])
+    .filter(child => sameDispatchLocation(child.transitCo?.toYard || child.sourceYard || order.sourceYard, location))
+    .flatMap(child => (child.items || []).map(identity)));
+  return (order.items || []).filter(item => selected.has(identity(item)));
+}
+
 function directPickupEntriesForLocation(order = {}, pickupLocation = "") {
   const location = normalizedPickupLocation(pickupLocation);
-  return (order.directPickupManifest || []).filter((entry) => normalizedPickupLocation(entry.location) === location);
+  return retainedDirectPickupManifest(order).filter((entry) => normalizedPickupLocation(entry.location) === location);
 }
 
 function directPickupItemsForLocation(order = {}, pickupLocation = "") {
@@ -2211,17 +2260,29 @@ function poPickupItemsForLocation(order = {}, pickupLocation = "") {
 function directPickupAllocatedForItem(order = {}, item = {}) {
   const itemId = String(item.itemId || item.item_id || "");
   const sku = String(item.sku || item.itemName || item.name || "").trim().toLowerCase();
-  const matches = (order.directPickupManifest || []).flatMap((entry) => entry.items || []).filter((entry) => {
+  const matches = retainedDirectPickupManifest(order).flatMap((entry) => entry.items || []).filter((entry) => {
     if (itemId && String(entry.itemId || entry.item_id || "") === itemId) return true;
     return sku && String(entry.sku || entry.itemName || "").trim().toLowerCase() === sku;
   });
-  return matches.reduce((total, entry) => ({
+  return spreadDirectPickupAllocation(order,item,matches.reduce((total, entry) => ({
     pallets: total.pallets + Number(entry.palletQty || 0),
     layers: total.layers + Number(entry.layerQty || 0),
     sections: total.sections + Number(entry.sectionQty || 0),
     pieces: total.pieces + Number(entry.pieceQty || 0),
     quantity: total.quantity + Number(entry.quantity || 0)
-  }), { pallets: 0, layers: 0, sections: 0, pieces: 0, quantity: 0 });
+  }), { pallets: 0, layers: 0, sections: 0, pieces: 0, quantity: 0 }));
+}
+
+function spreadDirectPickupAllocation(order = {}, item = {}, total = {}) {
+  const items = order.items || [];
+  const index = items.indexOf(item);
+  if (index < 0) {return total;}
+  const matches = candidate => item.itemId && candidate.itemId ? String(item.itemId) === String(candidate.itemId)
+    : String(item.sku || item.itemName || "") === String(candidate.sku || candidate.itemName || "");
+  const fields = { pallets: "poAllocatedPallets", layers: "poAllocatedLayers", sections: "poAllocatedSections", pieces: "poAllocatedPieces", quantity: "poAllocatedSalesQty" };
+  const available = (line,field) => Math.max(Number(line[field] ?? (field === "quantity" ? line.salesQty : 0) ?? 0)-Number(line[fields[field]] || 0),0);
+  return Object.fromEntries(Object.keys(fields).map(field => [field,Math.min(available(item,field),
+    Math.max(Number(total[field] || 0)-items.slice(0,index).filter(matches).reduce((sum,line)=>sum+available(line,field),0),0))]));
 }
 
 function itemForPickupLocation(item = {}, pickupLocation = "", order = {}) {
@@ -2319,6 +2380,11 @@ function pickupStopOrderRefs(load, stop) {
   return refs;
 }
 
+function pickupStopMatchesOrder(stop, order) {
+  const overrideKey = (value) => String(value?.pickupAddressOverride || "").toLowerCase().replace(/[^a-z0-9]/g, "");
+  return overrideKey(stopOrder(stop)) === overrideKey(order);
+}
+
 function pickupStopIncludesOrder(load, stop, orderId) {
   const wanted = String(orderId || "").trim().toLowerCase();
   return Boolean(wanted && pickupStopOrderRefs(load, stop)
@@ -2364,18 +2430,19 @@ function itemHasQuantity(item = {}) {
 
 function tooltipItemsForOrder(order, { pickupLocation = "", stop = null } = {}) {
   if (stop?.type === "drop") return dropItemsForStop(order, stop).filter(isOperationalDispatchItem).filter(itemHasQuantity);
-  if (pickupLocation && order?.type === "PO") {
+  if (pickupLocation && (order?.type === "PO" || order?.toRouteProjection)) {
     return routeItemsForOrder(order).filter(isOperationalDispatchItem).filter(itemHasQuantity);
   }
   const directItems = pickupLocation ? directPickupItemsForLocation(order, pickupLocation) : [];
-  if (directItems.length && !sameDispatchLocation(order.sourceYard || order.outboundLocation, pickupLocation)) {
+  const groupedSourceItems = pickupLocation ? groupPickupSourceItems(order,pickupLocation) : null;
+  if (directItems.length && !sameDispatchLocation(order.sourceYard || order.outboundLocation, pickupLocation) && !groupedSourceItems?.length) {
     return directItems.filter(isOperationalDispatchItem).filter(itemHasQuantity);
   }
   const poItems = pickupLocation ? poPickupItemsForLocation(order, pickupLocation) : [];
   if (poItems.length && !isOwnYardCode(pickupLocation)) return poItems.filter(isOperationalDispatchItem).filter(itemHasQuantity);
-  const sourceItems = (order.items || [])
+  const sourceItems = (groupedSourceItems ?? order.items ?? [])
     .filter(isOperationalDispatchItem)
-    .map((item) => pickupLocation ? itemForPickupLocation(item, pickupLocation, order) : item);
+    .map((item) => pickupLocation ? itemForPickupLocation(item, pickupLocation, groupedSourceItems ? {...order,sourceYard:pickupLocation} : order) : item);
   // A transit CO can bring the SO to the same yard as its direct TO pickup.
   // Keep the residual SO cargo and add that yard's TO cargo back exactly once.
   return [...sourceItems, ...directItems].filter(isOperationalDispatchItem).filter(itemHasQuantity);
@@ -3253,6 +3320,7 @@ function groupedOrderDependencies(groupItems = []) {
   };
   const visit = (order = {}) => {
     if (!order || typeof order !== "object" || visited.has(order)) return;
+    if (order.type === "CO" || /^CO-/iu.test(String(order.id || ""))) return;
     visited.add(order);
     for (const child of Array.isArray(order.childOrderDetails) ? order.childOrderDetails : []) visit(child);
     for (const dependency of Array.isArray(order.orderDependencies) ? order.orderDependencies : []) {
@@ -3442,6 +3510,20 @@ function normalizePoDropoffs(order = {}, type = "", items = []) {
 function normalizeOrder(order) {
   const id = String(order.id || "");
   const type = canonicalDispatchOrderType(order.type, id);
+  if (type === "CO") {
+    order = {
+      ...order,
+      transitCo: null,
+      orderDependencies: [],
+      dependencyLabels: [],
+      directPickupManifest: [],
+      dependencyDirectPickup: false,
+      dependencyWaitingForTransfer: false,
+      dependencyAttention: false,
+      dependencyUncovered: false,
+      dependencyUncoveredQuantity: 0
+    };
+  }
   const items = Array.isArray(order.items) ? order.items : [];
   const groupMembers = Array.isArray(order.childOrders) && order.childOrders.length
     ? flattenDispatchGroupMembers({ ...order, type })
@@ -3450,7 +3532,7 @@ function normalizeOrder(order) {
         childOrderDetails: Array.isArray(order.childOrderDetails) ? order.childOrderDetails : [],
         groupAliases: Array.isArray(order.groupAliases) ? order.groupAliases : []
       };
-  const groupedDependencySources = groupMembers.childOrders.length
+  const groupedDependencySources = type !== "CO" && groupMembers.childOrders.length
     ? [
         ...groupMembers.childOrderDetails,
         {
@@ -3466,7 +3548,7 @@ function normalizeOrder(order) {
     ? groupedOrderDependencyLabels(groupedDependencySources, orderDependencies)
     : order.dependencyLabels;
   const dependencyChildren = groupedDependencySources.length ? groupMembers.childOrderDetails : [];
-  const directPickupManifest = groupMembers.childOrders.length
+  const directPickupManifest = type !== "CO" && groupMembers.childOrders.length
     ? [...new Map([...groupMembers.childOrderDetails, order]
         .flatMap((member) => member.directPickupManifest || [])
         .map((entry) => [String(entry.dependencyId || entry.transferOrderRef), entry])).values()]
@@ -3517,7 +3599,7 @@ function normalizeOrder(order) {
       : splitParentOrderId({ ...order, id, type }) || order.originalOrderId || "",
     committedQty: Number(order.committedQty ?? order.salesQty ?? 0),
     customer: order.customer || order.vendorYard || order.sourceYard || "",
-    address: order.address || "",
+    address: order.address || groupMembers.childOrderDetails.find(child => String(child.address || "").trim())?.address || "",
     expectedDeliveryDate: order.expectedDeliveryDate || order.expected_delivery_date || "",
     notes: order.notes || order.instructions || "",
     windowStart: order.windowStart || "",
@@ -3681,6 +3763,7 @@ function replenishmentTransferCompletionInLoad(dependency = {}, targetLoad = nul
 }
 
 function normalizeReplenishmentDependentInsertIndex(order, targetLoad, insertIndex = null) {
+  if (order?.type === "CO" || /^CO-/iu.test(String(order?.id || ""))) return insertIndex;
   if (!targetLoad) return insertIndex;
   let completionBoundary = -1;
   for (const dependency of order?.orderDependencies || []) {
@@ -3754,6 +3837,7 @@ function replenishmentLoadPrecedence(transferTruck, transferLoad, targetTruck, t
 }
 
 function replenishmentPlacementBlockMessage(order, targetTruck, targetLoad, insertIndex = null) {
+  if (order?.type === "CO" || /^CO-/iu.test(String(order?.id || ""))) return "";
   const dependencies = (order?.orderDependencies || []).filter((dependency) =>
     dependency.mode === "yard_replenishment" && dependency.status !== "cancelled"
   );
@@ -4417,7 +4501,10 @@ function preserveDispatchPlanningFields(existing = {}, fresh = {}) {
     ].includes(key)))
     .filter((key) => existing[key] !== undefined)
     .map((key) => [key, existing[key]]));
-  return { ...fresh, ...planning, ...(authoritativeLocalCo ? { globalGroupDefinition: false, isGrouped: false } : {}) };
+  const merged = { ...fresh, ...planning, ...(authoritativeLocalCo ? { globalGroupDefinition: false, isGrouped: false } : {}) };
+  const guarded = globalThis.DispatchAddressGuard?.preserve(existing, merged);
+  if (guarded?.warnings.length && typeof routeNotice !== "undefined") {routeNotice = guarded.warnings.map(warning => warning.message).join(" ");}
+  return guarded?.order || { ...merged, address: String(merged.address || "").trim() ? merged.address : existing.address || "" };
 }
 
 function mergeFreshDispatchOperationalOrder(existing = {}, candidate = {}, activityEvidence = activePhysicalOrderEvidence()) {
@@ -4574,13 +4661,8 @@ async function loadDispatchOrderSearch(term, sequence) {
     orderSearchAbortController = new AbortController();
     const optimizedPool = dispatchConfig.plannerOrderPoolMode === "on";
     const versionedPool = optimizedPool || dispatchConfig.plannerOrderPoolMode === "shadow";
-    const request = dispatchOrderFeedRequest({ search: term });
-    const params = new URLSearchParams({ search: term, limit: "200" });
-    if (isDispatchHistoryEditMode()) params.set("historyPlanDate", currentPlanDate);
-    const response = await fetch(
-      versionedPool ? `/api/dispatch/v2/order-pool?${params.toString()}` : request.url,
-      { headers: request.headers, signal: orderSearchAbortController.signal }
-    );
+    const request = dispatchOrderFeedRequest({ search: term, versioned: versionedPool });
+    const response = await fetch(request.url, { headers: request.headers, signal: orderSearchAbortController.signal });
     if (!response.ok) throw new Error(await response.text());
     const payload = await response.json();
     const feed = versionedPool ? payload.orders : payload;
@@ -4699,11 +4781,11 @@ async function loadDispatchOrders({ sync = false, append = false } = {}) {
       const optimizedPool = !sync && dispatchConfig.plannerOrderPoolMode === "on";
       const versionedPool = optimizedPool
         || (!sync && dispatchConfig.plannerOrderPoolMode === "shadow");
-      const request = dispatchOrderFeedRequest({ sync });
-      const params = new URLSearchParams({ type: requestedType, limit: "200" });
-      if (append && dispatchOrderPoolNextCursor) params.set("cursor", dispatchOrderPoolNextCursor);
-      if (isDispatchHistoryEditMode()) params.set("historyPlanDate", currentPlanDate);
-      const response = await fetch(versionedPool ? `/api/dispatch/v2/order-pool?${params.toString()}` : request.url, {
+      const request = dispatchOrderFeedRequest({
+        sync, versioned: versionedPool, type: requestedType,
+        cursor: append ? dispatchOrderPoolNextCursor : ""
+      });
+      const response = await fetch(request.url, {
         method: sync ? "POST" : "GET",
         headers: request.headers
       });
@@ -4751,8 +4833,8 @@ async function loadMoreDispatchOrders() {
   try {
     const term = searchText.trim();
     if (term && dispatchConfig.plannerOrderPoolMode === "on") {
-      const params = new URLSearchParams({ search: term, limit: "200", cursor: dispatchOrderPoolNextCursor });
-      const response = await fetch(`/api/dispatch/v2/order-pool?${params.toString()}`);
+      const request = dispatchOrderFeedRequest({ search: term, versioned: true, cursor: dispatchOrderPoolNextCursor });
+      const response = await fetch(request.url, { headers: request.headers });
       if (!response.ok) throw new Error(await dispatchErrorMessage(response));
       const payload = await response.json();
       mergeDispatchOrderSearchFeed(payload.orders || []);
@@ -5186,6 +5268,7 @@ async function loadDriverJobStatuses() {
     }
     driverJobStatuses = nextStatuses;
     driverJobStatusesLoadedPlanId = requestedPlanId;
+    void loadExecutedOrderReviews();
     if (requestedPlanId) {
       try {
         const attentionResponse = await fetch(`/api/dispatch/driver-truck-switches/attention?planId=${encodeURIComponent(requestedPlanId)}`);
@@ -5883,9 +5966,74 @@ function loadGoogleMaps({ manual = false } = {}) {
   })();
 }
 
+function isMbtPlanningLoad(load) {
+  return Boolean(load?.mbtPlanning || load?.stops?.some(stop => stop?.mbt?.visitId));
+}
+
+function isPlanningLoadReadOnly(load) {
+  return Boolean(load) && isMbtPlanningLoad(load) !== Boolean(globalThis.MbbsBinPlanning);
+}
+
+// Read-only is a capability of the shared components, not a second layout.
+const planningViewActions = new Set(["select-load", "close-load-preview", "toggle-sequence"]);
+function applyReadOnlyPlanningControls() {
+  for (const root of app.querySelectorAll(".planning-read-only")) {
+    if (root.hasAttribute("draggable")) root.draggable = false;
+    for (const element of root.querySelectorAll("input, select, textarea, button, [draggable]")) {
+      if (element.hasAttribute("draggable")) element.draggable = false;
+      if (element.matches("input, select, textarea, button") && !planningViewActions.has(element.dataset.action)) element.disabled = true;
+    }
+  }
+}
+
+function guardReadOnlyPlanningEvent(event) {
+  const root = event.target.closest?.(".planning-read-only");
+  if (!root) return;
+  if (event.type === "click") {
+    const button = event.target.closest("button");
+    if (button && planningViewActions.has(button.dataset.action)) return;
+    if (!button) {
+      const loadId = root.dataset.driverLoadCard || root.dataset.load;
+      if (!loadId || !event.target.closest("[data-stop]")) return;
+      selectedLoadId = loadId; loadPreviewOpen = true;
+      render({ save: false });
+    }
+  }
+  if (event.type === "pointerdown" && !event.target.closest("[data-stop], .load-drag-handle")) return;
+  event.preventDefault();
+  event.stopImmediatePropagation();
+}
+
+for (const event of ["click", "dblclick", "input", "change", "dragstart", "dragover", "drop", "pointerdown"]) {
+  app.addEventListener(event, guardReadOnlyPlanningEvent, true);
+}
+
+function assignedOrdersForLoad(load) {
+  return [...new Map((load?.stops || []).map(stopOrder).filter(Boolean).map(order => [order.id, order])).values()];
+}
+
+function preserveMbtReadOnlyLoads(candidateTrucks) {
+  const source = lastAcknowledgedPlanState?.planDate === currentPlanDate ? lastAcknowledgedPlanState.trucks || [] : [];
+  const result = structuredClone(candidateTrucks);
+  for (const sourceTruck of source) {
+    const protectedLoads = (sourceTruck.loads || []).filter(isMbtPlanningLoad);
+    if (!protectedLoads.length) continue;
+    let target = result.find(truck => String(truck.id) === String(sourceTruck.id));
+    if (!target) {target = { ...structuredClone(sourceTruck), loads: [] }; result.push(target);}
+    for (const load of protectedLoads) {
+      const index = target.loads.findIndex(item => String(item.id) === String(load.id));
+      const preserved = structuredClone(load);
+      if (index < 0) target.loads.push(preserved);
+      else target.loads[index] = preserved;
+    }
+  }
+  return result;
+}
+
 function planPayload(savedAt = new Date(), { draftOnly = false } = {}) {
+  if (globalThis.MbbsBinPlanning) return globalThis.MbbsBinPlanning.payload(savedAt, draftOnly);
   if (!draftOnly) {normalizePlanBeforeSave();}
-  const payloadTrucks = withoutAuthoritativelyRetiredStops(draftOnly ? trucks : trucksWithTimingMetadata());
+  const payloadTrucks = preserveMbtReadOnlyLoads(withoutAuthoritativelyRetiredStops(draftOnly ? trucks : trucksWithTimingMetadata()));
   const payloadOrders = withoutAuthoritativelyRetiredOrders(orders);
   const assignedIds = assignedOrderIdsForTrucks(payloadTrucks);
   const ownedOrAssignedOrders = payloadOrders
@@ -6085,6 +6233,7 @@ function trucksWithTimingMetadata() {
   return trucks.map((truck) => ({
     ...truck,
     loads: (truck.loads || []).map((load) => {
+      if (isMbtPlanningLoad(load) && !globalThis.MbbsBinPlanning) return structuredClone(load);
       const { routeEstimate, routeEstimateId, fromPersistentCache, ...savedLoad } = load;
       const stats = loadStats(truck, load);
       const assignment = assignLoadFields(truck, savedLoad);
@@ -6140,6 +6289,7 @@ function trucksWithTimingMetadata() {
 }
 
 function normalizePlanBeforeSave() {
+  if (globalThis.MbbsBinPlanning) return;
   expandScmGroupedPoStops();
   collapseGroupedOrderStops();
   cleanupOrphanPickupStops();
@@ -6637,7 +6787,7 @@ function applySavedPlan(saved) {
       shortageAvailability: base.shortageAvailability || order.shortageAvailability,
       committedQty: base.shortageAvailability ? base.committedQty : order.committedQty
     }, activityEvidence);
-    return [order.id, normalizeOrder(merged)];
+    return [order.id, normalizeOrder(globalThis.DispatchAddressGuard?.preserve(order, merged).order || merged)];
   }));
   const hiddenOrderIds = new Set([
     ...groupedChildOrderIds([...savedById.values()]),
@@ -6663,6 +6813,9 @@ function applySavedPlan(saved) {
   if (!forecastMatchesCurrentPlan()) clearDispatchForecast();
   selectedOrderId = orders.find((order) => order.id === selectedOrderId)?.id || orders[0]?.id || "";
   selectedLoadId = trucks.flatMap((truck) => truck.loads).find((load) => load.id === selectedLoadId)?.id || trucks[0]?.loads[0]?.id || "";
+  if (!loadPreviewOpen && isMbtPlanningLoad(findLoad(selectedLoadId).load)) {
+    selectedLoadId = trucks.flatMap(truck => truck.loads).find(load => !isMbtPlanningLoad(load))?.id || "";
+  }
   selectedOrderIds = new Set(selectedOrderId ? [selectedOrderId] : []);
   lastSavedAt = saved.savedAt ? new Date(saved.savedAt).toLocaleTimeString([], { timeZone: "America/Toronto", hour: "2-digit", minute: "2-digit", second: "2-digit" }) : "";
   lastServerSavedAt = saved.savedAt || lastServerSavedAt;
@@ -6724,6 +6877,7 @@ function applyDispatchPlanSnapshotResult(snapshot) {
 }
 
 function shouldUseDispatchIncrementalSave(payload = {}) {
+  if (globalThis.MbbsBinPlanning) return false;
   return payload.saveMode !== "truck_sequence"
     && Boolean(payload.planId)
     && Number.isFinite(Number(payload.baseRevision))
@@ -6748,6 +6902,9 @@ function serializeDispatchPlanAction(run) {
 }
 
 async function dispatchPlanActionRequest(kind, url, payload, generation = localPlanGeneration, method = "POST") {
+  if (globalThis.MbbsBinPlanning && kind === "confirm") {
+    payload = { ...payload }; delete payload.orders; delete payload.trucks; delete payload.summary;
+  }
   if (pendingDispatchPlanAction && (pendingDispatchPlanAction.kind !== kind || pendingDispatchPlanAction.url !== url)) {
     throw new Error("Retry the pending plan action before starting another action.");
   }
@@ -6866,7 +7023,9 @@ async function savePlanToServer(payload, { retryOnStale = true, forceSave = fals
       saveMode,
       refreshOrderPool
     });
-    const response = incrementalSave
+    const response = globalThis.MbbsBinPlanning
+      ? await globalThis.MbbsBinPlanning.saveRequest(payload, attempt)
+      : incrementalSave
       ? await dispatchIncrementalSaveRequest(targetPlanId, payload, { payloadHash, operatorAlertRefs, attempt })
       : await dispatchFrozenSaveFetch(`/api/dispatch/plans/${encodeURIComponent(targetPlanId)}`, {
           method: "PUT",
@@ -6924,7 +7083,7 @@ async function savePlanToServer(payload, { retryOnStale = true, forceSave = fals
       }
       if (conflict.code && !["STALE_DISPATCH_PLAN", "DISPATCH_PLAN_FENCE_REQUIRED"].includes(conflict.code)) {
         localPlanDirty = true;
-        routeNotice = conflict.error || conflict.conflicts?.[0]?.message || "Driver or truck assignment is invalid.";
+        routeNotice = [...new Set((conflict.conflicts || []).map(item => item.message).filter(Boolean))].join(" ") || conflict.error || "Driver or truck assignment is invalid.";
         render({ save: false });
         return { blocked: true, code: conflict.code, error: routeNotice, businessConflict: true };
       }
@@ -6955,7 +7114,7 @@ async function savePlanToServer(payload, { retryOnStale = true, forceSave = fals
       pendingPlanSaveAttempt = null;
       localPlanDirty = true;
       const firstIssue = responsePayload.validationIssues?.[0];
-      const issueMessage = String(firstIssue?.message || "The submitted plan needs correction.");
+      const issueMessage = (responsePayload.validationIssues || []).flatMap(issue => issue.conflicts?.length ? issue.conflicts.map(conflict => conflict.message || issue.message) : [issue.message]).filter(Boolean).join(" ") || String(firstIssue?.message || "The submitted plan needs correction.");
       routeNotice = `Draft backed up separately, but not applied to the active plan: ${issueMessage}`;
       render({ save: false });
       return {
@@ -6987,6 +7146,7 @@ async function savePlanToServer(payload, { retryOnStale = true, forceSave = fals
     if (saveTargetsCurrentView) {
       if (typeof dispatchRecoveredDraft !== "undefined" && dispatchRecoveredDraft) {acknowledgeDispatchRecoveredSave(attempt);}
       currentPlan = compactCurrentPlan(result);
+      void loadExecutedOrderReviews({ force: true });
       minimumPlanRevisionToApply = { planId: String(targetPlanId), revision: resultRevision };
       lastAcknowledgedPlanState = dispatchPlanWireState(result);
       clearDispatchForecast();
@@ -7063,6 +7223,7 @@ async function savePlanToServer(payload, { retryOnStale = true, forceSave = fals
       reportDispatchSaveError("saved-with-followup-warning", warning, { followupWarnings: result.followupWarnings });
       routeNotice = `Plan saved, but ${result.followupWarnings.map((item) => item.label || item.step).join(", ")} needs attention. Details are in the browser console.`;
     }
+    await globalThis.MbbsBinPlanning?.acknowledgeSave(savedLatestLocal, saveGeneration, targetPlanDate);
     return { saved: true, latest: savedLatestLocal };
   } catch (error) {
     queueDispatchDraftJournal(saveGeneration === localPlanGeneration ? payload : null);
@@ -7441,10 +7602,18 @@ async function performDispatchPlanConfirmation() {
   if (!ensureDispatchPlanEditor()) throw new Error(dispatchEditModeMessage());
   if (!currentPlan?.id) throw new Error("Dispatch plan is not loaded.");
   const retry = pendingDispatchPlanAction?.kind === "confirm" ? pendingDispatchPlanAction : null;
+  const confirmationPlanKey = `${currentPlanDate}:${currentPlan.id}`;
+  let googleRouteRefresh = retry?.payload?.audit?.details?.googleRouteRefresh || { attempted: 0, failed: [] };
   clearTimeout(saveTimer);
   if (!retry) {
-  await refreshGoogleRouteEstimatesForConfirmation();
+  googleRouteRefresh = await refreshGoogleRouteEstimatesForConfirmation();
+  if (confirmationPlanKey !== `${currentPlanDate}:${currentPlan?.id}`) {
+    throw new Error("The date plan changed while Google routes were refreshing. Confirm the selected plan again.");
+  }
   const saveResult = await saveCurrentPlanNow();
+  if (confirmationPlanKey !== `${currentPlanDate}:${currentPlan?.id}`) {
+    throw new Error("The date plan changed while saving. Confirm the selected plan again.");
+  }
   if (saveResult?.recoverySaved) {
     const error = new Error(routeNotice || "The latest draft was backed up but not applied. Fix it before confirming.");
     error.code = "DISPATCH_PLAN_RECOVERY_PENDING";
@@ -7472,6 +7641,7 @@ async function performDispatchPlanConfirmation() {
             planDate: payload.planDate,
             status: currentPlan?.status,
             operatorAlertRefs,
+            googleRouteRefresh,
             refreshOrderPool: Boolean(payload.refreshOrderPool),
             saveMode: "confirm"
           }
@@ -7479,6 +7649,8 @@ async function performDispatchPlanConfirmation() {
       }, confirmGeneration);
     try {
       const plan = acknowledged.result;
+      plan.googleRouteWarnings = googleRouteRefresh?.failed || [];
+      routeNotice = confirmedPlanNotice(plan);
       if (String(currentPlan?.id) !== String(plan.id) || currentPlanDate !== plan.planDate) {return plan;}
       lastAcknowledgedPlanState = dispatchPlanWireState(plan);
       if (confirmGeneration !== localPlanGeneration) {
@@ -7513,6 +7685,35 @@ async function performDispatchPlanConfirmation() {
     confirmInFlight = false;
     if (localPlanDirty || saveQueued) {queueServerSave();}
   }
+}
+
+/**
+ * @param {{ planDate: string, followupWarnings?: Array<{ label?: string, step?: string }>,
+ *   googleRouteWarnings?: Array<{ truckPlate?: string, loadName?: string, loadId: string, status: string }> }} plan
+ */
+function confirmedPlanNotice(plan) {
+  const notices = [`Plan ${displayDate(plan.planDate)} confirmed.`];
+  if (plan.followupWarnings?.length) {
+    notices.push(`${plan.followupWarnings.map((item) => item.label || item.step).join(", ")} needs attention. Details are in the browser console.`);
+  }
+  if (plan.googleRouteWarnings?.length) {
+    const routes = plan.googleRouteWarnings.map((item) => `${item.truckPlate || "Truck"} ${item.loadName || item.loadId} (${googleRouteRefreshStatusText(item.status)})`);
+    notices.push(`Google route refresh needs attention: ${routes.join("; ")}. Available estimates were retained. Refresh these routes to update their Google estimates and mapping.`);
+  }
+  return notices.join(" ");
+}
+
+/** @param {string} status */
+function googleRouteRefreshStatusText(status) {
+  /** @type {Record<string, string>} */
+  const labels = {
+    MAP_GEOMETRY_UNAVAILABLE: "Google mapping unavailable",
+    INCOMPLETE_GOOGLE_LEGS: "Google returned incomplete travel times",
+    ROUTE_CHANGED: "route changed during refresh",
+    waypoint_cost_guard: "manual refresh required for routes with more than 12 stops",
+    LOCAL_FALLBACK: "Google estimate unavailable"
+  };
+  return labels[status] || String(status || "Google unavailable").replaceAll("_", " ").toLowerCase();
 }
 
 function commitPlanMutation(actionName = "dispatch_plan_mutation", mutator = null, options = {}) {
@@ -7665,6 +7866,8 @@ async function resetDispatchAfterOrderDataClear() {
 }
 
 async function loadPlanForDate(planDate = currentPlanDate, { createIfMissing = true, setupReady = null } = {}) {
+  const binNavigation = globalThis.MbbsBinPlanning?.navigation();
+  const currentNavigation = () => binNavigation === globalThis.MbbsBinPlanning?.navigation();
   if (String(planDate || "") !== String(currentPlanDate || "")) {
     driverNewTruckSelections.clear();
     resetActiveLinkModalState();
@@ -7701,6 +7904,7 @@ async function loadPlanForDate(planDate = currentPlanDate, { createIfMissing = t
           }
         : { exists: false, plan: { exists: false, planDate } };
     }
+    if (!currentNavigation()) return { loaded: false, created: false, stale: true };
     if (snapshot.exists === false && createIfMissing && isDispatchPlanEditor()) {
       const plan = await createPlanForDate(planDate);
       created = true;
@@ -7713,11 +7917,13 @@ async function loadPlanForDate(planDate = currentPlanDate, { createIfMissing = t
       };
     }
     const candidate = snapshot.plan || snapshot;
+    if (!currentNavigation()) return { loaded: false, created: false, stale: true };
     currentPlanDate = candidate?.planDate || planDate;
     if (candidate?.id) currentPlan = compactCurrentPlan(candidate);
     dispatchStorageSet(DISPATCH_PLAN_DATE_KEY, currentPlanDate);
     await loadDriverJobStatuses();
     await refreshPlannedAssignments();
+    if (!currentNavigation()) return { loaded: false, created: false, stale: true };
     const applied = applyDispatchPlanSnapshotResult(snapshot);
     if (applied.invalid) throw new Error(dispatchPlannerSnapshotError);
     try {
@@ -7725,13 +7931,16 @@ async function loadPlanForDate(planDate = currentPlanDate, { createIfMissing = t
     } catch (error) {
       routeNotice = `Edit Mode status is temporarily unavailable: ${error.message}`;
     }
+    if (!currentNavigation()) return { loaded: false, created: false, stale: true };
     resetUndoHistory();
     resetLocalPlanDirty();
     if (applied.loaded) await loadDispatchForecast();
     else clearDispatchForecast();
+    if (!currentNavigation()) return { loaded: false, created: false, stale: true };
     scheduleDispatchDraftRecovery();
     return { ...applied, created };
   } catch (error) {
+    if (!currentNavigation()) return { loaded: false, created: false, stale: true };
     if (currentPlan?.id && trucks.length) dispatchPlannerSnapshotState = "stale";
     else dispatchPlannerSnapshotState = "failed";
     dispatchPlannerSnapshotError = error.message || "Dispatch snapshot load failed.";
@@ -7851,6 +8060,7 @@ async function runQueuedDispatchOrderPoolRefresh() {
   const reason = orderPoolRefreshReason;
   const splitOrderTarget = modalType === "split" ? orderById(modalOrderId) : null;
   try {
+    void loadExecutedOrderReviews({ force: true });
     if (!await loadDispatchOrders()) throw new Error("the order feed request failed");
     if (splitOrderTarget) {
       await refreshDispatchSplitOrder(splitOrderTarget);
@@ -8263,6 +8473,12 @@ function pickupRepresentativeOrder(load, stop) {
 
 function stopOrder(stop) {
   const direct = directOrderForStop(stop);
+  if (stop?.mbt?.visitId) return direct || {
+    id: stop.mbt.visitReference || stop.orderId || `BIN ${stop.mbt.visitId}`,
+    type: "BIN", customer: "BIN visit", address: stop.planningAddress || stop.location || "",
+    pickupLocations: [], items: [], pallets: 0, weightLbs: 0,
+    mbt: { ...stop.mbt, binTypeCode: stop.mbt.capabilitySnapshot?.binTypeCode }
+  };
   if (stop?.type !== "pick") return direct;
   if (direct && orderRequiresPickupLocation(direct, stop.location)) return direct;
   return pickupRepresentativeOrder(loadContainingStop(stop), stop) || direct;
@@ -8311,7 +8527,11 @@ function stopById(stopId) {
 
 function requiredPickupLocations(order) {
   const locations = order?.pickupLocations?.length ? order.pickupLocations : ["3445"];
-  const uniqueLocations = uniqueDispatchLocationLabels(locations);
+  const childLocations = order.type !== "CO" && !order.transitCo?.toYard
+    ? (order.childOrderDetails || []).map(child => child.transitCo?.toYard || child.sourceYard).filter(Boolean) : [];
+  const uniqueLocations = uniqueDispatchLocationLabels([...locations,...childLocations,
+    ...(order.poPickupManifest || []).map(entry => entry.location),
+    ...retainedDirectPickupManifest(order).map(entry => entry.location)]);
   const hasPickupAddressOverride = Boolean(String(order?.pickupAddressOverride || "").trim());
   return uniqueLocations.filter((location, index) =>
     (hasPickupAddressOverride && index === 0)
@@ -8498,6 +8718,7 @@ function serializableRouteEstimateForLoad(truck, load) {
     legMinutes: Array.isArray(estimate.legMinutes) ? estimate.legMinutes.map(Number) : [],
     rawLegMinutes: Array.isArray(estimate.rawLegMinutes) ? estimate.rawLegMinutes.map(Number) : [],
     ...normalizedRouteMapGeometry(estimate, stops.length),
+    ...(Number.isFinite(Date.parse(estimate.asOf)) ? { asOf: new Date(estimate.asOf).toISOString() } : {}),
     allowTolls: Boolean(estimate.allowTolls),
     travelTimePercent: Number(estimate.travelTimePercent || 0),
     routeEstimateId: meta.id,
@@ -8623,6 +8844,15 @@ function physicalDropVisitKey(stop = {}, order = {}) {
 }
 
 function physicalVisitsForLoad(load, rows = []) {
+  if (globalThis.MbbsBinPlanning && isMbtPlanningLoad(load)) return globalThis.MbbsBinPlanning.physicalVisits(load, rows);
+  if (isMbtPlanningLoad(load)) return (load.stops || []).map((stop, index) => {
+    const view = { ...stop, loadId: load.id || stop.loadId,
+      type: ["collect_empty_bin", "pickup_bin"].includes(stop.actionCode) ? "pick" : "drop",
+      location: stop.yardCode || stop.planningAddress || stop.location };
+    const order = stopOrder(stop);
+    return { type: view.type, address: stopAddress(view, order), addressKey: `${stop.mbt?.visitId}:${index}`,
+      entries: [{ stop: view, order, row: rows[index] || null, index }] };
+  });
   const visits = [];
   for (const [index, stop] of (load?.stops || []).entries()) {
     const order = stopOrder(stop);
@@ -8683,6 +8913,17 @@ function physicalVisitStayMinutes(visit = {}, truck) {
 }
 
 function loadStats(parentTruck, load) {
+  if (isMbtPlanningLoad(load) && !globalThis.MbbsBinPlanning) {
+    const start = Number(load.plannedStartMinute ?? load.timing?.start ?? 420);
+    const finish = Number(load.plannedFinishMinute ?? load.timing?.finish ?? start);
+    const startInfo = loadStartInfo(parentTruck, load);
+    const rows = (load.stops || []).map(stop => ({ stop, order: stopOrder(stop),
+      arrival: Number(stop.timing?.arrival ?? start), depart: Number(stop.timing?.depart ?? stop.timing?.arrival ?? start) }));
+    return { ...startInfo, start, finish, rows, palletTotal: 0, footprintTotal: 0, weightTotalLbs: 0,
+      capacityLbs: truckCapacityLbs(parentTruck), warningCount: 0, warnings: [], capacityWarning: false,
+      fullLoad: false, startTravel: null,
+      returnTrip: load.returnOnly ? Math.max(0, finish - start) : 0 };
+  }
   const truck = effectiveTruckForLoad(parentTruck, load);
   const startInfo = loadStartInfo(parentTruck, load);
   const start = startInfo.start;
@@ -8745,7 +8986,7 @@ function loadStats(parentTruck, load) {
     warningCount += 1;
     warnings.push(`${unresolvedStop.orderId || unresolvedStop.id || "Stop"}: order details are temporarily unavailable. Refresh orders before saving this stop timing.`);
   }
-  const sequenceWarnings = sequenceWarningsForStops(load.stops);
+  const sequenceWarnings = isMbtPlanningLoad(load) ? [] : sequenceWarningsForStops(load.stops);
   const pickedOrderLocations = new Set();
   const onboardOrderIds = new Set();
   const droppedOrderIds = new Set();
@@ -8758,7 +8999,7 @@ function loadStats(parentTruck, load) {
     );
   }
   const explicitPickCount = load.stops.filter((stop) => stop.type === "pick").length;
-  if (!explicitPickCount) {
+  if (!explicitPickCount && !isMbtPlanningLoad(load)) {
     for (const location of uniquePickupLocations(load, truck)) {
       current += truckStopMinutes(truck, isOwnYardCode(location) ? "own" : "vendor", pickupFootprintForLocation(load, location));
     }
@@ -9245,6 +9486,7 @@ function ensurePickupStops(load, order, insertIndex = null, { activateSchema = f
     const reusable = load.stops.find((stop, index) =>
       stop.type === "pick"
       && normalizedPickupLocation(stop.location) === normalizedPickupLocation(location)
+      && pickupStopMatchesOrder(stop, order)
       && index > boundary
       && index <= pickupLimit
       && !stopHasDriverActivity(load, stop)
@@ -9290,6 +9532,7 @@ function pickupSplitDestinationOptions(load, stop, selectedRefs = null) {
       candidate === stop
       || candidate.type !== "pick"
       || !sameDispatchLocation(candidate.location, stop.location)
+      || !pickupStopMatchesOrder(candidate, stopOrder(stop))
       || stopHasDriverActivity(load, candidate)
       || index <= sourceIndex
       || index > lastLegalIndex
@@ -9332,7 +9575,8 @@ function splitPickupVisit(loadId, stopId, orderRefs, destination = "") {
     : -1;
   const targetIndex = target ? load.stops.indexOf(target) : insertionIndex;
   const invalidDestination = target
-    ? target.type !== "pick" || !sameDispatchLocation(target.location, source.location) || stopHasDriverActivity(load, target)
+    ? target.type !== "pick" || !sameDispatchLocation(target.location, source.location)
+      || !pickupStopMatchesOrder(target, stopOrder(source)) || stopHasDriverActivity(load, target)
     : !Number.isInteger(insertionIndex);
   const movedDropIndexes = movedRefs.map((ref) => load.stops.findIndex((candidate) =>
     candidate.type === "drop" && String(candidate.orderId || "").toLowerCase() === String(ref).toLowerCase()
@@ -9475,7 +9719,7 @@ function collapseGroupedOrderStops() {
 function cleanupOrphanPickupStops() {
   for (const truck of trucks) {
     for (const load of truck.loads) {
-      if (load.returnOnly) continue;
+      if (load.returnOnly || isMbtPlanningLoad(load)) continue;
       // Compact startup can arrive before the full order feed and older plan
       // snapshots may no longer contain a grouped child's order document. The
       // recorded stop ID is still immutable Driver PWA evidence and must never
@@ -9484,14 +9728,15 @@ function cleanupOrphanPickupStops() {
         stop.type !== "drop" || Boolean(stopOrder(stop)) || stopHasDriverActivity(load, stop)
       );
       materializePickupVisitOrderRefs(load);
-      load.stops = load.stops.filter((stop) => {
-        if (stop.type !== "pick" || stopHasDriverActivity(load, stop)) return true;
+      const boundary = dispatchEditableRouteBoundary(load);
+      load.stops = load.stops.filter((stop, index) => {
+        if (stop.type !== "pick" || index <= boundary || stopHasDriverActivity(load, stop)) return true;
         const validRefs = pickupStopOrderRefs(load, stop).filter((ref) => {
           const matchingDrop = load.stops.find((candidate) =>
             candidate.type === "drop" && String(candidate.orderId || "").toLowerCase() === String(ref).toLowerCase()
           );
           const order = matchingDrop ? stopOrder(matchingDrop) : null;
-          return Boolean(order && orderRequiresPickupLocation(order, stop.location));
+          return Boolean(order && orderRequiresPickupLocation(order, stop.location) && pickupStopMatchesOrder(stop, order));
         });
         stop.orderRefs = validRefs;
         if (validRefs.length) stop.orderId = validRefs[0];
@@ -9568,6 +9813,7 @@ function renumberDriverLoads() {
     );
     let number = 1;
     for (const entry of entries) {
+      if (isMbtPlanningLoad(entry.load) !== Boolean(globalThis.MbbsBinPlanning)) continue;
       if (entry.load.returnOnly) {
         entry.load.name = entry.load.name || "Return Load";
         continue;
@@ -9693,6 +9939,11 @@ function reflowDriverLaneEntries(driverLogin, orderedEntries, timingByLoad, move
   let previous = null;
   let previousFinish = laneStart;
   for (const [index, entry] of entries.entries()) {
+    if (isMbtPlanningLoad(entry.load) !== Boolean(globalThis.MbbsBinPlanning)) {
+      previous = entry;
+      previousFinish = loadStats(entry.truck, entry.load).finish;
+      continue;
+    }
     const timing = timingByLoad.get(entry.load.id) || { start: laneStart, duration: 30 };
     assignLoadToDriver(entry.truck, entry.load, login, { append: false });
     entry.load.driverSequence = index;
@@ -9739,6 +9990,7 @@ function reflowDriverLaneEntries(driverLogin, orderedEntries, timingByLoad, move
 function moveLoadToDriverLane(loadId, targetDriverLogin, { targetLoadId = "", insertAfter = false } = {}) {
   const found = findLoad(loadId);
   if (!found.load || !found.truck) return null;
+  if (isPlanningLoadReadOnly(found.load)) return null;
   const timingByLoad = driverEntryTimingSnapshot();
   const sourceLogin = loadDriverKey(found.truck, found.load);
   const targetLogin = String(targetDriverLogin || "").trim().toLowerCase();
@@ -9770,6 +10022,7 @@ function moveLoadToPhysicalTruck(loadId, targetTruckId) {
   const source = findLoad(loadId);
   const targetTruck = trucks.find((truck) => String(truck.id) === String(targetTruckId));
   if (!source.load || !source.truck || !targetTruck) return null;
+  if (isPlanningLoadReadOnly(source.load)) return null;
   if (source.truck.id !== targetTruck.id) {
     source.truck.loads = source.truck.loads.filter((item) => item.id !== source.load.id);
     targetTruck.loads.push(source.load);
@@ -9829,6 +10082,18 @@ function switchApproachTravelForLoad(truck, load) {
 }
 
 function loadStartInfo(truck, load) {
+  if (isPlanningLoadReadOnly(load) && Number.isFinite(load?.timing?.start)) {
+    // Keep another planner's saved schedule stable while this page has a draft.
+    const timing = load.timing;
+    const previous = driverOrientedPlanningEnabled() ? previousDriverLoad(truck, load) : null;
+    const switchBefore = Boolean(previous && loadTruckPlate(previous.truck, previous.load) !== loadTruckPlate(truck, load));
+    const handoff = timing.handoffTravel;
+    return { ...timing, startMode: resolvedLoadStartMode(load),
+      switchBefore, switchMinutes: switchBefore ? Number(load.truckSwitchMinutes ?? 10) : 0,
+      handoffTravel: handoff ? { ...switchApproachTravelForLoad(truck, load), ...handoff } : null,
+      handoffMinutes: Number(handoff?.minutes || 0), handoffStart: handoff?.start,
+      handoffFinish: handoff?.finish };
+  }
   if (driverOrientedPlanningEnabled()) {
     const previousEntry = previousDriverLoad(truck, load);
     const assignedTruck = effectiveTruckForLoad(truck, load);
@@ -9921,8 +10186,8 @@ function startPointAfterLoad(truck, load) {
   if (!stop) return null;
   const place = resolveStopPlace(stop, order);
   return {
-    label: stop.type === "pick" ? pickupStopLabel(stop, order) : (order?.id || "Previous stop"),
-    jobLabel: stop.type === "pick" ? String(stop.location || "") : (order?.id || "Previous stop"),
+    label: stop.mbt ? (stop.yardCode || place.address) : stop.type === "pick" ? pickupStopLabel(stop, order) : (order?.id || "Previous stop"),
+    jobLabel: stop.mbt ? (stop.yardCode || place.address) : stop.type === "pick" ? String(stop.location || "") : (order?.id || "Previous stop"),
     address: place.address,
     position: { lat: place.lat, lng: place.lng },
     routeLocation: place.routeLocation,
@@ -9938,7 +10203,7 @@ function travelMinutesBetweenPoints(from, toYard) {
 
 function startTravelForLoad(truck, load) {
   if (load?.returnOnly) return null;
-  const firstPickup = load.stops.find((stop) => stop.type === "pick");
+  const firstPickup = isMbtPlanningLoad(load) ? load.stops[0] : load.stops.find((stop) => stop.type === "pick");
   if (!firstPickup?.location) return null;
   const firstPickupOrder = stopOrder(firstPickup);
   const pickupPlace = resolveStopPlace(firstPickup, firstPickupOrder);
@@ -10174,6 +10439,14 @@ function dropStopLabel(stop = {}, order = {}) {
 }
 
 function resolveStopPlace(stop, order) {
+  if (globalThis.MbbsBinPlanning && stop?.mbt) return globalThis.MbbsBinPlanning.stopPlace(stop, order);
+  if (stop?.mbt) {
+    const place = stop.yardCode ? placeForLocation(stop.yardCode) : null;
+    const address = place?.address || stop.planningAddress || order?.address || stop.location || "";
+    const position = placePosition(place) || fallbackPositionForAddress(address, order);
+    return { kind: place?.kind || "delivery", key: stop.yardCode || address,
+      label: stop.displayName || address, address, routeLocation: address || position, ...position };
+  }
   if (!stop) {
     return {
       kind: "unknown",
@@ -10257,6 +10530,7 @@ function stopIsOwnYard(stop, order) {
 }
 
 function stopServiceType(stop, order) {
+  if (globalThis.MbbsBinPlanning && stop?.mbt) return stop.yardCode ? (isOwnYardCode(stop.yardCode) ? "own" : "vendor") : "delivery";
   if (stopIsOwnYard(stop, order)) return "own";
   const isLocalVrma = String(order?.sourceTable || order?.source_table || "") === "scm_vrma_orders"
     || String(order?.parseSource || order?.parse_source || "") === "scm-vrma";
@@ -10266,6 +10540,7 @@ function stopServiceType(stop, order) {
 }
 
 function stopTimeWindow(stop, order) {
+  if (globalThis.MbbsBinPlanning && stop?.mbt) return globalThis.MbbsBinPlanning.stopWindow(stop, order);
   if (!stop || !order || stopIsOwnYard(stop, order)) return { start: "", end: "" };
   if (stop.type === "pick") return vendorWindowForLocation(order.pickupAddressOverride || stop.location, order);
   if (stop.type === "drop") return { start: order.windowStart || "", end: order.windowEnd || "" };
@@ -10579,6 +10854,7 @@ function cacheRouteEstimate(truck, load, stops, estimate) {
       legMinutes: Array.isArray(estimate.legMinutes) ? estimate.legMinutes.map(Number) : [],
       rawLegMinutes: Array.isArray(estimate.rawLegMinutes) ? estimate.rawLegMinutes.map(Number) : [],
       ...normalizedRouteMapGeometry(estimate, stops.length),
+      ...(Number.isFinite(Date.parse(estimate.asOf)) ? { asOf: new Date(estimate.asOf).toISOString() } : {}),
       allowTolls: Boolean(estimate.allowTolls),
       travelTimePercent: Number(estimate.travelTimePercent || 0),
       routeEstimateId: meta.id,
@@ -10593,6 +10869,7 @@ function cacheRouteEstimate(truck, load, stops, estimate) {
 
 function applyCachedRouteEstimate(truck, load, stops = mapStopsForLoad(load, truck)) {
   if (!load?.id) return false;
+  if (isPlanningLoadReadOnly(load)) return false;
   const meta = routeEstimateMeta(truck, load, stops);
   const currentEstimate = estimateForLoad(load);
   const cached = persistedRouteEstimateCache[meta.id];
@@ -10824,9 +11101,17 @@ function fallbackLegMinutesForRouteStops(stops = []) {
 function applyServerRouteEstimate(truck, load, stops, response = {}) {
   if (!routeEstimateHasCompleteGoogleLegs(stops, response)) return null;
   const meta = routeEstimateMeta(truck, load, stops);
+  const geometry = normalizedRouteMapGeometry(response, stops.length);
+  if (!geometry.routePath.length || !geometry.stopCoordinates.length) {
+    const previous = estimateForLoad(load);
+    const previousGeometry = normalizedRouteMapGeometry(previous, stops.length);
+    if (["google", "google_routes_v2"].includes(previous?.source)
+      && routeEstimateMatchesMeta(previous, meta) && routeEstimateHasCompleteGoogleLegs(stops, previous)
+      && previousGeometry.routePath.length && previousGeometry.stopCoordinates.length) return previous;
+  }
   const estimate = {
     ...response,
-    ...normalizedRouteMapGeometry(response, stops.length),
+    ...geometry,
     routeEstimateId: meta.id,
     routeSignature: meta.signature,
     allowTolls: Boolean(load?.allowTolls),
@@ -10837,19 +11122,22 @@ function applyServerRouteEstimate(truck, load, stops, response = {}) {
   return estimate;
 }
 
-async function googleRouteForLoad(truck, load, { reason = "confirm" } = {}) {
+async function googleRouteForLoad(truck, load, { reason = "confirm", forceRefresh = false } = {}) {
   if (!load?.id) return null;
+  if (isPlanningLoadReadOnly(load)) return null;
   truck = effectiveTruckForLoad(findLoad(load.id).truck || truck, load);
   const stops = mapStopsForLoad(load, truck);
   if (stops.length <= 1) return null;
-  if (reason !== "manual_refresh" && applyCachedRouteEstimate(truck, load, stops)) {
+  if (!forceRefresh && reason !== "manual_refresh" && applyCachedRouteEstimate(truck, load, stops)) {
     return { source: "persistent-cache", stops, estimate: estimateForLoad(load) };
   }
   const meta = routeEstimateMeta(truck, load, stops);
   const requestPlanKey = `${currentPlanDate}:${currentPlan?.id || ""}`;
-  if (backgroundRouteInFlight.has(meta.id)) return null;
+  const requestKey = `${requestPlanKey}:${load.id}:${meta.signature}`;
+  if (backgroundRouteRequests.has(requestKey)) return backgroundRouteRequests.get(requestKey);
   backgroundRouteInFlight.add(meta.id);
-  try {
+  const request = (async () => {
+   try {
     const response = await fetch("/api/dispatch/maps/route-estimate", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
@@ -10879,15 +11167,25 @@ async function googleRouteForLoad(truck, load, { reason = "confirm" } = {}) {
       || routeEstimateMeta(latestTruck, latest.load, latestStops).signature !== meta.signature) {
       return { source: "fallback", status: "ROUTE_CHANGED", stops, estimate: null };
     }
+    const geometry = normalizedRouteMapGeometry(result, stops.length);
     return {
       source: result.source || "fallback",
-      status: result.fallbackReason || "OK",
+      status: result.fallbackReason || (result.source === "google_routes_v2"
+        && (!geometry.routePath.length || !geometry.stopCoordinates.length) ? "MAP_GEOMETRY_UNAVAILABLE" : "OK"),
       stops,
-      estimate: applyServerRouteEstimate(latestTruck, latest.load, latestStops, result)
+      estimate: result.source === "google_routes_v2"
+        ? applyServerRouteEstimate(latestTruck, latest.load, latestStops, result)
+        : null
     };
   } catch (error) {
     return { source: "fallback", status: error?.message || "ERROR", stops, estimate: null };
+   }
+  })();
+  backgroundRouteRequests.set(requestKey, request);
+  try {
+    return await request;
   } finally {
+    if (backgroundRouteRequests.get(requestKey) === request) backgroundRouteRequests.delete(requestKey);
     backgroundRouteInFlight.delete(meta.id);
   }
 }
@@ -11018,24 +11316,35 @@ async function renderGoogleMapPreview() {
   updateGoogleMapPreviewGeometry(canvas);
 }
 
-function routeLoadsNeedingEstimate() {
+function routeLoadsNeedingEstimate({ refreshAll = false } = {}) {
+  if (refreshAll) {
+    normalizePlanBeforeSave();
+  }
   const candidates = [];
-  for (const truck of trucks) {
-    for (const load of truck.loads || []) {
-      const stops = mapStopsForLoad(load, truck);
-      if (stops.length <= 1) continue;
-      if (applyCachedRouteEstimate(truck, load, stops)) continue;
-      if (!routeNeedsGoogleEstimateForLoad(truck, load)) continue;
-      const meta = routeEstimateMeta(truck, load, stops);
-      candidates.push({ truck, load, meta });
+  const driverOriented = driverOrientedPlanningEnabled();
+  /** @type {Array<Pick<ReturnType<typeof driverLoadEntries>[number], "truck" | "load">>} */
+  const entries = driverOriented ? driverLoadEntries() : [];
+  if (!driverOriented) {
+    for (const truck of trucks) {
+      for (const load of truck.loads || []) entries.push({ truck, load });
     }
+  }
+  for (const { truck, load } of entries) {
+      if (isPlanningLoadReadOnly(load)) continue;
+      const stops = mapStopsForLoad(load, effectiveTruckForLoad(truck, load));
+      if (stops.length <= 1) continue;
+      if (!stops.slice(1).some((stop, index) => !samePhysicalRouteStop(stops[index], stop))) continue;
+      if (!refreshAll && applyCachedRouteEstimate(truck, load, stops)) continue;
+      if (!refreshAll && !routeNeedsGoogleEstimateForLoad(truck, load)) continue;
+      const meta = routeEstimateMeta(truck, load, stops);
+      candidates.push({ truck, load, meta, refreshAll });
   }
   return candidates;
 }
 
 async function refreshGoogleRouteEstimatesForConfirmation() {
   if (backgroundRoutesRunning) return backgroundRouteRunPromise;
-  const candidates = routeLoadsNeedingEstimate();
+  const candidates = routeLoadsNeedingEstimate({ refreshAll: true });
   if (!candidates.length) return { attempted: 0, failed: [] };
   backgroundRoutesRunning = true;
   backgroundRouteRunPromise = (async () => {
@@ -11044,14 +11353,25 @@ async function refreshGoogleRouteEstimatesForConfirmation() {
       for (const candidate of candidates) {
         const latest = findLoad(candidate.load.id);
         if (!latest.truck || !latest.load) continue;
-        // An earlier load can change this load's inherited departure while the
-        // queue is running. Re-check the exact route identity before calling
-        // Google so a now-valid downstream estimate is not replaced needlessly.
-        if (!routeNeedsGoogleEstimateForLoad(latest.truck, latest.load)) continue;
+        // Earlier loads change inherited departures, including truck switches.
+        // Resolve the latest load before each sequential request.
+        if (!candidate.refreshAll && !routeNeedsGoogleEstimateForLoad(latest.truck, latest.load)) continue;
         const previousEstimate = estimateForLoad(latest.load);
-        const result = await googleRouteForLoad(latest.truck, latest.load, { reason: "confirm" });
+        const result = await googleRouteForLoad(latest.truck, latest.load, { reason: "confirm", forceRefresh: true });
+        let warningStatus = "";
         if (!result?.estimate || result.source !== "google_routes_v2") {
-          failed.push({ loadId: latest.load.id, status: result?.status || "LOCAL_FALLBACK" });
+          warningStatus = result?.source === "google_routes_v2" && !result.estimate
+            ? "INCOMPLETE_GOOGLE_LEGS" : result?.status || "LOCAL_FALLBACK";
+        } else {
+          const geometry = normalizedRouteMapGeometry(result.estimate, result.stops.length);
+          if (result.status === "MAP_GEOMETRY_UNAVAILABLE" || !geometry.stopCoordinates.length || !geometry.routePath.length) {
+            warningStatus = "MAP_GEOMETRY_UNAVAILABLE";
+          }
+        }
+        if (warningStatus) {
+          failed.push({ loadId: latest.load.id, loadName: latest.load.name || latest.load.id,
+            truckPlate: effectiveTruckForLoad(latest.truck, latest.load)?.plate || latest.truck.plate,
+            status: warningStatus });
         }
         if (routeEstimateChangesVisibleTiming(previousEstimate, result?.estimate)) {
           backgroundRouteRenderQueued = true;
@@ -11236,13 +11556,107 @@ function renderDispatchModalInPlace() {
   }
 }
 
+async function loadExecutedOrderReviews({ force = false } = {}) {
+  const planId = String(currentPlan?.id || "");
+  if (!planId || SALES_PLANNING_HOST) {
+    executedOrderReviews = []; executedOrderReviewPlanId = ""; executedOrderReviewError = "";
+    return;
+  }
+  if (!force && executedOrderReviewPlanId === planId && Date.now() - executedOrderReviewLoadedAt < 20000) {return;}
+  if (executedOrderReviewPlanId !== planId) {
+    executedOrderReviews = [];
+    executedOrderReviewExpanded.clear();
+  }
+  executedOrderReviewPlanId = planId;
+  executedOrderReviewLoadedAt = Date.now();
+  try {
+    const response = await fetch(`/api/dispatch/plans/${encodeURIComponent(planId)}/executed-order-reviews`);
+    if (!response.ok) {throw new Error(`Review information could not be loaded (${response.status}).`);}
+    const payload = await response.json();
+    if (String(currentPlan?.id || "") !== planId) {return;}
+    executedOrderReviews = Array.isArray(payload.reviews) ? payload.reviews : [];
+    executedOrderReviewError = "";
+  } catch (error) {
+    if (String(currentPlan?.id || "") !== planId) {return;}
+    executedOrderReviewError = `Source update warnings could not be refreshed: ${error.message}`;
+  }
+  renderDispatchNoticePatch();
+}
+
+async function confirmExecutedOrderReview(token) {
+  const planId = String(currentPlan?.id || "");
+  const review = executedOrderReviews.find(item => item.token === token && !item.acknowledged);
+  if (!review || executedOrderReviewPlanId !== planId || executedOrderReviewConfirming) {return;}
+  executedOrderReviewConfirming = token;
+  renderDispatchNoticePatch();
+  try {
+    const response = await fetch(`/api/dispatch/plans/${encodeURIComponent(planId)}/executed-order-reviews`, {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(dispatchLeaseRequestPayload({ tokens: [token], confirm: true, sessionId: dispatchSessionId }))
+    });
+    const payload = await response.json();
+    if (!response.ok) {throw new Error(payload.error || "The source update could not be confirmed.");}
+    if (String(currentPlan?.id || "") !== planId) {return;}
+    executedOrderReviews = payload.reviews || [];
+    executedOrderReviewError = "";
+  } catch (error) {
+    if (String(currentPlan?.id || "") === planId) {
+      await loadExecutedOrderReviews({ force: true });
+      executedOrderReviewError = error.message;
+    }
+  } finally {
+    executedOrderReviewConfirming = "";
+    renderDispatchNoticePatch();
+  }
+}
+
+function readDismissedExecutedOrderReviews() {
+  try {
+    const stored = JSON.parse(dispatchStorageGet(DISMISSED_SOURCE_REVIEWS_KEY, "[]"));
+    return new Set(Array.isArray(stored) ? stored.filter(value => typeof value === "string").slice(-500) : []);
+  } catch {
+    return new Set();
+  }
+}
+
+function visibleExecutedOrderReviewHistory() {
+  if (executedOrderReviewPlanId !== String(currentPlan?.id || "")) return [];
+  return executedOrderReviews.filter(review => review.acknowledged
+    && !dismissedExecutedOrderReviews.has(`${executedOrderReviewPlanId}:${review.token}`));
+}
+
+function dismissExecutedOrderReviewHistory() {
+  for (const review of visibleExecutedOrderReviewHistory()) {
+    dismissedExecutedOrderReviews.add(`${executedOrderReviewPlanId}:${review.token}`);
+  }
+  const stored = [...dismissedExecutedOrderReviews].slice(-500);
+  dismissedExecutedOrderReviews = new Set(stored);
+  dispatchStorageSet(DISMISSED_SOURCE_REVIEWS_KEY, JSON.stringify(stored));
+}
+
+function renderExecutedOrderReviews() {
+  if (executedOrderReviewPlanId !== String(currentPlan?.id || "")) {return "";}
+  const pending = executedOrderReviews.filter(review => !review.acknowledged);
+  const warnings = pending.map(review => {
+    const context = [...new Set((review.contexts || []).map(item => `${item.driverName || item.driverLogin}, ${item.truckPlate}, ${item.loadName}, ${item.stopType || "stop"} ${item.stopId}`))].join("; ");
+    const request = review.replanRequested ? "re-plan requested" : "review needed";
+    const guidance = review.replanRequested ? " Review the affected remaining work and re-plan where needed." : "";
+    return `<details data-executed-source-review data-review-token="${escapeHtml(review.token)}" ${executedOrderReviewExpanded.has(review.token) ? "open" : ""}><summary><strong>${escapeHtml(review.orderRef)}${review.groupRef ? ` (${escapeHtml(review.groupRef)})` : ""}: source update — ${request}</strong></summary><p>${escapeHtml(context)}</p><ul>${(review.changes || []).map(change => `<li>${escapeHtml(change.message || "Source details updated")}</li>`).join("")}</ul><p>Source updates and planning saves continue.${guidance} Confirm that you have reviewed these changes. Recorded driver work and photos are retained.</p><button type="button" data-action="confirm-executed-source-update" data-review-token="${escapeHtml(review.token)}" ${!dispatchEditLeaseIsLocallyActive() || executedOrderReviewConfirming || review.sourceAvailable === false ? "disabled" : ""}>${executedOrderReviewConfirming === review.token ? "Confirming…" : "Confirm updated information"}</button>${!dispatchEditLeaseIsLocallyActive() ? "<span> Enter Edit Mode to confirm.</span>" : ""}${review.sourceAvailable === false ? "<p>The current source record is unavailable. Refresh source data to review its latest information.</p>" : ""}</details>`;
+  }).join("");
+  const confirmed = visibleExecutedOrderReviewHistory();
+  const history = confirmed.length ? `<details><summary>${confirmed.length} source update${confirmed.length === 1 ? "" : "s"} reviewed</summary>${confirmed.map(review => `<p><strong>${escapeHtml(review.orderRef)}</strong> — ${escapeHtml(review.acknowledgedBy || "Dispatcher")}: ${(review.changes || []).map(change => escapeHtml(change.message || "")).join("; ")}</p>`).join("")}</details>` : "";
+  return `${executedOrderReviewError ? `<p role="alert">${escapeHtml(executedOrderReviewError)}</p>` : ""}${pending.length ? "<p>Source changes need review. You can continue planning and saving.</p>" : ""}${warnings}${history}`;
+}
+
 function renderDispatchRouteNotice() {
   const messages = [];
+  const reviews = renderExecutedOrderReviews();
+  if (reviews) {messages.push(reviews);}
   if (dispatchRecoveredDraft) {messages.push(`<div>An unsaved draft is available for this date.<div class="dispatch-draft-actions"><button data-action="recover-dispatch-draft" type="button">Restore draft</button><button data-action="download-dispatch-draft" type="button">Download draft</button><button data-action="discard-dispatch-draft" type="button">Discard draft</button></div></div>`);}
   if (dispatchDraftBackupError && localPlanDirty) {messages.push(`<div>${escapeHtml(dispatchDraftBackupError)}</div>`);}
   if (pendingDispatchPlanAction && !confirmInFlight) {messages.push(`<div>A plan action is waiting for its saved result.<div class="dispatch-draft-actions"><button data-action="retry-dispatch-plan-action" type="button">Retry pending action</button></div></div>`);}
   if (routeNotice) {messages.push(`<div>${escapeHtml(routeNotice)}</div>`);}
-  return messages.length ? `<div class="route-notice dispatch-save-notice"><div>${messages.join("")}</div>${routeNotice ? '<button data-action="close-route-notice" type="button" aria-label="Dismiss notice">x</button>' : ""}</div>` : "";
+  return messages.length ? `<div class="route-notice dispatch-save-notice${reviews ? " source-review-notice" : ""}"><div>${messages.join("")}</div>${routeNotice || visibleExecutedOrderReviewHistory().length ? '<button data-action="close-route-notice" type="button" aria-label="Dismiss notice">x</button>' : ""}</div>` : "";
 }
 
 function renderDriverTruckSwitchAttentionPanel() {
@@ -11340,6 +11754,7 @@ function renderDispatchPlannerPatch() {
     : trucks.map(renderTruck).join("");
   const preview = app.querySelector("[data-dispatch-load-preview-layer]");
   if (preview) preview.innerHTML = renderLoadPreview();
+  applyReadOnlyPlanningControls();
   const mapPreserved = restoreGoogleMapPreviewState(mapState);
   restoreRenderUiState(uiState, uiSequence);
   renderDispatchSaveStatePatch();
@@ -11352,6 +11767,7 @@ function renderDispatchExecutionPatch() {
 }
 
 function render(options = {}) {
+  if (globalThis.MbbsBinPlanning && dragged) return;
   const { save = false } = options;
   const uiSequence = ++renderUiSequence;
   const uiState = captureRenderUiState();
@@ -11366,21 +11782,22 @@ function render(options = {}) {
   }
   const { plannerRoot } = ensureDispatchRenderLayers();
   plannerRoot.innerHTML = `
-    <section class="dispatch-shell ${isDispatchPlanEditor() ? "dispatch-editing" : "dispatch-viewing"} ${isHistoricalDispatchPlanDate(currentPlanDate) ? "dispatch-history-plan" : ""}">
+    <section class="dispatch-shell dispatch-planning-shell ${isDispatchPlanEditor() ? "dispatch-editing" : "dispatch-viewing"} ${isHistoricalDispatchPlanDate(currentPlanDate) ? "dispatch-history-plan" : ""}">
       <header class="dispatch-topbar">
         <div class="topbar-main">
           <div>
             <p>${t("app.transportation", "MBBS Transportation")}</p>
-            <h1>${t("dispatch.planning", "Dispatch Planning")}</h1>
+            <h1>${globalThis.MbbsBinPlanning ? "BIN Planning" : t("dispatch.planning", "Dispatch Planning")}</h1>
           </div>
           <div class="topbar-controls">
-            <input id="planDateInput" type="date" value="${escapeHtml(currentPlanDate)}" />
+            <input id="planDateInput" aria-label="Plan date" type="date" value="${escapeHtml(currentPlanDate)}" />
             <span class="autosave-pill plan-status-pill" data-dispatch-plan-status>${escapeHtml(planBadgeText())}</span>
           </div>
         </div>
         <div class="topbar-language">${languageToggle()}</div>
         <div class="topbar-actions">
-          <button onclick="location.href='${SALES_PLANNING_HOST ? "/sales" : "/dispatch"}'" type="button">${t("common.menu", "Menu")}</button>
+          <button onclick="location.href='${globalThis.MbbsBinPlanning ? "/mbt" : SALES_PLANNING_HOST ? "/sales" : "/dispatch"}'" type="button">${t("common.menu", "Menu")}</button>
+          <a class="mbt-planning-link" href="${globalThis.MbbsBinPlanning ? "/dispatch/planning" : "/mbt/planning"}?planDate=${escapeHtml(currentPlanDate)}">${globalThis.MbbsBinPlanning ? "Dispatch Planning" : "BIN Planning"}</a>
           <button data-action="undo-plan" ${undoStack.length && isDispatchPlanEditor() ? "" : "disabled"} title="Undo (Ctrl+Z)" type="button">${t("dispatch.undo", "Undo")}</button>
           <button data-action="redo-plan" ${redoStack.length && isDispatchPlanEditor() ? "" : "disabled"} title="Redo (Ctrl+Y)" type="button">${t("dispatch.redo", "Redo")}</button>
           <button data-action="export-shipped-csv" ${currentPlan?.id ? "" : "disabled"} type="button">${t("dispatch.exportShippedCsv", "Export Shipped CSV")}</button>
@@ -11390,6 +11807,7 @@ function render(options = {}) {
           <span class="autosave-pill" data-dispatch-save-status>${localPlanDirty ? "Saving..." : t("dispatch.saved", "Saved")} ${lastSavedAt}</span>
         </div>
       </header>
+      ${trucks.some(truck => truck.loads?.some(isMbtPlanningLoad)) ? '<p class="mbt-shared-confirm-note">Confirm Plan confirms all Dispatch and BIN loads for this shared date.</p>' : ""}
       <div data-dispatch-route-notice>${renderDispatchRouteNotice()}</div>
       <div data-dispatch-truck-switch-attention>${renderDriverTruckSwitchAttentionPanel()}</div>
       <div class="dispatch-grid">
@@ -11407,6 +11825,7 @@ function render(options = {}) {
     </section>
   `;
   renderDispatchModalInPlace();
+  applyReadOnlyPlanningControls();
   const orderList = app.querySelector(".order-list");
   if (orderList) orderList.scrollTop = orderListScrollTop;
   const mapPreserved = restoreGoogleMapPreviewState(mapState);
@@ -11416,6 +11835,7 @@ function render(options = {}) {
 
 function orderPoolSubtitle() {
   if (activeOrderType === "BIN") {
+    if (globalThis.MbbsBinPlanning) return globalThis.MbbsBinPlanning.poolSubtitle();
     if (mbtBinDispatchLoading) return "Loading current BIN contract legs...";
     if (mbtBinDispatchError) return `BIN contract legs unavailable: ${mbtBinDispatchError}`;
     return "Current ready contract legs; later legs stay locked in the contract timeline.";
@@ -11439,8 +11859,8 @@ function renderOrderPool() {
           <p>${orderPoolSubtitle()}</p>
         </div>
         <div class="order-tools">
-          <input id="orderSearch" value="${escapeHtml(searchText)}" placeholder="Search SO, PO, TO, Custom, CO, SKU, address" />
-          <label class="date-filter">
+          <input id="orderSearch" aria-label="Search orders" value="${escapeHtml(searchText)}" placeholder="${globalThis.MbbsBinPlanning ? "Search BIN, customer, contract, address" : "Search SO, PO, TO, Custom, CO, SKU, address"}" />
+          <label class="date-filter" ${globalThis.MbbsBinPlanning ? "hidden" : ""}>
             <span>SO Date</span>
             <input id="dispatchDate" type="date" value="${escapeHtml(dispatchDateFilter)}" />
           </label>
@@ -11448,8 +11868,7 @@ function renderOrderPool() {
         <div data-dispatch-order-actions>${renderSelectedOrderActions()}</div>
       </div>
       <div class="order-type-tabs">
-        ${["SO", "PO", "TO", "CO"].map((type) => `<button class="${!searching && activeOrderType === type ? "active" : ""}" data-action="order-type-tab" data-type="${type}" type="button">${type}</button>`).join("")}
-        ${mbtBinDispatchEnabled ? `<button class="${!searching && activeOrderType === "BIN" ? "active" : ""}" data-action="order-type-tab" data-type="BIN" type="button">BIN</button>` : ""}
+        ${globalThis.MbbsBinPlanning ? globalThis.MbbsBinPlanning.tabs() : ["SO", "PO", "TO", "CO"].map((type) => `<button class="${!searching && activeOrderType === type ? "active" : ""}" data-action="order-type-tab" data-type="${type}" type="button">${type}</button>`).join("")}
       </div>
       <div class="order-list" ${activeOrderType === "BIN" ? 'role="region" aria-label="BIN contract legs"' : ""}>${renderOrderList()}</div>
     </section>
@@ -11457,7 +11876,7 @@ function renderOrderPool() {
 }
 
 function renderOrderList() {
-  if (activeOrderType === "BIN") return renderMbtBinFrontLegList();
+  if (activeOrderType === "BIN") return globalThis.MbbsBinPlanning?.orderList() ?? renderMbtBinFrontLegList();
   const listed = openOrders();
   const assignments = listed.length ? dispatchOrderAssignmentIndex() : null;
   const cards = listed.map(order => renderOrderCard(order, assignments)).join("") || `<div class="empty-drop">No open orders match the filter.</div>`;
@@ -11620,7 +12039,7 @@ async function manuallyCompleteSelectedOrder(order, button) {
 }
 
 function renderSelectedOrderActions() {
-  if (activeOrderType === "BIN") return "";
+  if (activeOrderType === "BIN") return globalThis.MbbsBinPlanning?.selectedActions() || "";
   const order = selectedOrder();
   if (!order) return "";
   const selected = selectedOrders();
@@ -11723,10 +12142,11 @@ function renderOrderCard(order, assignments = null) {
   return `
     <article class="order-card status-${executionStatus} ${selectedOrderIds.has(order.id) ? "selected" : ""} ${planned ? "planned" : ""} ${plannedElsewhere ? "planned-elsewhere" : ""} ${dependencyLinked && !dependencyParentPlanned ? "dependency-linked" : ""} ${dependencyParentPlanned ? "dependency-parent-planned" : ""} ${reviewOnly ? "review-only" : ""} ${planningRestricted ? "search-only" : ""} ${reconciliationBlocked || planningRestricted || missingAddress || transitBlocked || order.dependencyAttention ? "warning" : ""}" draggable="${dragBlocked ? "false" : "true"}" data-order="${escapeHtml(order.id)}" data-planned="${anyPlanned ? "true" : "false"}" data-dependency-linked="${dependencyLinked ? "true" : "false"}" data-review-only="${reviewOnly ? "true" : "false"}" data-reconciliation-blocked="${reconciliationBlocked ? "true" : "false"}" data-planning-restricted="${planningRestricted ? "true" : "false"}" data-planned-elsewhere="${plannedElsewhere ? "true" : "false"}">
       <strong>${escapeHtml(order.id)} | ${escapeHtml(order.customer)}</strong>
+      ${globalThis.MbbsBinPlanning?.cardActions(order) || ""}
       ${poReferenceText ? `<span class="order-compact-line po-source-reference">${escapeHtml(poReferenceText)}</span>` : ""}
       <span>${plannedElsewhere ? escapeHtml(orderPlannedElsewhereText(order)) : missingAddress ? "Missing delivery address" : transitBlocked ? escapeHtml(transitMessage) : escapeHtml(movementText(order))}</span>
       <span class="order-compact-line">Pickup ${escapeHtml(orderPickupText(order))} | ${dateText}${order.windowStart || "--"}-${order.windowEnd || "--"}</span>
-      <span class="order-compact-line">${orderUnitText(order)} | ${orderFootprintPallets(order)} pos | ${formatLbs(orderWeightLbs(order))}${packedText ? ` | Packed ${escapeHtml(packedText)}` : ""}</span>
+      <span class="order-compact-line">${order.type === "BIN" ? escapeHtml(`${order.mbt?.binTypeCode || "BIN"} · ${String(order.serviceAction || "").replaceAll("_", " ")}`) : `${orderUnitText(order)} | ${orderFootprintPallets(order)} pos | ${formatLbs(orderWeightLbs(order))}${packedText ? ` | Packed ${escapeHtml(packedText)}` : ""}`}</span>
       ${groupedCount ? `<span>Includes ${order.childOrders.join(", ")}</span>` : ""}
       ${isSalesOrderReattempt(order) ? `<span>Linked to original Sales Order ${escapeHtml(order.parentOrderRef || "")}; this transport child is excluded from duplicate billing.</span>` : ""}
       <div class="chip-row">
@@ -11735,7 +12155,7 @@ function renderOrderCard(order, assignments = null) {
         ${order.historicalReconciliationComplete ? `<span class="chip history-chip">Reconciliation history</span>` : ""}
         ${executionStatus === "complete" ? `<span class="chip complete-chip">Completed</span>` : executionStatus === "in_progress" ? `<span class="chip progress-chip">In progress</span>` : ""}
         ${reviewOnly ? `<span class="chip complete-chip">${escapeHtml(reviewOnlyText(order))}</span>` : ""}
-        ${planningRestricted ? `<span class="chip complete-chip" title="${escapeHtml(dispatchPlanningRestrictionText(order))}">Completed · search only</span>` : ""}
+        ${planningRestricted ? `<span class="chip ${dispatchCompleted ? "complete-chip" : "warn"}" title="${escapeHtml(dispatchPlanningRestrictionText(order))}">${dispatchCompleted ? "Completed · search only" : "Planning restricted"}</span>` : ""}
         ${fulfilledDeliveryPlanningEligible ? `<span class="chip complete-chip" title="NetSuite fulfillment is complete; Driver delivery is still pending.">Completed · delivery pending</span>` : ""}
         ${reconciliationPlanningEligible ? `<span class="chip warn" title="${escapeHtml(order.dispatchReconciliationPlanningReason || "Receipt reconciliation is complete, but Driver delivery is still pending.")}">Reconciled · dispatch pending</span>` : ""}
         ${reconciliationBlocked ? `<span class="chip warn" title="${escapeHtml(scmReconciliationBlockText(order))}">Reconcile Review</span>` : ""}
@@ -11819,7 +12239,7 @@ function loadTruckOptions(selectedTruckId = "", { includePrompt = false } = {}) 
   const selected = String(selectedTruckId || "");
   return [
     ...(includePrompt ? [`<option value="">${t("dispatch.selectTruck", "Select truck")}</option>`] : []),
-    ...trucks.map((truck) => `<option value="${escapeHtml(truck.id)}" ${String(truck.id) === selected ? "selected" : ""}>${escapeHtml(truck.plate)}</option>`)
+    ...trucks.filter(truck => String(truck.id) === selected || !globalThis.MbbsBinPlanning || globalThis.MbbsBinPlanning.compatibleTruck(truck)).map((truck) => `<option value="${escapeHtml(truck.id)}" ${String(truck.id) === selected ? "selected" : ""}>${escapeHtml(truck.plate)}</option>`)
   ].join("");
 }
 
@@ -11918,26 +12338,12 @@ function renderLoadAssignmentControls(parentTruck, load) {
   `;
 }
 
-function renderMbtAssignedStops(load) {
-  return (load?.stops || [])
-    .filter((stop) => stop?.mbt?.visitId)
-    .sort((left, right) => Number(left?.mbt?.stopSequence || left.sequence || 0) - Number(right?.mbt?.stopSequence || right.sequence || 0))
-    .map((stop) => {
-      const visitId = String(stop.mbt.visitId || "");
-      const binType = stop.mbt.capabilitySnapshot?.binTypeCode || "BIN";
-      const label = stop.displayName || mbtBinActionLabel(stop.actionCode, binType);
-      return `
-        <article class="stop-card compact mbt-bin-assigned-stop" draggable="false" data-mbt-stop-group="${escapeHtml(stop.mbt.stopGroupId || visitId)}" data-mbt-mandatory="${stop.mbt.mandatory === true}">
-          <strong>${escapeHtml(label)}</strong>
-        </article>
-      `;
-    }).join("");
-}
-
 function renderLoad(parentTruck, load) {
+  const readOnly = isPlanningLoadReadOnly(load);
+  const badge = readOnly ? '<span class="read-only-badge">Read only</span>' : "";
   const truck = effectiveTruckForLoad(parentTruck, load);
   const isLocked = loadHasDriverActivity(load);
-  const canDragLoad = isDispatchPlanEditor() && !isLocked;
+  const canDragLoad = isDispatchPlanEditor() && !isLocked && !readOnly;
   if (load.returnOnly) {
     const stats = loadStats(parentTruck, load);
     const returnRecord = driverRecordForReturn(parentTruck, load);
@@ -11945,13 +12351,13 @@ function renderLoad(parentTruck, load) {
     const executionStatus = String(returnForecast?.status || returnExecutionStatus(parentTruck, load));
     const finishText = loadFinishText(parentTruck, load, stats);
     return `
-      <section class="load-block return-only status-${executionStatus}" draggable="${canDragLoad}" data-driver-load-card="${escapeHtml(load.id)}">
+      <section class="load-block return-only status-${executionStatus} ${readOnly ? "planning-read-only" : ""}" draggable="${canDragLoad}" data-driver-load-card="${escapeHtml(load.id)}">
         <div class="load-header">
           <button class="load-title return-load-title" data-action="select-load" data-load="${escapeHtml(load.id)}" type="button">
             <strong>${load.manual ? "Manual Return" : "Return Load"}${load.endingTrip ? ` <span class="ending-trip-badge">Ending trip</span>` : ""}</strong>
             <span class="${finishText === "Route pending" ? "route-pending" : ""}">${loadFinishLabel(load, finishText)}</span>
           </button>
-          <div class="load-header-actions">
+          <div class="load-header-actions">${badge}
             <span class="load-drag-handle" draggable="${canDragLoad}" title="Drag this whole load to another driver" aria-label="Drag whole load">&#8942;&#8942;</span>
             <button class="load-insert-return" data-action="insert-driver-return" data-after-load="${escapeHtml(load.id)}" data-driver-login="${escapeHtml(loadDriverKey(parentTruck, load))}" title="Insert a return after this load" type="button">+R</button>
             <button class="load-delete" data-action="delete-load" data-load="${escapeHtml(load.id)}" ${isLocked ? "disabled" : ""} title="${isLocked ? escapeHtml(loadActivityLockNotice(load)) : "Delete return load"}" type="button">x</button>
@@ -11978,16 +12384,15 @@ function renderLoad(parentTruck, load) {
   const stats = loadStats(parentTruck, load);
   const active = selectedLoadId === load.id;
   const finishText = loadFinishText(parentTruck, load, stats);
-  const mbtAssignedStops = renderMbtAssignedStops(load);
   return `
-    <section class="load-block ${stats.warningCount ? "warning" : ""} ${active ? "selected" : ""} ${isLocked ? "driver-active" : ""}" draggable="${canDragLoad}" data-driver-load-card="${escapeHtml(load.id)}" data-load-card="${escapeHtml(load.id)}">
+    <section class="load-block ${readOnly ? "planning-read-only" : ""} ${stats.warningCount ? "warning" : ""} ${active ? "selected" : ""} ${isLocked ? "driver-active" : ""}" draggable="${canDragLoad}" data-driver-load-card="${escapeHtml(load.id)}" data-load-card="${escapeHtml(load.id)}">
       ${stats.warningCount ? `<span class="load-warning-badge">${stats.warningCount}</span>` : ""}
       <div class="load-header">
         <button class="load-title" data-action="select-load" data-load="${escapeHtml(load.id)}" type="button">
           <strong>${escapeHtml(load.name)}</strong>
           <span class="${finishText === "Route pending" ? "route-pending" : ""}">${loadFinishLabel(load, finishText)}</span>
         </button>
-        <div class="load-header-actions">
+        <div class="load-header-actions">${badge}
           <span class="load-drag-handle" draggable="${canDragLoad}" title="Drag this whole load to another driver" aria-label="Drag whole load">&#8942;&#8942;</span>
           <button class="load-insert-return" data-action="insert-driver-return" data-after-load="${escapeHtml(load.id)}" data-driver-login="${escapeHtml(loadDriverKey(parentTruck, load))}" title="Insert a return after this load" type="button">+R</button>
           <button class="load-delete" data-action="delete-load" data-load="${escapeHtml(load.id)}" ${isLocked ? "disabled" : ""} title="${isLocked ? escapeHtml(loadActivityLockNotice(load)) : "Delete load"}" type="button">x</button>
@@ -11997,8 +12402,7 @@ function renderLoad(parentTruck, load) {
       <div class="stop-list" data-load="${escapeHtml(load.id)}">
         ${stats.switchBefore ? "" : renderRestStop(parentTruck, load, stats)}
         ${renderStartTravelStop(parentTruck, load, stats.startTravel, stats.start)}
-        ${mbtAssignedStops}
-        ${renderCompactStopSequence(parentTruck, load, stats) || (mbtAssignedStops ? "" : `<div class="empty-drop">Drop order here</div>`)}
+        ${renderCompactStopSequence(parentTruck, load, stats) || `<div class="empty-drop">${readOnly ? "No assigned orders yet." : "Drop order here"}</div>`}
       </div>
     </section>
   `;
@@ -12010,12 +12414,13 @@ function renderTruckSwitchTransition(previousEntry, currentEntry) {
   const nextPlate = loadTruckPlate(currentEntry.truck, currentEntry.load);
   if (!previousPlate || !nextPlate || previousPlate === nextPlate) return "";
   const stats = loadStats(currentEntry.truck, currentEntry.load);
-  const disabled = isDispatchPlanEditor() && !loadHasDriverActivity(currentEntry.load) ? "" : "disabled";
+  const readOnly = isMbtPlanningLoad(currentEntry.load) !== Boolean(globalThis.MbbsBinPlanning);
+  const disabled = isDispatchPlanEditor() && !loadHasDriverActivity(currentEntry.load) && !readOnly ? "" : "disabled";
   return `
-    <section class="truck-switch-transition" data-truck-switch-for="${escapeHtml(currentEntry.load.id)}">
+    <section class="truck-switch-transition ${readOnly ? "planning-read-only" : ""}" data-truck-switch-for="${escapeHtml(currentEntry.load.id)}">
       <div class="truck-switch-transition-header">
         <div>
-          <strong>${t("dispatch.truckSwitchTransition", "Truck Switch")}</strong>
+          <strong>${t("dispatch.truckSwitchTransition", "Truck Switch")}${readOnly ? ' · Read only' : ''}</strong>
           <span>${escapeHtml(previousEntry.load.name || "Previous load")} &rarr; ${escapeHtml(currentEntry.load.name || "Next load")}</span>
         </div>
         <span class="truck-switch-plates">${escapeHtml(previousPlate)} &rarr; ${escapeHtml(nextPlate)}</span>
@@ -12161,7 +12566,7 @@ function renderStop(truck, load, stop, index, row) {
     <article class="stop-card compact status-${executionStatus} ${isPick ? "pick" : ""} ${selectedOrderId === order.id ? "selected-order-stop" : ""} ${showWarning ? "warning" : ""}" draggable="${isDispatchPlanEditor()}" data-load="${escapeHtml(stop.loadId)}" data-stop="${escapeHtml(stop.id)}" data-order="${escapeHtml(order.id)}" data-index="${index}">
       <button class="stop-remove" data-action="remove-stop" data-stop="${escapeHtml(stop.id)}" ${removalLocked ? "disabled" : ""} title="${removalLocked ? escapeHtml(stopActivityLockNotice(stop)) : "Remove stop"}" type="button">x</button>
       <div class="stop-main">
-        <strong>${index + 1}. ${escapeHtml(isPick ? `Pickup ${pickupVisitDisplayLabel(load, stop, order)}` : dropStopLabel(stop, order))}</strong>
+        <strong>${index + 1}. ${escapeHtml(stop.mbt ? `${stop.displayName} | ${order.id}` : isPick ? `Pickup ${pickupVisitDisplayLabel(load, stop, order)}` : dropStopLabel(stop, order))}</strong>
         <span>${escapeHtml(stopAddress(stop, order))}</span>
         ${isPick && canSplitPickupVisit(load, stop) ? `<button class="pickup-visit-split" data-action="open-pickup-visit-split" data-load="${escapeHtml(load.id)}" data-stop="${escapeHtml(stop.id)}" type="button">Split pickup visit</button>` : ""}
       </div>
@@ -12480,7 +12885,7 @@ function renderVisitStopTimeOverride(load, visit = {}) {
 function updatePhysicalVisitStopTimeOverride(loadId, stopId, value) {
   if (!ensureDispatchPlanEditor()) return false;
   const found = findLoad(loadId);
-  if (!found.load) return false;
+  if (!found.load || isPlanningLoadReadOnly(found.load)) return false;
   const stats = loadStats(found.truck, found.load);
   const visit = previewVisitContainingStop(found.load, stats, stopId);
   if (!visit) return false;
@@ -12600,6 +13005,7 @@ function renderLoadPreview() {
   if (!loadPreviewOpen) return "";
   const { truck: parentTruck, load } = selectedLoad();
   if (!parentTruck || !load) return "";
+  const readOnly = isPlanningLoadReadOnly(load);
   const truck = effectiveTruckForLoad(parentTruck, load);
   const stats = loadStats(parentTruck, load);
   const finishText = loadFinishText(parentTruck, load, stats);
@@ -12617,12 +13023,12 @@ function renderLoadPreview() {
     ? renderReturnPreviewStops(load, parentTruck, stats)
     : `${renderPreviewRestStop(parentTruck, load, stats)}${renderPreviewSwitchApproachTravelStop(parentTruck, load, stats, restOffset)}${renderPreviewTruckSwitchStop(parentTruck, load, stats, restOffset + handoffOffset)}${renderPreviewStartTravelStop(parentTruck, load, stats.startTravel, stats.start, restOffset + handoffOffset + switchOffset)}${renderPreviewStopSequence(parentTruck, load, stats, stopOffset)}`;
   return `
-    <aside class="load-preview-panel" style="width:${Math.min(Math.max(loadPreviewWidth, 390), Math.round(window.innerWidth * 0.92))}px">
+    <aside class="load-preview-panel ${readOnly ? "planning-read-only" : ""}" data-load="${escapeHtml(load.id)}" style="width:${Math.min(Math.max(loadPreviewWidth, 390), Math.round(window.innerWidth * 0.92))}px">
       <div class="load-preview-resize" title="Drag to resize"></div>
       <div class="load-preview-header">
         <div>
-          <h2>${escapeHtml(truck.plate)} | ${escapeHtml(load.name)}${load.endingTrip ? ` <span class="ending-trip-badge">Ending trip</span>` : ""}</h2>
-          <p>${load.returnOnly ? `Return to ${escapeHtml(load.returnYard || "12441")}` : `${formatLbs(stats.weightTotalLbs)}/${formatLbs(stats.capacityLbs)} | ${stats.footprintTotal} pallet positions | Pickup ${escapeHtml(pickupPoint)}`}</p>
+          <h2>${readOnly ? '<span class="read-only-badge">Read only</span> ' : ""}${escapeHtml(truck.plate)} | ${escapeHtml(load.name)}${load.endingTrip ? ` <span class="ending-trip-badge">Ending trip</span>` : ""}</h2>
+          <p>${load.returnOnly ? `Return to ${escapeHtml(load.returnYard || "12441")}` : `${isMbtPlanningLoad(load) ? `${new Set(load.stops.map(stop => stop.mbt?.visitId).filter(Boolean)).size} BIN visit(s) | ${Number(truck.binSlotCapacity || 0)} bin slot(s)` : `${formatLbs(stats.weightTotalLbs)}/${formatLbs(stats.capacityLbs)} | ${stats.footprintTotal} pallet positions`} | Pickup ${escapeHtml(pickupPoint)}`}</p>
         </div>
         <button data-action="close-load-preview" type="button">x</button>
       </div>
@@ -12631,7 +13037,7 @@ function renderLoadPreview() {
           <div class="preview-section-title">
             <strong>Stop Sequence</strong>
             <button class="sequence-toggle" data-action="toggle-sequence" type="button">${sequenceCollapsed ? "Expand" : "Collapse"}</button>
-            <span>Drag stops to reorder. Multiple pick/drop is allowed.</span>
+            <span>${readOnly ? "Read only" : isMbtPlanningLoad(load) ? "Drag visits to reorder. Required BIN steps stay together." : "Drag stops to reorder. Multiple pick/drop is allowed."}</span>
           </div>
           <div class="preview-stop-list ${sequenceCollapsed ? "collapsed" : ""}" data-load="${escapeHtml(load.id)}">
             ${sequenceHtml || `<div class="empty-drop">No assigned orders yet.</div>`}
@@ -12654,7 +13060,7 @@ function renderLoadPreview() {
             <div><span>${load.returnOnly ? "Return route" : "Drive buffer"}</span><strong>${durationText(stats.returnTrip)}</strong></div>
             <div><span>Weight</span><strong>${formatLbs(stats.weightTotalLbs)}</strong></div>
             <div><span>Capacity</span><strong>${formatLbs(stats.capacityLbs)}</strong></div>
-            <div><span>Pallet space</span><strong>${stats.footprintTotal} pos</strong></div>
+            <div><span>${isMbtPlanningLoad(load) ? "BIN slots" : "Pallet space"}</span><strong>${isMbtPlanningLoad(load) ? Number(truck.binSlotCapacity || 0) : `${stats.footprintTotal} pos`}</strong></div>
             <div><span>Status</span><strong>${stats.capacityWarning ? "Over capacity" : stats.fullLoad ? "Full load" : "Open"}</strong></div>
             ${load.returnOnly && load.manual ? `<label class="preview-ending-trip-control"><span>Ending trip</span><input data-ending-trip="${escapeHtml(load.id)}" type="checkbox" ${load.endingTrip ? "checked" : ""} ${isDispatchPlanEditor() && isFinalManualReturnForDriver(parentTruck, load) ? "" : "disabled"} /></label>` : ""}
           </div>
@@ -12680,10 +13086,9 @@ function renderLoadPreview() {
         <section class="preview-section">
           <div class="preview-section-title"><strong>Assigned Orders</strong></div>
           <div class="assigned-order-list">
-            ${[...new Set(load.stops.map((stop) => stop.orderId))].map((orderId) => {
-              const order = orderById(orderId);
+            ${assignedOrdersForLoad(load).map((order) => {
               if (!order) return "";
-              return `<div><strong>${escapeHtml(order.id)}</strong><span>${escapeHtml(order.customer)} | ${orderFootprintPallets(order)} pos | ${formatLbs(orderWeightLbs(order))}</span></div>`;
+              return `<div><strong>${escapeHtml(order.id)}</strong><span>${escapeHtml(order.customer)} | ${order.type === "BIN" ? escapeHtml(order.mbt?.binTypeCode || "BIN") : `${orderFootprintPallets(order)} pos | ${formatLbs(orderWeightLbs(order))}`}</span></div>`;
             }).join("") || `<div class="empty-drop">No assigned orders.</div>`}
           </div>
         </section>
@@ -12812,7 +13217,7 @@ function renderPreviewTruckSwitchStop(truck, load, stats, displayOffset = 0) {
 function renderPreviewStop(truck, load, stop, index, row, displayIndex = index) {
   const order = stopOrder(stop);
   if (!order) return "";
-  const label = stop.type === "pick" ? `${displayIndex + 1}. Pickup | ${pickupVisitDisplayLabel(load, stop, order)}` : `${displayIndex + 1}. Drop | ${dropStopLabel(stop, order)}`;
+  const label = stop.mbt ? `${displayIndex + 1}. ${stop.displayName} | ${order.id}` : stop.type === "pick" ? `${displayIndex + 1}. Pickup | ${pickupVisitDisplayLabel(load, stop, order)}` : `${displayIndex + 1}. Drop | ${dropStopLabel(stop, order)}`;
   const sub = stopAddress(stop, order);
   const executionStatus = stopExecutionStatus(truck, load, stop);
   const record = driverRecordForStop(truck, load, stop);
@@ -14211,7 +14616,7 @@ function addPoDropoffsToLoad(order, loadId, insertIndex = null) {
 function addOrderToLoad(orderId, loadId, type = "drop", location = "", insertIndex = null, stopDetails = {}) {
   const { truck, load } = findLoad(loadId);
   const order = orderById(orderId);
-  if (!load || !order) return false;
+  if (!load || !order || isPlanningLoadReadOnly(load)) return false;
   if (type === "drop" && isDispatchPlanningRestricted(order)) {
     selectedOrderId = orderId;
     selectedOrderIds = new Set([orderId]);
@@ -14393,7 +14798,7 @@ function findStop(stopId) {
 
 function deleteLoad(loadId) {
   const { truck, load } = findLoad(loadId);
-  if (!truck || !load) return;
+  if (!truck || !load || isPlanningLoadReadOnly(load)) return;
   if (loadHasDriverActivity(load)) {
     routeNotice = loadActivityLockNotice(load);
     return;
@@ -14651,12 +15056,14 @@ function groupedOrderDependencyStructureBlockMessage(groupItems = []) {
 }
 
 function dispatchGroupingRefs(order = {}) {
+  const coOrder = order.type === "CO" || /^CO-/iu.test(String(order.id || ""));
   return new Set([
     order.id,
     ...(order.childOrders || []),
     ...(order.groupAliases || []),
     ...(order.childOrderDetails || []).flatMap((child) => [child?.id, child?.originalOrderId])
-  ].map((value) => String(value || "")).filter(Boolean));
+  ].map((value) => String(value || "")).filter((ref) => ref
+    && (!coOrder || ref === String(order.id || "") || /^CO-/iu.test(ref))));
 }
 
 function prepareGroupedOrderPlanning(groupItems = []) {
@@ -14805,7 +15212,7 @@ function groupOrder(orderId) {
     routeNotice = blockReason;
     return false;
   }
-  const dependencyBlockedOrder = groupItems.find((item) => item.dependencyHidden);
+  const dependencyBlockedOrder = groupItems.find((item) => item.dependencyHidden || item.toRouteProjection);
   if (dependencyBlockedOrder) {
     selectedOrderId = dependencyBlockedOrder.id;
     selectedOrderIds = new Set([dependencyBlockedOrder.id]);
@@ -15618,6 +16025,7 @@ app.addEventListener("dragleave", (event) => {
 });
 
 app.addEventListener("drop", (event) => {
+  if (globalThis.MbbsBinPlanning?.drop(event)) return;
   const instructionZone = event.target.closest("[data-delivery-instruction-drop-zone]");
   if (instructionZone && window.DeliveryInstructionUpload?.isFileDrag(event)) {
     event.preventDefault();
@@ -15820,6 +16228,13 @@ app.addEventListener("focusin", (event) => {
     : selectorForElement(field) || "";
 });
 
+app.addEventListener("toggle", (event) => {
+  const details = event.target;
+  if (!details.matches?.("[data-executed-source-review]")) {return;}
+  if (details.open) {executedOrderReviewExpanded.add(details.dataset.reviewToken);}
+  else {executedOrderReviewExpanded.delete(details.dataset.reviewToken);}
+}, true);
+
 app.addEventListener("click", async (event) => {
   if (event.target.dataset?.action === "close-modal") {
     resetActiveLinkModalState();
@@ -15872,6 +16287,12 @@ app.addEventListener("click", async (event) => {
   if (!button) return;
   const action = button.dataset.action;
   if (!action) return;
+  if (action === "close-route-notice") {
+    routeNotice = "";
+    dismissExecutedOrderReviewHistory();
+    renderDispatchNoticePatch();
+    return;
+  }
   if (action === "refresh-google-route") {
     const found = findLoad(button.dataset.load || selectedLoadId);
     if (!found.load) return;
@@ -15978,6 +16399,10 @@ app.addEventListener("click", async (event) => {
       routeNotice = error.message;
       renderDispatchNoticePatch();
     });
+    return;
+  }
+  if (action === "confirm-executed-source-update") {
+    void confirmExecutedOrderReview(button.dataset.reviewToken);
     return;
   }
   if (action === "enter-edit-mode") {
@@ -16367,10 +16792,8 @@ app.addEventListener("click", async (event) => {
       if (Array.isArray(plan.followupWarnings) && plan.followupWarnings.length) {
         const warning = new Error(plan.followupWarnings.map((item) => `${item.step}: ${item.message}`).join("; "));
         reportDispatchSaveError("confirmed-with-followup-warning", warning, { followupWarnings: plan.followupWarnings });
-        routeNotice = `Plan ${displayDate(plan.planDate)} confirmed, but ${plan.followupWarnings.map((item) => item.label || item.step).join(", ")} needs attention. Details are in the browser console.`;
-      } else {
-        routeNotice = `Plan ${displayDate(plan.planDate)} confirmed.`;
       }
+      routeNotice = confirmedPlanNotice(plan);
       render({ save: false });
     }).catch((error) => {
       reportDispatchSaveError("confirm", error, { code: error.code || "" });
@@ -16771,7 +17194,6 @@ app.addEventListener("click", async (event) => {
     });
     return;
   }
-  if (action === "close-route-notice") routeNotice = "";
   const planMutationActions = new Set([
     "confirm-group",
     "confirm-consolidate",
@@ -17316,7 +17738,8 @@ app.addEventListener("change", (event) => {
 function showOrderTooltip(event) {
   const card = event.target.closest("[data-order]");
   if (!card) return;
-  const order = orderById(card.dataset.order);
+  const found = findStop(card.dataset.stop);
+  const order = orderById(card.dataset.order) || (found?.stop ? stopOrder(found.stop) : null);
   if (!order) return;
   const tooltip = document.getElementById("orderTooltip");
   tooltip.className = "tooltip";
@@ -17447,9 +17870,7 @@ function showLoadTooltip(event) {
   tooltip.className = "tooltip load-tooltip";
   tooltip.style.left = `${Math.min(event.clientX + 16, window.innerWidth - 330)}px`;
   tooltip.style.top = `${Math.min(event.clientY + 16, window.innerHeight - 220)}px`;
-  const assigned = [...new Set(load.stops.map((stop) => stop.orderId))]
-    .map(orderById)
-    .filter(Boolean)
+  const assigned = assignedOrdersForLoad(load)
     .map((order) => `<div><b>${escapeHtml(order.id)}</b><span>${orderFootprintPallets(order)} pos | ${formatLbs(orderWeightLbs(order))}</span></div>`)
     .join("");
   tooltip.innerHTML = `
@@ -17705,6 +18126,10 @@ app.addEventListener("submit", async (event) => {
     let order = orderById(modalOrderId);
     if (!order) return;
     const isPurchaseOrderDeliveryOverride = order.type === "PO" && order.sourceTable === "purchase_orders";
+    if (!String(data.address ?? "").trim() && !(isPurchaseOrderDeliveryOverride && String(order.defaultDestinationAddress || "").trim())) {
+      setEditFormStatus(form, `${order.id}: delivery address cannot be blank. Enter a valid address; the existing address has been kept.`, "error");
+      return;
+    }
     const windowStart = modalTimeValue(data.windowStart);
     const windowEnd = modalTimeValue(data.windowEnd);
     const validation = timeValidationMessage(windowStart, windowEnd);
@@ -17794,7 +18219,7 @@ app.addEventListener("submit", async (event) => {
         order.dispatchDetailsOverride = payload.updated.dispatch_details_override;
       }
       if (!isPurchaseOrderDeliveryOverride) {
-        const address = String(payload.updated?.dispatch_address ?? data.address ?? "").trim();
+        const address = String(payload.updated?.dispatch_address ?? "").trim() || String(data.address ?? "").trim() || String(order.address ?? "").trim();
         order.address = address;
         order.destinationAddress = address;
         order.defaultDestinationAddress = address;
@@ -17897,11 +18322,8 @@ async function initDispatch() {
   if (window.requestAnimationFrame) {
     window.requestAnimationFrame(() => window.requestAnimationFrame(loadBackground));
   } else {loadBackground();}
-  loadMbtBinDispatchCapability().then(async (enabled) => {
-    if (!enabled) return;
-    await loadMbtBinFrontLegs();
-    render({ save: false });
-  }).catch(() => null);
+  // The dedicated BIN page owns its feed and editing. Ordinary Dispatch does
+  // not wait for MBT capability discovery or a BIN pool request.
   scheduleDispatchForecastPolling();
   setInterval(pollServerPlan, 5000);
 }
@@ -17934,6 +18356,8 @@ window.addEventListener("pagehide", () => {
   // the server, while the explicit View Mode action releases immediately.
 });
 
+globalThis.MbbsBinPlanning?.install();
+
 requireDispatchLogin({
   mount: app,
   roles: SALES_PLANNING_HOST ? ["sales", "admin"] : ["dispatcher", "admin"],
@@ -17950,7 +18374,7 @@ async function dispatchDraftStorage(date = currentPlanDate) {
     return { journal: createDispatchDraftJournal(), owner };
   })();
   const { journal, owner } = await dispatchDraftStoragePromise;
-  return { journal, key: `${owner}:${dispatchSessionId}:${date}` };
+  return { journal, key: `${owner}:${dispatchSessionId}:${date}${globalThis.MbbsBinPlanning ? ":bin" : ""}` };
 }
 
 async function persistDispatchPendingRequest(payload = null) {

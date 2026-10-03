@@ -1,6 +1,8 @@
 import { query, withTransaction } from "./db.js";
+import { listScmSchedule } from "./dispatch-repository.js";
 import { scmManualSplitHasOperationalStatusAuthority } from "./scm-manual-split-authority.js";
 import { effectiveScmPurchaseOrderCatalogStatus } from "./scm-purchase-order-catalog-status.js";
+import { resolveScmScheduleRemark } from "./scm-schedule-remark.js";
 
 const DEFAULT_LIMIT = 200;
 const MAX_LIMIT = 200;
@@ -164,6 +166,7 @@ function searchText(order = {}, refs = linkedRefs(order)) {
   ].map(text).filter(Boolean))].join(" ").toLowerCase().slice(0, 100_000);
 }
 
+/** @param {any[]} orders @param {string} source */
 function catalogRows(orders = [], source = "") {
   const seen = new Set();
   const rows = [];
@@ -236,6 +239,7 @@ async function upsertRows(rows = []) {
   return { upserted: result.rowCount, orderRefs: result.rows.map((row) => row.order_ref) };
 }
 
+/** @param {{orders?:any[],source?:string}} options */
 export async function upsertScmPurchaseOrderCatalog({ orders = [], source = "" } = {}) {
   return withTransaction(async () => {
     const result = await upsertRows(catalogRows(orders, source));
@@ -370,6 +374,12 @@ async function currentScmPurchaseOrderStatusEvidence(orderRefs = []) {
      )
      SELECT requested.order_key,
             purchase.initial_scm_status AS source_initial_status,
+            purchase.netsuite_id AS source_po_id,
+            purchase.schedule_ref AS source_schedule_ref,
+            purchase.memo AS source_memo,
+            COALESCE(purchase.netsuite_note, purchase.dispatch_instructions) AS source_notes,
+            purchase.netsuite_note AS source_netsuite_note,
+            purchase.dispatch_instructions AS source_instructions,
             schedule.id AS schedule_id,
             schedule.status AS schedule_status,
             schedule.updated_at AS schedule_updated_at,
@@ -409,7 +419,9 @@ async function currentScmPurchaseOrderStatusEvidence(orderRefs = []) {
             completion.completion_evidence_type
        FROM requested
        LEFT JOIN LATERAL (
-         SELECT candidate.initial_scm_status
+         SELECT candidate.initial_scm_status, candidate.netsuite_id,
+                COALESCE(NULLIF(btrim(candidate.dispatch_ref), ''), candidate.tranid) AS schedule_ref,
+                candidate.memo, candidate.netsuite_note, candidate.dispatch_instructions
            FROM purchase_orders candidate
           WHERE upper(btrim(candidate.tranid)) = upper(requested.order_key)
              OR upper(btrim(COALESCE(candidate.dispatch_ref, ''))) = upper(requested.order_key)
@@ -526,6 +538,7 @@ async function currentScmPurchaseOrderSplitLocks(orders = []) {
 }
 
 async function applyCurrentScmPurchaseOrderStatuses(orders = []) {
+  if (!orders.length) return [];
   // linkedRefs also contains children, siblings, groups, and search aliases.
   // Those are useful for discovery but are not the same order identity and
   // therefore cannot supply mutable status or completion evidence.
@@ -534,8 +547,20 @@ async function applyCurrentScmPurchaseOrderStatuses(orders = []) {
     currentScmPurchaseOrderStatusEvidence(refsByOrder.flat()),
     currentScmPurchaseOrderSplitLocks(orders)
   ]);
+  const scheduleRefs = orders.map((order) => (
+    text(evidenceByRef.get(text(orderRef(order)).toLowerCase())?.source_schedule_ref) || orderRef(order)
+  ));
+  const scheduleRows = await listScmSchedule({
+    kind: "PO",
+    view: "blanket",
+    exactRefs: scheduleRefs,
+    statusProjectionOnly: true,
+    audience: "scm"
+  });
+  const scheduleByRef = new Map(scheduleRows.map((row) => [text(row.orderRef).toLowerCase(), row]));
   return orders.map((order, index) => {
     const exactRef = text(orderRef(order)).toLowerCase();
+    const currentSchedule = scheduleByRef.get(text(scheduleRefs[index]).toLowerCase());
     const exactScheduleEvidence = evidenceByRef.get(exactRef) || {};
     const candidates = refsByOrder[index]
       .map((ref) => evidenceByRef.get(text(ref).toLowerCase()))
@@ -574,17 +599,39 @@ async function applyCurrentScmPurchaseOrderStatuses(orders = []) {
         completion_evidence_type: completion.completion_evidence_type
       } : {})
     };
-    const status = effectiveScmPurchaseOrderCatalogStatus(order, evidence);
+    // Visible schedule identities use the same calculation as PO/TO Schedule.
+    // Linked-source fallback is only for catalog identities absent from that view.
+    const status = currentSchedule?.calculatedStatus || effectiveScmPurchaseOrderCatalogStatus(order, evidence);
     const hasExactSchedule = Boolean(exactScheduleEvidence.schedule_id);
+    const sourceNotes = exactScheduleEvidence.source_po_id
+      ? text(exactScheduleEvidence.source_notes)
+      : text(order.notes || order.instructions);
+    const sourceInstructions = exactScheduleEvidence.source_po_id
+      ? text(exactScheduleEvidence.source_instructions) : text(order.instructions);
+    const netSuiteNote = exactScheduleEvidence.source_po_id
+      ? exactScheduleEvidence.source_netsuite_note : order.netSuiteNote;
+    const sourceMemo = exactScheduleEvidence.source_po_id
+      ? text(exactScheduleEvidence.source_memo)
+      : text(order.scm?.netSuiteMemo || order.raw?.memo);
     const liveSplitLock = splitLocksByRef.get(exactRef);
     return {
       ...order,
+      notes: sourceNotes,
+      instructions: sourceInstructions,
+      netSuiteNote: netSuiteNote == null ? null : String(netSuiteNote),
       scmSplitLocked: order.isScmSplit === true && liveSplitLock !== undefined
         ? liveSplitLock
         : order.scmSplitLocked === true,
-      dispatchCompleted: Boolean(evidence.completion_event_id) || order.dispatchCompleted === true,
-      dispatchCompletionEvidenceType: text(evidence.completion_evidence_type)
-        || text(order.dispatchCompletionEvidenceType),
+      ...(currentSchedule ? {
+        dispatchPlanned: currentSchedule.dispatchPlanned,
+        readOnly: currentSchedule.dispatchPlanned,
+        dispatchCompleted: currentSchedule.dispatchCompleted,
+        dispatchCompletionEvidenceType: currentSchedule.dispatchCompletionEvidenceType
+      } : {
+        dispatchCompleted: Boolean(evidence.completion_event_id) || order.dispatchCompleted === true,
+        dispatchCompletionEvidenceType: text(evidence.completion_evidence_type)
+          || text(order.dispatchCompletionEvidenceType)
+      }),
       scm: {
         ...(order.scm || {}),
         ...(hasExactSchedule ? {
@@ -603,9 +650,23 @@ async function applyCurrentScmPurchaseOrderStatuses(orders = []) {
             || text(order.scm?.driver),
           notes: text(exactScheduleEvidence.schedule_notes)
             || text(exactScheduleEvidence.schedule_dispatch_assignment_note)
-            || assignmentScheduleNotes(order) || text(order.scm?.notes),
+            || assignmentScheduleNotes(order) || sourceNotes,
           remarkOverride: text(exactScheduleEvidence.schedule_remark_override)
         } : {}),
+        ...(currentSchedule ? {
+          etaDate: currentSchedule.etaDate,
+          etaTime: currentSchedule.etaTime,
+          driver: currentSchedule.driver,
+          notes: currentSchedule.notes
+        } : {}),
+        ...(!hasExactSchedule ? {notes:text(order.scm?.notes) || sourceNotes} : {}),
+        ...resolveScmScheduleRemark({
+          orderKind: "PO",
+          remarkOverride: hasExactSchedule
+            ? exactScheduleEvidence.schedule_remark_override
+            : order.scm?.remarkOverride,
+          netSuiteMemo: sourceMemo
+        }),
         status,
         scheduleId: hasExactSchedule ? Number(exactScheduleEvidence.schedule_id) : null,
         updatedAt: hasExactSchedule

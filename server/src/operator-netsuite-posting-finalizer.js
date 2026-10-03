@@ -27,7 +27,7 @@ export function publishOperatorNetSuitePostingCompletionEvents(command, operatio
     completionEventEmitter("delivery.order.loaded", { ...common, source: "customer-pickup", result });
     return;
   }
-  if (operation.kind === "receiving_receipt") {
+  if (["receiving_receipt", "direct_po_receipt"].includes(operation.kind)) {
     completionEventEmitter("receiving.order.received", {
       ...common,
       orderType: operation.orderType || null,
@@ -180,7 +180,9 @@ export function createOperatorNetSuitePostingFinalizer({
       response: { operatorNetSuitePosting: postingEvidence(command) },
       itemReceiptId: step?.netSuiteTransactionId ?? existingReceipt?.id ?? null,
       itemReceiptTranid: step?.netSuiteTransactionRef ?? existingReceipt?.ref ?? null,
-      allowNetSuiteCompleted: true
+      allowNetSuiteCompleted: true,
+      ...(operation.kind === 'direct_po_receipt'
+        ? {verifiedDirectCompletionEventId: command.inputSnapshot.directDeliveryEvidence.completionEventId} : {})
     });
     if (operation.orderType === "transfer_order") {
       await syncTransferDependencies(operation.orderId);
@@ -198,7 +200,18 @@ export function createOperatorNetSuitePostingFinalizer({
     },
     customer_pickup_load: customerPickupFinalization,
     delivery_prep_load: deliveryPrepFinalization,
-    receiving_receipt: receivingFinalization
+    receiving_receipt: receivingFinalization,
+    direct_po_receipt: async (/** @type {Record<string,any>} */ command, /** @type {Record<string,any>} */ operation, /** @type {string[]} */ photos) => {
+      // Whole local direct-PO delivery was verified before admission. Freeze its
+      // received progress only inside the verified command's finalization.
+      for (const line of command.inputSnapshot.lineReconciliation.lines) {
+        for (const local of line.localLines) {
+          await query(`UPDATE purchase_order_lines SET netsuite_received_qty=GREATEST(netsuite_received_qty,quantity)
+            WHERE id=$1 AND purchase_order_id=$2`,[local.localLineId,operation.orderId]);
+        }
+      }
+      return receivingFinalization(command,operation,photos);
+    }
   };
 
   return async function finalizeOperatorNetSuitePosting(/** @type {Record<string, any>} */ command) {

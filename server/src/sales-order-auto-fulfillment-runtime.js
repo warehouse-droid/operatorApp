@@ -1,6 +1,7 @@
 // @ts-check
 
 import { config } from "./config.js";
+import { directPoAutoReceiptTick } from './direct-po-auto-receipt.js';
 import { salesOrderAutoFulfillmentNetSuiteAdapter, fetchLiveSalesOrderAutoFulfillmentState } from "./sales-order-auto-fulfillment-netsuite-adapter.js";
 import {
   claimSalesOrderAutoFulfillmentCandidate,
@@ -62,6 +63,7 @@ export function enqueueSalesOrderAutoFulfillmentCandidate(candidateId) {
 
 export async function salesOrderAutoFulfillmentTick() {
   if (config.netsuite?.directAccessEnabled !== true) {return { disabled: true, discovered: 0 };}
+  await directPoAutoReceiptTick();
   const ids = await listRunnableSalesOrderAutoFulfillmentCandidateIds({ limit: 25 });
   await Promise.all(ids.map((/** @type {unknown} */ id) => enqueueSalesOrderAutoFulfillmentCandidate(id)));
   return { disabled: false, discovered: ids.length };

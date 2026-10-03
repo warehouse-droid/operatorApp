@@ -11,6 +11,8 @@ import {
   suiteqlAll
 } from "./netsuite.js";
 import { buildPalletReturnAuthorizationPayload, verifyReturnAuthorizationSnapshot } from "./return-ra-workflow.js";
+import { query } from "./db.js";
+import { mapStoredReturnSalesOrderLines } from "./return-stored-orderline.js";
 
 export const CONFIRMED_RETURN_REASONS = Object.freeze([
   { id: 5, code: "R1", label: "R1 - Color Variation", kind: "quality" },
@@ -204,12 +206,33 @@ export async function fetchReturnSalesOrderFromNetSuite(code, {
   return attachReturnSalesOrderRestLineMapping(order);
 }
 
-export async function attachReturnSalesOrderRestLineMapping(order) {
+function assertReturnLineMappingInput(order) {
   if (!order?.id || !Array.isArray(order.lines)) {
     throw Object.assign(new Error("A complete NetSuite Sales Order is required for REST line mapping."), {
       status: 400
     });
   }
+}
+
+function returnRestOrderLine(restItem, line) {
+  const orderLine = Number(restItem.orderLine ?? restItem.orderline ?? restItem.line ?? restItem.lineNumber);
+  if (!Number.isSafeInteger(orderLine) || orderLine <= 0) {
+    throw Object.assign(
+      new Error(`NetSuite REST orderLine is missing for ${line.itemName || line.itemId}.`),
+      { status: 409, code: "NETSUITE_ORDER_LINE_MISSING", sourceLineId: line.sourceLineId }
+    );
+  }
+  return orderLine;
+}
+
+export async function attachReturnSalesOrderRestLineMapping(order) {
+  assertReturnLineMappingInput(order);
+  const stored = await query(`SELECT sales_order_id, line_id, item_id, netsuite_order_line, netsuite_active
+    FROM sales_order_lines
+    WHERE sales_order_id = $1 AND netsuite_active = true AND line_id = ANY($2::bigint[])`,
+  [order.id, order.lines.map(line => line.sourceLineId)]);
+  const mapped = mapStoredReturnSalesOrderLines(order, stored.rows);
+  if (mapped) {return mapped;}
   const restItems = await fetchSalesOrderReturnLinesFromNetSuite(order.id);
   const unused = new Set(restItems.map((_, index) => index));
   for (const line of order.lines) {
@@ -238,15 +261,7 @@ export async function attachReturnSalesOrderRestLineMapping(order) {
       [matchedIndex] = candidates;
     }
     const restItem = restItems[matchedIndex];
-    const netSuiteOrderLine = Number(
-      restItem.orderLine ?? restItem.orderline ?? restItem.line ?? restItem.lineNumber
-    );
-    if (!Number.isSafeInteger(netSuiteOrderLine) || netSuiteOrderLine <= 0) {
-      throw Object.assign(
-        new Error(`NetSuite REST orderLine is missing for ${line.itemName || line.itemId}.`),
-        { status: 409, code: "NETSUITE_ORDER_LINE_MISSING", sourceLineId: line.sourceLineId }
-      );
-    }
+    const netSuiteOrderLine = returnRestOrderLine(restItem, line);
     unused.delete(matchedIndex);
     line.netSuiteOrderLine = netSuiteOrderLine;
     line.netSuiteOrderLineSnapshot = restItem;
@@ -849,7 +864,7 @@ export function buildReturnAuthorizationPayload(record) {
       item: { id: String(line.itemId) },
       quantity: Number(line.returnedSalesQuantity),
       rate,
-      ...(line.salesUomId ? { units: { id: String(line.salesUomId) } } : {}),
+      ...(line.salesUomId ? { units: String(line.salesUomId) } : {}),
       custcol_atlas_rc_so: { id: String(line.reasonId) }
     };
   });

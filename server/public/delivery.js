@@ -13,7 +13,7 @@ const app = document.getElementById("app");
 const toast = document.getElementById("toast");
 
 const TOKEN_KEY = "mbbs.delivery.token";
-let authToken = localStorage.getItem(TOKEN_KEY) || "";
+let authToken = localStorage.getItem("mbbs.staff.token") || localStorage.getItem(TOKEN_KEY) || "";
 let operator = null;
 
 let locationId = Number(localStorage.getItem("mbbs.delivery.locationId") || 0);
@@ -54,6 +54,7 @@ async function api(path, options = {}) {
     authToken = "";
     operator = null;
     localStorage.removeItem(TOKEN_KEY);
+    localStorage.removeItem("mbbs.staff.token");
     renderLogin("Login expired. Please login again.");
     throw new Error("Login required");
   }
@@ -367,29 +368,8 @@ function shell(title, subtitle, body, actions = "") {
   `;
 }
 
-function renderLogin(message = "") {
-  app.innerHTML = `
-    <section class="location-screen">
-      <form class="location-panel login-panel" data-form="login">
-        <p>MBBS Yard Operator Application</p>
-        <h1>Operator login</h1>
-        ${message ? `<div class="login-message">${message}</div>` : ""}
-        <div class="install-hint">
-          <strong>${installLabel()}</strong>
-          <span>${installPromptEvent ? "Tap Install app to open as a standalone tablet app." : "If this still opens like a browser, use Chrome or Edge on Android/Windows and install from a trusted HTTPS URL."}</span>
-        </div>
-        <label>
-          <span>Username</span>
-          <input id="loginUsername" autocomplete="username" required />
-        </label>
-        <label>
-          <span>Password</span>
-          <input id="loginPassword" type="password" autocomplete="current-password" required />
-        </label>
-        <button class="primary-button" type="submit">Login</button>
-      </form>
-    </section>
-  `;
+function renderLogin() {
+  window.location.replace('/login.html?next=' + encodeURIComponent(location.pathname + location.search + location.hash));
 }
 
 function renderLocationSelect() {
@@ -725,6 +705,7 @@ app.addEventListener("click", async (event) => {
       authToken = "";
       operator = null;
       localStorage.removeItem(TOKEN_KEY);
+    localStorage.removeItem("mbbs.staff.token");
       return renderLogin();
     }
     if (button.dataset.action === "save-location") {
@@ -820,28 +801,7 @@ app.addEventListener("click", async (event) => {
   }
 });
 
-app.addEventListener("submit", async (event) => {
-  const form = event.target.closest("[data-form='login']");
-  if (!form) return;
-  event.preventDefault();
-  try {
-    const result = await publicApi("/api/auth/login", {
-      method: "POST",
-      body: JSON.stringify({
-        username: document.getElementById("loginUsername").value,
-        password: document.getElementById("loginPassword").value
-      })
-    });
-    authToken = result.token;
-    operator = result.operator;
-    localStorage.setItem(TOKEN_KEY, authToken);
-    showToast(`Welcome ${operator.display_name}`);
-    if (locationId) await loadOrders();
-    else render();
-  } catch (error) {
-    renderLogin("Invalid username or password.");
-  }
-});
+
 
 async function boot() {
   if (!authToken) {

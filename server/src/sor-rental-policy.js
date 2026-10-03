@@ -24,6 +24,8 @@ export function rentalItemDecision(item = {}, policy = {}) {
 }
 
 export function projectSorOrder(order = {}, policies = new Map()) {
+  // A CO owns its route and cargo; source children describe the later delivery.
+  if (clean(order.type).toUpperCase() === 'CO' || /^CO-/iu.test(clean(order.id))) {return order;}
   if (Array.isArray(order.childOrderDetails) && order.childOrderDetails.length) {
     const children = order.childOrderDetails.map(child => projectSorOrder(child, policies));
     const byLine = new Map(children.flatMap(child => (child.items || []).filter(item=>item.lineRowId !== null && item.lineRowId !== undefined).map(item => [String(item.lineRowId), item])));

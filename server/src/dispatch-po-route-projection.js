@@ -112,17 +112,24 @@ function hasRouteQuantity(item = {}) {
 
 function residualItem(item = {}, allocations = []) {
   const matches = allocations.filter((allocation) => allocationMatchesItem(allocation, item));
+  const totalSales = number(item.quantity ?? item.salesQty ?? item.sales_qty);
+  const allocatedSales = matches.reduce((sum, allocation) => sum + allocatedQuantity(allocation, "salesQty"), 0);
+  // MBBS-Special links use Sales Qty. Their physical counts are display cargo,
+  // so reduce them by the same coverage used on the linked SO's pickup.
+  const specialCoverage = Number(item.itemId ?? item.item_id) === 2055 && totalSales > 0
+    ? Math.min(allocatedSales / totalSales, 1)
+    : 0;
   const residual = Object.fromEntries(QUANTITY_FIELDS.map((field) => [
     field,
     positiveDifference(
       item[field] ?? item[`${field.slice(0, -1)}_qty`],
-      matches.reduce((sum, allocation) => sum + allocatedQuantity(allocation, field), 0)
+      Math.max(
+        matches.reduce((sum, allocation) => sum + allocatedQuantity(allocation, field), 0),
+        number(item[field] ?? item[`${field.slice(0, -1)}_qty`]) * specialCoverage
+      )
     )
   ]));
-  residual.quantity = positiveDifference(
-    item.quantity ?? item.salesQty ?? item.sales_qty,
-    matches.reduce((sum, allocation) => sum + allocatedQuantity(allocation, "salesQty"), 0)
-  );
+  residual.quantity = positiveDifference(totalSales, allocatedSales);
   residual.salesQty = residual.quantity;
   return {
     ...item,
@@ -169,13 +176,17 @@ function routeDropoffs(order = {}, items = []) {
     const destinationLocationId = explicitDestinationLocationId
       ?? (explicitDestinationYard ? null : order.destinationLocationId ?? order.destination_location_id ?? null);
     const destinationYard = explicitDestinationYard || text(order.destinationYard ?? order.destination_yard);
+    const headerLocationId = text(order.destinationLocationId ?? order.destination_location_id);
+    const matchesHeaderDestination = headerLocationId && text(destinationLocationId)
+      ? headerLocationId === text(destinationLocationId)
+      : destinationYard.toLowerCase() === text(order.destinationYard ?? order.destination_yard).toLowerCase();
     const key = text(original.key) || destinationIdentity({ destinationLocationId, destinationYard });
     const group = groups.get(key) || {
       key,
       destinationLocationId,
       destinationYard,
       defaultAddress: text(original.defaultAddress ?? original.default_address ?? order.defaultDestinationAddress),
-      address: text(order.deliveryAddressOverride ?? order.delivery_address_override)
+      address: (matchesHeaderDestination ? text(order.deliveryAddressOverride ?? order.delivery_address_override) : "")
         || text(original.address ?? order.destinationAddress ?? order.destination_address ?? destinationYard),
       lineRowIds: [],
       pallets: 0,

@@ -32,14 +32,12 @@ function dispatchSpecialList() {
 
 function dispatchSpecialDetail() {
   const detail = dispatchSpecialState.selected;
-  if (!detail) return `<div class="stock-request-empty"><strong>Select a handoff</strong><span>Review exact order and route evidence before enabling Planning.</span></div>`;
+  if (!detail) return `<div class="stock-request-empty"><strong>Select a handoff</strong><span>Review the linked sales order, purchase order, and accepted materials.</span></div>`;
   const handoff = detail.handoff;
-  const ready = handoff?.status === "ready" && detail.stage === "dispatch_arrangement";
   return `<div class="stock-request-heading"><div><h2>${dispatchSpecialEscape(detail.requestRef)}</h2><p>${dispatchSpecialEscape(detail.salesOrderRef)} · ${dispatchSpecialEscape(detail.purchaseOrderRef)}</p></div><span class="stock-request-pill ${dispatchSpecialEscape(handoff.status)}">${dispatchSpecialEscape(detail.stageLabel)}</span></div>
     <div class="stock-request-summary"><span><small>Pickup</small><strong>${dispatchSpecialEscape(handoff.pickupAddress)}</strong></span><span><small>Destination</small><strong>${dispatchSpecialEscape(handoff.destinationAddress)}</strong></span><span><small>Fulfillment</small><strong>${dispatchSpecialEscape(detail.fulfillmentMethod.replaceAll("_", " "))}</strong></span><span><small>Operational yard</small><strong>${dispatchSpecialEscape(String(handoff.operationalYardLocationId))}</strong></span></div>
     <section class="stock-request-section"><h3>Exact accepted materials</h3><div class="stock-request-lines">${detail.lines.filter((line) => line.salesDecision === "accepted").map((line) => `<article class="stock-request-line"><strong>${dispatchSpecialEscape(line.itemResolution?.description || line.productName)}</strong><span>${dispatchSpecialEscape(line.itemResolution?.itemName)} · ${line.itemResolution?.salesQuantity} ${dispatchSpecialEscape(line.itemResolution?.salesUom)}</span></article>`).join("")}</div></section>
-    ${handoff.status === "waiting_route" && detail.stage === "dispatch_arrangement" ? `<div class="stock-request-notice">Choose the physical route. Until then, this page does not provide an active Planning link.</div><div class="stock-request-actions">${detail.fulfillmentMethod === "mbt_delivery" ? `<button class="primary" data-dispatch-special-action="route" data-route="direct" type="button">Direct vendor → customer</button>` : ""}<button class="primary" data-dispatch-special-action="route" data-route="via_yard" type="button">Via MBBS yard</button></div>` : ""}
-    ${ready ? `<div class="stock-request-notice">Route locked as <strong>${dispatchSpecialEscape(handoff.route.replaceAll("_", " "))}</strong>. The SO remains in the global order pool and can now be searched in Planning.</div><div class="stock-request-actions"><button class="primary" onclick="location.href='/dispatch/planning?search=${encodeURIComponent(detail.salesOrderRef)}'" type="button">Open ${dispatchSpecialEscape(detail.salesOrderRef)} in Planning</button></div>` : ""}`;
+    <div class="stock-request-notice">Plan the linked orders in Dispatch Planning. This notice clears when both the SO and PO are completed.</div>`;
 }
 
 function renderDispatchSpecial() {
@@ -87,15 +85,6 @@ dispatchSpecialStockApp.addEventListener("click", async (event) => {
       return renderDispatchSpecial();
     }
     if (button.dataset.dispatchSpecialAction === "refresh") return loadDispatchSpecial();
-    if (button.dataset.dispatchSpecialAction === "route") {
-      dispatchSpecialState.busy = true;
-      const detail = await dispatchSpecialApi(`/api/dispatch/special-stock-handoffs/${dispatchSpecialState.selected.id}/handoff-route`, {
-        method: "POST",
-        body: JSON.stringify({ expectedRevision: dispatchSpecialState.selected.revision, requestedRoute: button.dataset.route })
-      });
-      dispatchSpecialState.notice = `Route saved as ${detail.handoffRoute.replaceAll("_", " ")}.`;
-      await loadDispatchSpecial(detail.id);
-    }
   } catch (error) {
     dispatchSpecialState.error = error.message;
   } finally {

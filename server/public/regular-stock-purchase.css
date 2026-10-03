@@ -1,0 +1,23 @@
+.regular-purchase-orders {
+  display: block;
+  max-width: 100%;
+  overflow-x: auto;
+  margin-top: 16px;
+}
+.regular-purchase-orders table {
+  width: 100%;
+  min-width: 620px;
+  border-collapse: collapse;
+  font-size: 0.9rem;
+}
+.regular-purchase-orders th,
+.regular-purchase-orders td {
+  padding: 10px 8px;
+  text-align: left;
+  vertical-align: top;
+  border-bottom: 1px solid #d8e1e5;
+}
+.regular-purchase-orders:focus-visible {
+  outline: 2px solid #087c79;
+  outline-offset: 2px;
+}

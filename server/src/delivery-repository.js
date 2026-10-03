@@ -1106,6 +1106,16 @@ async function loadDispatchGroupChildOrders(groups = []) {
   ]));
 }
 
+/** @param {Array<{preparing_operator_id?: string|null, operator_status?: string, preparing_started_at?: string|null}>} childOrders */
+function groupPreparingFields(childOrders) {
+  const preparing = childOrders.find(order => order.preparing_operator_id && order.operator_status === "preparing")
+    || childOrders.find(order => order.preparing_operator_id && order.operator_status !== "packed");
+  return {
+    preparing_operator_id: preparing?.preparing_operator_id || null,
+    preparing_started_at: preparing?.preparing_started_at || null
+  };
+}
+
 function buildDispatchGroupDeliveryOrder(group, childOrders = []) {
   if (!childOrders.length) return null;
   const lines = aggregateGroupLines(group.id, childOrders).filter(hasDeliveryDisplayQuantity);
@@ -1131,6 +1141,7 @@ function buildDispatchGroupDeliveryOrder(group, childOrders = []) {
     reload_child_order_refs: reloadChildren.map((order) => order.tranid),
     reload_cycles: reloadChildren.map((order) => order.reload_cycle),
     customer: [...new Set(childOrders.map((order) => order.customer).filter(Boolean))].join(" + "),
+    ...groupPreparingFields(childOrders),
     operator_status: operatorStatus,
     local_yard_order_status: allLoaded ? "Loaded" : (hasOpen && (hasPacked || hasLoaded) ? "Partial Loaded" : "Open"),
     dispatch_planned: true,
@@ -1169,6 +1180,7 @@ function buildDispatchGroupDeliveryListOrder(group, orders = []) {
     reload_child_order_refs: reloadChildren.map((order) => order.tranid),
     reload_cycles: reloadChildren.map((order) => order.reload_cycle),
     customer: [...new Set(orders.map((order) => order.customer).filter(Boolean))].join(" + "),
+    ...groupPreparingFields(orders),
     operator_status: hasPreparing ? "preparing" : hasPacked ? "packed" : hasLoaded && hasOpen ? "partial_loaded" : "open",
     local_yard_order_status: allLoaded ? "Loaded" : (hasOpen && (hasPacked || hasLoaded) ? "Partial Loaded" : "Open"),
     dispatch_planned: true,
@@ -3572,7 +3584,7 @@ export async function getFulfillableDeliveryOrder(orderId) {
       + Math.max(positiveQuantity(line.packed_layer_qty) - positiveQuantity(line.fulfilled_layer_qty), 0)
       + Math.max(positiveQuantity(line.packed_section_qty) - positiveQuantity(line.fulfilled_section_qty), 0)
       + Math.max(positiveQuantity(line.packed_piece_qty) - positiveQuantity(line.fulfilled_piece_qty), 0);
-    return line.netsuite_active && !line.sync_exception && ["InvtPart", "NonInvtPart"].includes(line.item_type || "") && delta > 0;
+    return line.netsuite_active && !line.sync_exception && line.item_type === "InvtPart" && delta > 0;
   });
   if (!lines.length) throw new Error("No packed lines to fulfill.");
   return { ...order, fulfillableLines: lines };
@@ -3580,7 +3592,8 @@ export async function getFulfillableDeliveryOrder(orderId) {
 
 export function buildItemFulfillmentPayload(order, lines) {
   const isTransferOrder = order.order_type === "transfer_order";
-  const items = lines.map((line) => {
+  // Non-inventory resale rows remain visible locally but are not IF sublist rows.
+  const items = lines.filter((/** @type {Record<string, any>} */ line) => line.item_type === "InvtPart").map((line) => {
     const packedQuantity = fulfillmentLineQuantity(line);
     const item = {
       orderLine: Number(line.line_id),
@@ -3597,7 +3610,7 @@ export function buildItemFulfillmentPayload(order, lines) {
 
   const fulfilledLineIds = new Set(lines.map((line) => Number(line.line_id)));
   for (const line of order.lines || []) {
-    if (!line.netsuite_active || !["InvtPart", "NonInvtPart"].includes(line.item_type || "")) continue;
+    if (!line.netsuite_active || line.item_type !== "InvtPart") continue;
     if (fulfilledLineIds.has(Number(line.line_id))) continue;
     const item = {
       orderLine: Number(line.line_id),
@@ -3626,7 +3639,7 @@ function payloadItemReceive(item) {
   return item.itemReceive !== false && item.itemreceive !== false;
 }
 
-function fulfillmentLineQuantity(line) {
+export function fulfillmentLineQuantity(line) {
   const salesQuantity = Math.max(positiveQuantity(line.packed_piece_qty) - positiveQuantity(line.fulfilled_piece_qty), 0)
     || Math.max(positiveQuantity(line.packed_section_qty) - positiveQuantity(line.fulfilled_section_qty), 0)
     || Math.max(positiveQuantity(line.packed_layer_qty) - positiveQuantity(line.fulfilled_layer_qty), 0)
@@ -3689,6 +3702,7 @@ export async function recordDeliveryFulfillment(orderId, operatorId, { photoData
          )
      WHERE ${lineTarget.orderColumn} = $1
        AND line_id = ANY($2::bigint[])
+       AND item_type = 'InvtPart'
        ${lineTarget.extraWhere}`,
     [
       orderId,
@@ -3700,7 +3714,7 @@ export async function recordDeliveryFulfillment(orderId, operatorId, { photoData
   );
   const refreshedOrder = await getDeliveryOrder(orderId);
   const remainingLines = (order.lines || []).filter((line) => {
-    if (!line.netsuite_active || !["InvtPart", "NonInvtPart"].includes(line.item_type || "")) return false;
+    if (!line.netsuite_active || line.item_type !== "InvtPart") return false;
     const latest = (refreshedOrder.lines || []).find((item) => String(item.id) === String(line.id)) || line;
     return positiveQuantity(latest.pallet_qty) > positiveQuantity(latest.fulfilled_pallet_qty)
       || positiveQuantity(latest.layer_qty) > positiveQuantity(latest.fulfilled_layer_qty)
@@ -5498,7 +5512,22 @@ export async function getCurrentOperatorDeliveryDraft(operatorId, { locationId =
       LIMIT 1`,
     params
   );
-  return result.rows[0] || null;
+  const draft = result.rows[0];
+  if (!draft) return null;
+  const groups = await listDispatchDeliveryGroups({ orderType: draft.order_type });
+  const group = groups.find((/** @type {{id:string,childRefs:string[]}} */ candidate) => candidate.childRefs.includes(draft.tranid));
+  if (!group) return draft;
+  const order = await getDispatchGroupDeliveryOrder(group.id);
+  if (!order) return draft;
+  return {
+    ...draft,
+    netsuite_id: order.netsuite_id,
+    tranid: order.tranid,
+    dispatch_group_id: order.dispatch_group_id,
+    is_dispatch_group: true,
+    child_order_ids: order.child_order_ids,
+    draft_line_count: order.lines.filter(lineHasPackedQuantity).length
+  };
 }
 
 async function claimPreparingOrder(orderId, operatorId) {

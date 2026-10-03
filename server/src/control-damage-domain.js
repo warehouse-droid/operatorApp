@@ -1,5 +1,6 @@
 import {createHash} from 'node:crypto';
 import {inventoryError,inventoryId} from './inventory-workflow-domain.js';
+import {damageReceiptMemo} from './inventory-damage-posting-proof.js';
 
 function canonical(value) {
   if(Array.isArray(value)) {return value.map(canonical);}
@@ -61,29 +62,46 @@ export function planDamageAdjustment(record,input) {
   if(before.length-removed.length+added.length>1000) {throw inventoryError('An Inventory Transfer can contain at most 1,000 lines.');}
   const replace=removed.length>0;
   const items=replace?before.filter(row=>!removed.includes(Number(row.line))).map(row=>updated.find(value=>value.line===Number(row.line)) || {line:Number(row.line)}):updated;
-  return {requestId,note,revision,header:header(record),replace,removed,updated,added,
-    before:structuredClone(before),payload:{inventory:{items:[...items,...added]}}};
+  const receiptMemo=added.length?damageReceiptMemo(record.memo,requestId,'C'):null;
+  return {requestId,note,revision,header:header(record),replace,removed,updated,added,receiptMemo,
+    before:structuredClone(before),payload:{...(receiptMemo?{memo:receiptMemo}:{}),inventory:{items:[...items,...added]}}};
 }
-function comparable(line) {
+function comparable(line,ignoreDescription=false) {
   const ignored=new Set(['links','quantityAvailable','quantityOnHand','quantityOnHandToLocation','quantityAvailableToLocation']);
+  if(ignoreDescription) {ignored.add('description');}
   return canonical(Object.fromEntries(Object.entries(line).filter(([key])=>!ignored.has(key)).map(([key,value])=>[
     key,value && typeof value==='object' && !Array.isArray(value) && value.id!==undefined?{id:String(value.id)}:value
   ])));
 }
-function same(actual,expected) {return JSON.stringify(comparable(actual))===JSON.stringify(comparable(expected));}
-function matchesAddition(line,expected) {
+function same(actual,expected,ignoreDescription=false) {return JSON.stringify(comparable(actual,ignoreDescription))===JSON.stringify(comparable(expected,ignoreDescription));}
+function matchesAddition(line,expected,ignoreDescription=false) {
   return Number(line.item?.id)===Number(expected.item.id) && Math.abs(Number(line.adjustQtyBy)-expected.adjustQtyBy)<1e-6
-    && String(line.units)===expected.units && String(line.custcol_atlas_rc_so?.id)===expected.custcol_atlas_rc_so.id && line.description===expected.description;
+    && String(line.units)===expected.units && String(line.custcol_atlas_rc_so?.id)===expected.custcol_atlas_rc_so.id && (ignoreDescription || line.description===expected.description);
+}
+function receiptAdditionsApplied(current,plan) {
+  if(current.length!==plan.before.length-plan.removed.length+plan.added.length) {return false;}
+  const original=new Set(plan.before.map(line=>Number(line.line))),fresh=current.filter(line=>!original.has(Number(line.line)));
+  if(fresh.length!==plan.added.length) {return false;}
+  for(const expected of plan.added) {
+    const index=fresh.findIndex(line=>matchesAddition(line,expected,true)
+      && (!/^(?:DMG:|C:)|\[Damage report /.test(String(line.description || '')) || line.description===expected.description));
+    if(index<0) {return false;}
+    fresh.splice(index,1);
+  }
+  return fresh.length===0;
 }
 export function damageAdjustmentApplied(record,plan) {
-  if(JSON.stringify(canonical(header(record)))!==JSON.stringify(canonical(plan.header))) {return false;}
+  const receipted=Boolean(plan.receiptMemo && record.memo===plan.receiptMemo),actualHeader=header(record);
+  if(receipted) {actualHeader.memo=plan.header.memo;}
+  if(JSON.stringify(canonical(actualHeader))!==JSON.stringify(canonical(plan.header))) {return false;}
   const current=lines(record);
   if(plan.removed.some(key=>current.some(line=>Number(line.line)===key))) {return false;}
   for(const prior of plan.before.filter(line=>!plan.removed.includes(Number(line.line)))) {
     const actual=current.find(line=>Number(line.line)===Number(prior.line));
-    const expected={...prior,...plan.updated.find(line=>line.line===Number(prior.line))};
-    if(!actual || !same(actual,expected)) {return false;}
+    const update=plan.updated.find(line=>line.line===Number(prior.line)),expected={...prior,...update};
+    if(!actual || !same(actual,expected,Boolean(update))) {return false;}
   }
+  if(receipted) {return receiptAdditionsApplied(current,plan);}
   return plan.added.every(expected=>{
     const found=current.filter(line=>line.description===expected.description);
     return found.length===1 && matchesAddition(found[0],expected);

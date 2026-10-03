@@ -181,7 +181,7 @@ function smartProposalRoute(proposal) {
 function smartProposalEditable(proposal) {
   const hasReference = proposal.netsuitePurchaseOrderId || proposal.netsuitePurchaseOrderRef
     || proposal.netsuiteTransferOrderId || proposal.netsuiteTransferOrderRef;
-  return smartCanWrite() && !hasReference && ["draft", "held", "reviewed", "attention"].includes(proposal.status);
+  return smartCanWrite() && !proposal.regularReplenishmentId && !hasReference && ["draft", "held", "reviewed", "attention"].includes(proposal.status);
 }
 
 const smartProposalYards = [
@@ -556,7 +556,7 @@ smartFilteredProposals = function smartFilteredProposalsV2() {
   const secondary = smartState.planSort === "source"
     ? (proposal) => smartProposalStops(proposal).map((stop) => stop.name).join("|")
     : (proposal) => proposal.sourceName || proposal.vendor || "";
-  return proposals.sort((left, right) => smartProposalManualPriority(left) - smartProposalManualPriority(right)
+  return proposals.sort((left, right) => Number(Boolean(right.regularReplenishmentId))-Number(Boolean(left.regularReplenishmentId)) || smartProposalManualPriority(left) - smartProposalManualPriority(right)
     || smartUrgencyRank(smartProposalUrgencyLevel(right)) - smartUrgencyRank(smartProposalUrgencyLevel(left))
     || smartProposalDestinationPriority(left) - smartProposalDestinationPriority(right)
     || smartProposalUrgencyScore(right) - smartProposalUrgencyScore(left)
@@ -633,7 +633,7 @@ smartProposalCard = function smartProposalCardV2(proposal) {
     ? (proposal.netsuitePurchaseOrderId || proposal.netsuitePurchaseOrderRef)
     : (proposal.netsuiteTransferOrderId || proposal.netsuiteTransferOrderRef));
   const locked = hasExecutionReference || ["confirmed", "executing", "completed", "superseded", "cancelled"].includes(proposal.status);
-  const editable = smartProposalEditable(proposal);
+  const editable = !proposal.regularReplenishmentId && smartProposalEditable(proposal);
   const canConfirm = !hasExecutionReference && !isPo && ["draft", "reviewed", "executing", "failed", "attention"].includes(proposal.status);
   const confirmTransferLabel = ["executing", "failed", "attention"].includes(proposal.status)
     ? "Retry TO + print"
@@ -662,7 +662,8 @@ smartProposalCard = function smartProposalCardV2(proposal) {
       <div class="smart-proposal-metric"><strong>${executionRef ? smartEscape(executionRef) : "—"}</strong><span>${isPo ? "PO load ref" : "NetSuite TO"}</span></div>
       <div class="smart-actions">${recalculatePo}${actions}${smartCanWrite() && canConfirm ? `<button class="smart-button primary" data-smart-action="confirm-transfer" data-proposal-id="${proposal.id}" type="button">${confirmTransferLabel}</button>` : ""}${smartCanWrite() && !isPo && hasExecutionReference && proposal.status === "attention" ? `<button class="smart-button warn" data-smart-action="retry-picking-ticket" data-proposal-id="${proposal.id}" type="button">Retry picking ticket</button>` : ""}</div>
     </div>
-    <div class="smart-proposal-lines smart-table-wrap${smartProposalDetailClassName()}"><table class="smart-table"><thead><tr><th>Item</th><th>Destination</th><th class="numeric">Required</th><th>Proposed</th><th class="numeric">${smartState.planCompact ? "Sales qty" : "Sales quantity"}</th><th class="numeric">${smartState.planCompact ? "Weight" : "Line weight"}</th><th data-smart-plan-column="availability">Availability</th><th data-smart-plan-column="inventory"${!smartState.planCompact && smartState.planShowInventory ? "" : " hidden"}>Inventory calculation</th><th data-smart-plan-column="decision-evidence"${!smartState.planCompact && smartState.planShowDecisionEvidence ? "" : " hidden"}>Decision evidence</th></tr></thead><tbody>${proposal.lines.map((line) => smartProposalLineRow(proposal, line, editable)).join("")}${(proposal.physicalPalletLines || []).map((line) => smartPhysicalPalletLineRow(proposal, line, editable)).join("")}</tbody></table></div>
+    <div class="smart-proposal-lines smart-table-wrap${smartProposalDetailClassName()}"><table class="smart-table"><thead><tr><th>Item</th><th>Destination</th><th class="numeric">Required</th><th>Proposed</th><th class="numeric">${smartState.planCompact ? "Sales qty" : "Sales quantity"}</th><th class="numeric">${smartState.planCompact ? "Weight" : "Line weight"}</th><th data-smart-plan-column="availability">Availability</th><th data-smart-plan-column="inventory"${!smartState.planCompact && smartState.planShowInventory ? "" : " hidden"}>Inventory calculation</th><th data-smart-plan-column="decision-evidence"${!smartState.planCompact && smartState.planShowDecisionEvidence ? "" : " hidden"}>Decision evidence</th></tr></thead><tbody data-smart-line-order-proposal="${proposal.id}">${smartLineOrderRows(proposal, (line) => smartProposalLineRow(proposal, line, editable), (line) => smartPhysicalPalletLineRow(proposal, line, editable), smartLineOrderEditable(proposal))}</tbody></table></div>
+    ${smartLineOrderHelp(smartLineOrderEditable(proposal))}
     ${smartProposalLineEditor(proposal)}
   </article>`;
 };
@@ -755,8 +756,9 @@ smartPlans = function smartPlansV2() {
     ${smartUrgencyLegend()}
     </div>
     ${exclusionPanel}
+    ${smartRegularReplenishments(plan)}
     ${smartManualLoadPanel(plan)}
-    ${plan ? `<div class="smart-proposals">${proposals.map(smartProposalCard).join("") || `<div class="smart-empty">No proposal matches this filter.</div>`}</div>` : `<div class="smart-empty">No planning run exists. Configure Item Master, upload sales history, then build a plan; live NetSuite inventory is refreshed automatically.</div>`}
+    ${plan ? `<div class="smart-proposals">${proposals.map(proposal=>`${proposal.regularReplenishmentId?`<div class="regular-priority-banner">${window.RegularStockUI.t("Priority · stock request replenishment","优先 · 库存申请补货")}</div>`:""}${proposal.purchaseRequests?.length?`<div class="regular-priority-banner">${window.RegularStockUI.t("Stocking Purchase","备货采购")} · ${proposal.purchaseRequests.map(row=>smartEscape(row.requestRef)).join(" · ")}</div>`:""}${smartProposalCard(proposal)}`).join("") || `<div class="smart-empty">No proposal matches this filter.</div>`}</div>` : `<div class="smart-empty">No planning run exists. Configure Item Master, upload sales history, then build a plan; live NetSuite inventory is refreshed automatically.</div>`}
   </section>`;
 };
 
@@ -927,7 +929,8 @@ smartScmApp.addEventListener("click", async (event) => {
     } else if (action === "group-proposals") {
       const proposalIds = [...smartState.selectedProposalIds];
       if (proposalIds.length < 2) throw new Error("Select at least two compatible loads.");
-      if (!confirm(`Group ${proposalIds.length} selected loads into one truck? Quantities above capacity will be reduced proportionally to whole pallets and shown as deferred.`)) return;
+      const purchaseLinked=smartState.plan?.proposals.some(proposal=>proposalIds.includes(proposal.id)&&proposal.purchaseRequests?.length);
+      if (!confirm(purchaseLinked?`Group ${proposalIds.length} selected loads? Purchase quantities and request links will be preserved across capacity-safe loads.`:`Group ${proposalIds.length} selected loads into one truck? Quantities above capacity will be reduced proportionally to whole pallets and shown as deferred.`)) return;
       smartState.plan = await smartWork("Grouping selected loads", () => smartApi("/api/scm/smart/proposals/group", { method: "POST", body: { proposalIds } }), "Loads grouped and capacity reallocated");
       smartState.selectedProposalIds.clear();
       smartRender();
@@ -1012,4 +1015,18 @@ smartScmApp.addEventListener("click", async (event) => {
     smartState.error = error.message;
     smartRender();
   }
+});
+
+function smartRegularReplenishments(plan){
+  const groups=plan?.regularReplenishments||[];
+  if(!groups.length)return '';
+  const t=window.RegularStockUI.t;
+  return `<section class="smart-section regular-priority-loads"><h3>${t('Priority · stock request replenishment','优先 · 库存申请补货')}</h3><p>${t('These loads carry into every proposal run, including paused items, until SCM explicitly releases them. Release ends priority carry only; existing POs remain unchanged.','这些补货需求将保留至每次计划中（包括暂停的商品），直到 SCM 明确释放。释放仅结束优先保留，不更改已有采购订单。')}</p>${groups.map(group=>`<article class="smart-section-body regular-priority-card"><strong>${smartEscape(group.itemName)} · ${smartEscape(({1:'3445',28:'2967',26:'150',15:'12441'})[group.sourceLocationId]||group.sourceLocationId)}</strong><p>${smartNumber(group.quantity)} ${smartEscape(group.unit)} · ${smartEscape(group.purchaseOrderRefs?.join(', ')||group.purchaseOrderRef||group.proposalStatus||t('Covered · no new PO needed','库存已覆盖 · 无须新采购单'))}</p><p>${group.requests.map(request=>`${smartEscape(request.requestRef)} / ${smartEscape(request.salesOrderRef||'—')}`).join(' · ')}</p>${group.evidence.error?`<p class="smart-error">${smartEscape(group.evidence.error)}</p>`:''}${smartCanWrite()?`<button class="smart-button" data-regular-release="${group.id}" data-revision="${group.revision}" type="button">${t('Release','释放')}</button>`:''}</article>`).join('')}</section>`;
+}
+smartScmApp.addEventListener('click',async event=>{
+  const button=event.target.closest('[data-regular-release]');
+  if(!button||!smartCanWrite())return;
+  button.disabled=true;
+  try{await smartWork('Releasing priority replenishment',()=>smartApi(`/api/scm/smart/regular-replenishments/${button.dataset.regularRelease}/release`,{method:'POST',body:{expectedRevision:Number(button.dataset.revision)}}),'Released');if(smartState.plan)smartState.plan=await smartApi(`/api/scm/smart/planning-runs/${smartState.plan.id}`);await smartLoadBootstrap({quiet:true});}
+  catch{button.disabled=false;}
 });

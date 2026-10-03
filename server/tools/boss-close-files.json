@@ -1,0 +1,8 @@
+[
+  "src/boss-approval-netsuite.js",
+  "src/boss-approval-service.js",
+  "src/boss-approval-repository.js",
+  "src/boss-approval-mail.js",
+  "public/boss.js",
+  "public/boss.html"
+]

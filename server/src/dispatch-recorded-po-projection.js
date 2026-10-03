@@ -18,17 +18,22 @@ function startedPhysicalOrderRefs(recordedPlan, activity) {
   return refs;
 }
 
-/** Freeze derived PO route data from published evidence, never from a client payload. */
+/** Freeze derived transport cargo from published evidence, never from a client payload. */
 export function freezeRecordedPurchaseOrderProjections({ recordedPlan = {}, projectedOrders = [], activity = [] } = {}) {
   const startedRefs = startedPhysicalOrderRefs(recordedPlan, activity);
   const recordedByRef = new Map((recordedPlan.orders || [])
-    .filter(order => key(order.type) === "po" && startedRefs.has(key(order.id)))
+    .filter(order => ["po", "to"].includes(key(order.type)) && startedRefs.has(key(order.id)))
     .map(order => [key(order.id), order]));
   const preservedPoOrderRefs = new Set(recordedByRef.keys());
   const orders = projectedOrders.map(order => {
     const recorded = recordedByRef.get(key(order.id));
     if (!recorded) return order;
     const frozen = { ...order };
+    if (key(order.type) === "to") {
+      delete frozen.toRouteProjection;
+      if (recorded.toRouteProjection !== undefined) {frozen.toRouteProjection = structuredClone(recorded.toRouteProjection);}
+      return frozen;
+    }
     const published = recorded.poRouteProjection ?? recorded.po_route_projection;
     delete frozen.poRouteProjection;
     delete frozen.po_route_projection;

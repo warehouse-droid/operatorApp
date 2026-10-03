@@ -62,7 +62,8 @@ async function validateItems(plan,locationId,remote) {
 async function blocked(monthId,id,{pending=false}={}) {
   const result=await query(`SELECT id FROM inventory_damage_adjustments WHERE month_id=$1 AND id<>$2
     AND (status='posting' OR (status='attention' AND safe_to_retry=false) OR ($3::boolean AND status='pending'))
-    UNION ALL SELECT id FROM inventory_damage_reports WHERE month_id=$1 AND (status='posting' OR (status='attention' AND safe_to_retry=false)) LIMIT 1`,[monthId,id,pending]);
+    UNION ALL SELECT id FROM inventory_damage_reports r WHERE month_id=$1 AND (status='posting' OR (status='attention' AND safe_to_retry=false))
+    AND NOT EXISTS(SELECT 1 FROM inventory_damage_events e WHERE e.report_id=r.id AND e.action='superseded') LIMIT 1`,[monthId,id,pending]);
   if(result.rowCount) {throw inventoryError('Another change for this month is still posting or needs reconciliation.',409);}
 }
 function replay(existing,hash) {

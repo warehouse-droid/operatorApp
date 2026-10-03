@@ -1,5 +1,6 @@
 import { describePurchaseOrderLinePallets } from "./scm-netsuite-po-unit-conversion.js";
 import { overlaySmartScmVendorPoFinancials } from "./smart-scm-vendor-po-financials.js";
+import { smartScmLineKey, smartScmNetSuiteLineSequence } from "./smart-scm-line-order.js";
 
 function optionalNumber(value) {
   if (value === null || value === undefined || value === "") return null;
@@ -58,7 +59,9 @@ export function projectSmartScmCreatedPo(proposal, current) {
   });
   const evidence = new Map(evidenceLines.filter((line) => line.netsuitePurchaseOrderLineId)
     .map((line) => [line.netsuitePurchaseOrderLineId, line]));
-  const allLines = (current.lines || []).filter((line) => line.netsuite_active !== false).map((row) => {
+  const allLines = (current.lines || []).filter((line) => line.netsuite_active !== false)
+    .slice().sort((left, right) => (smartScmNetSuiteLineSequence(left) ?? Infinity)
+      - (smartScmNetSuiteLineSequence(right) ?? Infinity)).map((row) => {
     const line = currentLine(row);
     const confirmed = evidence.get(line.netsuitePurchaseOrderLineId);
     return {
@@ -77,6 +80,7 @@ export function projectSmartScmCreatedPo(proposal, current) {
     ...proposal,
     lines,
     physicalPalletLines,
+    lineOrder: allLines.map(smartScmLineKey),
     currentPurchaseOrder: true,
     purchaseOrderHistoryId: optionalNumber(header.history_id),
     purchaseOrderSyncedAt: header.last_synced_at || header.synced_at || null,

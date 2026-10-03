@@ -157,7 +157,7 @@ const consolidationLoadState = {
   datePreset: ["today", "tomorrow", "both", "custom"].includes(initialOperatorState.consolidationLoadDatePreset)
     ? initialOperatorState.consolidationLoadDatePreset : initialOperatorState.consolidationLoadDate ? "custom" : "both",
   page: Number.isInteger(initialOperatorState.consolidationLoadPage) ? Math.max(0, initialOperatorState.consolidationLoadPage) : 0,
-  batchId: initialOperatorState.consolidationLoadBatchId || "", batch: null, busy: false, error: "", photoRefs: [], uploads: new Map(), request: 0, poll: null
+  batchId: initialOperatorState.consolidationLoadBatchId || "", batch: null, busy: false, error: "", photoRefs: /** @type {string[]} */ ([]), uploads: new Map(), request: 0, poll: null
 };
 let pickupLookupBusy = false;
 let compactLineMode = localStorage.getItem("mbbs.operator.compactLineList") === "true";
@@ -176,6 +176,7 @@ let urgentDeliveryAlert = null;
 let operatorRequests = [];
 let activeDeliveryDraft = null;
 let selectedId = initialOperatorState.selectedId || null;
+/** @type {Record<string, any> | null} */
 let selectedOrder = null;
 let selectedLineId = initialOperatorState.selectedLineId || null;
 let orderPage = Number(initialOperatorState.orderPage || 0);
@@ -184,7 +185,9 @@ let pageConfirming = false;
 let pickupConfirming = false;
 let installPromptEvent = null;
 let appInstalled = window.matchMedia("(display-mode: standalone)").matches || window.navigator.standalone === true;
+/** @type {Record<string, any> | null} */
 let fulfillmentOrder = null;
+/** @type {string[]} */
 let fulfillmentPhotoDataUrls = [];
 let fulfillmentActivePhotoSlot = 0;
 let fulfillmentSubmitting = false;
@@ -194,6 +197,7 @@ let fulfillmentCameraActive = false;
 let fulfillmentStatusText = "";
 let fulfillmentJobStage = "";
 let fulfillmentStartedAt = 0;
+/** @type {number | null} */
 let fulfillmentProgressTimer = null;
 let fulfillmentValidation = null;
 let fulfillmentReturnModule = "delivery";
@@ -331,6 +335,7 @@ let receivingDetailRequest = 0;
 let receivingSuggestionsRequest = 0;
 /** @type {Record<string, any> | null} */
 let receiptOrder = null;
+/** @type {string[]} */
 let receiptPhotoDataUrls = [];
 let receiptActivePhotoSlot = 0;
 let receiptSubmitting = false;
@@ -373,10 +378,11 @@ let pickupFocusTimer = null;
 const OPERATOR_CAMERA_IDEAL_WIDTH = 4096;
 const OPERATOR_CAMERA_IDEAL_HEIGHT = 3072;
 const OPERATOR_CAMERA_JPEG_QUALITY = 0.92;
-const operatorPhotoCamera = { key: "", opening: "", request: 0 };
+const operatorPhotoCamera = { key: "", opening: "", request: 0, pending: /** @type {MediaStream|null} */ (null) };
+let nativeCameraInput = /** @type {HTMLInputElement|null} */ (null);
 
-function operatorPhotoCameraContext() {
-  if (!operator || operatorWorkspaceLeaving) return null;
+function operatorPhotoCameraContext(includeHidden = false) {
+  if (!operator || operatorWorkspaceLeaving || (!includeHidden && document.visibilityState === "hidden")) return null;
   if (["delivery-fulfill", "customer-pickup-load", "delivery-consolidation-load-proof"].includes(currentModule)
       && fulfillmentOrder && !fulfillmentSubmitting && !fulfillmentResult
       && app.querySelector('[data-action="start-camera"], #fulfillmentCamera')) {
@@ -397,6 +403,8 @@ function operatorPhotoCameraContext() {
 function cancelOperatorPhotoCameraOpening(kind) {
   if (operatorPhotoCamera.opening !== kind) return;
   operatorPhotoCamera.request += 1;
+  operatorPhotoCamera.pending?.getTracks().forEach((track) => track.stop());
+  operatorPhotoCamera.pending = null;
   operatorPhotoCamera.opening = "";
 }
 
@@ -411,12 +419,13 @@ function syncOperatorPhotoCamera() {
   if (operatorPhotoCamera.key === (context?.key || "")) return;
   stopOperatorPhotoCameras();
   operatorPhotoCamera.key = context?.key || "";
-  if (context?.automatic) void startOperatorPhotoCamera(context.kind);
+  if (context?.automatic && !useBasicCameraCapture()) void startOperatorPhotoCamera(context.kind);
 }
 
 async function startOperatorPhotoCamera(kind) {
   const context = operatorPhotoCameraContext();
-  if (context?.kind !== kind || operatorPhotoCamera.opening === kind) return;
+  if (!context || context.kind !== kind || operatorPhotoCamera.opening === kind) return;
+  if (useBasicCameraCapture()) return captureNativeOperatorPhoto(context);
   if (!navigator.mediaDevices?.getUserMedia) return showToast(t("operator.cameraUnavailable", "Camera is not available in this browser."));
   if (kind === "fulfillment") stopFulfillmentCamera();
   else if (kind === "receipt") stopReceiptCamera();
@@ -459,7 +468,81 @@ function selectRearCamera() {
   localStorage.setItem(CAMERA_FACING_KEY, cameraFacingMode);
 }
 
+function useBasicCameraCapture() {
+  const agent = /** @type {Navigator & {userAgentData?: {platform?: string}}} */ (navigator);
+  // Chrome desktop mode identifies Android tablets as Linux, including client hints.
+  return /Android/i.test(agent.userAgent) || agent.userAgentData?.platform === "Android"
+    || (agent.maxTouchPoints > 0 && (/Linux/i.test(agent.userAgent) || agent.userAgentData?.platform === "Linux"));
+}
+
+/** @returns {Promise<string|null>} */
+function captureNativeCameraPhoto(facing = cameraCaptureMode()) {
+  if (nativeCameraInput) return Promise.resolve(null);
+  return new Promise((resolve, reject) => {
+    const input = document.createElement("input");
+    input.type = "file";
+    input.accept = "image/*";
+    input.setAttribute("capture", facing);
+    input.hidden = true;
+    nativeCameraInput = input;
+    const finish = () => { input.remove(); if (nativeCameraInput === input) nativeCameraInput = null; };
+    input.addEventListener("cancel", () => { finish(); resolve(null); }, { once: true });
+    input.addEventListener("change", async () => {
+      try {
+        const file = input.files?.[0];
+        if (file && !file.type.startsWith("image/")) throw new Error("Please take a photo.");
+        resolve(file ? await readPhotoFile(file) : null);
+      } catch (error) { reject(error); }
+      finally { finish(); }
+    }, { once: true });
+    document.body.appendChild(input);
+    // Keep this click in the operator's tap, before any asynchronous work.
+    try { input.click(); }
+    catch (error) { finish(); reject(error); }
+  });
+}
+
+/** @param {{kind: string, key: string}} context */
+async function captureNativeOperatorPhoto(context) {
+  const { kind, key } = context;
+  const slot = kind === "fulfillment" ? fulfillmentActivePhotoSlot : kind === "receipt" ? receiptActivePhotoSlot : returnPhotoSlot;
+  const target = { ...returnPhotoTarget };
+  try {
+    const captured = await captureNativeCameraPhoto();
+    if (!captured) return;
+    const photo = kind === "return" ? await compressReturnPhoto(captured) : captured;
+    if (operatorPhotoCameraContext(true)?.key !== key) return;
+    if (kind === "fulfillment") {
+      fulfillmentPhotoDataUrls[slot] = photo;
+      fulfillmentActivePhotoSlot = nextPhotoSlot(fulfillmentPhotoDataUrls, slot, fulfillmentPhotoSlotFloor());
+    } else if (kind === "receipt") {
+      receiptPhotoDataUrls[slot] = photo;
+      receiptActivePhotoSlot = nextPhotoSlot(receiptPhotoDataUrls, slot, 2);
+    } else {
+      if (!returnPhotoTargetsMatch(target, returnPhotoTarget)) return;
+      const photos = [...returnTargetPhotos(target)];
+      photos[slot] = photo;
+      setReturnTargetPhotos(photos, target);
+      returnDirty = true;
+    }
+    render();
+  } catch (error) { showToast(error instanceof Error ? error.message : t("operator.photoCaptureFailed", "Photo capture failed.")); }
+}
+
+function detachCameraPreviews(root = app) {
+  root?.querySelectorAll("video").forEach((video) => {
+    video.pause();
+    video.srcObject = null;
+  });
+}
+
+function cameraOpenLabel() {
+  return useBasicCameraCapture() ? t("operator.capturePhoto", "Capture photo") : t("common.openCamera", "Open camera");
+}
+
 function cameraVideoConstraints(overrides = {}) {
+  // Restore Android's earlier browser-selected capture mode.
+  if (useBasicCameraCapture()) return { ...overrides };
   return {
     width: { ideal: OPERATOR_CAMERA_IDEAL_WIDTH },
     height: { ideal: OPERATOR_CAMERA_IDEAL_HEIGHT },
@@ -542,13 +625,18 @@ async function prepareCameraStream(stream, isCurrent = () => true) {
     stream.getTracks().forEach((track) => track.stop());
     throw new Error("Camera request cancelled.");
   }
-  await maximizeCameraStreamResolution(stream);
-  if (!isCurrent()) {
+  operatorPhotoCamera.pending = stream;
+  try {
+    if (!useBasicCameraCapture()) await maximizeCameraStreamResolution(stream);
+    if (!isCurrent()) throw new Error("Camera request cancelled.");
+    rememberCameraStream(stream);
+    return stream;
+  } catch (error) {
     stream.getTracks().forEach((track) => track.stop());
-    throw new Error("Camera request cancelled.");
+    throw error;
+  } finally {
+    if (operatorPhotoCamera.pending === stream) operatorPhotoCamera.pending = null;
   }
-  rememberCameraStream(stream);
-  return stream;
 }
 
 async function openCameraStream(isCurrent = () => true) {
@@ -560,7 +648,7 @@ async function openCameraStream(isCurrent = () => true) {
     });
     return prepareCameraStream(stream, isCurrent);
   } catch (error) {
-    if (!isCurrent() || ["NotAllowedError", "SecurityError"].includes(error?.name)) throw error;
+    if (!isCurrent() || !["NotFoundError", "OverconstrainedError"].includes(error?.name)) throw error;
     // Some browsers reject exact facingMode even when the camera exists.
   }
   const deviceId = pickCameraDevice(await listVideoInputDevices(), facing, lastCameraDeviceId);
@@ -573,7 +661,7 @@ async function openCameraStream(isCurrent = () => true) {
       });
       return prepareCameraStream(stream, isCurrent);
     } catch (error) {
-      if (!isCurrent() || ["NotAllowedError", "SecurityError"].includes(error?.name)) throw error;
+      if (!isCurrent() || !["NotFoundError", "OverconstrainedError"].includes(error?.name)) throw error;
       // Fall through to facingMode / generic camera fallback.
     }
   }
@@ -632,6 +720,7 @@ function switchCameraFacing() {
 }
 
 function renderCameraSwitchButton(action) {
+  if (useBasicCameraCapture()) return "";
   return `<button class="secondary-button compact-camera-button" data-action="${action}" type="button">${t("common.switchCamera", "Switch camera")} (${cameraFacingLabel()})</button>`;
 }
 
@@ -2031,7 +2120,7 @@ function orderLocksCurrentOperator(order) {
 
 function preparingOrderId() {
   if (viewMode !== "active") return null;
-  if (orderLocksCurrentOperator(selectedOrder)) return selectedOrder.netsuite_id || null;
+  if (orderLocksCurrentOperator(selectedOrder)) return selectedOrder?.netsuite_id || null;
   return orders.find((order) => orderLocksCurrentOperator(order))?.netsuite_id || activeDeliveryDraft?.netsuite_id || null;
 }
 
@@ -2182,6 +2271,7 @@ function renderTopbar(title, subtitle, actions = "") {
 
 function shell(title, subtitle, body, actions = "") {
   releaseSecurePhotoImages(app);
+  detachCameraPreviews();
   app.dataset.module = currentModule;
   app.innerHTML = `
     ${renderTopbar(title, subtitle, actions)}
@@ -2195,32 +2285,9 @@ function shell(title, subtitle, body, actions = "") {
   hydrateSecurePhotoImages(app);
 }
 
-function renderLogin(message = "") {
+function renderLogin() {
   releaseSecurePhotoImages(app);
-  app.innerHTML = `
-    <section class="location-screen">
-      <form class="location-panel login-panel" data-form="login">
-        <p>${t("app.operator", "MBBS Yard Operator Application")}</p>
-        <h1>${t("operator.loginTitle", "Operator login")}</h1>
-        ${message ? `<div class="login-message">${message}</div>` : ""}
-        <div class="install-hint">
-          <strong>${installLabel()}</strong>
-          <span>${installPromptEvent
-            ? t("operator.installAppHelp", "Tap Install app to open as a standalone tablet app.")
-            : t("operator.browserInstallHelp", "If this still opens like a browser, use Chrome or Edge on Android/Windows and install from a trusted HTTPS URL.")}</span>
-        </div>
-        <label>
-          <span>${t("common.username", "Username")}</span>
-          <input id="loginUsername" autocomplete="username" required />
-        </label>
-        <label>
-          <span>${t("common.password", "Password")}</span>
-          <input id="loginPassword" type="password" autocomplete="current-password" required />
-        </label>
-        <button class="primary-button" type="submit">${t("common.login", "Login")}</button>
-      </form>
-    </section>
-  `;
+  window.location.replace('/login.html?next=' + encodeURIComponent(location.pathname + location.search + location.hash));
 }
 
 function saveOperatorState() {
@@ -2995,7 +3062,7 @@ function renderReturnPhotoWorkspace() {
         }).join("")}
       </div>
       <div class="camera-actions">
-        <button class="primary-button" data-action="return-start-camera" ${operatorPhotoCamera.opening === "return" ? "disabled" : ""} type="button">${operatorPhotoCamera.opening === "return" ? t("operator.openingCamera", "Opening camera...") : returnCameraActive ? t("common.restartCamera", "Restart camera") : t("common.openCamera", "Open camera")}</button>
+        <button class="primary-button" data-action="return-start-camera" ${operatorPhotoCamera.opening === "return" ? "disabled" : ""} type="button">${operatorPhotoCamera.opening === "return" ? t("operator.openingCamera", "Opening camera...") : returnCameraActive ? t("common.restartCamera", "Restart camera") : cameraOpenLabel()}</button>
         ${renderCameraSwitchButton("return-switch-camera")}
         ${returnCameraActive || operatorPhotoCamera.opening === "return" ? `<button class="secondary-button" data-action="return-close-camera" type="button">${t("common.closeCamera", "Close camera")}</button>` : ""}
       </div>
@@ -3013,7 +3080,7 @@ function renderReturnPhotoWorkspace() {
       ` : selected ? `
         <img class="photo-preview" ${photoImgAttributes(selected)} alt="${escapeHtml(returnPhotoTargetLabel())}" />
       ` : `
-        <div class="photo-placeholder">${t("operator.liveCameraOnly", "Use the live PWA camera to take return evidence.")}</div>
+        <div class="photo-placeholder">${t("operator.takeReturnPhoto", "Take a photo of the return evidence.")}</div>
       `}
       <div class="photo-list-actions">
         <button class="secondary-button" data-action="return-add-photo" ${photos.length >= RETURN_MAX_PHOTOS ? "disabled" : ""} type="button">${t("common.addAnotherPhoto", "Add another photo")}</button>
@@ -3039,7 +3106,7 @@ function renderReturnLookup() {
           <span>${t("operator.returnScannerHelp", "Scan the Sales Order barcode to identify the exact customer and ordering yard.")}</span>
         </div>
         <div class="camera-actions">
-          <button class="primary-button" data-action="return-start-scanner" ${returnBusy ? "disabled" : ""} type="button">${returnScannerActive ? t("common.restartCamera", "Restart camera") : t("common.openCamera", "Open camera")}</button>
+          <button class="primary-button" data-action="return-start-scanner" ${returnBusy ? "disabled" : ""} type="button">${returnScannerActive ? t("common.restartCamera", "Restart camera") : cameraOpenLabel()}</button>
           ${renderCameraSwitchButton("return-switch-scanner-camera")}
         </div>
         ${returnScannerActive ? `
@@ -3641,57 +3708,6 @@ function returnNetSuiteResultLabel(record) {
   return "NetSuite RA pending — return saved";
 }
 
-
-function returnPostingFunctions() {
-  return [returnMode === "stock" && returnSelectedRows().length > 0 && "stock_return",
-    Number(returnPalletQuantity) > 0 && "pallet_return"].filter(Boolean);
-}
-
-
-function returnPostingReady() {
-  return !returnPostingLoading && !returnPostingError && returnPostingFunctions().length > 0
-    && returnPostingFunctions().every(key => Number(returnPostingPolicies[key]?.locationId) === Number(locationId)
-      && Boolean(operatorNetSuitePolicyToken(returnPostingPolicies[key])));
-}
-
-
-async function loadReturnPostingPolicies() {
-  const generation = ++returnPostingGeneration;
-  const yardId = Number(locationId);
-  returnPostingLoading = true;
-  returnPostingError = "";
-  returnPostingPolicies = {};
-  render();
-  try {
-    const entries = await Promise.all(returnPostingFunctions().map(async key => [key, await loadOperatorNetSuitePostingPolicy(key)]));
-    if (generation !== returnPostingGeneration || yardId !== Number(locationId)) {return;}
-    returnPostingPolicies = Object.fromEntries(entries);
-  } catch (error) {
-    if (generation !== returnPostingGeneration || yardId !== Number(locationId)) {return;}
-    returnPostingError = error.message || "Unable to check NetSuite posting mode.";
-  } finally {
-    if (generation === returnPostingGeneration && yardId === Number(locationId)) {
-      returnPostingLoading = false;
-      render();
-    }
-  }
-}
-
-
-function renderReturnPostingPolicies() {
-  if (returnPostingLoading) {return `<div class="sync-alert" role="status">Checking NetSuite posting mode…</div>`;}
-  if (returnPostingError || !returnPostingReady()) {
-    return `<div class="sync-alert danger">${escapeHtml(returnPostingError || "Refresh the posting mode before confirming.")}</div>
-      <button data-action="return-refresh-posting" type="button">Refresh posting mode</button>`;
-  }
-  const enabled = returnPostingFunctions().every(key => returnPostingPolicies[key].effective);
-  return `<div class="sync-alert operator-posting-mode" data-posting-mode="${enabled ? "netsuite" : "local"}">
-    <strong>NetSuite Return Authorization</strong>
-    <span>${enabled ? "Creates one RA for this return, including stock and pallets" : "Local only — NetSuite posting is off for part or all of this return"}</span>
-  </div>`;
-}
-
-
 function renderReturnSuccess() {
   const batch = returnResult?.batchReference || returnResult?.batch_reference || "";
   const stock = returnResult?.stockReturn || returnResult?.stock_return || null;
@@ -3888,7 +3904,7 @@ function renderCustomerPickupScan() {
           <span>${t("operator.scannerReadyHelp", "Scan a 1D or QR sales-order barcode with the camera or Zebra scanner. The order will open automatically.")}</span>
         </div>
         <div class="camera-actions">
-          <button class="primary-button" data-action="start-pickup-scanner" type="button">${pickupScannerActive ? t("common.restartCamera", "Restart camera") : t("common.openCamera", "Open camera")}</button>
+          <button class="primary-button" data-action="start-pickup-scanner" type="button">${pickupScannerActive ? t("common.restartCamera", "Restart camera") : cameraOpenLabel()}</button>
           ${renderCameraSwitchButton("switch-pickup-camera")}
         </div>
         ${pickupScannerActive ? `
@@ -4363,7 +4379,7 @@ function renderCycleSummary() {
         <button class="${selectedInventoryItem?.item_id === line.item_id ? "active" : ""}" data-action="edit-cycle-line" data-line="${line.id}" type="button">
           <strong>${line.item_name}</strong>
           <span>${displayQty(line.counted_pallet_qty)} ${displayUnit("PLT")} / ${displayQty(line.counted_layer_qty)} ${displayUnit("LYR")} / ${displayQty(line.counted_section_qty)} ${displayUnit("SEC")} / ${displayQty(line.counted_piece_qty)} ${displayUnit("PCS")}</span>
-          <span>${t("operator.total", "Total")} ${displayQty(line.counted_total_qty)} | ${t("control.variance", "Var")} ${displaySignedQty(line.variance_qty)}</span>
+          <span>${t("operator.total", "Total")} ${displayQty(line.counted_total_qty)}</span>
         </button>
       `).join("") || `<span class="muted">${t("operator.noLinesConfirmed", "No lines confirmed yet.")}</span>`}
     </div>
@@ -4735,14 +4751,21 @@ function renderFulfillmentScreen() {
       </section>
     `, `<button class="secondary-button" data-action="finish-fulfill" type="button">${t("operator.deliveryPrep", "Delivery")}</button>`);
   }
+  if (order.posting?.loadBlocked) {
+    return shell(t("operator.loadOrder", "Load Order"), escapeHtml(order.tranid),
+      `<section class="fulfillment-screen"><div class="fulfillment-card">${renderLoadPostingStatus(order)}</div></section>`,
+      `<button class="secondary-button" data-action="continue-operator-work" type="button">${t("common.back", "Back")}</button>`);
+  }
   return shell(t("operator.loadOrder", "Load Order"), `${order.tranid} | ${t("common.location", "Location")} ${currentLocation()?.text || ""}`, `
-    <section class="fulfillment-screen fulfillment-form-screen ${isReloadLoad ? "reload-fulfillment-screen" : ""}">
-      ${isReloadLoad ? `<div class="sync-alert reload-notice"><strong>Local-only re-load</strong><span>${escapeHtml(order.reload_reason || order.reload_cycle?.reason || "")}</span></div>` : ""}
-      ${isConsolidated ? "" : renderOperatorNetSuitePostingMode(fulfillmentNetSuitePolicy, {
-        localOnly: localOnlyPosting,
-        error: fulfillmentNetSuitePolicyError
-      })}
-      ${renderLoadPostingStatus(order)}
+    <section class="fulfillment-screen fulfillment-form-screen fulfillment-load-screen ${isReloadLoad ? "reload-fulfillment-screen" : ""}">
+      <div class="fulfillment-notices">
+        ${isReloadLoad ? `<div class="sync-alert reload-notice"><strong>Local-only re-load</strong><span>${escapeHtml(order.reload_reason || order.reload_cycle?.reason || "")}</span></div>` : ""}
+        ${isConsolidated ? "" : renderOperatorNetSuitePostingMode(fulfillmentNetSuitePolicy, {
+          localOnly: localOnlyPosting,
+          error: fulfillmentNetSuitePolicyError
+        })}
+        ${renderLoadPostingStatus(order)}
+      </div>
       <div class="fulfillment-card fulfillment-photo-card">
         <span>${isPickupLoad && requiredPhotoCount === 0
           ? t("operator.customerPickupPhotoOptional", "Customer Pickup photo proof (optional)")
@@ -4753,7 +4776,7 @@ function renderFulfillmentScreen() {
         <div class="camera-actions">
           ${fulfillmentCameraActive
             ? `<button class="secondary-button" data-action="stop-camera" type="button">${t("common.closeCamera", "Close camera")}</button>`
-            : `<button class="primary-button" data-action="start-camera" ${operatorPhotoCamera.opening === "fulfillment" ? "disabled" : ""} type="button">${operatorPhotoCamera.opening === "fulfillment" ? t("operator.openingCamera", "Opening camera...") : t("common.openCamera", "Open camera")}</button>`}
+            : `<button class="primary-button" data-action="start-camera" ${operatorPhotoCamera.opening === "fulfillment" ? "disabled" : ""} type="button">${operatorPhotoCamera.opening === "fulfillment" ? t("operator.openingCamera", "Opening camera...") : cameraOpenLabel()}</button>`}
           ${operatorPhotoCamera.opening === "fulfillment" ? `<button class="secondary-button" data-action="stop-camera" type="button">${t("common.closeCamera", "Close camera")}</button>` : ""}
           ${renderCameraSwitchButton("switch-fulfillment-camera")}
         </div>
@@ -6287,7 +6310,7 @@ async function loadReceivingDetail(id, options = {}) {
   const listOrder = receivingOrders.find((order) => String(order.netsuite_id) === String(id));
   const orderType = listOrder?.order_type || receivingOrderType;
   try {
-    const order = await api(`/api/receiving/orders/${encodeURIComponent(id)}?orderType=${encodeURIComponent(orderType)}`);
+    const order = await api(`/api/receiving/orders/${encodeURIComponent(id)}?orderType=${encodeURIComponent(orderType)}&locationId=${encodeURIComponent(locationId)}`);
     if (!receivingRequestIsCurrent(context) || request !== receivingDetailRequest || String(receivingSelectedId) !== String(id)) return null;
     receivingSelectedOrder = order;
     if (listOrder) listOrder.line_count = (order.lines || []).filter((line) => isPickableLine(line) && hasReceivingRemainingQty(line)).length;
@@ -6534,6 +6557,7 @@ async function scanPickupQrFrame() {
 async function startPickupScannerCamera() {
   stopPickupScannerCamera();
   pickupScanSubmitting = false;
+  if (useBasicCameraCapture()) return scanNativeCameraPhoto("pickup");
   try {
     if (!navigator.mediaDevices?.getUserMedia) {
       customerPickupMessage = "Camera is not available in this browser. Use Zebra scanner or manual input.";
@@ -6593,6 +6617,41 @@ async function startPickupScannerCamera() {
     stopPickupScannerCamera();
     render();
   }
+}
+
+/** @param {string} photo */
+async function decodeCameraPhoto(photo) {
+  const quagga = /** @type {Window & {Quagga?: {decodeSingle: (options: object, done: (value: unknown) => void) => void}}} */ (window).Quagga;
+  if (quagga) {
+    const result = await new Promise((resolve) => quagga.decodeSingle({
+      src: photo, numOfWorkers: 0, locate: true,
+      inputStream: { size: 1600 },
+      decoder: { readers: ["code_128_reader", "code_39_reader", "code_93_reader"] }
+    }, resolve));
+    const code = pickupQuaggaOrderCode(result);
+    if (code) return code;
+  }
+  try {
+    const modulePath = "/vendor/qr-scanner/qr-scanner.min.js";
+    const { default: QrScanner } = await import(modulePath);
+    return normalizedPickupCameraCode(await QrScanner.scanImage(photo, { returnDetailedScanResult: true }));
+  } catch { return ""; }
+}
+
+/** @param {"pickup"|"return"} kind */
+async function scanNativeCameraPhoto(kind) {
+  const module = currentModule, yard = locationId, returnRequest = returnIdempotencyKey;
+  const isCurrent = () => currentModule === module && locationId === yard && Boolean(operator)
+    && (kind !== "return" || (returnIdempotencyKey === returnRequest && returnStage === "lookup"));
+  try {
+    const photo = await captureNativeCameraPhoto("environment");
+    if (!photo || !isCurrent()) return;
+    const code = await decodeCameraPhoto(photo);
+    if (!isCurrent()) return;
+    if (!code) return showToast(t("operator.noBarcodeInPhoto", "No barcode found. Take a closer photo or enter the order number."));
+    if (kind === "pickup") await submitCustomerPickupScanValue(code);
+    else await lookupReturnOrder(code);
+  } catch (error) { showToast(error instanceof Error ? error.message : t("operator.photoCaptureFailed", "Photo capture failed.")); }
 }
 
 async function switchPickupScannerCamera() {
@@ -7113,6 +7172,8 @@ async function startFulfillment() {
 }
 
 function stopFulfillmentCamera() {
+  const video = /** @type {HTMLVideoElement|null} */ (document.getElementById("fulfillmentCamera"));
+  if (video) { video.pause(); video.srcObject = null; }
   cancelOperatorPhotoCameraOpening("fulfillment");
   if (fulfillmentCameraStream) {
     fulfillmentCameraStream.getTracks().forEach((track) => track.stop());
@@ -7141,7 +7202,7 @@ async function switchFulfillmentCamera() {
 
 async function captureCameraPhotoDataUrl(stream, video) {
   const track = stream?.getVideoTracks?.()[0];
-  if (track && typeof window.ImageCapture === "function") {
+  if (!useBasicCameraCapture() && track && typeof window.ImageCapture === "function") {
     try {
       const imageCapture = new window.ImageCapture(track);
       let photoSettings;
@@ -7203,10 +7264,11 @@ async function captureFulfillmentPhoto() {
   }
 }
 
+/** @param {Blob} file @returns {Promise<string>} */
 function readPhotoFile(file) {
   return new Promise((resolve, reject) => {
     const reader = new FileReader();
-    reader.onload = () => resolve(reader.result);
+    reader.onload = () => resolve(/** @type {string} */ (reader.result));
     reader.onerror = () => reject(reader.error);
     reader.readAsDataURL(file);
   });
@@ -7216,20 +7278,28 @@ async function confirmFulfillment() {
   if (fulfillmentOrder?.is_consolidation_load) return confirmConsolidationLoad();
   if (!fulfillmentOrder || fulfillmentSubmitting) return;
   if (fulfillmentOrder.posting?.loadBlocked) return;
+  const requestId = fulfillmentLoadRequestId;
+  const orderId = fulfillmentOrder.netsuite_id;
+  const isCurrent = () => fulfillmentOrder?.netsuite_id === orderId && fulfillmentLoadRequestId === requestId;
+  let retryWithNewRequest = false;
   fulfillmentSubmitting = true;
   if (fulfillmentOrder.confirmationSummary) {
     try {
       const latest = await api(`/api/delivery/orders/${encodeURIComponent(fulfillmentOrder.netsuite_id)}`);
+      if (!isCurrent()) return;
       if (latest.posting?.loadBlocked) {
         fulfillmentOrder.posting = latest.posting;
         fulfillmentSubmitting = false; render(); return;
       }
-      if (JSON.stringify(latest.confirmationSummary) !== fulfillmentOrder.loadConfirmationAcknowledged
-          && !await confirmMissingLoadLines([latest.confirmationSummary])) {
+      const confirmed = JSON.stringify(latest.confirmationSummary) === fulfillmentOrder.loadConfirmationAcknowledged
+        || await confirmMissingLoadLines([latest.confirmationSummary]);
+      if (!isCurrent()) return;
+      if (!confirmed) {
         fulfillmentSubmitting = false; render(); return;
       }
       fulfillmentOrder = { ...latest, loadConfirmationAcknowledged: JSON.stringify(latest.confirmationSummary) };
     } catch (error) {
+      if (!isCurrent()) return;
       fulfillmentSubmitting = false; showToast(error.message); render(); return;
     }
   }
@@ -7240,8 +7310,10 @@ async function confirmFulfillment() {
     try {
       await refreshCustomerPickupPhotoRequirement();
     } catch {
+      if (!isCurrent()) return;
       showToast(t("operator.pickupPhotoPolicyUnavailable", "Could not verify the Customer Pickup photo setting. One photo remains required."));
     }
+    if (!isCurrent()) return;
   }
   const photos = fulfillmentPhotoDataUrls.filter(Boolean);
   const requiredPhotoCount = fulfillmentRequiredPhotoCount();
@@ -7253,9 +7325,12 @@ async function confirmFulfillment() {
   }
   if (!localOnlyPosting) {
     try {
-      fulfillmentNetSuitePolicy = await loadOperatorNetSuitePostingPolicy(postingFunction);
+      const policy = await loadOperatorNetSuitePostingPolicy(postingFunction);
+      if (!isCurrent()) return;
+      fulfillmentNetSuitePolicy = policy;
       fulfillmentNetSuitePolicyError = "";
     } catch (error) {
+      if (!isCurrent()) return;
       fulfillmentSubmitting = false;
       fulfillmentNetSuitePolicy = null;
       fulfillmentNetSuitePolicyError = error.message || "Could not verify the live NetSuite posting mode.";
@@ -7269,17 +7344,20 @@ async function confirmFulfillment() {
   fulfillmentJobStage = "Saving load";
   fulfillmentStatusText = "Saving local loaded status...";
   fulfillmentValidation = null;
-  window.clearInterval(fulfillmentProgressTimer);
+  window.clearInterval(fulfillmentProgressTimer ?? undefined);
   fulfillmentProgressTimer = window.setInterval(() => {
     if (fulfillmentSubmitting) updateUploadElapsed("[data-fulfillment-upload-elapsed]", fulfillmentStartedAt);
   }, 1000);
+  const progressTimer = fulfillmentProgressTimer;
   render();
   try {
     const deferPhotos = !localOnlyPosting && fulfillmentNetSuitePolicy?.effective;
     const photoInput = await prepareOperatorBackgroundPhotos(fulfillmentLoadRequestId, photos);
+    const activeOrder = fulfillmentOrder;
+    if (!isCurrent() || !activeOrder) return;
     const path = currentModule === "customer-pickup-load"
-      ? `/api/customer-pickup/orders/${fulfillmentOrder.netsuite_id}/load`
-      : `/api/delivery/orders/${fulfillmentOrder.netsuite_id}/load`;
+      ? `/api/customer-pickup/orders/${activeOrder.netsuite_id}/load`
+      : `/api/delivery/orders/${activeOrder.netsuite_id}/load`;
     fulfillmentStatusText = fulfillmentNetSuitePolicy?.effective
       ? "Creating and verifying the NetSuite fulfillment..."
       : "Saving local loaded status...";
@@ -7291,10 +7369,11 @@ async function confirmFulfillment() {
         ...photoInput,
         requestId: fulfillmentLoadRequestId,
         locationId,
-        orderType: fulfillmentOrder.order_type || deliveryOrderType,
+        orderType: activeOrder.order_type || deliveryOrderType,
         netSuitePostingPolicy: operatorNetSuitePolicyToken(fulfillmentNetSuitePolicy)
       })
     });
+    if (!isCurrent()) return;
     resumeOperatorBackgroundPhotos();
     if (started.status === "error") throw new Error(started.error || "NetSuite posting could not be verified.");
     if (started.status === "complete" && started.result) {
@@ -7304,21 +7383,26 @@ async function confirmFulfillment() {
       fulfillmentJobStage = "Posting to NetSuite";
       fulfillmentStatusText = t("operator.waitingNetSuiteVerification", "Waiting for NetSuite transaction verification...");
       render();
-      fulfillmentResult = await pollOperatorNetSuitePostingJob(started.jobId, ({ stage, message }) => {
+      const result = await pollOperatorNetSuitePostingJob(started.jobId, ({ stage, message }) => {
+        if (!isCurrent()) return;
         fulfillmentJobStage = stage;
         fulfillmentStatusText = message;
         render();
       });
+      if (!isCurrent()) return;
+      fulfillmentResult = result;
     } else {
       fulfillmentResult = started;
     }
     rememberFulfillmentPosting(null);
     showToast(fulfillmentNetSuitePolicy?.effective ? "NetSuite verified and order loaded" : "Order loaded locally");
   } catch (error) {
+    if (!isCurrent()) return;
     const job = error.payload?.posting;
+    retryWithNewRequest = job?.status === "failed";
     if (job) rememberFulfillmentPosting(["completed", "failed"].includes(job.status) ? null : postingSummaryFromJob(job));
     else if (error.status >= 400 && error.status < 500 && !["OPERATOR_NETSUITE_POSTING_IN_PROGRESS", "OPERATOR_NETSUITE_POSTING_ORDER_CLAIMED"].includes(error.payload?.code || error.code)) rememberFulfillmentPosting(null);
-    fulfillmentJobStage = fulfillmentOrder.posting?.loadBlocked ? "Verification pending" : "Load failed";
+    fulfillmentJobStage = fulfillmentOrder?.posting?.loadBlocked ? "Verification pending" : "Load failed";
     fulfillmentValidation = error.payload?.validation || null;
     fulfillmentStatusText = fulfillmentValidation
       ? "Correct the listed packed lines before loading."
@@ -7326,10 +7410,13 @@ async function confirmFulfillment() {
     showToast(error.message);
   } finally {
     resumeOperatorBackgroundPhotos();
-    window.clearInterval(fulfillmentProgressTimer);
-    fulfillmentProgressTimer = null;
-    fulfillmentSubmitting = false;
-    render();
+    window.clearInterval(progressTimer);
+    if (isCurrent()) {
+      fulfillmentProgressTimer = null;
+      fulfillmentSubmitting = false;
+      if (retryWithNewRequest) fulfillmentLoadRequestId = createOperatorUuid();
+      render();
+    }
   }
 }
 
@@ -7386,18 +7473,70 @@ function renderLoadPostingStatus(order) {
   return `<div class="sync-alert danger" data-load-posting-status role="status">
     <strong>${posting.status === "attention" ? "Needs review" : "Verification pending"}${references ? ` · ${escapeHtml(references)}` : ""}</strong>
     <span>${escapeHtml(posting.reason || "The previous load is being checked. Check its status before continuing.")}</span>
+    <span>This order is held for verification. You can continue with other orders.</span>
     <button class="secondary-button" data-action="refresh-load-posting" type="button">Check status</button>
+    <button class="primary-button" data-action="continue-operator-work" type="button">Continue with other orders</button>
   </div>`;
+}
+
+async function continueOperatorWork() {
+  if (currentModule === "receiving-receipt") {
+    stopReceiptCamera();
+    window.clearInterval(receiptProgressTimer ?? undefined);
+    receiptProgressTimer = null;
+    receiptSubmitting = false;
+    receiptOrder = null;
+    receiptRequestId = "";
+    receiptPhotoDataUrls = [];
+    receiptResult = null;
+    receiptStatusText = "";
+    receiptJobStage = "";
+    receiptNetSuitePolicy = null;
+    receiptNetSuitePolicyError = "";
+    receivingSelectedId = null;
+    receivingSelectedOrder = null;
+    receivingSelectedLineId = null;
+    currentModule = "receiving";
+    saveOperatorState();
+    render();
+    return loadReceivingOrders({ keepSelection: false });
+  }
+  const wasPickup = ["customer-pickup-load", "customer-pickup"].includes(currentModule);
+  stopFulfillmentCamera();
+  window.clearInterval(fulfillmentProgressTimer ?? undefined);
+  fulfillmentProgressTimer = null;
+  fulfillmentSubmitting = false;
+  fulfillmentOrder = null;
+  fulfillmentLoadRequestId = "";
+  fulfillmentPhotoDataUrls = [];
+  fulfillmentResult = null;
+  fulfillmentStatusText = "";
+  fulfillmentJobStage = "";
+  fulfillmentValidation = null;
+  fulfillmentNetSuitePolicy = null;
+  fulfillmentNetSuitePolicyError = "";
+  selectedId = null;
+  selectedOrder = null;
+  selectedLineId = null;
+  currentModule = wasPickup ? "customer-pickup-scan" : (fulfillmentReturnModule || "delivery");
+  if (wasPickup) customerPickupScan = "";
+  saveOperatorState();
+  render();
+  if (!wasPickup) await loadOrders({ keepSelection: false });
 }
 
 async function refreshLoadPostingStatus() {
   const order = fulfillmentOrder || selectedOrder;
   if (!order) return;
+  const requestId = fulfillmentLoadRequestId;
+  const isCurrent = () => (fulfillmentOrder || selectedOrder) === order && fulfillmentLoadRequestId === requestId;
   const refreshed = await api(`/api/delivery/orders/${encodeURIComponent(order.netsuite_id)}`);
+  if (!isCurrent()) return;
   if (fulfillmentOrder) {
     const jobId = refreshed.posting?.jobId || fulfillmentOrder.posting?.jobId || loadPostingJournal(order)?.requestId;
     if (jobId) {
       const job = await api(`/api/operator/netsuite-posting-jobs/${encodeURIComponent(jobId)}`).catch(() => null);
+      if (!isCurrent()) return;
       if (job?.status === "completed") {
         fulfillmentResult = job.result?.localFinalization || job.result;
         rememberFulfillmentPosting(null);
@@ -7524,7 +7663,7 @@ function renderReceiptScreen() {
         <div class="camera-actions">
           ${receiptCameraActive
             ? `<button class="secondary-button" data-action="stop-receipt-camera" type="button">${t("common.closeCamera", "Close camera")}</button>`
-            : `<button class="primary-button" data-action="start-receipt-camera" ${operatorPhotoCamera.opening === "receipt" ? "disabled" : ""} type="button">${operatorPhotoCamera.opening === "receipt" ? t("operator.openingCamera", "Opening camera...") : t("common.openCamera", "Open camera")}</button>`}
+            : `<button class="primary-button" data-action="start-receipt-camera" ${operatorPhotoCamera.opening === "receipt" ? "disabled" : ""} type="button">${operatorPhotoCamera.opening === "receipt" ? t("operator.openingCamera", "Opening camera...") : cameraOpenLabel()}</button>`}
           ${operatorPhotoCamera.opening === "receipt" ? `<button class="secondary-button" data-action="stop-receipt-camera" type="button">${t("common.closeCamera", "Close camera")}</button>` : ""}
           ${renderCameraSwitchButton("switch-receipt-camera")}
         </div>
@@ -7606,7 +7745,7 @@ async function confirmReceivingPage() {
   try {
     const result = await api(`/api/receiving/orders/${encodeURIComponent(receivingSelectedId)}/lines/confirm-page`, {
       method: "POST",
-      body: JSON.stringify({ orderType: "purchase_order", lines: requests })
+      body: JSON.stringify({ orderType: "purchase_order", locationId, lines: requests })
     });
     receivingSelectedOrder = result.order || receivingSelectedOrder;
     const failures = result.failures || [];
@@ -7634,6 +7773,7 @@ async function confirmReceivingLine(lineId) {
     pieces: isIndependentManualLine(line) ? row.querySelector('[data-pack="pieces"]')?.value || 0 : salesQty || row.querySelector('[data-pack="pieces"]')?.value || 0,
     salesQty,
     sections: row.querySelector('[data-pack="sections"]')?.value || 0,
+    locationId,
     orderType: receivingSelectedOrder?.order_type || receivingOrderType
   };
   receivingSelectedOrder = await api(`/api/receiving/orders/${receivingSelectedId}/lines/${lineId}/confirm`, {
@@ -7649,6 +7789,7 @@ async function unconfirmReceivingLine(lineId) {
   receivingSelectedOrder = await api(`/api/receiving/orders/${receivingSelectedId}/lines/${lineId}/unconfirm`, {
     method: "POST",
     body: JSON.stringify({
+      locationId,
       orderType: receivingSelectedOrder?.order_type || receivingOrderType
     })
   });
@@ -7719,6 +7860,8 @@ async function startReceipt() {
 }
 
 function stopReceiptCamera() {
+  const video = /** @type {HTMLVideoElement|null} */ (document.getElementById("receiptCamera"));
+  if (video) { video.pause(); video.srcObject = null; }
   cancelOperatorPhotoCameraOpening("receipt");
   if (receiptCameraStream) receiptCameraStream.getTracks().forEach((track) => track.stop());
   receiptCameraStream = null;
@@ -7762,6 +7905,7 @@ async function confirmReceipt() {
   const activeOrder = receiptOrder;
   const requestId = receiptRequestId;
   const isCurrent = () => receiptOrder === activeOrder && receiptRequestId === requestId;
+  let retryWithNewRequest = false;
   const localOnlyPosting = operatorNetSuitePostingIsLocalOnly(receiptOrder, "receiving");
   if (!localOnlyPosting) {
     try {
@@ -7843,6 +7987,7 @@ async function confirmReceipt() {
     if (!isCurrent()) return;
     const error = /** @type {Record<string, any>} */ (caught);
     const job = error.payload?.posting;
+    retryWithNewRequest = job?.status === "failed";
     if (job) observeReceiptPostingJob(job);
     else if (receiptOrder.posting?.status === "submitting" && error.status >= 400 && error.status < 500
         && ![408, 429].includes(error.status)
@@ -7866,6 +8011,7 @@ async function confirmReceipt() {
     if (isCurrent()) {
       receiptProgressTimer = null;
       receiptSubmitting = false;
+      if (retryWithNewRequest) receiptRequestId = createOperatorUuid();
       render();
     }
   }
@@ -7942,14 +8088,15 @@ function observeReceiptPostingJob(job) {
 function renderReceiptPostingStatus(posting) {
   const transactions = posting.transactions || [];
   const message = posting.status === "attention"
-    ? "Local verification needs review. This screen will update when it finishes."
-    : "Checking the existing receipt. This screen will update when receiving is complete.";
+    ? "Local verification needs Admin review. This order is held; you can continue with other orders."
+    : "Checking the existing receipt. You can continue with other orders while verification finishes.";
   return `<div class="fulfillment-card" data-receipt-posting-status role="status">
     <strong>${transactions.length ? "NetSuite receipt created" : "Checking receipt status"}</strong>
     ${transactions.map((/** @type {Record<string, any>} */ transaction) => `<p>Item Receipt <strong>${escapeHtml(transaction.ref)}</strong></p>`).join("")}
     <p>${message}</p>
     ${receiptStatusText ? `<p>${escapeHtml(receiptStatusText)}</p>` : ""}
     <button class="secondary-button" data-action="refresh-receipt-posting" ${receiptSubmitting || posting.checking ? "disabled" : ""} type="button">Check status</button>
+    <button class="primary-button" data-action="continue-operator-work" type="button">Continue with other orders</button>
   </div>`;
 }
 
@@ -8099,6 +8246,9 @@ function historyTypeLabel(type) {
     confirm_line: t("operator.confirmLineHistory", "Confirm Line"),
     item_receipt: "IR",
     item_fulfillment: "IF",
+    sales_order_delivery_load: t("operator.deliveryLoadHistory", "Delivery Load"),
+    customer_pickup_load: t("operator.pickupLoadHistory", "Customer Pickup Load"),
+    transfer_order_load: t("operator.transferLoadHistory", "Transfer Order Load"),
     cycle_count: t("operator.cycleHistory", "Cycle"),
     customer_return: t("operator.customerReturnHistory", "Customer Return"),
     stock_return: t("operator.stockReturn", "Stock Return"),
@@ -8163,6 +8313,14 @@ function renderHistoryLineDetails(record) {
   `;
 }
 
+function historyDocumentLabel(record) {
+  return (record.documents || []).map((document) => `${document.type}: ${document.ref}`).join(" · ");
+}
+
+function historyStatusLabel(record) {
+  return record.waitingForDriverCompletion ? "waiting for driver completion" : record.status || "";
+}
+
 function renderHistoryDetail(record) {
   if (!record) {
     return `<div class="empty-state small"><strong>${t("operator.selectRecord", "Select a record")}</strong><span>${t("operator.selectRecordHelp", "Tap one history record to view details.")}</span></div>`;
@@ -8176,15 +8334,15 @@ function renderHistoryDetail(record) {
     ?? details.palletQuantity ?? details.pallet_quantity;
   return `
     <div class="history-detail-card">
-      <div class="detail-header">
+      <div class="detail-header"${record.waitingForDriverCompletion ? ' style="grid-template-columns: minmax(0, 1fr)"' : ""}>
         <div>
           <h2>${escapeHtml(record.tranid || record.reference || historyTypeLabel(record.type))}</h2>
           <p>${escapeHtml(historyTypeLabel(record.type))} | ${formatDateTime(record.createdAt)}</p>
         </div>
-        ${record.status ? `<span class="status-pill open">${escapeHtml(localizeMessage(record.status))}</span>` : ""}
+        ${historyStatusLabel(record) ? `<span class="status-pill open">${escapeHtml(localizeMessage(historyStatusLabel(record)))}</span>` : ""}
       </div>
       <div class="progress-strip history-meta">
-        <div><span>${t("operator.reference", "Reference")}</span><strong>${escapeHtml(record.reference || "-")}</strong></div>
+        <div><span>${historyDocumentLabel(record) ? "IR / IF" : t("operator.reference", "Reference")}</span><strong class="history-documents">${escapeHtml(historyDocumentLabel(record) || record.reference || "-")}</strong></div>
         <div><span>${t("operator.action", "Action")}</span><strong>${escapeHtml(localizeMessage(record.action || "-"))}</strong></div>
         <div><span>${t("common.order", "Order")}</span><strong>${escapeHtml(record.orderId || "-")}</strong></div>
       </div>
@@ -8229,8 +8387,8 @@ function renderPersonalHistory() {
                 <span>${historyTypeLabel(item.type)}</span>
                 <b>${escapeHtml(item.tranid || item.orderId || item.type)}</b>
                 <em>${formatDateTime(item.createdAt)}</em>
-                ${item.reference ? `<strong>${escapeHtml(item.reference)}</strong>` : ""}
-                ${item.status ? `<i>${escapeHtml(item.status)}</i>` : ""}
+                ${historyDocumentLabel(item) || item.reference ? `<strong class="history-documents">${escapeHtml(historyDocumentLabel(item) || item.reference)}</strong>` : ""}
+                ${historyStatusLabel(item) ? `<i>${escapeHtml(historyStatusLabel(item))}</i>` : ""}
               </button>
             `).join("") || `<div class="empty-state small"><strong>${t("operator.noHistory", "No history")}</strong><span>${t("operator.noHistoryHelp", "No operator records for this date.")}</span></div>`}
           </div>
@@ -8681,6 +8839,8 @@ async function deleteReturnDraft(id) {
 }
 
 function stopReturnCamera() {
+  const video = /** @type {HTMLVideoElement|null} */ (document.getElementById("returnCamera"));
+  if (video) { video.pause(); video.srcObject = null; }
   cancelOperatorPhotoCameraOpening("return");
   if (returnCameraStream) returnCameraStream.getTracks().forEach((track) => track.stop());
   returnCameraStream = null;
@@ -8844,6 +9004,7 @@ async function startReturnScannerCamera() {
   stopReturnCamera();
   stopReturnScannerCamera();
   returnScanSubmitting = false;
+  if (useBasicCameraCapture()) return scanNativeCameraPhoto("return");
   try {
     if (!navigator.mediaDevices?.getUserMedia) throw new Error(t("operator.cameraUnavailable", "Camera is not available in this browser."));
     if (!window.Quagga) throw new Error(t("operator.scannerLoadFailed", "Barcode scanner could not load. Refresh the app and try again."));
@@ -9112,6 +9273,52 @@ async function saveReturnDraft() {
   }
 }
 
+function returnPostingFunctions() {
+  return [returnMode === "stock" && returnSelectedRows().length > 0 && "stock_return",
+    Number(returnPalletQuantity) > 0 && "pallet_return"].filter(Boolean);
+}
+
+function returnPostingReady() {
+  return !returnPostingLoading && !returnPostingError && returnPostingFunctions().length > 0
+    && returnPostingFunctions().every(key => Number(returnPostingPolicies[key]?.locationId) === Number(locationId)
+      && Boolean(operatorNetSuitePolicyToken(returnPostingPolicies[key])));
+}
+
+async function loadReturnPostingPolicies() {
+  const generation = ++returnPostingGeneration;
+  const yardId = Number(locationId);
+  returnPostingLoading = true;
+  returnPostingError = "";
+  returnPostingPolicies = {};
+  render();
+  try {
+    const entries = await Promise.all(returnPostingFunctions().map(async key => [key, await loadOperatorNetSuitePostingPolicy(key)]));
+    if (generation !== returnPostingGeneration || yardId !== Number(locationId)) {return;}
+    returnPostingPolicies = Object.fromEntries(entries);
+  } catch (error) {
+    if (generation !== returnPostingGeneration || yardId !== Number(locationId)) {return;}
+    returnPostingError = error.message || "Unable to check NetSuite posting mode.";
+  } finally {
+    if (generation === returnPostingGeneration && yardId === Number(locationId)) {
+      returnPostingLoading = false;
+      render();
+    }
+  }
+}
+
+function renderReturnPostingPolicies() {
+  if (returnPostingLoading) {return `<div class="sync-alert" role="status">Checking NetSuite posting mode…</div>`;}
+  if (returnPostingError || !returnPostingReady()) {
+    return `<div class="sync-alert danger">${escapeHtml(returnPostingError || "Refresh the posting mode before confirming.")}</div>
+      <button data-action="return-refresh-posting" type="button">Refresh posting mode</button>`;
+  }
+  const enabled = returnPostingFunctions().every(key => returnPostingPolicies[key].effective);
+  return `<div class="sync-alert operator-posting-mode" data-posting-mode="${enabled ? "netsuite" : "local"}">
+    <strong>NetSuite Return Authorization</strong>
+    <span>${enabled ? "Creates one RA for this return, including stock and pallets" : "Local only — NetSuite posting is off for part or all of this return"}</span>
+  </div>`;
+}
+
 async function openReturnReview() {
   const error = validateReturnForReview({ requireVehiclePlate: false, requirePhotos: false });
   returnValidationMessage = error;
@@ -9146,6 +9353,10 @@ async function submitReturn() {
     showToast(t("operator.returnRecorded", "Return recorded"));
   } catch (error) {
     const code = String(error.payload?.code || "");
+    if (code === "RETURN_SUBMISSION_DRAFT" && error.payload?.draftId) {
+      returnDraftId = String(error.payload.draftId);
+      if (error.payload.draftSaved) returnDirty = false;
+    }
     returnValidationMessage = code === "CROSS_YARD_RETURN_BLOCKED"
       ? tf("operator.returnMustBeProcessedAt", "This return must be processed at {yard}.", { yard: returnYardName(error.payload.requiredReturnLocation) || "-" })
       : code === "ORDER_NOT_FULLY_FULFILLED"
@@ -9870,6 +10081,7 @@ app.addEventListener("click", async (event) => {
     if (button.dataset.action === "start-receive") return startReceipt();
     if (button.dataset.action === "refresh-receipt-posting") return refreshReceiptPostingStatus();
     if (button.dataset.action === "cancel-receive") {
+      if (receiptOrder?.posting?.receiveBlocked || receiptSubmitting) return continueOperatorWork();
       stopReceiptCamera();
       window.clearInterval(receiptProgressTimer ?? undefined);
       receiptProgressTimer = null;
@@ -10059,8 +10271,10 @@ app.addEventListener("click", async (event) => {
     if (button.dataset.action === "set-packed") return await setOrderStatus("packed");
     if (button.dataset.action === "edit-reload-packing") return editReloadPacking();
     if (button.dataset.action === "refresh-load-posting") return refreshLoadPostingStatus();
+    if (button.dataset.action === "continue-operator-work") return continueOperatorWork();
     if (button.dataset.action === "start-fulfill") return startFulfillment();
     if (button.dataset.action === "cancel-fulfill") {
+      if (fulfillmentOrder?.posting?.loadBlocked || fulfillmentSubmitting) return continueOperatorWork();
       stopFulfillmentCamera();
       currentModule = currentModule === "customer-pickup-load" ? "customer-pickup" : (fulfillmentReturnModule || "delivery");
       fulfillmentOrder = null;
@@ -10337,29 +10551,7 @@ app.addEventListener("change", async (event) => {
   return;
 });
 
-app.addEventListener("submit", async (event) => {
-  const form = event.target.closest("[data-form='login']");
-  if (!form) return;
-  event.preventDefault();
-  try {
-    const result = await publicApi("/api/auth/login", {
-      method: "POST",
-      body: JSON.stringify({
-        username: document.getElementById("loginUsername").value,
-        password: document.getElementById("loginPassword").value
-      })
-    });
-    operator = result.operator;
-    storeOperatorSession(result.token, operator);
-    if (!operatorRoleAllowed(operator)) {
-      window.location.replace(staffRoleHome(operator.role));
-      return;
-    }
-    reloadOperatorWorkspace();
-  } catch (error) {
-    renderLogin("Invalid username or password.");
-  }
-});
+
 
 /** @type {any} */
 const operatorBackgroundQueue = /** @type {any} */ (window).OperatorPhotoOutbox;
@@ -10401,7 +10593,9 @@ const operatorInventory = window.MBBSOperatorInventory.create({
   location: () => locationId, actor: () => operator,
   locationLabel: () => `${t("common.location", "Location")} ${currentLocation()?.text || locationId}`,
   back: () => openModule("inventory"), toast: showToast,
-  upload: uploadOperatorPhoto, photo: photoImgAttributes, preview: openPhotoLightbox
+  upload: uploadOperatorPhoto, photo: photoImgAttributes, preview: openPhotoLightbox,
+  nativeCamera: useBasicCameraCapture, captureNativePhoto: captureNativeCameraPhoto,
+  detachCameraPreviews, active: () => currentModule === "damage" && Boolean(operator)
 });
 window.addEventListener("pagehide", () => operatorInventory.close());
 const operatorDisplaySettings = window.OperatorDisplaySettings.create({
@@ -10413,10 +10607,6 @@ window.OperatorOrderKeypad.install(app);
 
 async function boot() {
   if (!authToken) {
-    if (localStorage.getItem("mbbs.driver.token")) {
-      window.location.replace("/driver");
-      return;
-    }
     const bootstrap = await publicApi("/api/auth/bootstrap-needed").catch(() => ({ needed: false }));
     return renderLogin(bootstrap.needed ? "No operator account yet. Open /control to create the first admin account." : "");
   }
@@ -10441,7 +10631,15 @@ async function boot() {
 
 window.addEventListener("focus", () => { refreshOperatorAccess().catch(() => {}); operatorDisplaySettings.refresh()?.catch(() => {}); });
 document.addEventListener("visibilitychange", () => {
-  if (document.visibilityState === "visible") { refreshOperatorAccess().catch(() => {}); operatorDisplaySettings.refresh()?.catch(() => {}); }
+  if (document.visibilityState === "hidden") {
+    stopOperatorPhotoCameras();
+    stopPickupScannerCamera();
+    stopReturnScannerCamera();
+    return;
+  }
+  refreshOperatorAccess().catch(() => {});
+  operatorDisplaySettings.refresh()?.catch(() => {});
+  if (operatorPhotoCameraContext() || currentModule === "damage") render();
 });
 window.addEventListener("storage", (event) => {
   if ([STAFF_TOKEN_KEY, TOKEN_KEY].includes(event.key) && readOperatorToken() !== authToken) reloadOperatorWorkspace();

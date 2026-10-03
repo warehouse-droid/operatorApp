@@ -1,0 +1,6 @@
+[
+  "public/dispatch.js",
+  "public/dispatch.html",
+  "src/dispatch-pickup-visits.js",
+  "src/scm-dependency-plan-reconciler.js"
+]

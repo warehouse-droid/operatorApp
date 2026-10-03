@@ -1,5 +1,6 @@
 import { query } from "./db.js";
 import { evaluateExecutedPrefixPolicy } from "./dispatch-planner-performance.js";
+import { prepareDispatchExecutedOrderComparison } from "./dispatch-executed-order-review-repository.js";
 
 function planIdentity(previousPlan = {}, nextPlan = {}) {
   return String(
@@ -23,9 +24,11 @@ export async function evaluateDispatchExecutedPrefixPreservation({
        FROM driver_job_records
       WHERE plan_id = $1
         AND status IN ('in_progress', 'complete')
+        AND mbt_assignment_withdrawn_at IS NULL
       ORDER BY id`,
     [planId]
   );
+  previousPlan = await prepareDispatchExecutedOrderComparison({ previousPlan, nextPlan, activity: activity.rows });
   return evaluateExecutedPrefixPolicy({
     previousPlan,
     nextPlan,

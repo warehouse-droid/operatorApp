@@ -128,6 +128,7 @@ function canonicalOrder(snapshot) {
     status: snapshot.status,
     status_text: snapshot.statusText,
     memo: snapshot.memo,
+    netsuite_note: snapshot.note ?? null,
     expected_delivery_date: snapshot.expectedDeliveryDate,
     foreigntotal: snapshot.foreignTotal,
     destination_location_id: destinations.length === 1 ? destinations[0][0] : null,

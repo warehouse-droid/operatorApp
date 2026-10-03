@@ -1,8 +1,9 @@
 // A durable plan is saved by the service before either order is touched. Retries
 // accept only the original or target quantity, and never apply a quantity delta.
+import { specialRestUnitId } from './special-stock-netsuite-adapter.js';
 /**
  * @typedef {{id:number,kind:string}} OrderIdentity
- * @typedef {{line:number,item:{id:string|number},quantity:number,units?:{id:string|number},rate?:string|number|null,description?:string}} RemoteLine
+ * @typedef {{line:number,item:{id:string|number},quantity:number,units?:string|number|{id:string|number},rate?:string|number|null,description?:string}} RemoteLine
  * @typedef {{line:number,itemId:number,quantity:number,unitId:number|null,rate:number|null,description:string}} LineSnapshot
  * @typedef {{caseLineId:number,remoteLineId:number,itemId:number,quantity:number,toQuantity:number,unitId:number,rate:number,description:string,line?:number}} ExpectedLine
  * @typedef {{caseLineId:number,remoteLineId:number,line:number,toQuantity:number}} QuantityChange
@@ -35,8 +36,9 @@ function recordPath(order) {
 function snapshot(line) {
   const rate = line.rate == null || line.rate === '' ? null : Number(line.rate);
   if (rate !== null && !Number.isFinite(rate)) throw conflict('A remote rate could not be verified.');
+  const unitId = specialRestUnitId(line.units);
   return { line: id(line.line), itemId: id(line.item?.id), quantity: Number(line.quantity),
-    unitId: line.units?.id ? id(line.units.id) : null, rate, description: String(line.description || '') };
+    unitId: unitId ? id(unitId) : null, rate, description: String(line.description || '') };
 }
 /** @template {{remoteLineId:number,line?:number}} T
  * @param {OrderIdentity} order @param {T[]} changes @param {Boundary} boundary */

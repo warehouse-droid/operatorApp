@@ -1,5 +1,5 @@
 import { dispatchDependencyOrderRefs } from "./yard-dependency-structure.js";
-import { dispatchLoadProtectedBoundary, dispatchRequiredPickupVisitLocations } from "./dispatch-pickup-visits.js";
+import { dispatchLoadProtectedBoundary, dispatchPickupOverridesMatch, dispatchRequiredPickupVisitLocations } from "./dispatch-pickup-visits.js";
 
 function text(value) {
   return String(value ?? "").trim();
@@ -274,9 +274,10 @@ function reconcileLoad(load = {}, ordersByRef, affected, plan, activity) {
     const isSov = dispatchDependencyOrderRefs(order).some(ref => /^SOV/iu.test(ref));
     for (const location of locations) {
       const priorPickup = stops.slice(0, index).find((stop) => stop?.type === "pick" && samePlace(stop.location, location)
+        && dispatchPickupOverridesMatch(ordersByRef.get(text(stop.orderId || stop.orderRefs?.[0]).toLowerCase()), order)
         && (!isSov || !protectedIds.has(text(stop.id)) || refs(stop.orderRefs || [stop.orderId]).includes(targetRef)));
       if (priorPickup) {
-        if (isSov && !protectedIds.has(text(priorPickup.id)) && Array.isArray(priorPickup.orderRefs)) {
+        if ((isSov || text(order.pickupAddressOverride)) && !protectedIds.has(text(priorPickup.id)) && Array.isArray(priorPickup.orderRefs)) {
           priorPickup.orderRefs = refs([...priorPickup.orderRefs, targetRef]);
         }
         if (protectedIds.has(text(priorPickup.id))) {continue;}
@@ -289,7 +290,7 @@ function reconcileLoad(load = {}, ordersByRef, affected, plan, activity) {
         id: `scm-dependency-pick-${safeIdPart(targetRef)}-${safeIdPart(location)}-${index}`,
         type: "pick",
         orderId: targetRef,
-        ...(isSov ? { orderRefs: [targetRef] } : {}),
+        ...(isSov || text(order.pickupAddressOverride) ? { orderRefs: [targetRef] } : {}),
         location,
         dependencyManaged: true,
         dependencySource: "scm-dependency-management",

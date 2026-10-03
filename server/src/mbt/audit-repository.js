@@ -60,9 +60,9 @@ function jsonEvidence(value, secretValues) {
   ));
 }
 
-/** @param {unknown} value @param {string} label */
-function requiredRevision(value, label) {
-  if (!Number.isSafeInteger(value) || Number(value) < 1) {
+/** @param {unknown} value @param {string} label @param {number} [minimum] */
+function requiredRevision(value, label, minimum = 1) {
+  if (!Number.isSafeInteger(value) || Number(value) < minimum) {
     throw new TypeError(`An audit ${label} is required.`);
   }
   return Number(value);
@@ -108,7 +108,8 @@ function prepareAuditRow({
     beforeState: jsonEvidence(audit.beforeState, secretValues),
     afterState: jsonEvidence(audit.afterState, secretValues),
     reason: requiredText(audit.reason, "reason"),
-    revisionBefore: requiredRevision(audit.revisionBefore, "revision before"),
+    revisionBefore: requiredRevision(audit.revisionBefore, "revision before",
+      audit.entityType === "dispatch_plan" && audit.source === "mbt-bin-planning" ? 0 : 1),
     revisionAfter: requiredRevision(audit.revisionAfter, "revision after"),
     correlationId: requiredText(correlationId, "correlation ID"),
     requestId: requiredText(requestId, "request ID"),

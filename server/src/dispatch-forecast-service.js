@@ -329,7 +329,7 @@ function laneVisitRows(plan, laneEntries, records, planningProfiles = new Map())
 
 function expectedLaneJobs(plan, laneKey) {
   if (!laneKey || laneKey.startsWith("unassigned:")) return [];
-  return planJobsForDriver(plan, laneKey);
+  return planJobsForDriver(plan, laneKey, { allowBin: true });
 }
 
 function expectedTravelJobs(plan, laneKey) {

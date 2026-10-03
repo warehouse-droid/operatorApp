@@ -46,19 +46,21 @@ function stop(id, type, orderId, extras = {}) {
   return { id, loadId: "LOAD", type, orderId, location: "3445", ...extras };
 }
 
-function planner(planOrders, stops = []) {
+export function planner(planOrders, stops = []) {
   const load = { id: "LOAD", pickupVisitSchemaVersion: 1, stops: structuredClone(stops) };
   const trucks = [{ id: "TRUCK", loads: [load] }];
   const orderById = (id) => planOrders.find((order) => order.id === id);
   const stopHasDriverActivity = (_load, entry) => ["complete", "in_progress"].includes(entry.status);
   const helpers = [
+    "isMbtPlanningLoad", "isPlanningLoadReadOnly",
     "dispatchLocationHierarchyRoot", "normalizedPickupLocation", "sameDispatchLocation",
     "uniqueDispatchLocationLabels", "orderRequiresPickupLocation", "pickupStopOrderRefs",
+    ...(source.includes("function pickupStopMatchesOrder(") ? ["pickupStopMatchesOrder"] : []),
     "pickupStopIncludesOrder", "pickupOrdersForStop", "isMbbsSpecialLinkLine",
     "isOperationalDispatchItem", "itemHasQuantity", "tooltipItemsForOrder",
     "poRouteProjectionForOrder", "routeItemsForOrder", "positiveBalance", "isOwnYardCode",
-    "directPickupEntriesForLocation", "directPickupItemsForLocation", "poPickupEntriesForLocation",
-    "poPickupItemsForLocation", "directPickupAllocatedForItem", "itemForPickupLocation",
+    "retainedDirectPickupManifest", "groupPickupSourceItems", "directPickupEntriesForLocation", "directPickupItemsForLocation", "poPickupEntriesForLocation",
+    "poPickupItemsForLocation", "directPickupAllocatedForItem", "spreadDirectPickupAllocation", "itemForPickupLocation",
     "requiredPickupLocations", "opaqueDispatchStopId", "materializePickupVisitOrderRefs",
     "driverActivityDetails", "dispatchEditableRouteBoundary", "lateOrderRoutePlacement",
     "makePickupStop", "enablePickupVisitSchema", "ensurePickupStops", "addOrderToLoad",

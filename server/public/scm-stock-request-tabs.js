@@ -1,8 +1,9 @@
 (() => {
-  const types = ['regular', 'special', 'aggregate'];
+  const types = ['special', 'regular', 'waitlist', 'aggregate'];
   const selected = new URLSearchParams(location.search).get('tab');
   const t = label => window.MBBSAggregateI18n?.text(label) || label;
-  let active = types.includes(selected) ? selected : 'regular';
+  let opened = false;
+  let active = types.includes(selected) ? selected : 'special';
   window.MBBSStockRequestTabs = {
     get active() { return active; },
     onOpen: null,
@@ -20,6 +21,8 @@
     },
     async open(type) {
       if (!types.includes(type)) { return; }
+      if (opened && active === type) return;
+      opened = true;
       active = type;
       document.getElementById('scmStockRequestApp')?.classList.remove('aggregate-shell');
       document.body.classList.remove('aggregate-module-active');
@@ -39,7 +42,7 @@
     if (!button || !['ArrowLeft', 'ArrowRight', 'Home', 'End'].includes(event.key)) { return; }
     event.preventDefault();
     const current = types.indexOf(button.dataset.stockRequestTab);
-    const next = event.key === 'Home' ? 0 : event.key === 'End' ? 2 : (current + (event.key === 'ArrowRight' ? 1 : 2)) % 3;
+    const next = event.key === 'Home' ? 0 : event.key === 'End' ? types.length-1 : (current + (event.key === 'ArrowRight' ? 1 : types.length-1)) % types.length;
     window.MBBSStockRequestTabs.open(types[next]);
   });
 })();

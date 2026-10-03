@@ -16,6 +16,15 @@ function barcode(doc,value,x,y,width,height){
 }
 const money=n=>new Intl.NumberFormat('en-CA',{style:'currency',currency:'CAD'}).format(n/100);
 const rate=n=>new Intl.NumberFormat('en-CA',{style:'currency',currency:'CAD',minimumFractionDigits:2,maximumFractionDigits:6}).format(Number(n));
+function quoteLineAmount(line){return line.grossAmountMinor??line.amountMinor;}
+function quoteTotalRows(totals){
+ const rows=[['Subtotal',totals.subtotalMinor,false],[`HST (${totals.taxBps/100}%)`,totals.taxMinor,false],['Total CAD',totals.totalMinor,true]];
+ if(Number.isSafeInteger(totals.discountMinor)&&totals.discountMinor>0){rows.splice(0,1,
+  ['Subtotal before discount',totals.grossSubtotalMinor,false],
+  [`Total Discount (${totals.discountPercent}%)`,totals.discountMinor,false],
+  ['Subtotal after discount',totals.subtotalMinor,false]);}
+ return rows;
+}
 export function companyQuotePdf(quote,company) {
  const s=quote.snapshot,combined=s.schemaVersion===3;
  if(company&&(!COMPANIES.includes(company)||combined&&!s.companies[company]||!combined&&company!==s.company)){return Promise.reject(fail('This revision has no document for that company.',404));}
@@ -59,18 +68,34 @@ function renderCompany(doc,quote){
    doc.rect(x,110,142,18).fill('#d4d4d4');text(label,x+5,113,132,8,true);text(body,x+5,132,132,8);infoBottom=Math.max(infoBottom,doc.y);
   }
   let y=Math.max(207,infoBottom+18);
-  const tableHeader=()=>{doc.rect(36,y,540,23).fill('#e4e4e4');for(const [label,x,w,align] of [['Quantity',40,51,'right'],['UOM',98,38,'left'],['Item',142,256,'left'],['Rate',404,72,'right'],['Amount',482,89,'right']]){text(label,x,y+5,w,8,true,align);}y+=28;};
+  const packing=s.showPackQuantities===true;
+  const columns=packing
+   ? [['Quantity',40,45,'right'],['UOM',91,31,'left'],['Item',128,174,'left'],['Rate',308,57,'right'],['Amount',371,69,'right'],['PLT',446,27,'right'],['SEC',479,27,'right'],['LYR',512,27,'right'],['PCS',545,27,'right']]
+   : [['Quantity',40,51,'right'],['UOM',98,38,'left'],['Item',142,256,'left'],['Rate',404,72,'right'],['Amount',482,89,'right']];
+  const tableHeader=()=>{doc.rect(36,y,540,23).fill('#e4e4e4');for(const [label,x,w,align] of columns){text(label,x,y+5,w,packing?7:8,true,align);}y+=28;};
   const newPage=()=>{doc.addPage();y=58;tableHeader();};
   tableHeader();
   for(const line of s.lines){
-   doc.font('regular').fontSize(9);const height=Math.max(30,doc.heightOfString(line.description,{width:254})+24);
+   const hasSku=String(line.sku??'').trim().length>0,descriptionOffset=hasSku?14:0;
+   const cells=[line.quantity,line.unit,line.description,rate(line.unitRate),money(quoteLineAmount(line)),
+    ...(packing?['palletQty','sectionQty','layerQty','pieceQty'].map(field=>String(line.packQuantities?.[field]??'')):[])];
+   doc.font('regular').fontSize(9);
+   const height=packing?Math.max(30,...cells.map((value,i)=>{
+    doc.font('regular').fontSize(i===2?9:8);
+    return doc.heightOfString(String(value??''),{width:columns[i][2]-2,lineGap:1})+(i===2?descriptionOffset+10:8);
+   })):Math.max(30,doc.heightOfString(line.description,{width:254})+descriptionOffset+10);
    if(y+height>675){newPage();}
-   text(line.quantity,40,y,51,9,false,'right');text(line.unit,98,y,38,8);text(line.sku,142,y,254,9,true);text(line.description,142,y+14,254,9);
-   text(rate(line.unitRate),404,y,72,9,false,'right');text(money(line.amountMinor),482,y,89,9,false,'right');y+=height;
+   for(const [i,value] of cells.entries()){
+    const [,x,width,align]=columns[i];
+    if(i===2){if(hasSku){text(line.sku,x,y,width-2,9,true);}text(value,x,y+descriptionOffset,width-2,9);}
+    else text(value,x,y,width,packing||i===1?8:9,false,align);
+   }
+   y+=height;
    doc.moveTo(36,y-4).lineTo(576,y-4).strokeColor('#ddd').lineWidth(.5).stroke();
   }
-  if(y+80>675){doc.addPage();y=58;}y+=8;
-  for(const [label,value,total] of [['Subtotal',totals.subtotalMinor,false],[`HST (${totals.taxBps/100}%)`,totals.taxMinor,false],['Total CAD',totals.totalMinor,true]]){
+  const totalRows=quoteTotalRows(totals);
+  if(y+totalRows.length*24+8>675){doc.addPage();y=58;}y+=8;
+  for(const [label,value,total] of totalRows){
    if(total){doc.rect(36,y-2,540,24).fill('#e4e4e4');}
    text(label,330,y+2,143,9,true,'right');text(money(value),482,y+2,89,9,total,'right');y+=24;
   }

@@ -6,6 +6,7 @@ import {
 } from "./dispatch-load-assignment.js";
 import { applyDispatchPlanDelta } from "./dispatch-planner-optimization.js";
 import { dispatchExecutedStopFingerprint } from "./dispatch-pickup-visits.js";
+import { describeExecutedPrefixConflicts } from "./dispatch-executed-order-review.js";
 
 const PLAN_OWNED_TYPES = new Set(["CO", "CUSTOM", "GROUP", "SPLIT"]);
 const PHYSICAL_STOP_TYPES = new Set([
@@ -742,7 +743,7 @@ function routeLoadMetadata(row = null) {
     truckPlate: row.truckPlate,
     switchYard: row.switchYard,
     parkingSpot: row.parkingSpot,
-    driverSequence: row.driverSequence,
+    // The lane-prefix identity check protects actual load order, not number gaps.
     plannedStartMinute: row.plannedStartMinute,
     handoffTravelMinutes: row.handoffTravelMinutes,
     handoffTravelFrom: row.handoffTravelFrom,
@@ -865,7 +866,7 @@ export function evaluateExecutedPrefixPolicy({ previousPlan = {}, nextPlan = {},
     }
   }
   conflicts.push(...routeConflicts);
-  return { allowed: conflicts.length === 0, conflicts };
+  return { allowed: conflicts.length === 0, conflicts: describeExecutedPrefixConflicts(previousPlan, nextPlan, conflicts, activity) };
 }
 
 export function resolveHistoricalPlanOrderIdentity({ plan = {}, orderRef: requestedRef = "" } = {}) {

@@ -1,0 +1,10 @@
+[
+  "src/boss-approval-repository.js",
+  "src/auth-repository.js",
+  "public/boss.js",
+  "public/boss.css",
+  "public/boss.html",
+  "public/control.js",
+  "public/admin.html",
+  "public/control.html"
+]

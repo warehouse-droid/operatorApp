@@ -1,4 +1,4 @@
-const CACHE='mbbs-field-sales-shell-v14';
+const CACHE='mbbs-field-sales-shell-v15';
 const SHELL=['/field-sales/netsuite-customer-picker.js','/field-sales/customer-search.js','/field-sales/quote-drafts.js','/field-sales/customers.js','/field-sales/identity.js','/field-sales/','/field-sales/index.html','/field-sales/app.js','/field-sales/ui.js','/field-sales/planner.js','/field-sales/planner-data.js','/field-sales/lead-policy.js','/field-sales/pricing.js','/field-sales/item-autocomplete.js','/field-sales/quotes.js','/field-sales/visiting.js','/field-sales/settings.js','/field-sales/offline.js','/field-sales/domain.js','/field-sales/styles.css','/field-sales/icon.svg','/field-sales/manifest.webmanifest'];
 self.addEventListener('install',event=>event.waitUntil(caches.open(CACHE).then(cache=>cache.addAll(SHELL))));
 self.addEventListener('activate',event=>event.waitUntil((async()=>{for(const key of await caches.keys()){if(key.startsWith('mbbs-field-sales-shell-')&&key!==CACHE){await caches.delete(key);}}await self.clients.claim();})()));

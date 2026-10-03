@@ -1,3 +1,4 @@
+import { normalizeRegularLeadHours, normalizeRegularApprovalMinutes } from '../public/regular-stock-input.js';
 import { query } from "./db.js";
 import { writeAudit } from "./auth-repository.js";
 import { listSmartScmForecastRuns, listSmartScmForecasts, runSmartScmForecast } from "./smart-scm-forecast-repository.js";
@@ -21,6 +22,9 @@ function number(value, fallback = 0) {
 
 function publicSettings(row) {
   return {
+    regularStockLeadHours: Number(row.regular_stock_lead_hours ?? 5),
+    regularStockAutoApprovalEnabled: row.regular_stock_auto_approval_enabled ?? true,
+    regularStockApprovalMinutes: Number(row.regular_stock_approval_minutes ?? 15),
     executionMode: row.execution_mode,
     forecastMode: row.forecast_mode,
     dailyEnabled: Boolean(row.daily_enabled),
@@ -60,6 +64,10 @@ export async function updateSmartScmSettings(values = {}, operatorId = null) {
   const currentResult = await query("SELECT * FROM scm_smart_settings WHERE id = 1");
   if (!currentResult.rowCount) throw new Error("Smart SCM settings are missing. Run migrations first.");
   const current = currentResult.rows[0];
+  const regularStockLeadHours = normalizeRegularLeadHours(values.regularStockLeadHours === undefined ? current.regular_stock_lead_hours : values.regularStockLeadHours);
+  const regularStockAutoApprovalEnabled=values.regularStockAutoApprovalEnabled===undefined?current.regular_stock_auto_approval_enabled:values.regularStockAutoApprovalEnabled;
+  if(typeof regularStockAutoApprovalEnabled!=='boolean')throw Object.assign(new Error('Stock request auto-approval must be enabled or disabled.'),{status:400});
+  const regularStockApprovalMinutes=normalizeRegularApprovalMinutes(values.regularStockApprovalMinutes===undefined?current.regular_stock_approval_minutes:values.regularStockApprovalMinutes);
   const executionMode = values.executionMode ?? current.execution_mode;
   const forecastMode = values.forecastMode ?? current.forecast_mode;
   const dailyEnabled = values.dailyEnabled === undefined ? current.daily_enabled : Boolean(values.dailyEnabled);
@@ -152,16 +160,19 @@ export async function updateSmartScmSettings(values = {}, operatorId = null) {
             skip_12441_enabled = $23,
             inventory_planning_mode = $24,
             updated_by = $25,
+            regular_stock_lead_hours = $26,
+            regular_stock_auto_approval_enabled = $27,
+            regular_stock_approval_minutes = $28,
             updated_at = now()
       WHERE id = $1
       RETURNING *`,
-    [1, executionMode, forecastMode, dailyEnabled, dailyTime, timeZone, vendorResponseSlaHours, truckCapacityLbs, fullLoadRatio, holdLoadRatio, formulaAverageWeeks, stockoutBenchmarkWeeks, deliverySafetyFactor, pickupSafetyFactor, zeroDemandCoverageEnabled, zeroDemandPickupOrderCount, zeroDemandDeliveryOrderCount, coverageOrderPercentile, coverageHistoryWeeks, coveragePriorStrengthOrders, JSON.stringify(modelActiveSegments), JSON.stringify(routeMatrix), skip12441Enabled, inventoryPlanningMode, operatorId]
+    [1, executionMode, forecastMode, dailyEnabled, dailyTime, timeZone, vendorResponseSlaHours, truckCapacityLbs, fullLoadRatio, holdLoadRatio, formulaAverageWeeks, stockoutBenchmarkWeeks, deliverySafetyFactor, pickupSafetyFactor, zeroDemandCoverageEnabled, zeroDemandPickupOrderCount, zeroDemandDeliveryOrderCount, coverageOrderPercentile, coverageHistoryWeeks, coveragePriorStrengthOrders, JSON.stringify(modelActiveSegments), JSON.stringify(routeMatrix), skip12441Enabled, inventoryPlanningMode, operatorId, regularStockLeadHours, regularStockAutoApprovalEnabled, regularStockApprovalMinutes]
   );
   await writeAudit({
     actorOperatorId: operatorId,
     source: "smart_scm",
     action: "smart_scm.settings.update",
-    details: { executionMode, forecastMode, dailyEnabled, dailyTime, timeZone, vendorResponseSlaHours, truckCapacityLbs, fullLoadRatio, holdLoadRatio, formulaAverageWeeks, stockoutBenchmarkWeeks, deliverySafetyFactor, pickupSafetyFactor, zeroDemandCoverageEnabled, zeroDemandPickupOrderCount, zeroDemandDeliveryOrderCount, coverageOrderPercentile, coverageHistoryWeeks, coveragePriorStrengthOrders, skip12441Enabled, inventoryPlanningMode, modelActiveSegments, routeMatrix }
+    details: { regularStockLeadHours, regularStockAutoApprovalEnabled, regularStockApprovalMinutes, executionMode, forecastMode, dailyEnabled, dailyTime, timeZone, vendorResponseSlaHours, truckCapacityLbs, fullLoadRatio, holdLoadRatio, formulaAverageWeeks, stockoutBenchmarkWeeks, deliverySafetyFactor, pickupSafetyFactor, zeroDemandCoverageEnabled, zeroDemandPickupOrderCount, zeroDemandDeliveryOrderCount, coverageOrderPercentile, coverageHistoryWeeks, coveragePriorStrengthOrders, skip12441Enabled, inventoryPlanningMode, modelActiveSegments, routeMatrix }
   });
   return publicSettings(result.rows[0]);
 }

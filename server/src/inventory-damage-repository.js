@@ -33,12 +33,17 @@ export async function verifyDamagePhotos(references,operatorId,{readPhoto=readAr
   }
 }
 const reportSql=`SELECT r.*,m.location_id,m.month,m.transfer_id,m.transfer_ref,m.external_id,
+  (SELECT e.details->>'replacementReportId' FROM inventory_damage_events e WHERE e.report_id=r.id
+    AND e.action='superseded' ORDER BY e.id DESC LIMIT 1) AS superseded_by,
   o.display_name AS operator_name,COALESCE((SELECT jsonb_agg(p.photo_reference ORDER BY p.position)
     FROM inventory_damage_photos p WHERE p.report_id=r.id),'[]') AS photos
   FROM inventory_damage_reports r JOIN inventory_damage_months m ON m.id=r.month_id
   LEFT JOIN operators o ON o.id=r.operator_id`;
+function reportState(row) {
+  return row?.superseded_by?{...row,status:'superseded',safe_to_retry:false}:row;
+}
 export async function damageRow(id) {
-  return (await query(`${reportSql} WHERE r.id=$1`,[damageRequestId(id)])).rows[0] || null;
+  return reportState((await query(`${reportSql} WHERE r.id=$1`,[damageRequestId(id)])).rows[0]) || null;
 }
 export async function getDamageReport(actor,id) {
   const row=await damageRow(id);
@@ -85,7 +90,7 @@ export async function damageEvent(id,action,details={}) {
 }
 export async function listDamageReports(actor,locationId,month,{management=false}={}) {
   assertInventoryYard(actor,locationId,management);inventoryMonth(month);
-  return (await query(`${reportSql} WHERE m.location_id=$1 AND m.month=$2 ORDER BY r.created_at DESC,r.id`,[locationId,month])).rows;
+  return (await query(`${reportSql} WHERE m.location_id=$1 AND m.month=$2 ORDER BY r.created_at DESC,r.id`,[locationId,month])).rows.map(reportState);
 }
 export async function assertDamagePhotoAccess(actor,reference) {
   const key=normalizeR2Key(reference),parts=key.split('/');

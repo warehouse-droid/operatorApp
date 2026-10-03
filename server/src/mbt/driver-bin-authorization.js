@@ -55,13 +55,22 @@ export async function authorizeMbtDriverBinProjection({
   const result = await query(
     `SELECT pilot_scope_id::text, plan_date::text, lower(driver_login) AS driver_login,
             truck_id::text, contract_id::text, service_visit_id::text,
-            authorized_at, expires_at
+            authorized_at, expires_at, 0::bigint AS generation
        FROM mbt_driver_pilot_scope
       WHERE plan_date = $1::date
         AND lower(driver_login) = $2
         AND active = true
         AND revoked_at IS NULL
         AND expires_at > now()
+        AND EXISTS (SELECT 1 FROM mbt_service_visits v WHERE v.service_visit_id=mbt_driver_pilot_scope.service_visit_id AND v.planning_generation=0)
+      UNION ALL
+      SELECT a.assignment_id::text,a.plan_date::text,lower(d.login),a.truck_id::text,v.contract_id::text,
+        a.service_visit_id::text,a.released_at,NULL::timestamptz,a.generation
+      FROM mbt_bin_planning_assignments a JOIN dispatch_drivers d ON d.id=a.driver_id
+      JOIN mbt_service_visits v ON v.service_visit_id=a.service_visit_id AND v.planning_generation=a.generation
+      WHERE a.plan_date=$1::date AND lower(d.login)=$2 AND d.active
+        AND a.released_at IS NOT NULL AND a.withdrawn_at IS NULL
+        AND v.dispatch_plan_id=a.plan_id::text AND v.planned_driver_id=a.driver_id AND v.planned_truck_id=a.truck_id
       ORDER BY service_visit_id, pilot_scope_id`,
     [date, login]
   );
@@ -73,7 +82,8 @@ export async function authorizeMbtDriverBinProjection({
     contractId: String(row.contract_id),
     visitId: String(row.service_visit_id),
     authorizedAt: row.authorized_at,
-    expiresAt: row.expires_at
+    expiresAt: row.expires_at,
+    generation: Number(row.generation || 0)
   }));
   await capabilityAuthorizer({
     capability: "driverExecution",
@@ -116,6 +126,7 @@ export function mbtDriverPilotScopeCoversJobs(jobs, scopes, context) {
         && (!jobTruckId || normalizedText(scope.truckId) === jobTruckId)
         && (!assignedTruckId || normalizedText(scope.truckId) === assignedTruckId)
         && normalizedText(scope.visitId || scope.serviceVisitId) === normalizedText(job.mbt.visitId)
+        && (!scope.generation || Number(scope.generation) === Number(job.mbt.planningGeneration))
         && (!contractId || normalizedText(scope.contractId) === contractId)
       );
   });

@@ -1,7 +1,8 @@
 import { normalizeOperatorYardLocationIds } from "./operator-yard-access.js";
 import crypto from "node:crypto";
+import { normalizeAccountEmail } from "./account-email.js";
 import { promisify } from "node:util";
-import { query } from "./db.js";
+import { query, withTransaction } from "./db.js";
 import { trackSemanticAudit } from "./audit-context.js";
 
 const scrypt = promisify(crypto.scrypt);
@@ -15,7 +16,8 @@ export const OPERATOR_ROLES = Object.freeze([
   "sales",
   "field_sales",
   "mbt_frontdesk",
-  "mbt_billing"
+  "mbt_billing",
+  "boss"
 ]);
 export const SALES_YARD_LOCATION_IDS = Object.freeze([1, 28, 15, 26]);
 
@@ -47,6 +49,7 @@ export function operatorHomeRoute(value) {
   const roles = new Set((typeof value === "object" && Array.isArray(value?.roles)
     ? value.roles
     : [role]).map(normalizeRole));
+  if (role === "boss") return "/boss";
   if (role === "admin") return "/admin";
   if (role === "dispatcher") return "/dispatch";
   if (role === "scm" || role === "scm_staff") return "/scm";
@@ -72,6 +75,7 @@ function publicOperator(row) {
   return {
     id: row.id,
     username: row.username,
+    email: row.email || "",
     display_name: row.display_name,
     role: authority.role,
     roles: authority.roles,
@@ -106,7 +110,8 @@ export async function hasOperators() {
   return result.rowCount > 0;
 }
 
-export async function createOperator({ username, displayName, password, role = "operator", roles = null, yardLocationIds = [], operatorYardLocationIds = [] }) {
+export async function createOperator({ username, displayName, email = "", password, role = "operator", roles = null, yardLocationIds = [], operatorYardLocationIds = [] }) {
+  const cleanEmail = normalizeAccountEmail(email);
   const cleanUsername = String(username || "").trim().toLowerCase();
   const cleanDisplayName = String(displayName || username || "").trim();
   if (!cleanUsername) throw new Error("Username is required.");
@@ -119,17 +124,17 @@ export async function createOperator({ username, displayName, password, role = "
   const { salt, hash } = await hashPassword(String(password));
   const id = crypto.randomUUID();
   const result = await query(
-    `INSERT INTO operators (id, username, display_name, password_hash, password_salt, role, roles, yard_location_ids, operator_yard_location_ids)
-     VALUES ($1, $2, $3, $4, $5, $6, $7::text[], $8::integer[], $9::integer[])
-     RETURNING id, username, display_name, role, roles, yard_location_ids, operator_yard_location_ids, active, created_at, updated_at, ${aggregateAccessSelect()}`,
-    [id, cleanUsername, cleanDisplayName, hash, salt, authority.role, authority.roles, yards, operatorYards]
+    `INSERT INTO operators (id, username, display_name, password_hash, password_salt, role, roles, yard_location_ids, operator_yard_location_ids, email)
+     VALUES ($1, $2, $3, $4, $5, $6, $7::text[], $8::integer[], $9::integer[], $10)
+     RETURNING id, username, display_name, email, role, roles, yard_location_ids, operator_yard_location_ids, active, created_at, updated_at, ${aggregateAccessSelect()}`,
+    [id, cleanUsername, cleanDisplayName, hash, salt, authority.role, authority.roles, yards, operatorYards, cleanEmail]
   );
   return publicOperator(result.rows[0]);
 }
 
 export async function listOperators() {
   const result = await query(
-    `SELECT id, username, display_name, role, roles, yard_location_ids, operator_yard_location_ids, active, created_at, updated_at, ${aggregateAccessSelect()}
+    `SELECT id, username, display_name, email, role, roles, yard_location_ids, operator_yard_location_ids, active, created_at, updated_at, ${aggregateAccessSelect()}
      FROM operators
      ORDER BY active DESC, display_name ASC`
   );
@@ -142,7 +147,7 @@ export async function setOperatorActive(id, active) {
      SET active = $2,
          updated_at = now()
      WHERE id = $1
-     RETURNING id, username, display_name, role, roles, yard_location_ids, operator_yard_location_ids, active, created_at, updated_at, ${aggregateAccessSelect()}`,
+     RETURNING id, username, display_name, email, role, roles, yard_location_ids, operator_yard_location_ids, active, created_at, updated_at, ${aggregateAccessSelect()}`,
     [id, Boolean(active)]
   );
   return publicOperator(result.rows[0]);
@@ -157,7 +162,7 @@ export async function updateOperatorPassword(id, password) {
          password_salt = $3,
          updated_at = now()
      WHERE id = $1
-     RETURNING id, username, display_name, role, roles, yard_location_ids, operator_yard_location_ids, active, created_at, updated_at, ${aggregateAccessSelect()}`,
+     RETURNING id, username, display_name, email, role, roles, yard_location_ids, operator_yard_location_ids, active, created_at, updated_at, ${aggregateAccessSelect()}`,
     [id, hash, salt]
   );
   await query("DELETE FROM operator_sessions WHERE operator_id = $1", [id]);
@@ -181,17 +186,18 @@ export async function updateOperatorRoles(id, { role, roles, yardLocationIds, op
          operator_yard_location_ids = $5::integer[],
          updated_at = now()
      WHERE id = $1
-     RETURNING id, username, display_name, role, roles, yard_location_ids, operator_yard_location_ids, active, created_at, updated_at, ${aggregateAccessSelect()}`,
+     RETURNING id, username, display_name, email, role, roles, yard_location_ids, operator_yard_location_ids, active, created_at, updated_at, ${aggregateAccessSelect()}`,
     [id, authority.role, authority.roles, yards, operatorYards]
   );
   return publicOperator(result.rows[0]);
 }
 
 export async function loginOperator(username, password) {
+  return withTransaction(async () => {
   const result = await query(
     `SELECT *, ${aggregateAccessSelect()}
      FROM operators
-     WHERE username = $1`,
+     WHERE username = $1 FOR UPDATE`,
     [String(username || "").trim().toLowerCase()]
   );
   const operator = result.rows[0];
@@ -207,12 +213,13 @@ export async function loginOperator(username, password) {
     [tokenHash, operator.id, SESSION_DAYS]
   );
   return { token, operator: publicOperator(operator) };
+  });
 }
 
 export async function getOperatorByToken(token) {
   if (!token) return null;
   const result = await query(
-    `SELECT o.id, o.username, o.display_name, o.role, o.roles, o.yard_location_ids, o.operator_yard_location_ids, o.active, o.created_at, o.updated_at, ${aggregateAccessSelect("o")}
+    `SELECT o.id, o.username, o.display_name, o.email, o.role, o.roles, o.yard_location_ids, o.operator_yard_location_ids, o.active, o.created_at, o.updated_at, ${aggregateAccessSelect("o")}
      FROM operator_sessions s
      INNER JOIN operators o ON o.id = s.operator_id
      WHERE s.token_hash = $1
@@ -344,12 +351,42 @@ const UNIFIED_AUDIT_CTE = `WITH unified_audit AS (
     )) AS details,
     a.occurred_at AS created_at
   FROM mbt_audit_events a
+  UNION ALL
+  SELECT
+    'boss:' || e.id::text AS id,
+    e.id AS legacy_sort_id,
+    'boss_approval'::text AS audit_stream,
+    CASE WHEN e.actor_id IS NULL THEN 'system' ELSE 'operator' END AS actor_type,
+    e.actor_id AS actor_operator_id,
+    COALESCE(e.actor_name, 'NetSuite') AS actor_name,
+    'boss_approvals'::text AS source,
+    'boss.approval.' || e.kind AS action,
+    r.order_id::text AS order_id,
+    r.order_id AS numeric_order_id,
+    NULL::bigint AS line_id,
+    'boss_approval_request'::text AS entity_type,
+    r.id::text AS entity_id,
+    NULL::text AS load_id,
+    NULL::text AS truck_id,
+    NULL::text AS session_id,
+    NULL::bigint AS plan_id,
+    NULL::date AS plan_date,
+    NULL::jsonb AS before_state,
+    NULL::jsonb AS after_state,
+    jsonb_build_object('requestId', r.id, 'cycle', r.cycle,
+      'tranid', e.snapshot->>'tranid', 'decision', e.kind,
+      'snapshotCapturedAt', e.snapshot->>'refreshedAt', 'snapshot', e.snapshot) AS details,
+    e.created_at
+  FROM boss_approval_events e
+  JOIN boss_approval_requests r ON r.id=e.request_id
 ), resolved_audit AS (
   SELECT
     a.*,
     COALESCE(o.username, NULLIF(a.actor_name, '')) AS username,
-    COALESCE(o.display_name, NULLIF(a.actor_name, '')) AS display_name,
+    COALESCE(CASE WHEN a.audit_stream='boss_approval' THEN a.actor_name END,
+      o.display_name, NULLIF(a.actor_name, '')) AS display_name,
     COALESCE(
+      CASE WHEN a.audit_stream='boss_approval' THEN a.details->>'tranid' END,
       so.tranid,
       tr.tranid,
       po.tranid,
@@ -500,4 +537,12 @@ export async function listAuditOptions({
     actors: result.rows[0]?.actors || [],
     actions: result.rows[0]?.actions || []
   };
+}
+
+export async function updateOperatorEmail(id, value) {
+  const email = normalizeAccountEmail(value);
+  const result = await query(`UPDATE operators SET email=$2, updated_at=now() WHERE id=$1
+    RETURNING id, username, display_name, email, role, roles, yard_location_ids, operator_yard_location_ids,
+    active, created_at, updated_at, ${aggregateAccessSelect()}`, [id, email]);
+  return publicOperator(result.rows[0]);
 }

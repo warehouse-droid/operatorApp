@@ -6,6 +6,7 @@ import {
 } from "./dispatch-location.js";
 import { comparableAllocationPlans } from "./dispatch-allocation-item-identity.js";
 import { VOYAGE_DISPATCH_YARD } from "./dispatch-sales-order-locations.js";
+import { retainedDirectPickupManifest,groupPickupSourceItems,spreadDirectPickupAllocation } from './dispatch-retained-link-manifests.js';
 
 const DEFAULT_SWITCH_MINUTES = 10;
 const DEFAULT_OWN_YARDS = ["3445", "2967", "12441", "150", VOYAGE_DISPATCH_YARD.code];
@@ -264,8 +265,9 @@ function dispatchDropItemsForStop(order = {}, stop = {}) {
 }
 
 function dispatchRouteProjection(order = {}) {
-  const projection = order.poRouteProjection ?? order.po_route_projection;
-  return text(order.type || order.orderType || order.order_type).toUpperCase() === "PO"
+  const kind = text(order.type || order.orderType || order.order_type).toUpperCase();
+  const projection = kind === "TO" ? order.toRouteProjection : order.poRouteProjection ?? order.po_route_projection;
+  return ["PO", "TO"].includes(kind)
     && projection
     && Number(projection.version || 0) >= 1
     ? projection
@@ -340,7 +342,8 @@ function normalizedDispatchPickupLocation(value) {
 
 function dispatchPickupEntriesForLocation(order = {}, field, location = "") {
   const wanted = normalizedDispatchPickupLocation(location);
-  return (Array.isArray(order[field]) ? order[field] : [])
+  const entries = field === 'directPickupManifest' ? retainedDirectPickupManifest(order) : order[field];
+  return (Array.isArray(entries) ? entries : [])
     .filter((entry) => normalizedDispatchPickupLocation(entry?.location) === wanted);
 }
 
@@ -368,17 +371,17 @@ function dispatchPoPickupItemsForLocation(order = {}, location = "") {
 function dispatchDirectPickupAllocatedForItem(order = {}, item = {}) {
   const itemId = text(item.itemId ?? item.item_id);
   const sku = text(item.sku || item.itemName || item.name).toLowerCase();
-  const matches = (order.directPickupManifest || []).flatMap((entry) => entry.items || []).filter((entry) => {
+  const matches = retainedDirectPickupManifest(order).flatMap((entry) => entry.items || []).filter((entry) => {
     if (itemId && text(entry.itemId ?? entry.item_id) === itemId) return true;
     return sku && text(entry.sku || entry.itemName).toLowerCase() === sku;
   });
-  return matches.reduce((total, entry) => ({
+  return spreadDirectPickupAllocation(order,item,matches.reduce((total, entry) => ({
     pallets: total.pallets + dispatchNumber(entry.palletQty ?? entry.pallet_qty),
     layers: total.layers + dispatchNumber(entry.layerQty ?? entry.layer_qty),
     sections: total.sections + dispatchNumber(entry.sectionQty ?? entry.section_qty),
     pieces: total.pieces + dispatchNumber(entry.pieceQty ?? entry.piece_qty),
     quantity: total.quantity + dispatchNumber(entry.quantity)
-  }), { pallets: 0, layers: 0, sections: 0, pieces: 0, quantity: 0 });
+  }), { pallets: 0, layers: 0, sections: 0, pieces: 0, quantity: 0 }));
 }
 
 function dispatchOwnYardLocationKeys(plan = {}) {
@@ -458,17 +461,18 @@ function dispatchOperationalPickupItem(item = {}) {
 }
 
 function dispatchPickupItemsForLocation(plan = {}, order = {}, location = "") {
-  if (text(order.type).toUpperCase() === "PO") return dispatchRouteItems(order).filter(dispatchOperationalPickupItem).filter(dispatchItemHasQuantity);
+  if (text(order.type).toUpperCase() === "PO" || order.toRouteProjection) return dispatchRouteItems(order).filter(dispatchOperationalPickupItem).filter(dispatchItemHasQuantity);
   const directItems = dispatchDirectPickupItemsForLocation(order, location);
-  if (directItems.length && !dispatchLocationsShareYard(order.sourceYard || order.outboundLocation, location)) {
+  const groupedSourceItems = groupPickupSourceItems(order,location);
+  if (directItems.length && !dispatchLocationsShareYard(order.sourceYard || order.outboundLocation, location) && !groupedSourceItems?.length) {
     return directItems.filter(dispatchOperationalPickupItem).filter(dispatchItemHasQuantity);
   }
   const poItems = dispatchPoPickupItemsForLocation(order, location);
   const ownYard = dispatchOwnYardLocationKeys(plan).has(normalizedYardLocationText(location));
   if (poItems.length && !ownYard) return poItems.filter(dispatchOperationalPickupItem).filter(dispatchItemHasQuantity);
-  const sourceItems = (order.items || [])
+  const sourceItems = (groupedSourceItems ?? order.items ?? [])
     .filter(dispatchOperationalPickupItem)
-    .map((item) => dispatchItemForPickupLocation(plan, order, item, location));
+    .map((item) => dispatchItemForPickupLocation(plan, groupedSourceItems ? {...order,sourceYard:location} : order, item, location));
   return [...sourceItems, ...directItems].filter(dispatchOperationalPickupItem).filter(dispatchItemHasQuantity);
 }
 
@@ -495,7 +499,10 @@ export function dispatchRequiredPickupLocations(plan = {}, order = {}) {
   const locations = Array.isArray(order.pickupLocations) && order.pickupLocations.length
     ? order.pickupLocations
     : ["3445"];
-  const uniqueLocations = uniqueDispatchLocations(locations);
+  const childLocations = order.type !== 'CO' && !order.transitCo?.toYard
+    ? (order.childOrderDetails || []).map(child => child.transitCo?.toYard || child.sourceYard).filter(Boolean) : [];
+  const uniqueLocations = uniqueDispatchLocations([...locations,...childLocations,
+    ...(order.poPickupManifest || []).map(entry=>entry.location),...retainedDirectPickupManifest(order).map(entry=>entry.location)]);
   const hasPickupAddressOverride = Boolean(text(order.pickupAddressOverride));
   return uniqueLocations.filter((location, index) =>
     (hasPickupAddressOverride && index === 0)
@@ -1253,10 +1260,12 @@ export function validateDispatchLoadAssignments(plan = {}, {
   switchMinutes = DEFAULT_SWITCH_MINUTES,
   ownYards = null,
   requireAssignments = false,
+  includeEmptyBinLoads = false,
   previousPlan = null,
   activityStatuses = []
 } = {}) {
-  const rows = flattenDispatchPlanLoads(plan).filter((row) => loadHasPlanningContent(row.load));
+  const rows = flattenDispatchPlanLoads(plan).filter((row) => loadHasPlanningContent(row.load)
+    || (includeEmptyBinLoads && row.load.mbtPlanning === true && row.plannedFinishMinute !== null));
   const conflicts = [];
   const parsedSwitchMinutes = Number(switchMinutes);
   const cleanSwitchMinutes = Math.max(0, Math.round(Number.isFinite(parsedSwitchMinutes) ? parsedSwitchMinutes : DEFAULT_SWITCH_MINUTES));
@@ -1501,6 +1510,10 @@ function semanticOrderAllocation(order = {}) {
     id: text(order.id),
     childOrders: [...new Set((order.childOrders || []).map(text).filter(Boolean))].sort(),
     items: semanticAllocationItems(order.items || []),
+    // Older compact receipts sometimes retain only aggregate cargo. Those
+    // quantities are execution evidence when item rows are unavailable.
+    ...(!(order.items || []).length ? { quantities: Object.fromEntries(Object.entries(ALLOCATION_MEASURE_FIELDS)
+      .map(([field, aliases]) => [field, allocationMeasureValue(order, aliases)])) } : {}),
     children: (order.childOrderDetails || [])
       .map(semanticOrderAllocation)
       .sort((left, right) => left.id.localeCompare(right.id))
@@ -1513,6 +1526,11 @@ export function changedLockedLoadAssignments(previousPlan = {}, nextPlan = {}, l
   [previousPlan, nextPlan] = comparableAllocationPlans(previousPlan, nextPlan);
   const before = new Map(flattenDispatchPlanLoads(previousPlan).map((row) => [text(row.load.id || row.load.loadId), row]));
   const after = new Map(flattenDispatchPlanLoads(nextPlan).map((row) => [text(row.load.id || row.load.loadId), row]));
+  // Sequence numbers may have gaps; only the actual position in a driver's
+  // ordered route is execution evidence.
+  const positions = new Map([previousPlan, nextPlan].map(plan => [plan,
+    new Map(driverLoadLanes(plan).flatMap(lane => lane.loads.map((row, index) => [text(row.load.id || row.load.loadId), index])))
+  ]));
   const allocationSignature = (plan, row) => {
     const refs = new Set((row?.load?.stops || []).map((stop) => text(stop.orderId || stop.orderRef)).filter(Boolean));
     return (plan.orders || [])
@@ -1557,7 +1575,7 @@ export function changedLockedLoadAssignments(previousPlan = {}, nextPlan = {}, l
     truckPlate: row.truckPlate,
     switchYard: row.switchYard,
     parkingSpot: row.parkingSpot,
-    driverSequence: row.driverSequence,
+    driverSequence: positions.get(plan).get(text(row.load.id || row.load.loadId)),
     plannedStartMinute: row.plannedStartMinute,
     plannedFinishMinute: row.plannedFinishMinute,
     handoffTravelMinutes: row.handoffTravelMinutes,
@@ -1647,7 +1665,7 @@ function driverActivityStopSignature(plan = {}, stop = null) {
     dropSections: stop.dropSections ?? stop.sections ?? null,
     dropPieces: stop.dropPieces ?? stop.pieces ?? null,
     dropSalesQty: stop.dropSalesQty ?? stop.salesQty ?? null,
-    dropWeight: stop.dropWeight ?? stop.weight ?? null,
+    // Derived weight is informational; physical cargo quantities remain locked.
     effectiveOrderLocation: pickup
       ? text(stop.location || stop.yard || order.sourceYard || order.source_yard)
       : text(
@@ -1766,6 +1784,17 @@ export function changedDriverActivityAssignments(previousPlan = {}, nextPlan = {
     const reasons = [];
     const changedStopIds = [];
     const changedOrderRefs = [];
+
+    // Retained snapshots can predate the stop IDs in a later Driver record.
+    // Missing on both sides is not a change. Protect the entire recorded load
+    // in that case, so uncertainty still rejects any real load modification.
+    if (previous && [...scope.stopIds].some(stopId => !(previous.load.stops || [])
+      .some(stop => text(stop.id || stop.stopId) === stopId))) {
+      const conservativeChanges = changedLockedLoadAssignments(previousPlan, nextPlan, new Set([scope.loadId]));
+      changes.push(...conservativeChanges.map(change => ({ ...change, reasons: ["full_load"],
+        stopIds: [...scope.stopIds], orderRefs: [...scope.orderRefs] })));
+      continue;
+    }
 
     if (scope.fullLoad) {
       const fullLoadChange = fullLoadChanges.get(scope.loadId);

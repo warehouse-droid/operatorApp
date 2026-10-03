@@ -1,8 +1,11 @@
 import { fulfilledSalesDeliveryPlanningRefs, overlayFulfilledSalesDeliveryPlanning, assertSalesDeliveryPlanningAllowed } from "./dispatch-fulfilled-so-repository.js";
+import { specialPlannedOrderRefs } from './special-stock-planning.js';
 import { query, withTransaction } from "./db.js";
 import { deferDispatchPlanMaintenance, enqueueDispatchPlanMaintenance } from "./dispatch-plan-maintenance-queue.js";
 import { applyPendingDispatchPlanMaintenance, notifyDispatchPlanMaintenance } from "./dispatch-plan-maintenance.js";
 import { persistedDispatchPlan } from './dispatch-plan-fence.js';
+import { preserveDispatchPlanAddresses } from "./dispatch-address-guard.js";
+import { prepareDispatchExecutedOrderComparison } from "./dispatch-executed-order-review-repository.js";
 import { isDeepStrictEqual } from "node:util";
 import { freezeRecordedPurchaseOrderProjections } from "./dispatch-recorded-po-projection.js";
 import { canonicalizeDispatchCoGroupIdentities } from "./dispatch-co-group-identity.js";
@@ -26,6 +29,7 @@ import {
 } from "./dispatch-executed-prefix-repository.js";
 import { syncDispatchPlanLoadAssignments } from "./dispatch-load-assignment-repository.js";
 import { assertBinDispatchCapability } from "./mbt/dispatch-bin-safety.js";
+import { preserveOrdinaryDispatchBins } from "./mbt/bin-planning-domain.js";
 import {
   DISPATCH_FLEET_PLANNING_LOCK,
   dispatchFleetAssignmentStatusConflicts,
@@ -587,29 +591,30 @@ async function assertCustomOrderPlanDateExclusivity(plan = {}, { previousPlan = 
   if (conflicts.length) throw new DispatchCustomOrderDateConflictError(conflicts);
 }
 
-async function assertSpecialStockHandoffPlanning(plan = {}, { previousPlan = null } = {}) {
-  const previousRefs = previousPlan ? dispatchPlannedOrderRefs(previousPlan) : new Set();
-  const refs = [...dispatchPlannedOrderRefs(plan)].filter((ref) => !previousRefs.has(ref));
+export async function assertSpecialStockHandoffPlanning(plan = {}, { previousPlan = null } = {}) {
+  const previousRefs = previousPlan ? specialPlannedOrderRefs(previousPlan) : new Set();
+  const refs = [...specialPlannedOrderRefs(plan)].filter((ref) => !previousRefs.has(ref));
   if (!refs.length) return;
   const result = await query(
     `SELECT special.request_id, special.sales_order_ref, special.purchase_order_ref,
-            special.post_po_change_pending, special.attention, special.fulfillment_method, special.quantity_review,
+            special.post_po_change_pending, special.attention, special.fulfillment_method, special.quantity_review, special.fulfillment_change, special.close_status, approval.approved AS purchase_approved,
             EXISTS(SELECT 1 FROM sales_special_stock_lines line WHERE line.request_id=special.request_id
-              AND line.sales_decision='accepted' AND line.supply_status IS DISTINCT FROM 'in_stock') AS waiting_for_production,
-            handoff.route, handoff.status,
-            purchase.status AS purchase_status,
-            purchase.status_text AS purchase_status_text,
-            purchase.receipt_status,
-            purchase.received_at
+              AND line.sales_decision='accepted' AND line.supply_status IS DISTINCT FROM 'in_stock') AS waiting_for_production
        FROM sales_special_stock_cases special
-       LEFT JOIN sales_special_stock_handoffs handoff ON handoff.request_id = special.request_id
        LEFT JOIN purchase_orders purchase ON purchase.netsuite_id = special.purchase_order_netsuite_id
+       JOIN special_stock_purchase_approval approval ON approval.request_id = special.request_id
       WHERE lower(btrim(special.sales_order_ref)) = ANY($1::text[])
          OR lower(btrim(special.purchase_order_ref)) = ANY($1::text[])
+         OR lower(btrim(purchase.dispatch_ref)) = ANY($1::text[])
       FOR SHARE OF special`,
     [refs.map((ref) => ref.trim().toLowerCase())]
   );
   for (const row of result.rows) {
+    if (!row.purchase_approved) throw Object.assign(new Error('The Special Purchase Order requires NetSuite approval before planning.'), {status:409,code:'SPECIAL_PO_APPROVAL_REQUIRED'});
+    if (['applying','attention'].includes(row.fulfillment_change?.status)) throw Object.assign(new Error('Sales must finish the delivery update before planning.'), {status:409,code:'SPECIAL_FULFILLMENT_PENDING'});
+    if (row.close_status !== 'active') {
+      throw Object.assign(new Error('This Special Item request is closing or closed and cannot be planned.'), { status: 409, code: 'SPECIAL_CLOSURE_PENDING' });
+    }
     if (['pending','applying','attention'].includes(row.quantity_review?.status)) {
       throw Object.assign(new Error('SCM must finish the quantity review before Dispatch planning.'), { status: 409, code: 'SPECIAL_QUANTITY_REVIEW_REQUIRED' });
     }
@@ -621,22 +626,6 @@ async function assertSpecialStockHandoffPlanning(plan = {}, { previousPlan = nul
         status: 409,
         code: "SPECIAL_PLAN_ATTENTION"
       });
-    }
-    if (!row.route || !["ready", "planned", "in_progress", "completed"].includes(row.status)) {
-      throw Object.assign(new Error(`${row.sales_order_ref} needs a Special Item Direct or Via Yard route before planning.`), {
-        status: 409,
-        code: "SPECIAL_PLAN_ROUTE_REQUIRED"
-      });
-    }
-    if (row.route === "via_yard" && refs.some(ref => ref.toLowerCase() === String(row.sales_order_ref).toLowerCase())) {
-      const purchaseState = `${row.purchase_status || ""} ${row.purchase_status_text || ""} ${row.receipt_status || ""}`;
-      const received = Boolean(row.received_at) || /\b(?:received|fully received|closed|fully billed)\b/i.test(purchaseState);
-      if (!received) {
-        throw Object.assign(new Error(`${row.sales_order_ref} must wait until ${row.purchase_order_ref} is received at the selected yard.`), {
-          status: 409,
-          code: "SPECIAL_PLAN_PO_RECEIPT_REQUIRED"
-        });
-      }
     }
   }
 }
@@ -849,7 +838,7 @@ function enrichOrderWeights(order, inventoryByItemId) {
       toPcs: item.toPcs ?? item.to_pcs ?? inventory?.to_pcs ?? null
     };
   });
-  const calculatedWeight = items.reduce((sum, item) => sum + numberValue(item.lineWeight), 0);
+  const calculatedWeight = Math.round(items.reduce((sum, item) => sum + numberValue(item.lineWeight), 0) * 1000) / 1000;
   const childOrderDetails = (order.childOrderDetails || []).map((child) => enrichOrderWeights(child, inventoryByItemId));
   const raw = order.raw ? {
     ...order.raw,
@@ -1635,6 +1624,9 @@ export async function saveDispatchPlanSnapshot(planId, {
     const existingPlan = currentPlan.rows[0];
     if (!existingPlan) throw new Error("Dispatch plan not found.");
     const previousPlan = persistedDispatchPlan(existingPlan);
+    const addressPreserved = preserveDispatchPlanAddresses(previousPlan, { orders, trucks, summary });
+    orders = addressPreserved.orders;
+    summary = addressPreserved.summary;
     const payloadPlanDate = cleanPlanDate(planDate || existingPlan.plan_date);
     const expectedPlanDate = cleanPlanDate(existingPlan.plan_date);
     if (payloadPlanDate !== expectedPlanDate) {
@@ -1644,10 +1636,7 @@ export async function saveDispatchPlanSnapshot(planId, {
         payloadPlanDate
       });
     }
-    assertBinDispatchCapability({
-      orders: [...(previousPlan.orders || []), ...(Array.isArray(orders) ? orders : [])],
-      trucks: [...(previousPlan.trucks || []), ...(Array.isArray(trucks) ? trucks : [])]
-    }, { operation: "save" });
+    trucks = preserveOrdinaryDispatchBins(previousPlan, { orders, trucks }).trucks;
     const canonicalPlan = await reconcileDispatchPlanOrderAuthorities(await canonicalizeDispatchCustomOrdersInPlan({
       id: String(planId),
       planDate: expectedPlanDate,
@@ -1677,6 +1666,7 @@ export async function saveDispatchPlanSnapshot(planId, {
       { comparisonOrders: canonicalPlan.orders || [] }
     );
     sanitizedPlan = await applyPendingDispatchPlanMaintenance(sanitizedPlan);
+    await prepareDispatchExecutedOrderComparison({ previousPlan, nextPlan: sanitizedPlan });
     const pickupVisits = materializeDispatchPickupVisits(sanitizedPlan, {
       previousPlan,
       allowLegacyPassthrough: true,
@@ -1691,6 +1681,7 @@ export async function saveDispatchPlanSnapshot(planId, {
       });
     }
     sanitizedPlan = pickupVisits.plan;
+    sanitizedPlan = preserveOrdinaryDispatchBins(previousPlan, sanitizedPlan);
     await assertDispatchExecutedPrefixPreserved({
       previousPlan,
       nextPlan: sanitizedPlan
@@ -1853,7 +1844,7 @@ export async function saveDispatchPlanSnapshot(planId, {
       ...storedPlan,
       id: planId,
       planDate: expectedPlanDate
-    });
+    }, { allowBin: true });
     if (retainedCompletedIds.length) await query(`UPDATE dispatch_plan_load_assignments
       SET started=true,completed=true WHERE plan_id=$1 AND load_id=ANY($2::text[])`, [planId, retainedCompletedIds]);
     return getDispatchPlan(planId);
@@ -1883,10 +1874,7 @@ export async function restoreDispatchPlanSnapshot(snapshotId, { sessionId = "" }
     );
     const current = currentResult.rows[0];
     if (!current) throw new Error("Dispatch plan was not found.");
-    assertBinDispatchCapability({
-      orders: [...(current.orders || []), ...(source.orders || [])],
-      trucks: [...(current.trucks || []), ...(source.trucks || [])]
-    }, { operation: "restore" });
+    source.trucks = preserveOrdinaryDispatchBins(current, source).trucks;
     const sourceDate = cleanPlanDate(source.plan_date);
     const currentDate = cleanPlanDate(current.plan_date);
     if (sourceDate !== currentDate) {
@@ -1926,12 +1914,12 @@ export async function restoreDispatchPlanSnapshot(snapshotId, { sessionId = "" }
         WHERE id = $1`,
       [source.plan_id]
     );
-    const sourcePlan = {
+    const sourcePlan = preserveDispatchPlanAddresses(current, {
       id: String(source.plan_id),
       orders: source.orders || [],
       trucks: source.trucks || [],
       summary: source.summary || {}
-    };
+    });
     const sanitizedPlan = await sanitizeDispatchPlan(
       isDispatchV2Plan(sourcePlan)
         ? sourcePlan
@@ -1972,6 +1960,7 @@ export async function restoreDispatchPlanSnapshot(snapshotId, { sessionId = "" }
         trucks: current.trucks || []
       }
     });
+    await prepareDispatchExecutedOrderComparison({ previousPlan: { ...current, id: String(current.id), planDate: currentDate }, nextPlan: canonicalPlan });
     const pickupVisits = materializeDispatchPickupVisits(canonicalPlan, {
       previousPlan: {
         id: current.id,
@@ -2007,13 +1996,18 @@ export async function restoreDispatchPlanSnapshot(snapshotId, { sessionId = "" }
         ORDER BY id`,
       [current.id]
     );
-    const executionPolicy = evaluateExecutedPrefixPolicy({
+    const reviewedPreviousPlan = await prepareDispatchExecutedOrderComparison({
       previousPlan: {
         id: String(current.id),
         planDate: currentDate,
         orders: current.orders || [],
         trucks: current.trucks || []
       },
+      nextPlan: cleanPlan,
+      activity: activity.rows
+    });
+    const executionPolicy = evaluateExecutedPrefixPolicy({
+      previousPlan: reviewedPreviousPlan,
       nextPlan: {
         ...cleanPlan,
         id: String(current.id),
@@ -2075,7 +2069,7 @@ export async function restoreDispatchPlanSnapshot(snapshotId, { sessionId = "" }
       ...cleanPlan,
       id: source.plan_id,
       planDate: currentDate
-    });
+    }, { allowBin: true });
     return {
       plan: await getDispatchPlan(source.plan_id),
       restoredSnapshot: snapshotSummary(source),

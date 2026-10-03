@@ -1,3 +1,5 @@
+import {reconcilePurchaseStockAllocations} from './regular-stock-purchase-repository.js';
+import {lockRegularReplenishments} from './regular-stock-replenishment.js';
 import { query, withTransaction } from "./db.js";
 import { smartScmSplitRemainingSql } from "./smart-scm-split-inbound-sql.js";
 import { writeAudit } from "./auth-repository.js";
@@ -532,7 +534,7 @@ async function createVendorResolutionChild(source, { kind, status, label, operat
        order_requested_at, order_requested_by, vendor_replied_at, vendor_replied_by,
        vendor_response_status, vendor_ready_date, vendor_reference, vendor_packing_number,
        vendor_credit_status, vendor_remarks, vendor_response_source,
-       pallet_quantity_overrides,
+       pallet_quantity_overrides, line_order,
        pallet_item_id, pallet_item_name, pallet_unit, pallet_purchase_unit,
        pallet_last_purchase_price, pallet_price_synced_at,
        parent_proposal_id, vendor_resolution_kind, price_snapshot_at, confirmed_at, confirmed_by
@@ -542,7 +544,7 @@ async function createVendorResolutionChild(source, { kind, status, label, operat
             order_requested_at, order_requested_by, vendor_replied_at, vendor_replied_by,
             $4, vendor_ready_date, vendor_reference, vendor_packing_number,
             vendor_credit_status, vendor_remarks, vendor_response_source,
-            CASE WHEN $5 = 'netsuite_po_review' THEN pallet_quantity_overrides ELSE '{}'::jsonb END,
+            CASE WHEN $5 = 'netsuite_po_review' THEN pallet_quantity_overrides ELSE '{}'::jsonb END, line_order,
             CASE WHEN $5 = 'netsuite_po_review' THEN pallet_item_id ELSE NULL END,
             CASE WHEN $5 = 'netsuite_po_review' THEN pallet_item_name ELSE NULL END,
             CASE WHEN $5 = 'netsuite_po_review' THEN pallet_unit ELSE NULL END,
@@ -556,6 +558,7 @@ async function createVendorResolutionChild(source, { kind, status, label, operat
      RETURNING id`,
     [source.id, proposalKey, status, kind === "netsuite_po_review" ? "confirmed" : "cancelled", kind, operatorId]
   );
+  if(source.regularReplenishmentId)await query('UPDATE scm_smart_proposals SET regular_replenishment_id=$2 WHERE id=$1',[created.rows[0].id,source.regularReplenishmentId]);
   return Number(created.rows[0].id);
 }
 
@@ -571,7 +574,7 @@ async function createVendorHeldLineChild(source, line) {
        vendor_credit_status, vendor_remarks, vendor_response_source,
        pallet_item_id, pallet_item_name, pallet_unit, pallet_purchase_unit,
        pallet_last_purchase_price, pallet_price_synced_at,
-       parent_proposal_id, vendor_resolution_kind, po_execution_status
+       parent_proposal_id, vendor_resolution_kind, po_execution_status, line_order
      )
      SELECT run_id, $2, proposal_type, phase, source_kind, source_location_id, source_vendor_yard_id, source_name,
             destination_location_id, destination_name, vendor, plant, 'vendor_replied', urgent, urgency_level, urgency_score, provisional,
@@ -583,11 +586,12 @@ async function createVendorHeldLineChild(source, line) {
             vendor_credit_status, vendor_remarks, vendor_response_source,
             pallet_item_id, pallet_item_name, pallet_unit, pallet_purchase_unit,
             pallet_last_purchase_price, pallet_price_synced_at,
-            id, NULL, 'idle'
+            id, NULL, 'idle', line_order
        FROM scm_smart_proposals WHERE id = $1
      RETURNING id`,
     [source.id, proposalKey, line.itemName]
   );
+  if(source.regularReplenishmentId)await query('UPDATE scm_smart_proposals SET regular_replenishment_id=$2 WHERE id=$1',[created.rows[0].id,source.regularReplenishmentId]);
   return Number(created.rows[0].id);
 }
 
@@ -923,6 +927,7 @@ export async function removeSmartScmNetSuitePoReviewLoad(proposalId, operatorId 
     throw Object.assign(new Error("Select a valid staged PO review."), { status: 400 });
   }
   const outcome = await withTransaction(async () => {
+    await lockRegularReplenishments();
     const result = await query(
       `SELECT id, run_id, status, vendor_resolution_kind, po_execution_status,
               netsuite_purchase_order_id, netsuite_purchase_order_ref
@@ -965,6 +970,7 @@ export async function removeSmartScmNetSuitePoReviewLoad(proposalId, operatorId 
       previousStatus: review.status,
       linesRetained: true
     }, operatorId);
+    await reconcilePurchaseStockAllocations();
     return { id, runId: Number(review.run_id), removed: true, reused: false };
   });
   if (outcome.removed) {
@@ -1036,6 +1042,7 @@ export async function removeSmartScmVendorReplyLoad(proposalId, operatorId = nul
     throw Object.assign(new Error("Select a valid vendor reply load."), { status: 400 });
   }
   const outcome = await withTransaction(async () => {
+    await lockRegularReplenishments();
     const result = await query(
       `SELECT id, run_id, proposal_type, status, vendor_resolution_kind,
               po_execution_status, netsuite_purchase_order_id, netsuite_purchase_order_ref
@@ -1078,6 +1085,7 @@ export async function removeSmartScmVendorReplyLoad(proposalId, operatorId = nul
       previousStatus: load.status,
       linesRetained: true
     }, operatorId);
+    await reconcilePurchaseStockAllocations();
     return { id, runId: Number(load.run_id), removed: true, reused: false };
   });
   if (outcome.removed) {
@@ -1333,6 +1341,7 @@ export async function addSmartScmVendorAlternativeLine(proposalId, values = {}, 
     await query("SELECT id FROM scm_smart_proposals WHERE id = $1 FOR UPDATE", [id]);
     const proposal = await getSmartScmProposal(id);
     ensureEditableVendorLoad(proposal);
+    if(proposal.regularReplenishmentId)throw Object.assign(new Error('Stock request replenishment must retain its approved item.'),{status:409});
     const vendor = await vendorIdentityForProposal(id);
     const alternativeForLineId = Number(values.alternativeForLineId);
     const originalLine = proposal.lines.find((line) => line.id === alternativeForLineId);
@@ -1496,6 +1505,7 @@ async function updateVendorReplyLineDestinations(proposal, inputs = [], operator
       ? Number(input.destinationLocationId)
       : Number(line.destination_location_id);
     if (requested === Number(line.destination_location_id)) return { line, destinationLocationId: requested };
+    if(line.reason?.purchaseDemandIds?.length)throw Object.assign(new Error('A Stocking Purchase item must remain at its requesting yard.'),{status:409});
     const destinationName = VENDOR_REPLY_DESTINATIONS.get(requested);
     if (!Number.isInteger(requested) || !destinationName) {
       throw Object.assign(new Error("Select a valid destination yard for every changed vendor reply line."), { status: 400 });
@@ -1514,6 +1524,7 @@ async function updateVendorReplyLineDestinations(proposal, inputs = [], operator
     return { line, destinationLocationId: requested };
   });
   if (!changes.length) return [];
+  if(proposal.regularReplenishmentId)throw Object.assign(new Error('Stock request replenishment must return to its approved source yard.'),{status:409});
 
   const duplicateKeys = new Map();
   for (const entry of nextLines) {
@@ -1599,6 +1610,7 @@ async function updateVendorReplyLineDestinations(proposal, inputs = [], operator
 export async function saveSmartScmVendorReplyLoad(proposalId, values = {}, operatorId = null) {
   const id = Number(proposalId);
   return withTransaction(async () => {
+    await lockRegularReplenishments();
     await query("SELECT id FROM scm_smart_proposals WHERE id = $1 FOR UPDATE", [id]);
   const proposal = await getSmartScmProposal(id);
   ensureEditableVendorLoad(proposal);
@@ -1727,6 +1739,7 @@ export async function stageSmartScmVendorReplyLoad(proposalId, values = {}, oper
   const id = Number(proposalId);
   const vendorItems = await resolveVendorReplyUnitPrices(id);
   const staged = await withTransaction(async () => {
+    await lockRegularReplenishments();
     await query("SELECT id FROM scm_smart_proposals WHERE id = $1 FOR UPDATE", [id]);
     const source = await getSmartScmProposal(id);
     ensureEditableVendorLoad(source);
@@ -1866,6 +1879,7 @@ export async function stageSmartScmVendorReplyLoad(proposalId, values = {}, oper
       heldSplits,
       conservation
     }, operatorId);
+    await reconcilePurchaseStockAllocations();
     return {
       sourceProposalId: id,
       runId: source.runId,
@@ -2050,6 +2064,7 @@ export async function prepareSmartScmPurchaseExecution(proposalId, operatorId = 
       palletLastPurchasePrice: palletItem.lastPurchasePrice,
       palletPriceSyncedAt: palletItem.lastPurchasePriceSyncedAt,
       palletQuantityOverrides,
+      lineOrder: Array.isArray(proposal.line_order) ? proposal.line_order : [],
       palletItem,
       palletLines,
       totalPallets: round(lines.reduce((sum, line) => sum + positive(line.confirmed_pallets), 0)),
@@ -2076,6 +2091,7 @@ export async function completeSmartScmPurchaseExecution(proposalId, { purchaseOr
     orderId: purchaseOrderId,
     details: { proposalId: Number(proposalId), purchaseOrderId, purchaseOrderRef, mock }
   });
+  await reconcilePurchaseStockAllocations();
   return getSmartScmProposal(proposalId);
 }
 
@@ -2093,6 +2109,7 @@ export async function failSmartScmPurchaseExecution(proposalId, error, operatorI
     action: "smart_scm.purchase.failed",
     details: { proposalId: Number(proposalId), error: message }
   });
+  await reconcilePurchaseStockAllocations();
 }
 
 export async function markSmartScmPurchaseAttention(proposalId, { purchaseOrderId = null, purchaseOrderRef = null, error } = {}, operatorId = null) {
@@ -2113,4 +2130,5 @@ export async function markSmartScmPurchaseAttention(proposalId, { purchaseOrderI
     orderId: purchaseOrderId,
     details: { proposalId: Number(proposalId), purchaseOrderId, purchaseOrderRef, error: message }
   });
+  await reconcilePurchaseStockAllocations();
 }

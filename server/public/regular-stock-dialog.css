@@ -1,0 +1,33 @@
+.regular-stock-dialog {
+  position: fixed; inset: 0; margin: auto; width: min(560px, calc(100vw - 32px));
+  max-height: calc(100dvh - 48px); overflow-y: auto; box-sizing: border-box;
+  padding: 32px; border: 1px solid #bed2d5; border-radius: 20px;
+  background: #fff; color: #1b3036; box-shadow: 0 24px 90px #102f4c55;
+  text-align: center;
+}
+.regular-stock-dialog::backdrop { background: #102731b8; backdrop-filter: blur(3px); }
+.regular-stock-dialog h2 { margin: 16px 0 12px; font-size: 1.5rem; line-height: 1.25; outline: none; }
+.regular-stock-dialog p { white-space: pre-line; overflow-wrap: anywhere; line-height: 1.6; margin: 12px 0; }
+.regular-dialog-icon { width: 44px; height: 44px; margin: auto; border: 4px solid #d2eeee; border-radius: 50%; }
+.regular-stock-dialog[data-state="busy"] .regular-dialog-icon { border-top-color: #087e83; animation: regular-stock-spin 1s linear infinite; }
+.regular-stock-dialog[data-state="confirm"] .regular-dialog-icon { background: #e5f5f3; color: #087b77; border-color: #91d3cc; }
+.regular-stock-dialog[data-state="confirm"] .regular-dialog-icon::after { content: "→"; font-size: 28px; line-height: 40px; }
+.regular-dialog-expiry { color: #5a6973; font-size: .9rem; }
+.regular-dialog-actions { display: flex; gap: 12px; justify-content: center; margin-top: 24px; }
+.regular-dialog-actions:empty { display: none; }
+.regular-dialog-actions button { min-height: 46px; padding: 12px 20px; border-radius: 10px; cursor: pointer; border: 1px solid #bccbd2; font: inherit; font-weight: 650; background: #fff; color: #273d45; }
+.regular-dialog-actions button.primary { background: #087b77; color: #fff; border-color: #087b77; }
+.regular-dialog-actions button:disabled { opacity: .5; cursor: wait; }
+.regular-dialog-actions button:focus-visible { outline: 3px solid #3c9ccc; outline-offset: 3px; }
+.regular-stock-review-reasons ul { margin: 8px 0 0; padding-left: 20px; }
+.regular-stock-review-reasons li + li { margin-top: 8px; }
+@keyframes regular-stock-spin { to { transform: rotate(360deg); } }
+@media (max-width: 480px) {
+  .regular-stock-dialog { padding: 24px 20px; }
+  .regular-dialog-actions { flex-direction: column-reverse; }
+}
+@media (prefers-reduced-motion: reduce) {
+  .regular-stock-dialog[data-state="busy"] .regular-dialog-icon { animation: none; }
+}
+
+.stock-request-actions[hidden]{display:none}

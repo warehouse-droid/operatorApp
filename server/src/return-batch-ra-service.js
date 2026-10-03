@@ -5,14 +5,16 @@ import { createOrUpdateReturnAuthorizationInNetSuite, createStandaloneReturnAuth
 import { findReturnTransactionByExternalId } from "./return-netsuite.js";
 import { withNetSuiteOperationalWork } from "./netsuite-operational-work.js";
 import { buildReturnBatchIntent, buildReturnBatchPayload, verifyReturnBatchSnapshot, hydrateReturnBatchSourceLinks } from "./return-batch-ra-domain.js";
+import { assertStagedReturnBatch, finalizeStagedReturnBatch } from "./return-submission-draft.js";
 
 function error(message, code = "RETURN_BATCH_RA_BLOCKED") {
   return Object.assign(new Error(message), { status: 409, code });
 }
 
-export async function findReturnBatchAuthorization(recordId) {
-  const result = await query(`SELECT a.* FROM return_batch_authorizations a
-    JOIN return_records r ON r.batch_id=a.batch_id WHERE r.id=$1`, [recordId]);
+export async function findReturnBatchAuthorization(recordId, { batchId = null } = {}) {
+  const result = batchId ? await query("SELECT * FROM return_batch_authorizations WHERE batch_id=$1", [batchId])
+    : await query(`SELECT a.* FROM return_batch_authorizations a
+      JOIN return_records r ON r.batch_id=a.batch_id WHERE r.id=$1`, [recordId]);
   return result.rows[0] || null;
 }
 
@@ -131,6 +133,7 @@ async function readBatchSnapshot(batch, transactionId) {
 }
 
 async function activeMembers(batch) {
+  if (batch.draft_id) { return assertStagedReturnBatch(batch); }
   const result = await query("SELECT id,status FROM return_records WHERE batch_id=$1 ORDER BY id", [batch.batch_id]);
   const ids = result.rows.map(row => Number(row.id));
   if (JSON.stringify(ids) !== JSON.stringify(batch.intent_snapshot.recordIds)
@@ -152,22 +155,32 @@ async function verifyManualCandidate(batch, manualTransactionId, manualTransacti
   return { transactionId: manualTransactionId, snapshot: candidate };
 }
 
-export async function synchronizeReturnBatchAuthorization({ recordId, actorOperatorId = null, reconcile = false, manualTransactionId = null, manualTransactionRef = "" }) {
-  const initial = await findReturnBatchAuthorization(recordId);
+function allowInactiveBatch(batch, reconcile) {
+  return !batch.draft_id && (reconcile || Boolean(batch.netsuite_transaction_id));
+}
+
+export async function synchronizeReturnBatchAuthorization({ recordId, batchId = null, actorOperatorId = null, reconcile = false, manualTransactionId = null, manualTransactionRef = "" }) {
+  const initial = await findReturnBatchAuthorization(recordId, { batchId });
   if (!initial) {throw error("Shared Return Authorization was not found.");}
   const outcome = await withTransaction(async () => {
     await query("SELECT pg_advisory_xact_lock(hashtext($1))", [`return-batch-ra:${initial.batch_id}`]);
-    const batch = await findReturnBatchAuthorization(recordId);
-    if (!reconcile && !manualTransactionId && ["succeeded", "manual_linked"].includes(batch.sync_status)) {return {};}
+    const batch = await findReturnBatchAuthorization(recordId, { batchId });
+    if (!batch) { return { error: error("Return submission changed. Retry its saved draft.") }; }
+    if (!reconcile && !manualTransactionId && ["succeeded", "manual_linked"].includes(batch.sync_status)) {
+      await finalizeStagedReturnBatch(batch);
+      return {};
+    }
     if (batch.posting_policy.effective !== true) {return { error: error("This return was saved locally and was not admitted for NetSuite posting.") };}
     try {
       await activeMembers(batch);
       const { transactionId, snapshot } = await withNetSuiteOperationalWork(
         reconcile ? "returns.reconcile" : "returns.pending", () => manualTransactionId
           ? verifyManualCandidate(batch, manualTransactionId, manualTransactionRef) : postOrRecover(batch));
-      verifyReturnBatchSnapshot({ ...batch.intent_snapshot, netSuiteTransactionId: transactionId }, snapshot, { allowInactive: reconcile || Boolean(batch.netsuite_transaction_id) });
+      verifyReturnBatchSnapshot({ ...batch.intent_snapshot, netSuiteTransactionId: transactionId }, snapshot,
+        { allowInactive: allowInactiveBatch(batch, reconcile) });
       const inactive = /cancel|void|reject/i.test(transactionStatusOf(snapshot));
       await setState(batch.batch_id, inactive ? "cancelled" : manualTransactionId ? "manual_linked" : "succeeded", { snapshot, actorOperatorId });
+      await finalizeStagedReturnBatch(batch);
       await writeAudit({ actorOperatorId, source: "returns", action: "returns.netsuite.batch_ra.linked",
         orderId: batch.intent_snapshot.sourceSalesOrderId,
         details: { batchId: Number(batch.batch_id), recordIds: batch.intent_snapshot.recordIds, transactionId,
@@ -180,7 +193,7 @@ export async function synchronizeReturnBatchAuthorization({ recordId, actorOpera
     }
   });
   if (outcome.error) {throw outcome.error;}
-  return findReturnBatchAuthorization(recordId);
+  return findReturnBatchAuthorization(recordId, { batchId });
 }
 
 export async function assertSharedReturnCanVoid(recordId) {

@@ -4,6 +4,13 @@
   "private": true,
   "type": "module",
   "scripts": {
+    "test:sor:recovery": "bash tools/sor-feature-gate-gauntlet.sh",
+    "test:aggregate-requests": "node --test --test-concurrency=1 test/mbt/unit/aggregate-request-domain.test.js test/mbt/integration/aggregate-request-repository.test.js test/mbt/integration/aggregate-request-http.test.js test/mbt/integration/aggregate-request-browser.test.js test/mbt/unit/aggregate-request-time.test.js test/mbt/integration/aggregate-request-alert-browser.test.js",
+    "mutate:aggregate-requests": "node tools/aggregate-mutations.mjs",
+    "gauntlet:aggregate-requests": "bash tools/aggregate-gauntlet.sh",
+    "test:operator-display-settings": "node --test test/mbt/unit/operator-display-settings.test.js test/mbt/unit/operator-ui-enhancements.test.js test/mbt/unit/operator-yard-assets.test.js test/mbt/unit/driver-pwa-recovery-assets.test.js",
+    "test:operator-display-settings:db": "node --test test/mbt/integration/operator-display-settings.test.js",
+    "test:operator-display-settings:browser": "node test/dispatch/frontend/operator-display-settings.browser.test.mjs",
     "dev": "node --watch src/server.js",
     "start": "node src/server.js",
     "migrate": "node src/migrate.js",
@@ -488,7 +495,9 @@
     "test:returns": "node src/return-module-harness.js",
     "test:returns-customer-directory": "node src/return-customer-directory-harness.js",
     "test:returns-operator-ui": "node src/operator-return-ui-harness.js",
-    "test:returns-portals": "node src/return-portal-ui-harness.js"
+    "test:returns-portals": "node src/return-portal-ui-harness.js",
+    "test:operator-inventory": "node --test --test-concurrency=1 test/operator-inventory-domain.test.js test/operator-inventory-adapter.test.js test/operator-inventory-photos.test.js test/operator-inventory-count.test.js test/operator-inventory-damage.test.js test/operator-inventory-http.test.js test/operator-inventory-browser.test.js",
+    "gauntlet:operator-inventory": "bash tools/operator-inventory-gauntlet.sh"
   },
   "dependencies": {
     "@ericblade/quagga2": "^1.12.1",
@@ -499,7 +508,8 @@
     "pg": "^8.11.5",
     "qr-scanner": "^1.4.2",
     "sharp": "0.35.3",
-    "web-push": "3.6.7"
+    "web-push": "3.6.7",
+    "nodemailer": "10.0.13"
   },
   "devDependencies": {
     "@axe-core/playwright": "4.12.1",

@@ -1,0 +1,5 @@
+import base from '../eslint.mbt.config.js';
+const rules={'no-undef':'error','no-unused-vars':['error',{argsIgnorePattern:'^_',varsIgnorePattern:'^_'}],'no-unreachable':'error','no-duplicate-imports':'error','no-var':'error','prefer-const':'error','curly':['error','all'],'eqeqeq':['error','always',{null:'ignore'}],complexity:['error',18],'max-depth':['error',4]};
+export default [{files:['src/password-reset-*.js','test/mbt/**/password-reset*.test.js','test/mbt/**/staff-login*.test.js','tools/staff-reset-*.mjs'],languageOptions:base[0].languageOptions,rules},
+ {files:['public/login.js','public/staff-login-routes.js'],languageOptions:{ecmaVersion:'latest',sourceType:'module',globals:{document:'readonly',window:'readonly',localStorage:'readonly',location:'readonly',fetch:'readonly',FormData:'readonly',URLSearchParams:'readonly',URL:'readonly',setInterval:'readonly'}},rules},
+ {files:['test/mbt/integration/staff-login-browser.test.js'],languageOptions:{globals:{document:'readonly',localStorage:'readonly',innerWidth:'readonly'}}}];

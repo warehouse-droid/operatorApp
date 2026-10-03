@@ -6647,6 +6647,15 @@ export async function enrichScmScheduleWithReconciliation(rows = [], {
             && !preserveManualSplitOperationalStatus
         });
     }
+    // Active direct links remain authoritative when NetSuite still reports a
+    // pre-dispatch status. Completed, review and execution progress take priority.
+    if (row.directShipLinked === true && [
+      "Queued", "Planned", "Urgent", "Priority", "Surplus Only", "Book Appt", "Direct ship", "In Transit"
+    ].includes(effectiveStatus)) {
+      effectiveStatus = row.directShipProgressStatus || (
+        effectiveStatus === "In Transit" ? effectiveStatus : "Direct ship"
+      );
+    }
     const displayedReason = isReview
       ? state.reconciliation_reason || target.reason || ""
       : "";

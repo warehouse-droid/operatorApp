@@ -1,0 +1,86 @@
+{
+  "passed": true,
+  "imageId": "sha256:f528e87e207f174c000338c2bad3a91cd9038cc82b7551cab4230803e4ccb137",
+  "focusedTests": 26,
+  "bossRegressionTests": 140,
+  "shuffledTests": 27,
+  "mutationsKilled": 5,
+  "suites": {
+    "baseline": {
+      "failures": [
+        "RP-08 sequence, timing, capacity, labels, and tooltips use visit-scoped orders",
+        "RP-05 active travel protects its destination while allowing work after it"
+      ],
+      "tests": 60,
+      "passes": 58,
+      "harnesses": [
+        {
+          "harness": "src/dispatch-pickup-override-harness.js",
+          "status": 1,
+          "failure": ""
+        },
+        {
+          "harness": "src/dispatch-load-assignment-harness.js",
+          "status": 1,
+          "failure": "AssertionError [ERR_ASSERTION]: Expected values to be strictly equal:"
+        }
+      ]
+    },
+    "current": {
+      "failures": [
+        "RP-08 sequence, timing, capacity, labels, and tooltips use visit-scoped orders",
+        "RP-05 active travel protects its destination while allowing work after it"
+      ],
+      "tests": 60,
+      "passes": 58,
+      "harnesses": [
+        {
+          "harness": "src/dispatch-pickup-override-harness.js",
+          "status": 1,
+          "failure": ""
+        },
+        {
+          "harness": "src/dispatch-load-assignment-harness.js",
+          "status": 1,
+          "failure": "AssertionError [ERR_ASSERTION]: Expected values to be strictly equal:"
+        }
+      ]
+    }
+  },
+  "static": {
+    "static": "no new diagnostics",
+    "existingLint": 1323,
+    "existingTypeDiagnostics": 183
+  },
+  "changedLineCoverage": [
+    {
+      "file": "public/dispatch.js",
+      "covered": 15,
+      "total": 15
+    },
+    {
+      "file": "src/dispatch-pickup-visits.js",
+      "covered": 9,
+      "total": 9
+    },
+    {
+      "file": "src/scm-dependency-plan-reconciler.js",
+      "covered": 4,
+      "total": 4
+    }
+  ],
+  "sourceHashes": {
+    "public/dispatch.js": "fbec7badd7276b1daca3486ddce5a6607aaf0cad9666d433514a056fafde2683",
+    "src/dispatch-pickup-visits.js": "e68c1f991abe954a4dfd916a4ea173f7d8f31ce2c28f8758263e93b16e01ded2",
+    "src/scm-dependency-plan-reconciler.js": "1c7325be30ae64b011141631e93a8344dcf4f3610c3e9f87083e44e7ae4a5481",
+    "public/dispatch.html": "db0e32d79913cd44b5c8904d06f5d4ff3e92614939bd48f7298a71997e6c988a",
+    "test/dispatch/frontend/dispatch-pickup-address-grouping.test.js": "dec64515e0d86abc0a0e53ad9f5e5fd0cec020b77b676c7acc109da015897a9d",
+    "test/dispatch/frontend/dispatch-pickup-address.browser.test.mjs": "4223d9cc58d4024b2286f7bdb6bf1055b90f87999c4b5191100dd4e6eec3f8c8",
+    "tools/dispatch-pickup-address-check.mjs": "3ed28b7d1f56a2dd8f08845c3909bd92c2df5c167c3d7b767945d206a0ab67bc"
+  },
+  "verificationToolHashes": {
+    "pickup-release-check.mjs": "70767ef1530cf761c29e8fedeb0544062da3e83e0e93a05d42e0c042a384257d",
+    "pickup-release-gauntlet.mjs": "18c737787a07a465ef453653b5fd9f7f8603fde9bf25404a1966dd21afebc1eb",
+    "pickup-release-evidence.py": "3272fd19713d3addc48696e65164ad1f524a2467712c75f1f275625c219c4c3f"
+  }
+}

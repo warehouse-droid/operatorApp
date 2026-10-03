@@ -1,4 +1,4 @@
-// Preserve only edited forms so saving one line does not discard another line.
+// Preserve edited forms with a separate key for each line and field.
 /** @typedef {HTMLInputElement | HTMLSelectElement | HTMLTextAreaElement} FormField */
 /** @typedef {Map<string, Map<string, {value:string, checked?:boolean}>>} FormDrafts */
 /** @param {HTMLFormElement} form */
@@ -9,7 +9,7 @@ export function specialFormKey(form) {
 
 /** @param {FormField} input */
 function fieldKey(input) {
-  const group = input.closest('[data-special-material], [data-special-po-line], [data-special-composer-line], [data-special-ancillary]');
+  const group = input.closest('[data-special-material], [data-special-po-line], [data-special-composer-line], [data-special-ancillary], [data-special-stock-line], [data-special-decision-line]');
   const section = group?.getAttributeNames().find(name => name.startsWith('data-special-'));
   const name = input.name || input.getAttributeNames().find(name => name.startsWith('data-special-'));
   return name ? `${section || ''}:${section ? group?.getAttribute(section) : ''}:${name}` : null;

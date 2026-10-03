@@ -1,4 +1,5 @@
 import crypto from "node:crypto";
+import { dispatchOrderRecency } from "./dispatch-order-recency.js";
 import { decorateSorOrders } from "./sor-rental-repository.js";
 
 import { query, withTransaction } from "./db.js";
@@ -70,7 +71,7 @@ function catalogRows(orders = [], source = "") {
       full_order: { ...order, catalogHydrated: true },
       source: text(source),
       source_updated_at: activityAt(order),
-      activity_at: activityAt(order)
+      activity_at: dispatchOrderRecency(order)
     });
   }
   return rows;
@@ -295,6 +296,9 @@ function decodeCursor(value) {
       || parsed.k.length > 500
       || parsed.r.length > 500
     ) throw cursorError();
+    // Old cursors used update activity. Restart once with arrival-date ordering.
+    if (parsed.v === undefined) return null;
+    if (parsed.v !== 2) throw cursorError();
     return { e: Number(parsed.e), d: parsed.d, k: parsed.k, r: parsed.r };
   } catch (error) {
     if (error?.code === "DISPATCH_ORDER_POOL_CURSOR_INVALID") throw error;
@@ -355,7 +359,7 @@ export async function listDispatchOrderPool({
        UNION ALL
        SELECT global_split.split_ref, global_split.order_type,
               global_split.eligible, global_split.search_text,
-              global_split.card, global_split.updated_at
+              global_split.card, COALESCE(NULLIF(global_split.card->>'firstSeenAt', '')::timestamptz, date_trunc('milliseconds', global_split.created_at))
          FROM dispatch_global_order_splits global_split
         WHERE global_split.active = true
           AND NOT EXISTS (
@@ -367,7 +371,7 @@ export async function listDispatchOrderPool({
        UNION ALL
        SELECT global_group.group_ref, global_group.order_type,
               global_group.eligible, global_group.search_text,
-              global_group.card, global_group.updated_at
+              global_group.card, COALESCE(NULLIF(global_group.card->>'firstSeenAt', '')::timestamptz, date_trunc('milliseconds', global_group.created_at))
          FROM dispatch_global_order_groups global_group
         WHERE global_group.active = true
           AND EXISTS (
@@ -497,6 +501,7 @@ export async function listDispatchOrderPool({
   return {
     orders: await decorateSorOrders(orders),
     nextCursor: hasMore && last ? encodeCursor({
+      v: 2,
       e: Number(last.exact_rank || 0),
       d: new Date(last.activity_at).toISOString(),
       k: text(last.order_ref).toLowerCase(),

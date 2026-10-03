@@ -1,4 +1,4 @@
-import { normalizeSpecialRate, normalizeSpecialDiscount, specialNativePricing, specialQuantity } from '../public/special-stock-pricing.js';
+import { normalizeSpecialRate, normalizeSpecialDiscount, specialNativeLinePricing, specialQuantity } from '../public/special-stock-pricing.js';
 
 function invalid(message, code) { return Object.assign(new Error(message), { status: 409, code }); }
 export const quantityReviewPending = review => ['pending','applying','attention'].includes(review?.status);
@@ -14,7 +14,7 @@ export function prepareSpecialMaterial(line, accepted) {
   const packageQuantity = line.packageQuantity ?? (legacy ? line.quantity : null);
   const conversionToPc = line.conversionToPc ?? (legacy && basisUom === line.uom ? 1 : null);
   const discountPercent = normalizeSpecialDiscount(line.discountPercent ?? accepted.discountPercent);
-  const native = specialNativePricing({ quantity: packageQuantity, rate: originalRate, discountPercent, conversionToPc });
+  const native = specialNativeLinePricing({ quantity: packageQuantity, rate: originalRate, discountPercent, conversionToPc });
   if (Number(line.quantity) !== native.quantity || (!legacy && line.uom !== 'PC')) {
     throw invalid('SO quantity and unit must match the explicit PC conversion.', 'SPECIAL_CONVERSION_MISMATCH');
   }

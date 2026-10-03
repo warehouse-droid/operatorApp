@@ -12,6 +12,7 @@ const LOCAL_OPERATION_TYPES = Object.freeze({
   delivery_consolidation_load: new Set(["consolidation_load"]),
   customer_pickup_load: new Set(["sales_order"]),
   receiving_receipt: new Set(["purchase_order", "transfer_order"]),
+  direct_po_receipt: new Set(["purchase_order"]),
   delivery_prep_load: new Set(["sales_order", "transfer_order", "group_order"])
 });
 
@@ -177,6 +178,10 @@ function normalizedSelectedLine(line) {
     localLineId: requiredText(line.localLineId, "Local line ID"),
     ...(sourceLineKey ? { sourceLineKey } : {}),
     ...(line.itemId ? { itemId: positiveInteger(line.itemId, 'Selected item ID') } : {}),
+    ...(line.autoIncludedNonInventory === true ? { autoIncludedNonInventory: true,
+      itemId: positiveInteger(line.itemId, 'Confirmed non-inventory item ID'),
+      salesUom: requiredText(line.salesUom, 'Confirmed sales UOM').toUpperCase() } : {}),
+    ...(line.directCompletionEventId ? { directCompletionEventId: positiveInteger(line.directCompletionEventId, 'Direct completion event') } : {}),
     ...(line.kit ? { kit: canonicalValue(line.kit) } : {})
   };
 }
@@ -256,7 +261,8 @@ function assertExistingPickupAvailable(existingPickup, available) {
 export function buildOperatorNetSuitePostingDraft(input = {}) {
   const requestId = String(input.requestId || "").trim().toLowerCase();
   operatorNetSuiteExternalId(requestId, 1);
-  const actorOperatorId = requiredText(input.actorOperatorId, "Operator ID");
+  const systemReceipt = input.localOperation?.kind === 'direct_po_receipt';
+  const actorOperatorId = systemReceipt ? null : requiredText(input.actorOperatorId, "Operator ID");
   const functionKey = requiredText(input.functionKey, "Operator function").toLowerCase();
   const transactionType = requiredText(input.transactionType, "NetSuite transaction type").toUpperCase();
   if (!['IF', 'IR'].includes(transactionType)) {throw inputError("NetSuite transaction type must be IF or IR.");}
@@ -275,6 +281,18 @@ export function buildOperatorNetSuitePostingDraft(input = {}) {
     .filter(Boolean))].sort();
   if (!claims.length) {throw inputError("At least one local order claim is required.");}
   const localOperation = normalizedLocalOperation(input.localOperation);
+  let directDeliveryEvidence;
+  if (systemReceipt) {
+    const evidence=input.directDeliveryEvidence;
+    if (functionKey !== 'receiving' || transactionType !== 'IR' || !evidence
+        || !Array.isArray(evidence.pickupJobIds) || !evidence.pickupJobIds.length) {
+      throw inputError('A system direct receipt requires verified pickup and delivery evidence.');
+    }
+    directDeliveryEvidence={completionEventId:positiveInteger(evidence.completionEventId,'Direct completion event'),
+      sourcePoId:positiveInteger(evidence.sourcePoId,'Direct receipt source PO'),
+      pickupJobIds:[...new Set(evidence.pickupJobIds.map((/** @type {unknown} */ value)=>requiredText(value,'Pickup job')))].sort(),
+      deliveryJobId:requiredText(evidence.deliveryJobId,'Delivery job')};
+  }
   if (!Array.isArray(input.targets) || !input.targets.length) {
     throw inputError("At least one NetSuite source target is required.");
   }
@@ -294,6 +312,9 @@ export function buildOperatorNetSuitePostingDraft(input = {}) {
     const sourceOrderKind = requiredText(rawTarget.sourceOrderKind, "Source order kind").toUpperCase();
     assertKindForTransaction(sourceOrderKind, transactionType);
     const sourceNetSuiteId = positiveInteger(rawTarget.sourceNetSuiteId, "Source NetSuite ID");
+    if (systemReceipt && (sourceOrderKind !== 'PO' || sourceNetSuiteId !== directDeliveryEvidence?.sourcePoId)) {
+      throw inputError('Direct receipt evidence belongs to a different PO source.');
+    }
     const sourceOrderRef = requiredText(rawTarget.sourceOrderRef, "Source order reference");
     const memo = transactionType === "IR" ? optionalText(rawTarget.memo) : null;
     const key = `${sourceOrderKind}:${sourceNetSuiteId}`;
@@ -365,6 +386,13 @@ export function buildOperatorNetSuitePostingDraft(input = {}) {
         sourceLineKey: current?.sourceLineKey || line.sourceLineKey || available.sourceLineKey
       });
       group.lineSnapshot.push(line);
+    }
+    for (const rawLine of rawTarget.confirmedNonInventoryLines || []) {
+      if (sourceOrderKind !== 'SO' || transactionType !== 'IF' || rawLine.autoIncludedNonInventory !== true
+          || group.availableByLine.has(Number(rawLine.orderLine))) {
+        throw inputError('Automatically included non-inventory evidence must identify a separate SO fulfillment line.');
+      }
+      group.lineSnapshot.push(normalizedSelectedLine(rawLine));
     }
   }
 
@@ -515,6 +543,7 @@ export function buildOperatorNetSuitePostingDraft(input = {}) {
     photoRefs: photoRefs.map(postingPhotoIdentity),
     claims,
     localOperation,
+    ...(directDeliveryEvidence ? {directDeliveryEvidence} : {}),
     localPayload,
     lineReconciliation,
     steps

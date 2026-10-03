@@ -252,7 +252,7 @@ export async function getNetSuiteMirrorOrderSnapshot(entityType, entityId) {
     const [header, lines] = await Promise.all([
       query(
         `SELECT netsuite_id AS id, tranid, trandate, vendor_id, vendor, vendor_address,
-                status, status_text, foreign_total AS foreigntotal, memo,
+                status, status_text, foreign_total AS foreigntotal, memo, netsuite_note,
                 source_location_id, source_location, destination_location_id,
                 destination_location, expected_delivery_date, netsuite_active,
                 netsuite_missing_at, synced_at

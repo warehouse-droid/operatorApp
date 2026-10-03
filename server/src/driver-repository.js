@@ -48,6 +48,7 @@ import {
 } from "./driver-completed-photo-evidence.js";
 
 import { VOYAGE_DISPATCH_YARD } from "./dispatch-sales-order-locations.js";
+import { retainedDirectPickupManifest,groupPickupSourceItems,spreadDirectPickupAllocation } from './dispatch-retained-link-manifests.js';
 
 const YARD_ADDRESSES = {
   "3445": "3445 Kennedy Road, Toronto, ON",
@@ -172,11 +173,9 @@ function todayLocalDate() {
 }
 
 function requiredPickupLocations(order) {
-  if (Array.isArray(order?.pickupLocations) && order.pickupLocations.length) {
-    return uniqueDispatchLocations(order.pickupLocations.map(String));
-  }
-  if (order?.sourceYard) return [String(order.sourceYard)];
-  return ["3445"];
+  const configured = order?.pickupLocations?.length ? order.pickupLocations : [order?.transitCo?.toYard || order?.sourceYard || '3445'];
+  return uniqueDispatchLocations([...configured,...(order?.poPickupManifest || []).map(entry=>entry.location),
+    ...retainedDirectPickupManifest(order || {}).map(entry=>entry.location)].map(String));
 }
 
 function jobId(plan, truck, load, stop) {
@@ -524,13 +523,14 @@ function dropStopsForPickup(plan, load, pickup) {
 }
 
 function firstPickupStop(load) {
+  if (load.stops?.[0]?.mbt) return load.stops[0];
   return (load.stops || []).find((stop) => stop.type === "pick") || null;
 }
 
 function lastRoutedStop(load) {
   const stops = Array.isArray(load?.stops) ? load.stops : [];
   for (let index = stops.length - 1; index >= 0; index -= 1) {
-    if (["pick", "drop"].includes(stops[index]?.type)) return stops[index];
+    if (stops[index]?.mbt || ["pick", "drop"].includes(stops[index]?.type)) return stops[index];
   }
   return null;
 }
@@ -581,6 +581,7 @@ function dropAddressForStop(stop = {}, order = {}) {
 
 function stopLocationLabel(plan, stop) {
   if (!stop) return "";
+  if (stop.mbt) return String(stop.yardCode || stop.planningAddress || stop.location || stop.displayName || "");
   if (stop.type === "pick") {
     const order = orderByRef(plan, stop.orderId) || {};
     const override = String(order.pickupAddressOverride || "").trim();
@@ -605,6 +606,7 @@ function pickupAddressForStop(plan, stop) {
 
 function stopAddressLabel(plan, stop) {
   if (!stop) return "";
+  if (stop.mbt) return yardAddress(stopLocationLabel(plan, stop));
   if (stop.type === "pick") return pickupAddressForStop(plan, stop);
   const order = orderByRef(plan, stop.orderId) || {};
   return dropAddressForStop(stop, order);
@@ -707,7 +709,7 @@ function buildTruckSwitchApproachJob(plan, previousAssignment, nextAssignment, s
 
 function startTravelForLoad(plan, truck, load, loadIndex, previousAssignment = null) {
   const firstPickup = firstPickupStop(load);
-  if (!firstPickup?.location) return null;
+  if (!firstPickup?.location && !firstPickup?.mbt) return null;
   const physicalPickupLocation = stopLocationLabel(plan, firstPickup);
   const toAddress = stopAddressLabel(plan, firstPickup);
   let from = null;
@@ -775,7 +777,7 @@ function buildTravelJob(plan, truck, load, truckIndex, loadIndex, previousAssign
 function loadHasDirectDependency(plan, load) {
   return (load.stops || []).some((stop) => {
     if (stop.type !== "drop") return false;
-    return (orderByRef(plan, stop.orderId)?.directPickupManifest || []).length > 0;
+    return retainedDirectPickupManifest(orderByRef(plan, stop.orderId) || {}).length > 0;
   });
 }
 
@@ -910,7 +912,7 @@ function buildJob(plan, truck, load, stop, truckIndex, loadIndex, stopIndex, phy
   const dependencyPickupManifests = isPickup
     ? relatedStops.flatMap((relatedStop) => {
         const order = orderByRef(plan, relatedStop.orderId) || {};
-        return (order.directPickupManifest || [])
+        return retainedDirectPickupManifest(order)
           .filter((entry) => dispatchLocationsShareYard(entry.location, stop.location))
           .map((entry) => ({ ...entry, salesOrderRef: entry.salesOrderRef || String(relatedStop.orderId || "") }));
       })
@@ -919,13 +921,21 @@ function buildJob(plan, truck, load, stop, truckIndex, loadIndex, stopIndex, phy
   const ordinaryStopRefs = isPickup
       ? stopOrderRefs.filter((ref) => {
         const order = orderByRef(plan, ref) || {};
-        const hasDirectHere = (order.directPickupManifest || []).some((entry) =>
+        const hasDirectHere = retainedDirectPickupManifest(order).some((entry) =>
           dispatchLocationsShareYard(entry.location, stop.location)
         );
         return !hasDirectHere || dispatchLocationsShareYard(order.sourceYard || order.outboundLocation, stop.location);
       })
     : stopOrderRefs;
-  const orderRefs = [...new Set([...expandOrderRefs(plan, ordinaryStopRefs), ...directTransferRefs])];
+  const ordinaryOrderRefs = expandOrderRefs(plan, ordinaryStopRefs).filter((ref) => {
+    if (!isPickup) {return true;}
+    const parent = ordinaryStopRefs.map(id => orderByRef(plan,id))
+      .find(order => (order?.childOrders || []).includes(ref));
+    if (parent?.transitCo?.toYard) {return dispatchLocationsShareYard(parent.transitCo.toYard,stop.location);}
+    const order = orderByRef(plan,ref);
+    return requiredPickupLocations(order).some(location => dispatchLocationsShareYard(location,stop.location));
+  });
+  const orderRefs = [...new Set([...ordinaryOrderRefs, ...directTransferRefs])];
   const firstOrder = orderByRef(plan, stopOrderRefs[0]) || orderByRef(plan, orderRefs[0]) || {};
   const pickupLocation = isPickup ? String(stop.location || "") : "";
   const physicalPickupLocation = isPickup ? stopLocationLabel(plan, stop) : "";
@@ -1168,6 +1178,7 @@ function materializePlanJobsForDriver(plan, driverLogin, { allowBin = false } = 
     let previousRoutedStop = null;
     (load.stops || []).forEach((stop, stopIndex) => {
       if (allowBin && stop?.mbt) {
+        if (stop.mbt.planningGeneration && stop.mbt.driverReleased !== true) return;
         jobs.push(buildBinJob(plan, truck, load, stop, truckIndex, assignmentIndex, stopIndex));
         previousRoutedStop = stop;
         return;
@@ -1193,7 +1204,17 @@ function materializePlanJobsForDriver(plan, driverLogin, { allowBin = false } = 
   return jobs;
 }
 
+function releasedDriverPlan(plan) {
+  return { ...plan, trucks: (plan.trucks || []).map(truck => ({
+    ...truck, loads: (truck.loads || []).map(load => ({ ...load,
+      stops: (load.stops || []).filter(stop => !stop.mbt?.planningGeneration || stop.mbt.driverReleased === true)
+    })).filter((load, index) => load.stops.length || (!truck.loads[index].stops?.length
+      && (!load.mbtPlanning || (load.returnOnly && load.mbtReturnReleased === true))))
+  })) };
+}
+
 export function planJobsForDriver(plan, driverLogin, { allowBin = false } = {}) {
+  plan = releasedDriverPlan(plan);
   if (!allowBin) {
     assertNoDriverBinMaterialization(assignedDriverSafetyPlan(plan, driverLogin));
   }
@@ -1201,6 +1222,7 @@ export function planJobsForDriver(plan, driverLogin, { allowBin = false } = {}) 
 }
 
 export function planJobsForDrivers(plan, driverLogins = [], { allowBin = false } = {}) {
+  plan = releasedDriverPlan(plan);
   if (!allowBin) {
     assertNoDriverBinMaterialization(plan);
   }
@@ -2171,20 +2193,31 @@ function visibleUnitsFromPlanItem(item) {
   return [{ unit: item.unit || "UOM", value: Number(item.quantity || item.salesQty || 0), fallback: true }];
 }
 
+function directAllocationForPlanItem(order = {}, item = {}) {
+  const total = retainedDirectPickupManifest(order).flatMap(entry => entry.items || []).filter(entry =>
+    item.itemId && entry.itemId ? String(item.itemId) === String(entry.itemId)
+      : String(item.sku || item.itemName || '').toLowerCase() === String(entry.sku || entry.itemName || '').toLowerCase()
+  ).reduce((sum,entry) => ({pallets:sum.pallets+numberValue(entry.palletQty),layers:sum.layers+numberValue(entry.layerQty),
+    sections:sum.sections+numberValue(entry.sectionQty),pieces:sum.pieces+numberValue(entry.pieceQty),
+    quantity:sum.quantity+numberValue(entry.quantity)}),{pallets:0,layers:0,sections:0,pieces:0,quantity:0});
+  return spreadDirectPickupAllocation(order,item,total);
+}
+
 function planItemForPickup(item, context = {}) {
   if (context.stopType !== "pickup") return item;
   if (String(context.orderType || "").trim().toUpperCase() === "CUSTOM") return item;
   const pickupLocation = String(context.pickupLocation || "").trim();
   const ownPickup = !pickupLocation || isOwnYard(context.plan, pickupLocation);
   if (ownPickup) {
+    const direct = directAllocationForPlanItem(context.planOrder,item);
     return {
       ...item,
-      pallets: positiveBalance(item.pallets, item.poAllocatedPallets),
-      layers: positiveBalance(item.layers, item.poAllocatedLayers),
-      sections: positiveBalance(item.sections, item.poAllocatedSections),
-      pieces: positiveBalance(item.pieces, item.poAllocatedPieces),
-      quantity: positiveBalance(item.quantity ?? item.salesQty, item.poAllocatedSalesQty),
-      salesQty: positiveBalance(item.salesQty ?? item.quantity, item.poAllocatedSalesQty)
+      pallets: positiveBalance(item.pallets, numberValue(item.poAllocatedPallets)+direct.pallets),
+      layers: positiveBalance(item.layers, numberValue(item.poAllocatedLayers)+direct.layers),
+      sections: positiveBalance(item.sections, numberValue(item.poAllocatedSections)+direct.sections),
+      pieces: positiveBalance(item.pieces, numberValue(item.poAllocatedPieces)+direct.pieces),
+      quantity: positiveBalance(item.quantity ?? item.salesQty, numberValue(item.poAllocatedSalesQty)+direct.quantity),
+      salesQty: positiveBalance(item.salesQty ?? item.quantity, numberValue(item.poAllocatedSalesQty)+direct.quantity)
     };
   }
   return {
@@ -2200,6 +2233,10 @@ function planItemForPickup(item, context = {}) {
 
 function planItemHasQuantity(item) {
   if (item.dispatchServiceFee === true) return false;
+  if (!item.rentalEquipment && !item.isSpecial && !item.salesQuantityOnly && Number(item.itemId) !== 2055) {
+    if (/delivery\s*(charge|fee)|shipping\s*(charge|fee)|sales\s*credit|discount/i.test(`${item.sku || ''} ${item.itemName || ''}`)) {return false;}
+    if (/oth\s*charge|other\s*charge|service|discount|description|subtotal|payment|markup/i.test(`${item.itemType || ''} ${item.itemTypeText || ''}`)) {return false;}
+  }
   return numberValue(item.pallets ?? item.pallet_qty)
     || numberValue(item.layers ?? item.layer_qty)
     || numberValue(item.sections ?? item.section_qty)
@@ -2214,18 +2251,28 @@ function isMaterialLine(line) {
 }
 
 export function driverOrderDetailsFromPlan(orderRef, planOrder = null, context = {}) {
-  const requestedLineRowIds = new Set((context.lineRowIds || []).map(String));
-  const projection = purchaseOrderRouteProjection(planOrder || {});
-  const routeItems = projection && context.stopType === "pickup"
+  const projection = planOrder?.toRouteProjection || purchaseOrderRouteProjection(planOrder || {});
+  const dropoffs = projection?.dropoffs || planOrder?.dropoffs || [];
+  const dropoff = dropoffs.find(drop => context.dropoffKey && drop.key === context.dropoffKey)
+    || dropoffs.find(drop => context.dropLocation && dispatchLocationsShareYard(drop.destinationYard,context.dropLocation))
+    || (dropoffs.length === 1 ? dropoffs[0] : null);
+  const requestedLineRowIds = new Set((context.lineRowIds?.length ? context.lineRowIds : dropoff?.lineRowIds || []).map(String));
+  const routeItems = planOrder?.toRouteProjection?.items || (projection && context.stopType === "pickup"
     ? (planOrder?.items || [])
-    : purchaseOrderRouteItems(planOrder);
-  const sourceItems = context.stopType === "dropoff" && requestedLineRowIds.size
+    : purchaseOrderRouteItems(planOrder));
+  const poManifests = context.stopType === 'pickup' && !isOwnYard(context.plan,context.pickupLocation)
+    ? (planOrder?.poPickupManifest || []).filter(entry => dispatchLocationsShareYard(entry.location,context.pickupLocation)) : [];
+  const coveredPoRefs = new Set((context.pickupCoveredPoOrderRefs || []).map(ref => String(ref).toLowerCase()));
+  const scopedPoItems = poManifests.filter(entry => !coveredPoRefs.has(String(entry.poOrderRef || '').toLowerCase()))
+    .flatMap(entry => entry.items || []);
+  const groupedPickupItems = context.stopType === 'pickup' ? groupPickupSourceItems(planOrder || {},context.pickupLocation) : null;
+  const sourceItems = poManifests.length ? scopedPoItems : groupedPickupItems ?? (context.stopType === "dropoff" && requestedLineRowIds.size
     ? routeItems.filter((item) => requestedLineRowIds.has(String(item.lineRowId)))
-    : routeItems;
+    : routeItems);
   const items = sourceItems
-    .map((item) => projection
+    .map((item) => projection || scopedPoItems.length || ['PO','CO'].includes(planOrder?.type)
       ? item
-      : planItemForPickup(item, { ...context, orderType: planOrder?.type || context.orderType }))
+      : planItemForPickup(item, { ...context, planOrder,orderType: planOrder?.type || context.orderType }))
     .filter(planItemHasQuantity);
   return {
     orderId: Number(planOrder?.netsuiteId || planOrder?.netsuite_id || 0) || null,
@@ -2268,8 +2315,11 @@ async function orderDetails(orderRef, typeHint = "", planOrder = null, context =
   if (String(typeHint || "").trim().toUpperCase() === "CUSTOM") {
     return detailsFromCustomOrder(orderRef, planOrder, context);
   }
-  if (purchaseOrderRouteProjection(planOrder || {})) {
-    return driverOrderDetailsFromPlan(orderRef, planOrder, { ...context, orderType: "PO" });
+  if (planOrder?.toRouteProjection || purchaseOrderRouteProjection(planOrder || {})) {
+    return driverOrderDetailsFromPlan(orderRef, planOrder, { ...context, orderType: planOrder.type });
+  }
+  if (context.stopType === 'pickup' && (retainedDirectPickupManifest(planOrder || {}).length || (planOrder?.poPickupManifest || []).length)) {
+    return driverOrderDetailsFromPlan(orderRef,planOrder,context);
   }
   const detail = typeHint === "PO"
     ? await detailsFromReceiving(orderRef, "PO", context)
@@ -2388,14 +2438,14 @@ async function materializeDriverJob(plan, job, status = null, { deferDeliveryIns
       }));
   materialized.orders = await Promise.all(displayScopes.map((scope) => {
     const ref = scope.orderRef;
-    const dependencyManifest = (materialized.dependencyPickupManifests || [])
-      .find((entry) => String(entry.transferOrderRef || "") === String(ref));
-    if (dependencyManifest) {
+    const dependencyManifests = (materialized.dependencyPickupManifests || [])
+      .filter((entry) => String(entry.transferOrderRef || "") === String(ref));
+    if (dependencyManifests.length) {
       return {
-        orderRef: dependencyManifest.transferOrderRef,
-        party: dependencyManifest.salesOrderRef || "",
+        orderRef: ref,
+        party: [...new Set(dependencyManifests.map(entry => entry.salesOrderRef).filter(Boolean))].join(' + '),
         source: "direct_dependency",
-        items: (dependencyManifest.items || []).map((item) => ({
+        items: dependencyManifests.flatMap(entry => entry.items || []).map((item) => ({
           itemName: item.itemName || item.sku || "",
           sku: item.sku || item.itemName || "",
           description: item.description || "",
@@ -2422,6 +2472,9 @@ async function materializeDriverJob(plan, job, status = null, { deferDeliveryIns
         ? scope.dropLocation || materialized.dropLocation || materialized.location
         : "",
       destinationLocationId: scope.destinationLocationId ?? materialized.destinationLocationId ?? null,
+      pickupCoveredPoOrderRefs: materialized.stopType === 'pickup' ? (materialized.orderRefs || [])
+        .map(pickupRef => orderByRef(plan,pickupRef)).filter(order => canonicalDriverPlanOrderType(order)==='PO')
+        .flatMap(order => [order.id,order.originalPoRef,order.originalOrderId].filter(Boolean)) : [],
       lineRowIds: materialized.stopType === "dropoff" ? scope.lineRowIds || [] : []
     });
   }));

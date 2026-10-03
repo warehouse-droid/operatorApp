@@ -3,6 +3,8 @@
 import {
   fetchItemFulfillmentFromNetSuite,
   fetchItemReceiptFromNetSuite,
+  fetchPurchaseOrderHistorySnapshotFromNetSuite,
+  fetchSalesOrderFulfillmentStateFromNetSuite,
   findOperatorNetSuitePostingTransactionByExternalId,
   transformPurchaseOrderToItemReceipt,
   transformSalesOrderToItemFulfillment,
@@ -15,6 +17,8 @@ import { createLocationAwareIFAdapter } from './item-fulfillment-parts-service.j
 import { itemFulfillmentPartsRepository } from './item-fulfillment-parts-repository.js';
 import { fetchOperatorKitSource } from './operator-netsuite-posting-kit-source.js';
 import { assertOperatorKitStepCurrent, operatorKitError, operatorStepHasKits } from './operator-netsuite-posting-kits.js';
+import { assertDirectPoReceiptStepCurrent } from './direct-po-auto-receipt-domain.js';
+import { assertDispatchFulfillmentStepCurrent } from './netsuite-fulfillable-items.js';
 
 /** @param {Record<string, any>} record @param {string | undefined} fallback */
 function transactionTypeFromRecord(record, fallback) {
@@ -59,6 +63,8 @@ async function recheckKitSource(step, readSource) {
  * @param {Function} dependencies.fetchItemFulfillment
  * @param {Function} dependencies.fetchItemReceipt
  * @param {Function} [dependencies.fetchKitSource]
+ * @param {Function} [dependencies.fetchDirectReceiptSource]
+ * @param {Function} [dependencies.fetchDispatchFulfillmentSource]
  */
 export function createOperatorNetSuitePostingAdapter({
   findTransactionByExternalId,
@@ -68,7 +74,9 @@ export function createOperatorNetSuitePostingAdapter({
   transformTransferOrderToItemReceipt: transferOrderReceipt,
   fetchItemFulfillment,
   fetchItemReceipt,
-  fetchKitSource = fetchOperatorKitSource
+  fetchKitSource = fetchOperatorKitSource,
+  fetchDirectReceiptSource = fetchPurchaseOrderHistorySnapshotFromNetSuite,
+  fetchDispatchFulfillmentSource = fetchSalesOrderFulfillmentStateFromNetSuite
 }) {
   const endpointTypes = new WeakMap();
   async function fetchById(/** @type {Record<string, any>} */ step, /** @type {number} */ id) {
@@ -111,6 +119,9 @@ export function createOperatorNetSuitePostingAdapter({
     async transform(/** @type {Record<string, any>} */ step) {
       if (step.transactionType === "IF" && step.sourceOrderKind === "SO") {
         return operatorNetSuiteRequestPool.run(async () => {
+          if (step.dispatchAutoFulfillment) {
+            assertDispatchFulfillmentStepCurrent(step,await fetchDispatchFulfillmentSource(step.sourceNetSuiteId));
+          }
           await recheckKitSource(step, fetchKitSource);
           return salesOrderFulfillment(step.sourceNetSuiteId, step.payload);
         });
@@ -119,7 +130,12 @@ export function createOperatorNetSuitePostingAdapter({
         return operatorNetSuiteRequestPool.run(() => transferOrderFulfillment(step.sourceNetSuiteId, step.payload));
       }
       if (step.transactionType === "IR" && step.sourceOrderKind === "PO") {
-        return operatorNetSuiteRequestPool.run(() => purchaseOrderReceipt(step.sourceNetSuiteId, step.payload));
+        return operatorNetSuiteRequestPool.run(async () => {
+          if ((step.lineSnapshot || []).some((/** @type {Record<string,any>} */ line)=>line.directCompletionEventId)) {
+            assertDirectPoReceiptStepCurrent(step,await fetchDirectReceiptSource(step.sourceNetSuiteId));
+          }
+          return purchaseOrderReceipt(step.sourceNetSuiteId, step.payload);
+        });
       }
       if (step.transactionType === "IR" && step.sourceOrderKind === "TO") {
         return operatorNetSuiteRequestPool.run(() => transferOrderReceipt(step.sourceNetSuiteId, step.payload));

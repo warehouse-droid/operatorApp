@@ -1,4 +1,5 @@
 import { hasActiveTransaction, query } from "./db.js";
+import { enrichYardMovementEvidence } from "./movement-record-evidence.js";
 import { salesStoreLocationIdSql } from "./sales-store.js";
 import {
   getActiveReloadCycleForOrder,
@@ -652,6 +653,7 @@ function movementSummaryColumns(alias = "movement") {
     ${alias}.direction,
     ${alias}.order_type,
     ${alias}.order_id,
+    ARRAY_AGG(DISTINCT ${alias}.event_key) AS record_keys,
     (ARRAY_AGG(${alias}.tranid ORDER BY ${alias}.activity_at DESC))[1] AS tranid,
     (ARRAY_AGG(${alias}.party ORDER BY ${alias}.activity_at DESC))[1] AS party,
     (ARRAY_AGG(${alias}.yard_location_id ORDER BY ${alias}.activity_at DESC))[1] AS yard_location_id,
@@ -709,7 +711,7 @@ export async function listYardMovements(filters = {}) {
                (ARRAY_AGG(movement.tranid ORDER BY movement.activity_at DESC))[1]`,
     params
   );
-  return result.rows;
+  return enrichYardMovementEvidence(result.rows);
 }
 
 export async function getYardMovementDetail({
@@ -884,8 +886,9 @@ export async function getYardMovementDetail({
     () => (isSalesOrderLoad ? getLatestSalesOrderReattemptForOrder(Number(orderId)) : Promise.resolve(null))
   ]);
   const loadAttempts = attemptsWithinDates(allLoadAttempts, fromDate, toDate);
+  const [order] = await enrichYardMovementEvidence(orderResult.rows);
   return {
-    order: orderResult.rows[0],
+    order,
     lines: lineResult.rows,
     photos: photoResult.rows,
     driverRecords: driverResult.rows,

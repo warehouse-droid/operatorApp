@@ -32,11 +32,11 @@ const menuItems = Object.freeze([
     summary: "Create local customer-site, quote, contract, and current front-leg records."
   }),
   Object.freeze({
-    title: "BIN Dispatch",
-    href: "/dispatch/planning",
+    title: "BIN Planning",
+    href: "/mbt/planning",
     roles: Object.freeze(["admin", "dispatcher"]),
     capability: "binDispatch",
-    summary: "Assign the current contract leg to an eligible BIN truck and driver."
+    summary: "Plan BIN visits with the shared daily driver schedule and Dispatch edit lock."
   }),
   Object.freeze({
     title: "Driver PWA",

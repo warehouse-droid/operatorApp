@@ -1,0 +1,2083 @@
+--- a/server/src/regular-stock-domain.js
++++ b/server/src/regular-stock-domain.js
+@@ -0,0 +1,110 @@
++// @ts-check
++/**
++ * @typedef {{id:number,itemId:number,sourceLocationId:number,salesQty:number,salesUom?:string,itemName?:string,decision?:string,status?:string,destinationLocationId?:number}} RegularLine
++ * @typedef {{itemId:number,sourceLocationId:number,availableQuantity:number|null,safetyQuantity:number|null}} StockPolicy
++ * @typedef {{remoteLineId:number,itemId:number,quantity:number,uom?:string,locationId:number,open:boolean,ancillary?:boolean}} MaterialLine
++ * @typedef {{destinationLocationId:number,lines:RegularLine[],regular?:{customerId?:number}}} RoutingRequest
++ * @typedef {{id?:number,ref?:string,locationId:number,customerId?:number,lines:MaterialLine[]}} SalesOrder
++ */
++import { normalizeRegularLeadHours } from '../public/regular-stock-input.js';
++import { groupStockRequestLinesForTransfer } from './stock-request-domain.js';
++
++/** @param {string} message @param {string} [code] @param {number} [status] */
++export const regularError = (message, code = 'REGULAR_STOCK_INVALID', status = 409) => Object.assign(new Error(message), { code, status });
++/** @param {{itemId:number,sourceLocationId:number}} line */
++const key = line => `${Number(line.itemId)}:${Number(line.sourceLocationId)}`;
++/** @param {unknown} value */
++const valid = value => value !== null && value !== undefined && Number.isFinite(Number(value));
++/** @param {unknown} value */
++const cleanUom = value => String(value || '').toUpperCase().replace(/[^A-Z0-9]/g, '');
++/** @param {number} a @param {number} b */
++const sameQty = (a, b) => Math.abs(Number(a) - Number(b)) <= 1e-6;
++
++/** @param {{lines?:RegularLine[],policies?:StockPolicy[],arrivalAt:string|number|Date,leadHours?:number,now?:string|number|Date}} input */
++export function evaluateRegularStockApproval({ lines = [], policies = [], arrivalAt, leadHours = 5, now = new Date() }) {
++  const hours = normalizeRegularLeadHours(leadHours);
++  const nowMs = new Date(now).getTime(), arrivalMs = new Date(arrivalAt).getTime();
++  if (!Number.isFinite(nowMs) || !Number.isFinite(arrivalMs)) throw regularError('A valid arrival instant is required.', 'REGULAR_ARRIVAL_INVALID', 400);
++  const enoughTime = arrivalMs >= nowMs + hours * 3600000;
++  const totals = new Map();
++  for (const line of lines) {
++    if (!valid(line.salesQty) || Number(line.salesQty) <= 0) throw regularError('Positive quantities are required.');
++    totals.set(key(line), (totals.get(key(line)) || 0) + Number(line.salesQty));
++  }
++  const policiesByKey = new Map(policies.map(policy => [key(policy), policy]));
++  const evidence = lines.map(line => {
++    const policy = policiesByKey.get(key(line));
++    const known = valid(policy?.availableQuantity) && valid(policy?.safetyQuantity) && Number(policy?.safetyQuantity) >= 0;
++    const available = known ? Number(policy?.availableQuantity) : null;
++    const safety = known ? Number(policy?.safetyQuantity) : null;
++    const requested = totals.get(key(line));
++    const remaining = known ? Number(available) - Number(requested) : null;
++    const safe = known && Number(remaining) + 1e-9 >= Number(safety);
++    return { lineId: Number(line.id), itemId: Number(line.itemId), sourceLocationId: Number(line.sourceLocationId),
++      requestedQuantity: Number(line.salesQty), groupedRequestedQuantity: requested, availableQuantity: available,
++      safetyQuantity: safety, remainingQuantity: remaining, shortfallQuantity: known ? Math.max(0, Number(safety) - Number(remaining)) : null,
++      unit: line.salesUom, stockEligible: safe, reasons: [...(!known ? ['policy_unavailable'] : !safe ? ['below_safety'] : []), ...(!enoughTime ? ['short_lead_time'] : [])] };
++  });
++  return { automatic: evidence.length > 0 && enoughTime && evidence.every(line => line.stockEligible), leadHours: hours,
++    evaluatedAt: new Date(nowMs).toISOString(), arrivalAt: new Date(arrivalMs).toISOString(), enoughTime, lines: evidence };
++}
++
++/** @param {{request:RoutingRequest,salesOrder:SalesOrder,selectedLineIds?:Record<string,number>}} input */
++export function planRegularStockRouting({ request, salesOrder, selectedLineIds = {} }) {
++  /** @param {string} message @returns {never} */
++  const mismatch = message => { throw regularError(message, 'REGULAR_SO_MISMATCH'); };
++  if (Number(salesOrder.locationId) !== Number(request.destinationLocationId)) mismatch('The SO must be created at your Sales location.');
++  if (request.regular?.customerId && Number(request.regular.customerId) !== Number(salesOrder.customerId)) mismatch('The SO customer does not match this request.');
++  const approved = request.lines.filter(line => ['stock', 'po'].includes(line.decision||''));
++  if (!approved.length || request.lines.some(line => !line.decision && !['rejected', 'cancelled'].includes(line.status||''))) mismatch('Every line needs a decision before linking an SO.');
++  const materials = salesOrder.lines.filter(line => !line.ancillary);
++  if (materials.some(line => !line.open)) mismatch('All SO material lines must be open and unfulfilled.');
++  /** @type {Map<string,RegularLine[]>} */
++  const byItem = new Map();
++  for (const line of approved) {
++    const itemKey = `${line.itemId}:${cleanUom(line.salesUom)}`;
++    if (!byItem.has(itemKey)) byItem.set(itemKey, []);
++    byItem.get(itemKey)?.push(line);
++  }
++  const mappings = [];
++  const used = new Set();
++  for (const lines of byItem.values()) {
++    const quantity = lines.reduce((sum, line) => sum + Number(line.salesQty), 0);
++    const selected = selectedLineIds[lines[0].itemId];
++    const matches = materials.filter(candidate => Number(candidate.itemId) === Number(lines[0].itemId)
++      && cleanUom(candidate.uom) === cleanUom(lines[0].salesUom)
++      && (!selected || Number(candidate.remoteLineId) === Number(selected)));
++    const exact=matches.filter(candidate=>sameQty(candidate.quantity,quantity));
++    const candidates=sameQty(matches.reduce((sum,line)=>sum+Number(line.quantity),0),quantity)?matches:exact.length===1?exact:[];
++    if (!candidates.length) mismatch(`Select the exact open SO line for ${lines[0].itemName || lines[0].itemId} with quantity ${quantity}.`);
++    for(const candidate of candidates){
++      if (Number(candidate.locationId) !== Number(request.destinationLocationId) || used.has(candidate.remoteLineId)) mismatch('Matched SO lines must still be at your Sales location.');
++      used.add(candidate.remoteLineId);
++    }
++    let index=0,remaining=Number(candidates[0].quantity);
++    for (const line of lines) {
++      let quantityLeft=Number(line.salesQty);
++      while(quantityLeft>1e-6){
++        const candidate=candidates[index];
++        if(!candidate||!(remaining>0))mismatch('SO quantities could not be allocated exactly.');
++        const allocated=Math.min(remaining,quantityLeft);
++        mappings.push({requestLineId:Number(line.id),remoteLineId:Number(candidate.remoteLineId),itemId:Number(line.itemId),quantity:allocated});
++        quantityLeft-=allocated;remaining-=allocated;
++        if(remaining<=1e-6){index++;remaining=Number(candidates[index]?.quantity||0);}
++      }
++    }
++  }
++  const sources = new Set(approved.map(line => Number(line.sourceLocationId)));
++  const complete = materials.every(line => used.has(line.remoteLineId));
++  const mode = complete && sources.size === 1 ? 'location' : 'transfer';
++  return { mode, sourceLocationId: mode === 'location' ? [...sources][0] : null,
++    materialLineIds: [...used], mappings, salesOrderId: Number(salesOrder.id), salesOrderRef: salesOrder.ref,
++    groups: mode === 'transfer' ? groupStockRequestLinesForTransfer(approved.map(line => ({ ...line, destinationLocationId: request.destinationLocationId }))) : [] };
++}
++
++/** @param {{preferredQuantity:number,inventoryPositionQuantity:number,purchaseIncrement?:number}} input */
++export function regularReplenishmentQuantity({ preferredQuantity, inventoryPositionQuantity, purchaseIncrement = 1 }) {
++  if (![preferredQuantity, inventoryPositionQuantity, purchaseIncrement].every(valid) || Number(preferredQuantity) < 0 || Number(purchaseIncrement) <= 0) throw regularError('Replenishment policy or units are unavailable.', 'REGULAR_REPLENISHMENT_POLICY');
++  const gap = Math.max(0, Number(preferredQuantity) - Number(inventoryPositionQuantity));
++  return Math.max(0, Math.ceil(gap / Number(purchaseIncrement) - 1e-9)) * Number(purchaseIncrement);
++}
+--- a/server/src/regular-stock-request-service.js
++++ b/server/src/regular-stock-request-service.js
+@@ -0,0 +1,162 @@
++import { query, withTransaction } from './db.js';
++import { createSalesStockRequest, updateSalesStockRequest, getScmStockRequest, getSalesStockRequest, recordStockRequestEvent, decideSalesStockRequestLines } from './stock-request-repository.js';
++import { refreshStockRequestItemsAvailability } from './stock-request-service.js';
++import { normalizeRegularArrival, normalizeRegularLeadHours } from '../public/regular-stock-input.js';
++import { evaluateRegularStockApproval, regularError } from './regular-stock-domain.js';
++import { assertStockRequestDestinationAccess } from './stock-request-domain.js';
++import { findSpecialCustomer } from './special-stock-customer-directory.js';
++
++export async function regularStockPolicies(itemIds=[]) {
++  const { loadSmartScmPlanningDemandStates } = await import('./smart-scm-planning-repository.js');
++  const planning = await loadSmartScmPlanningDemandStates({ includeTemporarilyExcluded: true,includePausedItemIds:itemIds });
++  return planning.states.map(state => ({ itemId: Number(state.policy.item_id), sourceLocationId: Number(state.policy.location_id),
++    availableQuantity: state.inventorySyncedAt ? (state.rawAvailableSales ?? state.availableSales) - (state.reservedOutboundSales || 0) : null,
++    safetyQuantity: state.toPlt > 0 ? state.safety * state.toPlt : null }));
++}
++
++function requiredId(value) {
++  const id = Number(value);
++  if (!Number.isSafeInteger(id) || id <= 0) throw regularError('A valid record ID is required.', 'REGULAR_STOCK_INVALID', 400);
++  return id;
++}
++
++async function lockRequest(id, expectedRevision) {
++  const result = await query('SELECT * FROM sales_stock_requests WHERE id=$1 FOR UPDATE', [requiredId(id)]);
++  const row = result.rows[0];
++  if (!row || row.request_type !== 'regular') throw regularError('Regular stock request not found.', 'REGULAR_NOT_FOUND', 404);
++  if (expectedRevision !== undefined && (!Number.isSafeInteger(Number(expectedRevision)) || Number(row.revision) !== Number(expectedRevision))) {
++    throw regularError('This request changed. Reload and try again.', 'STOCK_REQUEST_REVISION_CONFLICT');
++  }
++  return row;
++}
++
++async function inputDetails(input) {
++  const deliveryMethod = String(input.deliveryMethod || '').toLowerCase();
++  if (!['pickup', 'delivery'].includes(deliveryMethod)) throw regularError('Select Pickup or Delivery.', 'REGULAR_DELIVERY_REQUIRED', 400);
++  const arrival = normalizeRegularArrival(input.arrivalDate, input.arrivalTime);
++  let customerId = null;
++  let customerName = String(input.customerName || '').trim();
++  if (customerName.length > 200 || /[\u0000-\u001f]/u.test(customerName)) throw regularError('Customer name must be at most 200 characters.', 'REGULAR_CUSTOMER_INVALID', 400);
++  if (input.customerId) {
++    const customer = await findSpecialCustomer(requiredId(input.customerId));
++    if (!customer) throw regularError('Select an active customer.', 'REGULAR_CUSTOMER_INVALID', 400);
++    customerId = customer.id; customerName = customer.name;
++  }
++  return { customerId, customerName, deliveryMethod, arrivalDate: arrival.date, arrivalTime: arrival.time, arrivalAt: arrival.arrivalAt, timeZone: arrival.timeZone };
++}
++
++async function collectEvidence(itemIds, dependencies) {
++  try {
++    await (dependencies.refreshAvailability || refreshStockRequestItemsAvailability)([...new Set(itemIds.map(Number))]);
++    return { policies: await (dependencies.loadPolicies || regularStockPolicies)(itemIds), error: null };
++  } catch (error) {
++    return { policies: [], error: String(error.message).slice(0, 1000) };
++  }
++}
++
++async function persistApproval(request, details, evidence, now) {
++  const setting = await query('SELECT regular_stock_lead_hours FROM scm_smart_settings WHERE id=1');
++  const leadHours = normalizeRegularLeadHours(setting.rows[0]?.regular_stock_lead_hours ?? 5);
++  const approval = evaluateRegularStockApproval({ lines: request.lines, policies: evidence.policies, arrivalAt: details.arrivalAt, leadHours, now });
++  await query(`UPDATE sales_stock_requests SET workflow_version=2,regular_details=$2::jsonb,
++    status=$3,first_scm_decision_at=CASE WHEN $4 THEN now() ELSE first_scm_decision_at END WHERE id=$1`,
++  [request.id, JSON.stringify({ ...details, approval, evidenceError: evidence.error }), approval.automatic ? 'active' : 'submitted', approval.automatic]);
++  for (const line of approval.lines) {
++    await query(`UPDATE sales_stock_request_lines SET approval_evidence=$2::jsonb,status=$3,
++      regular_decision=$4,decided_at=CASE WHEN $5 THEN now() ELSE NULL END WHERE id=$1`,
++    [line.lineId, JSON.stringify(line), approval.automatic ? 'approved' : 'submitted', approval.automatic ? 'stock' : null, approval.automatic]);
++  }
++  await recordStockRequestEvent({ requestId: request.id, eventType: approval.automatic ? 'regular_auto_approved' : 'regular_manual_review', details: approval });
++  return getScmStockRequest(request.id);
++}
++
++export async function submitRegularStockRequest(input, context, dependencies = {}) {
++  assertStockRequestDestinationAccess(input.destinationLocationId, context.authorizedDestinationLocationIds);
++  const details = await inputDetails(input);
++  const evidence = await collectEvidence((input.lines || []).map(line => line.itemId), dependencies);
++  const now = (dependencies.now || (() => new Date()))();
++  return withTransaction(async () => {
++    const request = await createSalesStockRequest(input, context);
++    return persistApproval(request, details, evidence, now);
++  });
++}
++
++export async function editRegularStockRequest(id, input, context, dependencies = {}) {
++  const before = await getSalesStockRequest(id, context);
++  if (before.workflowVersion !== 2) return updateSalesStockRequest(id, input, context);
++  const details = await inputDetails(input);
++  const evidence = await collectEvidence((input.lines || []).map(line => line.itemId), dependencies);
++  return withTransaction(async () => {
++    const request = await updateSalesStockRequest(id, input, context);
++    return persistApproval(request, details, evidence, (dependencies.now || (() => new Date()))());
++  });
++}
++
++export async function refreshRegularStockEvidence(id, dependencies = {}) {
++  const request = await getScmStockRequest(id);
++  if (request.workflowVersion !== 2) return request;
++  const evidence = await collectEvidence(request.lines.map(line => line.itemId), dependencies);
++  const current = evaluateRegularStockApproval({ lines: request.lines, policies: evidence.policies, arrivalAt: request.regular.arrivalAt,
++    leadHours: request.regular.approval.leadHours, now: request.regular.approval.evaluatedAt });
++  // Current review evidence is separate from the immutable approval snapshot.
++  return { ...request, currentEvidence: current.lines, evidenceError: evidence.error };
++}
++
++export async function decideRegularStockRequest(id, input, context, dependencies = {}) {
++  const before = await getScmStockRequest(id);
++  if (before.workflowVersion !== 2) return decideSalesStockRequestLines(id, input, context);
++  const decision = String(input.decision || '');
++  if (!['stock', 'po', 'reject'].includes(decision)) throw regularError('Choose TO/location change, PO replenishment, or Reject.', 'REGULAR_DECISION_INVALID', 400);
++  const reason = String(input.reason || '').trim();
++  if (reason.length > 1000 || decision === 'reject' && !reason) throw regularError('Rejection requires a reason, at most 1000 characters.', 'REGULAR_REASON_REQUIRED', 400);
++  const lineIds = [...new Set((input.lineIds || []).map(requiredId))];
++  if (!lineIds.length) throw regularError('Select at least one item.', 'REGULAR_DECISION_INVALID', 400);
++  const evidence = await collectEvidence(before.lines.map(line => line.itemId), dependencies);
++  return withTransaction(async () => {
++    const row = await lockRequest(id, input.expectedRevision);
++    const request = await getScmStockRequest(id);
++    if (input.expectedRevision === undefined) throw regularError('Request revision is required.');
++    const selected = request.lines.filter(line => lineIds.includes(line.id));
++    if (selected.length !== lineIds.length || selected.some(line => line.status !== 'submitted')) throw regularError('Only undecided lines can be reviewed.');
++    const snapshot = evaluateRegularStockApproval({ lines: request.lines, policies: evidence.policies, arrivalAt: request.regular.arrivalAt,
++      leadHours: request.regular.approval.leadHours, now: (dependencies.now || (() => new Date()))() });
++    for (const line of selected) await query(`UPDATE sales_stock_request_lines SET regular_decision=$2,status=$3,
++      decision_reason=$4,decided_by=$5,decided_at=now(),approval_evidence=$6::jsonb,updated_at=now() WHERE id=$1`,
++    [line.id, decision, decision === 'reject' ? 'rejected' : 'approved', reason, context.operatorId,
++      JSON.stringify(snapshot.lines.find(entry => entry.lineId === line.id))]);
++    const event = await query(`INSERT INTO sales_stock_request_events(request_id,event_type,actor_id,details)
++      VALUES($1,'regular_manual_decision',$2,$3::jsonb) RETURNING id`, [id, context.operatorId, JSON.stringify({ decision, lineIds, reason, evidence: snapshot, evidenceError: evidence.error })]);
++    await query(`UPDATE sales_stock_requests SET revision=revision+1,first_scm_decision_at=COALESCE(first_scm_decision_at,now()),
++      manual_decision_event_id=$2,status=CASE WHEN EXISTS(SELECT 1 FROM sales_stock_request_lines WHERE request_id=$1 AND status NOT IN ('rejected','cancelled','fulfilled','received','closed')) THEN 'active' ELSE 'completed' END,
++      updated_at=now() WHERE id=$1`, [row.id,event.rows[0].id]);
++    return getScmStockRequest(id);
++  });
++}
++
++export async function regularStockAlerts({ scm = false, operatorId, authorizedDestinationLocationIds = [] } = {}) {
++  if (scm) {
++    const { rows } = await query(`SELECT count(*)::int AS count FROM sales_stock_requests r WHERE r.workflow_version=2 AND r.request_type='regular'
++      AND EXISTS(SELECT 1 FROM sales_stock_request_lines l WHERE l.request_id=r.id AND l.status='submitted')`);
++    return { manualReview: rows[0].count, total: rows[0].count };
++  }
++  if (!operatorId || !authorizedDestinationLocationIds.length) return { unread: 0, total: 0, requests: [] };
++  const { rows } = await query(`SELECT r.id,r.request_ref,r.manual_decision_event_id FROM sales_stock_requests r
++    LEFT JOIN regular_stock_decision_reads seen ON seen.request_id=r.id AND seen.operator_id=$1
++    WHERE r.workflow_version=2 AND r.request_type='regular' AND r.requested_by=$1 AND r.destination_location_id=ANY($2::bigint[])
++      AND r.manual_decision_event_id>COALESCE(seen.event_id,0) ORDER BY r.manual_decision_event_id DESC`,[operatorId,authorizedDestinationLocationIds]);
++  return { unread: rows.length, total: rows.length, requests: rows.map(row => ({ id: Number(row.id), requestRef: row.request_ref, eventId: Number(row.manual_decision_event_id) })) };
++}
++
++export async function acknowledgeRegularStockDecisions(id, { eventId }, context) {
++  return withTransaction(async () => {
++    const request = await lockRequest(id);
++    await getSalesStockRequest(id, context);
++    if (request.requested_by !== context.operatorId) throw regularError('Only the requester can acknowledge this decision.', 'REGULAR_ALERT_FORBIDDEN', 403);
++    const event = requiredId(eventId);
++    const found = await query(`SELECT id FROM sales_stock_request_events WHERE id=$1 AND request_id=$2 AND event_type='regular_manual_decision'`,[event,id]);
++    if (!found.rowCount || event > Number(request.manual_decision_event_id)) throw regularError('That decision was not displayed for this request.');
++    await query(`INSERT INTO regular_stock_decision_reads(request_id,operator_id,event_id) VALUES($1,$2,$3)
++      ON CONFLICT(request_id,operator_id) DO UPDATE SET event_id=GREATEST(regular_stock_decision_reads.event_id,EXCLUDED.event_id),read_at=now()`,[id,context.operatorId,event]);
++    return { acknowledged: true, eventId: event };
++  });
++}
+--- a/server/src/regular-stock-netsuite-adapter.js
++++ b/server/src/regular-stock-netsuite-adapter.js
+@@ -0,0 +1,66 @@
++import { regularError } from './regular-stock-domain.js';
++import { STOCK_REQUEST_YARDS } from './stock-request-domain.js';
++const conflict = message => regularError(message, 'REGULAR_SO_MISMATCH');
++const id = value => {
++  const result = Number(value);
++  if (!Number.isSafeInteger(result) || result <= 0) throw conflict('NetSuite returned an invalid record identity.');
++  return result;
++};
++
++export async function readRegularSalesOrder(reference, { queryAll, rest, resolveYards }) {
++  const ref = String(reference || '').trim();
++  if (!ref || ref.length > 80 || /[\u0000-\u001f]/u.test(ref)) throw conflict('Enter a valid SO number.');
++  const literal = ref.replaceAll("'", "''");
++  const rows = await queryAll(`SELECT t.id,t.tranid,t.location AS order_location_id,t.entity AS customer_id,t.status,
++    tl.uniquekey AS line_id,tl.id AS rest_line_id,tl.item AS item_id,BUILTIN.DF(tl.item) AS item_name,
++    tl.quantity,BUILTIN.DF(i.stockunit) AS stock_unit,i.itemtype AS item_type,tl.location AS location_id,
++    NVL(tl.quantityshiprecv,0) AS fulfilled_quantity,NVL(tl.quantitybilled,0) AS billed_quantity,tl.isclosed AS line_closed
++    FROM transaction t JOIN transactionline tl ON tl.transaction=t.id JOIN item i ON i.id=tl.item
++    WHERE t.type='SalesOrd' AND UPPER(t.tranid)=UPPER('${literal}') AND tl.mainline='F' AND tl.taxline='F'
++    ORDER BY tl.uniquekey`);
++  if (!rows.length || new Set(rows.map(row => Number(row.id))).size !== 1) throw conflict('A unique SO with item lines was not found.');
++  const orderId = id(rows[0].id);
++  const record = (await rest(`/record/v1/salesOrder/${orderId}?expandSubResources=true`)).data;
++  const remoteLines = record?.item?.items;
++  if (!Array.isArray(remoteLines) || remoteLines.length !== rows.length || rows.length > 500) throw conflict('A complete SO line snapshot is required.');
++  const yards = await resolveYards(STOCK_REQUEST_YARDS.map(yard => ({ locationId: yard.locationId, code: yard.yardCode })));
++  const local = value => Number(yards.find(yard => Number(yard.netsuiteLocationId) === Number(value))?.localLocationId || value);
++  if (Number(record.location?.id) !== Number(rows[0].order_location_id) || Number(record.entity?.id) !== Number(rows[0].customer_id)) throw conflict('The SO changed while its header was read.');
++  const lines = rows.map(row => {
++    const matches = remoteLines.filter(line => Number(line.line) === Number(row.rest_line_id));
++    if (matches.length !== 1 || Number(matches[0].item?.id) !== Number(row.item_id)) throw conflict('The SO line identities are inconsistent.');
++    const line = matches[0];
++    if(Number(line.location?.id||0)!==Number(row.location_id||0))throw conflict('The SO line location changed while it was read.');
++    const ancillary = !['InvtPart','Assembly','Kit'].includes(row.item_type) || /^PALLET$/i.test(String(row.item_name));
++    return { remoteLineId: id(row.line_id), restLineId: Number(row.rest_line_id), itemId: id(row.item_id), itemName: row.item_name,
++      quantity: Math.abs(Number(row.quantity)), restQuantity: Number(line.quantity), uom: row.stock_unit,
++      locationId: local(row.location_id), remoteLocationId: Number(row.location_id), ancillary, physicalPallet: /^PALLET$/i.test(String(row.item_name)),
++      rate: line.rate ?? null, open: ['A','B'].includes(row.status) && Number(row.fulfilled_quantity) === 0 && Number(row.billed_quantity) === 0 && [false,'F'].includes(row.line_closed) };
++  });
++  if (new Set(lines.map(line => line.remoteLineId)).size !== lines.length) throw conflict('The SO has duplicate line identities.');
++  return { id: orderId, ref: rows[0].tranid, customerId: id(rows[0].customer_id), locationId: local(rows[0].order_location_id),
++    remoteLocationId: Number(rows[0].order_location_id), yards, lines };
++}
++
++export async function applyRegularSalesOrderLocation({ order, plan }, boundary) {
++  const fresh = await readRegularSalesOrder(order.ref, boundary);
++  if (fresh.lines.length !== order.lines.length || fresh.id !== order.id || fresh.customerId !== order.customerId || fresh.locationId !== order.locationId) throw conflict('The SO header changed after it was linked.');
++  const target = Number(fresh.yards.find(yard => Number(yard.localLocationId) === Number(plan.sourceLocationId))?.netsuiteLocationId);
++  if (!target) throw conflict('The approved source yard has no NetSuite mapping.');
++  const selected = new Set(plan.materialLineIds);
++  const pending = [];
++  for (const original of order.lines.filter(line => selected.has(line.remoteLineId) || line.physicalPallet)) {
++    const line = fresh.lines.find(candidate => candidate.remoteLineId === original.remoteLineId);
++    if (!line || !line.open || line.itemId !== original.itemId || line.quantity !== original.quantity || line.restQuantity !== original.restQuantity
++        || line.rate !== original.rate || ![original.remoteLocationId,target].includes(line.remoteLocationId)) throw conflict('A linked SO line changed or started fulfillment. Refresh and resolve it before retrying.');
++    if (line.remoteLocationId !== target) pending.push({ line: line.restLineId, location: { id: String(target) } });
++  }
++  if (pending.length) await boundary.rest(`/record/v1/salesOrder/${id(order.id)}`, { method: 'PATCH', body: { item: { items: pending } } });
++  const after = await readRegularSalesOrder(order.ref, boundary);
++  if (after.lines.length !== order.lines.length || after.locationId !== order.locationId || after.customerId !== order.customerId || order.lines.some(original => {
++    const line = after.lines.find(candidate => candidate.remoteLineId === original.remoteLineId);
++    return !line || line.itemId !== original.itemId || line.quantity !== original.quantity || line.restQuantity !== original.restQuantity || line.uom !== original.uom || line.rate !== original.rate || (selected.has(original.remoteLineId)&&!line.open)
++      || line.remoteLocationId !== (selected.has(original.remoteLineId) || original.physicalPallet ? target : original.remoteLocationId);
++  })) throw conflict('SO location update needs verification. Retry to recover the existing change.');
++  return after;
++}
+--- a/server/src/regular-stock-handoff.js
++++ b/server/src/regular-stock-handoff.js
+@@ -0,0 +1,184 @@
++import { randomUUID } from 'node:crypto';
++import { pool, query, withTransaction } from './db.js';
++import { config } from './config.js';
++import { planRegularStockRouting, regularError } from './regular-stock-domain.js';
++import { getSalesStockRequest, getScmStockRequest, convertSalesStockRequestLines, recordStockRequestEvent } from './stock-request-repository.js';
++import { confirmAndPrintStockTransfer, refreshStockRequestItemsAvailability } from './stock-request-service.js';
++import { readRegularStockSalesOrderFromNetSuite, applyRegularStockSalesOrderLocationInNetSuite, createTransferOrderInNetSuite, fetchDeliveryOrderFromNetSuite, fetchDeliveryOrderDetailsFromNetSuite } from './netsuite.js';
++import { upsertSalesOrders, upsertSalesOrderLines } from './order-sync-repository.js';
++import { createOrderDependency } from './order-dependency-repository.js';
++
++async function hydrateOrder(order) {
++  const header = await fetchDeliveryOrderFromNetSuite(order.id);
++  if (!header) throw regularError('The linked SO could not be refreshed from NetSuite.');
++  await upsertSalesOrders([header]);
++  await upsertSalesOrderLines(order.id, await fetchDeliveryOrderDetailsFromNetSuite(order.id));
++}
++
++async function claim(id, input, context, readOrder) {
++  const before = await getSalesStockRequest(id, context);
++  if (before.workflowVersion !== 2) throw regularError('This request uses the legacy transfer workflow.');
++  const existing = (await query('SELECT * FROM regular_stock_handoffs WHERE request_id=$1',[id])).rows[0];
++  const ref = String(input.salesOrderRef || before.regular.salesOrderRef || '').trim();
++  if (!ref) throw regularError('Enter the Sales Order number.', 'REGULAR_SO_REQUIRED', 400);
++  const order = existing ? existing.plan.order : await readOrder(ref);
++  return withTransaction(async () => {
++    const row = (await query('SELECT * FROM sales_stock_requests WHERE id=$1 FOR UPDATE',[id])).rows[0];
++    let handoff = (await query('SELECT * FROM regular_stock_handoffs WHERE request_id=$1 FOR UPDATE',[id])).rows[0];
++    if (!handoff) {
++      if (Number(input.expectedRevision) !== Number(row.revision)) throw regularError('The request changed. Reload before linking the SO.');
++      const request = await getScmStockRequest(id);
++      if (request.lines.some(line => !['approved','rejected','cancelled'].includes(line.status))) throw regularError('Finish all SCM decisions before entering the SO.');
++      const plan = { ...planRegularStockRouting({ request, salesOrder: order, selectedLineIds: input.selectedLineIds || {} }), order };
++      await query('SELECT pg_advisory_xact_lock(hashtextextended($1,0))',[`regular-stock-so:${order.id}`]);
++      for (const remoteLineId of plan.materialLineIds) {
++        const owner = await query('SELECT request_id FROM regular_stock_so_line_owners WHERE sales_order_id=$1 AND remote_line_id=$2',[order.id,remoteLineId]);
++        if (owner.rowCount && Number(owner.rows[0].request_id) !== Number(id)) throw regularError('An SO line already belongs to another stock request.');
++        await query('INSERT INTO regular_stock_so_line_owners(sales_order_id,remote_line_id,request_id) VALUES($1,$2,$3) ON CONFLICT DO NOTHING',[order.id,remoteLineId,id]);
++      }
++      handoff = (await query(`INSERT INTO regular_stock_handoffs(request_id,sales_order_id,sales_order_ref,plan)
++        VALUES($1,$2,$3,$4::jsonb) RETURNING *`,[id,order.id,order.ref,JSON.stringify(plan)])).rows[0];
++    }
++    if (handoff.sales_order_ref.toLowerCase() !== ref.toLowerCase()) throw regularError('This request is already linked to a different SO.');
++    if (handoff.status === 'complete') return handoff;
++    const attemptId = randomUUID();
++    await query(`UPDATE regular_stock_handoffs SET status='executing',attempt_id=$2,lease_until=now()+interval '15 minutes',error=NULL,updated_at=now() WHERE request_id=$1`,[id,attemptId]);
++    await query(`UPDATE sales_stock_requests SET regular_details=regular_details||$2::jsonb,revision=revision+1,updated_at=now() WHERE id=$1`,
++      [id,JSON.stringify({salesOrderId:Number(handoff.sales_order_id),salesOrderRef:handoff.sales_order_ref,handoffStatus:'executing',handoffError:null,routingMode:handoff.plan.mode})]);
++    return {...handoff,status:'executing',attempt_id:attemptId};
++  });
++}
++
++async function linkTransferDependency(request, handoff, transfer, context) {
++  await withTransaction(async () => {
++    await query('SELECT pg_advisory_xact_lock(hashtextextended($1,0))',[`regular-stock-dependency:${transfer.id}`]);
++    const existing = await query(`SELECT id,sales_order_id FROM order_dependencies WHERE transfer_order_id=$1 AND status<>'cancelled'`,[transfer.netsuiteTransferOrderId]);
++    if (existing.rowCount) {
++      if (Number(existing.rows[0].sales_order_id) !== Number(handoff.sales_order_id)) throw regularError('The TO is linked to a different SO.');
++      return;
++    }
++    const allocationByRemote = new Map();
++    for (const mapping of handoff.plan.mappings) {
++      if (!transfer.lines.some(line=>line.id===mapping.requestLineId)) continue;
++      allocationByRemote.set(mapping.remoteLineId,(allocationByRemote.get(mapping.remoteLineId)||0)+mapping.quantity);
++    }
++    const allocations=[];
++    for (const [remoteLineId,quantity] of allocationByRemote) {
++      const canonical=await query('SELECT id,item_id,netsuite_backordered_qty FROM sales_order_lines WHERE sales_order_id=$1 AND line_id=$2',[handoff.sales_order_id,remoteLineId]);
++      if(canonical.rowCount!==1)throw regularError('The SO line mirror is not ready. Retry after refresh.');
++      allocations.push({salesLineId:Number(canonical.rows[0].id),itemId:Number(canonical.rows[0].item_id),quantity:Number(canonical.rows[0].netsuite_backordered_qty)>0?Math.min(quantity,Number(canonical.rows[0].netsuite_backordered_qty)):quantity});
++    }
++    await createOrderDependency({salesOrderRef:handoff.sales_order_ref,transferOrderRef:transfer.netsuiteTransferOrderRef,
++      mode:'yard_replenishment',allocations,operatorId:context.operatorId});
++    await recordStockRequestEvent({requestId:request.id,transferId:transfer.id,eventType:'regular_so_dependency_linked',actorId:context.operatorId,details:{salesOrderRef:handoff.sales_order_ref}});
++  });
++}
++
++async function executeTransfers(id, handoff, context, dependencies) {
++  let request = await getScmStockRequest(id);
++  const pending = request.lines.filter(line=>line.status==='approved');
++  if(pending.length) {
++    await convertSalesStockRequestLines(id,{expectedRevision:request.revision,lineIds:pending.map(line=>line.id)}, {...context,approvedHandoff:true});
++    request=await getScmStockRequest(id);
++  }
++  const confirm=dependencies.confirmTransfer || (async transfer=>{
++    // Do not let a printer preflight prevent NetSuite from making its commitment.
++    await confirmAndPrintStockTransfer(transfer.id,{expectedRevision:transfer.revision,requestId:`regular-stock:${id}:${transfer.id}`},
++      {id:context.operatorId},{ensurePrinter:async()=>{},
++        createRemote:(payload,options)=>createTransferOrderInNetSuite({...payload,externalId:`MBBS_REGULAR_STOCK_${id}_${transfer.id}`},options)});
++  });
++  for(const transfer of request.transfers) {
++    if(transfer.confirmationStatus!=='complete') {
++      try{await confirm(transfer);}catch(error){
++        const saved=(await getScmStockRequest(id)).transfers.find(candidate=>candidate.id===transfer.id);
++        // A committed TO must not wait on a printer before replenishment proceeds.
++        if(!saved?.netsuiteTransferOrderId || !['pending_fulfillment','partially_fulfilled','pending_receipt','received'].includes(saved.status))throw error;
++      }
++    }
++    const current=(await getScmStockRequest(id)).transfers.find(candidate=>candidate.id===transfer.id);
++    await (dependencies.linkTransferDependency||linkTransferDependency)(request,handoff,current,context);
++  }
++}
++
++async function complete(id, handoff, context) {
++  await withTransaction(async()=>{
++    await query('SELECT id FROM sales_stock_requests WHERE id=$1 FOR UPDATE',[id]);
++    const saved=await query(`UPDATE regular_stock_handoffs SET status='complete',error=NULL,lease_until=NULL,updated_at=now()
++      WHERE request_id=$1 AND attempt_id=$2 RETURNING request_id`,[id,handoff.attempt_id]);
++    if(!saved.rowCount)throw regularError('The SO handoff was taken over by another attempt.');
++    if(handoff.plan.mode==='location') await query(`UPDATE sales_stock_request_lines SET status='fulfilled',updated_at=now() WHERE request_id=$1 AND regular_decision IN ('stock','po')`,[id]);
++    await query(`UPDATE sales_stock_requests SET regular_details=regular_details||'{"handoffStatus":"complete","handoffError":null}'::jsonb,
++      status=CASE WHEN $2 THEN 'completed' ELSE 'active' END,revision=revision+1,updated_at=now() WHERE id=$1`,[id,handoff.plan.mode==='location']);
++    await recordStockRequestEvent({requestId:Number(id),eventType:'regular_so_handoff_complete',actorId:context.operatorId,details:{mode:handoff.plan.mode,salesOrderRef:handoff.sales_order_ref}});
++  });
++}
++
++export async function linkRegularStockSalesOrder(id, input, context, dependencies = {}) {
++  await getSalesStockRequest(id,context);
++  const client=await pool.connect();
++  const key=`regular-stock-handoff:${Number(id)}`;
++  let acquired=false;
++  try{
++    acquired=(await client.query('SELECT pg_try_advisory_lock(hashtextextended($1,0)) AS acquired',[key])).rows[0].acquired;
++    if(!acquired)throw regularError('This SO handoff is already running. Refresh to see its progress.');
++    return await executeHandoff(id,input,context,dependencies);
++  }finally{
++    if(acquired)await client.query('SELECT pg_advisory_unlock(hashtextextended($1,0))',[key]).catch(()=>{});
++    client.release();
++  }
++}
++
++async function executeHandoff(id, input, context, dependencies) {
++  if(!(dependencies.liveExecutionEnabled ?? config.smartScm.liveExecutionEnabled))throw regularError('Live NetSuite execution is disabled.','REGULAR_LIVE_DISABLED');
++  const handoff=await claim(id,input,context,dependencies.readOrder||readRegularStockSalesOrderFromNetSuite);
++  if(handoff.status==='complete')return getSalesStockRequest(id,context);
++  try {
++    if(handoff.plan.mode==='location'&&!handoff.location_applied){
++      await query('UPDATE regular_stock_handoffs SET remote_started_at=COALESCE(remote_started_at,now()) WHERE request_id=$1',[id]);
++      await (dependencies.applyLocation||applyRegularStockSalesOrderLocationInNetSuite)({order:handoff.plan.order,plan:handoff.plan});
++      await query('UPDATE regular_stock_handoffs SET location_applied=true WHERE request_id=$1 AND attempt_id=$2',[id,handoff.attempt_id]);
++    }
++    await (dependencies.hydrateOrder||hydrateOrder)(handoff.plan.order);
++    if(handoff.plan.mode==='transfer'){
++      const fresh=await (dependencies.readOrder||readRegularStockSalesOrderFromNetSuite)(handoff.sales_order_ref);
++      const original=handoff.plan.order;
++      if(fresh.id!==original.id||fresh.customerId!==original.customerId||fresh.locationId!==original.locationId||fresh.lines.length!==original.lines.length||original.lines.some(line=>{
++        const current=fresh.lines.find(row=>row.remoteLineId===line.remoteLineId);
++        return !current||current.itemId!==line.itemId||current.quantity!==line.quantity||current.locationId!==line.locationId||(!current.ancillary&&!current.open);
++      }))throw regularError('The SO changed after approval was linked. Resolve its lines before retrying.','REGULAR_SO_MISMATCH');
++      await executeTransfers(id,handoff,context,dependencies);
++    }
++    await (dependencies.refreshAvailability||refreshStockRequestItemsAvailability)([...new Set(handoff.plan.mappings.map(line=>line.itemId))]);
++    const request=await getScmStockRequest(id);
++    if(dependencies.syncReplenishments)await dependencies.syncReplenishments(request);
++    else if(request.lines.some(line=>line.decision==='po')){
++      const { enqueueRegularReplenishments,syncRegularReplenishments }=await import('./regular-stock-replenishment.js');
++      await enqueueRegularReplenishments(request);
++      await syncRegularReplenishments();
++    }
++    await complete(id,handoff,context);
++    return getSalesStockRequest(id,context);
++  }catch(error){
++    await withTransaction(async()=>{
++      const saved=await query(`UPDATE regular_stock_handoffs SET status='attention',error=$3,lease_until=NULL,updated_at=now()
++        WHERE request_id=$1 AND attempt_id=$2 RETURNING request_id`,[id,handoff.attempt_id,String(error.message).slice(0,2000)]);
++      if(saved.rowCount)await query(`UPDATE sales_stock_requests SET regular_details=regular_details||$2::jsonb,revision=revision+1,updated_at=now() WHERE id=$1`,[id,JSON.stringify({handoffStatus:'attention',handoffError:String(error.message).slice(0,2000)})]);
++    });
++    throw error;
++  }
++}
++
++export async function previewRegularStockSalesOrder(id,input,context,{readOrder=readRegularStockSalesOrderFromNetSuite}={}){
++  const request=await getSalesStockRequest(id,context);
++  if(request.workflowVersion!==2||request.lines.some(line=>line.status==='submitted'))throw regularError('Finish all SCM decisions before entering the SO.');
++  const order=await readOrder(input.salesOrderRef);
++  if(order.locationId!==request.destinationLocationId)throw regularError('The SO must be created at your Sales location.','REGULAR_SO_MISMATCH');
++  const choices=[];
++  const items=new Set(request.lines.filter(line=>['stock','po'].includes(line.decision)).map(line=>line.itemId));
++  for(const itemId of items){
++    const quantity=request.lines.filter(line=>line.itemId===itemId&&['stock','po'].includes(line.decision)).reduce((sum,line)=>sum+line.salesQty,0);
++    const matches=order.lines.filter(line=>!line.ancillary&&line.open&&line.itemId===itemId&&Math.abs(line.quantity-quantity)<1e-6);
++    if(matches.length>1)choices.push({itemId,itemName:matches[0].itemName,lines:matches.map(line=>({id:line.remoteLineId,quantity:line.quantity,uom:line.uom}))});
++  }
++  return {salesOrderRef:order.ref,choices};
++}
+--- a/server/src/regular-stock-replenishment.js
++++ b/server/src/regular-stock-replenishment.js
+@@ -0,0 +1,125 @@
++import { query, withTransaction } from './db.js';
++import { regularReplenishmentQuantity, regularError } from './regular-stock-domain.js';
++import { writeAudit } from './auth-repository.js';
++
++export const lockRegularReplenishments = () => query("SELECT pg_advisory_xact_lock(hashtextextended('regular-stock-replenishments',0))");
++
++export async function enqueueRegularReplenishments(request) {
++  return withTransaction(async()=>{
++    await lockRegularReplenishments();
++    const handoff=(await query('SELECT * FROM regular_stock_handoffs WHERE request_id=$1',[request.id])).rows[0];
++    if(!handoff || handoff.plan.mode==='location'&&!handoff.location_applied)throw regularError('Replenishment must wait for the SO commitment.');
++    if(handoff.plan.mode==='transfer'){
++      const incomplete=await query(`SELECT id FROM sales_stock_transfers WHERE request_id=$1 AND netsuite_transfer_order_id IS NULL`,[request.id]);
++      if(!request.transfers.length||incomplete.rowCount)throw regularError('Replenishment must wait for every TO commitment.');
++    }
++    for(const line of request.lines.filter(line=>line.decision==='po')){
++      const linked=await query('SELECT replenishment_id FROM regular_stock_replenishment_requests WHERE request_line_id=$1',[line.id]);
++      if(linked.rowCount)continue;
++      const group=await query(`INSERT INTO regular_stock_replenishments(item_id,source_location_id) VALUES($1,$2)
++        ON CONFLICT(item_id,source_location_id) WHERE released_at IS NULL DO UPDATE SET updated_at=now(),revision=regular_stock_replenishments.revision+1 RETURNING id`,[line.itemId,line.sourceLocationId]);
++      await query('INSERT INTO regular_stock_replenishment_requests(request_line_id,replenishment_id) VALUES($1,$2)',[line.id,group.rows[0].id]);
++    }
++    await query('UPDATE regular_stock_handoffs SET replenishment_ready=true WHERE request_id=$1',[request.id]);
++  });
++}
++
++export async function listRegularReplenishments({runId=null}={}){
++  const {rows}=await query(`SELECT g.*,i.item_name,i.stock_unit,p.status AS proposal_status,p.netsuite_purchase_order_ref,
++    COALESCE((SELECT jsonb_agg(DISTINCT ordered.netsuite_purchase_order_ref) FROM scm_smart_proposals ordered WHERE ordered.regular_replenishment_id=g.id AND ordered.netsuite_purchase_order_ref IS NOT NULL),'[]') AS purchase_order_refs,
++    COALESCE((SELECT jsonb_agg(jsonb_build_object('requestId',r.id,'requestRef',r.request_ref,'salesOrderRef',h.sales_order_ref,'arrivalAt',r.regular_details->>'arrivalAt') ORDER BY r.id)
++      FROM regular_stock_replenishment_requests link JOIN sales_stock_request_lines l ON l.id=link.request_line_id
++      JOIN sales_stock_requests r ON r.id=l.request_id LEFT JOIN regular_stock_handoffs h ON h.request_id=r.id WHERE link.replenishment_id=g.id),'[]') AS requests
++    FROM regular_stock_replenishments g JOIN inventory_items i ON i.item_id=g.item_id LEFT JOIN scm_smart_proposals p ON p.id=g.current_proposal_id
++    WHERE g.released_at IS NULL AND ($1::bigint IS NULL OR EXISTS(SELECT 1 FROM regular_stock_replenishment_runs link WHERE link.replenishment_id=g.id AND link.run_id=$1)) ORDER BY g.created_at,g.id`,[runId]);
++  return rows.map(row=>({id:Number(row.id),itemId:Number(row.item_id),itemName:row.item_name,unit:row.stock_unit,
++    sourceLocationId:Number(row.source_location_id),revision:Number(row.revision),quantity:Number(row.quantity),evidence:row.evidence,
++    currentProposalId:row.current_proposal_id?Number(row.current_proposal_id):null,proposalStatus:row.proposal_status||null,
++    purchaseOrderRef:row.netsuite_purchase_order_ref||null,purchaseOrderRefs:row.purchase_order_refs||[],requests:row.requests}));
++}
++
++async function ensureRun(runId,planning){
++  if(runId)return Number(runId);
++  const latest=await query("SELECT id FROM scm_smart_planning_runs WHERE status='ready' AND plan_kind='inventory' ORDER BY id DESC LIMIT 1");
++  if(latest.rowCount)return Number(latest.rows[0].id);
++  const created=await query(`INSERT INTO scm_smart_planning_runs(trigger_source,status,plan_kind,settings_snapshot,completed_at)
++    VALUES('regular-stock-request','ready','inventory',$1::jsonb,now()) RETURNING id`,[JSON.stringify(planning.settings)]);
++  return Number(created.rows[0].id);
++}
++
++export async function syncRegularReplenishments({runId=null,planning=null}={}){
++  const active=await query('SELECT item_id FROM regular_stock_replenishments WHERE released_at IS NULL');
++  if(!active.rowCount)return new Map();
++  const planner=await import('./smart-scm-planning-repository.js');
++  const current=planning||await planner.loadSmartScmPlanningDemandStates({includeTemporarilyExcluded:true,includePausedItemIds:active.rows.map(row=>Number(row.item_id))});
++  return withTransaction(async()=>{
++    await lockRegularReplenishments();
++    const targetRun=await ensureRun(runId,current);
++    const groups=(await query('SELECT * FROM regular_stock_replenishments WHERE released_at IS NULL ORDER BY id FOR UPDATE')).rows;
++    const coverage=new Map();
++    for(const group of groups){
++      await query('INSERT INTO regular_stock_replenishment_runs(replenishment_id,run_id) VALUES($1,$2) ON CONFLICT DO NOTHING',[group.id,targetRun]);
++      const key=`${group.item_id}:${group.source_location_id}`;
++      const state=current.states.find(candidate=>candidate.key===key);
++      const proposal=group.current_proposal_id?(await query('SELECT * FROM scm_smart_proposals WHERE id=$1 FOR UPDATE',[group.current_proposal_id])).rows[0]:null;
++      const requestLineIds=(await query('SELECT request_line_id FROM regular_stock_replenishment_requests WHERE replenishment_id=$1 ORDER BY request_line_id',[group.id])).rows.map(row=>Number(row.request_line_id));
++      const descendants=proposal?(await query(`WITH RECURSIVE family AS (
++        SELECT id FROM scm_smart_proposals WHERE id=$1 UNION SELECT child.id FROM scm_smart_proposals child JOIN family ON child.parent_proposal_id=family.id
++      ) SELECT p.*,COALESCE((SELECT SUM(sales_quantity) FROM scm_smart_proposal_lines WHERE proposal_id=p.id),0) AS sales_quantity
++        FROM family JOIN scm_smart_proposals p ON p.id=family.id WHERE p.id<>$1 AND p.status NOT IN ('cancelled','superseded')`,[proposal.id])).rows:[];
++      const placed=Boolean(proposal?.netsuite_purchase_order_id||descendants.some(row=>row.netsuite_purchase_order_id));
++      const newDemand=requestLineIds.some(id=>!group.evidence?.requestLineIds?.includes(id));
++      const descendantPending=descendants.filter(row=>!row.netsuite_purchase_order_id);
++      if(descendants.length&&(descendantPending.length||!newDemand)){
++        if(state?.toPlt>0)coverage.set(key,descendantPending.reduce((sum,row)=>sum+Number(row.sales_quantity),0)/state.toPlt);
++        continue;
++      }
++      const pending=proposal&&!placed&&(proposal.order_requested_at||!['draft','held','attention'].includes(proposal.status))&&!['cancelled','superseded'].includes(proposal.status);
++      if(pending || placed&&!newDemand){
++        if(pending&&state?.toPlt>0)coverage.set(key,Number(group.quantity)/state.toPlt);
++        continue;
++      }
++      const editable=proposal&&!placed&&['draft','held','attention'].includes(proposal.status);
++      let quantity=0,proposalId=group.current_proposal_id;
++      let evidence={calculatedAt:new Date().toISOString()};
++      if(!state||!(state.toPlt>0)||!state.inventorySyncedAt){
++        evidence.error='Current preferred stock, inventory or purchase conversion is unavailable.';
++        if(editable)await query("UPDATE scm_smart_proposals SET status='attention',updated_at=now() WHERE id=$1",[proposal.id]);
++      }else{
++        quantity=regularReplenishmentQuantity({preferredQuantity:state.preferred*state.toPlt,inventoryPositionQuantity:state.positionPallets*state.toPlt,purchaseIncrement:1});
++        evidence={...evidence,requestLineIds,preferredQuantity:state.preferred*state.toPlt,inventoryPositionQuantity:state.positionPallets*state.toPlt,
++          availableQuantity:state.availableSales,quantity,unit:state.policy.stock_unit};
++        if(quantity>0){
++          proposalId=await planner.persistRegularReplenishmentDraft({runId:targetRun,group:{...group,current_proposal_id:editable?group.current_proposal_id:null},state,quantity,settings:current.settings});
++          coverage.set(key,quantity/state.toPlt);
++        }else if(editable){
++          await query("UPDATE scm_smart_proposals SET status='superseded',superseded_at=now(),updated_at=now() WHERE id=$1",[proposal.id]);
++          proposalId=null;
++        }else if(placed){quantity=Number(group.quantity);}
++      }
++      await query(`UPDATE regular_stock_replenishments SET quantity=$2,evidence=$3::jsonb,current_proposal_id=$4,revision=revision+1,updated_at=now() WHERE id=$1`,[group.id,quantity,JSON.stringify(evidence),proposalId]);
++    }
++    return coverage;
++  });
++}
++
++export function creditRegularReplenishments(states,coverage){
++  return states.map(state=>{
++    const pallets=coverage.get(state.key)||0;
++    return pallets>0?{...state,requiredPallets:Math.max(0,state.requiredPallets-pallets),
++      residualRequiredPallets:Math.max(0,(state.residualRequiredPallets??state.requiredPallets)-pallets)}:state;
++  });
++}
++
++export async function releaseRegularReplenishment(id,{expectedRevision},context){
++  return withTransaction(async()=>{
++    await lockRegularReplenishments();
++    const group=(await query('SELECT * FROM regular_stock_replenishments WHERE id=$1 FOR UPDATE',[id])).rows[0];
++    if(!group)throw regularError('Replenishment load not found.','REGULAR_NOT_FOUND',404);
++    if(group.released_at)return {released:true};
++    if(Number(group.revision)!==Number(expectedRevision))throw regularError('This load changed. Refresh before releasing.');
++    await query('UPDATE regular_stock_replenishments SET released_at=now(),released_by=$2,revision=revision+1 WHERE id=$1',[id,context.operatorId]);
++    await writeAudit({actorOperatorId:context.operatorId,source:'smart_scm',action:'regular_stock.replenishment.release',details:{replenishmentId:Number(id),proposalId:group.current_proposal_id}});
++    return {released:true};
++  });
++}
+--- a/server/src/stock-request-repository.js
++++ b/server/src/stock-request-repository.js
+@@ -16,7 +16,7 @@
+ 
+ const YARD_BY_LOCATION_ID = new Map(STOCK_REQUEST_YARDS.map((yard) => [yard.locationId, yard]));
+ const EDITABLE_LINE_STATUSES = new Set(["submitted", "changes_requested"]);
+-const TERMINAL_LINE_STATUSES = new Set(["received", "rejected", "cancelled", "closed"]);
++const TERMINAL_LINE_STATUSES = new Set(["received", "rejected", "cancelled", "closed", "fulfilled"]);
+ 
+ function stockRequestError(message, status = 400, code = "STOCK_REQUEST_INVALID") {
+   return Object.assign(new Error(message), { status, code });
+@@ -178,6 +178,8 @@
+     toSec: nullableNumeric(row.to_sec),
+     toPcs: nullableNumeric(row.to_pcs),
+     status: row.status || "submitted",
++    decision: row.regular_decision || null,
++    approvalEvidence: row.approval_evidence || {},
+     decisionReason: row.decision_reason || "",
+     decidedBy: row.decided_by || null,
+     decidedAt: row.decided_at || null,
+@@ -200,6 +202,7 @@
+ 
+ function mapTransfer(row = {}) {
+   return {
++    workflowVersion:Number(row.request_workflow_version||1),
+     id: Number(row.id),
+     transferRef: row.transfer_ref || "",
+     requestId: Number(row.request_id),
+@@ -249,6 +252,9 @@
+     id: Number(row.id),
+     requestRef: row.request_ref || "",
+     requestType: row.request_type || "regular",
++    workflowVersion: Number(row.workflow_version || 1),
++    regular: row.regular_details || {},
++    manualDecisionEventId: Number(row.manual_decision_event_id || 0),
+     destinationLocationId: Number(row.destination_location_id),
+     destinationName: row.destination_name || "",
+     status: row.status || "submitted",
+@@ -493,6 +499,7 @@
+     );
+   const transferResult = await query(
+       `SELECT transfer.*,
++            (SELECT workflow_version FROM sales_stock_requests WHERE id=transfer.request_id) AS request_workflow_version,
+               print_job.status AS print_status,
+               canonical.dispatch_planned,
+               canonical.dispatch_plan_date,
+@@ -710,19 +717,19 @@
+          AND bucket_line.status IN ('submitted', 'changes_requested')
+     )`);
+   } else if (requestedBucket === "accepted") {
+-    clauses.push(`EXISTS (
++    clauses.push(`(EXISTS (
+       SELECT 1 FROM sales_stock_transfers bucket_transfer
+        WHERE bucket_transfer.request_id = request.id
+          AND (
+            bucket_transfer.status <> 'cancelled'
+            OR bucket_transfer.netsuite_transfer_order_id IS NOT NULL
+          )
+-    )`);
++    ) OR EXISTS (SELECT 1 FROM sales_stock_request_lines approved_line WHERE approved_line.request_id=request.id AND approved_line.status='approved'))`);
+   } else if (requestedBucket === "completed") {
+     clauses.push(`NOT EXISTS (
+       SELECT 1 FROM sales_stock_request_lines bucket_line
+        WHERE bucket_line.request_id = request.id
+-         AND bucket_line.status NOT IN ('received', 'rejected', 'cancelled', 'closed')
++         AND bucket_line.status NOT IN ('received', 'rejected', 'cancelled', 'closed', 'fulfilled')
+     )`);
+   }
+   if (normalizedSearch) {
+@@ -1056,9 +1063,12 @@
+   return result.rows[0] || null;
+ }
+ 
+-export async function convertSalesStockRequestLines(requestId, input = {}, { operatorId } = {}) {
++export async function convertSalesStockRequestLines(requestId, input = {}, { operatorId, approvedHandoff = false } = {}) {
+   return withTransaction(async () => {
+     const request = await lockRequest(requestId);
++    if (Number(request.workflow_version) === 2 && !approvedHandoff) {
++      throw stockRequestError("Approved regular requests execute after Sales links the SO.", 409);
++    }
+     const expected = requiredRevision(input.expectedRevision);
+     if (Number(request.revision) !== expected) {
+       throw stockRequestError("This stock request changed after the screen loaded. Reload and try again.", 409, "STOCK_REQUEST_REVISION_CONFLICT");
+@@ -1072,7 +1082,7 @@
+         FOR UPDATE`,
+       [request.id, lineIds]
+     );
+-    if (locked.rowCount !== lineIds.length || locked.rows.some((line) => !EDITABLE_LINE_STATUSES.has(line.status))) {
++    if (locked.rowCount !== lineIds.length || locked.rows.some((line) => Number(request.workflow_version) === 2 ? line.status !== 'approved' : !EDITABLE_LINE_STATUSES.has(line.status))) {
+       throw stockRequestError("Only submitted or returned lines can be converted.", 409, "STOCK_REQUEST_LINE_LOCKED");
+     }
+     const availability = await conversionAvailabilitySnapshot(locked.rows);
+@@ -1125,7 +1135,7 @@
+             line.to_plt, line.to_lyr, line.to_sec, line.to_pcs
+           ]
+         );
+-        await query(
++        if (Number(request.workflow_version) !== 2) await query(
+           `INSERT INTO sales_stock_transfer_reservations (
+              transfer_line_id, item_id, source_location_id, reserved_sales_quantity
+            ) VALUES ($1,$2,$3,$4)`,
+@@ -1186,7 +1196,7 @@
+   offset = 0
+ } = {}) {
+   const normalizedQueue = String(queue || "request").trim().toLowerCase();
+-  if (!new Set(["request", "pending_to", "rejected", "closed"]).has(normalizedQueue)) {
++  if (!new Set(["request", "approved", "pending_to", "rejected", "closed"]).has(normalizedQueue)) {
+     throw stockRequestError("SCM stock-request queue must be Request, Pending TO, Rejected, or Closed.");
+   }
+   const boundedLimit = normalizeStockRequestListLimit(limit);
+@@ -1200,6 +1210,8 @@
+        WHERE line.request_id = request.id
+          AND line.status IN ('submitted', 'changes_requested')
+     )`);
++  } else if (normalizedQueue === "approved") {
++    clauses.push("EXISTS(SELECT 1 FROM sales_stock_request_lines line WHERE line.request_id=request.id AND line.status='approved')");
+   } else if (normalizedQueue === "pending_to") {
+     clauses.push(`EXISTS (
+       SELECT 1 FROM sales_stock_transfers transfer
+@@ -1213,11 +1225,11 @@
+          AND line.status = 'rejected'
+     )`);
+   } else {
+-    clauses.push(`EXISTS (
++    clauses.push(`(request.status = 'completed' OR EXISTS (
+       SELECT 1 FROM sales_stock_transfers transfer
+        WHERE transfer.request_id = request.id
+          AND transfer.status = 'closed'
+-    )`);
++    ))`);
+   }
+   if (normalizedSearch) {
+     params.push(`%${normalizedSearch}%`);
+@@ -1291,6 +1303,7 @@
+ export async function getStockTransfer(transferId, { forUpdate = false } = {}) {
+   const result = await query(
+     `SELECT transfer.*,
++            (SELECT workflow_version FROM sales_stock_requests WHERE id=transfer.request_id) AS request_workflow_version,
+             print_job.status AS print_status,
+             canonical.dispatch_planned,
+             canonical.dispatch_plan_date,
+@@ -1331,6 +1344,7 @@
+   return withTransaction(async () => {
+     const transfer = await getStockTransfer(transferId, { forUpdate: true });
+     const request = await lockRequest(transfer.requestId);
++    if(Number(request.workflow_version)===2)throw stockRequestError('This transfer is part of an approved SO handoff and cannot be rejected independently.',409,'REGULAR_TRANSFER_LOCKED');
+     const expectedTransferRevision = requiredRevision(input.expectedRevision);
+     const expectedRequestRevision = requiredRevision(input.expectedRequestRevision);
+     if (transfer.revision !== expectedTransferRevision) {
+@@ -1655,9 +1669,10 @@
+           SET netsuite_transfer_order_id = COALESCE($2, netsuite_transfer_order_id),
+               netsuite_transfer_order_ref = COALESCE($3, netsuite_transfer_order_ref),
+               confirmation_status = 'attention', confirmation_error = $4,
+-              status = 'attention', updated_at = now()
++              status = CASE WHEN $5 AND status='pending_fulfillment' AND confirmation_status IN ('hydrating','printing')
++                THEN 'pending_fulfillment' ELSE 'attention' END, updated_at = now()
+         WHERE id = $1`,
+-      [transfer.id, remoteId || null, remoteRef, message]
++      [transfer.id, remoteId || null, remoteRef, message,transfer.workflowVersion===2]
+     );
+     await recordEvent({
+       requestId: transfer.requestId,
+@@ -1929,6 +1944,7 @@
+ export async function reviseStockTransferQuantities(transferId, input = {}, { operatorId = null } = {}) {
+   return withTransaction(async () => {
+     const transfer = await getStockTransfer(transferId, { forUpdate: true });
++    if(transfer.workflowVersion===2 && Array.isArray(input.lines) && input.lines.length)throw stockRequestError('SO-linked stock-request material quantities are locked after approval.',409,'REGULAR_TRANSFER_LOCKED');
+     const expected = requiredRevision(input.expectedRevision);
+     const revisionRequestId = String(input.requestId || "").trim();
+     if (!revisionRequestId || revisionRequestId.length > 200) throw stockRequestError("A stable requestId is required for a TO quantity revision.");
+--- a/server/src/stock-request-domain.js
++++ b/server/src/stock-request-domain.js
+@@ -8,7 +8,7 @@
+ ]);
+ 
+ const STOCK_REQUEST_LOCATION_IDS = new Set(STOCK_REQUEST_YARDS.map((yard) => yard.locationId));
+-const TERMINAL_LINE_STATUSES = new Set(["received", "rejected", "cancelled", "closed"]);
++const TERMINAL_LINE_STATUSES = new Set(["received", "rejected", "cancelled", "closed", "fulfilled"]);
+ 
+ function httpError(message, status = 400, code = "STOCK_REQUEST_INVALID") {
+   return Object.assign(new Error(message), { status, code });
+@@ -193,7 +193,7 @@
+   if (!lines.length) return "pending";
+   const statuses = lines.map((line) => String(line.status || "").trim().toLowerCase());
+   if (statuses.every((status) => TERMINAL_LINE_STATUSES.has(status))) return "completed";
+-  if (statuses.some((status) => ["converted", "pending_to", "confirmed", "fulfilled", "pending_receipt", "received"].includes(status))) {
++  if (statuses.some((status) => ["approved", "converted", "pending_to", "confirmed", "fulfilled", "pending_receipt", "received"].includes(status))) {
+     return "accepted";
+   }
+   return "pending";
+--- a/server/src/stock-request-service.js
++++ b/server/src/stock-request-service.js
+@@ -126,6 +126,7 @@
+     throw new Error("The official PALLET item is required for this Transfer Order.");
+   }
+   const payload = {
++    ...(transfer.workflowVersion===2?{externalId:`MBBS_REGULAR_STOCK_${transfer.requestId}_${transfer.id}`}:{ }),
+     location: { id: String(locations.source.netsuiteLocationId) },
+     transferLocation: { id: String(locations.destination.netsuiteLocationId) },
+     memo: `Sales stock request ${transfer.transferRef || transfer.id} | ${stockRequestMemoMarker(transfer.id)}`,
+--- a/server/src/netsuite.js
++++ b/server/src/netsuite.js
+@@ -1575,6 +1575,16 @@
+     delivery_method_id: null,
+     delivery_method: "Transfer Order"
+   }));
++}
++
++export async function readRegularStockSalesOrderFromNetSuite(reference) {
++  const { readRegularSalesOrder } = await import('./regular-stock-netsuite-adapter.js');
++  return readRegularSalesOrder(reference, { rest: netsuiteRest, queryAll: suiteqlAll, resolveYards: resolveNetSuiteYardLocations });
++}
++
++export async function applyRegularStockSalesOrderLocationInNetSuite(input) {
++  const { applyRegularSalesOrderLocation } = await import('./regular-stock-netsuite-adapter.js');
++  return queueNetSuiteMutation(() => applyRegularSalesOrderLocation(input, { rest: netsuiteRest, queryAll: suiteqlAll, resolveYards: resolveNetSuiteYardLocations }));
+ }
+ 
+ export async function fetchSalesOrderReferenceFromNetSuite(orderId) {
+--- a/server/src/server.js
++++ b/server/src/server.js
+@@ -1,3 +1,6 @@
++import {submitRegularStockRequest,editRegularStockRequest,decideRegularStockRequest,refreshRegularStockEvidence,regularStockAlerts,acknowledgeRegularStockDecisions} from './regular-stock-request-service.js';
++import {linkRegularStockSalesOrder,previewRegularStockSalesOrder} from './regular-stock-handoff.js';
++import {releaseRegularReplenishment} from './regular-stock-replenishment.js';
+ import { createSpecialExpiryRuntime } from './special-stock-expiry.js';
+ import { specialSalesReps } from './special-stock-sales-reps.js';
+ import { operatorNetSuitePriority } from './operator-netsuite-priority-middleware.js';
+@@ -466,10 +469,7 @@
+ } from "./scm-transfer-order-print-service.js";
+ import {
+   cancelSalesStockRequest,
+-  createSalesStockRequest,
+-  decideSalesStockRequestLines,
+   getSalesStockRequest,
+-  getScmStockRequest,
+   listSalesStockRequests,
+   listScmStockRequests,
+   listStockRequestFilterOptions,
+@@ -477,7 +477,6 @@
+   rejectPendingStockTransfer,
+   resubmitSalesStockRequest,
+   searchStockRequestItems,
+-  updateSalesStockRequest,
+   updateScmStockRequestLine
+ } from "./stock-request-repository.js";
+ import {
+@@ -12147,7 +12146,7 @@
+ app.post("/api/sales/stock-requests", requireSalesAccess, requirePrivateSalesRecordAccess, async (req, res, next) => {
+   try {
+     const availabilityPolicy = await getSalesStockRequestAvailabilityPolicy();
+-    const request = await createSalesStockRequest(req.body || {}, {
++    const request = await submitRegularStockRequest(req.body || {}, {
+       operatorId: req.operator.id,
+       authorizedDestinationLocationIds: operatorSalesYardLocationIds(req.operator),
+       allowOverAvailability: availabilityPolicy.allowOverAvailability
+@@ -12157,6 +12156,24 @@
+   } catch (error) {
+     next(error);
+   }
++});
++
++app.get('/api/sales/stock-requests/alerts', requireSalesAccess, requirePrivateSalesRecordAccess, async(req,res,next)=>{
++  try {res.setHeader('Cache-Control','private, no-store');res.json(await regularStockAlerts({operatorId:req.operator.id,authorizedDestinationLocationIds:operatorSalesYardLocationIds(req.operator)}));} catch(error){next(error);}
++});
++app.post('/api/sales/stock-requests/:id/decisions/read', requireSalesAccess, requirePrivateSalesRecordAccess, async(req,res,next)=>{
++  try {res.json(await acknowledgeRegularStockDecisions(req.params.id,req.body||{},{operatorId:req.operator.id,authorizedDestinationLocationIds:operatorSalesYardLocationIds(req.operator)}));} catch(error){next(error);}
++});
++app.post('/api/sales/stock-requests/:id/sales-order/preview', requireSalesAccess, requirePrivateSalesRecordAccess, async(req,res,next)=>{
++  try {res.setHeader('Cache-Control','private, no-store');res.json(await previewRegularStockSalesOrder(req.params.id,req.body||{},{operatorId:req.operator.id,authorizedDestinationLocationIds:operatorSalesYardLocationIds(req.operator)}));}catch(error){next(error);}
++});
++app.post('/api/sales/stock-requests/:id/sales-order', requireSalesAccess, requirePrivateSalesRecordAccess, async(req,res,next)=>{
++  try {
++    const request=await linkRegularStockSalesOrder(req.params.id,req.body||{},{operatorId:req.operator.id,authorizedDestinationLocationIds:operatorSalesYardLocationIds(req.operator)});
++    emitStockRequestUpdate('regular-so-handoff',{requestId:request.id});
++    emitAppEvent('scm.smart.updated',{reason:'regular-stock-replenishment'});
++    res.json(request);
++  } catch(error){emitStockRequestUpdate('regular-so-attention',{requestId:Number(req.params.id)});next(error);}
+ });
+ 
+ app.get("/api/sales/stock-requests/:id", requireSalesAccess, requirePrivateSalesRecordAccess, async (req, res, next) => {
+@@ -12173,7 +12190,7 @@
+ app.patch("/api/sales/stock-requests/:id", requireSalesAccess, requirePrivateSalesRecordAccess, async (req, res, next) => {
+   try {
+     const availabilityPolicy = await getSalesStockRequestAvailabilityPolicy();
+-    const request = await updateSalesStockRequest(req.params.id, req.body || {}, {
++    const request = await editRegularStockRequest(req.params.id, req.body || {}, {
+       operatorId: req.operator.id,
+       authorizedDestinationLocationIds: operatorSalesYardLocationIds(req.operator),
+       allowOverAvailability: availabilityPolicy.allowOverAvailability
+@@ -12238,10 +12255,20 @@
+   }
+ });
+ 
++app.get('/api/scm/stock-requests/alerts', requireScmAccess, async(_req,res,next)=>{
++  try {res.setHeader('Cache-Control','private, no-store');res.json(await regularStockAlerts({scm:true}));} catch(error){next(error);}
++});
++app.post('/api/scm/stock-requests/:id/evidence', requireScmAccess, async(req,res,next)=>{
++  try {res.json(await refreshRegularStockEvidence(req.params.id));} catch(error){next(error);}
++});
++app.post('/api/scm/smart/regular-replenishments/:id/release', requireSmartScmWriteAccess, async(req,res,next)=>{
++  try {res.json(await releaseRegularReplenishment(req.params.id,req.body||{},{operatorId:req.operator.id}));emitAppEvent('scm.smart.updated',{reason:'regular-stock-release'});} catch(error){next(error);}
++});
++
+ app.get("/api/scm/stock-requests/:id", requireScmAccess, async (req, res, next) => {
+   try {
+     res.setHeader("Cache-Control", "private, no-store");
+-    res.json(await getScmStockRequest(req.params.id));
++    res.json(await refreshRegularStockEvidence(req.params.id,{refreshAvailability:async()=>{}}));
+   } catch (error) {
+     next(error);
+   }
+@@ -12261,7 +12288,7 @@
+ 
+ app.post("/api/scm/stock-requests/:id/line-decisions", requireSmartScmWriteAccess, async (req, res, next) => {
+   try {
+-    const request = await decideSalesStockRequestLines(req.params.id, req.body || {}, {
++    const request = await decideRegularStockRequest(req.params.id, req.body || {}, {
+       operatorId: req.operator.id
+     });
+     emitStockRequestUpdate("scm-line-decision", { requestId: request.id });
+--- a/server/src/smart-scm-planning-repository.js
++++ b/server/src/smart-scm-planning-repository.js
+@@ -1,3 +1,4 @@
++import { syncRegularReplenishments, creditRegularReplenishments, listRegularReplenishments } from './regular-stock-replenishment.js';
+ import { hasActiveTransaction, query, withTransaction } from "./db.js";
+ import { smartScmSplitRemainingSql } from "./smart-scm-split-inbound-sql.js";
+ import { writeAudit } from "./auth-repository.js";
+@@ -371,6 +372,7 @@
+ 
+ export async function loadSmartScmPlanningPolicies({
+   includeTemporarilyExcluded = false,
++  includePausedItemIds = [],
+   blanketBalanceByItem = null
+ } = {}) {
+   const [result, resolvedBlanketBalanceByItem] = await Promise.all([query(
+@@ -420,12 +422,12 @@
+           LIMIT 1
+        ) active_exclusion ON true
+       WHERE y.eligible = true
+-        AND p.planning_enabled = true
++        AND (p.planning_enabled = true OR p.item_id = ANY($2::bigint[]))
+         AND p.inactive = false
+         AND p.discontinued = false
+         AND ($1::boolean OR active_exclusion.item_id IS NULL)
+       ORDER BY p.item_id, y.location_id`,
+-    [includeTemporarilyExcluded]
++    [includeTemporarilyExcluded,includePausedItemIds]
+   ), blanketBalanceByItem instanceof Map
+     ? Promise.resolve(blanketBalanceByItem)
+     : smartScmAvailableBlanketBalanceByItem()]);
+@@ -1638,6 +1640,27 @@
+   return { drafts, exceptions };
+ }
+ 
++export async function persistRegularReplenishmentDraft({runId,group,state,quantity,settings}) {
++  const line=smartScmProposalLineForState(state,quantity/state.toPlt,{regularReplenishmentId:Number(group.id),stockRequestReplenishment:true});
++  const draft=createDraft({type:'PO',phase:'direct_vendor',sourceKind:'vendor',sourceVendorYardId:state.policy.vendor_yard_id,
++    sourceName:state.policy.vendor_yard||state.policy.plant||state.policy.vendor||'Vendor',destinationLocationId:Number(group.source_location_id),
++    destinationName:state.policy.yard_code,vendor:state.policy.vendor,plant:state.policy.plant,line,status:line.manualPlanningRequired?'attention':'held',keySuffix:`regular-${group.id}-${group.revision}`},settings);
++  draft.memo=`Stock request replenishment · ${state.policy.item_name}`;
++  let proposalId=group.current_proposal_id;
++  if(proposalId){
++    await query(`UPDATE scm_smart_proposals SET total_pallets=$2,total_weight_lbs=$3,utilization=$4,status=$5,memo=$6,updated_at=now() WHERE id=$1`,
++      [proposalId,draft.totalPallets,draft.totalWeight,draft.utilization,draft.status,draft.memo]);
++    await query(`UPDATE scm_smart_proposal_lines SET required_pallets=$2,proposed_pallets=$2,residual_pallets=$2,sales_quantity=$3,
++      line_weight_lbs=$4,reason=$5::jsonb,manual_planning_required=$6,updated_at=now() WHERE proposal_id=$1`,
++      [proposalId,line.proposedPallets,line.salesQuantity,line.lineWeight,JSON.stringify(line.reason),line.manualPlanningRequired]);
++  }else{
++    await insertDrafts(runId,[draft]);
++    proposalId=Number((await query('SELECT id FROM scm_smart_proposals WHERE run_id=$1 AND proposal_key=$2',[runId,draft.proposalKey])).rows[0].id);
++    await query('UPDATE scm_smart_proposals SET regular_replenishment_id=$2 WHERE id=$1',[proposalId,group.id]);
++  }
++  return proposalId;
++}
++
+ async function insertDrafts(runId, drafts = []) {
+   for (const draft of drafts) {
+     const proposal = await query(
+@@ -1957,6 +1980,7 @@
+   return {
+     id: Number(row.id),
+     runId: Number(row.run_id),
++    regularReplenishmentId: row.regular_replenishment_id ? Number(row.regular_replenishment_id) : null,
+     proposalKey: row.proposal_key,
+     proposalType: row.proposal_type,
+     proposalOrigin: row.proposal_origin || "inventory",
+@@ -2028,11 +2052,11 @@
+     params.push(Number(proposalId));
+     clauses.push(`p.id = $${params.length}`);
+   } else {
+-    clauses.push("p.vendor_resolution_kind IS NULL");
++    clauses.push("(p.vendor_resolution_kind IS NULL OR p.regular_replenishment_id IS NOT NULL AND p.vendor_resolution_kind='netsuite_po_review')");
+   }
+   if (runId) {
+     params.push(Number(runId));
+-    clauses.push(`p.run_id = $${params.length}`);
++    clauses.push(`(p.run_id = $${params.length} OR EXISTS (SELECT 1 FROM regular_stock_replenishments g JOIN regular_stock_replenishment_runs carry ON carry.replenishment_id=g.id WHERE g.released_at IS NULL AND g.id=p.regular_replenishment_id AND p.status NOT IN ('cancelled','superseded') AND carry.run_id=$${params.length}))`);
+   }
+   if (status) {
+     params.push(String(status));
+@@ -2090,7 +2114,7 @@
+        FROM scm_smart_proposals p
+        LEFT JOIN scm_smart_planning_runs planning_run ON planning_run.id = p.run_id
+       ${clauses.length ? `WHERE ${clauses.join(" AND ")}` : ""}
+-      ORDER BY ${vendorQueue ? "p.order_requested_at DESC NULLS LAST, p.id DESC" : `p.run_id DESC,
++      ORDER BY (p.regular_replenishment_id IS NOT NULL) DESC, ${vendorQueue ? "p.order_requested_at DESC NULLS LAST, p.id DESC" : `p.run_id DESC,
+         CASE p.urgency_level
+           WHEN 'ultimate_urgent' THEN 3
+           WHEN 'super_urgent' THEN 2
+@@ -2108,7 +2132,8 @@
+   forecastRunId = null,
+   includeTemporarilyExcluded = true,
+   excludeTransferOrderIds = [],
+-  settingsOverride = null
++  settingsOverride = null,
++  includePausedItemIds = []
+ } = {}) {
+   const selectedForecastRunId = forecastRunId || await latestSmartScmForecastRunId();
+   const settings = settingsOverride || await settingsRow();
+@@ -2116,6 +2141,7 @@
+   const blanketBalanceByItem = smartScmBlanketBalanceByItem(blanketPoolRows);
+   const policies = await loadSmartScmPlanningPolicies({
+     includeTemporarilyExcluded,
++    includePausedItemIds,
+     blanketBalanceByItem
+   });
+   const inventory = await inventoryState({
+@@ -2158,8 +2184,10 @@
+ 
+ export async function runSmartScmPlan({ triggerSource = "manual", operatorId = null, forecastRunId = null } = {}) {
+   await resumeSmartScmBlanketCoveredPlanningExclusions({ operatorId });
++  const forcedItemIds=(await query("SELECT DISTINCT item_id FROM regular_stock_replenishments WHERE released_at IS NULL")).rows.map(row=>Number(row.item_id));
+   const planning = await loadSmartScmPlanningDemandStates({
+     forecastRunId,
++    includePausedItemIds: forcedItemIds,
+     includeTemporarilyExcluded: true
+   });
+   const selectedForecastRunId = planning.forecastRunId;
+@@ -2183,18 +2211,22 @@
+   );
+   const run = created.rows[0];
+   try {
+-    const calculated = smartScmBuildPlanningDrafts({ states, supplyMap, settings });
+-    const phaseOneDrafts = smartScmPlanningPhaseOneDrafts(calculated.drafts, { mode: planningMode });
+-    const drafts = consolidateCompatibleDrafts(phaseOneDrafts, settings, "initial", routeRules);
+-    const { exceptions } = calculated;
++    let drafts, exceptions;
+     await withTransaction(async () => {
++      const coverage = await syncRegularReplenishments({runId:run.id,planning});
++      const calculated = smartScmBuildPlanningDrafts({ states: creditRegularReplenishments(states.filter(state=>state.policy.planning_enabled!==false),coverage), supplyMap, settings });
++      const phaseOneDrafts = smartScmPlanningPhaseOneDrafts(calculated.drafts, { mode: planningMode });
++      drafts = consolidateCompatibleDrafts(phaseOneDrafts, settings, "initial", routeRules);
++      exceptions = calculated.exceptions;
+       await insertDrafts(run.id, drafts);
++      const priority = await listRegularReplenishments({runId:run.id});
+       const totals = {
+         shortageLines: states.filter((state) => state.requiredPallets > 0).length,
+         zeroDemandCoverageLines: states.filter((state) => state.coverageCausedNeed && state.requiredPallets > 0).length,
+         zeroDemandReviewLines: states.filter((state) => state.coverageReviewRequired && state.requiredPallets > 0).length,
+-        proposals: drafts.length,
+-        poProposals: drafts.filter((draft) => draft.proposalType === "PO").length,
++        proposals: drafts.length + priority.filter(group=>group.currentProposalId).length,
++        regularReplenishments: priority.length,
++        poProposals: drafts.filter((draft) => draft.proposalType === "PO").length + priority.filter(group=>group.currentProposalId).length,
+         toProposals: drafts.filter((draft) => draft.proposalType === "TO").length,
+         urgent: drafts.filter((draft) => draft.urgent).length,
+         held: drafts.filter((draft) => draft.status === "held").length,
+@@ -2275,12 +2307,14 @@
+         }
+         const planning = await loadSmartScmPlanningDemandStates({
+           forecastRunId: run.forecast_run_id,
++          includePausedItemIds: (await query("SELECT DISTINCT item_id FROM regular_stock_replenishments WHERE released_at IS NULL")).rows.map(row=>Number(row.item_id)),
+           includeTemporarilyExcluded: true,
+           settingsOverride: run.settings_snapshot
+         });
+         const evidence = await smartScmExpectedPoEvidence();
++        const priorityCoverage=await syncRegularReplenishments({runId:id,planning});
+         const calculated = smartScmBuildTransferPhaseDrafts({
+-          states: planning.states,
++          states: creditRegularReplenishments(planning.states.filter(state=>state.policy.planning_enabled!==false),priorityCoverage),
+           settings: run.settings_snapshot
+         });
+         const coverageSnapshot = smartScmBlanketCoverageSnapshot(planning.states);
+@@ -2427,6 +2461,7 @@
+     startedAt: row.started_at,
+     completedAt: row.completed_at,
+     proposals,
++    regularReplenishments: await listRegularReplenishments({runId:row.id}),
+     revisions: revisions.rows.map((revision) => ({
+       id: Number(revision.id),
+       revision: Number(revision.revision),
+@@ -2580,6 +2615,14 @@
+ }
+ 
+ export async function updateSmartScmProposal(proposalId, patch = {}, operatorId = null) {
++  return withTransaction(async()=>{
++    const {lockRegularReplenishments} = await import('./regular-stock-replenishment.js');
++    await lockRegularReplenishments();
++    return updateSmartScmProposalLocked(proposalId,patch,operatorId);
++  });
++}
++
++async function updateSmartScmProposalLocked(proposalId, patch, operatorId) {
+   const currentResult = await query("SELECT * FROM scm_smart_proposals WHERE id = $1", [Number(proposalId)]);
+   if (!currentResult.rowCount) throw Object.assign(new Error("Smart SCM proposal was not found."), { status: 404 });
+   const current = currentResult.rows[0];
+@@ -2592,6 +2635,10 @@
+     throw Object.assign(new Error("This proposal already has an execution reference and cannot be changed."), { status: 409 });
+   }
+   const nextStatus = patch.status ? String(patch.status) : current.status;
++  if(current.regular_replenishment_id && nextStatus !== 'cancelled') {
++    const group=(await query('SELECT evidence FROM regular_stock_replenishments WHERE id=$1',[current.regular_replenishment_id])).rows[0];
++    if(group?.evidence?.error)throw Object.assign(new Error(group.evidence.error),{status:409});
++  }
+   let result;
+   if (current.proposal_type === "PO") {
+     const transitions = {
+--- a/server/src/smart-scm-proposal-editor.js
++++ b/server/src/smart-scm-proposal-editor.js
+@@ -77,6 +77,9 @@
+ 
+ function assertEditableProposal(proposal) {
+   if (!proposal) throw Object.assign(new Error("Smart SCM proposal was not found."), { status: 404 });
++  if (proposal.regular_replenishment_id) {
++    throw Object.assign(new Error("Stock request replenishment loads keep their item, source and calculated quantity. Release the priority requirement separately when finished."), {status:409});
++  }
+   if (proposal.proposal_origin === "blanket") {
+     throw Object.assign(new Error("Blanket pool proposals must be edited from the Blanket order tab so their source allocation stays exact."), { status: 409 });
+   }
+--- a/server/src/smart-scm-repository.js
++++ b/server/src/smart-scm-repository.js
+@@ -1,3 +1,4 @@
++import { normalizeRegularLeadHours } from '../public/regular-stock-input.js';
+ import { query } from "./db.js";
+ import { writeAudit } from "./auth-repository.js";
+ import { listSmartScmForecastRuns, listSmartScmForecasts, runSmartScmForecast } from "./smart-scm-forecast-repository.js";
+@@ -21,6 +22,7 @@
+ 
+ function publicSettings(row) {
+   return {
++    regularStockLeadHours: Number(row.regular_stock_lead_hours ?? 5),
+     executionMode: row.execution_mode,
+     forecastMode: row.forecast_mode,
+     dailyEnabled: Boolean(row.daily_enabled),
+@@ -60,6 +62,7 @@
+   const currentResult = await query("SELECT * FROM scm_smart_settings WHERE id = 1");
+   if (!currentResult.rowCount) throw new Error("Smart SCM settings are missing. Run migrations first.");
+   const current = currentResult.rows[0];
++  const regularStockLeadHours = normalizeRegularLeadHours(values.regularStockLeadHours === undefined ? current.regular_stock_lead_hours : values.regularStockLeadHours);
+   const executionMode = values.executionMode ?? current.execution_mode;
+   const forecastMode = values.forecastMode ?? current.forecast_mode;
+   const dailyEnabled = values.dailyEnabled === undefined ? current.daily_enabled : Boolean(values.dailyEnabled);
+@@ -152,16 +155,17 @@
+             skip_12441_enabled = $23,
+             inventory_planning_mode = $24,
+             updated_by = $25,
++            regular_stock_lead_hours = $26,
+             updated_at = now()
+       WHERE id = $1
+       RETURNING *`,
+-    [1, executionMode, forecastMode, dailyEnabled, dailyTime, timeZone, vendorResponseSlaHours, truckCapacityLbs, fullLoadRatio, holdLoadRatio, formulaAverageWeeks, stockoutBenchmarkWeeks, deliverySafetyFactor, pickupSafetyFactor, zeroDemandCoverageEnabled, zeroDemandPickupOrderCount, zeroDemandDeliveryOrderCount, coverageOrderPercentile, coverageHistoryWeeks, coveragePriorStrengthOrders, JSON.stringify(modelActiveSegments), JSON.stringify(routeMatrix), skip12441Enabled, inventoryPlanningMode, operatorId]
++    [1, executionMode, forecastMode, dailyEnabled, dailyTime, timeZone, vendorResponseSlaHours, truckCapacityLbs, fullLoadRatio, holdLoadRatio, formulaAverageWeeks, stockoutBenchmarkWeeks, deliverySafetyFactor, pickupSafetyFactor, zeroDemandCoverageEnabled, zeroDemandPickupOrderCount, zeroDemandDeliveryOrderCount, coverageOrderPercentile, coverageHistoryWeeks, coveragePriorStrengthOrders, JSON.stringify(modelActiveSegments), JSON.stringify(routeMatrix), skip12441Enabled, inventoryPlanningMode, operatorId, regularStockLeadHours]
+   );
+   await writeAudit({
+     actorOperatorId: operatorId,
+     source: "smart_scm",
+     action: "smart_scm.settings.update",
+-    details: { executionMode, forecastMode, dailyEnabled, dailyTime, timeZone, vendorResponseSlaHours, truckCapacityLbs, fullLoadRatio, holdLoadRatio, formulaAverageWeeks, stockoutBenchmarkWeeks, deliverySafetyFactor, pickupSafetyFactor, zeroDemandCoverageEnabled, zeroDemandPickupOrderCount, zeroDemandDeliveryOrderCount, coverageOrderPercentile, coverageHistoryWeeks, coveragePriorStrengthOrders, skip12441Enabled, inventoryPlanningMode, modelActiveSegments, routeMatrix }
++    details: { regularStockLeadHours, executionMode, forecastMode, dailyEnabled, dailyTime, timeZone, vendorResponseSlaHours, truckCapacityLbs, fullLoadRatio, holdLoadRatio, formulaAverageWeeks, stockoutBenchmarkWeeks, deliverySafetyFactor, pickupSafetyFactor, zeroDemandCoverageEnabled, zeroDemandPickupOrderCount, zeroDemandDeliveryOrderCount, coverageOrderPercentile, coverageHistoryWeeks, coveragePriorStrengthOrders, skip12441Enabled, inventoryPlanningMode, modelActiveSegments, routeMatrix }
+   });
+   return publicSettings(result.rows[0]);
+ }
+--- a/server/src/smart-scm-vendor-repository.js
++++ b/server/src/smart-scm-vendor-repository.js
+@@ -1,3 +1,4 @@
++import {lockRegularReplenishments} from './regular-stock-replenishment.js';
+ import { query, withTransaction } from "./db.js";
+ import { smartScmSplitRemainingSql } from "./smart-scm-split-inbound-sql.js";
+ import { writeAudit } from "./auth-repository.js";
+@@ -556,6 +557,7 @@
+      RETURNING id`,
+     [source.id, proposalKey, status, kind === "netsuite_po_review" ? "confirmed" : "cancelled", kind, operatorId]
+   );
++  if(source.regularReplenishmentId)await query('UPDATE scm_smart_proposals SET regular_replenishment_id=$2 WHERE id=$1',[created.rows[0].id,source.regularReplenishmentId]);
+   return Number(created.rows[0].id);
+ }
+ 
+@@ -588,6 +590,7 @@
+      RETURNING id`,
+     [source.id, proposalKey, line.itemName]
+   );
++  if(source.regularReplenishmentId)await query('UPDATE scm_smart_proposals SET regular_replenishment_id=$2 WHERE id=$1',[created.rows[0].id,source.regularReplenishmentId]);
+   return Number(created.rows[0].id);
+ }
+ 
+@@ -1333,6 +1336,7 @@
+     await query("SELECT id FROM scm_smart_proposals WHERE id = $1 FOR UPDATE", [id]);
+     const proposal = await getSmartScmProposal(id);
+     ensureEditableVendorLoad(proposal);
++    if(proposal.regularReplenishmentId)throw Object.assign(new Error('Stock request replenishment must retain its approved item.'),{status:409});
+     const vendor = await vendorIdentityForProposal(id);
+     const alternativeForLineId = Number(values.alternativeForLineId);
+     const originalLine = proposal.lines.find((line) => line.id === alternativeForLineId);
+@@ -1514,6 +1518,7 @@
+     return { line, destinationLocationId: requested };
+   });
+   if (!changes.length) return [];
++  if(proposal.regularReplenishmentId)throw Object.assign(new Error('Stock request replenishment must return to its approved source yard.'),{status:409});
+ 
+   const duplicateKeys = new Map();
+   for (const entry of nextLines) {
+@@ -1599,6 +1604,7 @@
+ export async function saveSmartScmVendorReplyLoad(proposalId, values = {}, operatorId = null) {
+   const id = Number(proposalId);
+   return withTransaction(async () => {
++    await lockRegularReplenishments();
+     await query("SELECT id FROM scm_smart_proposals WHERE id = $1 FOR UPDATE", [id]);
+   const proposal = await getSmartScmProposal(id);
+   ensureEditableVendorLoad(proposal);
+@@ -1727,6 +1733,7 @@
+   const id = Number(proposalId);
+   const vendorItems = await resolveVendorReplyUnitPrices(id);
+   const staged = await withTransaction(async () => {
++    await lockRegularReplenishments();
+     await query("SELECT id FROM scm_smart_proposals WHERE id = $1 FOR UPDATE", [id]);
+     const source = await getSmartScmProposal(id);
+     ensureEditableVendorLoad(source);
+--- a/server/public/regular-stock-input.js
++++ b/server/public/regular-stock-input.js
+@@ -0,0 +1,48 @@
++// @ts-check
++const invalidArrival = () => Object.assign(new Error('Enter a valid, unambiguous Toronto arrival date and time (YYYY-MM-DD and HH:mm).'), { status: 400, code: 'REGULAR_ARRIVAL_INVALID' });
++/** @param {number} value */
++const pad = value => String(value).padStart(2, '0');
++const toronto = new Intl.DateTimeFormat('en-CA', { timeZone: 'America/Toronto', year: 'numeric', month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit', hourCycle: 'h23' });
++
++/** @param {unknown} dateInput @param {unknown} timeInput */
++export function normalizeRegularArrival(dateInput, timeInput) {
++  const rawDate = String(dateInput ?? '').trim();
++  const iso = /^(\d{4})-(\d{1,2})-(\d{1,2})$/.exec(rawDate);
++  const us = /^(\d{1,2})\/(\d{1,2})\/(\d{4})$/.exec(rawDate);
++  const values=iso?iso.slice(1):us?[us[3],us[1],us[2]]:null;
++  if(!values)throw invalidArrival();
++  const [year,month,day]=values.map(Number);
++  const date = `${year}-${pad(month)}-${pad(day)}`;
++  const rawTime = String(timeInput ?? '').trim().toLowerCase().replace(/\s+/g, '');
++  const match = /^(\d{1,2})(?::(\d{2}))?(am|pm)?$/.exec(rawTime);
++  const compact = /^(\d{2})(\d{2})$/.exec(rawTime);
++  const parsed=match||compact;
++  if (!parsed) throw invalidArrival();
++  let hour = Number(parsed[1]);
++  const minute = Number(parsed[2] || 0);
++  if (match?.[3]) {
++    if (hour < 1 || hour > 12) throw invalidArrival();
++    hour = hour % 12 + (match[3] === 'pm' ? 12 : 0);
++  }
++  if (year < 1000 || year > 9999 || hour > 23 || minute > 59) throw invalidArrival();
++  const time = `${pad(hour)}:${pad(minute)}`;
++  const naive = Date.UTC(year, month - 1, day, hour, minute);
++  if (new Date(naive).toISOString().slice(0, 10) !== date) throw invalidArrival();
++  // Resolve wall time through Intl; zero/two matches are the DST gap/fold.
++  const candidates = [];
++  for (let offset = -14; offset <= 14; offset += 1) {
++    const instant = new Date(naive + offset * 3600000);
++    const parts = Object.fromEntries(toronto.formatToParts(instant).map(part => [part.type, part.value]));
++    if (`${parts.year}-${parts.month}-${parts.day}` === date && `${parts.hour}:${parts.minute}` === time) candidates.push(instant);
++  }
++  if (candidates.length !== 1) throw invalidArrival();
++  return { date, time, arrivalAt: candidates[0].toISOString(), timeZone: 'America/Toronto' };
++}
++
++/** @param {unknown} [value] */
++export function normalizeRegularLeadHours(value = 5) {
++  if (value === null || typeof value === 'boolean' || String(value).trim() === '' || !Number.isFinite(Number(value)) || Number(value) < 0 || Number(value) > 87600) {
++    throw Object.assign(new Error('Minimum auto-approval lead hours must be a number between 0 and 87600.'), { status: 400, code: 'REGULAR_LEAD_HOURS_INVALID' });
++  }
++  return Number(value);
++}
+--- a/server/public/regular-stock-ui.js
++++ b/server/public/regular-stock-ui.js
+@@ -0,0 +1,51 @@
++(() => {
++  const t = (en,zh) => window.MBBS_I18N?.language?.() === 'zh-CN' ? zh : en;
++  const esc = value => String(value ?? '').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
++  const number = value => value == null ? t('Unavailable','暂无数据') : new Intl.NumberFormat('en-CA',{maximumFractionDigits:4}).format(value);
++  const decision = value => ({stock:t('Approved · TO / location change','已批准 · 调货 / 更改地点'),po:t('Approved · source replenishment PO','已批准 · 原货场采购补货'),reject:t('Rejected','已拒绝')})[value] || '';
++  function fields(composer) {
++    if(composer.workflowVersion !== 2)return '';
++    return `<div class="stock-request-line-fields regular-stock-fields">
++      <label><span>${t('Customer (optional)','客户（选填）')}</span><input data-regular-field="customerName" maxlength="200" value="${esc(composer.customerName)}" /></label>
++      <label><span>${t('Delivery method','取货方式')} *</span><select data-regular-field="deliveryMethod" required><option value="">${t('Select…','请选择…')}</option><option value="pickup" ${composer.deliveryMethod==='pickup'?'selected':''}>${t('Pickup','自取')}</option><option value="delivery" ${composer.deliveryMethod==='delivery'?'selected':''}>${t('Delivery','送货')}</option></select></label>
++      <label><span>${t('Expected arrival date','预计到达日期')} *</span><input data-regular-field="arrivalDate" autocomplete="off" required placeholder="YYYY-MM-DD" value="${esc(composer.arrivalDate)}" /></label>
++      <label><span>${t('Expected arrival time (Toronto)','预计到达时间（多伦多）')} *</span><input data-regular-field="arrivalTime" autocomplete="off" required placeholder="15:00 / 3pm" value="${esc(composer.arrivalTime)}" /></label>
++    </div>`;
++  }
++  function summary(request) {
++    if(request?.workflowVersion!==2)return '';
++    const r=request.regular||{}, a=r.approval||{};
++    return `<div class="stock-request-summary regular-stock-summary">
++      <span><small>${t('Customer','客户')}</small><strong>${esc(r.customerName||'—')}</strong></span>
++      <span><small>${t('Method','取货方式')}</small><strong>${r.deliveryMethod==='pickup'?t('Pickup','自取'):t('Delivery','送货')}</strong></span>
++      <span><small>${t('Expected arrival · Toronto','预计到达 · 多伦多')}</small><strong>${esc(r.arrivalDate)} ${esc(r.arrivalTime)}</strong></span>
++      <span><small>${t('Review route','审核方式')}</small><strong>${a.automatic?t('Automatically approved','自动批准'):t('SCM review','SCM 人工审核')}</strong></span>
++      <span><small>${t('Minimum lead time at submission','提交时最短提前时间')}</small><strong>${number(a.leadHours)} ${t('hours','小时')}</strong></span>
++      ${r.salesOrderRef?`<span><small>SO</small><strong>${esc(r.salesOrderRef)}</strong></span>`:''}
++    </div>${!a.automatic && a.enoughTime===false?`<p class="stock-request-notice">${t('Arrival is within the configured lead time; manual review is required.','预计到达时间短于设定的提前时间，须人工审核。')}</p>`:''}
++    ${r.handoffError?`<p class="stock-request-notice stock-request-error">${esc(r.handoffError)}</p>`:''}`;
++  }
++  function safety(request,line) {
++    if(request?.workflowVersion!==2)return '';
++    const e=request.currentEvidence?.find(entry=>entry.lineId===line.id)||line.approvalEvidence||{};
++    const labels=[[t('Available','可用库存'),e.availableQuantity],[t('Requested (all matching lines)','申请数量（相同货品合计）'),e.groupedRequestedQuantity],[t('Safety stock required','所需安全库存'),e.safetyQuantity],[t('After shipment','发货后库存'),e.remainingQuantity],[t('Below safety by','低于安全库存'),e.shortfallQuantity]];
++    return `<div class="regular-stock-safety" aria-label="${t('Safety stock review','安全库存审核')}">${labels.map(([label,value])=>`<span><small>${label}</small><strong>${number(value)} ${esc(e.unit||line.salesUom)}</strong></span>`).join('')}</div>${e.reasons?.includes('policy_unavailable')?`<p class="stock-request-notice">${t('Safety or availability evidence is unavailable. SCM must review this line.','安全库存或可用库存数据不足，须 SCM 人工审核此行。')}</p>`:''}${line.decision?`<p><strong>${decision(line.decision)}</strong></p>`:''}`;
++  }
++  function salesOrder(request,saving) {
++    if(request?.workflowVersion!==2)return '';
++    const r=request.regular||{};
++    if(r.handoffStatus==='complete')return `<p class="stock-request-notice">${t('SO handoff complete.','销售订单处理完成。')} ${r.routingMode==='location'?t('Material line locations were changed to the source yard.','商品行地点已更改为出货场。'):t('Transfer Orders were created to your sales yard.','已创建调货单至您的销售货场。')}</p>`;
++    if(request.lines.some(line=>line.status==='submitted'))return `<p class="stock-request-notice">${t('Waiting for SCM to finish reviewing all lines before entering the SO number.','待 SCM 审核所有商品行后，请输入销售订单号。')}</p>`;
++    if(!request.lines.some(line=>['stock','po'].includes(line.decision)))return '';
++    return `<section class="stock-request-section regular-stock-so"><h3>${t('Sales Order','销售订单')}</h3><p>${t('Create the SO at your own sales yard, then enter its number. The approved routing will be applied automatically.','请在您的销售货场建立销售订单，再输入订单号，系统将自动执行已批准的调货安排。')}</p><label><span>${t('SO number','销售订单号')}</span><input data-regular-so maxlength="80" value="${esc(r.salesOrderRef||r.soInput)}" ${r.salesOrderRef?'readonly':''} /></label>${(r.soChoices||[]).map(choice=>`<label><span>${esc(choice.itemName||choice.itemId)} · ${t("Select SO line","选择销售订单行")}</span><select data-regular-so-line="${choice.itemId}">${choice.lines.map(line=>`<option value="${line.id}">${line.id} · ${number(line.quantity)} ${esc(line.uom)}</option>`).join('')}</select></label>`).join('')}<button class="primary" data-sales-stock-action="link-so" type="button" ${saving?'disabled':''}>${saving?t('Processing…','处理中…'):r.salesOrderRef?t('Retry / check progress','重试 / 查看进度'):t('Apply approved routing','执行已批准的安排')}</button></section>`;
++  }
++  async function normalize(composer,root) {
++    if(!composer?.arrivalDate||!composer?.arrivalTime)return;
++    const {normalizeRegularArrival}=await import('/regular-stock-input.js?v=20260929');
++    const arrival=normalizeRegularArrival(composer.arrivalDate,composer.arrivalTime);
++    composer.arrivalDate=arrival.date;composer.arrivalTime=arrival.time;
++    for(const key of ['arrivalDate','arrivalTime']) {const input=root.querySelector(`[data-regular-field="${key}"]`);if(input){input.value=composer[key];input.setCustomValidity('');}}
++    return arrival;
++  }
++  window.RegularStockUI={t,esc,number,decision,fields,summary,safety,salesOrder,normalize};
++})();
+--- a/server/public/regular-stock-alert.js
++++ b/server/public/regular-stock-alert.js
+@@ -0,0 +1,90 @@
++(() => {
++  if (window.MBBSRegularStockAlert) return;
++  const keys = ['mbbs.staff.token','mbbs.dispatch.token','mbbs.control.token','mbbs.operator.token'];
++  const token = () => keys.map(key=>localStorage.getItem(key)).find(Boolean)||'';
++  const t = (en,zh) => window.MBBS_I18N?.language?.()==='zh-CN'?zh:en;
++  let session='',generation=0,controller=null,events=null,timer=null,observer=null,checking=null;
++  let audiences=[],counts={},links={};
++  function paint(){
++    const host=document.querySelector('.dispatch-topbar .topbar-actions, .topbar .topbar-actions, .topbar > .actions')||document.querySelector('.dispatch-topbar,.topbar,.mbt-app-topbar');
++    if(!host)return;
++    for(const audience of audiences){
++      const data=counts[audience];
++      if(!data)continue;
++      const link=links[audience]||document.createElement('a');links[audience]=link;
++      link.className='regular-stock-alert';link.dataset.audience=audience;
++      link.href=audience==='scm'?'/scm/stock-requests?tab=regular&review=1':`/sales/stock-requests?tab=regular&requestId=${Number(data.requests?.[0]?.id)||''}`;
++      const label=audience==='scm'?t('Stock requests to review','库存申请待审核'):t('Stock request decisions','库存申请审批结果');
++      const text=`${label} · ${data.total}`;
++      if(link.textContent!==text)link.textContent=text;
++      link.hidden=!data.total;link.setAttribute('aria-label',text);
++      if(link.parentElement!==host)host.prepend(link);
++    }
++  }
++  function stop(){
++    generation++;controller?.abort();controller=null;checking=null;
++    events?.close();events=null;clearInterval(timer);timer=null;
++    observer?.disconnect();observer=null;
++    for(const link of Object.values(links))link.remove();
++    audiences=[];counts={};links={};
++  }
++  async function refresh(){
++    if(token()!==session)return checkSession();
++    if(!audiences.length||document.hidden||controller)return;
++    const ownGeneration=generation,abort=new AbortController();controller=abort;
++    const timeout=setTimeout(()=>abort.abort(),10000);
++    try{
++      await Promise.all(audiences.map(async audience=>{
++        const response=await fetch(`/api/${audience}/stock-requests/alerts`,{cache:'no-store',signal:abort.signal,headers:{Accept:'application/json',Authorization:`Bearer ${session}`}});
++        if(ownGeneration!==generation||token()!==session)return;
++        if(response.status===401||response.status===403){stop();session='';return;}
++        if(!response.ok)return;
++        const data=await response.json();
++        if(ownGeneration!==generation||token()!==session||!Number.isSafeInteger(data.total)||data.total<0)return;
++        counts[audience]=data;paint();
++      }));
++    }catch{ /* Keep counts during transient failures. */ }
++    finally{clearTimeout(timeout);if(controller===abort)controller=null;}
++  }
++  async function checkSession(){
++    const current=token();
++    if(current!==session){stop();session=current;}
++    if(!session)return;
++    if(audiences.length)return refresh();
++    if(checking)return;
++    const ownGeneration=generation,abort=new AbortController();checking=abort;
++    const timeout=setTimeout(()=>abort.abort(),10000);
++    try{
++      const response=await fetch('/api/auth/me',{cache:'no-store',signal:abort.signal,headers:{Accept:'application/json',Authorization:`Bearer ${current}`}});
++      if(!response.ok)return;
++      const data=await response.json();
++      if(ownGeneration!==generation||token()!==current)return;
++      const operator=data.operator,roles=[...(operator?.roles||[]),operator?.role];
++      if(!operator||operator.publicSales)return;
++      if(roles.some(role=>['admin','sales'].includes(role)))audiences.push('sales');
++      if(roles.some(role=>['admin','scm','scm_staff','yard_manager'].includes(role)))audiences.push('scm');
++      if(!audiences.length)return;
++      observer=new MutationObserver(paint);observer.observe(document.body,{childList:true,subtree:true});
++      timer=setInterval(refresh,30000);
++      if('EventSource' in window){
++        events=new EventSource('/api/events?client=regular-stock-alert');
++        events.addEventListener('open',refresh);
++        events.addEventListener('app-event',message=>{try{if(JSON.parse(message.data).type==='stock-request.updated')void refresh();}catch{ /* Invalid event. */ }});
++      }
++      await refresh();
++    }catch{ /* Retry on focus or session changes. */ }
++    finally{clearTimeout(timeout);if(checking===abort)checking=null;}
++  }
++  const style=document.createElement('style');
++  style.textContent='.regular-stock-alert{display:inline-flex;align-items:center;padding:7px 10px;margin:3px;border:1px solid #a16207;border-radius:8px;background:#fffbeb;color:#78350f;font:700 12px/1.3 system-ui;text-decoration:none}.regular-stock-alert[hidden]{display:none}.regular-stock-alert:focus-visible{outline:3px solid #a16207;outline-offset:2px}';
++  document.head.append(style);
++  window.MBBSRegularStockAlert={refresh};
++  window.addEventListener('mbbs-auth-operator-changed',()=>{checking?.abort();stop();session='';void checkSession();});
++  window.addEventListener('mbbs-language-changed',paint);
++  window.addEventListener('storage',event=>{if(keys.includes(event.key)||event.key===null)void checkSession();});
++  window.addEventListener('focus',checkSession);
++  window.addEventListener('pageshow',checkSession);
++  window.addEventListener('pagehide',()=>{checking?.abort();stop();session='';});
++  document.addEventListener('visibilitychange',()=>{if(!document.hidden)void checkSession();});
++  if(document.readyState==='loading')document.addEventListener('DOMContentLoaded',checkSession,{once:true});else void checkSession();
++})();
+--- a/server/public/sales-stock-requests.js
++++ b/server/public/sales-stock-requests.js
+@@ -52,6 +52,8 @@
+ function salesStockStatusLabel(value) {
+   const status = String(value || "unknown").trim().toLowerCase();
+   if (status === "pending") return salesStockT("salesStock.status.pending", "Pending");
++  if (status === "approved") return window.RegularStockUI.t("Approved · awaiting SO", "已批准 · 待销售订单");
++  if (status === "fulfilled") return window.RegularStockUI.t("SO location updated", "销售订单地点已更新");
+   if (status === "accepted") return salesStockT("salesStock.status.accepted", "Accepted");
+   if (status === "completed") return salesStockT("salesStock.status.completed", "Completed");
+   if (status === "submitted") return salesStockT("salesStock.status.submitted", "Submitted");
+@@ -235,6 +237,8 @@
+       <span><small>${salesStockT("salesStock.lines", "Lines")}</small><strong>${request.lines.length}</strong></span>
+       <span><small>${salesStockT("salesStock.lastUpdate", "Last update")}</small><strong>${salesStockDate(request.updatedAt)}</strong></span>
+     </div>
++    ${request.workflowVersion===2?window.RegularStockUI.summary(request):""}
++    ${request.workflowVersion===2?window.RegularStockUI.salesOrder(request,salesStockState.saving):""}
+     ${request.remarks ? `<div class="stock-request-notice"><strong>${salesStockT("salesStock.salesRemark", "Sales remark:")}</strong> ${salesStockEscape(request.remarks)}</div>` : ""}
+     <div class="stock-request-actions">
+       ${(editableBeforeDecision || returnedLines.length) ? `<button data-sales-stock-action="edit" type="button">${returnedLines.length ? salesStockT("salesStock.editReturnedLines", "Edit returned line(s)") : salesStockT("salesStock.editRequest", "Edit request")}</button>` : ""}
+@@ -252,6 +256,7 @@
+             <span><small>${salesStockT("salesStock.quantity", "Quantity")}</small><strong>${salesStockNumber(line.salesQty)} ${salesStockEscape(line.salesUom)}</strong></span>
+             ${line.quantityMode === "conversion" ? `<span><small>${salesStockT("salesStock.entered", "Entered")}</small><strong>${salesStockNumber(line.pallets)} PLT · ${salesStockNumber(line.layers)} LYR · ${salesStockNumber(line.sections)} SEC · ${salesStockNumber(line.pieces)} PCS</strong></span>` : ""}
+           </div>
++          ${line.decision ? `<p><strong>${window.RegularStockUI.decision(line.decision)}</strong></p>` : ""}
+           ${line.decisionReason ? `<div class="stock-request-notice"><strong>${salesStockT("salesStock.scmUpdate", "SCM update:")}</strong> ${salesStockEscape(line.decisionReason)}</div>` : ""}
+         </article>
+       `).join("")}</div>
+@@ -293,6 +298,7 @@
+ function salesStockStartNew() {
+   if (salesStockState.loading || !salesStockState.yards.length) return;
+   salesStockState.composer = {
++    workflowVersion:2, customerName:"", deliveryMethod:"", arrivalDate:"", arrivalTime:"",
+     requestId: null,
+     expectedRevision: null,
+     partial: false,
+@@ -329,6 +335,7 @@
+   const partial = Boolean(request.firstScmDecisionAt);
+   const sourceLines = partial ? request.lines.filter((line) => line.status === "changes_requested") : request.lines;
+   salesStockState.composer = {
++    workflowVersion:request.workflowVersion, ...request.regular,
+     requestId: request.id,
+     expectedRevision: request.revision,
+     partial,
+@@ -408,9 +415,10 @@
+     <form class="stock-request-form" data-sales-stock-form>
+       <div class="stock-request-form-head">
+         <label><span>${salesStockT("salesStock.yourDestination", "Your destination yard")}</span><select data-sales-stock-destination ${singleYard || composer.partial ? "disabled" : ""}>${supportedDestinationLocationId ? "" : `<option value="" selected>${salesStockT("salesStock.selectDestinationYard", "Select destination yard")}</option>`}${salesStockState.yards.map((yard) => `<option value="${Number(yard.locationId)}" ${supportedDestinationLocationId === Number(yard.locationId) ? "selected" : ""}>${salesStockEscape(yard.yardCode)}</option>`).join("")}</select></label>
+-        <div class="stock-request-notice">${salesStockT("salesStock.availabilityNotice", "Availability is refreshed from NetSuite through the backend when an item is selected. Submitting does not reserve inventory; SCM conversion does.")}</div>
++        <div class="stock-request-notice">${composer.workflowVersion===2 ? window.RegularStockUI.t("Approval checks safety stock and arrival time. NetSuite commits stock when the SO or TO is processed.","审批将检查安全库存和预计到达时间，处理销售订单或调货单时由 NetSuite 承诺库存。") : salesStockT("salesStock.availabilityNotice", "Availability is refreshed from NetSuite through the backend when an item is selected. Submitting does not reserve inventory; SCM conversion does.")}</div>
+         ${salesStockState.allowOverAvailability ? `<div class="stock-request-notice stock-request-availability-override"><strong>${salesStockT("salesStock.overAvailabilityEnabled", "Admin override enabled:")}</strong> ${salesStockT("salesStock.overAvailabilityHelp", "You may request more than this yard currently has. SCM can convert the full requested quantity; the shortage will remain visible as a Transfer Order backorder.")}</div>` : ""}
+       </div>
++      ${composer.workflowVersion===2?window.RegularStockUI.fields(composer):""}
+       <label class="stock-request-remark"><span>${salesStockT("salesStock.remarkOptional", "Request remark (optional)")}</span><textarea name="remarks" data-sales-stock-remarks maxlength="2000" rows="3" ${composer.partial ? "readonly" : ""}>${salesStockEscape(composer.remarks)}</textarea></label>
+       <div class="stock-request-lines">${composer.lines.map(salesStockComposerLine).join("")}</div>
+       <div class="stock-request-actions">
+@@ -426,6 +434,10 @@
+   let selector = "";
+   if (active.matches("[data-sales-stock-search]")) {
+     selector = "[data-sales-stock-search]";
++  } else if (active.matches('[data-regular-field]')) {
++    selector = `[data-regular-field="${CSS.escape(active.dataset.regularField)}"]`;
++  } else if (active.matches('[data-regular-so]')) {
++    selector = '[data-regular-so]';
+   } else if (active.matches("[data-sales-stock-remarks]")) {
+     selector = "[data-sales-stock-remarks]";
+   } else if (active.matches("[data-sales-stock-destination]")) {
+@@ -509,6 +521,16 @@
+     </section>`;
+   salesStockRestoreFocus(focusSnapshot);
+   salesStockRestoreScroll(scrollSnapshot);
++  const displayed=salesStockState.detail;
++  if(!salesStockState.composer&&!salesStockState.loading&&!document.hidden && displayed?.manualDecisionEventId && displayed.requestedBy===salesStockState.operator?.id){
++    const key=`${displayed.id}:${displayed.manualDecisionEventId}`;
++    salesStockState.readDecisions ||= new Set();
++    if(!salesStockState.readDecisions.has(key)){
++      salesStockState.readDecisions.add(key);
++      void salesStockApi(`/api/sales/stock-requests/${displayed.id}/decisions/read`,{method:'POST',body:JSON.stringify({eventId:displayed.manualDecisionEventId})})
++        .then(()=>window.MBBSRegularStockAlert?.refresh()).catch(()=>salesStockState.readDecisions.delete(key));
++    }
++  }
+ }
+ 
+ async function salesStockLoadDetail(id) {
+@@ -697,7 +719,9 @@
+   try {
+     const destinationLocationId = salesStockSupportedDestinationLocationId(composer.destinationLocationId);
+     if (!destinationLocationId) throw new Error("Select a valid supported destination yard.");
++    if(composer.workflowVersion===2)await window.RegularStockUI.normalize(composer,salesStockRequestApp);
+     const body = {
++      ...(composer.workflowVersion===2?{customerName:composer.customerName,deliveryMethod:composer.deliveryMethod,arrivalDate:composer.arrivalDate,arrivalTime:composer.arrivalTime}:{}),
+       destinationLocationId,
+       remarks: composer.remarks,
+       lines: composer.lines.map(salesStockLinePayload),
+@@ -707,6 +731,7 @@
+       ? await salesStockApi(`/api/sales/stock-requests/${composer.requestId}`, { method: "PATCH", body: JSON.stringify(body) })
+       : await salesStockApi("/api/sales/stock-requests", { method: "POST", body: JSON.stringify(body) });
+     salesStockState.selectedId = saved.id;
++    salesStockState.bucket = saved.bucket || "pending";
+     salesStockState.composer = null;
+     salesStockState.suggestions.clear();
+     salesStockState.refreshPending = false;
+@@ -727,6 +752,14 @@
+ }
+ 
+ salesStockRequestApp.addEventListener("input", (event) => {
++  if(event.target.matches('[data-regular-so]') && salesStockState.detail?.regular){
++    const regular=salesStockState.detail.regular;
++    regular.soInput=event.target.value;
++    delete regular.soChoices;
++    for(const choice of salesStockRequestApp.querySelectorAll('[data-regular-so-line]'))choice.closest('label')?.remove();
++    return;
++  }
++  if(event.target.dataset.regularField && salesStockState.composer){event.target.setCustomValidity('');salesStockState.composer[event.target.dataset.regularField]=event.target.value;return;}
+   if (event.target.matches("[data-sales-stock-search]")) {
+     salesStockState.search = event.target.value;
+     window.clearTimeout(salesStockState.refreshTimer);
+@@ -761,6 +794,7 @@
+ });
+ 
+ salesStockRequestApp.addEventListener("change", (event) => {
++  if(event.target.dataset.regularField && salesStockState.composer){salesStockState.composer[event.target.dataset.regularField]=event.target.value;return;}
+   if (event.target.matches("[data-sales-stock-filter]")) {
+     const filterName = event.target.dataset.salesStockFilter;
+     const yardName = event.target.type === 'checkbox' ? event.target.name : null;
+@@ -789,6 +823,19 @@
+   if (line && event.target.dataset.salesStockField) line[event.target.dataset.salesStockField] = event.target.value;
+ });
+ 
++salesStockRequestApp.addEventListener('focusout',async event=>{
++  const field=event.target.dataset.regularField;
++  if(!['arrivalDate','arrivalTime'].includes(field))return;
++  const composer=salesStockState.composer,date=composer?.arrivalDate,time=composer?.arrivalTime;
++  try{
++    await window.RegularStockUI.normalize(composer,salesStockRequestApp);
++    if(composer===salesStockState.composer)salesStockRequestApp.querySelector(`[data-regular-field="${field}"]`)?.setCustomValidity('');
++  }catch(error){
++    if(composer===salesStockState.composer&&composer?.arrivalDate===date&&composer?.arrivalTime===time){
++      salesStockRequestApp.querySelector(`[data-regular-field="${field}"]`)?.setCustomValidity(error.message);
++    }
++  }
++});
+ salesStockRequestApp.addEventListener("submit", (event) => {
+   if (!event.target.matches("[data-sales-stock-form]")) return;
+   event.preventDefault();
+@@ -848,6 +895,25 @@
+       await salesStockLoadDetail(salesStockState.selectedId);
+       return renderSalesStockRequests();
+     }
++    if(action==='link-so'){
++      if(salesStockState.saving)return;
++      const request=salesStockState.detail;
++      const salesOrderRef=salesStockRequestApp.querySelector('[data-regular-so]')?.value.trim();
++      const selectedLineIds=Object.fromEntries([...salesStockRequestApp.querySelectorAll('[data-regular-so-line]')].map(input=>[input.dataset.regularSoLine,Number(input.value)]));
++      salesStockState.saving=true;button.disabled=true;
++      try{
++        if(!request.regular.salesOrderRef&&!Object.keys(selectedLineIds).length){
++          const preview=await salesStockApi(`/api/sales/stock-requests/${request.id}/sales-order/preview`,{method:'POST',body:JSON.stringify({salesOrderRef})});
++          if(preview.choices.length){
++            request.regular.soChoices=preview.choices;request.regular.soInput=salesOrderRef;
++            return;
++          }
++        }
++        const saved=await salesStockApi(`/api/sales/stock-requests/${request.id}/sales-order`,{method:'POST',body:JSON.stringify({salesOrderRef,selectedLineIds,expectedRevision:request.revision})});
++        salesStockState.bucket=saved.bucket;await salesStockLoad({preserveSelection:true});
++      }finally{salesStockState.saving=false;if(!request.regular.soChoices)await salesStockLoadDetail(request.id);renderSalesStockRequests();}
++      return;
++    }
+     if (action === "edit") return salesStockStartEdit();
+     if (action === "cancel") {
+       if (!confirm(salesStockTf("salesStock.confirmCancel", "Cancel {reference}?", {
+@@ -915,7 +981,11 @@
+     try {
+       ({yardFilterHtml: salesStockYardFilterHtml} = await salesStockYardFilterReady);
+       if (window.MBBSSalesStockActiveTab === "special") await window.MBBSSalesSpecialStock.open({operator});
+-      else await salesStockLoad({ preserveSelection: true });
++      else {
++        const linkedId=Number(new URLSearchParams(location.search).get('requestId'));
++        if(linkedId>0){const linked=await salesStockApi(`/api/sales/stock-requests/${linkedId}`);salesStockState.bucket=linked.bucket;salesStockState.selectedId=linked.id;}
++        await salesStockLoad({ preserveSelection: true });
++      }
+       salesStockConnectEvents();
+     } catch (error) {
+       salesStockState.loading = false;
+--- a/server/public/scm-stock-requests.js
++++ b/server/public/scm-stock-requests.js
+@@ -4,7 +4,7 @@
+ 
+ const scmStockState = {
+   operator: null,
+-  queue: localStorage.getItem("mbbs.scm.stockRequests.queue") || "request",
++  queue: new URLSearchParams(location.search).get("review") === "1" ? "request" : localStorage.getItem("mbbs.scm.stockRequests.queue") || "request",
+   search: "",
+   vendorFilter: "",
+   requestDateFilter: "",
+@@ -191,6 +191,7 @@
+       ${scmStockQuantityInputs(line, "line", !editable)}
+     </div>
+     ${scmStockAvailabilityMatrix(line.itemId)}
++    ${window.RegularStockUI.safety(scmStockState.detail,line)}
+     ${line.decisionReason ? `<div class="stock-request-notice"><strong>Decision reason:</strong> ${scmStockEscape(line.decisionReason)}</div>` : ""}
+     ${editable ? `<div class="stock-request-actions"><button data-scm-stock-action="save-line" type="button">Save line adjustment</button></div>` : ""}
+   </article>`;
+@@ -200,12 +201,13 @@
+   const pending = scmStockState.pendingDecision;
+   if (!pending) return "";
+   const isReject = pending.decision === "reject";
+-  const label = isReject ? "Reject" : "Request Changes";
+-  const title = isReject ? "Reject stock-request lines" : "Request changes for stock-request lines";
++  const approval=["stock","po"].includes(pending.decision);
++  const label = approval ? window.RegularStockUI.decision(pending.decision) : isReject ? "Reject" : "Request Changes";
++  const title = approval ? label : isReject ? "Reject stock-request lines" : "Request changes for stock-request lines";
+   return `<section class="stock-request-section stock-request-form stock-request-decision-editor" role="dialog" aria-labelledby="scmStockDecisionTitle">
+     <h3 id="scmStockDecisionTitle">${title}</h3>
+-    <p>${pending.lineIds.length} line(s) will be updated. Enter the required reason before confirming.</p>
+-    <label><span>${label} reason</span><textarea data-scm-stock-decision-reason maxlength="1000" rows="3" required>${scmStockEscape(pending.reason || "")}</textarea></label>
++    <p>${pending.lineIds.length} ${window.RegularStockUI.t("line(s) will be updated.","行将被更新。")} ${approval ? window.RegularStockUI.t("Notes are optional.","备注选填。") : "Enter the required reason before confirming."}</p>
++    <label><span>${label} reason</span><textarea data-scm-stock-decision-reason maxlength="1000" rows="3" ${approval?"":"required"}>${scmStockEscape(pending.reason || "")}</textarea></label>
+     <div class="stock-request-actions">
+       <button data-scm-stock-action="cancel-decision" type="button">Cancel</button>
+       <button class="${isReject ? "danger" : "primary"}" data-scm-stock-action="confirm-decision" type="button">Confirm ${label}</button>
+@@ -229,12 +231,13 @@
+       <span><small>Submitted</small><strong>${scmStockDate(request.createdAt)}</strong></span>
+       <span><small>First SCM decision</small><strong>${scmStockDate(request.firstScmDecisionAt)}</strong></span>
+     </div>
++    ${window.RegularStockUI.summary(request)}
+     ${request.remarks ? `<div class="stock-request-notice"><strong>Sales remark:</strong> ${scmStockEscape(request.remarks)}</div>` : ""}
+     ${scmStockBackorderNotice(selectable)}
+     <div class="stock-request-actions">
+       <button data-scm-stock-action="select-all" type="button" ${selectable.length ? "" : "disabled"}>Select actionable lines</button>
+-      <button class="primary" data-scm-stock-action="convert" type="button" ${scmStockState.selectedLineIds.size ? "" : "disabled"}>Convert to TO</button>
+-      <button data-scm-stock-action="request-changes" type="button" ${canRequestChanges ? "" : "disabled"}>Request Changes</button>
++      ${request.workflowVersion===2 ? `<button data-scm-stock-action="refresh-evidence" type="button">${window.RegularStockUI.t('Refresh stock evidence','刷新库存数据')}</button><button class="primary" data-scm-stock-action="approve-stock" type="button" ${canRequestChanges?'':'disabled'}>${window.RegularStockUI.t('Approve · TO / location change','批准 · 调货 / 更改地点')}</button><button data-scm-stock-action="approve-po" type="button" ${canRequestChanges?'':'disabled'}>${window.RegularStockUI.t('Approve · source replenishment PO','批准 · 原货场采购补货')}</button>` : `<button class="primary" data-scm-stock-action="convert" type="button" ${scmStockState.selectedLineIds.size ? "" : "disabled"}>Convert to TO</button>
++      <button data-scm-stock-action="request-changes" type="button" ${canRequestChanges ? "" : "disabled"}>Request Changes</button>`}
+       <button class="danger" data-scm-stock-action="reject" type="button" ${selectable.length ? "" : "disabled"}>${selected.length ? "Reject selected" : "Reject all actionable"}</button>
+     </div>
+     ${scmStockDecisionEditor()}
+@@ -281,11 +284,11 @@
+   if (!request.transfers.length) return `<div class="stock-request-empty"><strong>No pending TO on this request</strong></div>`;
+   const transfer = scmStockSelectedTransfer();
+   scmStockState.selectedTransferId = transfer.id;
+-  const canEdit = !["partially_fulfilled", "pending_receipt", "received", "cancelled", "closed"].includes(transfer.status);
+-  const canEditStructure = scmStockCanRestructureTransfer(transfer);
++  const canEdit = request.workflowVersion !== 2 && !["partially_fulfilled", "pending_receipt", "received", "cancelled", "closed"].includes(transfer.status);
++  const canEditStructure = request.workflowVersion !== 2 && scmStockCanRestructureTransfer(transfer);
+   const canConfirm = ["pending_local", "attention"].includes(transfer.status);
+   const hasPrinted = Boolean(transfer.printJobId || transfer.printGeneration);
+-  const canRejectPending = transfer.status === "pending_local"
++  const canRejectPending = request.workflowVersion !== 2 && transfer.status === "pending_local"
+     && transfer.confirmationStatus === "idle"
+     && !transfer.confirmationRequestId
+     && !transfer.netsuiteTransferOrderId
+@@ -363,6 +366,7 @@
+       <div class="stock-request-toolbar">
+         <div class="stock-request-tabs" role="tablist" aria-label="Regular stock request queue">
+           <button data-scm-stock-action="queue" data-queue="request" aria-selected="${scmStockState.queue === "request"}" type="button">Request</button>
++          <button data-scm-stock-action="queue" data-queue="approved" aria-selected="${scmStockState.queue === 'approved'}" type="button">${window.RegularStockUI.t("Awaiting SO","待销售订单")}</button>
+           <button data-scm-stock-action="queue" data-queue="pending_to" aria-selected="${scmStockState.queue === "pending_to"}" type="button">Pending TO</button>
+           <button data-scm-stock-action="queue" data-queue="rejected" aria-selected="${scmStockState.queue === "rejected"}" type="button">Rejected</button>
+           <button data-scm-stock-action="queue" data-queue="closed" aria-selected="${scmStockState.queue === "closed"}" type="button">Closed</button>
+@@ -382,7 +386,7 @@
+       </div>
+       <div class="stock-request-workspace">
+         <aside class="stock-request-panel stock-request-list">${scmStockList()}</aside>
+-        <section class="stock-request-panel stock-request-detail">${["pending_to", "closed"].includes(scmStockState.queue) ? scmStockPendingToDetail() : scmStockRequestDetail()}</section>
++        <section class="stock-request-panel stock-request-detail">${["pending_to", "closed"].includes(scmStockState.queue) && scmStockState.detail?.transfers?.length ? scmStockPendingToDetail() : scmStockRequestDetail()}</section>
+       </div>
+     </section>`;
+   scmStockRestoreFocus(focusSnapshot);
+@@ -481,6 +485,7 @@
+     method: "PATCH",
+     body: JSON.stringify(body)
+   });
++  if(scmStockState.detail.workflowVersion===2)await scmStockLoadDetail(scmStockState.detail.id);
+   renderScmStockRequests();
+ }
+ 
+@@ -505,7 +510,7 @@
+ async function scmStockDecision(decision, { lineIds, reason } = {}) {
+   const label = decision === "reject" ? "Reject" : "Request Changes";
+   const normalizedReason = String(reason || "").trim();
+-  if (!normalizedReason) throw new Error(`${label} requires a reason.`);
++  if (["reject","request_changes"].includes(decision) && !normalizedReason) throw new Error(`${label} requires a reason.`);
+   const selectedLineIds = [...new Set((lineIds || []).map(Number))];
+   if (!selectedLineIds.length) throw new Error("Select at least one stock-request line.");
+   scmStockState.detail = await scmStockApi(`/api/scm/stock-requests/${scmStockState.detail.id}/line-decisions`, {
+@@ -519,7 +524,7 @@
+   });
+   scmStockState.pendingDecision = null;
+   scmStockState.error = "";
+-  scmStockState.notice = decision === "reject"
++  scmStockState.notice = ["stock","po"].includes(decision) ? window.RegularStockUI.decision(decision) : decision === "reject"
+     ? "Selected request line(s) were rejected."
+     : "Changes were requested. Convert and Reject remain available until Sales submits a newer revision.";
+   if (decision === "reject") {
+@@ -529,6 +534,7 @@
+   } else {
+     scmStockState.selectedLineIds = new Set(selectedLineIds);
+   }
++  if(["stock","po"].includes(decision)&&!scmStockState.detail.lines.some(line=>line.status==='submitted'))scmStockState.queue="approved";
+   await scmStockLoad({ preserveSelection: decision !== "reject" });
+ }
+ 
+@@ -638,6 +644,13 @@
+       return renderScmStockRequests();
+     }
+     if (action === "save-line") return scmStockSaveLine(button);
++    if(action==='refresh-evidence'){
++      button.disabled=true;
++      scmStockState.detail=await scmStockApi(`/api/scm/stock-requests/${scmStockState.detail.id}/evidence`,{method:'POST',body:'{}'});
++      return renderScmStockRequests();
++    }
++    if(action==='approve-stock')return scmStockOpenDecision('stock');
++    if(action==='approve-po')return scmStockOpenDecision('po');
+     if (action === "request-changes") return scmStockOpenDecision("request_changes");
+     if (action === "reject") return scmStockOpenDecision("reject");
+     if (action === "cancel-decision") {
+--- a/server/public/scm-smart.js
++++ b/server/public/scm-smart.js
+@@ -740,6 +740,7 @@
+     <form class="smart-section" id="smartSettingsForm">
+       <div class="smart-section-head"><div><h2>Smart SCM controls</h2><p>Live execution is guarded by both this setting and a server environment flag. Daily planning uses the configured Toronto-local schedule.</p></div>${smartCanWrite() ? `<button class="smart-button primary" type="submit">Save settings</button>` : ""}</div>
+       <div class="smart-section-body smart-form-grid">
++        <label class="smart-field"><span>${window.RegularStockUI.t('Stock request auto-approval lead time (hours)','库存申请自动批准提前时间（小时）')}</span><input name="regularStockLeadHours" type="number" min="0" max="87600" step="any" required value="${smartEscape(settings.regularStockLeadHours ?? 5)}" ${smartCanWrite()?'':'disabled'} /><small>${window.RegularStockUI.t('Default 5. Requests arriving sooner require SCM review. Zero disables the lead-time restriction; applies to new submissions only.','默认 5。早于此时间须 SCM 审核，设为 0 关闭提前时间限制；仅适用于新提交的申请。')}</small></label>
+         <label class="smart-field"><span>Execution mode</span><select name="executionMode" ${smartCanWrite() ? "" : "disabled"}><option value="mock" ${settings.executionMode === "mock" ? "selected" : ""}>Mock — no NetSuite write</option><option value="live" ${settings.executionMode === "live" ? "selected" : ""}>Live — guarded NetSuite PO + TO</option></select><small>Live mode inserts confirmed POs and TOs into NetSuite; TO confirmation also queues the NetSuite picking ticket.</small></label>
+         <label class="smart-field"><span>Forecast mode</span><select name="forecastMode" ${smartCanWrite() ? "" : "disabled"}><option value="formula" ${settings.forecastMode === "formula" ? "selected" : ""}>Formula only</option><option value="shadow" ${settings.forecastMode === "shadow" ? "selected" : ""}>Formula + shadow comparison</option><option value="hybrid" ${settings.forecastMode === "hybrid" ? "selected" : ""}>Promoted prediction segments</option></select><small>Hybrid uses prediction only for explicitly promoted yard/series segments.</small></label>
+         <label class="smart-field"><span>Daily run time</span><input name="dailyTime" type="time" value="${smartEscape(settings.dailyTime || "06:00")}" ${smartCanWrite() ? "" : "disabled"} /><small>${smartEscape(settings.timeZone || "America/Toronto")}</small></label>
+@@ -1378,6 +1379,7 @@
+     await smartWork("Saving Smart SCM settings", () => smartApi("/api/scm/smart/settings", {
+       method: "PUT",
+       body: {
++        regularStockLeadHours: Number(fields.get("regularStockLeadHours")),
+         executionMode: fields.get("executionMode"),
+         forecastMode: fields.get("forecastMode"),
+         dailyEnabled: fields.get("dailyEnabled") === "on",
+--- a/server/public/scm-smart-proposals.js
++++ b/server/public/scm-smart-proposals.js
+@@ -181,7 +181,7 @@
+ function smartProposalEditable(proposal) {
+   const hasReference = proposal.netsuitePurchaseOrderId || proposal.netsuitePurchaseOrderRef
+     || proposal.netsuiteTransferOrderId || proposal.netsuiteTransferOrderRef;
+-  return smartCanWrite() && !hasReference && ["draft", "held", "reviewed", "attention"].includes(proposal.status);
++  return smartCanWrite() && !proposal.regularReplenishmentId && !hasReference && ["draft", "held", "reviewed", "attention"].includes(proposal.status);
+ }
+ 
+ const smartProposalYards = [
+@@ -556,7 +556,7 @@
+   const secondary = smartState.planSort === "source"
+     ? (proposal) => smartProposalStops(proposal).map((stop) => stop.name).join("|")
+     : (proposal) => proposal.sourceName || proposal.vendor || "";
+-  return proposals.sort((left, right) => smartProposalManualPriority(left) - smartProposalManualPriority(right)
++  return proposals.sort((left, right) => Number(Boolean(right.regularReplenishmentId))-Number(Boolean(left.regularReplenishmentId)) || smartProposalManualPriority(left) - smartProposalManualPriority(right)
+     || smartUrgencyRank(smartProposalUrgencyLevel(right)) - smartUrgencyRank(smartProposalUrgencyLevel(left))
+     || smartProposalDestinationPriority(left) - smartProposalDestinationPriority(right)
+     || smartProposalUrgencyScore(right) - smartProposalUrgencyScore(left)
+@@ -633,7 +633,7 @@
+     ? (proposal.netsuitePurchaseOrderId || proposal.netsuitePurchaseOrderRef)
+     : (proposal.netsuiteTransferOrderId || proposal.netsuiteTransferOrderRef));
+   const locked = hasExecutionReference || ["confirmed", "executing", "completed", "superseded", "cancelled"].includes(proposal.status);
+-  const editable = smartProposalEditable(proposal);
++  const editable = !proposal.regularReplenishmentId && smartProposalEditable(proposal);
+   const canConfirm = !hasExecutionReference && !isPo && ["draft", "reviewed", "executing", "failed", "attention"].includes(proposal.status);
+   const confirmTransferLabel = ["executing", "failed", "attention"].includes(proposal.status)
+     ? "Retry TO + print"
+@@ -755,8 +755,9 @@
+     ${smartUrgencyLegend()}
+     </div>
+     ${exclusionPanel}
++    ${smartRegularReplenishments(plan)}
+     ${smartManualLoadPanel(plan)}
+-    ${plan ? `<div class="smart-proposals">${proposals.map(smartProposalCard).join("") || `<div class="smart-empty">No proposal matches this filter.</div>`}</div>` : `<div class="smart-empty">No planning run exists. Configure Item Master, upload sales history, then build a plan; live NetSuite inventory is refreshed automatically.</div>`}
++    ${plan ? `<div class="smart-proposals">${proposals.map(proposal=>`${proposal.regularReplenishmentId?`<div class="regular-priority-banner">${window.RegularStockUI.t("Priority · stock request replenishment","优先 · 库存申请补货")}</div>`:""}${smartProposalCard(proposal)}`).join("") || `<div class="smart-empty">No proposal matches this filter.</div>`}</div>` : `<div class="smart-empty">No planning run exists. Configure Item Master, upload sales history, then build a plan; live NetSuite inventory is refreshed automatically.</div>`}
+   </section>`;
+ };
+ 
+@@ -1013,3 +1014,17 @@
+     smartRender();
+   }
+ });
++
++function smartRegularReplenishments(plan){
++  const groups=plan?.regularReplenishments||[];
++  if(!groups.length)return '';
++  const t=window.RegularStockUI.t;
++  return `<section class="smart-section regular-priority-loads"><h3>${t('Priority · stock request replenishment','优先 · 库存申请补货')}</h3><p>${t('These loads carry into every proposal run, including paused items, until SCM explicitly releases them. Release ends priority carry only; existing POs remain unchanged.','这些补货需求将保留至每次计划中（包括暂停的商品），直到 SCM 明确释放。释放仅结束优先保留，不更改已有采购订单。')}</p>${groups.map(group=>`<article class="smart-section-body regular-priority-card"><strong>${smartEscape(group.itemName)} · ${smartEscape(({1:'3445',28:'2967',26:'150',15:'12441'})[group.sourceLocationId]||group.sourceLocationId)}</strong><p>${smartNumber(group.quantity)} ${smartEscape(group.unit)} · ${smartEscape(group.purchaseOrderRefs?.join(', ')||group.purchaseOrderRef||group.proposalStatus||t('Covered · no new PO needed','库存已覆盖 · 无须新采购单'))}</p><p>${group.requests.map(request=>`${smartEscape(request.requestRef)} / ${smartEscape(request.salesOrderRef||'—')}`).join(' · ')}</p>${group.evidence.error?`<p class="smart-error">${smartEscape(group.evidence.error)}</p>`:''}${smartCanWrite()?`<button class="smart-button" data-regular-release="${group.id}" data-revision="${group.revision}" type="button">${t('Release','释放')}</button>`:''}</article>`).join('')}</section>`;
++}
++smartScmApp.addEventListener('click',async event=>{
++  const button=event.target.closest('[data-regular-release]');
++  if(!button||!smartCanWrite())return;
++  button.disabled=true;
++  try{await smartWork('Releasing priority replenishment',()=>smartApi(`/api/scm/smart/regular-replenishments/${button.dataset.regularRelease}/release`,{method:'POST',body:{expectedRevision:Number(button.dataset.revision)}}),'Released');if(smartState.plan)smartState.plan=await smartApi(`/api/scm/smart/planning-runs/${smartState.plan.id}`);await smartLoadBootstrap({quiet:true});}
++  catch{button.disabled=false;}
++});
+--- a/server/public/app-sidebar.js
++++ b/server/public/app-sidebar.js
+@@ -689,6 +689,9 @@
+   }
+ 
+   function init() {
++    const regularAlert = document.createElement("script");
++    regularAlert.src = "/regular-stock-alert.js?v=20260929";
++    document.head.appendChild(regularAlert);
+     const aggregateAlert = document.createElement("script");
+     aggregateAlert.src = "/scm-aggregate-alert.js?v=20260925-aggregate-alert-v1";
+     document.head.appendChild(aggregateAlert);
+--- a/server/public/stock-requests.css
++++ b/server/public/stock-requests.css
+@@ -769,3 +769,10 @@
+   .special-stock-page .special-case-pricing-row.special-sales-pricing-row { grid-template-columns: minmax(0,1fr); }
+   .special-case-delivery-row { grid-template-columns: repeat(2,minmax(0,1fr)); }
+ }
++
++.regular-stock-safety {display:grid;grid-template-columns:repeat(auto-fit,minmax(125px,1fr));gap:12px;padding:14px;background:#f0fdfa;border:1px solid #99d4cc;border-radius:8px;margin:12px 0}
++.regular-stock-safety span {display:flex;flex-direction:column;gap:6px}
++.regular-stock-safety small {color:#365752}
++.regular-stock-so label {display:inline-flex;flex-direction:column;gap:6px;margin-right:12px}
++.regular-stock-fields {margin:18px 0}
++.stock-request-pill.approved,.stock-request-pill.fulfilled {background:#dcfce7;color:#14532d}
+--- a/server/public/scm-smart.css
++++ b/server/public/scm-smart.css
+@@ -1083,3 +1083,7 @@
+     grid-template-columns: 1fr;
+   }
+ }
++
++.regular-priority-loads {border:2px solid #b45309!important;padding:16px;background:#fffbeb!important;margin:18px 0}
++.regular-priority-card {border-top:1px solid #fcd34d;padding:12px 0}
++.regular-priority-banner {background:#92400e;color:white;padding:10px 16px;border-radius:8px;font-weight:700;margin-top:12px}
+--- a/server/public/sales-stock-requests.html
++++ b/server/public/sales-stock-requests.html
+@@ -5,16 +5,17 @@
+     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+     <title>MBBS Sales Request Stock</title>
+     <link rel="stylesheet" href="/dispatch.css?v=20260811-stock-request-v1" />
+-    <link rel="stylesheet" href="/stock-requests.css?v=20260928-enhancements-v1" />
++    <link rel="stylesheet" href="/stock-requests.css?v=20260928-enhancements-v1&regular=20260929" />
+     <link rel="stylesheet" href="/i18n.css?v=20260701-i18n-v2" />
+   </head>
+   <body class="sales-stock-requests-page">
+     <main class="dispatch-shell stock-request-shell" id="salesStockRequestApp"></main>
+     <script src="/i18n.js?v=20260815-customer-pickup-photo-gate-v1"></script>
+-    <script src="/app-sidebar.js?v=20260928-enhancements-v1"></script>
++    <script src="/app-sidebar.js?v=20260928-enhancements-v1&regular=20260929"></script>
+     <script src="/dispatch-auth.js?v=20260811-stock-request-private-v1"></script>
+     <script src="/delivery-instruction-upload.js?v=20260812-delivery-image-720p-v1"></script>
+-    <script src="/sales-stock-requests.js?v=20260927-yard-layout-v1"></script>
++    <script src="/regular-stock-ui.js?v=20260929"></script>
++  <script src="/sales-stock-requests.js?v=20260927-yard-layout-v1&regular=20260929"></script>
+     <script src="/sales-special-stock-requests.js?v=20260928-enhancements-v1"></script>
+   </body>
+ </html>
+--- a/server/public/scm-stock-requests.html
++++ b/server/public/scm-stock-requests.html
+@@ -5,19 +5,20 @@
+     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+     <title>MBBS SCM Stock Requests</title>
+     <link rel="stylesheet" href="/dispatch.css?v=20260811-stock-request-v1" />
+-    <link rel="stylesheet" href="/stock-requests.css?v=20260928-enhancements-v1" />
++    <link rel="stylesheet" href="/stock-requests.css?v=20260928-enhancements-v1&regular=20260929" />
+     <link rel="stylesheet" href="/aggregate-requests.css?v=20260925-aggregate-alert-v1" />
+     <link rel="stylesheet" href="/i18n.css?v=20260701-i18n-v2" />
+   </head>
+   <body class="scm-stock-requests-page">
+     <main class="dispatch-shell stock-request-shell" id="scmStockRequestApp"></main>
+     <script src="/i18n.js?v=20260923-aggregate-terminology-layout-v1"></script>
+-    <script src="/app-sidebar.js?v=20260928-batch-discount-v1"></script>
++    <script src="/app-sidebar.js?v=20260928-batch-discount-v1&regular=20260929"></script>
+     <script src="/dispatch-auth.js?v=20260922-aggregate-v1"></script>
+     <script src="/aggregate-requests-i18n.js?v=20260925-aggregate-confirmation-date-v1"></script>
+     <script src="/scm-stock-request-tabs.js?v=20260926-special-queue-v1"></script>
+     <script src="/aggregate-requests.js?v=20260925-aggregate-confirmation-date-v1"></script>
+-    <script src="/scm-stock-requests.js?v=20260927-yard-layout-v1"></script>
++    <script src="/regular-stock-ui.js?v=20260929"></script>
++  <script src="/scm-stock-requests.js?v=20260927-yard-layout-v1&regular=20260929"></script>
+     <script src="/scm-special-stock-requests.js?v=20260928-enhancements-v1"></script>
+   </body>
+ </html>
+--- a/server/public/scm-smart.html
++++ b/server/public/scm-smart.html
+@@ -5,7 +5,7 @@
+     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+     <title>MBBS Smart SCM</title>
+     <link rel="stylesheet" href="/dispatch.css?v=20260720-smart-scm-v1" />
+-    <link rel="stylesheet" href="/scm-smart.css?v=20260801-blanket-ui-v2" />
++    <link rel="stylesheet" href="/scm-smart.css?v=20260801-blanket-ui-v2&regular=20260929" />
+     <link rel="stylesheet" href="/scm-smart-vendor.css?v=20260812-vendor-price-source-v1" />
+     <link rel="stylesheet" href="/scm-smart-blanket.css?v=20260807-blanket-editor-v1" />
+     <link rel="stylesheet" href="/scm-smart-proposals.css?v=20260801-proposal-priority-v3" />
+@@ -15,12 +15,13 @@
+   <body>
+     <main class="smart-shell" id="smartScmApp"></main>
+     <script src="/i18n.js?v=20260815-customer-pickup-photo-gate-v1"></script>
+-    <script src="/app-sidebar.js?v=20260819-scm-custom-orders-v1"></script>
++    <script src="/app-sidebar.js?v=20260819-scm-custom-orders-v1&regular=20260929"></script>
+     <script src="/dispatch-auth.js?v=20260716-multi-role-v1"></script>
+-    <script src="/scm-smart.js?v=20260826-phased-planning-v1"></script>
++    <script src="/regular-stock-ui.js?v=20260929"></script>
++  <script src="/scm-smart.js?v=20260826-phased-planning-v1&regular=20260929"></script>
+     <script src="/scm-smart-blanket.js?v=20260812-blanket-source-items-v1"></script>
+     <script src="/scm-smart-vendor.js?v=20260915-created-po-sync-v1"></script>
+-    <script src="/scm-smart-proposals.js?v=20260826-phased-planning-v1"></script>
++    <script src="/scm-smart-proposals.js?v=20260826-phased-planning-v1&regular=20260929"></script>
+     <script src="/scm-smart-exclusions.js?v=20260915-blanket-auto-resume-v1"></script>
+   </body>
+ </html>
+--- a/server/public/sales.html
++++ b/server/public/sales.html
+@@ -11,7 +11,7 @@
+   <body>
+     <main class="dispatch-shell dispatch-menu-shell" id="salesApp"></main>
+     <script src="/i18n.js?v=20260815-customer-pickup-photo-gate-v1"></script>
+-    <script src="/app-sidebar.js?v=20260917-return-ra-v1"></script>
++    <script src="/app-sidebar.js?v=20260917-return-ra-v1&regular=20260929"></script>
+     <script src="/dispatch-auth.js?v=20260725-private-record-v1"></script>
+     <script src="/sales.js?v=20260918-return-batch-ra-v1"></script>
+   </body>
+--- a/server/public/scm-menu.html
++++ b/server/public/scm-menu.html
+@@ -10,7 +10,7 @@
+   <body>
+     <main class="dispatch-shell dispatch-menu-shell" id="scmMenuApp"></main>
+     <script src="/i18n.js?v=20260716-yard-movements-v1"></script>
+-    <script src="/app-sidebar.js?v=20260928-special-alert-v1"></script>
++    <script src="/app-sidebar.js?v=20260928-special-alert-v1&regular=20260929"></script>
+     <script src="/dispatch-auth.js?v=20260716-multi-role-v1"></script>
+     <script>
+       const scmMenuApp = document.getElementById("scmMenuApp");
+--- a/server/migrations/239_regular_stock_approval_workflow.sql
++++ b/server/migrations/239_regular_stock_approval_workflow.sql
+@@ -0,0 +1,65 @@
++ALTER TABLE scm_smart_settings ADD COLUMN IF NOT EXISTS regular_stock_lead_hours numeric NOT NULL DEFAULT 5
++  CHECK (regular_stock_lead_hours >= 0 AND regular_stock_lead_hours <= 87600);
++ALTER TABLE sales_stock_requests ADD COLUMN IF NOT EXISTS workflow_version integer NOT NULL DEFAULT 1;
++ALTER TABLE sales_stock_requests ADD COLUMN IF NOT EXISTS regular_details jsonb NOT NULL DEFAULT '{}'::jsonb;
++ALTER TABLE sales_stock_requests ADD COLUMN IF NOT EXISTS manual_decision_event_id bigint NOT NULL DEFAULT 0;
++ALTER TABLE sales_stock_request_lines ADD COLUMN IF NOT EXISTS regular_decision text
++  CHECK (regular_decision IN ('stock','po','reject'));
++ALTER TABLE sales_stock_request_lines ADD COLUMN IF NOT EXISTS approval_evidence jsonb NOT NULL DEFAULT '{}'::jsonb;
++ALTER TABLE sales_stock_request_lines DROP CONSTRAINT sales_stock_request_lines_status_check;
++ALTER TABLE sales_stock_request_lines ADD CONSTRAINT sales_stock_request_lines_status_check CHECK (
++  status IN ('submitted','changes_requested','approved','converted','fulfilled','rejected','received','cancelled','closed'));
++
++CREATE TABLE regular_stock_decision_reads (
++  request_id bigint NOT NULL REFERENCES sales_stock_requests(id) ON DELETE CASCADE,
++  operator_id text NOT NULL REFERENCES operators(id) ON DELETE CASCADE,
++  event_id bigint NOT NULL,
++  read_at timestamptz NOT NULL DEFAULT now(),
++  PRIMARY KEY(request_id,operator_id)
++);
++CREATE TABLE regular_stock_handoffs (
++  request_id bigint PRIMARY KEY REFERENCES sales_stock_requests(id) ON DELETE RESTRICT,
++  sales_order_id bigint NOT NULL,
++  sales_order_ref text NOT NULL,
++  plan jsonb NOT NULL,
++  status text NOT NULL DEFAULT 'ready' CHECK(status IN ('ready','executing','attention','complete')),
++  attempt_id text,
++  lease_until timestamptz,
++  remote_started_at timestamptz,
++  location_applied boolean NOT NULL DEFAULT false,
++  replenishment_ready boolean NOT NULL DEFAULT false,
++  error text,
++  updated_at timestamptz NOT NULL DEFAULT now()
++);
++CREATE TABLE regular_stock_so_line_owners (
++  sales_order_id bigint NOT NULL,
++  remote_line_id bigint NOT NULL,
++  request_id bigint NOT NULL REFERENCES sales_stock_requests(id) ON DELETE RESTRICT,
++  PRIMARY KEY(sales_order_id,remote_line_id)
++);
++CREATE TABLE regular_stock_replenishments (
++  id bigserial PRIMARY KEY,
++  item_id bigint NOT NULL REFERENCES inventory_items(item_id) ON DELETE RESTRICT,
++  source_location_id bigint NOT NULL,
++  revision integer NOT NULL DEFAULT 1,
++  quantity numeric NOT NULL DEFAULT 0 CHECK(quantity>=0),
++  evidence jsonb NOT NULL DEFAULT '{}'::jsonb,
++  current_proposal_id bigint REFERENCES scm_smart_proposals(id) ON DELETE RESTRICT,
++  released_by text REFERENCES operators(id) ON DELETE RESTRICT,
++  released_at timestamptz,
++  created_at timestamptz NOT NULL DEFAULT now(),
++  updated_at timestamptz NOT NULL DEFAULT now()
++);
++CREATE UNIQUE INDEX regular_stock_replenishments_active_item_yard
++  ON regular_stock_replenishments(item_id,source_location_id) WHERE released_at IS NULL;
++CREATE TABLE regular_stock_replenishment_requests (
++  request_line_id bigint PRIMARY KEY REFERENCES sales_stock_request_lines(id) ON DELETE RESTRICT,
++  replenishment_id bigint NOT NULL REFERENCES regular_stock_replenishments(id) ON DELETE RESTRICT
++);
++ALTER TABLE scm_smart_proposals ADD COLUMN IF NOT EXISTS regular_replenishment_id bigint REFERENCES regular_stock_replenishments(id);
++CREATE TABLE regular_stock_replenishment_runs (
++  replenishment_id bigint NOT NULL REFERENCES regular_stock_replenishments(id),
++  run_id bigint NOT NULL REFERENCES scm_smart_planning_runs(id),
++  PRIMARY KEY(replenishment_id,run_id)
++);
++CREATE INDEX regular_stock_manual_review ON sales_stock_requests(workflow_version,status,id) WHERE workflow_version=2;

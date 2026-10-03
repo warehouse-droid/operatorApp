@@ -1,17 +1,23 @@
 export const SPECIAL_STAGES = Object.freeze({
   new_enquiry: 'New enquiry',
+  pending_update: 'Pending Update',
   await_customer_confirmation: 'Await Customer Confirmation',
   confirmed: 'Confirmed',
   dispatch_arrangement: 'Dispatch Arrangement',
-  wait_for_production: 'Wait For Production',
+  wait_for_production: 'Wait for production / Transfer',
   closed: 'Closed',
   completed: 'Completed'
 });
 
-/** @param {{closed?:boolean,cancelled?:boolean,operationallyComplete?:boolean,waitingForProduction?:boolean,purchaseOrderId?:number|null,salesOrderId?:number|null,salesOrderSkipped?:boolean,purchaseOrderSkipped?:boolean,fulfillmentMethod?:string,hasPendingSalesDecision?:boolean,linesResolved?:boolean}} evidence */
+/** @param {unknown} status */
+export const specialStockAvailable = status => status === 'in_stock' || status === 'low_inventory';
+
+/** @param {{closed?:boolean,cancelled?:boolean,operationallyComplete?:boolean,pendingUpdate?:boolean,waitingForProduction?:boolean,purchaseOrderId?:number|null,purchaseOrderApproved?:boolean,salesOrderId?:number|null,salesOrderSkipped?:boolean,purchaseOrderSkipped?:boolean,fulfillmentMethod?:string,hasPendingSalesDecision?:boolean,linesResolved?:boolean}} evidence */
 export function specialStage(evidence = {}) {
   if (evidence.closed || evidence.cancelled) return 'closed';
   if (evidence.operationallyComplete) return 'completed';
+  if (evidence.pendingUpdate) return 'pending_update';
+  if (evidence.purchaseOrderId && evidence.purchaseOrderApproved === false) return 'confirmed';
   if (evidence.waitingForProduction) return 'wait_for_production';
   if ((evidence.purchaseOrderId || evidence.purchaseOrderSkipped) && evidence.fulfillmentMethod !== 'vendor_pickup') return 'dispatch_arrangement';
   if (evidence.salesOrderId || evidence.salesOrderSkipped) return 'confirmed';

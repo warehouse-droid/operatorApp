@@ -41,6 +41,7 @@ import { assertExpectedOperatorNetSuitePostingPolicy } from "./operator-netsuite
 import { confirmedReturnPolicy, remainingPalletReservation, verifyReturnAuthorizationSnapshot } from "./return-ra-workflow.js";
 import { admitReturnBatchAuthorization, findReturnBatchAuthorization, synchronizeReturnBatchAuthorization,
   assertSharedReturnCanVoid } from "./return-batch-ra-service.js";
+import { assertReturnDraftMutable, stageReturnBatchRecords, retainFailedReturnDraft } from "./return-submission-draft.js";
 
 export const RETURN_YARDS = Object.freeze([
   { locationId: 1, yardCode: "3445", name: "3445" },
@@ -317,7 +318,11 @@ export async function localPalletReserved(customerId, observedExternalIds = [], 
           NOT (r.external_id = ANY($2::text[]))
           AND (r.netsuite_transaction_id IS NULL
             OR NOT (r.netsuite_transaction_id = ANY($3::bigint[])))
-        ))`,
+        ))
+      UNION ALL
+      SELECT (line->>'returnedSalesQuantity')::numeric,3,a.batch_id,a.netsuite_transaction_id
+      FROM return_batch_authorizations a CROSS JOIN LATERAL jsonb_array_elements(a.intent_snapshot->'lines') line
+      WHERE a.draft_id IS NOT NULL AND a.intent_snapshot->>'customerId'=$1::text AND line->>'kind'='pallet'`,
     [
       customerId,
       observedExternalIds.map(String).filter(Boolean),
@@ -363,7 +368,14 @@ export async function localStockReserved(sourceLineIds = [], observedExternalIds
     JOIN return_batch_authorizations a ON a.batch_id=r.batch_id
     WHERE l.source_sales_order_line_id=ANY($1::bigint[]) AND l.approval_status=ANY($2::text[])
       AND r.status NOT IN ('rejected','voided')
-    GROUP BY r.id,l.source_sales_order_line_id,a.netsuite_transaction_id,a.external_id`, [lineIds, RESERVING_APPROVAL_STATUSES]);
+    GROUP BY r.id,l.source_sales_order_line_id,a.netsuite_transaction_id,a.external_id
+    UNION ALL
+    SELECT (line->>'sourceSalesOrderLineId')::bigint,a.netsuite_transaction_id,a.external_id,
+      SUM((line->>'returnedSalesQuantity')::numeric)
+    FROM return_batch_authorizations a CROSS JOIN LATERAL jsonb_array_elements(a.intent_snapshot->'lines') line
+    WHERE a.draft_id IS NOT NULL AND line->>'kind'='stock'
+      AND (line->>'sourceSalesOrderLineId')::bigint=ANY($1::bigint[])
+    GROUP BY a.batch_id,line->>'sourceSalesOrderLineId',a.netsuite_transaction_id,a.external_id`, [lineIds, RESERVING_APPROVAL_STATUSES]);
   for (const row of shared.rows) {
     const key = String(row.source_sales_order_line_id);
     const observed = (observedReturns.get(key)?.transactions || []).find(transaction =>
@@ -397,7 +409,10 @@ async function customerPalletBalance(customer, remoteBalance = null, { force = f
     `SELECT COALESCE(a.netsuite_transaction_id,r.netsuite_transaction_id) AS netsuite_transaction_id
        FROM return_records r LEFT JOIN return_batch_authorizations a ON a.batch_id=r.batch_id
       WHERE r.customer_id = $1 AND r.record_type = 'pallet' AND (a.batch_id IS NOT NULL OR r.workflow_version = 2)
-        AND r.status NOT IN ('rejected', 'voided') AND COALESCE(a.netsuite_transaction_id,r.netsuite_transaction_id) IS NOT NULL`,
+        AND r.status NOT IN ('rejected', 'voided') AND COALESCE(a.netsuite_transaction_id,r.netsuite_transaction_id) IS NOT NULL
+       UNION
+       SELECT a.netsuite_transaction_id FROM return_batch_authorizations a
+       WHERE a.draft_id IS NOT NULL AND a.intent_snapshot->>'customerId'=$1::text AND a.netsuite_transaction_id IS NOT NULL`,
     [customerId]
   );
   const linkedCredits = await fetchPalletReturnCreditsFromNetSuite(
@@ -741,6 +756,7 @@ async function pruneExpiredReturnDrafts() {
   const expired = await query(
     `DELETE FROM return_drafts
       WHERE expires_at <= now()
+        AND NOT EXISTS(SELECT 1 FROM return_batch_authorizations a WHERE a.draft_id=return_drafts.id)
       RETURNING id, operator_id, receiving_location_id`
   );
   if (expired.rowCount) {
@@ -786,7 +802,7 @@ export async function listReturnDrafts({ operatorId, receivingLocationId = null 
        FROM return_drafts
       WHERE operator_id = $1
         ${locationClause}
-        AND expires_at > now()
+        AND (expires_at > now() OR EXISTS(SELECT 1 FROM return_batch_authorizations a WHERE a.draft_id=return_drafts.id))
       ORDER BY updated_at DESC`,
     params
   );
@@ -945,6 +961,7 @@ export async function discardReturnDraftForControl({
   reason = ""
 } = {}) {
   const cleanReason = cleanText(reason, "Discard reason", 1000);
+  await assertReturnDraftMutable(draftId);
   return withTransaction(async () => {
     const params = [String(draftId || "")];
     const yardClause = receivingLocationIds?.length
@@ -983,6 +1000,7 @@ export async function saveReturnDraft({ operatorId, input = {} } = {}) {
     throw httpError(400, "Draft ID is invalid.");
   }
   const id = suppliedId || crypto.randomUUID();
+  await assertReturnDraftMutable(id);
   const requestedType = String(input.draftType || input.type || "").toLowerCase();
   const type = ["stock", "pallet", "combined"].includes(requestedType)
     ? requestedType
@@ -1053,6 +1071,7 @@ export async function saveReturnDraft({ operatorId, input = {} } = {}) {
 }
 
 export async function deleteReturnDraft({ draftId, operatorId, admin = false } = {}) {
+  await assertReturnDraftMutable(draftId);
   return withTransaction(async () => {
     const result = await query(
       `DELETE FROM return_drafts
@@ -1088,15 +1107,81 @@ async function nextReference(sequence, prefix) {
 
 async function existingBatchByIdempotency(idempotencyKey, operator = null) {
   const result = await query(
-    `SELECT b.id, b.receiving_location_id
+    `SELECT b.id, b.receiving_location_id,a.draft_id
        FROM return_batches b
+       LEFT JOIN return_batch_authorizations a ON a.batch_id=b.id
       WHERE b.idempotency_key = $1
       LIMIT 1`,
     [idempotencyKey]
   );
   if (!result.rows[0]?.id) return null;
   if (operator) assertOperatorYard(operator, result.rows[0].receiving_location_id);
+  if (result.rows[0].draft_id) { return { staged: true, batchId: Number(result.rows[0].id), draftId: result.rows[0].draft_id }; }
   return listReturnRecords({ batchId: result.rows[0].id, limit: 10 });
+}
+
+async function existingStagedReturnDraft(input, operatorId, operator) {
+  if (!/^[0-9a-f-]{36}$/i.test(String(input.draftId || ""))) { return null; }
+  const result = await query(`SELECT b.id,b.receiving_location_id,a.draft_id FROM return_batch_authorizations a
+    JOIN return_batches b ON b.id=a.batch_id WHERE a.draft_id=$1::uuid AND b.operator_id=$2`, [input.draftId, operatorId]);
+  const row = result.rows[0];
+  if (!row) { return null; }
+  if (operator) { assertOperatorYard(operator, row.receiving_location_id); }
+  return { staged: true, batchId: Number(row.id), draftId: row.draft_id };
+}
+
+async function replayReturnSubmission(prior, input, operatorId) {
+  if (prior.staged) { return resumeStagedReturnSubmission(prior, input, operatorId); }
+  const records = prior.records || [];
+  return { idempotentReplay: true, batchReference: records[0]?.batchReference || "",
+    stockReturn: records.find(record => record.recordType === "stock") || null,
+    palletReturn: records.find(record => record.recordType === "pallet") || null, records };
+}
+
+async function retainReturnAdmissionDraft({ autoSync, batchIntents, admittedPolicies, operatorId, input, draftState, hasStock, hasPallet, batchId }) {
+  const staged = autoSync && batchIntents.every(record => admittedPolicies[`${record.recordType}_return`].effective);
+  if (staged) {
+    const savedDraft = await saveReturnDraft({ operatorId, input: { ...draftState?.payload, ...input,
+      draftId: draftState?.id || undefined, draftType: hasStock ? hasPallet ? "combined" : "stock" : "pallet" } });
+    await stageReturnBatchRecords(batchId, savedDraft.id);
+  } else if (draftState) {
+    await query("DELETE FROM return_drafts WHERE id=$1::uuid AND operator_id=$2", [draftState.id, operatorId]);
+  }
+  return { staged, auditAction: staged ? "returns.batch.staged" : "returns.batch.submit" };
+}
+
+async function finishStagedReturnSubmission(batchId, operatorId, idempotentReplay = false) {
+  try {
+    await synchronizeReturnBatchAuthorization({ batchId, actorOperatorId: operatorId });
+  } catch (problem) {
+    const draftId = await retainFailedReturnDraft(batchId, operatorId, String(problem.message || problem).slice(0, 4000));
+    throw httpError(409, `Return remains a draft. ${problem.message}`, { code: "RETURN_SUBMISSION_DRAFT", draftId, draftSaved: true });
+  }
+  const result = await listReturnRecords({ batchId, limit: 10 });
+  const records = await Promise.all((result.records || []).map(record => getReturnRecordDetail(record.id)));
+  return { idempotentReplay, batchReference: records[0]?.batchReference || "",
+    stockReturn: records.find(record => record.recordType === "stock") || null,
+    palletReturn: records.find(record => record.recordType === "pallet") || null, records };
+}
+
+async function resumeStagedReturnSubmission(prior, input, operatorId) {
+  const result = await query("SELECT payload,receiving_location_id FROM return_drafts WHERE id=$1::uuid AND operator_id=$2", [prior.draftId, operatorId]);
+  if (!result.rowCount) { throw httpError(404, "Return draft was not found."); }
+  const saved = result.rows[0];
+  const canonical = value => Array.isArray(value) ? value.map(canonical) : value && typeof value === "object"
+    ? Object.fromEntries(Object.keys(value).sort().map(key => [key, canonical(value[key])])) : value;
+  const orderCode = value => String(value.orderCode || value.salesOrderNumber || value.code || "").trim().toUpperCase();
+  const fields = value => canonical({ lines: (value.lines || []).map(line => ({ ...line, photos: line.photos || [] })), stockReturnType: value.stockReturnType || value.type || "normal",
+    orderId: Number(value.orderId) || null, customerId: Number(value.customerId) || null,
+    orderCode: orderCode(value),
+    palletQuantity: Number(value.palletQuantity) || 0, photos: value.photos || value.stockPhotos || [],
+    palletPhotos: value.palletPhotos || [], vehiclePlate: String(value.vehiclePlate || "").trim(), note: String(value.note || "").trim() });
+  if ((input.receivingLocationId && Number(input.receivingLocationId) !== Number(saved.receiving_location_id))
+      || JSON.stringify(fields(input)) !== JSON.stringify(fields(saved.payload))) {
+    throw httpError(409, "This draft has an unconfirmed NetSuite RA. Retry its saved quantities before changing it.",
+      { code: "RETURN_SUBMISSION_DRAFT", draftId: prior.draftId });
+  }
+  return finishStagedReturnSubmission(prior.batchId, operatorId, true);
 }
 
 function matchedInputLine(input, contextLines) {
@@ -1398,6 +1483,8 @@ export async function submitReturnBatch({
   input = {},
   autoSync = true
 } = {}) {
+  const stagedDraft = await existingStagedReturnDraft(input, operatorId, operator);
+  if (stagedDraft) { return replayReturnSubmission(stagedDraft, input, operatorId); }
   const explicitRequestKey = cleanText(
     input.idempotencyKey || input.clientRequestId || "",
     "Idempotency key",
@@ -1408,17 +1495,15 @@ export async function submitReturnBatch({
       normalizedIdempotencyKey({ idempotencyKey: explicitRequestKey }, operatorId), operator
     );
     if (earlyReplay) {
-      const records = earlyReplay.records || [];
-      return {
-        idempotentReplay: true,
-        batchReference: records[0]?.batchReference || "",
-        stockReturn: records.find((record) => record.recordType === "stock") || null,
-        palletReturn: records.find((record) => record.recordType === "pallet") || null,
-        records
-      };
+      return replayReturnSubmission(earlyReplay, input, operatorId);
     }
   }
-  const draftId = cleanText(input.draftId || "", "Draft ID", 80);
+  let draftId = cleanText(input.draftId || "", "Draft ID", 80);
+  if (!draftId && explicitRequestKey) {
+    const retained = await query(`SELECT id FROM return_drafts WHERE operator_id=$1
+      AND payload->>'idempotencyKey'=$2 AND expires_at>now() ORDER BY updated_at DESC LIMIT 1`, [operatorId, explicitRequestKey]);
+    draftId = retained.rows[0]?.id || "";
+  }
   let draftState = null;
   if (draftId) {
     if (!/^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(draftId)) {
@@ -1454,14 +1539,7 @@ export async function submitReturnBatch({
   const idempotencyKey = normalizedIdempotencyKey(input, operatorId);
   const prior = await existingBatchByIdempotency(idempotencyKey, operator);
   if (prior) {
-    const records = prior.records || [];
-    return {
-      idempotentReplay: true,
-      batchReference: records[0]?.batchReference || "",
-      stockReturn: records.find((record) => record.recordType === "stock") || null,
-      palletReturn: records.find((record) => record.recordType === "pallet") || null,
-      records
-    };
+    return replayReturnSubmission(prior, input, operatorId);
   }
   const vehiclePlate = cleanVehiclePlate(input.vehiclePlate);
   const hasStock = Array.isArray(input.lines) && input.lines.length > 0;
@@ -1498,6 +1576,10 @@ export async function submitReturnBatch({
       enforceYardRestriction: hasStock,
       forcePalletBalance: hasPallet
     });
+    const admitted = await existingBatchByIdempotency(idempotencyKey, operator);
+    if (admitted) {
+      return replayReturnSubmission(admitted, input, operatorId);
+    }
     if (!lookup.crossYardAllowed) {
       throw httpError(409, `This return must be processed at ${lookup.defaultReturnLocation.yardCode || lookup.defaultReturnLocation.name}.`, {
         code: "CROSS_YARD_RETURN_BLOCKED",
@@ -1573,6 +1655,9 @@ export async function submitReturnBatch({
     for (const lockKey of lockKeys) {
       await query("SELECT pg_advisory_xact_lock(hashtext($1))", [lockKey]);
     }
+    const existing = await query(`SELECT b.id,a.draft_id FROM return_batches b
+      LEFT JOIN return_batch_authorizations a ON a.batch_id=b.id WHERE b.idempotency_key=$1 FOR UPDATE OF b`, [idempotencyKey]);
+    if (existing.rowCount) { return { replayBatchId: existing.rows[0].id, staged: Boolean(existing.rows[0].draft_id) }; }
     if (lookup && hasStock) {
       const latestReserved = await localStockReserved(
         validatedLines.map((line) => line.line.sourceLineId),
@@ -1612,12 +1697,6 @@ export async function submitReturnBatch({
       }
       palletBalance = { ...palletBalance, localReserved: currentLocal, available: currentAvailable };
     }
-    const existing = await query(
-      "SELECT id FROM return_batches WHERE idempotency_key = $1 FOR UPDATE",
-      [idempotencyKey]
-    );
-    if (existing.rowCount) return { replayBatchId: existing.rows[0].id };
-
     const batchReference = await nextReference("return_batch_reference_seq", "RB");
     const admittedPolicies = await postingPolicies(true);
     const batchResult = await query(
@@ -1680,16 +1759,12 @@ export async function submitReturnBatch({
       if (record.recordType === "pallet") {record.palletItemId = record.balanceSnapshot?.item?.id || record.balanceSnapshot?.item?.itemId;}
     }
     await admitReturnBatchAuthorization({ records: batchIntents, postingPolicies: admittedPolicies });
-    if (draftState) {
-      await query(
-        "DELETE FROM return_drafts WHERE id = $1::uuid AND operator_id = $2",
-        [draftId, operatorId]
-      );
-    }
+    const admission = await retainReturnAdmissionDraft({ autoSync, batchIntents, admittedPolicies, operatorId,
+      input, draftState, hasStock, hasPallet, batchId: batch.id });
     await writeAudit({
       actorOperatorId: operatorId,
       source: "returns",
-      action: "returns.batch.submit",
+      action: admission.auditAction,
       orderId: lookup?.order?.id || null,
       details: {
         batchReference,
@@ -1701,10 +1776,11 @@ export async function submitReturnBatch({
         idempotencyKey
       }
     });
-    return { batch, stockRecord, palletRecord };
+    return { batch, stockRecord, palletRecord, staged: admission.staged };
   });
 
   if (transactionResult.replayBatchId) {
+    if (transactionResult.staged) { return finishStagedReturnSubmission(transactionResult.replayBatchId, operatorId, true); }
     const replay = await listReturnRecords({ batchId: transactionResult.replayBatchId, limit: 10 });
     return {
       idempotentReplay: true,
@@ -1715,6 +1791,7 @@ export async function submitReturnBatch({
     };
   }
 
+  if (transactionResult.staged) { return finishStagedReturnSubmission(transactionResult.batch.id, operatorId); }
   const result = {
     batchReference: transactionResult.batch.batchReference,
     stockReturn: transactionResult.stockRecord
@@ -2698,6 +2775,18 @@ export async function processPendingReturnSyncs({ limit = 25 } = {}) {
       summary.succeeded += 1;
     } catch {
       // Uncertain v2 attempts are recovery-only; definite failures need retry.
+      summary.failed += 1;
+    }
+  }
+  const staged = await query(`SELECT batch_id FROM return_batch_authorizations WHERE draft_id IS NOT NULL
+    AND (sync_status IN ('pending','succeeded') OR (sync_status='failed' AND (attempted_at IS NOT NULL OR netsuite_transaction_id IS NOT NULL)))
+    ORDER BY updated_at,batch_id LIMIT $1`, [Math.min(100, Math.max(1, Number(limit) || 25))]);
+  summary.queued += staged.rowCount;
+  for (const row of staged.rows) {
+    try {
+      await finishStagedReturnSubmission(row.batch_id, null);
+      summary.succeeded += 1;
+    } catch {
       summary.failed += 1;
     }
   }

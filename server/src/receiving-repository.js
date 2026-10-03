@@ -5,6 +5,7 @@ import { readReceivingPoSplitReservations, applyReceivingPoSplitReservations } f
 import { writeAudit } from "./auth-repository.js";
 import { netSuiteClosedOrderFamilySql } from "./netsuite-closed-order-policy.js";
 import { assertNoClosedNetSuiteOrders, listClosedNetSuiteOrders } from "./netsuite-closed-order-repository.js";
+import { receivingOrderYards, scopeReceivingOrderYard } from "./receiving-yard-scope.js";
 
 function normalizeNumber(value) {
   if (value === null || value === undefined || value === "") return null;
@@ -60,6 +61,16 @@ function scheduleDestinationLocationIdSql(field) {
     WHEN '150' THEN 26
     ELSE NULL
   END`;
+}
+
+function receivingLineYardSql(line = 'rol', order = 'ro') {
+  return `COALESCE(${scheduleDestinationLocationIdSql(`${order}.destination_override`)}, ${line}.location_id, ${order}.destination_location_id)`;
+}
+
+function receivingLineScopeSql(destinationLocationId, parameter, line = 'rol', order = 'ro') {
+  return destinationLocationId
+    ? `AND (${order}.order_type <> 'purchase_order' OR ${receivingLineYardSql(line, order)} = ${parameter})`
+    : '';
 }
 
 function hasConversion(line) {
@@ -277,10 +288,12 @@ export async function listReceivingVendors({ destinationLocationId = null } = {}
   let destinationClause = "";
   if (destinationLocationId) {
     params.push(destinationLocationId);
-    destinationClause = `AND COALESCE(
-      ${scheduleDestinationLocationIdSql("schedule.dropoff_point")},
-      po.destination_location_id
-    ) = $${params.length}`;
+    destinationClause = `AND EXISTS (
+      SELECT 1 FROM purchase_order_lines line
+      WHERE line.purchase_order_id = po.netsuite_id AND line.netsuite_active = true
+        AND COALESCE(${scheduleDestinationLocationIdSql("schedule.dropoff_point")},
+          line.location_id, po.destination_location_id) = $${params.length}
+    )`;
   }
   const result = await query(
     `SELECT vendor_id, vendor, COUNT(*)::int AS order_count
@@ -339,6 +352,7 @@ export async function listReceivingSources({ destinationLocationId = null } = {}
 
 export async function listReceivingOrders({ orderType, vendor = null, sourceLocationId = null, destinationLocationId = null, search = null, itemSearch = null } = {}) {
   const params = [orderType];
+  let destinationParameter = null;
   const clauses = ["ro.order_type = $1", "ro.netsuite_active = true", "ro.receipt_status IS DISTINCT FROM 'received'", "(ro.status_text ILIKE '%Pending Receipt%' OR ro.status_text ILIKE '%Partially Received%')"];
   if (vendor) {
     params.push(vendor);
@@ -350,7 +364,12 @@ export async function listReceivingOrders({ orderType, vendor = null, sourceLoca
   }
   if (destinationLocationId) {
     params.push(destinationLocationId);
-    clauses.push(`ro.destination_location_id = $${params.length}`);
+    destinationParameter = `$${params.length}`;
+    clauses.push(`((ro.order_type = 'purchase_order' AND EXISTS (
+      SELECT 1 FROM receiving_line_source rol WHERE rol.order_id = ro.netsuite_id
+        AND rol.order_type = ro.order_type AND rol.netsuite_active = true
+        AND ${receivingLineYardSql()} = ${destinationParameter}
+    )) OR (ro.order_type = 'transfer_order' AND ro.destination_location_id = ${destinationParameter}))`);
   }
   if (search) {
     params.push(`%${String(search).trim()}%`);
@@ -361,7 +380,9 @@ export async function listReceivingOrders({ orderType, vendor = null, sourceLoca
     clauses.push(`EXISTS (
       SELECT 1 FROM receiving_line_source rol
       WHERE rol.order_id = ro.netsuite_id
+        AND rol.order_type = ro.order_type
         AND rol.netsuite_active = true
+        ${receivingLineScopeSql(destinationLocationId, destinationParameter)}
         AND (rol.item_name ILIKE $${params.length} OR rol.item_description ILIKE $${params.length})
     )`);
   }
@@ -410,15 +431,17 @@ export async function listReceivingOrders({ orderType, vendor = null, sourceLoca
          )
      ),
      receiving_line_source AS (
-       SELECT purchase_order_id AS order_id, item_name, item_description, netsuite_active
+       SELECT purchase_order_id AS order_id, 'purchase_order'::text AS order_type, location_id, item_name, item_description, netsuite_active
        FROM purchase_order_lines
        UNION ALL
-       SELECT transfer_order_id AS order_id, item_name, item_description, netsuite_active
+       SELECT transfer_order_id AS order_id, 'transfer_order'::text AS order_type, location_id, item_name, item_description, netsuite_active
        FROM transfer_order_lines
        WHERE line_stage = 'receiving'
      )
      SELECT ro.*,
-            (SELECT COUNT(*)::int FROM receiving_line_source rol WHERE rol.order_id = ro.netsuite_id AND rol.netsuite_active = true) AS line_count
+            (SELECT COUNT(*)::int FROM receiving_line_source rol WHERE rol.order_id = ro.netsuite_id
+              AND rol.order_type = ro.order_type AND rol.netsuite_active = true
+              ${receivingLineScopeSql(destinationLocationId, destinationParameter)}) AS line_count
      FROM receiving_order_source ro
      WHERE ${clauses.join(" AND ")}
      ORDER BY ro.trandate DESC, ro.tranid DESC
@@ -428,7 +451,7 @@ export async function listReceivingOrders({ orderType, vendor = null, sourceLoca
   return result.rows;
 }
 
-export async function getReceivingOrder(orderId, { includeNetSuiteClosed = false } = {}) {
+export async function getReceivingOrder(orderId, { includeNetSuiteClosed = false, destinationLocationId = null } = {}) {
   const purchaseVisibilitySql = includeNetSuiteClosed
     ? "true"
     : `NOT ${netSuiteClosedOrderFamilySql("po", "PO")}`;
@@ -545,12 +568,16 @@ export async function getReceivingOrder(orderId, { includeNetSuiteClosed = false
         location: overrideLocation
       }
     : line);
-  return {
+  const result = {
     ...receivingOrder,
+    ...(receivingOrder.order_type === 'purchase_order' ? {
+      receiving_yard_location_ids: receivingOrderYards({ ...receivingOrder, lines: projectedLines })
+    } : {}),
     lines: projectedLines.map((/** @type {Record<string,any>} */ line) => applyPoAllocationFields(receipts
       ? applyReceivingPoSplitReservations(applyReceivingReceiptProgress(line, receipts), splitReservations) : line))
       .filter(hasReceivingDisplayQuantity)
   };
+  return destinationLocationId === null ? result : scopeReceivingOrderYard(result, destinationLocationId);
 }
 
 export async function confirmReceivingLine(orderId, lineRowId, values, operatorId) {
@@ -779,7 +806,7 @@ export async function unconfirmReceivingLine(orderId, lineRowId, operatorId) {
   return getReceivingOrder(orderId);
 }
 
-export async function getReceivableReceivingOrder(orderId, { includeNetSuiteClosed = false } = {}) {
+export async function getReceivableReceivingOrder(orderId, { includeNetSuiteClosed = false, destinationLocationId = null } = {}) {
   const order = await getReceivingOrder(orderId, { includeNetSuiteClosed });
   if (!order) throw new Error("Receiving order not found.");
   if (order.receipt_status === "received") {
@@ -801,8 +828,10 @@ export async function getReceivableReceivingOrder(orderId, { includeNetSuiteClos
       && ["InvtPart", "NonInvtPart"].includes(line.item_type || "")
       && (physicalTotal > 0 || confirmedSalesQuantity > 0);
   });
-  if (!receivableLines.length) throw new Error("No confirmed lines to receive.");
-  return { ...order, receivableLines };
+  const result = destinationLocationId === null ? { ...order, receivableLines }
+    : scopeReceivingOrderYard({ ...order, receivableLines }, destinationLocationId, { keepAllLines: true });
+  if (!result.receivableLines.length) throw new Error("No confirmed lines to receive.");
+  return result;
 }
 
 export function buildItemReceiptPayload(order, lines) {
@@ -1490,13 +1519,29 @@ async function recordReceivingReceiptUnlocked(orderId, operatorId, {
   response,
   itemReceiptId,
   itemReceiptTranid,
-  allowNetSuiteCompleted = false
+  allowNetSuiteCompleted = false,
+  verifiedDirectCompletionEventId = null
 }) {
   if (!allowNetSuiteCompleted) {
     await assertNoClosedNetSuiteOrders([orderId], "be received");
   }
   const photos = Array.isArray(photoDataUrls) ? photoDataUrls.filter(isPhotoReference) : [];
-  if (photos.length < 2) throw new Error("Two receiving photos are required.");
+  if (photos.length < 2) {
+    const directProof = verifiedDirectCompletionEventId && itemReceiptId
+      ? (await query(`SELECT job.id FROM dispatch_direct_po_ir_jobs job
+          JOIN dispatch_effective_order_completion_events event ON event.id=job.completion_event_id
+          JOIN driver_job_records driver ON driver.job_id=event.completion_evidence_id
+          JOIN operator_netsuite_posting_commands command ON command.id=job.command_id AND command.status='finalizing'
+          JOIN operator_netsuite_posting_steps step ON step.command_id=command.id AND step.status='posted'
+          WHERE job.completion_event_id=$1 AND job.local_po_id=$2
+            AND step.transaction_type='IR' AND step.netsuite_transaction_id=$3
+            AND event.metadata->>'directShipCoverageVerified'='true'
+            AND event.metadata->>'directPoLink'='true'
+            AND driver.status='complete' AND driver.stop_type='dropoff' AND driver.completed_at IS NOT NULL`,
+        [verifiedDirectCompletionEventId,orderId,itemReceiptId])).rows[0]
+      : null;
+    if (!directProof) throw new Error("Two receiving photos are required.");
+  }
   const order = await getReceivingOrder(orderId, { includeNetSuiteClosed: allowNetSuiteCompleted });
   if (!order) throw new Error("Receiving order not found.");
   const receivedQuantities = new Map((payload?.item?.items || [])
@@ -1667,13 +1712,15 @@ export async function searchReceivingItems({ orderType, vendor = null, sourceLoc
   }
   if (destinationLocationId) {
     params.push(destinationLocationId);
-    clauses.push(`ro.destination_location_id = $${params.length}`);
+    clauses.push(`((ro.order_type = 'purchase_order' AND ${receivingLineYardSql()} = $${params.length})
+      OR (ro.order_type = 'transfer_order' AND ro.destination_location_id = $${params.length}))`);
   }
   const result = await query(
     `WITH receiving_order_source AS (
        SELECT po.netsuite_id, 'purchase_order'::text AS order_type, po.vendor,
               NULL::bigint AS source_location_id,
               COALESCE(${scheduleDestinationLocationIdSql("schedule.dropoff_point")}, po.destination_location_id) AS destination_location_id,
+              NULLIF(BTRIM(schedule.dropoff_point), '') AS destination_override,
               po.status_text, po.netsuite_active
 	       FROM purchase_orders po
          LEFT JOIN scm_transport_schedule schedule
@@ -1684,6 +1731,7 @@ export async function searchReceivingItems({ orderType, vendor = null, sourceLoc
 	       UNION ALL
        SELECT netsuite_id, 'transfer_order'::text AS order_type, NULL::text AS vendor,
               from_location_id AS source_location_id, to_location_id AS destination_location_id,
+              NULL::text AS destination_override,
               status_text, netsuite_active
 	       FROM transfer_orders t
 	       WHERE t.to_location_id IS NOT NULL
@@ -1697,10 +1745,10 @@ export async function searchReceivingItems({ orderType, vendor = null, sourceLoc
          )
      ),
      receiving_line_source AS (
-       SELECT purchase_order_id AS order_id, item_id, item_name, item_description, netsuite_active
+       SELECT purchase_order_id AS order_id, 'purchase_order'::text AS order_type, location_id, item_id, item_name, item_description, netsuite_active
        FROM purchase_order_lines
        UNION ALL
-       SELECT transfer_order_id AS order_id, item_id, item_name, item_description, netsuite_active
+       SELECT transfer_order_id AS order_id, 'transfer_order'::text AS order_type, location_id, item_id, item_name, item_description, netsuite_active
        FROM transfer_order_lines
        WHERE line_stage = 'receiving'
      )
@@ -1709,7 +1757,7 @@ export async function searchReceivingItems({ orderType, vendor = null, sourceLoc
             MIN(rol.item_description) AS item_description,
             COUNT(DISTINCT ro.netsuite_id)::int AS order_count
      FROM receiving_line_source rol
-     INNER JOIN receiving_order_source ro ON ro.netsuite_id = rol.order_id
+     INNER JOIN receiving_order_source ro ON ro.netsuite_id = rol.order_id AND ro.order_type = rol.order_type
      WHERE ${clauses.join(" AND ")}
      GROUP BY rol.item_id, rol.item_name
      ORDER BY order_count DESC, rol.item_name

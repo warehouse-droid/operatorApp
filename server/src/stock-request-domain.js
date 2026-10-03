@@ -8,7 +8,7 @@ export const STOCK_REQUEST_YARDS = Object.freeze([
 ]);
 
 const STOCK_REQUEST_LOCATION_IDS = new Set(STOCK_REQUEST_YARDS.map((yard) => yard.locationId));
-const TERMINAL_LINE_STATUSES = new Set(["received", "rejected", "cancelled", "closed"]);
+const TERMINAL_LINE_STATUSES = new Set(["received", "rejected", "cancelled", "closed", "fulfilled"]);
 
 function httpError(message, status = 400, code = "STOCK_REQUEST_INVALID") {
   return Object.assign(new Error(message), { status, code });
@@ -193,7 +193,7 @@ export function stockRequestBucket(request = {}) {
   if (!lines.length) return "pending";
   const statuses = lines.map((line) => String(line.status || "").trim().toLowerCase());
   if (statuses.every((status) => TERMINAL_LINE_STATUSES.has(status))) return "completed";
-  if (statuses.some((status) => ["converted", "pending_to", "confirmed", "fulfilled", "pending_receipt", "received"].includes(status))) {
+  if (statuses.some((status) => ["approved", "converted", "pending_to", "confirmed", "fulfilled", "pending_receipt", "received"].includes(status))) {
     return "accepted";
   }
   return "pending";

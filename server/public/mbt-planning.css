@@ -1,0 +1,52 @@
+body[data-mbt-surface="planning"] { background: #eef2f3; }
+.bin-planning-shell { width: 100%; max-width: none; margin: 0; padding: 0 22px 40px; }
+.bin-planning-shell nav { display: flex; flex-wrap: wrap; gap: 16px; }
+.bin-planning-shell a { color: #00615e; font-weight: 600; }
+.bin-plan-toolbar { display: flex; align-items: end; flex-wrap: wrap; gap: 12px; }
+.bin-plan-toolbar label, .bin-planning-shell form label { display: grid; gap: 5px; font-size: 13px; font-weight: 600; }
+.bin-planning-shell button, .bin-planning-shell input, .bin-planning-shell select { border: 1px solid #a9b9be; border-radius: 6px; padding: 9px 11px; background: white; color: #192d33; font: inherit; font-size: 13px; }
+.bin-planning-shell button { cursor: pointer; font-weight: 650; }
+.bin-planning-shell button.primary { background: #006f6b; border-color: #006f6b; color: white; }
+.bin-planning-shell button:disabled { color: #637077; background: #e6ebed; cursor: default; }
+.bin-planning-shell :focus-visible { outline: 3px solid #008782; outline-offset: 3px; }
+.bin-shared-note, #binLeaseStatus { font-size: 13px; color: #41555f; margin: 12px 0; }
+#binPlanMessage { padding: 12px; border: 1px solid #c9984d; background: #fff4de; color: #65400b; border-radius: 6px; }
+.bin-badge { display: inline-block; border-radius: 20px; background: #e1eeeb; padding: 5px 9px; font-size: 12px; font-weight: 650; color: #16534c; }
+.bin-planning-grid { display: grid; grid-template-columns: minmax(280px, 350px) minmax(0, 1fr); gap: 18px; margin-top: 18px; align-items: start; }
+.bin-pool, .bin-board { border: 1px solid #c7d2d6; background: white; border-radius: 9px; padding: 15px; min-width: 0; }
+.bin-pool > header, .bin-board > header, .bin-lane > header, .bin-load > header { display: flex; align-items: center; justify-content: space-between; gap: 10px; }
+.bin-planning-shell h2 { margin: 0; font-size: 17px; }
+.bin-planning-shell h3 { margin: 0; font-size: 14px; }
+.bin-pool p, .bin-board > header span { color: #536771; font-size: 12px; }
+.bin-search { display: grid; gap: 5px; font-size: 12px; margin: 16px 0; }
+.bin-pool-card, .bin-planned-visit { border: 1px solid #c6d9d4; border-left: 4px solid #00817a; background: #f8fcfa; border-radius: 6px; margin: 10px 0; padding: 12px; }
+.bin-pool-card[draggable="true"], .bin-planned-visit[draggable="true"] { cursor: grab; }
+.bin-pool-card p, .bin-planned-visit p { margin: 6px 0; font-size: 12px; }
+.bin-pool-card .bin-ref { color: #516670; font-size: 11px; overflow-wrap: anywhere; }
+.bin-card-controls { display: grid; gap: 8px; margin-top: 10px; }
+.bin-card-controls label { display: grid; gap: 4px; font-size: 12px; }
+.bin-card-controls select { width: 100%; min-width: 0; }
+.bin-card-buttons { display: flex; gap: 7px; flex-wrap: wrap; }
+.bin-card-buttons button { padding: 6px 9px; font-size: 12px; }
+.bin-blocked { color: #824910; }
+.bin-lane { margin-top: 15px; border-top: 1px solid #d6dfe2; padding-top: 14px; }
+.bin-lane > header { margin-bottom: 8px; }
+.bin-lane-loads { display: flex; flex-wrap: wrap; gap: 12px; align-items: start; }
+.bin-load { flex: 1 1 290px; max-width: 500px; min-width: 0; border: 1px solid #c6d2d6; border-radius: 7px; padding: 12px; }
+.bin-load[data-drop-load].bin-drop-target { outline: 3px solid #00817a; background: #e6f5f0; }
+.bin-load-time { font-size: 14px; font-weight: 700; }
+.bin-load-context { background: #f0f3f5; color: #41555f; }
+.bin-load-context ul { padding-left: 20px; font-size: 12px; }
+.bin-empty { padding: 20px 5px; color: #546a73; font-size: 13px; }
+.bin-planning-shell dialog { width: min(720px, calc(100vw - 24px)); max-height: 88vh; border: 1px solid #aabcc3; border-radius: 10px; padding: 24px; color: #192d33; }
+.bin-planning-shell dialog::backdrop { background: #152a36a0; }
+.bin-dialog-top { display: flex; align-items: center; justify-content: space-between; gap: 14px; margin-bottom: 18px; }
+.bin-dialog-fields { display: grid; grid-template-columns: 1fr 1fr; gap: 14px; }
+.bin-dialog-fields .wide { grid-column: 1 / -1; }
+.bin-dialog-actions { display: flex; justify-content: end; gap: 10px; margin-top: 22px; }
+.bin-history { padding-left: 20px; font-size: 13px; }
+.bin-history li { margin: 10px 0; }
+.bin-visit-detail { font-size: 14px; line-height: 1.6; }
+.bin-dialog-error { color: #963c25; }
+@media (max-width: 900px) { .bin-planning-grid { grid-template-columns: 1fr; } .bin-load { max-width: none; } }
+@media (max-width: 520px) { .bin-planning-shell { padding: 0 12px 24px; } .bin-dialog-fields { grid-template-columns: 1fr; } .bin-plan-toolbar { align-items: stretch; } }
