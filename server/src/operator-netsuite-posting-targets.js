@@ -3,13 +3,17 @@
 import { query } from "./db.js";
 import { config } from "./config.js";
 import { STORED_ORDER_LINE_STRATEGY, storedOperatorPostingLines } from "./operator-netsuite-posting-stored-lines.js";
+import { operatorPostingLinePackQuantities } from './operator-netsuite-posting-packs.js';
+import { storedTransferPostingRows, transferPostingOrderLine } from './netsuite-transfer-posting-line.js';
 import { mapOperatorKitSelections, operatorKitError } from './operator-netsuite-posting-kits.js';
 import { fetchOperatorKitSource } from './operator-netsuite-posting-kit-source.js';
 import { applyVerifiedPoReceiptProgress } from "./receiving-receipt-progress.js";
 import { refreshPoReceiptAvailability } from "./operator-po-receipt-availability.js";
+import { isSqftPostingUnit } from './operator-netsuite-posting-quantity.js';
 import { receivingOrderYards, scopeReceivingOrderYard } from './receiving-yard-scope.js';
 import { fetchPickupExistingFulfillment } from './operator-pickup-existing-if-source.js';
-import { outboundOrderYards } from './outbound-location-domain.js';
+import { outboundOrderYards, outboundYardLocationId } from './outbound-location-domain.js';
+import { customerPickupOrderYards, scopeCustomerPickupOrderYard } from './customer-pickup-yard-scope.js';
 import { operatorPostingTelemetry as telemetry } from "./operator-netsuite-posting-telemetry.js";
 import {
   buildItemFulfillmentPayload,
@@ -212,6 +216,9 @@ export function createOperatorNetSuitePostingLiveSourceFetcher({
     }
 
     for (const line of lines) {
+      if (kind === 'TO' && line.restOrderLine && line.identityStatus === 'exact') {
+        line.restOrderLine = transferPostingOrderLine(line, {sourceNetSuiteId: id, stage: line.stage});
+      }
       if (!line.restOrderLine) {
         line.identityStatus = "ambiguous";
         line.identityIssue = line.identityIssue || "The SuiteQL source line did not map uniquely to the REST item sublist.";
@@ -405,6 +412,7 @@ async function targetForOrder(order, functionKey, resolveRealSource) {
       const localLine = localLineForPayload(order, functionKey, Number(item.orderLine));
       return { sourceLineKey: String(localLine.line_id), itemId: Number(localLine.item_id),
         quantity: Number(item.quantity), location: item.location ?? null,
+        packQuantities: operatorPostingLinePackQuantities(localLine, functionKey),
         localOrderKey: orderKey, localLineId: String(localLine.id ?? localLine.line_id) };
     });
     physicalLines.push(...ignoredKitComponentSelections(order, source, orderKey));
@@ -442,9 +450,11 @@ async function targetForOrder(order, functionKey, resolveRealSource) {
       return {
         orderLine: Number(candidates[0].orderLine),
         quantity: Number(item.quantity),
+        packQuantities: operatorPostingLinePackQuantities(localLine, functionKey),
         location: item.location ?? null,
         localOrderKey: orderKey,
         localLineId: String(localLine.id ?? localLine.line_id),
+        ...(localLine.unit ? { salesUom: String(localLine.unit).trim().toUpperCase() } : {}),
         ...(authoritativeIdentityPresent ? { sourceLineKey } : {})
       };
     }),
@@ -527,6 +537,15 @@ export function createOperatorNetSuitePostingTargetResolver({
         "Only a current Pick-Up Sales Order can use Customer Pickup posting."
       );
     }
+    if (functionKey === 'customer_pickup') {
+      const yard = clientLocationId === null || clientLocationId === undefined || clientLocationId === ''
+        ? outboundYardLocationId(root.outbound_location_id) : normalizeOperatorNetSuiteLocationId(clientLocationId);
+      if (yard === null || !customerPickupOrderYards(root).includes(yard)) {
+        throw resolutionError('OPERATOR_NETSUITE_POSTING_LOCATION_MISMATCH',
+          'The selected yard does not match a current pickup line. Refresh before confirming.');
+      }
+      root = scopeCustomerPickupOrderYard(root, yard);
+    }
 
     const children = functionKey === "delivery_prep" && root.is_dispatch_group
       ? (root.child_orders || [])
@@ -538,7 +557,8 @@ export function createOperatorNetSuitePostingTargetResolver({
       );
     }
     const locations = new Set(children.flatMap((/** @type {Record<string, any>} */ order) =>
-      functionKey === 'receiving' ? [orderLocation(order, functionKey)] : outboundOrderYards(order)));
+      functionKey === 'customer_pickup' ? [order.pickup_location_id]
+        : functionKey === 'receiving' ? [orderLocation(order, functionKey)] : outboundOrderYards(order)));
     if (locations.size !== 1 || locations.has(null)) {
       throw resolutionError(
         "OPERATOR_NETSUITE_POSTING_MIXED_YARDS",
@@ -566,8 +586,7 @@ export function createOperatorNetSuitePostingTargetResolver({
     ));
     const postingChildren = children.filter((/** @type {Record<string, any>} */ child) => !localChildren.includes(child));
     const netSuitePostingOwner = functionKey === "delivery_prep"
-      && postingChildren.length > 0
-      && postingChildren.every((/** @type {Record<string, any>} */ child) => child.order_type === "sales_order")
+      || (functionKey === "receiving" && root.order_type === "transfer_order")
       ? "driver_completion"
       : "operator";
     const baseResolution = {
@@ -692,7 +711,7 @@ export function createOperatorNetSuitePostingRealSourceResolver({ query: runQuer
   } else if (sourceOrderKind === "PO") {
     rows = await runQuery(
       `SELECT line.line_id AS source_line_key,
-              line.netsuite_order_line, line.item_id, line.quantity,
+              line.netsuite_order_line, line.item_id, line.quantity, line.unit,
               line.netsuite_received_qty AS cached_completed_qty, line.netsuite_closed AS cached_closed,
               COALESCE(line.location_id, parent.destination_location_id) AS location_id,
               mapped.local_line_key, mapped.local_line_id
@@ -730,7 +749,7 @@ export function createOperatorNetSuitePostingRealSourceResolver({ query: runQuer
     const withSplit = useStoredOrderLines && Number(order.netsuite_id) < 0;
     rows = await runQuery(
       `SELECT line.line_id AS source_line_key, NULL::bigint AS location_id,
-              line.netsuite_order_line, line.item_id, line.item_type, line.quantity,
+              line.netsuite_order_line, line.item_id, line.item_type, line.quantity, line.unit, line.raw,
               CASE WHEN line.line_stage='receiving' THEN line.netsuite_received_qty ELSE line.loaded_qty END AS cached_completed_qty,
               false AS cached_closed, ${withSplit ? "mapped.local_line_key, mapped.local_line_id" : "NULL AS local_line_key, NULL AS local_line_id"}
          FROM transfer_order_lines line
@@ -779,10 +798,19 @@ export function createOperatorNetSuitePostingRealSourceResolver({ query: runQuer
   }
   if (useStoredOrderLines) {
     const sourceRows = sourceOrderKind === "PO"
-      ? await applyVerifiedPoReceiptProgress(runQuery, sourceNetSuiteId, rows.rows || []) : rows.rows || [];
+      ? await applyVerifiedPoReceiptProgress(runQuery, sourceNetSuiteId, rows.rows || [])
+      : sourceOrderKind === 'TO'
+        ? await storedTransferPostingRows(rows.rows || [], {sourceNetSuiteId,
+          stage: functionKey === 'receiving' ? 'receiving' : 'outbound', fetchLiveSource})
+        : rows.rows || [];
     const storedLines = storedOperatorPostingLines(sourceRows);
-    const availableLines = sourceOrderKind === "PO" && fetchPoReceiptLines
+    let availableLines = sourceOrderKind === "PO" && fetchPoReceiptLines
       ? refreshPoReceiptAvailability(storedLines, await fetchPoReceiptLines(sourceNetSuiteId)) : storedLines;
+    if (sourceOrderKind === 'SO' && availableLines.some(line => isSqftPostingUnit(line.salesUom))
+        && typeof fetchLiveSource === 'function') {
+      availableLines = refreshSqftPostingAvailability(availableLines,
+        await fetchLiveSource({ sourceOrderKind, sourceNetSuiteId, functionKey }));
+    }
     return { sourceOrderKind, sourceNetSuiteId, sourceOrderRef, nonInventoryLines,
       postingStrategy: STORED_ORDER_LINE_STRATEGY,
       availableLines };
@@ -844,6 +872,7 @@ export function createOperatorNetSuitePostingRealSourceResolver({ query: runQuer
           ...(rows.rows || []).filter((/** @type {Record<string, any>} */ row) => reconciliationSourceLineAliases(line)
             .includes(String(row.source_line_key || ""))).map((/** @type {Record<string, any>} */ row) => row.local_line_key)]),
         orderLine: Number(line.restOrderLine),
+        ...postingSalesUnit(line.unit),
         location: line.location === null || line.location === undefined
           ? matchingLocal?.location_id === null || matchingLocal?.location_id === undefined
             ? null
@@ -857,6 +886,28 @@ export function createOperatorNetSuitePostingRealSourceResolver({ query: runQuer
     }).sort((/** @type {Record<string, any>} */ left, /** @type {Record<string, any>} */ right) => left.orderLine - right.orderLine)
     };
   };
+}
+
+/** @param {any[]} available @param {any} live */
+export function refreshSqftPostingAvailability(available, live) {
+  return available.map(line => {
+    if (!isSqftPostingUnit(line.salesUom)) {return line;}
+    const matches = (live?.lines || []).filter((/** @type {any} */ row) => Number(row.restOrderLine) === Number(line.orderLine)
+      && reconciliationSourceLineAliases(row).includes(String(line.sourceLineKey)));
+    const row = matches[0];
+    if (matches.length !== 1 || row.identityStatus !== 'exact' || Number(row.itemId) !== Number(line.itemId)
+        || !isSqftPostingUnit(row.unit) || (line.location !== null && Number(row.location) !== Number(line.location))) {
+      throw resolutionError('OPERATOR_NETSUITE_POSTING_LINE_MAPPING_UNRESOLVED',
+        'The live NetSuite SQFT quantity does not match its saved source line, item, unit and yard.');
+    }
+    return { ...line, orderedQuantity: positiveNumber(row.quantity ?? row.orderedQuantity),
+      completedQuantity: positiveNumber(row.completedQuantity), remainingQuantity: positiveNumber(row.remainingQuantity) };
+  });
+}
+
+/** @param {unknown} unit */
+function postingSalesUnit(unit) {
+  return unit ? { salesUom: String(unit).trim().toUpperCase() } : {};
 }
 
 /** @param {{getLocalCoReceivingOrder: Function, getReceivableReceivingOrder: Function}} dependencies */

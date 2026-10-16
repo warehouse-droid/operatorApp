@@ -1,0 +1,18 @@
+:root{font-family:Arial,sans-serif;color:#17343e;background:#f2f6f7;color-scheme:light}
+*{box-sizing:border-box}body{margin:0}.menu-order-shell{max-width:980px;margin:0 auto;padding:32px 24px 64px}
+.menu-order-header{display:flex;justify-content:space-between;gap:20px;align-items:center;margin-bottom:24px}
+.menu-order-header p{margin:0 0 6px;color:#58737e;font-size:12px;font-weight:700;letter-spacing:.12em}.menu-order-header h1{margin:0;font-size:30px}
+a{color:#17667a}.menu-order-card{padding:24px;background:white;border:1px solid #d8e3e6;border-radius:14px}
+.menu-order-help{color:#536d78;line-height:1.5;margin-top:0}.menu-order-toolbar,.menu-order-actions{display:flex;align-items:center;gap:10px;flex-wrap:wrap}
+.menu-order-toolbar{justify-content:space-between}.menu-order-toolbar label{display:grid;gap:7px;font-size:14px;font-weight:700}
+select,button{font:inherit;border:1px solid #bacdd3;border-radius:7px;padding:10px 14px;background:#fff;color:#17343e}
+select{min-width:220px}button{cursor:pointer}button:hover{background:#eff6f8}button:disabled{opacity:.45;cursor:default}
+button.primary{background:#12657b;border-color:#12657b;color:white}button.primary:hover{background:#0d4e60}
+:focus-visible{outline:3px solid #26a8c4;outline-offset:3px}
+.menu-order-list{list-style:none;margin:24px 0;padding:0;display:grid;gap:9px}.menu-order-row{display:flex;align-items:center;gap:12px;padding:12px;border:1px solid #dbe6e9;border-radius:9px;background:#fff}
+.menu-order-row.drag-over{border-color:#168ca6;background:#eaf7fa}.menu-order-grip{color:#75919c;cursor:grab;font-size:20px;user-select:none}
+.menu-order-number{font-size:13px;color:#58717d;min-width:22px}.menu-order-label{font-weight:600;flex:1;min-width:0}.menu-order-move{display:flex;gap:5px}.menu-order-move button{padding:7px 10px}
+.menu-order-footer{display:flex;align-items:center;gap:14px;flex-wrap:wrap;border-top:1px solid #e0e9ec;padding-top:20px}
+.menu-order-status{min-height:24px;color:#42616d;line-height:1.45}.menu-order-status.error{color:#a53034}.menu-order-status:empty{display:none}
+.menu-order-dirty{font-size:13px;color:#80632b}.menu-order-note{font-size:13px;color:#58717d;line-height:1.5;margin-bottom:0}
+@media(max-width:650px){.menu-order-shell{padding:20px 12px}.menu-order-card{padding:16px}.menu-order-header h1{font-size:25px}.menu-order-row{gap:8px}.menu-order-move button{padding:7px}.menu-order-label{font-size:14px}.menu-order-actions{margin-top:10px}}

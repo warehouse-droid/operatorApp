@@ -6,6 +6,15 @@
   function options(rows,value) {
     return rows.map(yard=>`<option value="${yard.locationId}" ${Number(value)===yard.locationId?'selected':''}>${ui().esc(yard.yardCode)}</option>`).join('');
   }
+  function lineChoices(preview) {
+    if(!preview?.candidates)return '';
+    const {t,esc,number}=ui(),selected=new Set(preview.selectedRemoteLineIds);
+    return `<section class="stock-request-section"><h3>${t('Select lines to transfer','选择调货行')}</h3>
+      <p>${t('Only checked lines will be transferred. Unchecked backordered lines stay on the Sales Order.','仅调拨勾选行。未勾选的欠货行保留在销售订单上。')}</p>
+      ${preview.candidates.map(line=>`<label class="stock-request-line regular-delivery-line-option"><input type="checkbox" data-delivery-line-id="${line.remoteLineId}" ${selected.has(line.remoteLineId)?'checked':''} />
+        <span><strong>${esc(line.itemName)}</strong> · ${t('SO quantity','订单数量')}: ${number(line.quantity)} ${esc(line.uom)} · ${t('Backordered','欠货')}: ${number(line.backorderedQuantity)} ${esc(line.uom)}</span></label>`).join('')}
+    </section>`;
+  }
   function composer(value,destinations,saving) {
     const {t,esc}=ui();
     const preview=value.deliveryPreview;
@@ -19,16 +28,16 @@
           <label><span>${t('Sales Order number','销售订单号')} *</span><input data-regular-field="salesOrderRef" maxlength="80" required value="${esc(value.salesOrderRef)}" autocomplete="off" /></label>
         </div>
         <p class="stock-request-notice">${t('Transfer: Target Yard → Base Yard. 3445 ↔ 2967 is automatically approved, created and sent to the yard printers. Routes involving 150 or 12441 require SCM approval.','调货方向：目标货场 → 基础货场。3445 ↔ 2967 自动批准、建立调货单并发送至货场打印机。涉及 150 或 12441 的路线须 SCM 人工批准。')}</p>
-        <div data-delivery-calculation>${value.deliveryLoading?t('Reading SO and calculating quantities…','正在读取订单并计算数量…'):value.deliveryError?`<p class="stock-request-error">${esc(value.deliveryError)}</p><button type="button" data-sales-stock-action="delivery-preview-retry">${t('Retry SO check','重新检查销售订单')}</button>`:preview?.lines?calculation(preview):t('Enter the SO and select Target Yard to calculate the transfer.','输入销售订单并选择目标货场，以计算调货数量。')}</div>
-        <button class="primary" type="submit" ${saving||value.deliveryLoading||!preview?.lines?'disabled':''}>${saving?t('Processing…','处理中…'):t('Submit request','提交申请')}</button>
+        <div data-delivery-calculation>${lineChoices(preview)}${value.deliveryLoading?t('Reading SO and calculating quantities…','正在读取订单并计算数量…'):value.deliveryError?`<p class="stock-request-error">${esc(value.deliveryError)}</p><button type="button" data-sales-stock-action="delivery-preview-retry">${t('Retry SO check','重新检查销售订单')}</button>`:preview?.calculationError?`<p class="stock-request-error">${esc(preview.calculationError)}</p>`:preview?.lines?calculation(preview):preview?.selectedRemoteLineIds?.length===0?t('Select at least one line to transfer.','请至少选择一行进行调货。'):t('Enter the SO and select Target Yard to calculate the transfer.','输入销售订单并选择目标货场，以计算调货数量。')}</div>
+        <button class="primary" type="submit" ${saving||value.deliveryLoading||!preview?.lines?.length?'disabled':''}>${saving?t('Processing…','处理中…'):t('Submit request','提交申请')}</button>
       </form>`;
   }
   function calculation(preview) {
     const {t,esc,number}=ui();
     return `<section class="stock-request-section"><h3>${t('Calculated transfer','自动计算调货数量')}</h3>
-      ${preview.lines.map(line=>`<p><strong>${esc(line.itemName)}</strong> · ${number(line.salesQty)} ${esc(line.salesUom)} · ${line.quantityBasis==='whole_line'?t('Whole SO line','整行数量'):t('Backorder quantity','欠货数量')}</p>`).join('')}
+      ${preview.lines.map(line=>`<p><strong>${esc(line.itemName)}</strong> · ${number(line.salesQty)} ${esc(line.salesUom)} · ${line.quantityBasis==='whole_line'?t('Remaining SO quantity','订单剩余数量'):t('Backorder quantity','欠货数量')}</p>`).join('')}
       <p><strong>PALLET: ${number(preview.palletQuantity)}</strong></p>
-      <p>${t('For backordered lines, use the whole line when stock allows; otherwise use only the backorder. Insufficient stock for the backorder stops submission. Quantities are checked again before creating the TO.','有欠货的订单行：库存足够时调拨整行数量，否则仅调拨欠货数量。若欠货数量仍不足，则停止提交。建立调货单前会再次核对数量。')}</p></section>`;
+      <p>${t('For backordered lines, use the remaining unfulfilled quantity when stock allows; otherwise use only the backorder. Insufficient stock for the backorder stops submission. Quantities are checked again before creating the TO.','有欠货的订单行：库存足够时调拨尚未履行的剩余数量，否则仅调拨欠货数量。若欠货数量仍不足，则停止提交。建立调货单前会再次核对数量。')}</p></section>`;
   }
   function invalidate(value,root) {
     value.deliveryPreview=null;value.deliveryError='';
@@ -39,19 +48,31 @@
   async function refresh(value,api,render) {
     if(window.RegularStockDialog.isBusy())return;
     const ref=String(value.salesOrderRef||'').trim(),source=String(value.sourceLocationId||'');
+    if(value.deliverySelectionRef!==ref.toUpperCase())value.selectedRemoteLineIds=undefined;
+    value.deliverySelectionRef=ref.toUpperCase();
     const generation=value.deliveryGeneration=Number(value.deliveryGeneration||0)+1;
     value.deliveryPreview=null;value.deliveryError='';value.deliveryLoading=!!ref;render();
     if(!ref)return;
     try {
-      const preview=await run(api,'preview',{salesOrderRef:ref,sourceLocationId:source});
+      const preview=await run(api,'preview',{salesOrderRef:ref,sourceLocationId:source,
+        ...(value.selectedRemoteLineIds===undefined?{}:{selectedRemoteLineIds:value.selectedRemoteLineIds})});
       if(generation!==value.deliveryGeneration||!composing(value)||ref!==String(value.salesOrderRef||'').trim()||source!==String(value.sourceLocationId||''))return;
       value.deliveryPreview=preview;value.destinationLocationId=String(preview.baseLocationId);
+      value.selectedRemoteLineIds=preview.selectedRemoteLineIds;
       if(source===String(preview.baseLocationId))value.sourceLocationId='';
     } catch(error) {
       if(generation===value.deliveryGeneration&&ref===String(value.salesOrderRef||'').trim()&&source===String(value.sourceLocationId||''))value.deliveryError=error.message;
     } finally {
       if(generation===value.deliveryGeneration){value.deliveryLoading=false;render();}
     }
+  }
+  async function selectLine(value,lineId,checked,api,render) {
+    const candidates=value.deliveryPreview?.candidates||[];
+    if(!candidates.some(line=>line.remoteLineId===lineId))return;
+    const selected=new Set(value.selectedRemoteLineIds||value.deliveryPreview.selectedRemoteLineIds);
+    if(checked)selected.add(lineId);else selected.delete(lineId);
+    value.selectedRemoteLineIds=candidates.filter(line=>selected.has(line.remoteLineId)).map(line=>line.remoteLineId);
+    return refresh(value,api,render);
   }
   function summary(request) {
     const {t,esc}=ui(),r=request.regular;
@@ -143,5 +164,5 @@
   function printing(request) {
     return simple(request)&&(request.transfers||[]).some(transfer=>transfer.printJobId&&['queued','leased','printing'].includes(transfer.printStatus));
   }
-  window.RegularStockDelivery={simple,composing,composer,summary,progress,scm,refresh,invalidate,run,resume,printing,phaseText,configure};
+  window.RegularStockDelivery={simple,composing,composer,summary,progress,scm,refresh,selectLine,invalidate,run,resume,printing,phaseText,configure};
 })();

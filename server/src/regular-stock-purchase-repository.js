@@ -1,6 +1,7 @@
 import {query,withTransaction} from './db.js';
 import {allocatePurchaseQuantity} from './regular-stock-purchase-domain.js';
 import {describePurchaseOrderLinePallets} from './scm-netsuite-po-unit-conversion.js';
+import {refreshStockingReplyStatus} from './regular-stock-line-actions.js';
 
 const round=value=>Number(Number(value).toFixed(6));
 const idsFor=line=>(line.reason?.purchaseDemandIds||[]).map(Number);
@@ -119,6 +120,7 @@ export async function reconcilePurchaseStockAllocations() {
     await query(`UPDATE sales_stock_requests r SET status=CASE WHEN NOT EXISTS(SELECT 1 FROM sales_stock_request_lines l WHERE l.request_id=r.id
       AND l.status NOT IN ('received','rejected','cancelled','closed','fulfilled')) THEN 'completed' ELSE 'active' END
       WHERE r.id=ANY($1::bigint[])`,[requestIds]);
+    await refreshStockingReplyStatus(requestIds);
   });
 }
 

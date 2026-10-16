@@ -1,5 +1,6 @@
 :root {
   --smart-topbar-height: 62px;
+  --smart-topbar-min-height: 62px;
   --smart-tabs-height: 44px;
   --smart-navy: #17324d;
   --smart-blue: #1d5fa7;
@@ -19,6 +20,7 @@ body {
 }
 
 .smart-shell {
+  font-size: calc(16px * var(--smart-font-scale, 1));
   min-height: 100vh;
   min-width: 1040px;
   color: #142331;
@@ -28,7 +30,7 @@ body {
   position: sticky;
   top: 0;
   z-index: 40;
-  min-height: 62px;
+  min-height: var(--smart-topbar-min-height);
   grid-template-columns: minmax(350px, 1fr) auto minmax(350px, 1fr);
   box-shadow: 0 2px 9px rgb(24 51 72 / 8%);
 }
@@ -47,7 +49,7 @@ body {
   border-radius: 10px;
   color: white;
   background: linear-gradient(145deg, var(--smart-teal), var(--smart-blue));
-  font-size: 12px;
+  font-size: calc(12px * var(--smart-font-scale, 1));
   font-weight: 900;
 }
 
@@ -57,21 +59,42 @@ body {
 }
 
 .smart-brand h1 {
-  font-size: 19px;
+  font-size: calc(19px * var(--smart-font-scale, 1));
 }
 
 .smart-brand p {
   color: var(--smart-muted);
-  font-size: 10px;
+  font-size: calc(10px * var(--smart-font-scale, 1));
   font-weight: 900;
   letter-spacing: .08em;
   text-transform: uppercase;
 }
 
 .smart-main {
-  width: min(1540px, calc(100% - 30px));
+  width: calc(100% - 30px);
   margin: 0 auto;
   padding: 16px 0 42px;
+}
+
+.smart-font-controls {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  padding: 3px;
+  border: 1px solid var(--smart-border);
+  border-radius: 7px;
+  background: #f9fbfc;
+}
+
+.smart-font-controls output {
+  min-width: 4ch;
+  text-align: center;
+  font-size: calc(11px * var(--smart-font-scale, 1));
+  font-weight: 800;
+}
+
+.smart-font-controls button {
+  min-width: 38px;
 }
 
 .smart-notice {
@@ -81,7 +104,7 @@ body {
   border-radius: 8px;
   color: var(--smart-green);
   background: #edf9f5;
-  font-size: 12px;
+  font-size: calc(12px * var(--smart-font-scale, 1));
   font-weight: 800;
 }
 
@@ -126,7 +149,7 @@ body {
   border-radius: 999px;
   color: inherit;
   background: rgb(255 255 255 / 65%);
-  font-size: 18px;
+  font-size: calc(18px * var(--smart-font-scale, 1));
   line-height: 1;
 }
 
@@ -140,7 +163,7 @@ body {
   border-radius: 999px;
   color: var(--smart-blue);
   background: #edf5fc;
-  font-size: 11px;
+  font-size: calc(11px * var(--smart-font-scale, 1));
   font-weight: 900;
   text-transform: uppercase;
 }
@@ -175,7 +198,7 @@ body {
   border-radius: 0;
   color: var(--smart-muted);
   background: white;
-  font-size: 12px;
+  font-size: calc(12px * var(--smart-font-scale, 1));
 }
 
 .smart-sr-only {
@@ -202,10 +225,11 @@ body {
 @media (max-width: 1500px) {
   :root {
     --smart-topbar-height: 96px;
+    --smart-topbar-min-height: 96px;
   }
 
   .smart-shell .dispatch-topbar {
-    min-height: var(--smart-topbar-height);
+    min-height: var(--smart-topbar-min-height);
   }
 }
 
@@ -240,18 +264,18 @@ body {
 }
 
 .smart-section-head h2 {
-  font-size: 17px;
+  font-size: calc(17px * var(--smart-font-scale, 1));
 }
 
 .smart-section-head h3 {
-  font-size: 14px;
+  font-size: calc(14px * var(--smart-font-scale, 1));
 }
 
 .smart-section-head p,
 .smart-help {
   margin-top: 3px;
   color: var(--smart-muted);
-  font-size: 11px;
+  font-size: calc(11px * var(--smart-font-scale, 1));
   line-height: 1.45;
 }
 
@@ -297,7 +321,7 @@ body {
 
 .smart-item-csv-copy span {
   color: var(--smart-muted);
-  font-size: 11px;
+  font-size: calc(11px * var(--smart-font-scale, 1));
   line-height: 1.4;
 }
 
@@ -314,7 +338,7 @@ body {
 .smart-shell input,
 .smart-shell select,
 .smart-shell textarea {
-  font-size: 12px;
+  font-size: calc(12px * var(--smart-font-scale, 1));
 }
 
 .smart-shell textarea {
@@ -382,7 +406,7 @@ body {
 .smart-stat small {
   display: block;
   color: var(--smart-muted);
-  font-size: 10px;
+  font-size: calc(10px * var(--smart-font-scale, 1));
   font-weight: 900;
   letter-spacing: .06em;
   text-transform: uppercase;
@@ -392,12 +416,12 @@ body {
   display: block;
   margin: 8px 0 3px;
   color: var(--smart-navy);
-  font-size: 27px;
+  font-size: calc(27px * var(--smart-font-scale, 1));
 }
 
 .smart-stat span {
   color: var(--smart-muted);
-  font-size: 11px;
+  font-size: calc(11px * var(--smart-font-scale, 1));
 }
 
 .smart-grid-2 {
@@ -422,13 +446,13 @@ body {
 }
 
 .smart-card h3 {
-  font-size: 14px;
+  font-size: calc(14px * var(--smart-font-scale, 1));
 }
 
 .smart-card p {
   margin-top: 4px;
   color: var(--smart-muted);
-  font-size: 11px;
+  font-size: calc(11px * var(--smart-font-scale, 1));
   line-height: 1.45;
 }
 
@@ -461,7 +485,7 @@ body {
 .smart-table {
   width: 100%;
   border-collapse: collapse;
-  font-size: 11px;
+  font-size: calc(11px * var(--smart-font-scale, 1));
 }
 
 .smart-table th,
@@ -478,7 +502,7 @@ body {
   z-index: 1;
   color: #4c6170;
   background: #f4f7f9;
-  font-size: 10px;
+  font-size: calc(10px * var(--smart-font-scale, 1));
   letter-spacing: .04em;
   text-transform: uppercase;
   white-space: nowrap;
@@ -513,7 +537,7 @@ body {
   width: 100%;
   min-width: 1600px;
   table-layout: fixed;
-  font-size: 10px;
+  font-size: calc(10px * var(--smart-font-scale, 1));
 }
 
 .smart-item-table th,
@@ -589,7 +613,7 @@ body {
   min-width: 0;
   min-height: 27px;
   padding: 2px 4px;
-  font-size: 10px;
+  font-size: calc(10px * var(--smart-font-scale, 1));
 }
 
 .smart-item-table [data-item-field="planningEnabled"] {
@@ -601,7 +625,7 @@ body {
 .smart-item-table td:last-child .smart-button {
   min-height: 28px;
   padding: 0 7px;
-  font-size: 10px;
+  font-size: calc(10px * var(--smart-font-scale, 1));
 }
 
 .smart-item-name strong,
@@ -615,7 +639,7 @@ body {
 .smart-yard-cell span {
   margin-top: 3px;
   color: var(--smart-muted);
-  font-size: 9px;
+  font-size: calc(9px * var(--smart-font-scale, 1));
   line-height: 1.25;
 }
 
@@ -629,7 +653,7 @@ body {
 
 .smart-return-policy-cell small {
   color: var(--smart-muted);
-  font-size: 8px;
+  font-size: calc(8px * var(--smart-font-scale, 1));
   font-weight: 700;
   line-height: 1.25;
 }
@@ -641,7 +665,7 @@ body {
   background: #e8eef2;
   padding: 3px 6px;
   color: #435866;
-  font-size: 8px;
+  font-size: calc(8px * var(--smart-font-scale, 1));
   font-weight: 900;
   line-height: 1.15;
 }
@@ -667,7 +691,7 @@ body {
   background: transparent;
   padding: 0 !important;
   color: var(--smart-blue);
-  font-size: 9px !important;
+  font-size: calc(9px * var(--smart-font-scale, 1)) !important;
   text-align: left;
   text-decoration: underline;
 }
@@ -678,7 +702,7 @@ body {
   gap: 3px;
   margin-top: 4px;
   color: #344b5c;
-  font-size: 9px;
+  font-size: calc(9px * var(--smart-font-scale, 1));
   font-weight: 800;
 }
 
@@ -699,7 +723,7 @@ body {
   display: block;
   margin-top: 3px;
   color: var(--smart-muted);
-  font-size: 8px;
+  font-size: calc(8px * var(--smart-font-scale, 1));
   font-weight: 700;
   line-height: 1.25;
 }
@@ -713,7 +737,7 @@ body {
   border-radius: 999px;
   color: #506571;
   background: #f5f8fa;
-  font-size: 10px;
+  font-size: calc(10px * var(--smart-font-scale, 1));
   font-weight: 900;
   white-space: nowrap;
 }
@@ -780,17 +804,17 @@ body {
 .smart-proposal-route span {
   margin-top: 2px;
   color: var(--smart-muted);
-  font-size: 10px;
+  font-size: calc(10px * var(--smart-font-scale, 1));
 }
 
 .smart-proposal-metric {
   text-align: right;
-  font-size: 11px;
+  font-size: calc(11px * var(--smart-font-scale, 1));
 }
 
 .smart-proposal-metric strong {
   display: block;
-  font-size: 13px;
+  font-size: calc(13px * var(--smart-font-scale, 1));
 }
 
 .smart-proposal-lines {
@@ -809,7 +833,7 @@ body {
   border-radius: 4px;
   color: #536874;
   background: #eef3f6;
-  font-size: 9px;
+  font-size: calc(9px * var(--smart-font-scale, 1));
 }
 
 .smart-stock-policy {
@@ -817,7 +841,7 @@ body {
   gap: 3px;
   min-width: 145px;
   color: var(--smart-muted);
-  font-size: 10px;
+  font-size: calc(10px * var(--smart-font-scale, 1));
 }
 
 .smart-stock-policy strong {
@@ -832,7 +856,7 @@ body {
   padding: 34px 18px;
   color: var(--smart-muted);
   text-align: center;
-  font-size: 12px;
+  font-size: calc(12px * var(--smart-font-scale, 1));
 }
 
 .smart-form-grid {
@@ -849,13 +873,13 @@ body {
 
 .smart-field > span {
   color: #445c69;
-  font-size: 11px;
+  font-size: calc(11px * var(--smart-font-scale, 1));
   font-weight: 900;
 }
 
 .smart-field small {
   color: var(--smart-muted);
-  font-size: 10px;
+  font-size: calc(10px * var(--smart-font-scale, 1));
   line-height: 1.35;
 }
 
@@ -864,7 +888,7 @@ body {
   align-items: center;
   gap: 8px;
   min-height: 36px;
-  font-size: 12px;
+  font-size: calc(12px * var(--smart-font-scale, 1));
   font-weight: 800;
 }
 
@@ -899,12 +923,12 @@ body {
 }
 
 .printer-yard strong {
-  font-size: 20px;
+  font-size: calc(20px * var(--smart-font-scale, 1));
 }
 
 .printer-yard span {
   margin-top: 4px;
-  font-size: 9px;
+  font-size: calc(9px * var(--smart-font-scale, 1));
   font-weight: 900;
   opacity: .8;
   text-transform: uppercase;
@@ -935,7 +959,7 @@ body {
 .printer-destination legend {
   padding: 0 5px;
   color: var(--smart-navy);
-  font-size: 11px;
+  font-size: calc(11px * var(--smart-font-scale, 1));
   font-weight: 950;
   text-transform: uppercase;
 }
@@ -948,7 +972,7 @@ body {
 
 .printer-route-options .smart-check {
   min-height: 28px;
-  font-size: 10px;
+  font-size: calc(10px * var(--smart-font-scale, 1));
 }
 
 .printer-route-summary {
@@ -960,7 +984,7 @@ body {
 .printer-route-summary span {
   padding: 5px 8px;
   border-radius: 999px;
-  font-size: 10px;
+  font-size: calc(10px * var(--smart-font-scale, 1));
   font-weight: 950;
 }
 
@@ -979,7 +1003,7 @@ body {
   align-items: center;
   gap: 7px;
   color: var(--smart-muted);
-  font-size: 10px;
+  font-size: calc(10px * var(--smart-font-scale, 1));
   font-weight: 800;
 }
 
@@ -993,7 +1017,7 @@ body {
   justify-content: space-between;
   gap: 8px;
   color: var(--smart-muted);
-  font-size: 10px;
+  font-size: calc(10px * var(--smart-font-scale, 1));
 }
 
 .printer-token-panel {
@@ -1012,7 +1036,7 @@ body {
 .printer-token-panel p {
   margin-top: 4px;
   color: #74511e;
-  font-size: 11px;
+  font-size: calc(11px * var(--smart-font-scale, 1));
 }
 
 .printer-secret {
@@ -1028,7 +1052,7 @@ body {
   border: 1px solid #ddc28f;
   border-radius: 6px;
   background: white;
-  font-size: 11px;
+  font-size: calc(11px * var(--smart-font-scale, 1));
   white-space: nowrap;
 }
 

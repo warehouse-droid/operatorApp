@@ -206,7 +206,7 @@ function salesPrintOrderRows() {
         </td>
       </tr>
     `;
-  }).join("") || `<tr><td colspan="8">No Delivery Sales Orders match this search and ordering-location scope.</td></tr>`;
+  }).join("") || `<tr><td colspan="8">No delivery or pickup Sales Orders match this search and ordering-location scope.</td></tr>`;
 }
 
 function salesPrintJobCards() {
@@ -293,12 +293,12 @@ function renderSalesPrinting() {
       ${salesPrintNotice ? `<div class="route-notice"><span>${salesPrintEscape(salesPrintNotice)}</span></div>` : ""}
       <div class="sales-print-columns">
         <section class="panel sales-print-orders-panel">
-          <div class="sales-section-head"><div><h2>Delivery Sales Orders</h2><p>Unprinted orders are shown by default. Search also finds orders that were printed before.</p></div></div>
+          <div class="sales-section-head"><div><h2>Delivery &amp; Pickup Sales Orders</h2><p>Unprinted orders are shown by default. Search also finds orders that were printed before.</p></div></div>
           <div class="sales-print-toolbar">
-            <input data-sales-search type="search" value="${salesPrintEscape(salesPrintSearch)}" placeholder="Search delivery SO, customer, item, or SKU" autocomplete="off" />
+            <input data-sales-search type="search" value="${salesPrintEscape(salesPrintSearch)}" placeholder="Search delivery or pickup SO, customer, item, or SKU" autocomplete="off" />
             <select data-sales-ordering-yard><option value="">All assigned ordering locations</option>${[...new Map(salesPrintOrders.map((order) => [String(order.orderingLocationId), order.orderingYardCode])).entries()].map(([locationId, yardCode]) => `<option value="${salesPrintEscape(locationId)}" ${salesPrintOrderingYard === locationId ? "selected" : ""}>${salesPrintEscape(yardCode)}</option>`).join("")}</select>
             <button data-action="refresh" type="button" ${salesPrintBusy ? "disabled" : ""}>Refresh</button>
-            <div class="sales-table-settings" role="group" aria-label="Delivery Sales Order table settings">
+            <div class="sales-table-settings" role="group" aria-label="Sales Order table settings">
               <label>Font <input data-sales-table-setting="fontSize" type="range" min="10" max="18" step="1" value="${salesPrintTablePreferences.fontSize}" /><output data-sales-table-output="fontSize">${salesPrintTablePreferences.fontSize}px</output></label>
               <button data-action="reset-table-layout" type="button" title="Reset font size and all column widths">Reset columns</button>
             </div>

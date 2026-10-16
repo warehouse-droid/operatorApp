@@ -76,6 +76,14 @@ dispatchSpecialStockApp.addEventListener("change", (event) => {
 });
 
 dispatchSpecialStockApp.addEventListener("click", async (event) => {
+  const apply = event.target.closest('[data-special-apply-stages]');
+  if (apply) {
+    if (dispatchSpecialState.busy || apply.disabled) return;
+    apply.closest('details')?.removeAttribute('open');
+    try { await loadDispatchSpecial(null); }
+    catch (error) { dispatchSpecialState.error = error.message; renderDispatchSpecial(); }
+    return;
+  }
   if (event.target.closest('[data-special-clear-stages]')) { dispatchSpecialState.stages = []; await loadDispatchSpecial(null); return; }
   const button = event.target.closest("[data-dispatch-special-action]");
   if (!button || dispatchSpecialState.busy) return;
@@ -97,7 +105,7 @@ requireDispatchLogin({
   mount: dispatchSpecialStockApp,
   roles: ["admin", "dispatcher"],
   async onReady(operator) {
-    specialStageFilter = (await import("/special-stock-workflow.js")).stageFilterHtml;
+    specialStageFilter = (await import("/special-stock-workflow.js?filterApply=20261010-v1")).stageFilterHtml;
     dispatchSpecialState.operator = operator;
     try {
       const policy = await dispatchSpecialApi("/api/dispatch/special-stock-handoffs/policy");

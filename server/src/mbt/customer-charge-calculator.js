@@ -443,13 +443,10 @@ function standaloneAggregateDeliveryLine(input) {
   };
 }
 
-/** @param {string} kind @param {Array<Record<string, any>>} aggregateLines @param {unknown} orderFrom150 */
-function assertRequestComposition(kind, aggregateLines, orderFrom150) {
+/** @param {string} kind @param {Array<Record<string, any>>} aggregateLines */
+function assertRequestComposition(kind, aggregateLines) {
   if (kind === "aggregate_order" && aggregateLines.length === 0) {
     invalid(400, "MBT_CHARGE_AGGREGATE_REQUIRED", "An Aggregate Order requires at least one material.");
-  }
-  if (aggregateLines.length > 0 && orderFrom150 !== true) {
-    invalid(400, "MBT_CHARGE_AGGREGATE_ORIGIN_REQUIRED", "Aggregate requests require Order from 150 pricing.");
   }
 }
 
@@ -528,7 +525,7 @@ export function calculateCustomerCharge(value) {
   const currentContractTotalMinor = nonnegativeInteger(input.currentContractTotalMinor ?? 0, "Current contract total");
   const bin = normalizedBin(input, kind);
   const aggregateLines = aggregateEvidence(input.aggregateLines);
-  assertRequestComposition(kind, aggregateLines, input.orderFrom150);
+  assertRequestComposition(kind, aggregateLines);
   const rawLines = rawChargeLines(bin, kind, aggregateLines, input);
   const lines = rawLines.map((line) => pricedLine(line, paymentCategory, taxRateBasisPoints, currency));
   const preTaxRevenueMinor = sumLineField(lines, "preTaxAmountMinor", "Pre-tax request total");

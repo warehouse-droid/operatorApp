@@ -63,7 +63,12 @@
       for (const role of roles) {
         const style = value.styles[area][role];
         const target = `${prefix} :is(${selectors[role]})`;
-        if (style.fontSizePx !== null) css.push(`${target}{font-size:${style.fontSizePx}px!important;}`);
+        if (style.fontSizePx !== null) {
+          css.push(`${target}{font-size:${style.fontSizePx}px!important;}`);
+          // Quantity preferences may be smaller for labels, but editable
+          // values stay readable on both phones and tablets.
+          if (role === "quantities") css.push(`${prefix} .stepper input{font-size:${Math.max(25, style.fontSizePx)}px!important;}`);
+        }
         if (style.color !== null) css.push(`${target}:not(:where(.sync-alert *,.line-alert *,.status-pill *,.status-pill,.confirmed-measure *,.danger-button *,.danger-button)){color:${style.color}!important;}`);
       }
       const measureSize = Math.max(effective(value, area, "labels").fontSizePx, effective(value, area, "quantities").fontSizePx);

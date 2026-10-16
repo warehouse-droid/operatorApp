@@ -80,6 +80,18 @@ for (const definition of OPERATOR_NETSUITE_RETURN_GATE_DEFINITIONS) {
   GATES_BY_IDENTITY.set(`${definition.operatorFunction}:${definition.locationId}`, definition);
 }
 
+export const OPERATOR_NETSUITE_RETURN_CREDIT_MEMO_GATE_DEFINITIONS = Object.freeze(
+  OPERATOR_NETSUITE_RETURN_GATE_DEFINITIONS.map(definition => Object.freeze({
+    ...definition,
+    flagKey: definition.flagKey.replace("_return_ra_", "_return_cm_"),
+    label: `${definition.yardCode} ${definition.operatorFunction.replaceAll("_", " ")} Credit Memo`,
+    description: `Create a Credit Memo directly on Operator ${definition.operatorFunction.replaceAll("_", " ")} confirmation at ${definition.yardCode}. Takes priority over the RA gate for new returns. Enable both CM gates for combined stock and pallet returns.`,
+    transactionType: "CM"
+  }))
+);
+const CREDIT_MEMO_GATES_BY_IDENTITY = new Map(OPERATOR_NETSUITE_RETURN_CREDIT_MEMO_GATE_DEFINITIONS
+  .map(definition => [`${definition.operatorFunction}:${definition.locationId}`, definition]));
+
 /** @param {unknown} value */
 export function normalizeOperatorNetSuiteLocationId(value) {
   if (typeof value !== "string" && typeof value !== "number") {return null;}
@@ -134,21 +146,28 @@ function unsupportedPolicy(functionKey, locationId, directAccessEnabled) {
  * @param {unknown} [input.functionKey]
  * @param {unknown} [input.locationId]
  * @param {{enabled?: unknown, revision?: unknown} | null | undefined} [input.flag]
+ * @param {{enabled?: unknown, revision?: unknown} | null | undefined} [input.creditMemoFlag]
  * @param {unknown} [input.directAccessEnabled]
  */
 export function materializeOperatorNetSuitePostingPolicy({
   functionKey,
   locationId,
   flag,
+  creditMemoFlag,
   directAccessEnabled
 } = {}) {
   const canonicalLocationId = normalizeOperatorNetSuiteLocationId(locationId);
   const normalizedFunction = String(functionKey || "").trim().toLowerCase();
-  const definition = canonicalLocationId
+  let definition = canonicalLocationId
     ? GATES_BY_IDENTITY.get(`${normalizedFunction}:${canonicalLocationId}`)
     : null;
   if (!definition) {
     return unsupportedPolicy(normalizedFunction, canonicalLocationId, directAccessEnabled);
+  }
+  const creditMemoDefinition = CREDIT_MEMO_GATES_BY_IDENTITY.get(`${normalizedFunction}:${canonicalLocationId}`);
+  if (creditMemoDefinition && creditMemoFlag?.enabled === true) {
+    definition = creditMemoDefinition;
+    flag = creditMemoFlag;
   }
   const { present, revision, configured, environmentAllowed } = materializedFlagState(flag, directAccessEnabled);
   return {

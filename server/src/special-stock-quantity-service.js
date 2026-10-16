@@ -1,3 +1,5 @@
+import { specialItemDescription } from '../public/special-stock-line-details.js';
+import { SPECIAL_LINE_PACK_FIELDS } from '../public/special-stock-line-fields.js';
 import {
   withSpecialQuantityReviewLock, claimSpecialQuantityReview, rejectSpecialQuantityReview,
   saveSpecialQuantityReviewPlan, finishSpecialQuantityReview, failSpecialQuantityReview
@@ -7,6 +9,7 @@ import {
   prepareSpecialAdjustmentPlanInNetSuite, applySpecialAdjustmentPlanInNetSuite
 } from './netsuite.js';
 import { refreshSpecialVendorDiscountReview } from '../public/special-stock-purchase-pricing.js';
+import { specialAdjustmentIsLocal } from './special-stock-local-adjustments.js';
 
 function error(message, code) { return Object.assign(new Error(message), { status: 409, code }); }
 
@@ -28,7 +31,15 @@ export function createSpecialQuantityService(dependencies = {}) {
         const line = (sales ? detail.salesOrderLines : detail.purchaseOrderLines)
           .find(line => !line.ancillary && line.caseLineId === change.caseLineId);
         if (!line?.remoteLineId) throw error('Wait for the exact issued order lines to synchronize before confirming quantities.', 'SPECIAL_QUANTITY_LINES_INVALID');
-        return { ...line, rate: sales ? line.rate : line.unitPurchaseCost ?? line.rate ?? 0,
+        const material = detail.lines?.find(/** @param {Record<string,any>} value */ value => value.id === change.caseLineId);
+        const fields = change.toFields || {}, packFields = SPECIAL_LINE_PACK_FIELDS.filter(field => Object.hasOwn(fields, field));
+        const corrected = {
+          ...(['productName', 'color', 'size', 'detailSpec'].some(field => Object.hasOwn(fields, field))
+            ? { toDescription: specialItemDescription({ ...material, ...fields }) } : {}),
+          ...(packFields.length ? { fromPack: Object.fromEntries(packFields.map(field => [field, change.fromFields[field] ?? 0])),
+            toPack: Object.fromEntries(packFields.map(field => [field, fields[field]])) } : {})
+        };
+        return { ...line, ...corrected, rate: sales ? line.rate : line.unitPurchaseCost ?? line.rate ?? 0,
           quantity: sales ? change.fromQuantity : change.fromPurchaseQuantity,
           ...(sales ? {toRate:change.toRate,toNativeDiscountPercent:change.toNativeDiscountPercent} : {}),
           toQuantity: sales ? change.toQuantity : change.toPurchaseQuantity };
@@ -64,7 +75,7 @@ export function createSpecialQuantityService(dependencies = {}) {
         if (remote && (claimed.salesOrderSkipped || claimed.purchaseOrderSkipped)) throw error('A mixed real/test order pair cannot update live orders.', 'SPECIAL_TEST_ORDER_REMOTE_BLOCKED');
         let verifiedOrderIds = [];
         let verifiedOrders = [];
-        if (remote) {
+        if (remote && !specialAdjustmentIsLocal(claimed.quantityReview)) {
           const orders = claimed.quantityReviewPlan ? null : await orderTargets(claimed);
           const prepare=claimed.quantityReview.adjustmentVersion===2 || orders?.some(order=>order.vendorDiscountTotal) ? deps.prepareAdjustmentPlan : deps.preparePlan;
           const plan = claimed.quantityReviewPlan || await prepare({ orders });

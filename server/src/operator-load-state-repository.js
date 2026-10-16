@@ -1,5 +1,6 @@
 // @ts-check
 import { query } from './db.js';
+import { retainedOperatorReopenEvidence } from './operator-order-progress-repository.js';
 import { deliveryLoadConfirmation, postingOrderKeys } from './operator-load-state.js';
 
 /** Only minimal order-scoped state is public; actor, photos and snapshots stay private.
@@ -21,7 +22,7 @@ export async function attachOperatorLoadState(order) {
     const id = row.id || row.observed?.id, ref = row.ref || row.observed?.tranId;
     return id ? [{ id: Number(id), ref: String(ref || id), verified: row.verified === true }] : [];
   });
-  return { ...order, confirmationSummary: deliveryLoadConfirmation(order), posting: command ? {
+  return { ...order, operatorReopen: await retainedOperatorReopenEvidence(order), confirmationSummary: deliveryLoadConfirmation(order), posting: command ? {
     jobId: command.id, status: command.status, loadBlocked: true, transactions,
     reason: command.status === 'attention' ? 'NetSuite verification needs review. This load is held until reconciliation finishes.'
       : 'This load is already being processed. Check its status before continuing.'

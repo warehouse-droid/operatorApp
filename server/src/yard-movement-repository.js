@@ -621,6 +621,28 @@ function movementFilterParams({
       OR movement.order_id::text ILIKE $${params.length}
       OR COALESCE(movement.source_location, '') ILIKE $${params.length}
       OR COALESCE(movement.destination_location, '') ILIKE $${params.length}
+      OR (movement.order_type = 'purchase_order' AND movement.order_id IN (
+        SELECT po.netsuite_id
+          FROM purchase_orders po
+          LEFT JOIN dispatch_scm_po_splits split ON split.split_po_id = po.netsuite_id
+          LEFT JOIN purchase_orders parent ON parent.netsuite_id = split.source_po_id
+         WHERE COALESCE(po.tranid, '') ILIKE $${params.length}
+            OR COALESCE(po.dispatch_ref, '') ILIKE $${params.length}
+            OR COALESCE(split.source_po_ref, '') ILIKE $${params.length}
+            OR split.source_po_id::text ILIKE $${params.length}
+            OR COALESCE(parent.tranid, '') ILIKE $${params.length}
+            OR COALESCE(parent.dispatch_ref, '') ILIKE $${params.length}
+            OR EXISTS (
+              SELECT 1 FROM dispatch_global_order_splits registered
+               WHERE registered.order_type = 'PO'
+                 AND registered.definition_kind = 'split'
+                 AND LOWER(BTRIM(registered.split_ref)) IN (
+                   LOWER(BTRIM(COALESCE(po.tranid, ''))),
+                   LOWER(BTRIM(COALESCE(po.dispatch_ref, '')))
+                 )
+                 AND registered.parent_order_ref ILIKE $${params.length}
+            )
+      ))
     )`);
   }
   const itemTerm = String(itemSearch || "").trim();

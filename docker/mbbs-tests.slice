@@ -1,0 +1,10 @@
+[Unit]
+Description=Shared resource budget for disposable MBBS test workloads
+
+[Slice]
+MemoryAccounting=yes
+MemoryHigh=3G
+MemoryMax=4G
+MemorySwapMax=0
+CPUQuota=200%
+TasksMax=2048

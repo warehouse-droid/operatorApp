@@ -11,7 +11,7 @@ function blocked(message) {
 export async function assertReturnDraftMutable(draftId) {
   if (!draftId || !/^[0-9a-f-]{36}$/i.test(String(draftId))) { return; }
   const result = await query("SELECT batch_id FROM return_batch_authorizations WHERE draft_id=$1::uuid", [draftId]);
-  if (result.rowCount) { throw blocked("This draft has a NetSuite posting or unconfirmed RA. Retry it before changing or discarding it."); }
+  if (result.rowCount) { throw blocked("This draft has a NetSuite posting or unconfirmed return transaction. Retry it before changing or discarding it."); }
 }
 
 /** @param {number} batchId @param {string} draftId */
@@ -49,7 +49,7 @@ export async function finalizeStagedReturnBatch(batch) {
   const current = await query("SELECT * FROM return_batch_authorizations WHERE batch_id=$1", [batch.batch_id]);
   const saved = current.rows[0];
   if (!saved?.draft_id) { return; }
-  if (!["succeeded", "manual_linked"].includes(saved.sync_status)) { throw blocked("NetSuite must verify this RA before the return can be recorded."); }
+  if (!["succeeded", "manual_linked"].includes(saved.sync_status)) { throw blocked("NetSuite must verify this return transaction before the return can be recorded."); }
   await assertStagedReturnBatch(saved);
   for (const [table, key] of [["return_records", "records"], ["return_record_lines", "lines"], ["return_photos", "photos"]]) {
     await query(`INSERT INTO ${table} SELECT * FROM jsonb_populate_recordset(NULL::${table},$1::jsonb)`,
@@ -57,12 +57,13 @@ export async function finalizeStagedReturnBatch(batch) {
   }
   await query(`UPDATE return_records r SET netsuite_sync_status=a.sync_status,netsuite_sync_error=a.sync_error,
     netsuite_transaction_ref=a.netsuite_transaction_ref,netsuite_transaction_status=a.netsuite_transaction_status,
-    netsuite_stage='return_authorization',netsuite_snapshot=a.netsuite_snapshot,
+    netsuite_stage=COALESCE(a.intent_snapshot->>'transactionType','return_authorization'),netsuite_snapshot=a.netsuite_snapshot,
     netsuite_sync_attempts=a.sync_attempts,netsuite_last_synced_at=a.last_synced_at,updated_at=now()
     FROM return_batch_authorizations a WHERE a.batch_id=$1 AND r.batch_id=a.batch_id`, [batch.batch_id]);
   await query(`INSERT INTO return_sync_events(return_record_id,event_type,status,response_snapshot)
-    SELECT id,'batch_return_authorization','succeeded',jsonb_build_object('reference',$2::text)
-    FROM return_records WHERE batch_id=$1`, [batch.batch_id, saved.netsuite_transaction_ref]);
+    SELECT id,$3,'succeeded',jsonb_build_object('reference',$2::text)
+    FROM return_records WHERE batch_id=$1`, [batch.batch_id, saved.netsuite_transaction_ref,
+    `batch_${saved.intent_snapshot.transactionType || "return_authorization"}`]);
   await query("UPDATE return_batch_authorizations SET draft_id=NULL,staged_records=NULL WHERE batch_id=$1", [batch.batch_id]);
   await query("DELETE FROM return_drafts WHERE id=$1::uuid", [saved.draft_id]);
 }

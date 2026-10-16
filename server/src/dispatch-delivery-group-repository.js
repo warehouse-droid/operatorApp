@@ -1,6 +1,8 @@
 import { query, withTransaction } from "./db.js";
 import { assertDispatchAddressPatch, preserveDispatchOrderAddress } from "./dispatch-address-guard.js";
 import { DISPATCH_FLEET_PLANNING_LOCK } from "./dispatch-fleet-status.js";
+import { assertSalesOrderSplitUnallocated } from "./dispatch-sales-split-allocation.js";
+import { writeDispatchAudit } from "./dispatch-audit-repository.js";
 import { dispatchLoadAssignment } from "./dispatch-load-assignment.js";
 import {
   compactDispatchOrderCard,
@@ -569,7 +571,21 @@ function projectGlobalSplits(plan = {}) {
   return splits;
 }
 
-async function syncDispatchGlobalOrderSplitsFromPlan(plan = {}) {
+/** @param {Array<Record<string, unknown>>} items */
+function splitAllocationQuantitySignature(items = []) {
+  return JSON.stringify(items.map(item => [String(item.lineId ?? item.lineRowId ?? item.id ?? item.sku),
+    ...["quantity", "pallets", "layers", "sections", "pieces"].map(key => Number(Number(item[key] || 0).toFixed(6)))])
+    .sort((a, b) => String(a[0]).localeCompare(String(b[0]))));
+}
+
+export async function syncDispatchGlobalOrderSplitsFromPlan(plan = {}) {
+  return withTransaction(async () => {
+    await query("SELECT pg_advisory_xact_lock(hashtext($1))", [DISPATCH_FLEET_PLANNING_LOCK]);
+    return syncDispatchGlobalOrderSplitsFromPlanInTransaction(plan);
+  });
+}
+
+async function syncDispatchGlobalOrderSplitsFromPlanInTransaction(plan = {}) {
   const planId = Number(plan.id);
   const sourcePlanDate = dateOnly(plan.planDate || plan.plan_date);
   if (!Number.isInteger(planId) || !sourcePlanDate) return { splits: 0, deactivated: 0 };
@@ -585,7 +601,7 @@ async function syncDispatchGlobalOrderSplitsFromPlan(plan = {}) {
   }
   const existingSources = projected.length
     ? await query(
-        `SELECT lower(split_ref) AS split_key, source_plan_id,
+        `SELECT lower(split_ref) AS split_key, source_plan_id, active, parent_order_ref, full_order,
                 source_plan_date::text AS source_plan_date
            FROM dispatch_global_order_splits
           WHERE lower(split_ref) = ANY($1::text[])`,
@@ -595,6 +611,9 @@ async function syncDispatchGlobalOrderSplitsFromPlan(plan = {}) {
   const sourceBySplit = new Map(existingSources.rows.map((row) => [
     text(row.split_key),
     {
+      active: row.active,
+      parentOrderRef: row.parent_order_ref,
+      items: row.full_order?.items || [],
       planId: row.source_plan_id === null ? null : Number(row.source_plan_id),
       planDate: dateOnly(row.source_plan_date)
     }
@@ -619,6 +638,15 @@ async function syncDispatchGlobalOrderSplitsFromPlan(plan = {}) {
       searchText: dispatchOrderSearchText(snapshot)
     }];
   });
+  const changedSalesSplits = splits.filter(split => {
+    if (split.orderType !== "SO" || split.definitionKind !== "split") return false;
+    const previous = sourceBySplit.get(split.splitRef.toLowerCase());
+    return !previous?.active || previous.parentOrderRef !== split.parentOrderRef
+      || splitAllocationQuantitySignature(previous.items) !== splitAllocationQuantitySignature(split.snapshot.items);
+  });
+  await assertSalesOrderSplitUnallocated(changedSalesSplits.flatMap(split => [
+    split.splitRef, text(split.snapshot.resplitSourceOrderId) || split.parentOrderRef
+  ]));
   const splitRefs = splits.map((split) => split.splitRef);
   const deactivated = { rowCount: 0, rows: [] };
   if (splits.length) {
@@ -1470,6 +1498,35 @@ export async function deactivateDispatchGlobalOrderDefinitions(orderRefs = []) {
         RETURNING split_ref`,
       [refs]
     );
+    const retiredPoLinks = await query(
+      `UPDATE dispatch_so_po_allocations allocation
+          SET status = 'cancelled',
+              cancelled_by = 'dispatch-target-retired',
+              cancelled_at = now(),
+              updated_at = now()
+        WHERE allocation.status = 'active'
+          AND lower(allocation.dispatch_target_ref) = ANY($1::text[])
+          AND (
+            EXISTS (SELECT 1 FROM dispatch_global_order_groups retired
+              WHERE lower(retired.group_ref) = lower(allocation.dispatch_target_ref) AND retired.active = false)
+            OR EXISTS (SELECT 1 FROM dispatch_global_order_splits retired
+              WHERE lower(retired.split_ref) = lower(allocation.dispatch_target_ref) AND retired.active = false)
+          )
+        RETURNING allocation.id, allocation.dispatch_target_ref, allocation.po_order_ref`,
+      [refs]
+    );
+    const linksByTarget = new Map();
+    for (const link of retiredPoLinks.rows) {
+      if (!linksByTarget.has(link.dispatch_target_ref)) linksByTarget.set(link.dispatch_target_ref, []);
+      linksByTarget.get(link.dispatch_target_ref).push(link);
+    }
+    for (const [targetRef, links] of linksByTarget) {
+      await writeDispatchAudit({ action: "dispatch.po_links.target_retired", entityType: "dispatch_order",
+        entityId: targetRef, orderId: targetRef, details: {
+          allocationIds: links.map((link) => link.id),
+          purchaseOrders: [...new Set(links.map((link) => link.po_order_ref))]
+        } });
+    }
     const catalog = await query(
       `DELETE FROM dispatch_order_catalog_entries catalog
         WHERE lower(catalog.order_ref) = ANY($1::text[])
@@ -1501,7 +1558,7 @@ export async function deactivateDispatchGlobalOrderDefinitions(orderRefs = []) {
         RETURNING relation.plan_id`,
       [refs]
     );
-    if (groups.rowCount || splits.rowCount || catalog.rowCount || assignments.rowCount || relations.rowCount) {
+    if (groups.rowCount || splits.rowCount || catalog.rowCount || assignments.rowCount || relations.rowCount || retiredPoLinks.rowCount) {
       await query(
         `UPDATE dispatch_order_catalog_state
             SET generation = generation + 1,
@@ -1686,7 +1743,10 @@ async function syncDispatchDeliveryGroupsFromPlanInTransaction(plan = {}, {
 }
 
 export async function syncDispatchDeliveryGroupsFromPlan(plan = {}, options = {}) {
-  return withTransaction(() => syncDispatchDeliveryGroupsFromPlanInTransaction(plan, options));
+  return withTransaction(async () => {
+    await query("SELECT pg_advisory_xact_lock(hashtext($1))", [DISPATCH_FLEET_PLANNING_LOCK]);
+    return syncDispatchDeliveryGroupsFromPlanInTransaction(plan, options);
+  });
 }
 
 function mapGroup(row) {

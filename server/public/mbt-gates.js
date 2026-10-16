@@ -16,6 +16,7 @@ const refreshButton = document.getElementById("refreshGates");
 
 let inventory = null;
 let attentionCommands = [];
+let transferPostingJobs = [];
 let attentionLoadError = "";
 let fulfillmentCandidates = [];
 let fulfillmentLoadError = "";
@@ -199,7 +200,9 @@ function renderOperatorNetSuiteGateMatrix() {
     { key: "receiving", label: "Receiving", type: "IR" },
     { key: "delivery_prep", label: "Delivery Prep", type: "IF" },
     { key: "stock_return", label: "Stock Return", type: "RA" },
-    { key: "pallet_return", label: "Pallet Return", type: "RA" }
+    { key: "pallet_return", label: "Pallet Return", type: "RA" },
+    { key: "stock_return", label: "Stock Return", type: "CM" },
+    { key: "pallet_return", label: "Pallet Return", type: "CM" }
   ];
   const yards = [...new Set(gates.map((gate) => String(gate.yardCode || "")))];
   const table = document.createElement("table");
@@ -226,13 +229,16 @@ function renderOperatorNetSuiteGateMatrix() {
     row.append(label);
     for (const definition of functions) {
       row.append(operatorGateCell(gates.find((gate) => (
-        gate.yardCode === yardCode && gate.operatorFunction === definition.key
+        gate.yardCode === yardCode && gate.operatorFunction === definition.key && gate.transactionType === definition.type
       ))));
     }
     body.append(row);
   }
   table.append(head, body);
-  operatorNetSuiteGateMatrix.append(ceiling, table);
+  const returnHelp = document.createElement("p");
+  returnHelp.className = "muted";
+  returnHelp.textContent = "CM creates a Credit Memo directly and takes priority over RA for new returns. Enable both Stock Return → CM and Pallet Return → CM at a yard for combined returns. Existing submissions retain their original transaction type.";
+  operatorNetSuiteGateMatrix.append(ceiling, returnHelp, table);
 }
 
 function renderSalesOrderFulfillmentGateMatrix() {
@@ -287,12 +293,13 @@ function fulfillmentActionSelect(candidate) {
 }
 
 function fulfillmentCandidateCard(candidate) {
+  const waiting = candidate.status === 'waiting_evidence';
   const article = document.createElement("article");
   article.className = "mbt-attention-card mbt-fulfillment-candidate";
   article.dataset.candidateStatus = candidate.status;
   const copy = document.createElement("div");
   const title = document.createElement("h3");
-  title.textContent = `${candidate.dispatchOrderRef} · ${candidate.status}`;
+  title.textContent = `${candidate.dispatchOrderRef} · ${waiting ? 'Waiting for load evidence' : candidate.status}`;
   const identity = document.createElement("code");
   identity.textContent = `${candidate.externalId} · source ${candidate.sourceSalesOrderRef || "unresolved"}`;
   const completion = document.createElement("p");
@@ -305,7 +312,7 @@ function fulfillmentCandidateCard(candidate) {
   }
   if (candidate.lastError) {
     const error = document.createElement("p");
-    error.className = "danger";
+    error.className = waiting ? '' : 'danger';
     error.textContent = candidate.lastError;
     copy.append(error);
   }
@@ -327,6 +334,13 @@ function fulfillmentCandidateCard(candidate) {
     lines.append(row);
   }
   copy.append(lines);
+  if (waiting) {
+    const explanation = document.createElement('p');
+    explanation.textContent = 'Posting resumes automatically when the required load and completion evidence is available.';
+    copy.append(explanation);
+    article.append(copy);
+    return article;
+  }
   const actions = document.createElement("div");
   actions.className = "mbt-fulfillment-card-actions";
   actions.append(fulfillmentActionSelect(candidate));
@@ -357,7 +371,18 @@ function renderSalesOrderFulfillmentCandidates() {
     salesOrderFulfillmentAttention.append(empty);
     return;
   }
-  salesOrderFulfillmentAttention.replaceChildren(...fulfillmentCandidates.map(fulfillmentCandidateCard));
+  const waiting = fulfillmentCandidates.filter(candidate => candidate.status === 'waiting_evidence');
+  const review = fulfillmentCandidates.filter(candidate => candidate.status !== 'waiting_evidence');
+  const count = document.createElement('p');
+  count.textContent = `${review.length} ${review.length === 1 ? 'needs' : 'need'} Admin review`;
+  salesOrderFulfillmentAttention.replaceChildren(count, ...review.map(fulfillmentCandidateCard));
+  if (waiting.length) {
+    const pending = document.createElement('details');
+    const summary = document.createElement('summary');
+    summary.textContent = `${waiting.length} waiting for load evidence`;
+    pending.append(summary, ...waiting.map(fulfillmentCandidateCard));
+    salesOrderFulfillmentAttention.append(pending);
+  }
 }
 
 function renderHistoricalFulfillmentEvents() {
@@ -395,14 +420,22 @@ function renderAttentionCommands() {
     operatorNetSuiteAttention.append(unavailable);
     return;
   }
-  if (!attentionCommands.length) {
+  const commands=[...attentionCommands,...transferPostingJobs.map(job=>({id:job.id,transferJob:true,
+    yardCode:job.order_ref,functionKey:'transfer order',transactionType:job.transaction_type,
+    driverContext:(job.driver_order_refs || []).length ? `Linked SO: ${job.driver_order_refs.join(' / ')}${(job.driver_dispatch_refs || [])
+      .filter(ref=>!job.driver_order_refs.includes(ref)).map(ref=>` · ${ref}`).join('')}` : '',
+    lastError:job.command_error || job.last_error || (job.status==='waiting_driver' && (job.driver_order_refs || []).length
+      ? `Waiting for ${job.driver_order_refs.join(' / ')} delivery completion.`
+      : `${job.command_status || job.status}: Waiting for the required completion evidence.`),
+    steps:[{sourceOrderRef:(job.lines || []).map(line=>`Item ${line.itemId}: ${line.quantity}`).join(' · '),status:job.command_status || job.status}]}))];
+  if (!commands.length) {
     const empty = document.createElement("p");
     empty.className = "mbt-attention-empty";
     empty.textContent = "No Operator NetSuite posting commands need attention.";
     operatorNetSuiteAttention.append(empty);
     return;
   }
-  for (const command of attentionCommands) {
+  for (const command of commands) {
     const article = document.createElement("article");
     article.className = "mbt-attention-card";
     const copy = document.createElement("div");
@@ -412,6 +445,11 @@ function renderAttentionCommands() {
     identity.textContent = command.id;
     const detail = document.createElement("p");
     detail.textContent = command.lastError || "Verification stopped before local completion.";
+    if (command.driverContext) {
+      const linked = document.createElement("p");
+      linked.textContent = command.driverContext;
+      copy.append(linked);
+    }
     const steps = document.createElement("p");
     steps.textContent = (command.steps || []).map((step) => (
       `${step.sourceOrderRef || step.sourceNetSuiteId}: ${step.status}${(step.fulfillmentParts || []).map(part =>
@@ -421,7 +459,8 @@ function renderAttentionCommands() {
     const button = document.createElement("button");
     button.type = "button";
     button.dataset.postingResume = command.id;
-    button.textContent = "Resume verification";
+    button.dataset.transferJob = command.transferJob ? 'true' : '';
+    button.textContent = command.transferJob ? "Retry background posting" : "Resume verification";
     button.disabled = saving;
     article.append(copy, button);
     operatorNetSuiteAttention.append(article);
@@ -458,6 +497,7 @@ async function loadGates(message = "Gate controls ready") {
   ]);
   inventory = nextInventory;
   attentionCommands = attention.result?.commands || [];
+  transferPostingJobs = attention.result?.transferJobs || [];
   attentionLoadError = attention.error;
   fulfillmentCandidates = fulfillment.result?.candidates || [];
   fulfillmentLoadError = fulfillment.error;
@@ -530,10 +570,13 @@ async function resumeOperatorNetSuitePosting(button) {
   saving = true;
   renderGates();
   replaceStatus("Resuming NetSuite verification", [
-    "The existing external ID will be checked before any retry. Local completion remains frozen."
+    "The existing external ID will be checked before any retry. Saved Operator quantities are retained."
   ], "safe", true);
   try {
-    await api(`/api/admin/operator-netsuite-posting/${encodeURIComponent(commandId)}/resume`, {
+    const path=button.dataset.transferJob==='true'
+      ? `/api/admin/transfer-order-posting/${encodeURIComponent(commandId)}/retry`
+      : `/api/admin/operator-netsuite-posting/${encodeURIComponent(commandId)}/resume`;
+    await api(path, {
       method: "POST",
       body: JSON.stringify({ reason })
     });

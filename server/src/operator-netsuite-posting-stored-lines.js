@@ -26,6 +26,7 @@ export function storedOperatorPostingLines(rows) {
       sourceLineAliases: [...new Set([sourceLineKey, row.local_line_key].filter(Boolean).map(String))],
       orderLine,
       itemId: Number(row.item_id),
+      ...(row.unit ? { salesUom: String(row.unit).trim().toUpperCase() } : {}),
       location: row.location_id === null || row.location_id === undefined ? null : Number(row.location_id),
       orderedQuantity: quantity,
       completedQuantity: completed,

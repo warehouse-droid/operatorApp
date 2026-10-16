@@ -33,6 +33,12 @@ textarea {
   font: inherit;
 }
 
+input,
+select,
+textarea {
+  font-size: max(25px, 1em);
+}
+
 button {
   min-height: 46px;
   border: 2px solid var(--line);
@@ -250,7 +256,7 @@ label span {
   border: 2px solid var(--line);
   border-radius: 8px;
   padding: 0 14px;
-  font-size: 24px;
+  font-size: 25px;
   font-weight: 900;
 }
 
@@ -260,7 +266,7 @@ label span {
   border: 2px solid var(--line);
   border-radius: 8px;
   padding: 0 14px;
-  font-size: 22px;
+  font-size: 25px;
   font-weight: 900;
 }
 
@@ -542,7 +548,7 @@ label span {
   border: 2px solid var(--line);
   border-radius: 8px;
   padding: 0 12px;
-  font-size: 18px;
+  font-size: 25px;
   font-weight: 900;
 }
 
@@ -648,7 +654,7 @@ label span {
   border: 2px solid var(--line);
   border-radius: 8px;
   padding: 0 12px;
-  font-size: 18px;
+  font-size: 25px;
   font-weight: 900;
 }
 
@@ -861,7 +867,7 @@ label span {
 }
 
 .cycle-grid .stepper input {
-  font-size: 21px;
+  font-size: 25px;
 }
 
 .cycle-grid .selected-actions {
@@ -1174,7 +1180,7 @@ label span {
   padding: 5px 7px;
   border: 2px solid var(--line);
   border-radius: 8px;
-  font-size: 13px;
+  font-size: 25px;
   font-weight: 900;
 }
 
@@ -2259,7 +2265,7 @@ label span {
   width: 100%;
   border: 0;
   text-align: center;
-  font-size: 23px;
+  font-size: 25px;
   font-weight: 900;
 }
 
@@ -2371,7 +2377,7 @@ label span {
 .consolidation-date-field { position: relative; min-width: 0; }
 .consolidation-load-filters .consolidation-date-field label { position: absolute; z-index: 1; top: 3px; left: 5px; min-width: 0; margin: 0; font-size: 10px; line-height: 12px; color: #50635f; cursor: pointer; }
 .consolidation-date-box { position: relative; }
-.consolidation-date-box input { box-sizing: border-box; height: 44px; padding: 14px 16px 2px 4px; font-size: 16px; }
+.consolidation-date-box input { box-sizing: border-box; height: 52px; padding: 14px 16px 2px 4px; font-size: 25px; }
 .consolidation-date-box input[readonly] { cursor: pointer; }
 .consolidation-date-box input[aria-invalid="true"] { border-color: #b42318; }
 .consolidation-date-box > span { pointer-events: none; position: absolute; right: 4px; top: 50%; transform: translateY(-50%); color: #315b57; }
@@ -3138,6 +3144,35 @@ label span {
   opacity: 1;
 }
 
+.customer-pickup-message {
+  position: fixed;
+  z-index: 90;
+  top: calc(76px + env(safe-area-inset-top, 0px));
+  left: 50%;
+  transform: translateX(-50%);
+  width: min(640px, calc(100% - 32px));
+  padding: 12px;
+  grid-template-columns: minmax(0, 1fr) auto;
+  align-items: start;
+  gap: 12px;
+  box-shadow: 0 8px 28px #14202933;
+}
+
+.customer-pickup-message-content {
+  min-width: 0;
+  max-height: min(35dvh, 240px);
+  display: grid;
+  gap: 6px;
+  overflow-y: auto;
+  overflow-wrap: anywhere;
+}
+
+.customer-pickup-message button {
+  padding: 0 12px;
+  border-color: var(--danger);
+  color: var(--danger);
+}
+
 /* Operator returns: tablet-first, camera-only workflow. */
 .return-lookup-grid,
 .return-form-shell,
@@ -3260,7 +3295,7 @@ label span {
   border: 2px solid var(--line);
   border-radius: 8px;
   background: white;
-  font-size: 18px;
+  font-size: 25px;
   font-weight: 900;
 }
 

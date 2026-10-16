@@ -11,7 +11,7 @@
   const busyReady = import('/special-stock-busy.js');
   /** @type {ReturnType<typeof import('./special-stock-busy.js').installSpecialBusyState>|undefined} */
   let busyUI;
-  const queueReady = import('/special-stock-queue.js');
+  const queueReady = import(new URL('/special-stock-queue.js?v=20261006-stable-view', location.href).href);
   let queue;
   /** @type {typeof import('./special-stock-fulfillment.js').specialFulfillmentEditor} */
   let specialFulfillmentEditor=()=>'';
@@ -19,17 +19,19 @@
   let syncSpecialFulfillmentForm=()=>{};
   /** @type {typeof import('./special-stock-internal-remark.js').syncSpecialInternalRemarkForm} */
   let syncSpecialInternalRemarkForm=()=>{};
-  import(new URL('/special-stock-fulfillment.js?v=20261003-internal-remark-v1', location.href).href).then(module=>{
+  import(new URL('/special-stock-fulfillment.js?v=20261006-confirmed-note-v1', location.href).href).then(module=>{
     specialFulfillmentEditor=module.specialFulfillmentEditor;syncSpecialFulfillmentForm=module.syncSpecialFulfillmentForm;
     syncSpecialInternalRemarkForm=module.syncSpecialInternalRemarkForm;
     if(state.enabled)render();
   });
-  const informationReady = import(new URL('/special-stock-information.js?v=20261002-stock-updates-v1', location.href).href);
+  const informationReady = import(new URL('/special-stock-information.js?conversation=20261016&v=20261002-stock-updates-v1', location.href).href);
   /** @type {typeof import('./special-stock-information.js').specialInformationPanel} */
   let specialInformationPanel = () => '';
   /** @type {typeof import('./special-stock-workflow.js').specialStockAvailable} */
   let specialStockAvailable;
-  const workflowReady = import(new URL('/special-stock-workflow.js?v=20261002-stock-updates-v1', location.href).href);
+  const transferEtaReady = import('/special-stock-transfer-eta.js?v=20261016');
+  let isSpecialTransferEta, specialSupplyEtaLabel;
+  const workflowReady = import(new URL('/special-stock-workflow.js?v=20261002-stock-updates-v1&filterApply=20261010-v1', location.href).href);
   const lineDetailsReady = import('/special-stock-line-details.js?v=20261001-po-mini-rows-v1');
   let specialItemDescription;
   const palletDisplayReady = import(new URL('/special-stock-pallet-display.js?v=20261001-delivery-fee-v1', location.href).href);
@@ -37,9 +39,9 @@
   let specialRequestPalletLine;
   /** @type {typeof import('./special-stock-delivery-fee.js').savedSpecialDeliveryFee} */
   let savedSpecialDeliveryFee;
-  const vendorFilterReady = import('/stock-request-vendor-filter.js?v=20260928-enhancements-v1');
+  const vendorFilterReady = import('/stock-request-vendor-filter.js?v=20260928-enhancements-v1&filterApply=20261010-v1');
   let vendorFilterHtml = () => '';
-  const yardFilterReady = import('/stock-request-yard-filter.js?v=20260927');
+  const yardFilterReady = import('/stock-request-yard-filter.js?v=20260927&filterApply=20261010-v1');
   let yardFilterHtml = () => '';
   const formsReady = import('/special-stock-form-state.js?v=20260928-batch-v1');
   const requestActionsReady = import(new URL('/special-stock-request-actions.js?v=20261003-internal-remark-v1',location.href).href);
@@ -51,12 +53,21 @@
   let confirmSpecialAddItems;
   /** @type {typeof import('./special-stock-case-edits.js').revokeSpecialLineDecision} */
   let revokeSpecialLineDecision;
-  const caseEditsReady = import(new URL('/special-stock-case-edits.js?v=20261003-line-decline-v1', location.href).href);
+  const lineFieldsReady = import(new URL('/special-stock-line-fields.js?v=20261003-scm-lines-v1', location.href).href);
+  /** @type {typeof import('./special-stock-line-fields.js').specialLineFields} */
+  let specialLineFields;
+  /** @type {typeof import('./special-stock-line-fields.js').specialLineFieldValues} */
+  let specialLineFieldValues;
+  /** @type {typeof import('./special-stock-line-fields.js').specialAdjustmentFieldSummary} */
+  let specialAdjustmentFieldSummary;
+  /** @type {typeof import('./special-stock-line-fields.js').changedSpecialLineFields} */
+  let changedSpecialLineFields;
+  /** @type {typeof import('./special-stock-line-fields.js').defaultSpecialLineRequiredDate} */
+  let defaultSpecialLineRequiredDate;
+  const caseEditsReady = import(new URL('/special-stock-case-edits.js?v=20261003-fields-v1', location.href).href);
   const lineNotesReady = import(new URL('/special-stock-line-notes.js?v=20261003-request-corrections-v1', location.href).href);
   /** @type {typeof import('./special-stock-line-notes.js').specialLineNotes} */
   let specialLineNotes;
-  /** @type {typeof import('./special-stock-line-notes.js').specialRequestLineNotes} */
-  let specialRequestLineNotes;
   /** @type {typeof import('./special-stock-case-edits.js').canEditSpecialCaseLines} */
   let canEditSpecialCaseLines;
   /** @type {typeof import('./special-stock-case-edits.js').specialCaseEditDraft} */
@@ -71,13 +82,13 @@
   /** @type {typeof import('./special-stock-case-status.js').specialPlanningStatus} */
   let specialPlanningStatus = () => '';
   let specialClosureStatus = () => '', canRequestSpecialClosure = () => false;
-  import(new URL('/special-stock-case-status.js?v=20261002-stock-updates-v1', location.href).href).then(status => {
+  import(new URL('/special-stock-case-status.js?v=20261005-status-following-v1', location.href).href).then(status => {
     specialPlanningStatus = (detail, compact = false) => status.specialPlanningStatus(detail, compact, { audience: 'sales', showOrderPreviews: !compact }); specialClosureStatus = status.specialClosureStatus;
     canRequestSpecialClosure = status.canRequestSpecialClosure;
     if (state.enabled) render();
   });
   import('/special-stock-documents.js').then(documents => {
-    specialDocumentActions = detail => documents.specialDocumentActions(detail, 'sales');
+    specialDocumentActions = detail => documents.specialDocumentActions(detail, 'sales', { showOrderPreviews: false });
     documents.installSpecialDocumentPreviews(mount, { audience: 'sales', getDraft: () => {
       syncCaseComposerFromDom();
       return { ...state.composer, customerId: state.composer.customerId || null, vendorId: state.composer.vendorId || null };
@@ -116,6 +127,7 @@
     caseEditSource: /** @type {SpecialRequestModel|null} */ (null),
     soDraft: /** @type {Record<string,any>|null} */ (null),
     soDraftDirty: false,
+    adjustmentEditing: false,
     formDrafts: new Map(),
     salesReps: null,
     salesRepsLoading: false,
@@ -198,7 +210,7 @@
         try {
           const line = state.soDraft?.materials.find(line => line.caseLineId === Number(element.dataset.specialMaterial));
           const price = specialNativePricing({quantity:value('quantity'),rate:value('rate'),discountPercent:value('discountPercent'),conversionToPc:line?.conversionToPc ?? 1});
-          native.textContent = `NetSuite: ${number(price.quantity)} ${line?.legacy ? line.uom : 'PC'} × ${rateLabel(price.rate)} per unit${price.discountPercent ? ` · Custom Discount%: -${number(price.discountPercent)}%` : ''}`;
+          native.textContent = `NetSuite: ${number(price.quantity)} ${line?.legacy || line?.uom === 'SQFT' ? line.uom : 'PC'} × ${rateLabel(price.rate)} per unit${price.discountPercent ? ` · Custom Discount%: -${number(price.discountPercent)}%` : ''}`;
         } catch (error) { native.textContent = error.message; }
       }
     }
@@ -215,32 +227,47 @@
   function quantityReviewNotice(detail) {
     if (!detail.quantityReviewPending) return '';
     return `<div class="stock-request-notice stock-request-error" role="status"><strong>Order adjustment · SCM review required</strong>
-      ${(detail.quantityReview?.lines || []).map(line => `<p>${escapeHtml(line.productName)}: ${number(line.fromPackageQuantity)} → ${number(line.toPackageQuantity)} ${escapeHtml(line.packageUom)} (${number(line.fromQuantity)} → ${number(line.toQuantity)} ${escapeHtml(line.salesUom)})</p>`).join('')}
-      ${(detail.quantityReview?.lines || []).filter(line=>line.fromDiscountPercent!==line.toDiscountPercent).map(line=>`<p>${escapeHtml(line.productName)} discount: ${number(line.fromDiscountPercent)}% → ${number(line.toDiscountPercent)}%</p>`).join('')}
+      ${(detail.quantityReview?.lines || []).map(line => line.remove ? `<p>Remove item: ${escapeHtml(line.productName)}</p>` : `<p>${escapeHtml(line.productName)}: ${number(line.fromPackageQuantity)} → ${number(line.toPackageQuantity)} ${escapeHtml(line.packageUom)}</p>`).join('')}
+      ${(detail.quantityReview?.lines || []).map(specialAdjustmentFieldSummary).join('')}
+      ${(detail.quantityReview?.lines || []).filter(line=>!line.remove && line.fromDiscountPercent!==line.toDiscountPercent).map(line=>`<p>${escapeHtml(line.productName)} discount: ${number(line.fromDiscountPercent)}% → ${number(line.toDiscountPercent)}%</p>`).join('')}
       ${detail.quantityReview?.pallets ? `<p>PALLET: ${number(detail.quantityReview.pallets.fromQuantity)} → ${number(detail.quantityReview.pallets.toQuantity)} EACH</p>` : ''}
       <p>${escapeHtml(detail.quantityReview?.error || 'Order creation and Dispatch wait for SCM confirmation.')}</p></div>`;
   }
   function quantityProposalEditor(detail) {
     if (detail.closeStatus !== 'active' || detail.operationallyComplete || detail.remotelyReconciled || ['applying','attention'].includes(detail.quantityReview?.status)) return '';
-    return `<form class="stock-request-form" data-special-quantity-form><h4>Request an order adjustment</h4><p>SCM confirms quantity, discount and PALLET changes. Original rates stay fixed.</p>
-      ${detail.lines.filter(line=>line.salesDecision==='accepted').map(line=>`<article class="stock-request-line" data-special-material="${line.id}"><strong>MBBS-Special</strong><p>${escapeHtml(specialItemDescription(line))}</p><div class="special-sales-pricing-row">
-        <label><span>Quantity (${escapeHtml(line.rateUom)}) *</span><input name="quantity" type="number" min="0.000001" step="0.000001" required value="${escapeHtml(detail.quantityReviewPending ? detail.quantityReview?.lines.find(change=>change.caseLineId===line.id)?.toPackageQuantity ?? line.packageQuantity : line.packageQuantity)}" /></label>
-        <label><span>Original rate ($)</span><output class="special-fixed-value">${rateLabel(line.originalRate)}</output><input name="rate" type="hidden" value="${escapeHtml(line.originalRate)}" /></label><label><span>Discount (%)</span><input name="discountPercent" type="number" min="0" max="100" step="0.0001" required value="${escapeHtml(detail.quantityReviewPending ? detail.quantityReview?.lines.find(change=>change.caseLineId===line.id)?.toDiscountPercent ?? line.discountPercent : line.discountPercent)}" /></label>
-        <label><span>Subtotal (before tax)</span><output data-special-subtotal></output></label></div></article>`).join('')}
+    const heading = `<div class="stock-request-actions"><h3>Request an adjustment</h3>${!state.adjustmentEditing ? '<button type="button" data-special-sales-action="edit-adjustment" aria-expanded="false">Edit</button>' : ''}</div><p>SCM reviews changes and item removals for this local request. Existing NetSuite orders stay as created. Original rates stay fixed.</p>`;
+    if (!state.adjustmentEditing) return `<section class="stock-request-section" data-special-adjustment-section>${heading}</section>`;
+    return `<section class="stock-request-section" data-special-adjustment-section>${heading}<form class="stock-request-form" data-special-quantity-form>
+      ${detail.lines.filter(line=>line.salesDecision==='accepted').map(line => {
+        const proposal = detail.quantityReviewPending ? detail.quantityReview?.lines.find(change => change.caseLineId === line.id) : null;
+        const values = { ...specialLineFieldValues(line), ...proposal?.toFields, quantity: proposal?.toPackageQuantity ?? line.packageQuantity,
+          discountPercent: proposal?.toDiscountPercent ?? line.discountPercent };
+        return `<article class="stock-request-line" data-special-material="${line.id}"><strong>MBBS-Special</strong>
+          <label><input type="checkbox" name="remove" data-special-adjustment-remove ${proposal?.remove ? 'checked' : ''} /> Remove item</label>
+          <p data-special-removal-notice ${proposal?.remove ? '' : 'hidden'}>This item will be removed from the request after SCM confirmation.</p>
+          <fieldset style="border:0;margin:0;padding:0;min-width:0" ${proposal?.remove ? 'disabled' : ''}>${specialLineFields(values, { rateMode: 'fixed' })}</fieldset></article>`;
+      }).join('')}
       <div class="stock-request-line-fields"><label><span>PALLET quantity *</span><input name="palletTotal" type="number" min="0" max="1000000000" step="1" required value="${escapeHtml(detail.quantityReviewPending ? detail.quantityReview?.pallets?.toQuantity ?? detail.palletTotal ?? 0 : detail.palletTotal ?? 0)}" /><small>0 removes the PALLET line.</small></label><label><span>PALLET rate ($)</span>${detail.palletRate == null ? `<input name="palletRate" type="number" min="0" step="0.000001" value="${escapeHtml(detail.quantityReview?.pallets?.rate ?? '')}" /><small>Set the rate when adding PALLET for the first time.</small>` : `<output class="special-fixed-value">${rateLabel(detail.palletRate)}</output>`}</label></div>
-      <button type="submit">Request adjustment</button></form>`;
+      <div class="stock-request-actions"><button type="submit">Request adjustment</button><button type="button" data-special-sales-action="cancel-adjustment">Cancel</button></div></form></section>`;
+  }
+
+  function syncAdjustmentRemoval(input) {
+    const line = input.closest('[data-special-material]');
+    line.querySelector('fieldset').disabled = input.checked;
+    line.querySelector('[data-special-removal-notice]').hidden = !input.checked;
   }
 
   function newLine() {
     return {
       key: crypto.randomUUID(), productName: "", color: "", size: "", detailSpec: "",
       palletQty: "", layerQty: "", sectionQty: "", pieceQty: "",
-      quantity: "", uom: "PLT", rate: "", discountPercent: 0, requiredDate: minimumRequiredDate(), customerNote: ""
+      quantity: "", uom: "PLT", rate: "", discountPercent: 0, requiredDate: defaultSpecialLineRequiredDate(todayToronto()), customerNote: ""
     };
   }
 
   function startComposer() {
     state.formDrafts.clear();
+    state.adjustmentEditing = false;
     state.copySource = null; state.addItemsDraft = null;
     state.caseEditDraft = null; state.caseEditSource = null;
     state.detail = null;
@@ -273,6 +300,7 @@
   }
 
   function caseList() {
+    state.requests = window.StockRequestConversation?.order(state.requests) || state.requests;
     if (state.loading && !state.requests.length) return `<div class="stock-request-empty"><strong>Loading Special Item cases…</strong></div>`;
     if (!state.requests.length) return `<div class="stock-request-empty"><strong>No matching Special Item cases</strong><span>Create a multi-line case for one vendor.</span></div>`;
     return state.requests.map((request) => `
@@ -289,23 +317,7 @@
     const removeAction = adding ? 'remove-added-line' : 'remove-case-line';
     return `<article class="stock-request-line" data-special-composer-line="${index}">
       <header><div><strong>MBBS-Special</strong><small>Line ${index + 1 + (adding ? state.detail?.lines.length || 0 : 0)}</small></div>${lines.length > 1 ? `<button class="danger" data-special-sales-action="${removeAction}" data-index="${index}" type="button">Remove</button>` : ""}</header>
-      <div class="stock-request-line-fields special-case-initial-grid">
-        <div class="special-case-product-row">
-        <label><span>Product name *</span><input name="productName" required value="${escapeHtml(line.productName)}" /></label>
-        <label><span>Colour</span><input name="color" value="${escapeHtml(line.color)}" /></label>
-        <label><span>Size</span><input name="size" value="${escapeHtml(line.size)}" /></label>
-        <label><span>Detail Spec</span><input name="detailSpec" maxlength="2000" value="${escapeHtml(line.detailSpec)}" /></label>
-        </div>
-        <div class="special-sales-pricing-row special-case-pricing-row">
-        <label><span>Quantity *</span><input name="quantity" type="number" min="0.000001" step="any" required value="${escapeHtml(line.quantity)}" /></label>
-        <label><span>Sales UOM *</span><select name="uom" required>${[["PLT", "Plt"], ["LYR", "lyr"], ["SEC", "Sec"], ["PCS", "Pcs"], ["EACH", "Each"], ["SQFT", "SQFT"]].map(([value, label]) => `<option value="${value}" ${line.uom === value ? "selected" : ""}>${label}</option>`).join("")}</select></label>
-        <label><span>Sales rate per unit ($) *</span><input name="rate" type="number" min="0" step="0.000001" required value="${escapeHtml(line.rate)}" /></label>
-        <label><span>Discount (%)</span><input name="discountPercent" type="number" min="0" max="100" step="0.0001" value="${escapeHtml(line.discountPercent)}" /></label>
-        <label><span>Subtotal (before tax)</span><output data-special-subtotal></output></label></div>
-        <div class="special-case-delivery-row"><label><span>Required date *</span><input name="requiredDate" type="date" min="${minimumRequiredDate()}" required value="${escapeHtml(line.requiredDate || minimumRequiredDate())}" /><small>Delivery requires at least three working days after SO placement, excluding weekends and Ontario public holidays.</small></label>
-        <label><span>Line note</span><input name="customerNote" value="${escapeHtml(line.customerNote)}" /></label>
-        ${[["palletQty","PLT"],["layerQty","LYR"],["sectionQty","SEC"],["pieceQty","PCS"]].map(([name,label])=>`<label><span>${label}</span><input name="${name}" type="number" min="0" max="1000000000" step="any" value="${escapeHtml(line[name])}" /></label>`).join("")}</div>
-      </div>
+      ${specialLineFields({ ...line, requiredDate: line.requiredDate || defaultSpecialLineRequiredDate(todayToronto()) }, { minimumDate: minimumRequiredDate() })}
     </article>`;
   }
 
@@ -368,7 +380,7 @@
 
   function decisionForm(line) {
     if (!canDecide(line)) return '';
-    const canAccept = specialStockAvailable(line.supplyStatus) || line.availableDate;
+    const canAccept = specialStockAvailable(line.supplyStatus) || line.availableDate || isSpecialTransferEta(line);
     return `<div class="stock-request-line-fields special-inline-form" data-special-decision-line="${line.id}">
       <label><span>Customer decision</span><select name="decision"><option value="">Select decision</option>${canAccept ? `<option value="accepted">${specialStockAvailable(line.supplyStatus) ? 'Customer confirms' : 'Customer will wait for ETA'}</option>` : ''}<option value="declined">Customer declines</option></select></label>
       <label><span>Reason (required unless accepted)</span><input name="reason" /></label>
@@ -381,9 +393,9 @@
     const product = specialItemDescription(line);
     return `<article class="stock-request-line">
       <header><div><strong>MBBS-Special</strong><small>${escapeHtml(product)}</small><small>${number(line.packageQuantity ?? line.quantity)} ${escapeHtml(line.rateUom || line.uom)}</small></div>${pill(line.salesDecision)}</header>
-      <div class="stock-request-summary">
-        <span><small>SCM supply</small><strong>${escapeHtml(line.supplyStatus === 'low_inventory' ? 'Low inventory' : line.supplyStatus === 'vendor_transfer' ? 'Wait for Transfer' : line.supplyStatus?.replaceAll("_", " ") || "Waiting")}</strong></span>
-        <span><small>Projection</small><strong>${escapeHtml(line.availableDate || line.availabilityMode || "—")}</strong></span>
+      <div class="stock-request-summary" data-special-supply-status="${escapeHtml(line.supplyStatus || '')}">
+        <span><small>SCM stock check</small><strong>${escapeHtml(line.supplyStatus === 'in_stock' ? 'In stock' : line.supplyStatus === 'low_inventory' ? 'Low inventory' : line.supplyStatus === 'production' ? 'Wait for Production' : line.supplyStatus === 'vendor_transfer' ? 'Wait for Transfer' : line.supplyStatus === 'no_stock' ? 'No stock or ETA' : line.supplyStatus?.replaceAll("_", " ") || "Waiting")}</strong></span>
+        <span><small>SCM ETA</small><strong>${escapeHtml(specialSupplyEtaLabel(line))}</strong></span>
         <span><small>Vendor yard</small><strong>${escapeHtml(line.vendorYard || "—")}</strong></span>
         <span><small>Vendor ref</small><strong>${escapeHtml(line.vendorReference || "—")}</strong></span>
       </div>
@@ -451,6 +463,17 @@
     finally { syncCaseComposerFromDom(); syncSoFromDom(); state.salesRepsLoading = false; render(); }
   }
 
+  /** @param {any} detail */
+  function manualSalesLink(detail) {
+    if (detail.closeStatus !== 'active' || detail.informationRequest?.status === 'pending' || state.caseEditDraft
+        || !detail.lines.some(line => line.salesDecision === 'accepted')
+        || !detail.lines.every(line => ['accepted', 'declined', 'closed'].includes(line.salesDecision))
+        || detail.salesOrderId || detail.salesOrderSkipped || detail.purchaseOrderSkipped
+        || detail.salesOrderSubmissionStartedAt || detail.salesOrderOperationStatus === 'creating') return '';
+    return `<section class="stock-request-section"><h3>Manual Sales Order link</h3>
+      <form class="stock-request-line-fields special-inline-form" data-special-link-so-form><label class="stock-request-item-search"><span>Sales Order number</span><input name="salesOrderRef" data-special-so-link-search autocomplete="off" required placeholder="Search or enter synced SO number" /><div class="stock-request-suggestions" data-special-so-link-suggestions></div></label><button type="submit">Link existing SO</button></form></section>`;
+  }
+
   function soEditor() {
     ensureSoDraft();
     const draft = state.soDraft;
@@ -460,7 +483,7 @@
     if (!draft || !draft.materials.length) return "";
     if (state.salesReps === null) void loadSalesReps();
     return `<section class="stock-request-section special-order-editor"><h3>Create or link Sales Order</h3>
-      ${detail?.lineDecisionsNeedReview ? '<p class="stock-request-notice">Line decisions changed. Save the SO draft before creating or linking an order.</p>' : ''}
+      ${detail?.lineDecisionsNeedReview ? '<p class="stock-request-notice">Line decisions changed. Save the SO draft before creating an order.</p>' : ''}
       <form class="stock-request-form" data-special-so-form>
         <div class="stock-request-line-fields">
           <input name="customerId" type="hidden" value="${escapeHtml(draft.customerId)}" />
@@ -488,7 +511,7 @@
       </form>
       ${detail.salesOrderLines.length ? `<div class="stock-request-actions"><select data-special-so-source><option value="standalone" ${draft.source === "standalone" ? "selected" : ""}>Create standalone SO</option>${detail.estimateId ? `<option value="estimate_transform" ${draft.source === "estimate_transform" ? "selected" : ""}>Transform estimate ${escapeHtml(detail.estimateNumber || detail.estimateId)}</option>` : ""}</select><button class="primary" data-special-sales-action="create-so" type="button" ${state.soDraftDirty || detail.quantityReviewPending || detail?.lineDecisionsNeedReview ? 'disabled' : ''}>Create in NetSuite</button>${state.testSkipOrdersEnabled && !['creating','attention'].includes(detail.salesOrderOperationStatus) ? `<button data-special-sales-action="skip-so" type="button" ${state.soDraftDirty || detail.quantityReviewPending || detail?.lineDecisionsNeedReview ? 'disabled' : ''}>Skip SO creation</button>` : ''}</div>` : ""}
       <p class="stock-request-muted" id="special-so-action-status" data-special-so-action-status role="status" hidden></p>
-      <form class="stock-request-line-fields special-inline-form" data-special-link-so-form><label class="stock-request-item-search"><span>Search active Sales Order</span><input data-special-so-link-search autocomplete="off" /><div class="stock-request-suggestions" data-special-so-link-suggestions></div></label><label><span>Existing SO internal ID</span><input name="salesOrderId" type="number" min="1" required /></label><label><span>SO number</span><input name="salesOrderRef" required /></label><button type="submit" ${detail.quantityReviewPending || detail?.lineDecisionsNeedReview ? 'disabled' : ''}>Link existing SO</button></form>
+
     </section>`;
   }
 
@@ -513,14 +536,13 @@
   /** @param {SpecialRequestModel} detail @param {boolean} showSaveDecisions @param {boolean} showAddItems */
   function caseLinesView(detail, showSaveDecisions, showAddItems) {
     const draft = state.caseEditDraft;
-    if (detail.salesOrderId && !draft) return specialRequestLineNotes(detail);
     const editable = canEditSpecialCaseLines(detail) && !state.addItemsDraft;
     const heading = `<div class="stock-request-actions"><h3>Case lines</h3>${editable && !draft ? '<button type="button" data-special-sales-action="edit-case-lines">Edit case lines</button>' : ''}</div>`;
-    if (!draft) return `<section class="stock-request-section">${heading}<form data-special-decisions-form><div class="stock-request-lines">${detail.lines.map(detailLine).join('')}${specialRequestPalletLine(/** @type {Parameters<typeof specialRequestPalletLine>[0]} */ (detail))}</div>${showSaveDecisions || showAddItems ? `<div class="stock-request-actions special-case-line-actions">${showSaveDecisions ? '<button class="primary" type="submit">Save customer decisions</button>' : ''}${showAddItems ? '<button class="special-add-item-button" type="button" data-special-sales-action="add-items">Add item</button>' : ''}</div>` : ''}</form></section>`;
+    if (!draft) return `<section class="stock-request-section" data-special-case-lines>${heading}<form data-special-decisions-form><div class="stock-request-lines">${detail.lines.map(detailLine).join('')}${specialRequestPalletLine(/** @type {Parameters<typeof specialRequestPalletLine>[0]} */ (detail))}</div>${showSaveDecisions || showAddItems ? `<div class="stock-request-actions special-case-line-actions">${showSaveDecisions ? '<button class="primary" type="submit">Save customer decisions</button>' : ''}${showAddItems ? '<button class="special-add-item-button" type="button" data-special-sales-action="add-items">Add item</button>' : ''}</div>` : ''}</form></section>`;
     const fresh = editable && draft.expectedRevision === detail.revision;
     const source = /** @type {SpecialRequestModel} */ (state.caseEditSource);
     return `<section class="stock-request-section">${heading}<form class="stock-request-form" data-special-case-edit-form>
-      <p>Material name or quantity changes return this request to New enquiry. Sales rate, PALLET quantity or rate, delivery fee, and decline or revoke changes keep its current status.</p>
+      <p>Material details, quantity, UOM, required date or packing changes return this request to New enquiry. Sales rate, discount, line note, PALLET, delivery fee, and decline or revoke changes keep its current status.</p>
       ${fresh ? '' : '<p class="stock-request-error">This request changed while you were editing. Your entries are kept below. Cancel edits and reopen the editor to use the latest request.</p>'}
       <div class="stock-request-lines">${draft.lines.map(line => {
         const saved = /** @type {Record<string,any>} */ (source.lines.find(item => item.id === line.lineId));
@@ -528,12 +550,7 @@
         const decision = declined ? 'declined' : saved.salesDecision === 'declined' ? revokeSpecialLineDecision(saved) : saved.salesDecision;
         return `<article class="stock-request-line${declined ? ' special-case-line-declined' : ''}" data-special-case-edit-line="${line.lineId}">
           <header><div><strong>MBBS-Special</strong><small>${escapeHtml([saved.color, saved.size, saved.detailSpec].filter(Boolean).join(' '))}</small></div>${declined ? '<span class="stock-request-pill declined">Declined</span>' : pill(decision)}</header>
-          <div class="stock-request-line-fields">
-            <label><span>Product name *</span><input name="productName" required maxlength="500" value="${escapeHtml(line.productName)}" /></label>
-            <label><span>Quantity * (${escapeHtml(saved.rateUom || saved.uom)})</span><input name="quantity" type="number" min="0.000001" max="1000000000" step="0.000001" required value="${escapeHtml(line.quantity)}" /></label>
-            <label><span>Sales rate${saved.originalRate == null ? '' : ' *'}</span><input name="rate" type="number" min="0" max="1000000000" step="0.000001" ${saved.originalRate == null ? '' : 'required'} value="${escapeHtml(line.rate)}" />${saved.originalRate == null ? '<small>Enter a sales rate when changing this item.</small>' : ''}</label>
-          </div><input name="discountPercent" type="hidden" value="${escapeHtml(saved.discountPercent || 0)}" />
-          <p>Discount: ${number(saved.discountPercent || 0)}% · Subtotal: <output data-special-subtotal></output></p>
+          ${specialLineFields(line, { rateMode: saved.originalRate == null ? 'optional' : 'required' })}
           ${specialLineNotes(saved)}
           <div class="special-case-line-decision-actions"><button type="button" data-special-sales-action="toggle-case-decline" data-line-id="${line.lineId}" ${fresh && saved.salesDecision !== 'closed' ? '' : 'disabled'}>${declined ? 'Revoke decline' : 'Decline'}</button></div>
         </article>`;
@@ -570,64 +587,77 @@
       ${detail.postPoChangePending ? `<div class="stock-request-notice stock-request-error"><strong>Vendor changed availability after PO:</strong> ${escapeHtml(JSON.stringify(detail.postPoChangeDetails))}<form data-special-ack-form><input name="acknowledgement" required placeholder="Customer acknowledgement" /><button type="submit">Record acknowledgement</button></form></div>` : ""}
       ${caseLinesView(detail, showSaveDecisions, showAddItems)}
       ${addItemsView(detail)}
+      ${manualSalesLink(detail)}
       ${detail.informationRequest?.status !== 'pending' && !state.caseEditDraft && (detail.salesOrderId || detail.salesOrderSkipped || (detail.closeStatus === 'active' && detail.lines.every(line => ['accepted','declined','closed'].includes(line.salesDecision)))) ? soEditor() : ''}
       ${(detail.purchaseOrderId || detail.purchaseOrderSkipped) ? `<section class="stock-request-section"><h3>Fulfillment</h3><div class="stock-request-summary"><span><small>Dispatch route</small><strong>${escapeHtml(detail.handoffRoute || (detail.fulfillmentMethod === "vendor_pickup" ? "Not required" : "Waiting Dispatch"))}</strong></span><span><small>Completion</small><strong>${detail.operationallyComplete ? "Operationally complete" : "In progress"}</strong></span></div>${detail.vendorPickupDate ? `<div class="stock-request-muted">Customer pickup: ${escapeHtml(detail.vendorPickupDate)} · ${escapeHtml(detail.vendorPickupReference)}</div>` : ""}</section>` : ""}
       ${(detail.purchaseOrderId || detail.purchaseOrderSkipped) && (!detail.purchaseOrderId || detail.purchaseOrderApproved !== false) && detail.fulfillmentMethod === "vendor_pickup" && !detail.operationallyComplete && detail.lines.filter(line => line.salesDecision === "accepted").every(line => specialStockAvailable(line.supplyStatus)) ? `<form class="stock-request-line-fields special-inline-form" data-special-vendor-pickup-form><label><span>Customer pickup date *</span><input name="pickupDate" type="date" required value="${todayToronto()}" /></label><label><span>Pickup reference / evidence *</span><input name="pickupReference" required /></label><button class="primary" type="submit">Complete vendor pickup</button></form>` : ""}
       ${canRequestSpecialClosure(detail) ? `<form class="stock-request-line-fields special-inline-form" data-special-close-form><label><span>Close reason</span><input name="reason" required value="${escapeHtml(detail.closureReason || '')}" /></label><button class="danger" type="submit">${detail.closeStatus === "closure_pending" ? "Retry SO closure" : detail.purchaseOrderId ? "Request closure · SCM confirmation" : detail.salesOrderId ? "Close SO and case" : "Close case"}</button></form>` : ""}
       ${detail.closeStatus === "closure_pending" && !detail.closureReview?.id ? `<div class="stock-request-notice">SO closure has not completed. Use Retry SO closure to finish.</div>` : ""}
-      ${!detail.salesOrderId ? specialDocumentActions(detail) : ''}`;
+      ${specialDocumentActions(detail)}`;
   }
 
-  function render() {
+  function render({detailOnly=false} = {}) {
     if (window.MBBSSalesStockActiveTab === "regular") return;
     const restoreScroll = preserveSpecialScroll?.(/** @type {HTMLElement} */ (mount));
-    if (state.detail) state.requests = state.requests.map(request => request.id === state.detail.id ? state.detail : request)
-      .filter(request => !state.stages.length || state.stages.includes(request.stage))
+    if (state.detail && !detailOnly) state.requests = state.requests.map(request => request.id === state.detail.id ? state.detail : request)
+      .filter(request => state.search.trim() || !state.stages.length || state.stages.includes(request.stage))
       .sort((a,b) => Number(Boolean(b.quantityReviewPending)) - Number(Boolean(a.quantityReviewPending)));
     if (state.enabled === false) {
       mount.innerHTML = `${header()}<section class="stock-request-page"><div class="stock-request-tabs"><button aria-selected="true" type="button">Special</button><button data-special-sales-action="regular" type="button">Regular</button></div><div class="stock-request-empty"><strong>Special Item workflow is off</strong><span>An administrator must enable special_stock_request_workflow after reviewing NetSuite mappings.</span></div></section>`;
       return;
     }
+    if (!detailOnly || !window.StockRequestView?.renderDetail(mount, state.composer ? composerView() : detailView(), state.detail?.id)) {
     mount.innerHTML = `${header()}<section class="stock-request-page special-stock-page">
       <div class="stock-request-tabs"><button aria-selected="true" type="button">Special</button><button data-special-sales-action="regular" type="button">Regular</button></div>
       <div class="stock-request-toolbar"><div class="stock-request-actions"><input class="stock-request-search" data-special-search value="${escapeHtml(state.search)}" placeholder="Search case, customer, vendor, SO, PO, or item" />${yardFilterHtml(state.yards, state.storeLocationIds)}${vendorFilterHtml(state.vendors, state.vendorNames)}${stageFilterHtml(state.stages)}<label class="special-own-filter"><input type="checkbox" data-special-mine ${state.mine ? "checked" : ""}> My requests</label><button class="primary" data-special-sales-action="new" type="button">New Special case</button><button data-special-sales-action="refresh" type="button">Refresh</button></div></div>
       <div class="stock-request-feedback">${state.notice ? `<div class="stock-request-notice">${escapeHtml(state.notice)}</div>` : ""}${state.error ? `<div class="stock-request-notice stock-request-error">${escapeHtml(state.error)}</div>` : ""}</div>
       <div class="stock-request-workspace"><aside class="stock-request-panel stock-request-list">${caseList()}</aside><section class="stock-request-panel stock-request-detail">${state.composer ? composerView() : detailView()}</section></div>
     </section>`;
+    }
     restoreSpecialForms?.(/** @type {HTMLElement} */ (mount), state.formDrafts);
+    mount.querySelectorAll('[data-special-adjustment-remove]').forEach(syncAdjustmentRemoval);
     syncSpecialFulfillmentForm(/** @type {HTMLElement} */ (mount).querySelector('[data-special-fulfillment-form]'), state.detail?.revision);
+    syncSpecialFulfillmentForm(/** @type {HTMLElement} */ (mount).querySelector('[data-special-note-form]'), state.detail?.revision);
     syncSpecialInternalRemarkForm(/** @type {HTMLElement} */ (mount).querySelector('[data-special-internal-remark-form]'), state.detail?.revision);
     for (const group of mount.querySelectorAll('[data-special-decision-line]')) updateDecisionReason(group);
     refreshPricing();
     syncSoActionAvailability();
     busyUI?.render();
+    window.StockRequestConversation?.watchQueue(mount, {url:`/api/sales/special-stock-requests?${queueKey()}`, requests:state.requests,
+      active, read:api, error:()=>updates?.changed(),
+      accept:requests=>{state.requests=requests; const list=mount.querySelector('.stock-request-list'); if(list)list.innerHTML=caseList();}});
+    window.StockRequestConversation?.render(mount, state.composer ? null : state.detail, 'sales', {onWorkflowUpdated:()=>load({force:true})});
     restoreScroll?.();
+    updates?.paint();
   }
 
   const active = () => window.MBBSSalesStockActiveTab !== 'regular';
+  const updates = window.StockRequestView?.create({mount,active});
   const editing = () => state.busy || state.confirmingAddItems || Boolean(state.addItemsDraft) || Boolean(state.caseEditDraft) || (!busyUI?.remote() && (Boolean(state.composer) || state.soDraftDirty || state.formDrafts.size > 0));
-  const queueKey = () => new URLSearchParams({ search: state.search, stages: state.stages.join(','), storeLocationIds: state.storeLocationIds.join(','), vendorNames: JSON.stringify(state.vendorNames), mine: state.mine ? '1' : '' }).toString();
+  const queueKey = () => new URLSearchParams({ search: state.search, stages: state.search.trim() ? '' : state.stages.join(','), storeLocationIds: state.storeLocationIds.join(','), vendorNames: JSON.stringify(state.vendorNames), mine: state.mine ? '1' : '' }).toString();
 
   async function initializeQueue() {
     if (queue) return;
     const {createSpecialQueueLoader,watchSpecialQueue} = await queueReady;
     if (queue) return;
     queue = createSpecialQueueLoader({
+      autoReload: false,
       read: (key,signal) => api(`/api/sales/special-stock-requests?${key}`, {signal}),
       blocked: () => !active() || editing(),
       loading: value => { state.loading = value; if (value && !state.requests.length) render(); },
       error: error => { state.error = error.message; render(); },
       accept: payload => {
-        const selectedId = state.detail?.id;
+        const selectedId = state.detail?.id || Number(new URLSearchParams(location.search).get('requestId'));
         state.yards = payload.yards || state.yards;
         state.vendors = payload.vendors || [];
         state.requests = payload.requests || [];
         state.detail = state.requests.find(row => row.id === selectedId) || state.requests[0] || null;
+        if (state.detail?.id !== selectedId) state.adjustmentEditing = false;
         state.error = ''; state.soDraft = null; state.soDraftDirty = false;
         render();
       }
     });
-    watchSpecialQueue({queue,key:queueKey,requests:()=>state.requests,active,audience:'sales'});
+    watchSpecialQueue({queue,key:queueKey,requests:()=>state.requests,active,audience:'sales',onUpdate:()=>updates?.changed()});
   }
 
   async function load({selectedId,force=false} = {}) {
@@ -639,18 +669,20 @@
       return;
     }
     if (selectedId === null) state.detail = null;
+    const version = updates?.version;
     await queue.load(queueKey(), {force});
+    if (!queue.pending) updates?.acknowledge(version);
   }
 
   function selectCase(id) {
     const detail = state.requests.find(row => String(row.id) === String(id));
     if (!detail || detail.id === state.detail?.id) return;
     state.formDrafts.clear(); state.composer = null; state.soDraft = null; state.soDraftDirty = false;
+    state.adjustmentEditing = false;
     state.copySource = null; state.addItemsDraft = null;
     state.caseEditDraft = null; state.caseEditSource = null;
     state.detail = detail; state.error = ''; state.notice = '';
-    render();
-    if (queue?.pending) void load();
+    render({detailOnly:true});
   }
 
   function syncCaseComposerFromDom() {
@@ -671,7 +703,7 @@
     if (!form || !state.addItemsDraft) return;
     for (const element of /** @type {NodeListOf<HTMLElement>} */ (form.querySelectorAll('[data-special-composer-line]'))) {
       const line = state.addItemsDraft.lines[Number(element.dataset.specialComposerLine)];
-      for (const input of /** @type {NodeListOf<HTMLInputElement|HTMLSelectElement>} */ (element.querySelectorAll('[name]'))) line[input.name] = input.value;
+      for (const input of /** @type {NodeListOf<HTMLInputElement|HTMLSelectElement|HTMLTextAreaElement>} */ (element.querySelectorAll('[name]'))) line[input.name] = input.value;
     }
   }
 
@@ -680,9 +712,7 @@
     if (!form || !draft) return;
     for (const element of /** @type {NodeListOf<HTMLElement>} */ (form.querySelectorAll('[data-special-case-edit-line]'))) {
       const line = /** @type {typeof draft.lines[number]} */ (draft.lines.find(item => item.lineId === Number(element.dataset.specialCaseEditLine)));
-      for (const field of /** @type {Array<'productName'|'quantity'|'rate'>} */ (['productName', 'quantity', 'rate'])) {
-        line[field] = /** @type {HTMLInputElement} */ (element.querySelector(`[name=${field}]`)).value;
-      }
+      for (const input of /** @type {NodeListOf<HTMLInputElement|HTMLSelectElement>} */ (element.querySelectorAll('[name]'))) line[input.name] = input.value;
     }
     draft.pallet.quantity = /** @type {HTMLInputElement} */ (form.querySelector('[name=palletTotal]')).value;
     draft.pallet.rate = /** @type {HTMLInputElement} */ (form.querySelector('[name=palletRate]')).value;
@@ -870,6 +900,7 @@
   }
 
   mount.addEventListener("change", async (event) => {
+    if (event.target.matches('[data-special-adjustment-remove]')) { syncAdjustmentRemoval(event.target); rememberSpecialForm?.(state.formDrafts,event.target.closest('form')); return; }
     if ((/** @type {HTMLElement|null} */ (event.target))?.closest('[data-special-case-edit-form]')) { syncCaseEditsFromDom(); refreshPricing(); return; }
     if(event.target.matches("[data-special-mine]")){state.mine=event.target.checked;await load({selectedId:null});return;}
     if(event.target.matches('[data-special-fulfillment-form] [name=fulfillmentMethod]')) syncSpecialFulfillmentForm(event.target.closest('form'));
@@ -909,7 +940,7 @@
   mount.addEventListener("submit", async (event) => {
     const form = /** @type {HTMLFormElement} */ (event.target);
     if (state.busy) { event.preventDefault(); return; }
-    if (!form.matches("[data-special-internal-remark-form], [data-special-information-reply-form], [data-special-case-form], [data-special-case-edit-form], [data-special-add-items-form], [data-special-expiry-form], [data-special-fulfillment-form], [data-special-decisions-form], [data-special-so-form], [data-special-link-so-form], [data-special-close-form], [data-special-ack-form], [data-special-vendor-pickup-form], [data-special-quantity-form]")) return;
+    if (!form.matches("[data-special-note-form], [data-special-internal-remark-form], [data-special-information-reply-form], [data-special-case-form], [data-special-case-edit-form], [data-special-add-items-form], [data-special-expiry-form], [data-special-fulfillment-form], [data-special-decisions-form], [data-special-so-form], [data-special-link-so-form], [data-special-close-form], [data-special-ack-form], [data-special-vendor-pickup-form], [data-special-quantity-form]")) return;
     event.preventDefault();
     state.busy = true;
     syncSoActionAvailability();
@@ -964,7 +995,7 @@
         if (plan.restart && !await confirmSpecialCaseRestart()) return;
         state.detail = await api(`/api/sales/special-stock-requests/${state.detail.id}/case-lines`, {
           method: 'PUT', body: JSON.stringify({ expectedRevision: draft.expectedRevision,
-            lines: plan.lines.map(line => ({ lineId: line.lineId, productName: line.productName, quantity: line.quantity, rate: line.rate })),
+            lines: plan.lines.map(line => ({ lineId: line.lineId, productName: line.productName, quantity: line.quantity, rate: line.rate, ...line.fields })),
             ...(plan.pallet ? { pallet: plan.pallet } : {}),
             ...(plan.decisions?.length ? { decisions: plan.decisions } : {}),
             ...(plan.deliveryFeeRate !== undefined ? { deliveryFeeRate: plan.deliveryFeeRate } : {}) })
@@ -1016,7 +1047,7 @@
             media: draft.media,
             materialLines: draft.materials.map(line => {
               const price = specialNativePricing({ quantity: line.quantity, rate: line.rate, discountPercent: line.discountPercent, conversionToPc: line.conversionToPc });
-              return { ...line, packageQuantity: line.quantity, quantity: price.quantity, uom: line.legacy ? line.uom : 'PC' };
+              return { ...line, packageQuantity: line.quantity, quantity: price.quantity, uom: line.legacy || line.uom === 'SQFT' ? line.uom : 'PC' };
             }),
             ancillaryLines: draft.ancillaryLines.map((line) => ({ itemId: Number(line.itemId), description: line.description, quantity: Number(line.quantity), uom: line.uom, rate: Number(line.rate) }))
           })
@@ -1025,37 +1056,47 @@
         ensureSoDraft();
         state.soDraft.source = draft.source;
         state.notice = "Sales Order draft saved.";
-      } else if(form.matches('[data-special-fulfillment-form]')) {
+      } else if(form.matches('[data-special-fulfillment-form], [data-special-note-form]')) {
         const detail = state.detail;
         if (!detail) throw new Error('Select a request before saving the header.');
         const header = form.hasAttribute('data-special-header-form');
+        const noteOnly = form.hasAttribute('data-special-note-form');
         if (header && (state.caseEditDraft || state.addItemsDraft)) throw new Error('Save or cancel your item edits before saving the header.');
-        syncSoFromDom();
+        if (!noteOnly) syncSoFromDom();
         const values=Object.fromEntries(new FormData(form));
         const change=state.detail.fulfillmentChange;
         const expected = header ? Number(values.expectedRevision) : detail.revision;
         if (expected !== detail.revision) throw new Error('This request changed. Reload the header before saving.');
         const changed = Object.entries(values).some(([field,value]) => field !== 'expectedRevision' && String(value) !== String(detail[field] ?? ''));
-        if (header && !changed) { state.notice = 'Header is already saved.'; state.formDrafts.delete(specialFormKey(form)); return; }
+        if (header && !changed) { state.notice = noteOnly ? 'Note is already saved.' : 'Header is already saved.'; state.formDrafts.delete(specialFormKey(form)); return; }
         state.detail=await api(`/api/sales/special-stock-requests/${detail.id}/${header ? 'header' : 'fulfillment'}`,{method:header ? 'PUT' : 'POST',body:JSON.stringify({
           ...values,expectedRevision:expected,...(!header && ['applying','attention'].includes(change?.status)?{changeId:change.id}:{})
         })});
-        if(state.soDraft) for(const field of ['fulfillmentMethod','deliveryAddress','deliveryContactName','deliveryContactPhone','deliveryDate','windowStart','windowEnd','deliveryInstructions']) state.soDraft[field]=state.detail[field];
-        state.formDrafts.delete('data-special-so-form:');state.notice=header ? 'Header saved. Request status and stock checks are kept.' : 'Delivery method saved.';
+        if (!noteOnly) {
+          if(state.soDraft) for(const field of ['fulfillmentMethod','deliveryAddress','deliveryContactName','deliveryContactPhone','deliveryDate','windowStart','windowEnd','deliveryInstructions','deliveryFeeRate']) state.soDraft[field]=state.detail[field];
+          state.formDrafts.delete('data-special-so-form:');
+        }
+        const methodChanged = detail.fulfillmentMethod !== state.detail?.fulfillmentMethod;
+        state.notice=noteOnly ? 'Note saved.' : header ? 'Header saved. Request status and stock checks are kept.' : 'Delivery method saved.';
+        if (methodChanged) state.notice = header ? 'Header saved. SCM and Dispatch alerted.' : 'Delivery method saved. SCM and Dispatch alerted.';
       } else if (form.matches('[data-special-quantity-form]') && state.detail) {
         state.detail = await api(`/api/sales/special-stock-requests/${state.detail.id}/quantity-change`, { method: 'POST', body: JSON.stringify({
           expectedRevision: state.detail.revision, palletTotal: /** @type {HTMLInputElement} */ (form.querySelector('[name=palletTotal]')).value,
           palletRate: /** @type {HTMLInputElement|null} */ (form.querySelector('[name=palletRate]'))?.value,
-          lines: [.../** @type {NodeListOf<HTMLElement>} */ (form.querySelectorAll('[data-special-material]'))].map(element => ({
-            caseLineId: Number(element.dataset.specialMaterial), quantity: /** @type {HTMLInputElement} */ (element.querySelector('[name=quantity]')).value,
-            discountPercent: /** @type {HTMLInputElement} */ (element.querySelector('[name=discountPercent]')).value
-          }))
+          lines: [.../** @type {NodeListOf<HTMLElement>} */ (form.querySelectorAll('[data-special-material]'))].map(element => {
+            const caseLineId = Number(element.dataset.specialMaterial);
+            if (/** @type {HTMLInputElement|null} */ (element.querySelector('[data-special-adjustment-remove]'))?.checked) return {caseLineId,remove:true};
+            const saved = /** @type {Record<string,any>} */ (state.detail?.lines.find(line => line.id === caseLineId));
+            const values = Object.fromEntries([...element.querySelectorAll('input[name], select[name], textarea[name]')].map(input => { const field = /** @type {HTMLInputElement} */ (input); return [field.name, field.value]; }));
+            const fields = changedSpecialLineFields(values, saved, { sales: true });
+            return { caseLineId, ...fields, quantity: values.quantity, discountPercent: values.discountPercent };
+          })
         }) });
-        state.soDraft = null; state.notice = 'Order adjustment sent to SCM for confirmation.';
+        state.soDraft = null; state.adjustmentEditing = false; state.notice = 'Order adjustment sent to SCM for confirmation.';
       } else if (form.matches("[data-special-link-so-form]")) {
         const values = Object.fromEntries(new FormData(form));
         state.detail = await api(`/api/sales/special-stock-requests/${state.detail.id}/sales-order/link`, {
-          method: "POST", body: JSON.stringify({ expectedRevision: state.detail.revision, salesOrderId: Number(values.salesOrderId), salesOrderRef: values.salesOrderRef })
+          method: "POST", body: JSON.stringify({ expectedRevision: state.detail.revision, salesOrderRef: values.salesOrderRef })
         });
       } else if (form.matches("[data-special-close-form]")) {
         const values = Object.fromEntries(new FormData(form));
@@ -1082,11 +1123,18 @@
     } finally {
       state.busy = false; busyUI?.end();
       render();
-      if (queue?.pending && !editing()) void load();
     }
   });
 
   mount.addEventListener("click", async (event) => {
+    const apply = event.target.closest('[data-special-apply-vendors], [data-yard-filter-apply="storeLocationIds"], [data-special-apply-stages]');
+    if (apply) {
+      if (!active() || state.busy || state.confirmingAddItems || apply.disabled) return;
+      apply.closest('details')?.removeAttribute('open');
+      try { await load({selectedId: null, force: true}); }
+      catch (error) { state.error = error.message; render(); }
+      return;
+    }
     if (event.target.closest('[data-special-clear-vendors]')) { state.vendorNames=[];await load({selectedId:null});return; }
     if (event.target.closest('[data-yard-filter-clear="storeLocationIds"]')) { state.storeLocationIds = []; await load({selectedId: null}); return; }
     if (event.target.closest('[data-special-clear-stages]')) { state.stages = []; await load({ selectedId: null }); return; }
@@ -1130,6 +1178,15 @@
         state.caseEditDraft = null; state.caseEditSource = null;
         state.formDrafts.delete('data-special-case-edit-form:'); return render();
       }
+      if (action === 'edit-adjustment' && state.detail) {
+        state.adjustmentEditing = true; state.error = ''; state.notice = ''; return render();
+      }
+      if (action === 'cancel-adjustment') {
+        state.adjustmentEditing = false; state.error = '';
+        state.formDrafts.delete('data-special-quantity-form:');
+        render();
+        /** @type {HTMLButtonElement|null} */ (mount.querySelector('[data-special-sales-action="edit-adjustment"]'))?.focus(); return;
+      }
       if (action === 'add-items') {
         if (state.formDrafts.has('data-special-fulfillment-form:')) throw new Error('Save header before adding items.');
         state.confirmingAddItems = true;
@@ -1142,6 +1199,7 @@
       if (action === 'remove-added-line' && state.addItemsDraft) { syncAddedItemsFromDom(); state.addItemsDraft.lines.splice(Number(button.dataset.index),1); state.formDrafts.delete('data-special-add-items-form:'); return render(); }
       if (action === 'cancel-add-items') { state.addItemsDraft = null; state.formDrafts.delete('data-special-add-items-form:'); return render(); }
       if (action === 'reload-header') { state.formDrafts.delete('data-special-fulfillment-form:'); state.error = ''; state.notice = ''; return render(); }
+      if (action === 'reload-note') { state.formDrafts.delete('data-special-note-form:'); state.error = ''; state.notice = ''; return render(); }
       if (action === 'reload-internal-remark') { state.formDrafts.delete('data-special-internal-remark-form:'); state.error = ''; state.notice = ''; return render(); }
       if (action === "cancel-compose") { state.detail = state.copySource || state.detail; state.copySource = null; state.composer = null; state.notice = ''; state.formDrafts.clear(); return render(); }
       if (action === "add-case-line") { syncCaseComposerFromDom(); state.composer.lines.push(newLine()); return render(); }
@@ -1179,9 +1237,8 @@
       }
       if (action === "choose-so-link") {
         const form = mount.querySelector("[data-special-link-so-form]");
-        form.querySelector("[name=salesOrderId]").value = button.dataset.orderId;
         form.querySelector("[name=salesOrderRef]").value = button.dataset.orderRef;
-        form.querySelector("[data-special-so-link-search]").value = button.dataset.orderRef;
+        rememberSpecialForm(state.formDrafts, /** @type {HTMLFormElement} */ (form));
         replaceSuggestions("[data-special-so-link-suggestions]", "");
         return;
       }
@@ -1221,7 +1278,6 @@
     } finally {
       state.busy = false; busyUI?.end();
       render();
-      if (queue?.pending && !editing()) void load();
     }
   });
 
@@ -1242,18 +1298,21 @@
         busyUI = installSpecialBusyState(mount, { getDetail: () => state.detail, getLocalBusy: () => state.busy });
       }
       ({ SPECIAL_STAGES, stageFilterHtml, specialStockAvailable } = await workflowReady);
+      ({ isSpecialTransferEta, specialSupplyEtaLabel } = await transferEtaReady);
       ({ specialInformationPanel } = await informationReady);
       ({ yardFilterHtml } = await yardFilterReady);
       ({ vendorFilterHtml } = await vendorFilterReady);
       ({ specialItemDescription } = await lineDetailsReady);
+      ({ specialLineFields, specialLineFieldValues, specialAdjustmentFieldSummary, changedSpecialLineFields, defaultSpecialLineRequiredDate } = await lineFieldsReady);
       ({ specialRequestPalletLine, savedSpecialDeliveryFee } = await palletDisplayReady);
       ({ defaultSpecialExpiry } = await expiryReady);
       ({ specialFormKey, rememberSpecialForm, restoreSpecialForms, preserveSpecialScroll } = await formsReady);
       ({ canAddSpecialItems, copySpecialRequestDraft, confirmSpecialAddItems } = await requestActionsReady);
       ({ canEditSpecialCaseLines, specialCaseEditDraft, planSpecialCaseEdits, confirmSpecialCaseRestart, revokeSpecialLineDecision } = await caseEditsReady);
-      ({ specialLineNotes, specialRequestLineNotes } = await lineNotesReady);
+      ({ specialLineNotes } = await lineNotesReady);
       ({ specialDiscountLineSubtotal: specialLineSubtotal, specialNativeLinePricing: specialNativePricing, earliestSpecialDeliveryDate } = await pricingReady);
       state.operator = operator || state.operator;
+      if (!state.detail && new URLSearchParams(location.search).get('requestRef')) state.search = new URLSearchParams(location.search).get('requestRef');
       state.yards = yards || state.yards;
       if (state.enabled !== null) { render(); if (state.enabled) await load(); return; }
       state.loading = true;

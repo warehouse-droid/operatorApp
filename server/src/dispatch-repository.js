@@ -75,17 +75,6 @@ const SCM_VRMA_OWN_YARDS = [
 const SCM_VRMA_OWN_YARD_CODES = new Set(SCM_VRMA_OWN_YARDS.map((yard) => yard.code));
 const SCM_VRMA_FALLBACK_UNITS = new Set(["PLT", "SQFT", "PC"]);
 
-function exactBilledSalesOrderSql(alias) {
-  return `(
-    UPPER(BTRIM(COALESCE(${alias}.status, ''))) = 'G'
-    OR UPPER(REGEXP_REPLACE(
-         REGEXP_REPLACE(BTRIM(COALESCE(${alias}.status_text, '')), '\\s*:\\s*', ':', 'g'),
-         '\\s+', ' ', 'g'
-       ))
-       IN ('BILLED', 'SALES ORDER:BILLED')
-  )`;
-}
-
 function netSuitePendingApprovalSql(alias) {
   if (!/^[A-Za-z_][A-Za-z0-9_]*$/.test(String(alias || ""))) {
     throw new TypeError("A safe NetSuite order SQL alias is required.");
@@ -94,36 +83,6 @@ function netSuitePendingApprovalSql(alias) {
     UPPER(BTRIM(COALESCE(${alias}.status, ''))) = 'A'
     OR COALESCE(${alias}.status_text, '') ~*
       '^[[:space:]]*((sales|purchase|transfer)[[:space:]]+order[[:space:]]*:[[:space:]]*)?pending([[:space:]]+supervisor)?[[:space:]]+approval[[:space:]]*$'
-  )`;
-}
-
-function billedSalesOrderFamilySql(alias) {
-  return `(
-    ${exactBilledSalesOrderSql(alias)}
-    OR EXISTS (
-      SELECT 1
-        FROM dispatch_scm_so_splits family_membership
-        JOIN sales_orders billed_source
-          ON billed_source.netsuite_id = family_membership.source_so_id
-       WHERE (
-         family_membership.source_so_id = ${alias}.netsuite_id
-         OR family_membership.split_so_id = ${alias}.netsuite_id
-       )
-         AND ${exactBilledSalesOrderSql("billed_source")}
-    )
-    OR EXISTS (
-      SELECT 1
-        FROM dispatch_scm_so_splits family_membership
-        JOIN dispatch_scm_so_splits billed_membership
-          ON billed_membership.source_so_id = family_membership.source_so_id
-        JOIN sales_orders billed_split
-          ON billed_split.netsuite_id = billed_membership.split_so_id
-       WHERE (
-         family_membership.source_so_id = ${alias}.netsuite_id
-         OR family_membership.split_so_id = ${alias}.netsuite_id
-       )
-         AND ${exactBilledSalesOrderSql("billed_split")}
-    )
   )`;
 }
 
@@ -757,7 +716,6 @@ export async function listDispatchOrders({
         CASE WHEN $2::boolean AND COALESCE(is_test_fixture, false) THEN true ELSE netsuite_active END AS netsuite_active
       FROM sales_orders
       WHERE sales_order_type <> '${CUSTOMER_PICKUP_DELIVERY_METHOD.replaceAll("'", "''")}'
-        AND ($11::boolean OR NOT ${billedSalesOrderFamilySql("sales_orders")})
         AND NOT ${netSuiteClosedOrderFamilySql("sales_orders", "SO")}
         AND (COALESCE(is_test_fixture, false) = false OR $2::boolean)
         AND (
@@ -1269,6 +1227,8 @@ export async function listDispatchOrders({
           'lineId', l.line_id,
           'netSuiteLineSequence', l.netsuite_line_sequence,
           'itemId', l.item_id,
+          'netsuiteDestinationLocationId', COALESCE(l.location_id, o.destination_location_id),
+          'netsuiteDestinationYard', COALESCE(NULLIF(l.location, ''), o.destination_location),
           'destinationLocationId', COALESCE(
             ${scmScheduleDestinationLocationIdSql("scm.dropoff_point")},
             l.location_id,
@@ -3473,6 +3433,7 @@ export async function listScmSchedule({
   audience = "scm"
 } = {}) {
   const globalSearch = String(search || "").trim().toLowerCase();
+  const searchAcrossOrders = Boolean(globalSearch) && String(audience).trim().toLowerCase() === "schedule_search";
   const kindFilters = normalizeScmScheduleFilterValues(kind).map((kind) => {
     const rawKind = kind.toUpperCase();
     return rawKind === "SP.O" ? "Sp.O" : rawKind;
@@ -3498,7 +3459,7 @@ export async function listScmSchedule({
     String(to || "").trim() || null,
     cleanView,
     cleanExactRef,
-    String(audience || "").trim().toLowerCase() !== "operations",
+    searchAcrossOrders || !["operations", "schedule_search"].includes(String(audience || "").trim().toLowerCase()),
     String(queuedFrom || "").trim() || null,
     String(queuedTo || "").trim() || null,
     String(pickup || "").trim().toLowerCase(),
@@ -3512,7 +3473,8 @@ export async function listScmSchedule({
     normalizeScmScheduleOptionalNumber(slaMin),
     normalizeScmScheduleOptionalNumber(slaMax),
     includeCompleted,
-    cleanExactRefs
+    cleanExactRefs,
+    searchAcrossOrders
   ];
   const result = await query(
     `
@@ -3636,11 +3598,17 @@ export async function listScmSchedule({
       LEFT JOIN purchase_order_lines l ON l.purchase_order_id = po.netsuite_id AND l.netsuite_active = true
       LEFT JOIN active_po_split_alloc split_alloc ON split_alloc.source_line_id = l.id
       WHERE (po.netsuite_active = true OR $24::boolean)
-        AND NOT EXISTS (
+        AND ($26::boolean OR NOT EXISTS (
+          SELECT 1
+            FROM dispatch_scm_po_splits cancelled_split
+           WHERE cancelled_split.split_po_id = po.netsuite_id
+             AND cancelled_split.status = 'cancelled'
+        ))
+        AND ($26::boolean OR NOT EXISTS (
           SELECT 1
             FROM closed_po_family_ids closed_family
            WHERE closed_family.netsuite_id = po.netsuite_id
-        )
+        ))
         AND (
           ($10 = '' AND cardinality($25::text[]) = 0)
           OR lower(po.tranid) = lower($10)
@@ -3769,11 +3737,11 @@ export async function listScmSchedule({
         ON receiving_location.transfer_order_id = t.netsuite_id
        AND receiving_location.line_stage = 'receiving'
 	      WHERE (t.netsuite_active = true OR $24::boolean)
-	        AND NOT EXISTS (
+	        AND ($26::boolean OR NOT EXISTS (
 	          SELECT 1
 	            FROM closed_to_family_ids closed_family
 	           WHERE closed_family.netsuite_id = t.netsuite_id
-	        )
+	        ))
         AND COALESCE(t.to_location_id, receiving_location.location_id) IS NOT NULL
         AND ($10 = '' OR lower(t.tranid) = lower($10))
       GROUP BY t.netsuite_id,
@@ -4229,12 +4197,14 @@ export async function listScmSchedule({
     WHERE (cardinality($25::text[]) = 0 OR lower(b.order_ref) = ANY($25::text[]))
       AND ($1 = '' OR lower(concat_ws(' ', b.order_ref, b.source_ref, b.dispatch_ref, b.party, b.pickup_point, b.dropoff_point, b.brand, b.content, s.remark_override, CASE WHEN b.order_kind IN ('PO', 'TO') THEN b.source_memo ELSE NULL END, s.packing_slip_ref, s.group_ref)) LIKE '%' || $1 || '%')
       AND (
-        $9 = 'blanket'
+        $26::boolean
+        OR $9 = 'blanket'
         OR NOT COALESCE(b.is_blanket_po, false)
         OR COALESCE(s.reconciliation_blocked, false)
         OR reconciliation_projection.reconciliation_status = 'review'
       )
       AND ($9 <> 'blanket' OR b.order_kind = 'PO')
+      AND (NOT $26::boolean OR LOWER(BTRIM(effective_status.status)) <> 'hold')
       AND (
         $11::boolean
         OR (
@@ -7493,6 +7463,7 @@ export async function createScmPurchaseOrderSplit({
   newPoRef = "",
   pickupPoint = "",
   destinationLocationId = null,
+  retainNetSuiteDestination = false,
   status = "Hold",
   remarkOverride = "",
   lines = [],
@@ -7503,6 +7474,9 @@ export async function createScmPurchaseOrderSplit({
 } = {}) {
   const sourceRef = String(sourcePoRef || "").trim();
   const splitRef = String(newPoRef || "").trim();
+  if (typeof retainNetSuiteDestination !== "boolean") {
+    throw Object.assign(new Error("Retain NetSuite destination must be true or false."), { status: 400 });
+  }
   if (!sourceRef) throw new Error("Blanket PO is required.");
   if (!splitRef) throw new Error("New PO ref number is required.");
   if (sourceRef.toLowerCase() === splitRef.toLowerCase()) throw new Error("New PO ref must be different from the blanket PO.");
@@ -7535,12 +7509,13 @@ export async function createScmPurchaseOrderSplit({
     );
     const source = sourceOrder.rows[0];
     if (!source) throw new Error(`Blanket PO ${sourceRef} was not found.`);
-    const splitDestinationLocationId = normalizeScmDestinationLocationId(destinationLocationId)
+    let splitDestinationLocationId = normalizeScmDestinationLocationId(destinationLocationId)
       || requestedLines.map((line) => line.destinationLocationId).find(Boolean)
       || normalizeScmDestinationLocationId(source.destination_location_id)
       || normalizeScmDestinationLocationId(source.destination_location);
-    if (!splitDestinationLocationId) throw new Error("Destination yard is required for the split PO.");
-    const splitDestinationLocation = locationTextFromId(splitDestinationLocationId);
+    if (!retainNetSuiteDestination && !splitDestinationLocationId) {
+      throw new Error("Destination yard is required for the split PO.");
+    }
     const selectedPickupYard = String(pickupPoint || "").trim()
       ? await resolveScmPurchaseOrderPickupYard(query, source, pickupPoint)
       : null;
@@ -7717,7 +7692,15 @@ export async function createScmPurchaseOrderSplit({
       if (salesQty > salesRemaining + 0.000001) {
         throw new Error(`${label}: blanket PO only has ${salesRemaining} ${sourceLine.unit || "UOM"} remaining.`);
       }
-      const lineDestinationLocationId = request.destinationLocationId || splitDestinationLocationId;
+      const lineDestinationLocationId = retainNetSuiteDestination
+        ? normalizeScmDestinationLocationId(sourceLine.location_id)
+          || normalizeScmDestinationLocationId(sourceLine.location)
+          || normalizeScmDestinationLocationId(source.destination_location_id)
+          || normalizeScmDestinationLocationId(source.destination_location)
+        : request.destinationLocationId || splitDestinationLocationId;
+      if (!lineDestinationLocationId) {
+        throw new Error(`${label}: NetSuite destination is missing. Choose a destination yard for the split PO.`);
+      }
       const lineDestinationLocation = locationTextFromId(lineDestinationLocationId);
       selected.push({
         sourceLine,
@@ -7735,6 +7718,8 @@ export async function createScmPurchaseOrderSplit({
       });
     }
 
+    if (retainNetSuiteDestination) splitDestinationLocationId = selected[0].destinationLocationId;
+    const splitDestinationLocation = locationTextFromId(splitDestinationLocationId);
     let splitOrderId = extendingSplit?.split_po_id || null;
     let split = extendingSplit;
     if (!split) {
@@ -7801,6 +7786,7 @@ export async function createScmPurchaseOrderSplit({
             ...(details || {}),
             pickupPoint: splitPickupPoint,
             pickupAddress: splitPickupAddress,
+            retainNetSuiteDestination,
             destinationLocationId: splitDestinationLocationId,
             destinationLocation: splitDestinationLocation
           })
@@ -7818,7 +7804,8 @@ export async function createScmPurchaseOrderSplit({
        )
        ON CONFLICT (order_kind, order_ref) DO UPDATE SET
          pickup_point = COALESCE(EXCLUDED.pickup_point, scm_transport_schedule.pickup_point),
-         dropoff_point = COALESCE(NULLIF(scm_transport_schedule.dropoff_point, ''), EXCLUDED.dropoff_point),
+         dropoff_point = CASE WHEN $9::boolean AND NOT $8::boolean THEN EXCLUDED.dropoff_point
+           ELSE COALESCE(NULLIF(scm_transport_schedule.dropoff_point, ''), EXCLUDED.dropoff_point) END,
          brand = COALESCE(scm_transport_schedule.brand, EXCLUDED.brand),
          packing_slip_ref = COALESCE(NULLIF(scm_transport_schedule.packing_slip_ref, ''), EXCLUDED.packing_slip_ref),
          status = CASE WHEN $8::boolean THEN scm_transport_schedule.status ELSE EXCLUDED.status END,
@@ -7829,12 +7816,13 @@ export async function createScmPurchaseOrderSplit({
       [
         splitRef,
         splitPickupPoint,
-        splitDestinationLocation,
+        retainNetSuiteDestination ? "" : splitDestinationLocation,
         selectedPickupYard?.vendor || "",
         splitInitialStatus,
         splitRemarkOverride || "",
         createdBy || null,
-        Boolean(extendingSplit)
+        Boolean(extendingSplit),
+        retainNetSuiteDestination
       ]
     );
     const createdLines = [];
@@ -8002,6 +7990,7 @@ export async function createScmPurchaseOrderSplit({
         sourcePoId: source.netsuite_id,
         splitPoRef: splitRef,
         splitPoId: splitOrderId,
+        retainNetSuiteDestination,
         destinationLocationId: splitDestinationLocationId,
         destinationLocation: splitDestinationLocation,
         pickupPoint: splitPickupPoint,

@@ -56,6 +56,7 @@ function buildConfig(env) {
     port: Number(env.PORT || 3000),
     appBaseUrl: env.APP_BASE_URL || "http://localhost:3000",
     databaseUrl: env.DATABASE_URL,
+    mbr: { enabled: booleanValue(env.MBR_CONTRACTS_ENABLED, false) },
     googleMapsApiKey: googleMapsServerApiKey,
     googleMaps: {
       serverApiKey: googleMapsServerApiKey,

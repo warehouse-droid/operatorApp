@@ -1,0 +1,14 @@
+{
+  "compilerOptions": {
+    "allowJs": true,
+    "checkJs": true,
+    "noEmit": true,
+    "module": "NodeNext",
+    "moduleResolution": "NodeNext",
+    "target": "ES2023",
+    "skipLibCheck": true,
+    "strictNullChecks": true,
+    "types": ["node"]
+  },
+  "files": ["../src/driver-upload-failure.js", "support/driver-upload-types.ts"]
+}

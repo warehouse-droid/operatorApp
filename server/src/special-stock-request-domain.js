@@ -1,3 +1,5 @@
+import { SPECIAL_LINE_SCM_FIELDS } from '../public/special-stock-line-fields.js';
+import { SPECIAL_TRANSFER_ETA_MODE } from '../public/special-stock-transfer-eta.js';
 import { normalizeSpecialExpiry } from '../public/special-stock-expiry.js';
 import { normalizeSpecialSalesInternalRemark } from '../public/special-stock-internal-remark.js';
 import { specialStage } from '../public/special-stock-workflow.js';
@@ -108,17 +110,19 @@ export function minimumSpecialCaseRequiredDate(now = new Date()) {
   return torontoCalendarDate(now);
 }
 
-function normalizeCaseLine(line, index, { minimumRequiredDate }) {
+/** @param {Record<string,any>} line @param {number} index @param {{minimumRequiredDate:string,workflowKind?:string,storeLocationId?:number}} options */
+function normalizeCaseLine(line, index, { minimumRequiredDate, workflowKind = 'special', storeLocationId = undefined }) {
   if (!line || typeof line !== "object" || Array.isArray(line)) {
     throw domainError(`Line ${index + 1} is invalid.`, "SPECIAL_CASE_LINES_INVALID");
   }
-  const uom = text(line.uom, {
+  const nativeUom = text(line.uom, {
     required: true,
     label: `Line ${index + 1} UOM`,
     max: 40,
     code: "SPECIAL_CASE_UOM_REQUIRED"
-  }).toUpperCase();
-  if (!SPECIAL_CASE_UOM_SET.has(uom)) {
+  });
+  const uom = workflowKind === 'backorder' ? nativeUom : nativeUom.toUpperCase();
+  if (workflowKind !== 'backorder' && !SPECIAL_CASE_UOM_SET.has(uom)) {
     throw domainError(
       `Line ${index + 1} UOM must be PLT, LYR, SEC, PCS, EACH, or SQFT.`,
       "SPECIAL_CASE_UOM_INVALID"
@@ -135,7 +139,10 @@ function normalizeCaseLine(line, index, { minimumRequiredDate }) {
       "SPECIAL_CASE_REQUIRED_DATE_TOO_SOON"
     );
   }
+  const unpriced = workflowKind === 'backorder' && (line.rate == null || line.rate === '');
   return {
+    ...(workflowKind === 'backorder' ? {regularItemId:positiveId(line.regularItemId, 'Regular inventory item'),regularItemCode:line.regularItemCode,
+      regularVendorId:optionalPositiveId(line.regularVendorId,'Material vendor'),destinationLocationId:positiveId(line.destinationLocationId ?? storeLocationId,'Material destination yard')} : {}),
     brand: text(line.brand, { max: 200 }),
     productName: text(line.productName, {
       required: true,
@@ -146,15 +153,15 @@ function normalizeCaseLine(line, index, { minimumRequiredDate }) {
     color: text(line.color, { max: 200 }),
     size: text(line.size, { max: 200 }),
     detailSpec: text(line.detailSpec, { max: 2000 }),
-    ...Object.fromEntries(["palletQty", "layerQty", "sectionQty", "pieceQty"].map(field => [field, finiteNumber(line[field] ?? 0, field, {allowZero:true,code:"SPECIAL_PACK_QUANTITY_INVALID"})])),
+    .../** @type {{palletQty:number,layerQty:number,sectionQty:number,pieceQty:number}} */ (Object.fromEntries(["palletQty", "layerQty", "sectionQty", "pieceQty"].map(field => [field, finiteNumber(line[field] ?? 0, field, {allowZero:true,code:"SPECIAL_PACK_QUANTITY_INVALID"})]))),
     quantity: finiteNumber(line.quantity, `Line ${index + 1} quantity`, {
       maximum: SPECIAL_CASE_MAX_QUANTITY,
       code: "SPECIAL_CASE_QUANTITY_INVALID"
     }),
     uom,
-    rate: normalizeSpecialRate(line.rate),
+    rate: unpriced ? null : normalizeSpecialRate(line.rate),
     discountPercent: normalizeSpecialDiscount(line.discountPercent),
-    subtotal: specialLineSubtotal(line.quantity, line.rate, line.discountPercent),
+    subtotal: unpriced ? null : specialLineSubtotal(line.quantity, line.rate, line.discountPercent),
     requiredDate,
     estimateLineReference: text(line.estimateLineReference, { max: 200 }),
     customerNote: text(line.customerNote, { max: 4_000 })
@@ -173,7 +180,7 @@ export function normalizeSpecialAdditionalLines(lines, {
   const earliestRequiredDate = isoDate(minimumRequiredDate, {
     required: true, label: 'Minimum required date', code: 'SPECIAL_CASE_REQUIRED_DATE_INVALID'
   });
-  return lines.map((line,index) => normalizeCaseLine(line,existingLineCount + index,{minimumRequiredDate:earliestRequiredDate}));
+  return lines.map((line,index) => normalizeCaseLine(line,existingLineCount + index,{minimumRequiredDate:/** @type {string} */ (earliestRequiredDate)}));
 }
 
 /** @param {{palletTotal?:unknown,palletRate?:unknown}} input */
@@ -186,9 +193,11 @@ export function normalizeSpecialQuotePallet(input = {}) {
   return { palletTotal, palletRate };
 }
 
+/** @param {Record<string,any>} input @param {{authorizedStoreLocationIds?:number[],minimumRequiredDate?:string,workflowKind?:string}} [options] */
 export function normalizeSpecialCaseDraft(input = {}, {
   authorizedStoreLocationIds = [],
-  minimumRequiredDate = minimumSpecialCaseRequiredDate()
+  minimumRequiredDate = minimumSpecialCaseRequiredDate(),
+  workflowKind = 'special'
 } = {}) {
   if (!input || typeof input !== "object" || Array.isArray(input)) {
     throw domainError("Special stock request data is required.", "SPECIAL_CASE_INVALID");
@@ -216,8 +225,8 @@ export function normalizeSpecialCaseDraft(input = {}, {
     netsuiteSalesRepId: optionalPositiveId(input.netsuiteSalesRep?.id, "NetSuite Sales Rep"),
     netsuiteSalesRepName: text(input.netsuiteSalesRep?.name, {max:500}),
     ...normalizeSpecialFulfillment(input),
-    ...normalizeSpecialQuotePallet(input),
-    deliveryFeeRate: normalizeSpecialDeliveryFee(input),
+    ...(workflowKind === 'backorder' ? {palletTotal:null,palletRate:null} : normalizeSpecialQuotePallet(input)),
+    deliveryFeeRate: workflowKind === 'backorder' ? null : normalizeSpecialDeliveryFee(input),
     inquiryDate: isoDate(input.inquiryDate, {
       required: true,
       label: "Inquiry date",
@@ -225,7 +234,7 @@ export function normalizeSpecialCaseDraft(input = {}, {
     }),
     customerId: optionalPositiveId(input.customerId, "Customer", "SPECIAL_CASE_CUSTOMER_INVALID"),
     customerName: text(input.customerName, {
-      required: true,
+      required: workflowKind !== 'backorder',
       label: "Customer name",
       max: 500,
       code: "SPECIAL_CASE_CUSTOMER_REQUIRED"
@@ -244,7 +253,7 @@ export function normalizeSpecialCaseDraft(input = {}, {
     remarks: text(input.remarks, { max: 8_000 }),
     salesInternalRemark: normalizeSpecialSalesInternalRemark(salesInternalRemark === undefined ? '' : salesInternalRemark),
     lines: input.lines.map((line, index) => normalizeCaseLine(line, index, {
-      minimumRequiredDate: earliestRequiredDate
+      minimumRequiredDate: /** @type {string} */ (earliestRequiredDate), workflowKind, storeLocationId
     }))
   };
 }
@@ -298,14 +307,12 @@ export function normalizeSpecialSupplyResponse(input = {}) {
   if (!SUPPLY_STATUSES.has(supplyStatus)) {
     throw domainError("Select a supported vendor supply status.", "SPECIAL_RESPONSE_STATUS_INVALID");
   }
-  const availabilityMode = text(input.availabilityMode).toLowerCase();
-  if (!AVAILABILITY_MODES.has(availabilityMode)) {
+  const transfer = supplyStatus === 'vendor_transfer';
+  const availabilityMode = transfer ? SPECIAL_TRANSFER_ETA_MODE : text(input.availabilityMode).toLowerCase();
+  if (!transfer && !AVAILABILITY_MODES.has(availabilityMode)) {
     throw domainError("Select a dated projection or no projection.", "SPECIAL_RESPONSE_AVAILABILITY_INVALID");
   }
-  const suppliedDate = text(input.availableDate);
-  if (supplyStatus === 'vendor_transfer' && (availabilityMode !== 'dated' || !suppliedDate)) {
-    throw domainError('An ETA is required for stock waiting for transfer.', 'SPECIAL_RESPONSE_DATE_REQUIRED');
-  }
+  const suppliedDate = transfer ? '' : text(input.availableDate);
   if (availabilityMode === "dated" && !suppliedDate) {
     throw domainError("An estimated available date is required.", "SPECIAL_RESPONSE_DATE_REQUIRED");
   }
@@ -318,6 +325,7 @@ export function normalizeSpecialSupplyResponse(input = {}) {
     ...(productName === undefined ? {} : { productName: text(productName, {
       required: true, label: 'Item name', max: 500, code: 'SPECIAL_RESPONSE_PRODUCT_REQUIRED'
     }) }),
+    corrections: Object.fromEntries(SPECIAL_LINE_SCM_FIELDS.filter(field => field !== 'productName' && Object.hasOwn(input, field)).map(field => [field, (/** @type {Record<string,any>} */ (input))[field]])),
     supplyStatus,
     availabilityMode,
     availableDate: availabilityMode === "dated"
@@ -400,6 +408,7 @@ export function normalizeSpecialSalesDecision(input = {}) {
   };
 }
 
+/** @param {Parameters<typeof specialStage>[0]&Record<string,any>} evidence */
 export function deriveSpecialCaseStage(evidence = {}) {
   return specialStage(evidence);
 }
@@ -475,19 +484,20 @@ function normalizeStagedMedia(media, index) {
   return { id, mimeType, byteSize };
 }
 
+/** @param {Record<string,any>} input */
 export function normalizeSpecialFulfillment(input = {}) {
   const fulfillmentMethod = text(input.fulfillmentMethod).toLowerCase();
   if (!FULFILLMENT_METHODS.has(fulfillmentMethod)) throw domainError('Select a delivery method.', 'SPECIAL_SO_FULFILLMENT_INVALID');
   const delivery = fulfillmentMethod === 'mbt_delivery';
-  const fields = { fulfillmentMethod };
-  for (const key of ['deliveryAddress', 'deliveryContactName', 'deliveryContactPhone']) {
+  const fields = /** @type {{fulfillmentMethod:string,deliveryAddress?:string|null,deliveryContactName?:string|null,deliveryContactPhone?:string|null,deliveryDate?:string|null,deliveryInstructions?:string|null,windowStart?:string|null,windowEnd?:string|null}} */ ({ fulfillmentMethod });
+  for (const key of /** @type {Array<'deliveryAddress'|'deliveryContactName'|'deliveryContactPhone'>} */ (['deliveryAddress', 'deliveryContactName', 'deliveryContactPhone'])) {
     fields[key] = delivery ? text(input[key], { required: key === 'deliveryAddress', label: key.replace(/([A-Z])/g, ' $1'), max: 2000, code: 'SPECIAL_SO_DELIVERY_REQUIRED' }) : null;
   }
   fields.deliveryDate = delivery ? isoDate(input.deliveryDate, { label: 'Delivery date' }) : null;
   fields.deliveryInstructions = delivery ? text(input.deliveryInstructions, { max: 8000 }) : null;
   fields.windowStart = delivery && text(input.windowStart) ? clockTime(input.windowStart, 'Window start') : null;
   fields.windowEnd = delivery && text(input.windowEnd) ? clockTime(input.windowEnd, 'Window end') : null;
-  if (Boolean(fields.windowStart) !== Boolean(fields.windowEnd) || (fields.windowStart && fields.windowStart >= fields.windowEnd)) {
+  if (Boolean(fields.windowStart) !== Boolean(fields.windowEnd) || (fields.windowStart && fields.windowStart >= (fields.windowEnd || ''))) {
     throw domainError('Provide a complete delivery window with end after start.', 'SPECIAL_SO_WINDOW_INVALID');
   }
   return fields;
@@ -530,7 +540,7 @@ export function normalizeSpecialSalesOrderDraft(input = {}, { now = new Date() }
     ancillaryLines.push({ itemId: 1784, description: 'PALLET', quantity: palletTotal, uom: 'EACH', rate: palletRate });
   }
   const mediaInput = input.media ?? [];
-  if (deliveryFeeRate != null) ancillaryLines.push(specialDeliveryFeeLine(deliveryFeeRate));
+  if (deliveryFeeRate > 0) ancillaryLines.push(specialDeliveryFeeLine(deliveryFeeRate));
   if (!Array.isArray(mediaInput)) throw domainError("Delivery media is invalid.", "SPECIAL_SO_MEDIA_INVALID");
   const media = mediaInput.map(normalizeStagedMedia);
 

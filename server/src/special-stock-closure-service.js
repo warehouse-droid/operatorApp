@@ -1,13 +1,13 @@
 import { withSpecialClosureReviewLock, claimSpecialClosureReview, saveSpecialClosurePlan,
   finishSpecialClosureReview, rejectSpecialClosureReview, failSpecialClosureReview,
   requestSpecialCaseClosure, getSpecialStockCase, closeSpecialCaseForClosedOrders } from './special-stock-request-repository.js';
-import { resolveSpecialOrderUnitsFromNetSuite, prepareSpecialClosurePlanInNetSuite, applySpecialClosurePlanInNetSuite, suiteqlAll } from './netsuite.js';
+import { prepareSpecialClosurePlanInNetSuite, applySpecialClosurePlanInNetSuite, suiteqlAll } from './netsuite.js';
 import { readSpecialClosedOrders } from './special-stock-closed-orders.js';
 
 export function createSpecialClosureService(dependencies = {}) {
   const deps = { withReviewLock: withSpecialClosureReviewLock, claimReview: claimSpecialClosureReview,
     savePlan: saveSpecialClosurePlan, finishReview: finishSpecialClosureReview, rejectReview: rejectSpecialClosureReview,
-    failReview: failSpecialClosureReview, resolveOrderUnits: resolveSpecialOrderUnitsFromNetSuite,
+    failReview: failSpecialClosureReview,
     preparePlan: prepareSpecialClosurePlanInNetSuite, applyPlan: applySpecialClosurePlanInNetSuite,
     requestCaseClosure: requestSpecialCaseClosure, getCase: getSpecialStockCase,
     readClosedOrders: detail=>readSpecialClosedOrders(detail,{queryAll:suiteqlAll}),
@@ -33,9 +33,9 @@ export function createSpecialClosureService(dependencies = {}) {
         let plan = claimed.closureReviewPlan;
         if (!plan) {
           const orders=[];
-          for (const [kind,id,lines] of [['sales_order',claimed.salesOrderId,claimed.salesOrderLines],['purchase_order',claimed.purchaseOrderId,claimed.purchaseOrderLines]]) {
+          for (const [kind,id] of [['sales_order',claimed.salesOrderId],['purchase_order',claimed.purchaseOrderId]]) {
             if (kind === 'purchase_order' && !id) continue;
-            orders.push({kind,id,lines:await deps.resolveOrderUnits(lines),discountCount:lines.filter(line=>line.nativeDiscountPercent>0).length});
+            orders.push({kind,id});
           }
           plan = await deps.preparePlan({orders});
         }

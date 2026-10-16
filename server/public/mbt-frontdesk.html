@@ -187,12 +187,13 @@
             <label class="mbt-field" for="chargeReturnAt"><span>Return date and time</span><input id="chargeReturnAt" type="datetime-local" required /></label>
           </div>
         </fieldset>
+        <label class="mbt-pricing-origin-choice" for="chargeOrderFrom150">
+          <input id="chargeOrderFrom150" type="checkbox" />
+          <span><strong>Order from 150</strong><small>Select only when ordering from yard 150. This pricing choice is independent of aggregate material.</small></span>
+        </label>
         <fieldset class="mbt-service-line">
           <legend>Aggregate material</legend>
-          <label class="mbt-pricing-origin-choice" for="chargeOrderFrom150">
-            <input id="chargeOrderFrom150" type="checkbox" />
-            <span><strong>Order from 150</strong><small>Required whenever aggregate travels with a bin. Combined bin work receives one $50 loading fee and no separate aggregate delivery fee.</small></span>
-          </label>
+          <p class="mbt-frontdesk-muted">Aggregate can be ordered from other yards. Combined bin work receives one $50 loading fee and no separate aggregate delivery fee.</p>
           <div id="aggregateLineEditor" class="mbt-surcharge-editor" aria-live="polite"></div>
           <button id="addAggregateLine" class="mbt-button-secondary" type="button">Add aggregate material</button>
         </fieldset>

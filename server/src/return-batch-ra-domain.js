@@ -1,4 +1,5 @@
 // @ts-check
+import { buildReturnCreditMemoPayload, verifyReturnCreditMemoSnapshot } from "./return-credit-memo.js";
 
 /** @param {string} message @param {string} [code] */
 function invalid(message, code = "RETURN_BATCH_INTENT_INVALID") {
@@ -90,6 +91,7 @@ export function buildReturnBatchIntent(records) {
 
 /** @param {Record<string, any>} intent */
 export function buildReturnBatchPayload(intent) {
+  if (intent.transactionType === "credit_memo") { return buildReturnCreditMemoPayload(intent); }
   const seen = new Set();
   const items = intent.lines.map((/** @type {Record<string, any>} */ line, /** @type {number} */ index) => {
     const linked = line.kind === "stock" && !seen.has(line.netSuiteOrderLine);
@@ -145,6 +147,7 @@ function verifyHeader(intent, snapshot, allowInactive) {
 
 /** @param {Record<string, any>} intent @param {Record<string, any>} snapshot @param {{allowInactive?: boolean}} [options] */
 export function verifyReturnBatchSnapshot(intent, snapshot, { allowInactive = false } = {}) {
+  if (intent.transactionType === "credit_memo") { return verifyReturnCreditMemoSnapshot(intent, snapshot, { allowInactive }); }
   verifyHeader(intent, snapshot, allowInactive);
   const actual = snapshot.item?.items;
   if (!Array.isArray(actual) || actual.length !== intent.lines.length) {throw mismatch("item rows were added, removed or merged.");}

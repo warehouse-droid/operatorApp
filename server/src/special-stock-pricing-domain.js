@@ -11,14 +11,18 @@ export function prepareSpecialMaterial(line, accepted) {
   if (Number(line.rate) !== originalRate) throw invalid('The original rate is locked. Use Discount % to offer a lower price.', 'SPECIAL_RATE_LOCKED');
   const legacy = accepted.pricingSource !== 'enquiry';
   const basisUom = accepted.rateUom || (legacy ? line.uom : accepted.uom);
+  const nativeSqft = basisUom === 'SQFT';
   const packageQuantity = line.packageQuantity ?? (legacy ? line.quantity : null);
   const conversionToPc = line.conversionToPc ?? (legacy && basisUom === line.uom ? 1 : null);
+  if (nativeSqft && Number(conversionToPc) !== 1) {
+    throw invalid('SQFT orders must retain their quoted SQFT quantity and rate.', 'SPECIAL_CONVERSION_MISMATCH');
+  }
   const discountPercent = normalizeSpecialDiscount(line.discountPercent ?? accepted.discountPercent);
   const native = specialNativeLinePricing({ quantity: packageQuantity, rate: originalRate, discountPercent, conversionToPc });
-  if (Number(line.quantity) !== native.quantity || (!legacy && line.uom !== 'PC')) {
+  if (Number(line.quantity) !== native.quantity || (!legacy && line.uom !== (nativeSqft ? 'SQFT' : 'PC'))) {
     throw invalid('SO quantity and unit must match the explicit PC conversion.', 'SPECIAL_CONVERSION_MISMATCH');
   }
-  return { ...line, ...native, uom: legacy && native.conversionToPc === 1 ? line.uom : 'PC', originalRate, basisUom, discountPercent };
+  return { ...line, ...native, uom: (nativeSqft || legacy) && native.conversionToPc === 1 ? line.uom : 'PC', originalRate, basisUom, discountPercent };
 }
 
 export function draftQuantityChanges(lines, acceptedById) {

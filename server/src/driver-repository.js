@@ -2718,7 +2718,17 @@ function driverJobRecordDetails(job = {}, { driverRemark, completionContext = nu
   return details;
 }
 
-export async function startDriverJob(driverLogin, jobIdValue, {
+/** Driver start and Control reopen share a transaction boundary for order execution.
+ * @param {any} driverLogin @param {any} jobIdValue @param {any} [options]
+ */
+export async function startDriverJob(driverLogin, jobIdValue, options = {}) {
+  return withTransaction(async () => {
+    await query("SELECT pg_advisory_xact_lock(hashtext($1))", [DISPATCH_FLEET_PLANNING_LOCK]);
+    return startDriverJobUnlocked(driverLogin, jobIdValue, options);
+  });
+}
+
+async function startDriverJobUnlocked(driverLogin, jobIdValue, {
   job = null,
   occurredAt = null,
   offlineTrace = null

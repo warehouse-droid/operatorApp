@@ -709,6 +709,10 @@ function scmScheduleQuery() {
   const params = new URLSearchParams();
   const search = String(scmScheduleFilters.search || "").trim();
   if (search) params.set("search", search);
+  if (scmScheduleSearchesAcrossOrders()) {
+    if (scmScheduleDispatchHost) params.set("surface", "dispatch");
+    return `?${params.toString()}`;
+  }
   Object.entries(scmScheduleFilters).forEach(([key, value]) => {
     if (key === "search") return;
     if (key === "status" && search && scmScheduleCanViewRestrictedOrders()) return;
@@ -757,8 +761,9 @@ async function loadScmSchedule() {
     ]);
     if (requestId !== scmScheduleLoadRequestId) return;
     const schedule = normalizeScmSchedulePayload(schedulePayload);
-    scmScheduleRows = schedule.rows.filter((row) =>
-      scmScheduleCanViewRestrictedOrders() || !scmScheduleIsRestrictedOrder(row));
+    scmScheduleRows = schedule.rows.filter((row) => scmScheduleSearchesAcrossOrders()
+      ? scmScheduleEffectiveStatus(row).trim().toLowerCase() !== "hold"
+      : scmScheduleCanViewRestrictedOrders() || !scmScheduleIsRestrictedOrder(row));
     scmScheduleMeta = schedule.meta;
     scmSchedulePresets = presets;
     const validRowIds = new Set(scmScheduleRows.filter((row) => !scmScheduleNeedsReconciliationReview(row)).map(scheduleRowId));
@@ -844,6 +849,11 @@ function scmScheduleCanCompleteVrma() {
 function scmScheduleCanViewRestrictedOrders() {
   const roles = scmScheduleRoles();
   return ["admin", "scm", "scm_staff"].some((role) => roles.has(role));
+}
+
+function scmScheduleSearchesAcrossOrders() {
+  return Boolean(String(scmScheduleFilters.search || "").trim())
+    && (scmScheduleSalesHost || scmScheduleDispatchHost || scmScheduleRoles().has("dispatcher"));
 }
 
 function scmScheduleIsRestrictedOrder(row = {}) {
@@ -1280,7 +1290,7 @@ function scmScheduleReviewCount() {
 
 function scmScheduleDisplayRows({ useDrafts = false } = {}) {
   let rows = scmScheduleRows;
-  if (scmScheduleReviewOnly) rows = rows.filter(scmScheduleNeedsReconciliationReview);
+  if (scmScheduleReviewOnly && !scmScheduleSearchesAcrossOrders()) rows = rows.filter(scmScheduleNeedsReconciliationReview);
   const elements = useDrafts ? new Map([...scmScheduleApp.querySelectorAll(".scm-sheet-row")]
     .map((element) => [element.dataset.scheduleRow, element])) : new Map();
   const values = new Map(rows.map((row) => [row, scmScheduleSorts.map(({ key }) =>
@@ -1350,7 +1360,8 @@ function scmScheduleNumberFilterMatches(value, minimum, maximum) {
 }
 
 function scmScheduleRowMatchesCurrentFilters(row = {}) {
-  if (!scmScheduleCanViewRestrictedOrders() && scmScheduleIsRestrictedOrder(row)) return false;
+  const searchAcrossOrders = scmScheduleSearchesAcrossOrders();
+  if (!searchAcrossOrders && !scmScheduleCanViewRestrictedOrders() && scmScheduleIsRestrictedOrder(row)) return false;
   const effectiveStatus = scmScheduleEffectiveStatus(row);
   const search = String(scmScheduleFilters.search || "").trim().toLowerCase();
   if (search) {
@@ -1371,6 +1382,7 @@ function scmScheduleRowMatchesCurrentFilters(row = {}) {
     ].join(" ").toLowerCase();
     if (!searchable.includes(search)) return false;
   }
+  if (searchAcrossOrders) return effectiveStatus.trim().toLowerCase() !== "hold";
   const statuses = scmScheduleFilterValues(scmScheduleFilters.status);
   const searchAllStatuses = Boolean(search) && scmScheduleCanViewRestrictedOrders();
   if (!searchAllStatuses && statuses.length && !statuses.includes(effectiveStatus)) return false;

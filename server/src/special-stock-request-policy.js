@@ -1,4 +1,5 @@
 import { query } from "./db.js";
+import {assertBackorderLocalAction} from '../public/backorder-workflow.js';
 
 export const SPECIAL_STOCK_REQUEST_FLAG_KEY = "special_stock_request_workflow";
 export const SPECIAL_STOCK_TEST_SKIP_FLAG_KEY = 'special_stock_request_test_skip_orders';
@@ -31,7 +32,8 @@ async function getFlagPolicy(flagKey, queryFn) {
   };
 }
 
-export function assertSpecialStockRemoteOrderAllowed(detail) {
+export function assertSpecialStockRemoteOrderAllowed(detail, options = {}) {
+  assertBackorderLocalAction(detail, options);
   if (detail?.salesOrderSkipped || detail?.purchaseOrderSkipped) {
     throw policyError('This request contains a skipped test order. NetSuite order actions are unavailable.', 409, 'SPECIAL_TEST_ORDER_REMOTE_BLOCKED');
   }

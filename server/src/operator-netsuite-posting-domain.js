@@ -4,11 +4,40 @@ import { EXISTING_PICKUP_IF_STRATEGY } from './operator-pickup-existing-if-domai
 import crypto from "node:crypto";
 import { postingPhotoIdentity, validatePostingPhotos } from "./operator-netsuite-posting-photos.js";
 import { operatorKitError } from './operator-netsuite-posting-kits.js';
+import { isSqftPostingUnit, netSuitePostingQuantity, localReceiptNetSuiteQuantities } from './operator-netsuite-posting-quantity.js';
+import { operatorPostingPackEvidence, mergeOperatorPostingPackEvidence, operatorPostingPackFields } from './operator-netsuite-posting-packs.js';
+
+/** @param {any} available @param {boolean} direct @param {any} unit @param {number} quantity */
+function assertSelectedPostingAvailability(available, direct, unit, quantity) {
+  if (direct && isSqftPostingUnit(unit) && available.remainingQuantity === 0) {
+    throw inputError('The NetSuite SQFT source has no remaining quantity. Recover its existing posting before completing locally.');
+  }
+  if ((!direct || isSqftPostingUnit(unit)) && available.orderedQuantity !== null
+      && quantity > available.orderedQuantity + 0.000001) {
+    throw inputError('A selected quantity exceeds the authoritative NetSuite source-line quantity.');
+  }
+}
+
+/** @param {any} group @param {any} available @param {any} selected @param {boolean} direct @param {boolean} existingPickup */
+function planSelectedPostingQuantity(group, available, selected, direct, existingPickup) {
+  const salesUom = selected.salesUom || available.salesUom;
+  const postingQuantity = netSuitePostingQuantity(selected.quantity, available.remainingQuantity, salesUom);
+  assertSelectedPostingAvailability(available, direct, salesUom, postingQuantity);
+  assertExistingPickupAvailable(existingPickup, available);
+  const kitSelected = group.lineSnapshot.some((/** @type {any} */ line) => line.orderLine === available.orderLine && line.kit);
+  if (kitSelected && postingQuantity > available.remainingQuantity + 0.000001) {
+    throw operatorKitError('Combined kit allocations exceed the remaining source quantity.');
+  }
+  const authoritative = !direct && available.remainingQuantity !== null;
+  const postedQuantity = Number((authoritative ? Math.min(postingQuantity, available.remainingQuantity) : postingQuantity).toFixed(6));
+  return { salesUom, postingQuantity, authoritative, postedQuantity };
+}
 
 const REQUEST_ID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/iu;
 const SOURCE_ORDER_KINDS = new Set(["SO", "PO", "TO"]);
 /** @type {Readonly<Record<string, Set<string>>>} */
 const LOCAL_OPERATION_TYPES = Object.freeze({
+  transfer_background_posting: new Set(["transfer_order"]),
   delivery_consolidation_load: new Set(["consolidation_load"]),
   customer_pickup_load: new Set(["sales_order"]),
   receiving_receipt: new Set(["purchase_order", "transfer_order"]),
@@ -173,11 +202,13 @@ function normalizedSelectedLine(line) {
   return {
     orderLine: positiveInteger(line.orderLine, "NetSuite order line"),
     quantity: positiveQuantity(line.quantity),
+    ...operatorPostingPackEvidence(line.packQuantities),
     location: optionalLocation(line.location),
     localOrderKey: requiredText(line.localOrderKey, "Local order key"),
     localLineId: requiredText(line.localLineId, "Local line ID"),
     ...(sourceLineKey ? { sourceLineKey } : {}),
     ...(line.itemId ? { itemId: positiveInteger(line.itemId, 'Selected item ID') } : {}),
+    ...(optionalText(line.salesUom ?? line.unit) ? { salesUom: String(line.salesUom ?? line.unit).trim().toUpperCase() } : {}),
     ...(line.autoIncludedNonInventory === true ? { autoIncludedNonInventory: true,
       itemId: positiveInteger(line.itemId, 'Confirmed non-inventory item ID'),
       salesUom: requiredText(line.salesUom, 'Confirmed sales UOM').toUpperCase() } : {}),
@@ -198,7 +229,8 @@ function normalizedAvailableLine(line) {
     orderedQuantity: optionalNonNegativeQuantity(line.orderedQuantity, "Ordered NetSuite quantity"),
     completedQuantity: optionalNonNegativeQuantity(line.completedQuantity, "Completed NetSuite quantity"),
     remainingQuantity: optionalNonNegativeQuantity(line.remainingQuantity, "Remaining NetSuite quantity"),
-    linkedTransactions: normalizedLinkedTransactions(line.linkedTransactions)
+    linkedTransactions: normalizedLinkedTransactions(line.linkedTransactions),
+    ...(optionalText(line.salesUom ?? line.unit) ? { salesUom: String(line.salesUom ?? line.unit).trim().toUpperCase() } : {})
   };
 }
 
@@ -236,7 +268,8 @@ function mergeLocation(left, right) {
 function payloadItem(item) {
   const result = {
     orderLine: item.orderLine,
-    ...(item.selected ? { quantity: item.quantity, itemReceive: true } : { itemReceive: false }),
+    ...(item.selected ? { quantity: item.quantity, itemReceive: true,
+      ...operatorPostingPackFields(item.packQuantities) } : { itemReceive: false }),
     ...(item.location === null ? {} : { location: item.location })
   };
   return result;
@@ -247,6 +280,36 @@ function assertExistingPickupAvailable(existingPickup, available) {
   if (existingPickup && (available.remainingQuantity !== 0 || !available.linkedTransactions.length)) {
     throw inputError('An existing pickup IF must fully reconcile every confirmed line.');
   }
+}
+
+/** @param {Record<string,any>} input */
+function directTransferOperation(input) {
+  return input.localOperation?.kind==='transfer_background_posting' && input.localOperation.orderType==='transfer_order'
+    && input.functionKey==='receiving' && input.transactionType==='IR'
+    && input.targets?.length===1 && input.targets[0].sourceOrderKind==='TO';
+}
+
+/** @param {Record<string,any>} evidence */
+function directTransferLists(evidence) {
+  return Array.isArray(evidence.fulfillmentTransactionIds) && evidence.fulfillmentTransactionIds.length>0
+    && Array.isArray(evidence.driverOrderRefs) && evidence.driverOrderRefs.length>0;
+}
+
+/** @param {Record<string,any>} input */
+function normalizedDirectTransferEvidence(input) {
+  const evidence=input.directTransferEvidence;
+  if(!evidence){return null;}
+  if(!directTransferOperation(input) || !directTransferLists(evidence)) {
+    throw inputError('A system direct transfer receipt requires its saved transfer, Driver and verified IF evidence.');
+  }
+  const sourceNetSuiteId=positiveInteger(evidence.sourceNetSuiteId,'Direct transfer source');
+  if(sourceNetSuiteId!==Number(input.localOperation.orderId) || sourceNetSuiteId!==Number(input.targets[0].sourceNetSuiteId)) {
+    throw inputError('The direct transfer receipt source differs from its saved transfer.');
+  }
+  const driverOrderRefs=[...new Set(/** @type {string[]} */(evidence.driverOrderRefs.map((/** @type {unknown} */ ref)=>requiredText(ref,'Direct Driver order'))))];
+  if(driverOrderRefs.some(ref=>!/^SO/iu.test(ref))){throw inputError('Direct transfer completion must reference linked Sales Orders.');}
+  return {sourceNetSuiteId,driverOrderRefs:driverOrderRefs.sort(),fulfillmentTransactionIds:
+    [...new Set(/** @type {number[]} */(evidence.fulfillmentTransactionIds.map((/** @type {unknown} */ id)=>positiveInteger(id,'Verified transfer IF'))))].sort((a,b)=>a-b)};
 }
 
 /**
@@ -262,7 +325,9 @@ export function buildOperatorNetSuitePostingDraft(input = {}) {
   const requestId = String(input.requestId || "").trim().toLowerCase();
   operatorNetSuiteExternalId(requestId, 1);
   const systemReceipt = input.localOperation?.kind === 'direct_po_receipt';
-  const actorOperatorId = systemReceipt ? null : requiredText(input.actorOperatorId, "Operator ID");
+  const directTransferEvidence = normalizedDirectTransferEvidence(input);
+  const actorOperatorId = systemReceipt || (directTransferEvidence && (input.actorOperatorId === null || input.actorOperatorId === undefined))
+    ? null : requiredText(input.actorOperatorId, "Operator ID");
   const functionKey = requiredText(input.functionKey, "Operator function").toLowerCase();
   const transactionType = requiredText(input.transactionType, "NetSuite transaction type").toUpperCase();
   if (!['IF', 'IR'].includes(transactionType)) {throw inputError("NetSuite transaction type must be IF or IR.");}
@@ -345,6 +410,9 @@ export function buildOperatorNetSuitePostingDraft(input = {}) {
     for (const rawLine of availableLines) {
       const line = normalizedAvailableLine(rawLine);
       const current = group.availableByLine.get(line.orderLine);
+      if (current?.salesUom && line.salesUom && current.salesUom !== line.salesUom) {
+        throw inputError('One NetSuite source line cannot use conflicting sales units.');
+      }
       if (current
           && current.sourceLineKey !== line.sourceLineKey
           && !current.sourceLineAliases.some((/** @type {string} */ alias) => line.sourceLineAliases.includes(alias))) {
@@ -355,6 +423,7 @@ export function buildOperatorNetSuitePostingDraft(input = {}) {
         location: current ? mergeLocation(current.location, line.location) : line.location,
         sourceLineKey: current?.sourceLineKey || line.sourceLineKey,
         sourceLineAliases: normalizedAliases([current?.sourceLineAliases || [], line.sourceLineAliases]),
+        ...((current?.salesUom || line.salesUom) ? { salesUom: current?.salesUom || line.salesUom } : {}),
         orderedQuantity: current
           ? mergeOptionalQuantity(current.orderedQuantity, line.orderedQuantity, "ordered quantities")
           : line.orderedQuantity,
@@ -379,11 +448,19 @@ export function buildOperatorNetSuitePostingDraft(input = {}) {
         throw inputError("A selected stable source-line identity does not match its NetSuite REST line.");
       }
       const current = group.selectedByLine.get(line.orderLine);
+      if (line.salesUom && available.salesUom && line.salesUom !== available.salesUom) {
+        throw inputError('The selected sales unit does not match the NetSuite source line.');
+      }
+      if (current?.salesUom && line.salesUom && current.salesUom !== line.salesUom) {
+        throw inputError('One NetSuite selected line cannot use conflicting sales units.');
+      }
       group.selectedByLine.set(line.orderLine, {
         orderLine: line.orderLine,
         quantity: Number(((current?.quantity || 0) + line.quantity).toFixed(6)),
+        ...mergeOperatorPostingPackEvidence(current, line),
         location: current ? mergeLocation(current.location, line.location) : line.location,
-        sourceLineKey: current?.sourceLineKey || line.sourceLineKey || available.sourceLineKey
+        sourceLineKey: current?.sourceLineKey || line.sourceLineKey || available.sourceLineKey,
+        ...((line.salesUom || available.salesUom) ? { salesUom: line.salesUom || available.salesUom } : {})
       });
       group.lineSnapshot.push(line);
     }
@@ -410,19 +487,8 @@ export function buildOperatorNetSuitePostingDraft(input = {}) {
       const selected = group.selectedByLine.get(available.orderLine);
       if (!selected) {continue;}
       const requestedQuantity = selected.quantity;
-      assertExistingPickupAvailable(existingPickup, available);
-      const kitSelected = group.lineSnapshot.some((/** @type {any} */ line) => line.orderLine === available.orderLine && line.kit);
-      if (kitSelected && requestedQuantity > available.remainingQuantity + 0.000001) {
-        throw operatorKitError('Combined kit allocations exceed the remaining source quantity.');
-      }
-      if (!direct && available.orderedQuantity !== null
-          && requestedQuantity > available.orderedQuantity + 0.000001) {
-        throw inputError("A selected quantity exceeds the authoritative NetSuite source-line quantity.");
-      }
-      const authoritative = !direct && available.remainingQuantity !== null;
-      const postedQuantity = Number((authoritative
-        ? Math.min(requestedQuantity, available.remainingQuantity)
-        : requestedQuantity).toFixed(6));
+      const { salesUom, postingQuantity, authoritative, postedQuantity } =
+        planSelectedPostingQuantity(group, available, selected, direct, existingPickup);
       const reconciledQuantity = Number(Math.max(requestedQuantity - postedQuantity, 0).toFixed(6));
       postedByLine.set(available.orderLine, postedQuantity);
       const localLines = group.lineSnapshot
@@ -444,6 +510,10 @@ export function buildOperatorNetSuitePostingDraft(input = {}) {
         sourceLineAliases: available.sourceLineAliases,
         requestedQuantity,
         postedQuantity,
+        ...(salesUom ? { salesUom } : {}),
+        ...(postingQuantity !== requestedQuantity ? { roundingAdjustment: {
+          salesUom, requestedQuantity, netSuiteQuantity: postedQuantity
+        } } : {}),
         reconciledQuantity,
         authoritative,
         orderedQuantity: available.orderedQuantity,
@@ -518,7 +588,10 @@ export function buildOperatorNetSuitePostingDraft(input = {}) {
   };
   const localPayload = input.localPayload === undefined || input.localPayload === null
     ? null
-    : canonicalValue(input.localPayload);
+    : localReceiptNetSuiteQuantities(canonicalValue(input.localPayload), lineReconciliation.lines,
+      lineReconciliation.lines.filter(line => line.roundingAdjustment).map(line => ({
+        orderLine: line.orderLine, ...line.roundingAdjustment
+      })));
   const photoRefs = [...new Set((Array.isArray(input.photoRefs) ? input.photoRefs : [])
     .map((value) => String(value || "").trim())
     .filter(Boolean))].sort();
@@ -543,7 +616,13 @@ export function buildOperatorNetSuitePostingDraft(input = {}) {
     photoRefs: photoRefs.map(postingPhotoIdentity),
     claims,
     localOperation,
+    ...(localOperation.kind === 'transfer_background_posting' ? {transferEvidence: {
+      jobId: requiredText(input.transferEvidence?.jobId, 'Transfer posting job'),
+      operatorRecordId: positiveInteger(input.transferEvidence?.operatorRecordId, 'Operator completion record'),
+      completionEventId: positiveInteger(input.transferEvidence?.completionEventId, 'Driver completion event')
+    }} : {}),
     ...(directDeliveryEvidence ? {directDeliveryEvidence} : {}),
+    ...(directTransferEvidence ? {directTransferEvidence} : {}),
     localPayload,
     lineReconciliation,
     steps

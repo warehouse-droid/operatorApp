@@ -10,7 +10,6 @@ import {
   createSalesOrderInNetSuite,
   createSpecialDiscountSalesOrderInNetSuite,
   assertSpecialDiscountRestReady,
-  verifySpecialDiscountSalesOrderInNetSuite,
   fetchPurchaseOrderReferenceFromNetSuite,
   fetchSalesOrderReferenceFromNetSuite,
   findSpecialStockOrdersWithNativeLinkFromNetSuite,
@@ -20,6 +19,7 @@ import {
 import {
   buildSpecialPurchaseOrderPayload,
   buildSpecialSalesOrderPayload,
+  isDefinitiveSpecialOrderRejection,
   selectSpecialMarkerRecord
 } from "./special-stock-request-netsuite.js";
 import {
@@ -67,6 +67,7 @@ function locationCode(detail) {
 function salesDraft(detail) {
   return {
     customerId: detail.netsuiteCustomerId || detail.customerId,
+    remarks: detail.remarks,
     salesRepId: detail.netsuiteSalesRepId,
     operationalYardLocationId: detail.operationalYardLocationId,
     fulfillmentMethod: detail.fulfillmentMethod,
@@ -128,7 +129,6 @@ export function createSpecialStockRequestService(dependencies = {}) {
     createSalesOrder: createSalesOrderInNetSuite,
     createDiscountSalesOrder: createSpecialDiscountSalesOrderInNetSuite,
     assertDiscountReady: assertSpecialDiscountRestReady,
-    verifyDiscountSalesOrder: verifySpecialDiscountSalesOrderInNetSuite,
     transformEstimate: transformEstimateToSalesOrderInNetSuite,
     createPurchaseOrder: createPurchaseOrderInNetSuite,
     findLinkedPurchaseOrder: findSpecialLinkedPurchaseOrderInNetSuite,
@@ -160,6 +160,7 @@ export function createSpecialStockRequestService(dependencies = {}) {
   async function createSalesOrder(caseId, input = {}, context = {}) {
     const operationId = String(input.operationId || "");
     let claimed = null;
+    let remoteId = null;
     try {
       const before = await deps.getCase(caseId, { audience: "scm", authorizedStoreLocationIds: context.authorizedStoreLocationIds });
       assertSpecialStockRemoteOrderAllowed(before);
@@ -176,20 +177,21 @@ export function createSpecialStockRequestService(dependencies = {}) {
         netsuiteSalesRep: selectedRep,
         operationId
       }, context);
-      const location = await resolvedLocation(claimed);
       const recoveryInput = {
         findMarkerOrders: deps.findMarkerOrders,
         selectMarker: deps.selectMarker,
         caseId: claimed.id,
         orderKind: "sales_order",
-        entityId: claimed.netsuiteCustomerId || claimed.customerId,
-        locationId: location.netsuiteLocationId,
+        // The request marker identifies an existing SO even after NetSuite edits.
+        entityId: null,
+        locationId: null,
         sleep: deps.sleep
       };
       let match = await recoverMarker({ ...recoveryInput, attempts: 1 });
-      let remoteId = recordId(match?.id);
+      remoteId = recordId(match?.id);
       if (!remoteId) {
         if (claimed.salesOrderSubmissionStartedAt) throw serviceError('The SO submission already started. Its marker is not yet visible; recover again after NetSuite sync.', 'SPECIAL_REMOTE_OUTCOME_UNCERTAIN');
+        const location = await resolvedLocation(claimed);
         const payload = buildSpecialSalesOrderPayload({
           caseId: claimed.id,
           discountMode: claimed.salesDiscountMode || 'line',
@@ -220,6 +222,8 @@ export function createSpecialStockRequestService(dependencies = {}) {
           remoteId = recordId(match?.id);
         }
         if (!remoteId) {
+          if (isDefinitiveSpecialOrderRejection(remoteError)) throw serviceError(
+            `${/** @type {Error} */ (remoteError).message} The request is unlocked; correct the error and try again.`, 'SPECIAL_REMOTE_REJECTED', 400);
           const uncertain = serviceError(
             `${remoteError?.message || "NetSuite did not return a durable Sales Order ID."} The marker is not visible, so no automatic resubmission was attempted.`,
             "SPECIAL_REMOTE_OUTCOME_UNCERTAIN"
@@ -231,12 +235,6 @@ export function createSpecialStockRequestService(dependencies = {}) {
       const reference = await deps.fetchSalesOrderReference(remoteId);
       if (!reference?.tranid) {
         throw serviceError("The Sales Order exists but could not be hydrated from NetSuite.", "SPECIAL_REMOTE_HYDRATION_FAILED", 502);
-      }
-      if((claimed.salesOrderLines||[]).some(line=>line.nativeDiscountPercent>0 || ['palletQty','layerQty','sectionQty','pieceQty'].some(field=>line[field]!=null))){
-        const draft=salesDraft(claimed);
-        const expected=buildSpecialSalesOrderPayload({caseId:claimed.id,discountMode:claimed.salesDiscountMode || 'line',draft:{...draft,materialLines:await deps.resolveOrderUnits(draft.materialLines),ancillaryLines:await deps.resolveOrderUnits(draft.ancillaryLines)},
-          netsuiteLocationId:location.netsuiteLocationId,subsidiaryId:location.subsidiaryId||deps.config.subsidiaryId,deliveryMethodId:deps.config.deliveryMethodId,pickupMethodId:deps.config.pickupMethodId});
-        await deps.verifyDiscountSalesOrder(remoteId,expected);
       }
       return await deps.linkSalesOrder(caseId, {
         expectedRevision: claimed.revision,
@@ -254,7 +252,8 @@ export function createSpecialStockRequestService(dependencies = {}) {
           orderKind: "sales_order",
           operationId,
           errorMessage: error.message,
-          errorCode: error.code
+          errorCode: error.code,
+          retryable: !remoteId
         }, context).catch(() => null);
       }
       throw error;
@@ -265,11 +264,13 @@ export function createSpecialStockRequestService(dependencies = {}) {
     const operationId = String(input.operationId || "");
     /** @type {any} */
     let claimed = null;
+    let remoteId = null;
     try {
       const before = await deps.getCase(caseId, { audience: 'scm' });
       assertSpecialStockRemoteOrderAllowed(before);
       const prepared = Array.isArray(input.lines) && !before.purchaseOrderSubmissionStartedAt
         ? await deps.preparePurchaseOrder(caseId, input, context) : before;
+      const independentPurchase = prepared.salesOrderSource === 'manual_link';
       if (!prepared.purchaseOrderSubmissionStartedAt && prepared.vendorDiscountReview?.mode !== 'per_line') {
         throw serviceError('SCM must confirm a vendor discount percentage for every material, including 0, before PO creation.', 'SPECIAL_VENDOR_DISCOUNT_REQUIRED', 400);
       }
@@ -278,7 +279,7 @@ export function createSpecialStockRequestService(dependencies = {}) {
         orderKind: "purchase_order",
         operationId
       }, context);
-      const changes = (claimed.salesOrderId ? claimed.purchaseOrderLines || [] : []).flatMap(line => {
+      const changes = (claimed.salesOrderId && !independentPurchase && !claimed.localAdjustedAt ? claimed.purchaseOrderLines || [] : []).flatMap(line => {
         const sales = (claimed.salesOrderLines || []).find(candidate => candidate.caseLineId === line.caseLineId && !candidate.ancillary);
         if (!sales || (sales.description === line.description && Number(sales.quantity) === Number(line.quantity) && sales.uom === line.uom)) return [];
         if (!sales.remoteLineId) throw serviceError('Wait for the exact SO lines to synchronize before applying the SCM review.', 'SPECIAL_SO_LINES_NOT_READY');
@@ -302,12 +303,12 @@ export function createSpecialStockRequestService(dependencies = {}) {
       const prepareRemoteInput = async () => {
         if (!remoteInput) {
           const salesOrderRef = String(claimed.salesOrderRef || '').trim()
-            || (claimed.salesOrderId ? String((await deps.fetchSalesOrderReference(claimed.salesOrderId))?.tranid || '').trim() : '');
+            || (claimed.salesOrderId && !independentPurchase ? String((await deps.fetchSalesOrderReference(claimed.salesOrderId))?.tranid || '').trim() : '');
           if (claimed.salesOrderId && !salesOrderRef) throw serviceError(
             'The Sales Order number could not be hydrated from NetSuite.', 'SPECIAL_REMOTE_HYDRATION_FAILED', 502);
           remoteInput = { salesOrderId: claimed.salesOrderId, salesOrderLines: claimed.salesOrderLines,
             purchaseOrderLines: claimed.purchaseOrderLines,
-            payload: buildSpecialPurchaseOrderPayload({ caseId: claimed.id, vendorId: claimed.vendorId, salesOrderRef,
+            payload: buildSpecialPurchaseOrderPayload({ caseId: claimed.id, vendorId: claimed.vendorId, salesOrderRef, remarks: claimed.remarks,
               netsuiteLocationId: location.netsuiteLocationId, subsidiaryId: location.subsidiaryId || deps.config.subsidiaryId,
               lines: await deps.resolveOrderUnits(claimed.purchaseOrderLines || []), vendorDiscountReview: claimed.vendorDiscountReview }) };
         }
@@ -318,14 +319,14 @@ export function createSpecialStockRequestService(dependencies = {}) {
         selectMarker: deps.selectMarker,
         caseId: claimed.id,
         orderKind: "purchase_order",
-        salesOrderId: claimed.salesOrderId,
-        findLinkedOrder: async () => deps.findLinkedPurchaseOrder(await prepareRemoteInput()),
+        salesOrderId: independentPurchase ? null : claimed.salesOrderId,
+        findLinkedOrder: independentPurchase ? null : async () => deps.findLinkedPurchaseOrder(await prepareRemoteInput()),
         entityId: claimed.vendorId,
         locationId: location.netsuiteLocationId,
         sleep: deps.sleep
       };
       let match = await recoverMarker({ ...recoveryInput, attempts: 1 });
-      let remoteId = recordId(match?.id);
+      remoteId = recordId(match?.id);
       let nativeLink = match?.nativeLink === true;
       if (!remoteId) {
         if (claimed.purchaseOrderSubmissionStartedAt) throw serviceError('The PO submission already started. Its marker is not yet visible; recover again after NetSuite sync.', 'SPECIAL_REMOTE_OUTCOME_UNCERTAIN');
@@ -345,6 +346,8 @@ export function createSpecialStockRequestService(dependencies = {}) {
           nativeLink = match?.nativeLink === true;
         }
         if (!remoteId) {
+          if (isDefinitiveSpecialOrderRejection(remoteError)) throw serviceError(
+            `${/** @type {Error} */ (remoteError).message} The request is unlocked; correct the error and try again.`, 'SPECIAL_REMOTE_REJECTED', 400);
           const uncertain = serviceError(
             `${remoteError?.message || "NetSuite did not return a durable Purchase Order ID."} The marker is not visible, so no automatic resubmission was attempted.`,
             "SPECIAL_REMOTE_OUTCOME_UNCERTAIN"
@@ -353,7 +356,7 @@ export function createSpecialStockRequestService(dependencies = {}) {
           throw uncertain;
         }
       }
-      if (nativeLink) await deps.finalizeLinkedPurchaseOrder({ ...await prepareRemoteInput(), purchaseOrderId: remoteId });
+      if (nativeLink && !independentPurchase) await deps.finalizeLinkedPurchaseOrder({ ...await prepareRemoteInput(), purchaseOrderId: remoteId });
       const reference = await deps.fetchPurchaseOrderReference(remoteId);
       if (!reference?.tranid) {
         throw serviceError("The Purchase Order exists but could not be hydrated from NetSuite.", "SPECIAL_REMOTE_HYDRATION_FAILED", 502);
@@ -386,7 +389,9 @@ export function createSpecialStockRequestService(dependencies = {}) {
         await deps.failOperation(caseId, {
           orderKind: "purchase_order",
           operationId,
-          errorMessage: error.message
+          errorMessage: error.message,
+          errorCode: /** @type {{code?:string}} */ (error).code,
+          retryable: !remoteId
         }, context).catch(() => null);
       }
       throw error;

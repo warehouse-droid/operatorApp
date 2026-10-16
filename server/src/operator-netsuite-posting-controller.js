@@ -29,6 +29,7 @@ async function preflightExistingLocalCompletion(input, resolution) {
     if (operation.kind === "customer_pickup_load") {
       await recordCustomerPickupLoad(operation.orderId, input.actorOperatorId, {
         photoDataUrls: input.photoRefs,
+        locationId: resolution.canonicalLocationId,
         allowNetSuiteCompleted: resolution.allowNetSuiteCompleted === true
       });
       return;
@@ -81,8 +82,8 @@ const admit = createOperatorNetSuitePostingAdmission({
 
 /** @param {Record<string, any>} input */
 export async function submitOperatorNetSuitePostingAction(input) {
-  if (input.functionKey !== 'receiving') {await ensureOutboundLocationDirectory();}
-  if (input.functionKey === "delivery_prep") {
+  if (input.functionKey === 'customer_pickup') {await ensureOutboundLocationDirectory();}
+  if (["delivery_prep", "customer_pickup"].includes(input.functionKey)) {
     return withConsolidatedLoadMutation(() => getDeliveryOrder(input.orderId, { includeNetSuiteClosed: true }), () => admit(input));
   }
   return withTransaction(() => admit(input));

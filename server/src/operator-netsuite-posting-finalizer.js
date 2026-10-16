@@ -1,8 +1,10 @@
 import { fulfillmentTransactions } from "./item-fulfillment-parts-domain.js";
 import { pickupExistingFulfillmentTransactions } from './operator-pickup-existing-if-domain.js';
+import { localReceiptNetSuiteQuantities, verifiedLocalNetSuiteSalesQuantities } from './operator-netsuite-posting-quantity.js';
 // @ts-check
 
 import { query } from "./db.js";
+import { finalizeTransferPosting } from './transfer-order-posting-repository.js';
 import { completeConsolidatedLoad } from "./consolidation-load-repository.js";
 import { recordCustomerPickupLoad, recordDeliveryLoad } from "./delivery-repository.js";
 import { recordReceivingReceipt } from "./receiving-repository.js";
@@ -127,7 +129,9 @@ export function createOperatorNetSuitePostingFinalizer({
   async function customerPickupFinalization(command, operation, photos) {
       const result = await finalizeCustomerPickup(operation.orderId, command.actorOperatorId, {
         photoDataUrls: photos,
-        allowNetSuiteCompleted: true
+        locationId: command.canonicalLocationId ?? null,
+        allowNetSuiteCompleted: true,
+        verifiedSalesQuantities: verifiedLocalNetSuiteSalesQuantities(command)
       });
       await persistLoadEvidence(result, command);
       const completed = { ...result, operatorNetSuitePosting: postingEvidence(command) };
@@ -167,7 +171,8 @@ export function createOperatorNetSuitePostingFinalizer({
     }
     const step = steps[0] || null;
     const existingReceipt = reconciledWithoutPost ? uniqueReconciledReceipt(command) : null;
-    const payload = command?.inputSnapshot?.localPayload || step?.payload;
+    const payload = localReceiptNetSuiteQuantities(command?.inputSnapshot?.localPayload || step?.payload,
+      command?.inputSnapshot?.lineReconciliation?.lines || [], step?.response?.quantityAdjustments || []);
     if (!payload?.item?.items?.length) {
       throw Object.assign(new Error("Receiving finalization requires the stable local receipt payload."), {
         status: 409,
@@ -181,6 +186,7 @@ export function createOperatorNetSuitePostingFinalizer({
       itemReceiptId: step?.netSuiteTransactionId ?? existingReceipt?.id ?? null,
       itemReceiptTranid: step?.netSuiteTransactionRef ?? existingReceipt?.ref ?? null,
       allowNetSuiteCompleted: true,
+      verifiedSalesQuantities: verifiedLocalNetSuiteSalesQuantities(command),
       ...(operation.kind === 'direct_po_receipt'
         ? {verifiedDirectCompletionEventId: command.inputSnapshot.directDeliveryEvidence.completionEventId} : {})
     });
@@ -193,6 +199,7 @@ export function createOperatorNetSuitePostingFinalizer({
   }
 
   const handlers = {
+    transfer_background_posting: finalizeTransferPosting,
     delivery_consolidation_load: async (/** @type {Record<string,any>} */ command, /** @type {Record<string,any>} */ operation) => {
       const result = await completeConsolidatedLoad(operation.orderId, { allowNetSuiteCompleted: true });
       await persistLoadEvidence(result, command);
@@ -204,10 +211,13 @@ export function createOperatorNetSuitePostingFinalizer({
     direct_po_receipt: async (/** @type {Record<string,any>} */ command, /** @type {Record<string,any>} */ operation, /** @type {string[]} */ photos) => {
       // Whole local direct-PO delivery was verified before admission. Freeze its
       // received progress only inside the verified command's finalization.
+      const verifiedQuantities = verifiedLocalNetSuiteSalesQuantities(command);
       for (const line of command.inputSnapshot.lineReconciliation.lines) {
         for (const local of line.localLines) {
-          await query(`UPDATE purchase_order_lines SET netsuite_received_qty=GREATEST(netsuite_received_qty,quantity)
-            WHERE id=$1 AND purchase_order_id=$2`,[local.localLineId,operation.orderId]);
+          const quantity = verifiedQuantities[String(local.localLineId)];
+          const netSuiteCompleted = Number.isFinite(quantity) ? Number(line.completedQuantity) + quantity : null;
+          await query(`UPDATE purchase_order_lines SET netsuite_received_qty=GREATEST(netsuite_received_qty,COALESCE($3,quantity))
+            WHERE id=$1 AND purchase_order_id=$2`,[local.localLineId,operation.orderId,netSuiteCompleted]);
         }
       }
       return receivingFinalization(command,operation,photos);

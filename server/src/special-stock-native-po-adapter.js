@@ -5,7 +5,7 @@
  * @typedef {{line:number,lineUniqueKey?:string,item:Ref,quantity:number|string,units:Ref,rate:number|string,description?:string,isClosed?:boolean,quantityFulfilled?:number,quantityReceived?:number,quantityBilled?:number,createPo?:{id:string},createdPo?:{id:string},poVendor?:{id:string},poRate?:number}} RemoteLine
  * @typedef {{id?:string,tranId?:string,orderStatus?:Ref,createdFrom?:Ref,entity?:Ref,location?:Ref,memo?:string,item?:{items:RemoteLine[]}}} RemoteRecord
  * @typedef {{item:Ref,quantity:number,units?:Ref,rate:number,description:string,location?:Ref}} PurchaseLine
- * @typedef {{salesOrderId:number|null,purchaseOrderId?:number,salesOrderLines:{caseLineId:number,ancillary?:boolean,remoteLineId:number,rate:number}[],purchaseOrderLines:{caseLineId:number}[],payload:{entity:{id:string},location:{id:string},memo:string,item:{items:PurchaseLine[]}}}} Input
+ * @typedef {{salesOrderId:number|null,purchaseOrderId?:number,salesOrderLines:{caseLineId:number|null,itemId?:number,ancillary?:boolean,remoteLineId:number,rate:number}[],purchaseOrderLines:{caseLineId:number|null}[],payload:{entity:{id:string},location:{id:string},memo:string,item:{items:PurchaseLine[]}}}} Input
  * @typedef {{rest:(path:string,options?:{method?:string,body?:{memo?:string,item?:{items:Partial<RemoteLine>[]}}})=>Promise<{data?:RemoteRecord}>,createNative?:(request:object)=>Promise<unknown>,queryAll:(sql:string)=>Promise<{previousline?:number|string,nextline?:number|string,linktype?:string,id?:number|string,itemtype?:string,subtype?:string,isinactive?:string,isfulfillable?:string}[]>}} Boundary
  * @typedef {{so:RemoteRecord,source:RemoteLine[],selected:{line:RemoteLine,item:PurchaseLine}[],purchaseOrderId:number|null}} Plan
  */
@@ -53,19 +53,24 @@ async function readSo(input, { rest }) {
   const source = lines(so);
   const items = input.payload.item.items.filter(item=>ref(item.item)!=='4981');
   if (!items.length || items.length !== input.purchaseOrderLines.length) throw conflict('Every reviewed purchase line is required.');
-  const selected = items.map((item, index) => {
-    const expected = input.salesOrderLines.filter(l => l.caseLineId === input.purchaseOrderLines[index].caseLineId && !l.ancillary);
+  const nativeLinkPresent = source.some(line => line.createdPo || line.createPo?.id);
+  const selected = items.flatMap((item, index) => {
+    const itemId = ref(item.item);
+    // A standalone vendor PALLET review is independent of the SO selling quantity.
+    if (itemId === '1784' && !nativeLinkPresent) return [];
+    const expected = input.salesOrderLines.filter(l => itemId === '1784' ? l.ancillary && l.itemId === 1784
+      : l.caseLineId === input.purchaseOrderLines[index].caseLineId && !l.ancillary);
     if (expected.length !== 1) throw conflict('The corresponding reviewed SO line is ambiguous.');
     const matches = source.filter(l => Number(l.lineUniqueKey) === id(expected[0].remoteLineId));
     const line = matches[0];
-    if (matches.length !== 1 || ref(line.item) !== '2055' || ref(item.item) !== '2055'
+    if (matches.length !== 1 || !['2055', '1784'].includes(itemId) || ref(line.item) !== itemId
       || Number(line.quantity) !== Number(item.quantity) || ref(line.units) !== ref(item.units)
       || String(line.description || '') !== String(item.description) || Number(line.rate) !== Number(expected[0].rate)
       || line.isClosed === true || Number(line.quantityFulfilled || 0) > 0
       || (line.createPo && ref(line.createPo) !== 'SpecOrd')) {
       throw conflict('Correct and verify the SO quantity, UOM and description before creating its native PO.');
     }
-    return { line, item };
+    return [{ line, item }];
   });
   if (new Set(selected.map(s => s.line.line)).size !== selected.length) throw conflict('A reviewed SO line cannot be used twice.');
   const linked = selected.filter(s => s.line.createdPo);

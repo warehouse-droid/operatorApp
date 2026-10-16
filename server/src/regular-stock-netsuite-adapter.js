@@ -1,5 +1,5 @@
 import { isDeepStrictEqual } from 'node:util';
-import { regularError } from './regular-stock-domain.js';
+import { regularError, regularLineRemainingQuantity } from './regular-stock-domain.js';
 import { STOCK_REQUEST_YARDS } from './stock-request-domain.js';
 const conflict = message => regularError(message, 'REGULAR_SO_MISMATCH');
 const stockTypes = new Set(['InvtPart', 'Assembly', 'Kit']);
@@ -50,9 +50,16 @@ function componentSnapshot(row, local, parent) {
 }
 
 export function regularStockKitComponentsMatch(original, current, {ignoreLocation = false} = {}) {
-  const components = line => (line.kitComponents || []).map(component => ignoreLocation
-    ? {...component, locationId:null, remoteLocationId:null} : component);
+  const components = line => (line.kitComponents || []).map(component => {
+    const {billedQuantity:_billedQuantity,...physical} = component;
+    return ignoreLocation ? {...physical, locationId:null, remoteLocationId:null} : physical;
+  });
   return isDeepStrictEqual(components(original), components(current));
+}
+
+export function regularStockPhysicalProgressMatches(original, current) {
+  return (original.fulfilledQuantity ?? 0) === (current.fulfilledQuantity ?? 0)
+    && (original.closed ?? false) === (current.closed ?? false);
 }
 
 export async function readRegularSalesOrder(reference, { queryAll, rest, resolveYards }) {
@@ -85,17 +92,26 @@ export async function readRegularSalesOrder(reference, { queryAll, rest, resolve
     const itemType = Number(row.item_id) === -2 ? 'Subtotal' : row.item_type;
     if (!stockTypes.has(itemType) && !nonStockTypes.has(itemType)) throw conflict('NetSuite returned an unsupported SO item type. Review the item before linking this order.');
     const ancillary = nonStockTypes.has(itemType) || /^PALLET$/i.test(String(row.item_name));
+    const physicalPallet = /^PALLET$/i.test(String(row.item_name));
+    const quantity = ancillary && row.quantity == null ? null : Math.abs(Number(row.quantity));
+    const fulfilledQuantity = row.fulfilled_quantity == null || row.fulfilled_quantity === '' ? NaN : Number(row.fulfilled_quantity);
+    if (!Number.isFinite(fulfilledQuantity) || fulfilledQuantity < 0 || ![true,false,'T','F'].includes(row.line_closed)
+        || (quantity !== null && (!Number.isFinite(quantity) || quantity > 1_000_000_000 || (!ancillary && quantity <= 0)))) {
+      throw conflict('The SO fulfillment quantities or closed state are inconsistent.');
+    }
+    const closed = [true,'T'].includes(row.line_closed);
+    const remainingQuantity = quantity === null ? 0 : regularLineRemainingQuantity({quantity,fulfilledQuantity,closed});
     const kitComponents = itemType === 'Kit' ? rows.filter(component => kitParent(component) === Number(row.rest_line_id))
       .map(component => componentSnapshot(component, local, row)).sort((a,b) => a.restLineId-b.restLineId) : undefined;
     if (itemType === 'Kit' && !kitComponents.length) throw conflict('The SO kit component snapshot is missing.');
     return { remoteLineId: id(row.line_id), restLineId: Number(row.rest_line_id), itemId: Number(row.item_id) === -2 ? -2 : id(row.item_id), itemName: row.item_name, itemType,
-      quantity: ancillary && row.quantity == null ? null : Math.abs(Number(row.quantity)),
+      quantity, fulfilledQuantity, remainingQuantity, closed,
       backorderedQuantity: row.backordered_quantity == null || row.backordered_quantity === '' ? null : Number(row.backordered_quantity),
       restQuantity: ancillary && line.quantity == null ? null : Number(line.quantity), uom: row.stock_unit,
       locationId: local(row.location_id || 0), remoteLocationId: Number(row.location_id || 0), ancillary,
-      physicalPallet: /^PALLET$/i.test(String(row.item_name)), discount: row.item_type === 'Discount',
+      physicalPallet, discount: row.item_type === 'Discount',
       ...(kitComponents ? {kitComponents} : {}),
-      rate: line.rate ?? null, open: ['A','B'].includes(row.status) && Number(row.fulfilled_quantity) === 0 && Number(row.billed_quantity) === 0 && [false,'F'].includes(row.line_closed) };
+      rate: line.rate ?? null, open: ['A','B','D','E'].includes(row.status) && !closed && ((ancillary && !physicalPallet) || remainingQuantity > 0) };
   });
   if (new Set(lines.map(line => line.remoteLineId)).size !== lines.length) throw conflict('The SO has duplicate line identities.');
   return { id: orderId, ref: rows[0].tranid, customerId: id(rows[0].customer_id), locationId: local(rows[0].order_location_id),
@@ -108,11 +124,12 @@ export async function applyRegularSalesOrderLocation({ order, plan }, boundary) 
   const target = Number(fresh.yards.find(yard => Number(yard.localLocationId) === Number(plan.sourceLocationId))?.netsuiteLocationId);
   if (!target) throw conflict('The approved source yard has no NetSuite mapping.');
   const selected = new Set([...plan.materialLineIds,
-    ...fresh.lines.filter(line => line.ancillary).map(line => line.remoteLineId)]);
+    ...order.lines.filter(line => line.ancillary && line.open).map(line => line.remoteLineId)]);
   const pending = [];
   for (const original of order.lines.filter(line => selected.has(line.remoteLineId))) {
     const line = fresh.lines.find(candidate => candidate.remoteLineId === original.remoteLineId);
     if (!line || !line.open || line.itemId !== original.itemId || line.quantity !== original.quantity || line.restQuantity !== original.restQuantity
+        || !regularStockPhysicalProgressMatches(original, line)
         || !regularStockKitComponentsMatch(original, line, {ignoreLocation:true})
         || line.rate !== original.rate || ![original.remoteLocationId,target].includes(line.remoteLocationId)) throw conflict('A linked SO line changed or started fulfillment. Refresh and resolve it before retrying.');
     if (line.remoteLocationId !== target) pending.push({ line: line.restLineId, location: { id: String(target) } });
@@ -122,6 +139,7 @@ export async function applyRegularSalesOrderLocation({ order, plan }, boundary) 
   if (after.lines.length !== order.lines.length || after.locationId !== order.locationId || after.customerId !== order.customerId || order.lines.some(original => {
     const line = after.lines.find(candidate => candidate.remoteLineId === original.remoteLineId);
     return !line || line.itemId !== original.itemId || line.quantity !== original.quantity || line.restQuantity !== original.restQuantity || line.uom !== original.uom || line.rate !== original.rate
+      || !regularStockPhysicalProgressMatches(original, line)
       || !regularStockKitComponentsMatch(original, line, {ignoreLocation:selected.has(original.remoteLineId)}) || (selected.has(original.remoteLineId)&&!line.open)
       || line.remoteLocationId !== (selected.has(original.remoteLineId) ? target : original.remoteLocationId);
   })) throw conflict('SO location update needs verification. Retry to recover the existing change.');

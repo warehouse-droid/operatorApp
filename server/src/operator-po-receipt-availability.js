@@ -36,7 +36,9 @@ export function refreshPoReceiptAvailability(available, items) {
     const orderedQuantity = counter(row.quantity), completedQuantity = counter(row.quantityReceived);
     const remainingQuantity = row.isClosed === true ? 0 : Number(Math.max(orderedQuantity - completedQuantity, 0).toFixed(6));
     if (remainingQuantity > 0 && !known.has(id)) invalid("NetSuite has an open PO line missing from the local order.");
-    current.set(id, { itemId, orderedQuantity, completedQuantity, remainingQuantity });
+    const unit = row.unitsDisplay ?? row.units?.refName;
+    current.set(id, { itemId, orderedQuantity, completedQuantity, remainingQuantity,
+      ...(unit ? { salesUom: String(unit).trim().toUpperCase() } : {}) });
   }
   return available.flatMap(line => {
     const live = current.get(Number(line.orderLine));

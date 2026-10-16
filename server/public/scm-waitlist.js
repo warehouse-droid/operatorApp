@@ -3,7 +3,7 @@
 {
   const esc=window.RegularStockUI.esc,number=window.RegularStockUI.number;
   const state={mount:null,api:null,pools:[],requests:[],pool:null,orders:[],selectedPo:null,error:'',busy:false,choices:new Map(),reason:'',search:'',tab:'pools',filters:{},options:{},sortBy:'createdAt',direction:'asc',reject:null};
-  let searchTimer=null,refreshTimer=null,generation=0;
+  let searchTimer=null,generation=0,updates=null,checking=false;
   const active=()=>window.MBBSStockRequestTabs?.isActive('waitlist');
   const totals=pool=>`<div class="waitlist-totals">${[['PO item total',pool.capacityQty],['Allocated',pool.heldQty],['Converted to SO',pool.convertedQty],['Available',pool.availableQty]].map(([label,qty])=>`<span><small>${label}</small><strong>${number(qty)} ${esc(pool.salesUom)}</strong></span>`).join('')}</div>`;
   function allocationForm(pool){
@@ -46,19 +46,37 @@
       <div class="waitlist-toolbar"><button type="button" data-waitlist-view="pools">PO pools</button><button type="button" data-waitlist-view="requests">All waiting requests (${state.requests.length})</button></div>
       ${state.tab==='requests'?waitingRequests():`<section class="stock-request-section"><h3>Add PO / split PO pool</h3><form data-waitlist-pool-form><div class="waitlist-toolbar"><label><span>Find existing PO / split PO</span><input data-waitlist-po-search type="search" value="${esc(state.search)}" placeholder="PO reference" /></label><label><span>PO *</span><select data-waitlist-po required><option value="">Select an existing PO</option>${state.orders.map(o=>`<option value="${o.id}" ${state.selectedPo?.id===o.id?'selected':''}>${esc(o.ref)}</option>`).join('')}</select></label><label><span>Item *</span><select name="itemId" required><option value="">Select one item</option>${(state.selectedPo?.items||[]).map(i=>`<option value="${i.itemId}">${esc(i.itemCode)} · ${i.quantity==null?'Unit review required':number(i.quantity)+' '+esc(i.salesUom)}</option>`).join('')}</select></label><button ${state.busy?'disabled':''}>Open pool</button></div></form></section>
         <div class="waitlist-layout"><aside class="waitlist-pool-list">${state.pools.map(p=>`<button type="button" data-waitlist-pool="${p.id}" aria-pressed="${state.pool?.id===p.id}"><strong>${esc(p.purchaseOrderRef)} · ${esc(p.itemCode)}</strong><small>${number(p.availableQty)} ${esc(p.salesUom)} available${p.attention?' · Review PO':''}</small></button>`).join('')||'<p>No PO pools yet.</p>'}</aside><div>${poolDetail(state.pool)}</div></div>`}</div>`;
+    updates?.paint();
   }
   async function load(){
+    const readVersion=updates?.version;
     const version=++generation;const [pools,requests]=await Promise.all([state.api('/api/scm/waitlist/pools'),state.api('/api/scm/waitlist/requests')]);
     if(version!==generation||!active())return;state.pools=pools.pools;state.requests=requests.requests;
     const options=window.SCMWaitlistList.facets(state.requests);
     for(const field of Object.keys(options)){const selected=(state.options[field]||[]).find(option=>option.value===state.filters[field]);if(selected&&!options[field].some(option=>option.value===selected.value))options[field].push(selected);}
     state.options=options;
-    if(state.pool)state.pool=state.pools.find(p=>p.id===state.pool.id)||null;render();
+    if(state.pool)state.pool=state.pools.find(p=>p.id===state.pool.id)||null;updates?.acknowledge(readVersion);render();
+  }
+  function renderPool(){
+    const panel=state.mount?.querySelector('.waitlist-layout>div');
+    if(!panel){render();return;}
+    panel.innerHTML=poolDetail(state.pool);
+    for(const card of state.mount.querySelectorAll('.waitlist-pool-list [data-waitlist-pool]'))card.setAttribute('aria-pressed',String(Number(card.dataset.waitlistPool)===state.pool?.id));
+    updates?.paint();
   }
   async function selectPool(id){
-    state.pool=await state.api('/api/scm/waitlist/pools/'+id);state.choices.clear();state.reason='';state.tab='pools';
-    const url=new URL(location.href);url.searchParams.set('poolId',id);history.replaceState(null,'',url);render();
-    if(state.pool.returnedUnread){await state.api(`/api/scm/waitlist/pools/${id}/read`,{method:'POST',body:JSON.stringify({eventId:state.pool.lastReturnEventId})});const row=state.pools.find(p=>p.id===Number(id));if(row)row.returnedUnread=false;state.pool.returnedUnread=false;render();}
+    if(state.tab==='pools'&&state.pool?.id===id)return;
+    const current=++generation,readVersion=updates?.version,edits=updates?.editVersion;
+    state.choices.clear();state.reason='';state.tab='pools';
+    state.pool=structuredClone(state.pools.find(pool=>pool.id===id)||null);
+    const url=new URL(location.href);url.searchParams.set('poolId',id);history.replaceState(null,'',url);renderPool();
+    let pool;
+    try{pool=await state.api('/api/scm/waitlist/pools/'+id);}
+    catch(error){if(current===generation&&active())window.StockRequestView?.setError(state.mount,error.message,'.waitlist-workspace>.waitlist-toolbar');return;}
+    if(current!==generation||!active())return;
+    if(edits!==updates?.editVersion||readVersion!==updates?.version){updates?.changed();return;}
+    state.pool=pool;renderPool();
+    if(state.pool.returnedUnread){await state.api(`/api/scm/waitlist/pools/${id}/read`,{method:'POST',body:JSON.stringify({eventId:state.pool.lastReturnEventId})});const row=state.pools.find(p=>p.id===Number(id));if(row)row.returnedUnread=false;if(state.pool?.id===id)state.pool.returnedUnread=false;}
   }
   document.addEventListener('input',/** @param {Event & {target:HTMLInputElement}} event */ event=>{
     if(!active())return;
@@ -96,7 +114,24 @@
       const result=await state.api(url,{method:'POST',body:JSON.stringify(body)});if(form.matches('[data-waitlist-reject-form]'))state.reject=null;else state.pool=result;state.choices.clear();state.reason='';await load();
     }catch(error){state.error=error.message;render();}finally{state.busy=false;render();}
   });
-  function refresh(){if(!active()||state.busy||document.activeElement?.closest('[data-waitlist-allocation-form],[data-waitlist-pool-form],[data-waitlist-release-form],[data-waitlist-reject-form]'))return;clearTimeout(refreshTimer);refreshTimer=setTimeout(()=>load().catch(error=>{state.error=error.message;render();}),300);}
-  setInterval(refresh,15000);
-  window.SCMWaitlist={refresh,async open({mount,api}){state.mount=mount;state.api=api;state.error='';render();await load();const id=Number(new URL(location.href).searchParams.get('poolId'));if(id)await selectPool(id);}};
+  function refresh(){if(active())updates?.changed();}
+  async function check(){
+    if(!active()||document.hidden||state.busy||checking||updates?.pending)return;
+    const current=generation;checking=true;
+    try{const [pools,requests]=await Promise.all([state.api('/api/scm/waitlist/pools'),state.api('/api/scm/waitlist/requests')]);
+      if(current===generation&&active()&&JSON.stringify([pools.pools,requests.requests])!==JSON.stringify([state.pools,state.requests]))updates?.changed();
+    }catch{/* Retain the displayed pool when a background check fails. */}finally{checking=false;}
+  }
+  const poll=setInterval(check,15000);
+  window.addEventListener('pagehide',()=>clearInterval(poll),{once:true});
+  window.SCMWaitlist={refresh,async open({mount,api}){
+    state.mount=mount;state.api=api;state.error='';
+    const params=new URL(location.href).searchParams,target=Number(params.get('requestId'));
+    const linked=Number.isSafeInteger(target)&&target>0;
+    if(linked){state.tab='requests';state.filters={};}
+    updates||=window.StockRequestView?.create({mount,active,detailSelector:'.waitlist-layout>div',feedbackSelector:'.waitlist-workspace>.waitlist-toolbar'});
+    render();await load();
+    if(linked){const row=state.mount.querySelector(`[data-waitlist-request-row="${target}"]`);if(row){row.tabIndex=-1;row.focus({preventScroll:true});row.scrollIntoView({block:'center'});}}
+    else{const id=Number(params.get('poolId'));if(id)await selectPool(id);}
+  }};
 }

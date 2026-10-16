@@ -129,11 +129,12 @@ export function createOperatorNetSuitePostingProcessor({ repository, adapter, fi
     let verified;
     let recovered = false;
     const direct = command.inputSnapshot?.postingStrategy === "stored_order_line_v1";
-    const mayTransform = !direct || attempt.fresh === true || await adapter.hasSplitPlan?.(step) === true;
+    const backgroundRetry = Boolean(command.inputSnapshot?.transferEvidence) && step.status === 'failed';
+    const mayTransform = !direct || attempt.fresh === true || backgroundRetry || await adapter.hasSplitPlan?.(step) === true;
     let recoveryAttempted = direct && !mayTransform;
     let remoteMayExist = direct && !mayTransform;
     try {
-      const existing = direct && mayTransform && !operatorStepHasKits(step) ? null
+      const existing = direct && mayTransform && !backgroundRetry && !operatorStepHasKits(step) ? null
         : await verifiedExternalRecord(step, direct ? "recovery" : "duplicate_check", direct);
       if (existing) {
         ({ record, verified } = existing);
@@ -205,7 +206,8 @@ export function createOperatorNetSuitePostingProcessor({ repository, adapter, fi
       attemptNumber: attempt.attemptNumber,
       transactionId: verified.id,
       transactionRef: verified.transactionRef,
-      response: safeRemoteEvidence(record),
+      response: { ...safeRemoteEvidence(record),
+        ...(verified.quantityAdjustments?.length ? { quantityAdjustments: verified.quantityAdjustments } : {}) },
       recovered
     });
     replaceStep(command, updated);

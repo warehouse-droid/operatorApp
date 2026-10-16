@@ -277,7 +277,9 @@ function scmOrderVendorLabel(order = {}) {
 }
 
 function ensureScmDestinationLocation(order = scmSelectedOrder()) {
-  if (!scmDestinationLocationId) scmDestinationLocationId = scmDefaultDestinationLocationId(order);
+  if (!scmDestinationLocationId) {
+    scmDestinationLocationId = scmOrderIsSplit(order) ? scmDefaultDestinationLocationId(order) : "netsuite";
+  }
   return scmDestinationLocationId;
 }
 
@@ -285,7 +287,7 @@ function scmLiveSplitDestinationLocationId(order = scmSelectedOrder()) {
   const fallback = ensureScmDestinationLocation(order);
   const selected = String(scmApp.querySelector('[data-action="split-destination-yard"]')?.value || "").trim();
   const matched = SCM_DESTINATION_YARDS.find((yard) => yard.id === selected);
-  scmDestinationLocationId = matched?.id || fallback;
+  scmDestinationLocationId = selected === "netsuite" ? "netsuite" : matched?.id || fallback;
   return scmDestinationLocationId;
 }
 
@@ -960,8 +962,10 @@ function renderScmSplitModal() {
           <label class="scm-ref-input">
             <span>${t("dispatch.destinationYard", "Destination Yard")}</span>
             <select data-action="split-destination-yard">
+              <option value="netsuite" ${selectedDestination === "netsuite" ? "selected" : ""}>Retain NetSuite destination</option>
               ${SCM_DESTINATION_YARDS.map((yard) => `<option value="${yard.id}" ${yard.id === selectedDestination ? "selected" : ""}>${yard.text}</option>`).join("")}
             </select>
+            <small>Retain keeps each selected line's NetSuite destination. Choosing a yard sends all selected lines there.</small>
           </label>
           <div class="scm-ref-input">
             ${renderScmPickupYardControl(order, { action: "split-pickup-yard", field: false })}
@@ -981,7 +985,9 @@ function renderScmSplitModal() {
               <article>
                 <strong>${escapeHtml(item.sku || item.itemName || "Item")}</strong>
                 <span>${escapeHtml(scmSelectedLineLabel(item, quantities))}</span>
-                <small>${t("dispatch.destinationYard", "Destination Yard")}: ${escapeHtml(item.destinationYard || order?.destinationYard || "--")}</small>
+                <small>${t("dispatch.destinationYard", "Destination Yard")}: ${escapeHtml(selectedDestination === "netsuite"
+                  ? item.netsuiteDestinationYard ?? item.destinationYard ?? order?.destinationYard ?? "--"
+                  : SCM_DESTINATION_YARDS.find((yard) => yard.id === selectedDestination)?.text || "--")}</small>
                 <small>${escapeHtml(scmLineWeightText(item, quantities))}</small>
               </article>
             `).join("") || `<div class="empty-state">${t("dispatch.noLinesSelected", "No lines selected.")}</div>`}
@@ -1046,6 +1052,7 @@ async function createScmSplit() {
     ...quantities
   }));
   const destinationLocationId = scmLiveSplitDestinationLocationId(order);
+  const retainNetSuiteDestination = destinationLocationId === "netsuite";
   const pickupPoint = scmVendorYardOptions(order).length ? scmLiveSplitPickupPoint(order) : "";
   const status = scmLiveSplitInitialStatus();
   const remarkOverride = scmLiveSplitRemark();
@@ -1074,7 +1081,8 @@ async function createScmSplit() {
         sourcePoRef: order.originalPoRef || order.id,
         newPoRef: scmRef.trim(),
         pickupPoint,
-        destinationLocationId,
+        destinationLocationId: retainNetSuiteDestination ? null : destinationLocationId,
+        retainNetSuiteDestination,
         status,
         remarkOverride,
         lines,
@@ -1608,7 +1616,7 @@ scmApp.addEventListener("click", async (event) => {
       return;
     }
     scmSummaryOpen = true;
-    scmDestinationLocationId = scmDefaultDestinationLocationId(scmSelectedOrder());
+    scmDestinationLocationId = "netsuite";
     scmPickupPoint = scmDefaultPickupPoint(scmSelectedOrder());
     scmSplitInitialStatus = "Hold";
     scmSplitRemark = "";
@@ -1727,6 +1735,10 @@ scmApp.addEventListener("change", (event) => {
   const target = event.target;
   if (target.dataset.action === "split-destination-yard" || target.dataset.action === "existing-split-destination-yard") {
     scmDestinationLocationId = target.value;
+    if (target.dataset.action === "split-destination-yard") {
+      scmLiveSplitRemark();
+      renderScm();
+    }
   }
   if (target.dataset.action === "split-pickup-yard" || target.dataset.action === "existing-split-pickup-yard" || target.dataset.action === "existing-pickup-yard") {
     scmPickupPoint = target.value;

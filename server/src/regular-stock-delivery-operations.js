@@ -4,6 +4,7 @@ import {submitDeliveryStockRequest,previewDeliveryStockRequest,retryDeliveryStoc
 import {getScmStockRequest} from './stock-request-repository.js';
 import {withOperatorNetSuitePriority} from './operator-netsuite-request-pool.js';
 import {withDeliveryProgress} from './regular-stock-delivery-progress.js';
+import {assertDeliveryStockRequestDestinationAccess} from './regular-stock-delivery-access.js';
 
 const active = row => ['queued','running'].includes(row.status);
 const uuid = value => typeof value === 'string' && /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(value);
@@ -17,8 +18,13 @@ export async function getDeliveryOperation(id,context) {
   const row=(await query('SELECT * FROM regular_stock_delivery_operations WHERE id=$1 AND actor_id=$2 AND audience=$3',[id,context.operatorId,context.audience])).rows[0];
   if (!row) throw regularError('Delivery operation not found.','REGULAR_DELIVERY_OPERATION_MISSING',404);
   const base=row.result?.destinationLocationId || row.result?.baseLocationId;
-  if(context.audience==='sales' && base && !context.authorizedDestinationLocationIds?.includes(base)) {
-    throw regularError('Sales yard access changed.','REGULAR_DELIVERY_ACCESS',403);
+  if(context.audience==='sales' && base) {
+    try {
+      assertDeliveryStockRequestDestinationAccess(row.result?.regular?.sourceLocationId ?? row.input.sourceLocationId,
+        base,context.authorizedDestinationLocationIds,{preview:row.action==='preview'});
+    } catch {
+      throw regularError('Sales yard access changed.','REGULAR_DELIVERY_ACCESS',403);
+    }
   }
   return view(row);
 }

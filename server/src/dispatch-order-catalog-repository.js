@@ -1,5 +1,6 @@
 import crypto from "node:crypto";
 import { dispatchOrderRecency } from "./dispatch-order-recency.js";
+import { deliveryPrioritySql, prioritizeDeliveryOrders } from './delivery-request-repository.js';
 import { decorateSorOrders } from "./sor-rental-repository.js";
 
 import { query, withTransaction } from "./db.js";
@@ -299,7 +300,10 @@ function decodeCursor(value) {
     // Old cursors used update activity. Restart once with arrival-date ordering.
     if (parsed.v === undefined) return null;
     if (parsed.v !== 2) throw cursorError();
-    return { e: Number(parsed.e), d: parsed.d, k: parsed.k, r: parsed.r };
+    // Cursors made before delivery priority restart once under the new ordering.
+    if (parsed.p === undefined) return null;
+    if (![0,1].includes(parsed.p)) throw cursorError();
+    return { e: Number(parsed.e), p:parsed.p, d: parsed.d, k: parsed.k, r: parsed.r };
   } catch (error) {
     if (error?.code === "DISPATCH_ORDER_POOL_CURSOR_INVALID") throw error;
     throw cursorError();
@@ -442,13 +446,17 @@ export async function listDispatchOrderPool({
                AND lower(global_split.parent_order_ref) = lower(candidate.order_ref)
           )
      )
-     SELECT catalog.order_ref, catalog.card, catalog.activity_at,
+     , ranked_catalog AS (
+       SELECT candidate.*, CASE WHEN ${deliveryPrioritySql('candidate')} THEN 1 ELSE 0 END AS delivery_rank
+         FROM visible_catalog candidate
+     )
+     SELECT catalog.order_ref, catalog.card, catalog.activity_at, catalog.delivery_rank,
             CASE WHEN $2 <> '' AND lower(catalog.order_ref) = $2 THEN 1 ELSE 0 END AS exact_rank,
             assignment.plan_id::text AS plan_id,
             assignment.plan_date::text AS plan_date,
             assignment.planned_order_ref,
             assignment.assignment
-       FROM visible_catalog catalog
+       FROM ranked_catalog catalog
        LEFT JOIN LATERAL (
          SELECT candidate.plan_id, candidate.plan_date, candidate.planned_order_ref,
                 candidate.assignment
@@ -470,13 +478,11 @@ export async function listDispatchOrderPool({
         AND ($2 <> '' OR assignment.plan_id IS NULL)
         AND (
           $3::int IS NULL
-          OR CASE WHEN $2 <> '' AND lower(catalog.order_ref) = $2 THEN 1 ELSE 0 END < $3
-          OR (
-            CASE WHEN $2 <> '' AND lower(catalog.order_ref) = $2 THEN 1 ELSE 0 END = $3
-            AND (catalog.activity_at, lower(catalog.order_ref)) < ($4::timestamptz, $5)
-          )
+          OR (catalog.delivery_rank,
+              CASE WHEN $2 <> '' AND lower(catalog.order_ref) = $2 THEN 1 ELSE 0 END,
+              catalog.activity_at,lower(catalog.order_ref)) < ($7::int,$3::int,$4::timestamptz,$5)
         )
-      ORDER BY exact_rank DESC,
+      ORDER BY catalog.delivery_rank DESC, exact_rank DESC,
                catalog.activity_at DESC,
                lower(catalog.order_ref) DESC
       LIMIT $6`,
@@ -486,7 +492,8 @@ export async function listDispatchOrderPool({
       decoded?.e ?? null,
       decoded?.d || new Date(0).toISOString(),
       decoded?.r || "",
-      safeLimit + 1
+      safeLimit + 1,
+      decoded?.p ?? 0
     ]
   );
   const hasMore = result.rows.length > safeLimit;
@@ -494,14 +501,15 @@ export async function listDispatchOrderPool({
   const last = page.at(-1);
   const [orders, state] = await Promise.all([
     overlayDispatchOrderCompletionStatuses(
-      page.map((row) => ({ ...row.card, ...assignmentFields(row) }))
+      page.map((row) => ({ ...row.card, ...assignmentFields(row),...(row.delivery_rank?{deliveryApprovalPriority:true}:{}) }))
     ).then(overlayFulfilledSalesDeliveryPlanning),
     getDispatchOrderCatalogState()
   ]);
   return {
-    orders: await decorateSorOrders(orders),
+    orders: await prioritizeDeliveryOrders(await decorateSorOrders(orders)),
     nextCursor: hasMore && last ? encodeCursor({
       v: 2,
+      p: Number(last.delivery_rank || 0),
       e: Number(last.exact_rank || 0),
       d: new Date(last.activity_at).toISOString(),
       k: text(last.order_ref).toLowerCase(),

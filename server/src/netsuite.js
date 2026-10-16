@@ -1,4 +1,5 @@
 import { normalizeNetSuiteTransactionUnits } from './netsuite-transaction-units.js';
+import { salesOrderBillingExclusions } from './netsuite-fulfillment-exclusions.js';
 import { createBossNetSuiteAdapter } from './boss-approval-netsuite.js';
 
 export function createBossApprovalNetSuite() {
@@ -907,14 +908,23 @@ export async function fetchReturnAuthorizationFromNetSuite(returnAuthorizationId
   }
 }
 
-export async function fetchCreditMemoFromNetSuite(creditMemoId) {
+function missingCreditMemoError(error, strictMissing) {
+  if (!strictMissing) { return String(error.message).includes("NetSuite REST failed: 404"); }
+  return Number(error.status) === 404 && error.netsuiteResponseReceived === true
+    && error.netsuiteErrorCodes?.includes("NONEXISTENT_ID");
+}
+
+export async function fetchCreditMemoFromNetSuite(creditMemoId, { strictMissing = false } = {}) {
   const id = Number(creditMemoId);
   if (!Number.isInteger(id) || id <= 0) return null;
   try {
     const result = await netsuiteRest(`/record/v1/creditMemo/${id}?expandSubResources=true`, { method: "GET" });
+    if (strictMissing && Number(result.data?.id) !== id) {
+      throw new Error("NetSuite Credit Memo lookup did not return the requested record.");
+    }
     return result.data || null;
   } catch (error) {
-    if (String(error.message).includes("NetSuite REST failed: 404")) return null;
+    if (missingCreditMemoError(error, strictMissing)) { return null; }
     throw error;
   }
 }
@@ -1176,6 +1186,12 @@ export async function fetchPurchaseOrderPdfFromNetSuite(orderId, { filenamePrefi
 
 export async function fetchSalesOrderPdfFromNetSuite(orderId, { filenamePrefix = "SO" } = {}) {
   return fetchNetSuiteOrderPdf('sales_order', orderId, { filenamePrefix, restlet: configuredRestletJson });
+}
+
+export async function fetchEstimateRecordFromNetSuite(estimateId, { rest = netsuiteRest } = {}) {
+  const id = Number(estimateId);
+  if (!Number.isSafeInteger(id) || id <= 0) throw new Error('A valid numeric NetSuite estimate ID is required.');
+  return (await rest(`/record/v1/estimate/${id}?expandSubResources=true`, { method: 'GET' })).data;
 }
 
 export async function prepareSpecialClosurePlanInNetSuite(input, boundary = { rest: netsuiteRest, queryAll: suiteqlAll }) {
@@ -2610,8 +2626,6 @@ export async function fetchTransferDeliveryOrderFromNetSuite(orderId, locationId
       AND tl.quantity < 0
       AND tl.mainline = 'F'
       AND tl.taxline = 'F'
-      AND ${outboundStatusFilterSql("t")}
-      AND ${openLineFilterSql("tl")}
       ${locationFilter}
     ORDER BY t.trandate DESC
   `);
@@ -2689,7 +2703,8 @@ export async function fetchDeliveryOrderDetailsFromNetSuite(orderId, locationId 
 }
 
 export async function fetchSalesOrderFulfillmentStateFromNetSuite(orderId, {
-  query: readQuery = suiteql, fetchItems = fetchOperatorNetSuiteSourceItemLinesFromNetSuite
+  query: readQuery = suiteql, fetchItems = fetchOperatorNetSuiteSourceItemLinesFromNetSuite,
+  includeAllSourceLines = false
 } = {}) {
   const id = Number(orderId);
   if (!Number.isInteger(id) || id <= 0) {
@@ -2731,8 +2746,12 @@ export async function fetchSalesOrderFulfillmentStateFromNetSuite(orderId, {
       statusText:String(header.status_text || ''),fulfillmentComplete:true,lines:[]};
   }
   const sourceItems = await fetchItems('SO', id);
+  const excludedLines = salesOrderBillingExclusions(rows,sourceItems);
   const lines = rows.filter((row) => {
-    return Boolean(row.order_line) && isFulfillableNetSuiteLine(row);
+    return Boolean(row.order_line) && (includeAllSourceLines
+      ? sourceItems.some(item => Number(item.orderLine ?? item.orderline ?? item.line) === Number(row.rest_order_line)
+        && Number(item.item?.id ?? item.itemId ?? item.item) === Number(row.item_id))
+      : isFulfillableNetSuiteLine(row));
   }).map((row) => {
     const matches = sourceItems.filter(item => Number(item.orderLine ?? item.orderline ?? item.line) === Number(row.rest_order_line)
       && Number(item.item?.id ?? item.itemId ?? item.item) === Number(row.item_id));
@@ -2746,6 +2765,11 @@ export async function fetchSalesOrderFulfillmentStateFromNetSuite(orderId, {
       orderLine: Number(matches[0].orderLine ?? matches[0].orderline ?? matches[0].line),
       sourceLineKey: String(row.order_line),
       itemId: Number(row.item_id),
+      ...(includeAllSourceLines ? { canFulfill: row.item_type === 'Kit'
+        ? !/^(?:f|false|no|0)$/iu.test(String(row.is_fulfillable)) : isFulfillableNetSuiteLine(row) } : {}),
+      ...(matches[0].unitsDisplay || matches[0].units?.refName ? {
+        unit: String(matches[0].unitsDisplay || matches[0].units.refName).trim().toUpperCase()
+      } : {}),
       quantity: Number(quantity.toFixed(6)),
       fulfilledQuantity: Number(fulfilledQuantity.toFixed(6)),
       remainingQuantity: lineClosed ? 0 : Number(Math.max(quantity - fulfilledQuantity, 0).toFixed(6)),
@@ -2758,7 +2782,8 @@ export async function fetchSalesOrderFulfillmentStateFromNetSuite(orderId, {
     tranid: String(header.tranid || ""),
     status: String(header.status || ""),
     statusText: String(header.status_text || ""),
-    lines
+    lines,
+    ...(excludedLines.length ? {excludedLines} : {})
   };
 }
 
@@ -3300,8 +3325,6 @@ export async function fetchTransferReceivingOrderFromNetSuite(orderId, sourceLoc
       AND tl.quantity > 0
       AND tl.mainline = 'F'
       AND tl.taxline = 'F'
-      AND ${receivingStatusFilterSql("t")}
-      AND ${openLineFilterSql("tl")}
       ${sourceFilter}
     ORDER BY t.trandate DESC
   `);
@@ -3748,7 +3771,7 @@ export async function findSpecialStockOrdersByMarkerFromNetSuite({
   caseId,
   orderKind,
   entityId = null
-} = {}) {
+} = {}, { query = suiteql } = {}) {
   const requestId = Number(caseId);
   const entity = Number(entityId);
   if (!Number.isSafeInteger(requestId) || requestId <= 0) {
@@ -3762,7 +3785,7 @@ export async function findSpecialStockOrdersByMarkerFromNetSuite({
   if (!type) throw new Error("Select sales_order or purchase_order marker recovery.");
   const marker = `MBBS-SPECIAL-${orderKind === "sales_order" ? "SO" : "PO"}:${requestId}`.toUpperCase();
   const entityFilter = Number.isSafeInteger(entity) && entity > 0 ? `AND t.entity = ${entity}` : "";
-  const result = await suiteql(`
+  const result = await query(`
     SELECT t.id,
            t.tranid,
            t.trandate,
@@ -3776,7 +3799,8 @@ export async function findSpecialStockOrdersByMarkerFromNetSuite({
       FROM transaction t
      WHERE t.type = '${type}'
        AND (
-         UPPER(COALESCE(t.memo, '')) LIKE '%${marker} |%'
+         UPPER(COALESCE(t.externalid, '')) = '${marker}'
+         OR UPPER(COALESCE(t.memo, '')) LIKE '%${marker} |%'
          OR UPPER(COALESCE(t.memo, '')) LIKE '%${marker}'
        )
        ${entityFilter}

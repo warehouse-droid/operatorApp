@@ -29,6 +29,7 @@ function quoteDiscountSummary(grossSubtotal, subtotal) {
 
 /** @param {Record<string,any>} detail @param {Array<Record<string,any>>} saved */
 function quoteAncillaryLines(detail, saved) {
+  if (detail.workflowKind === 'backorder') return [];
   const ancillary = saved.filter(line => line.ancillary);
   /** @param {Record<string,any>} line */
   const isPallet = line => Number(line.itemId) === 1784 || String(line.description || '').trim().toUpperCase() === 'PALLET';
@@ -38,17 +39,17 @@ function quoteAncillaryLines(detail, saved) {
   const deliveryRate = normalizeSpecialDeliveryFee(detail);
   const managedDelivery = deliveryRate != null || (Object.hasOwn(detail, 'deliveryFeeRate') && detail.fulfillmentMethod !== 'mbt_delivery');
   /** @type {Array<Record<string,any>>} */
-  const lines = ancillary.filter(line => !isPallet(line) && (!managedDelivery || Number(line.itemId) !== 1987)).map(line => ({ ...line, discountPercent: 0 }));
+  const lines = ancillary.filter(line => !isPallet(line) && (!managedDelivery || Number(line.itemId) !== 1987)
+    && !(Number(line.itemId) === 1987 && Number(line.rate) === 0)).map(line => ({ ...line, discountPercent: 0 }));
   if (palletTotal > 0) lines.push({ ...palletLine, itemId: 1784, description: palletLine?.description || 'PALLET',
     quantity: palletTotal, uom: 'EACH', rate: palletRate, discountPercent: 0 });
-  if (deliveryRate != null) lines.push({ ...specialDeliveryFeeLine(deliveryRate), uom: 'EACH', discountPercent: 0 });
+  if (deliveryRate > 0) lines.push({ ...specialDeliveryFeeLine(deliveryRate), uom: 'EACH', discountPercent: 0 });
   return lines;
 }
 
 // Reuse the Field Sales MBBS presentation and configuration without creating a
 // Field Sales record, looking up a NetSuite item, or posting an estimate.
 export function buildSpecialQuote(detail, company, { operatorName = '', draft = false } = {}) {
-  if (detail.salesOrderId) throw invalid('The Sales Order has been created. Preview the Sales Order instead.', 409);
   const profile = quoteProfile(company);
   if (!profile.name || !Number.isInteger(profile.taxBps) || profile.taxBps < 0 || profile.taxBps > 10000) {
     throw invalid('Configure the MBBS company name and tax in Field Sales Settings.', 409);
@@ -60,7 +61,7 @@ export function buildSpecialQuote(detail, company, { operatorName = '', draft = 
     const orderLine = saved.find(order => order.caseLineId === line.id);
     const description = orderLine?.description || specialItemDescription(line);
     const legacy = !draft && line.originalRate == null;
-    return { description: `MBBS-Special\n${description}`, quantity: legacy ? orderLine?.quantity : draft ? line.quantity : line.packageQuantity ?? line.quantity,
+    return { description: `${detail.workflowKind === 'backorder' ? (line.itemName || line.productName) : 'MBBS-Special'}\n${description}`, quantity: legacy ? orderLine?.quantity : draft ? line.quantity : line.packageQuantity ?? line.quantity,
       uom: legacy ? orderLine?.uom : line.rateUom || line.uom,
       rate: legacy ? orderLine?.rate : draft ? line.rate : line.originalRate,
       discountPercent: legacy ? 0 : line.discountPercent,
@@ -110,8 +111,9 @@ export function specialOrderSnapshot(detail, kind, audience) {
   if (kind === 'purchase_order' && audience !== 'scm') throw invalid('Purchase Order PDFs are available to SCM only.', 403);
   const sales = kind === 'sales_order';
   const id = sales ? detail.salesOrderId : detail.purchaseOrderId;
-  const lines = sales ? detail.salesOrderLines : detail.purchaseOrderLines;
-  if (!id || (sales ? detail.salesOrderSkipped : detail.purchaseOrderSkipped) || !lines?.length) throw invalid('This request has no linked order to preview.', 409);
+  const lines = (sales ? detail.salesOrderLines : detail.purchaseOrderLines) || [];
+  const manualSalesLink = (sales && detail.salesOrderSource === 'manual_link') || detail.workflowKind === 'backorder';
+  if (!id || (sales ? detail.salesOrderSkipped : detail.purchaseOrderSkipped) || (!lines.length && !manualSalesLink)) throw invalid('This request has no linked order to preview.', 409);
   return { version: 2, source: 'netsuite-native', kind, audience, id, title: sales ? 'Sales Order' : 'Purchase Order',
     number: sales ? detail.salesOrderRef : detail.purchaseOrderRef, requestRef: detail.requestRef,
     status: (sales ? detail.salesOrderStatus : detail.purchaseOrderStatus) || 'Awaiting status update',

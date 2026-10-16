@@ -1,14 +1,15 @@
+import { SPECIAL_LINE_PACK_FIELDS } from '../public/special-stock-line-fields.js';
 /* global structuredClone */
 import { sumSpecialAmounts } from './special-stock-discount-total.js';
 import { normalizeSpecialDiscount, normalizeSpecialRate, specialPalletQuantity, specialQuantity, specialDiscountLineAmount } from '../public/special-stock-pricing.js';
 /**
- * @typedef {{remoteLineId:number|null,itemId:number,quantity:number|null,unitId:number|null,rate:string,description:string,locationId:number|null,taxCode:string,createdPoId:number|null,createPo:string}} SnapshotLine
+ * @typedef {{remoteLineId:number|null,itemId:number,quantity:number|null,unitId:number|null,rate:string,description:string,locationId:number|null,taxCode:string,createdPoId:number|null,createPo:string,pack?:Record<string,number>}} SnapshotLine
  * @typedef {{header:Record<string,string|number>,lines:SnapshotLine[]}} Snapshot
  * @typedef {{id:number,kind:string}} Identity
- * @typedef {{remoteLineId:number,itemId:number,quantity:number,rate:number,unitId:number,description:string,toQuantity:number,toRate?:number,nativeDiscountPercent?:number|null,toNativeDiscountPercent?:number|null}} Change
+ * @typedef {{remoteLineId:number,itemId:number,quantity:number,rate:number,unitId:number,description:string,toQuantity:number,toRate?:number,nativeDiscountPercent?:number|null,toNativeDiscountPercent?:number|null,toDescription?:string,fromPack?:Record<string,number>,toPack?:Record<string,number>}} Change
  * @typedef {{fromQuantity:number,toQuantity:number,rate:number,unitId?:number}} Pallets
  * @typedef {Identity & {lines:Change[],pallets?:Pallets,discountMode?:string,vendorDiscountTotal?:{before:number,after:number}}} InputOrder
- * @typedef {Identity & {baseline:Snapshot,target:Snapshot}} PreparedOrder
+ * @typedef {Identity & {baseline:Snapshot,target:Snapshot,reviewedFields?:Array<{remoteLineId:number,description?:string,pack?:Record<string,number>}>}} PreparedOrder
  * @typedef {{version:number,orders:PreparedOrder[]}} Plan
  * @typedef {{snapshot:(order:Identity)=>Promise<Snapshot>,apply:(order:PreparedOrder)=>Promise<unknown>,validate?:(plan:Plan)=>unknown}} Boundary
  */
@@ -25,7 +26,8 @@ export function specialAdjustmentMatches(expected,current) {
     && expected.lines.every((line,index)=>{
       const actual=current.lines[index];
       return (!line.remoteLineId || line.remoteLineId===actual.remoteLineId)
-        && fields.every(key=>line[key]===actual[key]);
+        && fields.every(key=>line[key]===actual[key])
+        && (!line.pack || SPECIAL_LINE_PACK_FIELDS.every(key => Number(line.pack?.[key] ?? 0) === Number(actual.pack?.[key] ?? 0)));
     }));
 }
 
@@ -50,8 +52,19 @@ function materialTarget(order,baseline) {
     const index=target.lines.findIndex(line=>line.remoteLineId===change.remoteLineId),before=target.lines[index];
     if (!before || before.itemId!==2055 || before.quantity!==Number(change.quantity) || before.rate!==String(change.rate)
       || before.unitId!==Number(change.unitId) || before.description!==change.description) throw conflict('The issued material no longer matches its reviewed quantity, rate, UOM or description.');
+    if (change.toDescription !== undefined) {
+      if (typeof change.toDescription !== 'string' || !change.toDescription.trim() || change.toDescription.length > 4000) throw conflict('A valid reviewed description is required.');
+      before.description = change.toDescription;
+    }
+    for (const [field, value] of Object.entries(change.toPack || {})) {
+      if (!SPECIAL_LINE_PACK_FIELDS.includes(field) || typeof value !== 'number' || !Number.isFinite(value) || value < 0 || value > 1e9
+        || Number(before.pack?.[field] ?? 0) !== change.fromPack?.[field]) throw conflict('The issued packing no longer matches its review.');
+      before.pack = { ...before.pack, [field]: value };
+    }
     if (order.kind!=='sales_order' || change.toNativeDiscountPercent == null) {
-      before.quantity=specialQuantity(change.toQuantity); continue;
+      before.quantity=specialQuantity(change.toQuantity);
+      if (order.kind === 'sales_order' && change.toRate !== undefined) before.rate = String(normalizeSpecialRate(change.toRate));
+      continue;
     }
     if (totalDiscount) {
       const previous = specialDiscountLineAmount(before.quantity, before.rate, change.nativeDiscountPercent || 0);
@@ -110,7 +123,9 @@ export async function prepareSpecialAdjustmentPlan({orders},boundary) {
   for(const order of [...orders].sort((a,b)=>Number(a.kind==='purchase_order')-Number(b.kind==='purchase_order'))){
     const baseline=await boundary.snapshot(order),target=materialTarget(order,baseline);
     if(order.kind==='sales_order')palletTarget(target,order.pallets);
-    prepared.push({id:order.id,kind:order.kind,baseline,target});
+    const reviewedFields = order.lines.filter(line => line.toDescription !== undefined || line.toPack).map(line => ({ remoteLineId: line.remoteLineId,
+      ...(line.toDescription !== undefined ? { description: line.toDescription } : {}), ...(line.toPack ? { pack: line.toPack } : {}) }));
+    prepared.push({id:order.id,kind:order.kind,baseline,target,...(reviewedFields.length ? { reviewedFields } : {})});
   }
   return {version:2,orders:prepared};
 }

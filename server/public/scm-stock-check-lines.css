@@ -1,0 +1,23 @@
+.stock-live-heading { display:flex; align-items:center; justify-content:space-between; gap:1rem; flex-wrap:wrap; margin-bottom:.65rem; }
+.stock-live-heading h3,.stock-live-heading h2 { margin:0; }
+.stock-live-heading button { margin-left:auto; flex-shrink:0; }
+.stock-live-feedback { color:#9f1239; margin:.35rem 0; overflow-wrap:anywhere; }
+.stock-live-feedback:empty { display:none; }
+.stock-live-feedback.stock-live-matching,.stock-live-match-note { color:#475569; }
+.stock-live-summary { display:flex; align-items:baseline; flex-wrap:wrap; gap:.5rem 1rem; }
+.stock-live-result { margin-left:auto; font-size:.9rem; font-weight:600; color:#475569; overflow-wrap:anywhere; }
+.stock-live-result a { color:inherit; text-decoration:underline; text-underline-offset:3px; }
+.stock-live-result[data-live-status="stock_available"] { color:#166534; }
+.stock-live-result[data-live-status="low_stock"],.stock-live-result[data-live-status="in_production"] { color:#854d0e; }
+.stock-live-result[data-live-status="scrape_failure"],.stock-live-result[data-live-status="insufficient_stock"] { color:#9f1239; }
+.stock-live-dialog { box-sizing:border-box; width:min(800px,calc(100vw - 24px)); max-height:90dvh; padding:1.25rem; border:1px solid #cbd5e1; border-radius:14px; color:#0f172a; background:white; }
+.stock-live-dialog::backdrop { background:rgb(15 23 42 / 55%); }
+.stock-live-dialog fieldset { min-width:0; margin:1rem 0; padding:1rem; border:1px solid #cbd5e1; border-radius:8px; }
+.stock-live-dialog legend { font-weight:700; overflow-wrap:anywhere; max-width:100%; }
+.stock-live-dialog label { display:grid; gap:.4rem; min-width:0; }
+.stock-live-dialog input,.stock-live-dialog select { box-sizing:border-box; width:100%; min-width:0; padding:.6rem; border:1px solid #94a3b8; border-radius:6px; color:#0f172a; background:white; font:inherit; }
+.stock-live-search { display:flex; align-items:end; gap:.5rem; margin-bottom:.7rem; }
+.stock-live-search label { flex:1; }
+.stock-live-dialog-actions { display:flex; justify-content:flex-end; gap:.75rem; }
+.stock-live-dialog [data-live-dialog-error] { color:#9f1239; }
+@media(max-width:650px) { .stock-live-result { margin-left:0; } .stock-live-dialog { padding:1rem; } }

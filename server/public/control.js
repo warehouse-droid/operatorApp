@@ -11,6 +11,7 @@ const ACCOUNT_ROLE_OPTIONS = [
   { value: "yard_manager", labelKey: "control.roleYardManager", label: "Yard Manager" },
   { value: "sales", labelKey: "control.roleSales", label: "Sales" },
   { value: "field_sales", labelKey: "control.roleFieldSales", label: "Field Sales" },
+  { value: "mbr_sales", labelKey: "control.roleMbrSales", label: "MBR Sales" },
   { value: "mbt_frontdesk", labelKey: "control.roleMbtFrontdesk", label: "MBT Front Desk" },
   { value: "mbt_billing", labelKey: "control.roleMbtBilling", label: "MBT Billing" },
   { value: "admin", labelKey: "control.roleAdmin", label: "Admin" }
@@ -26,11 +27,12 @@ const SECTION_STORAGE_KEY = IS_ADMIN_PAGE ? "mbbs.admin.section" : "mbbs.control
 const ACCOUNT_SELECTION_KEY = "mbbs.admin.selectedAccount";
 const SCM_RECONCILIATION_SELECTED_RUN_KEY = "mbbs.admin.reconciliation.selectedRun";
 const ADMIN_SECTIONS = new Set(["dashboard", "operators", "sync", "maps-usage", "reconciliation", "return-automation", "sor-auto-returns", "storage", "audit"]);
-const CONTROL_SECTIONS = new Set(["dashboard", "returns", "locks", "classification", "vendor-mapping", "warnings", "loaded-export", "cycle-count", "count-sheets", "damage-stock", "fulfillment"]);
+const CONTROL_SECTIONS = new Set(["dashboard", "returns", "locks", "reopen", "classification", "vendor-mapping", "warnings", "loaded-export", "cycle-count", "count-sheets", "damage-stock", "fulfillment"]);
 const CONTROL_SECTION_ROUTES = {
   dashboard: "/control",
   returns: "/control/returns",
   locks: "/control/order-locks",
+  reopen: "/control/order-reopen",
   classification: "/control/item-classification",
   "vendor-mapping": "/control/vendor-mapping",
   warnings: "/control/operator-warnings",
@@ -220,7 +222,7 @@ function sectionFromCurrentRoute() {
 
 function routeForSection(section) {
   const sectionRoutes = IS_ADMIN_PAGE ? ADMIN_SECTION_ROUTES : CONTROL_SECTION_ROUTES;
-  return sectionRoutes[normalizedSection(section)] || (IS_ADMIN_PAGE ? "/admin" : "/control");
+  return (/** @type {Record<string, string>} */ (sectionRoutes))[normalizedSection(section)] || (IS_ADMIN_PAGE ? "/admin" : "/control");
 }
 
 function setActiveSection(section, { updateRoute = true } = {}) {
@@ -1652,6 +1654,9 @@ function render() {
     </section>
   `;
   if (activeSection === "sor-auto-returns") { void window.SorAdmin?.mount(app.querySelector("[data-sor-admin]"), request); }
+  if (IS_ADMIN_PAGE && activeSection === "dashboard") {
+    window.AdminDispatchEditors?.mount(app.querySelector("[data-admin-dispatch-editors]"), request);
+  }
   restoreControlFocus(focusState);
   restoreControlScrollPositions(scrollPositions);
   hydrateSecurePhotoImages(app);
@@ -1667,6 +1672,7 @@ function renderActiveSection() {
   if (activeSection === "sor-auto-returns") { return "<div data-sor-admin></div>"; }
   if (activeSection === "return-automation") return renderReturnAutomationSection();
   if (activeSection === "locks") return renderLocksSection();
+  if (activeSection === "reopen") return controlOrderReopen.render();
   if (activeSection === "classification") return renderClassificationSection();
   if (activeSection === "vendor-mapping") return renderVendorMappingSection();
   if (activeSection === "storage") return renderStorageSection();
@@ -1865,6 +1871,11 @@ function renderDashboardSection() {
         <p class="muted">Manage application access, NetSuite synchronization, yard printers, photo storage, and security audit history. Yard operations remain under Control.</p>
         <div class="actions"><button onclick="location.href='/control'">Open Control</button></div>
       </section>
+      <section class="panel">
+        <h2>Dispatch date-plan editors</h2>
+        <p class="muted">Kick a user out to release their date plan. Edit Mode ends automatically after 10 minutes without activity.</p>
+        <div data-admin-dispatch-editors></div>
+      </section>
     `;
   }
   const classified = classifications.filter((item) => item.product_type || item.brand || item.series).length;
@@ -1876,6 +1887,7 @@ function renderDashboardSection() {
   );
   return `
     <div class="dashboard-grid">
+      <button class="metric-card" data-action="control-section" data-section="reopen" type="button"><span>Order Reopen</span><strong>Unpack</strong><em>reset Operator progress and retain images</em></button>
       <button class="metric-card ${pendingReturns ? "warning" : ""}" data-action="control-section" data-section="returns" type="button">
         <span>Return Management</span>
         <strong>${pendingReturns}</strong>
@@ -1962,13 +1974,15 @@ function returnReference(record) {
 }
 
 function returnStatus(record) {
-  if (record?.draftId || record?.draft_id) return "draft";
+  if (firstDefined(record, ["draftId", "draft_id"], "")) return "draft";
   const syncStatus = String(firstDefined(record, ["netSuiteSyncStatus", "netsuite_sync_status"], "")).toLowerCase();
+  const creditMemo = firstDefined(record, ["netSuiteStage", "netsuite_stage"], "") === "credit_memo";
   if (syncStatus === "failed") {
-    return returnType(record) === "pallet" && Number(record.workflowVersion || 1) < 2 ? "credit_memo_creation_failed" : "ra_creation_failed";
+    return creditMemo || (returnType(record) === "pallet" && Number(record.workflowVersion || 1) < 2) ? "credit_memo_creation_failed" : "ra_creation_failed";
   }
   if (Number(record.workflowVersion) >= 2 && !["voided", "rejected"].includes(record.status)) {
-    const result = { disabled: "local_only", pending: "ra_pending", succeeded: "ra_created", manual_linked: "ra_created" }[syncStatus];
+    const prefix = creditMemo ? "credit_memo" : "ra";
+    const result = { disabled: "local_only", pending: `${prefix}_pending`, succeeded: `${prefix}_created`, manual_linked: `${prefix}_created` }[syncStatus];
     if (result) {return result;}
   }
   return String(firstDefined(record, ["status", "returnStatus", "return_status", "approvalStatus", "approval_status"], "unknown"))
@@ -2015,6 +2029,8 @@ function returnStatusLabel(value) {
     ra_created: "RA Created",
     ra_creation_failed: "RA Creation Failed",
     credit_memo_creation_failed: "Credit Memo Creation Failed",
+    credit_memo_pending: "Credit Memo Pending",
+    credit_memo_created: "Credit Memo Created",
     sync_failed: "NetSuite Sync Failed",
     synced: "Synced",
     linked: "Linked",
@@ -2444,7 +2460,7 @@ function renderReturnAutomationSection() {
     <div class="section-heading">
       <div>
         <h2>Legacy Return NetSuite Automation</h2>
-        <p class="muted">These settings apply to earlier return records. For new stock and pallet Return Authorizations, use the per-yard RA columns in <a href="/mbt-gates.html">Feature Gates</a>.</p>
+        <p class="muted">These settings apply to earlier return records. For new stock and pallet returns, use the per-yard RA and CM columns in <a href="/mbt-gates.html">Feature Gates</a>. Enabled CM gates create Credit Memos directly and take priority over RA.</p>
       </div>
       <button data-action="refresh-return-automation" type="button">Refresh</button>
     </div>
@@ -2454,7 +2470,7 @@ function renderReturnAutomationSection() {
     </div>
     <div class="notice">
       <strong>Legacy split reasons</strong>
-      <span>Earlier Quality Returns with multiple reasons on one Sales Order line still require manual linking. New confirmations preserve separate reason rows in one Return Authorization.</span>
+      <span>Earlier Quality Returns with multiple reasons on one Sales Order line still require manual linking. New confirmations preserve separate reason rows in one NetSuite return transaction.</span>
     </div>
     ${returnSettingsError ? `<div class="notice sync-error"><strong>Return automation settings could not be loaded</strong><span>${escapeHtml(returnSettingsError)}</span></div>` : `
       <div class="return-automation-grid">
@@ -4847,6 +4863,7 @@ async function loadAdminReturnSettings() {
 }
 
 async function loadControlData() {
+  if (!IS_ADMIN_PAGE && activeSection === "reopen") return controlOrderReopen.load();
   if (!IS_ADMIN_PAGE && activeSection === "count-sheets") return controlCountSheets.load();
   if (!IS_ADMIN_PAGE && activeSection === "damage-stock") return controlDamage.load();
   if (IS_ADMIN_PAGE) {
@@ -5913,6 +5930,7 @@ app.addEventListener("input", (event) => {
   }, 250);
 });
 
+const controlOrderReopen = (/** @type {any} */ (window)).MBBSControlOrderReopen?.create({ root: app, request, escape: escapeHtml, render, active: () => activeSection === "reopen" });
 const controlCountSheets = window.MBBSControlCountSheets?.create({root:app, request, escape:escapeHtml, render});
 const controlDamage = window.MBBSControlDamage?.create({root:app, request, escape:escapeHtml, render, photo:photoImgAttributes, preview:openPhotoLightbox, readPhoto:readOriginalDamagePhoto, active:()=>activeSection==="damage-stock"});
 

@@ -29,6 +29,22 @@ function mutationError(status, code, message, details = {}) {
   return error;
 }
 
+/** @param {Record<string, any>} activity */
+function operatorActivityMessage(activity) {
+  if (!Array.isArray(activity.orders) || !activity.orders.length) {
+    return `Operator work has started for ${(activity.refs || []).join(", ") || "an affected order"}.`;
+  }
+  return activity.orders.map((/** @type {any} */ order) => {
+    const name = String(order.operator?.displayName || order.operator?.username || "").trim();
+    const login = String(order.operator?.username || "").trim();
+    const actor = name ? ` by ${name}${login && login !== name ? ` (${login})` : ""}` : "; the operator was not recorded";
+    const progress = order.status === "loaded" ? "has loaded quantities"
+      : order.status === "packed" ? "is packed" : "is being prepared";
+    return `${order.orderRef} ${progress}${order.viaOrderRef ? ` on ${order.viaOrderRef}` : ""}${actor}.`;
+  }).join(" ") + " Review the affected order in Control → Order Reopen.";
+}
+
+/** @param {Record<string, any>} [input] */
 export function evaluateDependencyMutationBlockers(input = {}) {
   const blockers = [];
   if (hasEntries(input.closedOrders)) {
@@ -65,7 +81,7 @@ export function evaluateDependencyMutationBlockers(input = {}) {
   if (hasEntries(input.operatorActivity)) {
     blockers.push(blocker(
       "OPERATOR_ACTIVITY_STARTED",
-      "Operator work has started for an affected order.",
+      operatorActivityMessage(input.operatorActivity),
       { ...input.operatorActivity }
     ));
   }

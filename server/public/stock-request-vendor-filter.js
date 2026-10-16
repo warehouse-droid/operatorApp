@@ -15,5 +15,5 @@ const escapeHtml = value => String(value ?? '').replace(/[&<>"']/g, char => ({'&
 export function vendorFilterHtml(vendors, selected) {
   const names = new Set(parseVendorNames(selected));
   const options = [...new Set([...vendors,...names])].sort((a,b)=>a.localeCompare(b));
-  return `<details class="stock-request-yard-filter special-vendor-filter"><summary>Vendors${names.size ? ` (${names.size})` : ': All'}</summary><div>${options.map(name=>`<label><input type="checkbox" data-special-vendor value="${escapeHtml(name)}" ${names.has(name)?'checked':''}> ${escapeHtml(name)}</label>`).join('')}<button type="button" data-special-clear-vendors>Clear selection</button></div></details>`;
+  return `<details class="stock-request-yard-filter special-vendor-filter"><summary>Vendors${names.size ? ` (${names.size})` : ': All'}</summary><div>${options.map(name=>`<label><input type="checkbox" data-special-vendor value="${escapeHtml(name)}" ${names.has(name)?'checked':''}> ${escapeHtml(name)}</label>`).join('')}<div class="stock-request-filter-actions"><button type="button" data-special-clear-vendors>Clear selection</button><button class="primary" type="button" data-special-apply-vendors>Apply</button></div></div></details>`;
 }

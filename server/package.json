@@ -509,7 +509,8 @@
     "qr-scanner": "^1.4.2",
     "sharp": "0.35.3",
     "web-push": "3.6.7",
-    "nodemailer": "10.0.13"
+    "nodemailer": "10.0.13",
+    "playwright": "1.62.1"
   },
   "devDependencies": {
     "@axe-core/playwright": "4.12.1",

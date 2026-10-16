@@ -3,7 +3,7 @@ import { driverActivityOrderRefs } from "./driver-co-pickup-evidence.js";
 import { DISPATCH_FLEET_PLANNING_LOCK } from './dispatch-fleet-status.js';
 import { lockDispatchPlanEditLease, lockDispatchPlanEditLeaseDate } from './dispatch-plan-lease-repository.js';
 import { lockConsolidatedLoadOrders } from "./consolidation-load-locks.js";
-import { completedCoArrivalSql, coSourcePackingActivityRefs, coSourcePackingOrders } from "./co-source-packing-handoff.js";
+import { completedCoArrivalSql, coSourcePackingOrders } from "./co-source-packing-handoff.js";
 import { getDispatchPlan } from "./dispatch-plan-repository.js";
 import { resolveDispatchSalesTarget } from "./dispatch-order-target-repository.js";
 import { listClosedNetSuiteOrders } from "./netsuite-closed-order-repository.js";
@@ -26,10 +26,6 @@ function statusError(status, code, message, details = {}) {
   return Object.assign(new Error(message), { status, code, details });
 }
 
-function activeWorkStatus(value) {
-  return ["preparing", "confirmed", "packed", "loaded", "fulfilled", "shipped", "received", "complete", "completed"]
-    .includes(text(value).toLowerCase());
-}
 
 async function relationshipContext(command = {}) {
   const action = text(command.action);
@@ -83,11 +79,6 @@ function selectedSalesLineIds(action, allocations, lines) {
   return [...new Set(selected.map((line) => line.salesLineId))];
 }
 
-function salesStatusBlocks(value, salesLineIds) {
-  // Packed/confirmed summarize other lines too; preparation and execution do not.
-  return activeWorkStatus(value)
-    && !(salesLineIds && ["confirmed", "packed"].includes(text(value).toLowerCase()));
-}
 
 async function lockDependencyOperatorOrders(salesRefs, transferRefs) {
   const orders = await query(
@@ -121,101 +112,6 @@ async function lockDependencyOperatorOrders(salesRefs, transferRefs) {
   await query("SELECT id FROM local_co_order_lines WHERE co_id=ANY($1::bigint[]) ORDER BY id FOR UPDATE", [coIds]);
 }
 
-async function operatorActivityRefs({ salesRefs = [], transferRefs = [], salesLineIds = null, allowReceivedCo = false, ignorePacking = false } = {}) {
-  if (ignorePacking) {
-    // A dependency describes supply and routing. Operator preparation,
-    // confirmation and packing do not constitute execution of that route.
-    const execution = await query(`
-      SELECT sales.tranid AS ref FROM sales_orders sales
-       WHERE sales.tranid = ANY($1::text[]) AND (
-         LOWER(COALESCE(sales.operator_status, '')) IN ('loaded','partial_loaded','fulfilled','shipped','received','complete','completed')
-         OR LOWER(COALESCE(sales.local_yard_order_status, '')) = 'loaded'
-         OR LOWER(COALESCE(sales.fulfillment_status, '')) IN ('fulfilled','partial_fulfilled','shipped')
-         OR EXISTS (SELECT 1 FROM sales_order_lines line
-           WHERE line.sales_order_id=sales.netsuite_id AND COALESCE(line.loaded_qty,0)>0))
-      UNION
-      SELECT transfer.tranid FROM transfer_orders transfer
-       WHERE transfer.tranid = ANY($2::text[]) AND (
-         LOWER(COALESCE(transfer.outbound_operator_status, '')) IN ('loaded','partial_loaded','fulfilled','shipped')
-         OR LOWER(COALESCE(transfer.local_yard_order_status, '')) = 'loaded'
-         OR LOWER(COALESCE(transfer.fulfillment_status, '')) IN ('loaded','fulfilled','partial_fulfilled','shipped')
-         OR EXISTS (SELECT 1 FROM transfer_order_lines line
-           WHERE line.transfer_order_id=transfer.netsuite_id AND line.line_stage='outbound'
-             AND COALESCE(line.loaded_qty,0)>0))
-      UNION
-      SELECT sales.tranid FROM local_co_orders co JOIN sales_orders sales
-        ON co.source_order_ref=sales.tranid OR co.details->'childOrderIds' ? sales.tranid
-       WHERE sales.tranid = ANY($1::text[]) AND co.status <> 'cancelled'
-         AND (co.loaded_at IS NOT NULL OR co.received_at IS NOT NULL
-           OR co.status IN ('loaded','received','completed'))
-         AND NOT ($3::boolean AND co.status='completed' AND ${completedCoArrivalSql("co")} IS NOT NULL)`,
-    [salesRefs,transferRefs,allowReceivedCo]);
-    return [...new Set(execution.rows.map(row => text(row.ref)).filter(Boolean))];
-  }
-  const refs = [];
-  if (salesRefs.length) {
-    refs.push(...await coSourcePackingActivityRefs(salesRefs, salesLineIds, { allowReceivedCo }));
-    const sales = await query(
-      `SELECT DISTINCT sales.tranid AS ref, sales.operator_status,
-              sales.local_yard_order_status, sales.preparing_operator_id,
-              sales.preparing_started_at,
-              bool_or(COALESCE(line.loaded_qty, 0) > 0) AS order_loaded,
-              bool_or(($2::bigint[] IS NULL OR line.id = ANY($2::bigint[])) AND (
-                COALESCE(line.confirmed, false)
-                OR ($2::bigint[] IS NOT NULL AND line.confirmed_at IS NOT NULL)
-                OR COALESCE(line.packed_pallet_qty, 0) > 0
-                OR COALESCE(line.packed_layer_qty, 0) > 0
-                OR COALESCE(line.packed_section_qty, 0) > 0
-                OR COALESCE(line.packed_piece_qty, 0) > 0
-                OR COALESCE(line.packed_sales_qty, 0) > 0
-                OR COALESCE(line.loaded_qty, 0) > 0
-              )) AS line_started
-         FROM sales_orders sales
-         LEFT JOIN sales_order_lines line ON line.sales_order_id = sales.netsuite_id
-        WHERE sales.tranid = ANY($1::text[])
-        GROUP BY sales.netsuite_id`,
-      [salesRefs, salesLineIds]
-    );
-    refs.push(...sales.rows.filter((row) => (
-      text(row.preparing_operator_id)
-      || row.preparing_started_at
-      || salesStatusBlocks(row.operator_status, salesLineIds)
-      || salesStatusBlocks(row.local_yard_order_status, salesLineIds)
-      || row.order_loaded === true
-      || row.line_started === true
-    )).map((row) => text(row.ref)));
-  }
-  if (transferRefs.length) {
-    const transfers = await query(
-      `SELECT DISTINCT transfer.tranid AS ref, transfer.outbound_operator_status,
-              transfer.local_yard_order_status, transfer.preparing_operator_id,
-              transfer.preparing_started_at,
-              bool_or(
-                COALESCE(line.confirmed, false)
-                OR COALESCE(line.packed_pallet_qty, 0) > 0
-                OR COALESCE(line.packed_layer_qty, 0) > 0
-                OR COALESCE(line.packed_section_qty, 0) > 0
-                OR COALESCE(line.packed_piece_qty, 0) > 0
-                OR COALESCE(line.packed_sales_qty, 0) > 0
-                OR COALESCE(line.loaded_qty, 0) > 0
-              ) AS line_started
-         FROM transfer_orders transfer
-         LEFT JOIN transfer_order_lines line
-           ON line.transfer_order_id = transfer.netsuite_id AND line.line_stage = 'outbound'
-        WHERE transfer.tranid = ANY($1::text[])
-        GROUP BY transfer.netsuite_id`,
-      [transferRefs]
-    );
-    refs.push(...transfers.rows.filter((row) => (
-      text(row.preparing_operator_id)
-      || row.preparing_started_at
-      || activeWorkStatus(row.outbound_operator_status)
-      || activeWorkStatus(row.local_yard_order_status)
-      || row.line_started === true
-    )).map((row) => text(row.ref)));
-  }
-  return [...new Set(refs.filter(Boolean))];
-}
 
 async function receivingActivityRefs({ purchaseRefs = [], transferRefs = [] } = {}) {
   const refs = [];
@@ -465,9 +361,8 @@ export async function previewScmDependencyMutation(command = {}, actor = {}, { l
   // queries on the same transaction connection.
   if (lock && salesLineIds) {await lockDependencyOperatorOrders(memberRefs, guardedTransferRefs);}
   const closed = await closedOrderRefs(guardedRefs);
-  const operatorRefs = await operatorActivityRefs({ salesRefs: memberRefs, transferRefs: guardedTransferRefs, salesLineIds,
-    allowReceivedCo: action === "link_to" && Boolean(salesLineIds?.length),
-    ignorePacking: ["link_to", "unlink_to", "change_mode", "link_po", "unlink_po"].includes(action) });
+  // Operator loading and fulfillment do not execute a Dispatch route.
+  // Driver activity, route evidence and plan fences below govern these changes.
   const receivingRefs = await receivingActivityRefs({ purchaseRefs, transferRefs: guardedTransferRefs });
   const executionIds = completedUnlink ? [] : await dependencyExecutionIds({ dependencyIds, transferRefs });
   const jobIds = await driverActivity({ refs: guardedRefs });
@@ -491,7 +386,6 @@ export async function previewScmDependencyMutation(command = {}, actor = {}, { l
     expectedPlanRevision: command.expectedPlanRevision,
     actualPlanRevision: plan?.revision,
     editLease: lease,
-    operatorActivity: operatorRefs.length ? { refs: operatorRefs } : null,
     receivingActivity: receivingRefs.length ? { refs: receivingRefs } : null,
     dependencyExecution: executionIds.length ? { dependencyIds: executionIds } : null,
     driverActivity: jobIds.length ? { jobIds } : null,

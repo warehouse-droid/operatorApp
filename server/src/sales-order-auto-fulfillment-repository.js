@@ -1,4 +1,5 @@
 // @ts-check
+import {firstSplitFulfillmentLines} from './sales-order-fulfillment-first-split.js';
 
 import crypto from "node:crypto";
 
@@ -124,10 +125,18 @@ async function completionSource(row) {
             local_order.outbound_location,
             COALESCE(split.source_so_id, local_order.netsuite_id) AS source_order_id,
             COALESCE(split.source_so_ref, local_order.tranid) AS source_order_ref,
-            split.id AS split_ledger_id
+            split.id AS split_ledger_id,
+            CASE WHEN first_split.split_ref IS NULL THEN NULL
+                 ELSE COALESCE(first_split.full_order->'items','{}'::jsonb) END AS first_split_items
        FROM dispatch_effective_order_completion_events event
+       LEFT JOIN dispatch_global_order_splits first_split
+         ON lower(first_split.split_ref) = lower(btrim(event.order_ref))
+        AND first_split.active = true AND first_split.order_type = 'SO'
+        AND first_split.definition_kind = 'split'
+        AND lower(first_split.split_ref) = lower(first_split.parent_order_ref) || '-s1'
+        AND NOT EXISTS (SELECT 1 FROM sales_orders child WHERE lower(btrim(child.tranid)) = lower(btrim(event.order_ref)))
        LEFT JOIN sales_orders local_order
-         ON lower(btrim(local_order.tranid)) = lower(btrim(event.order_ref))
+         ON lower(btrim(local_order.tranid)) = lower(btrim(COALESCE(first_split.parent_order_ref,event.order_ref)))
        LEFT JOIN dispatch_scm_so_splits split
          ON split.split_so_id = local_order.netsuite_id
         AND split.status = 'active'
@@ -218,7 +227,7 @@ async function sourceLines(source) {
       ORDER BY local_line.line_id NULLS LAST, local_line.id`,
     [source.local_order_id, source.source_order_id]
   );
-  return result.rows;
+  return firstSplitFulfillmentLines(result.rows,source.first_split_items);
 }
 
 /** @param {LooseRecord} source @param {LooseRecord[]} lines @returns {Promise<Map<string, LooseRecord>>} */
@@ -504,17 +513,21 @@ export async function prepareSalesOrderAutoFulfillmentCandidate(candidateId) {
       );
       return publicCandidate(await candidateRow(row.id));
     }
+    if (!row.snapshot_hash) {
+      await query(`UPDATE dispatch_sales_order_if_candidates SET source_sales_order_id=$2,source_sales_order_ref=$3 WHERE id=$1`,
+        [row.id,source.source_order_id,source.source_order_ref]);
+    }
     const decision = await gateDecision(source);
-    if (decision.status === "historical" && row.resolution_action === "historical_backfill") {
+    if (decision.status === "historical" && ["historical_backfill", "snapshot", "all_live_remaining", "custom", "recover"].includes(row.resolution_action)) {
       decision.status = "eligible";
     }
     if (decision.status !== "eligible") {
       await query(
         `UPDATE dispatch_sales_order_if_candidates
             SET status = $2, gate_key = $3, gate_revision = $4,
-                activation_event_id = $5, updated_at = now()
+                activation_event_id = $5, last_error = $6, updated_at = now()
           WHERE id = $1`,
-        [row.id, decision.status, decision.gateKey || null, decision.gateRevision || null, decision.activationEventId || null]
+        [row.id, decision.status, decision.gateKey || null, decision.gateRevision || null, decision.activationEventId || null, decision.error || null]
       );
       return publicCandidate(await candidateRow(row.id));
     }
@@ -744,12 +757,21 @@ async function setTerminalState({ candidateId, status, action, details = {}, err
   });
 }
 
-export const markSalesOrderAutoFulfillmentAttention = (/** @type {LooseRecord} */ input) => setTerminalState({
-  candidateId: input.candidateId,
-  status: "attention",
-  action: "drift_attention",
-  details: { issues: input.issues, liveOrder: input.liveOrder },
-  error: "Live NetSuite Sales Order lines differ from the delivered snapshot."
+export const markSalesOrderAutoFulfillmentAttention = (/** @type {LooseRecord} */ input) => withTransaction(async()=>{
+  if(input.recoveryRequired) {
+    const row=await candidateRow(input.candidateId,{lock:true});
+    if(!row || !['queued','uncertain'].includes(row.status) || row.lease_token) {return publicCandidate(row);}
+    return setTerminalState({candidateId:input.candidateId,status:'uncertain',action:'recovery_unverified',
+      details:{postingAttempted:false},error:input.error});
+  }
+  if(input.sourceReadFailed) {
+    const row=await candidateRow(input.candidateId,{lock:true});
+    if(!row || !['queued','discovered','waiting_evidence'].includes(row.status) || row.lease_token) {return publicCandidate(row);}
+  }
+  return setTerminalState({candidateId:input.candidateId,status:'attention',
+    action:input.sourceReadFailed?'source_read_failed':'drift_attention',
+    details:{issues:input.issues,liveOrder:input.liveOrder},
+    error:input.error || 'Live NetSuite Sales Order lines differ from the delivered snapshot.'});
 });
 export const markSalesOrderAutoFulfillmentClosed = (/** @type {LooseRecord} */ input) => setTerminalState({
   candidateId: input.candidateId,
@@ -777,7 +799,8 @@ export async function listRunnableSalesOrderAutoFulfillmentCandidateIds({ limit 
     `SELECT id
        FROM dispatch_sales_order_if_candidates
       WHERE status IN ('discovered', 'waiting_evidence', 'queued')
-      ORDER BY created_at, id
+      ORDER BY CASE WHEN status = 'waiting_evidence' THEN 1 ELSE 0 END,
+               updated_at, id
       LIMIT $1`,
     [Math.max(1, Math.min(Number(limit) || 25, 100))]
   );

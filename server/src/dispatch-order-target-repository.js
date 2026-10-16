@@ -209,6 +209,15 @@ function lineMatchesItem(line = {}, item = {}, { allowRowId = true } = {}) {
   return Boolean(sku && [line.sku, line.item_name].map((value) => text(value).toLowerCase()).includes(sku));
 }
 
+function findLineForItem(lines = [], item = {}, { allowRowId = true } = {}) {
+  const rowId = Number(item.lineRowId || item.id || 0);
+  const rowMatch = allowRowId && rowId ? lines.find((line) => Number(line.id) === rowId) : null;
+  if (rowMatch) return rowMatch;
+  const lineId = text(item.lineId ?? item.line_id);
+  const lineMatch = lineId ? lines.find((line) => text(line.line_id) === lineId) : null;
+  return lineMatch || lines.find((line) => lineMatchesItem(line, item, { allowRowId: false }));
+}
+
 function sourceLineIdentity(item = {}, line = {}) {
   return text(item.lineRowId || item.sourceLineId || item.lineId || item.line_id || line.id || line.line_id || item.itemId || item.sku);
 }
@@ -266,9 +275,8 @@ function linesForEntry({ targetRef, kind, entry, canonical }) {
   }
   const rows = [];
   for (const item of items) {
-    let line = sourceLines.find((candidate) => lineMatchesItem(candidate, item, { allowRowId: !exactHeader || kind !== "split" }));
-    if (!line && exactHeader) line = sourceLines.find((candidate) => lineMatchesItem(candidate, item, { allowRowId: false }));
-    if (!line && parentLines.length) line = parentLines.find((candidate) => lineMatchesItem(candidate, item));
+    let line = findLineForItem(sourceLines, item, { allowRowId: !exactHeader || !parentRef });
+    if (!line && parentLines.length) line = findLineForItem(parentLines, item);
     if (!line) continue;
     rows.push(normalizedTargetLine({ targetRef, kind, sourceRef: text(line.source_order_ref || sourceRef), item, line }));
   }
@@ -368,8 +376,8 @@ export async function remapDispatchLinksToMaterializedSplit(order = {}, splitOrd
   let dependencyCount = 0;
   let poAllocationCount = 0;
   for (const item of order.items || []) {
-    const parentLine = parentLines.find((line) => lineMatchesItem(line, item));
-    const splitLine = splitLines.find((line) => lineMatchesItem(line, item, { allowRowId: false }));
+    const parentLine = findLineForItem(parentLines, item);
+    const splitLine = findLineForItem(splitLines, item, { allowRowId: false });
     if (!parentLine || !splitLine) continue;
     const sourceIdentity = sourceLineIdentity(item, parentLine);
     const previousKey = targetLineKey(targetRef, parentRef, sourceIdentity);

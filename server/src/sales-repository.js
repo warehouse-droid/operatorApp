@@ -139,7 +139,7 @@ export async function listSalesOrderPrintCandidates({ search = "", orderingLocat
           AND l.netsuite_active = true
           AND ${PRINTABLE_LINE_SQL}
         WHERE so.netsuite_active = true
-          AND lower(trim(COALESCE(so.sales_order_type, ''))) = 'delivery'
+          AND lower(trim(COALESCE(so.sales_order_type, ''))) IN ('delivery', 'pick-up', 'pickup', 'pick up')
      )
      SELECT scope.order_id,
             scope.order_ref,
@@ -249,7 +249,7 @@ export async function getSalesOrderPrintCandidate({ orderId, allowedOrderingLoca
           AND ${PRINTABLE_LINE_SQL}
         WHERE so.netsuite_id = $1
           AND so.netsuite_active = true
-          AND lower(trim(COALESCE(so.sales_order_type, ''))) = 'delivery'
+          AND lower(trim(COALESCE(so.sales_order_type, ''))) IN ('delivery', 'pick-up', 'pickup', 'pick up')
      )
      SELECT scope.order_id,
             scope.order_ref,

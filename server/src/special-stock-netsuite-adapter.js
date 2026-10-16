@@ -1,7 +1,7 @@
 /**
  * @typedef {{itemId:number,itemName?:string,uom:string,quantity:number,unitId?:number,remoteLineId?:number,caseLineId?:number,description?:string,previousDescription?:string,previousQuantity?:number,previousUnitId?:number,previousUom?:string,rate?:number}} SpecialLine
  * @typedef {{line:number,item:{id:string|number},quantity:number,units?:string|number|{id:string|number},description?:string,rate?:string|number,createdPo?:{id:string|number},createPo?:{id:string},quantityReceived?:number,quantityBilled?:number,isClosed?:boolean}} RemoteLine
- * @typedef {{internalId?:string|number,id?:string|number,abbreviation?:string,pluralAbbreviation?:string,unitName?:string,pluralName?:string}} RemoteUnit
+ * @typedef {{internalId?:string|number,id?:string|number,abbreviation?:string,pluralAbbreviation?:string,unitName?:string,pluralName?:string,links?:{rel?:string,href?:string}[]}} RemoteUnit
  * @typedef {{unitstype?:string|number,stock_unit_id?:string|number,stock_unit?:string,sales_unit_id?:string|number,sales_unit?:string,purchase_unit_id?:string|number,purchase_unit?:string,uniquekey?:string|number,rest_line_id?:string|number,item?:string|number,execution_quantity?:number|string,billed_quantity?:number|string,line_closed?:boolean|string}} UnitMetadata
  * @typedef {{rest:(path:string,options?:{method?:string,body?:{discountItem?:{id:string},discountRate?:number,item:{items:{line:number,description:string,quantity?:number,units?:string,rate?:number}[]}}})=>Promise<{data?:{discountItem?:{id:string},discountRate?:number,item?:{items?:RemoteLine[]},uom?:{items?:RemoteUnit[]},createdFrom?:{id:string|number},entity?:{id:string|number},orderStatus?:{id:string}}}>,queryAll:(sql:string)=>Promise<UnitMetadata[]>}} Boundary
  */
@@ -17,6 +17,21 @@ function id(value) {
 }
 /** @param {unknown} value */
 const normalized = value => String(value || '').trim().toUpperCase();
+
+/** REST UOM rows may identify their native unit only in the self link.
+ * @param {RemoteUnit} unit @param {number} typeId */
+function nativeUnitId(unit, typeId) {
+  const explicit = unit.internalId ?? unit.id;
+  if (explicit != null) return id(explicit);
+  const links = Array.isArray(unit.links) ? unit.links.filter(link => link?.rel === 'self') : [];
+  const match = links.length === 1 && typeof links[0].href === 'string'
+    ? links[0].href.match(/\/record\/v1\/unitstype\/(\d+)\/uom\/(\d+)\/?$/i) : null;
+  const number = Number(match?.[2]);
+  if (!match || Number(match[1]) !== typeId || !Number.isSafeInteger(number) || number <= 0) {
+    throw error('The selected NetSuite UOM has no valid native identity.', 'SPECIAL_UOM_INVALID');
+  }
+  return number;
+}
 
 /** REST transaction units are scalar IDs; retain compatibility with reference-shaped records.
  * @param {RemoteLine['units']} units */
@@ -63,7 +78,7 @@ export async function resolveSpecialUnits(lines, { rest, queryAll }) {
     }
     const matches = (units.get(typeId) || []).filter(unit => [unit.abbreviation, unit.pluralAbbreviation, unit.unitName, unit.pluralName].some(name => normalized(name) === normalized(line.uom)));
     if (!line.uom || matches.length !== 1) throw error(`Select a native NetSuite UOM for ${line.itemName || line.itemId}: ${line.uom || '(empty)'}.`, 'SPECIAL_UOM_INVALID');
-    result.push({ ...line, unitId: id(matches[0].internalId ?? matches[0].id) });
+    result.push({ ...line, unitId: nativeUnitId(matches[0], typeId) });
   }
   return result;
 }

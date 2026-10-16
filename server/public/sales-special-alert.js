@@ -111,7 +111,7 @@
     paint();
     if (!timer) { timer = window.setInterval(refresh, 30000); }
     if (!events && 'EventSource' in window) {
-      events = new EventSource('/api/events?client=sales-special-alert');
+      events = window.MBBSAppEventStream?.connect('/api/events?client=sales-special-alert') || new EventSource('/api/events?client=sales-special-alert');
       events.addEventListener('open', refresh);
       events.addEventListener('app-event', message => {
         try {
@@ -168,7 +168,7 @@
   function init() {
     const poReferenceAlert = document.createElement('script');
     poReferenceAlert.type = 'module';
-    poReferenceAlert.src = '/special-po-reference-alert.js?v=20261001';
+    poReferenceAlert.src = '/special-po-reference-alert.js?v=20261008-sales-queue';
     document.head.append(poReferenceAlert);
     const style = document.createElement('style');
     style.textContent = `

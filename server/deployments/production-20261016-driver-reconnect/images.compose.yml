@@ -1,0 +1,5 @@
+services:
+  app:
+    image: sha256:1c3a9eb67d1967511dc21ac934908e3e1a0e3776bab29e87961cf569ae7ba55e
+  webhook-worker:
+    image: sha256:3c15669576565d5fa8be316bca5bc5b59cb3b4069f25b7d4ae0b5ab0d7b4d9b9

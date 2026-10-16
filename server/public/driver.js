@@ -3,6 +3,9 @@ const toast = document.getElementById("driverToast");
 const offlineStatus = document.getElementById("driverOfflineStatus");
 const routeChangeStatus = document.getElementById("driverRouteChangeStatus");
 const syncHold = document.getElementById("driverSyncHold");
+const uploadStatus = document.getElementById("driverUploadStatus");
+const driverUploadFailures = window.DriverUpload.failureQueue(localStorage);
+const driverUploadSaveChecks = new Map();
 const TOKEN_KEY = "mbbs.driver.token"; // secret-scan: allow -- localStorage key name, not a token.
 const STAFF_TOKEN_KEY = "mbbs.staff.token"; // secret-scan: allow -- localStorage key name, not a token.
 const STAFF_ROLE_KEY = "mbbs.staff.role";
@@ -657,21 +660,34 @@ function markDriverInteraction() {
 function beginDriverMutation(action, button) {
   if (!DRIVER_MUTATION_ACTIONS.has(action)) return null;
   if (activeDriverMutationToken) return false;
+  const controller = new AbortController();
+  const parentSignal = driverRequestController.signal;
+  const abort = () => controller.abort();
+  parentSignal.addEventListener("abort", abort, {once: true});
+  if (parentSignal.aborted) abort();
   const token = {
+    controller, release: () => parentSignal.removeEventListener("abort", abort),
     action,
     jobId: String(currentJob?.jobId || ""),
     button,
     buttonDisabled: Boolean(button?.disabled),
-    buttonText: button?.textContent || ""
+    buttonText: button?.textContent || "",
+    uploadScope: {owner: driverUploadOwner(), signal: controller.signal}
   };
   activeDriverMutationToken = token;
   if (button) button.disabled = true;
   return token;
 }
 
+uploadStatus?.querySelector("[data-driver-upload-pause]")?.addEventListener("click", () => {
+  activeDriverMutationToken?.controller.abort();
+});
+
 function endDriverMutation(token) {
   if (!token || activeDriverMutationToken !== token) return;
+  token.release?.();
   activeDriverMutationToken = null;
+  if (uploadStatus) uploadStatus.hidden = true;
   if (token.button?.isConnected) {
     token.button.disabled = token.buttonDisabled;
     token.button.textContent = token.buttonText;
@@ -2246,28 +2262,39 @@ async function ensureLocationApprovalBeforeConfirmation() {
 
 async function request(path, options = {}) {
   let response;
+  let text;
+  const {timeoutMs = window.DriverUpload.API_TIMEOUT_MS, ...fetchOptions} = options;
   try {
-    response = await fetch(path, {
-      cache: options.cache || "no-store",
-      ...options,
-      signal: options.signal || driverRequestController.signal,
-      headers: {
-        "Content-Type": "application/json",
-        [DRIVER_PWA_VERSION_HEADER]: DRIVER_PWA_CLIENT_VERSION,
-        ...(authToken ? { Authorization: `Bearer ${authToken}` } : {}),
-        ...(offlineDeviceId ? { "X-MBBS-Driver-Device": offlineDeviceId } : {}),
-        ...(options.headers || {})
-      }
-    });
+    const received = await window.DriverUpload.deadline(async (signal) => {
+      const result = await fetch(path, {
+        cache: options.cache || "no-store",
+        ...fetchOptions,
+        signal,
+        headers: {
+          "Content-Type": "application/json",
+          [DRIVER_PWA_VERSION_HEADER]: DRIVER_PWA_CLIENT_VERSION,
+          ...(authToken ? { Authorization: `Bearer ${authToken}` } : {}),
+          ...(offlineDeviceId ? { "X-MBBS-Driver-Device": offlineDeviceId } : {}),
+          ...(options.headers || {})
+        }
+      });
+      return {response: result, text: await result.text()};
+    }, {signal: options.signal || driverRequestController.signal, timeoutMs});
+    response = received.response;
+    text = received.text;
   } catch (error) {
-    error.isNetworkError = true;
+    error.isNetworkError = error.code !== "driver_upload_cancelled";
     throw error;
   }
-  const text = await response.text();
   let data = {};
   try {
     data = text ? JSON.parse(text) : {};
   } catch {
+    if (response.ok) {
+      throw Object.assign(new Error("The server returned an unreadable response."), {
+        code: "driver_request_invalid_response", status: response.status
+      });
+    }
     data = {};
   }
   applyDriverOfflineMode(data);
@@ -2396,6 +2423,7 @@ function renderDriverRouteChangeStatus() {
 
 async function sendDriverRoutePresence({ visible = document.visibilityState === "visible", keepalive = false } = {}) {
   if (!driver || !authToken || !offlineDeviceId || !navigator.onLine) return false;
+  void flushDriverUploadFailures();
   const payload = { ...driverRoutePresenceSnapshot(), visible: visible === true };
   try {
     const response = await fetch("/api/driver/route-presence", {
@@ -2509,7 +2537,8 @@ async function isGenuineNetworkFailure(error) {
   if (!navigator.onLine) return true;
   if (!error?.isNetworkError) return false;
   try {
-    await fetch(`/api/driver/network-health?nonce=${encodeURIComponent(Date.now())}`, {
+    await window.DriverUpload.deadline(signal => fetch(`/api/driver/network-health?nonce=${encodeURIComponent(Date.now())}`, {
+      signal,
       method: "GET",
       cache: "no-store",
       credentials: "same-origin", // secret-scan: allow -- Fetch credential mode, not a credential value.
@@ -2517,7 +2546,7 @@ async function isGenuineNetworkFailure(error) {
         "Cache-Control": "no-store",
         [DRIVER_PWA_VERSION_HEADER]: DRIVER_PWA_CLIENT_VERSION
       }
-    });
+    }), {signal: driverRequestController.signal, timeoutMs: 10000});
     return false;
   } catch {
     return true;
@@ -2533,67 +2562,306 @@ function dataUrlToFile(dataUrl, filename = "photo.jpg") {
   return new File([bytes], filename, { type: mime });
 }
 
-async function uploadDriverPhoto(photo, context = {}) {
-  if (!photo) return photo;
-  if (typeof photo === "string" && photo.startsWith("r2://")) return photo;
-  if (photo?.objectReference) return photo.objectReference;
-  const ticket = await request("/api/driver/photo-upload-token", {
-    method: "POST",
-    body: JSON.stringify({
-      ...context,
-      ...(photo && typeof photo === "object" ? {
-        manifestId: offlineManifest?.manifestId || undefined,
-        photoId: photo.photoId,
-        mimeType: photo.mimeType || "image/jpeg",
-        byteSize: Number(photo.byteSize || photo.blob?.size || 0),
-        sha256: photo.sha256
-      } : {})
-    })
-  });
-  const file = photo?.blob instanceof Blob
-    ? new File([photo.blob], context.filename || `${context.recordType || "driver-photo"}.jpg`, { type: photo.mimeType || "image/jpeg" })
-    : dataUrlToFile(photo, context.filename || `${context.recordType || "driver-photo"}.jpg`);
-  const formData = new FormData();
-  formData.append("file", file);
-  let response;
-  try {
-    response = await fetch(ticket.uploadUrl, {
-      method: "POST",
-      headers: { Authorization: `Bearer ${ticket.token}` },
-      body: formData
+function driverUploadOwner() {
+  return {login: String(driver?.login || "").toLowerCase(), deviceId: offlineDeviceId};
+}
+
+function flushDriverUploadFailures() {
+  if (!authToken || !driver || !offlineDeviceId || !navigator.onLine) return Promise.resolve();
+  const owner = driverUploadOwner();
+  const signal = driverRequestController.signal;
+  return driverUploadFailures.flush(owner, async (failure) => {
+    const result = await request("/api/driver/upload-failures", {
+      method: "POST", body: JSON.stringify(failure), signal, timeoutMs: 10000
     });
-  } catch (error) {
-    error.isNetworkError = true;
-    throw error;
-  }
-  const text = await response.text();
-  let payload = null;
+    if (!result.ok) throw new Error("The upload diagnostic was not acknowledged.");
+  }, {signal});
+}
+
+function recordDriverUploadFailure(failure, owner = driverUploadOwner()) {
+  driverUploadFailures.enqueue(owner, failure);
+  void flushDriverUploadFailures();
+}
+
+function renderDriverUploadProgress(progress) {
+  if (!uploadStatus) return;
+  const label = uploadStatus.querySelector("[data-driver-upload-label]");
+  const meter = uploadStatus.querySelector("[data-driver-upload-current]");
+  const overall = uploadStatus.querySelector("[data-driver-upload-overall]");
+  uploadStatus.hidden = false;
+  if (progress.phase === "reconnecting") label.textContent = t("driver.uploadReconnecting", "Reconnecting automatically. Your photos are retained...");
+  else if (progress.phase === "saving") label.textContent = t("driver.uploadSavingStop", "Photos uploaded. Saving...");
+  else if (progress.phase === "reconciling") label.textContent = t("driver.uploadCheckingSave", "Checking whether the server saved this submission...");
+  else if (progress.phase === "authorizing") label.textContent = tf("driver.uploadPreparingPhoto", "Preparing photo {number} of {count}...", {number: progress.photoNumber, count: progress.photoCount});
+  else if (progress.phase === "confirming") label.textContent = tf("driver.uploadConfirmingPhoto", "Photo {number} of {count}: 100% sent. Waiting for confirmation...", {number: progress.photoNumber, count: progress.photoCount});
+  else label.textContent = tf("driver.uploadPhotoPercentage", "Photo {number} of {count}: {percentage}", {
+    number: progress.photoNumber, count: progress.photoCount,
+    percentage: progress.percentage === null ? t("common.uploading", "Uploading...") : `${progress.percentage}%`
+  });
+  if (progress.percentage === null) meter.removeAttribute("value");
+  else meter.value = progress.percentage ?? 100;
+  overall.textContent = progress.overallPercentage === null
+    ? t("driver.uploadOverallUnknown", "Overall: uploading...")
+    : tf("driver.uploadOverallPercentage", "Overall: {percentage}%", {percentage: progress.overallPercentage ?? 100});
+}
+
+function driverUploadScope() {
+  return activeDriverMutationToken?.uploadScope || {owner: driverUploadOwner(), signal: driverRequestController.signal};
+}
+
+function assertDriverUploadScope(scope) {
+  if (scope.signal.aborted) throw Object.assign(new Error("Upload was cancelled."), {code: "driver_upload_cancelled"});
+}
+
+async function updateDriverPhotoCache(task, scope = driverUploadScope()) {
+  const startedAt = Date.now();
+  const job = currentJob;
   try {
-    payload = text ? JSON.parse(text) : null;
-  } catch {
-    payload = null;
+    await window.DriverUpload.deadline(task, {signal: scope.signal, timeoutMs: 5000});
+  } catch (error) {
+    assertDriverUploadScope(scope);
+    recordDriverPhotoActionFailure({
+      code: error.code === "driver_upload_timeout" ? "driver_photo_cache_timeout" : "driver_photo_cache_failed",
+      message: error.message
+    }, {stage: "confirming", job, startedAt, owner: scope.owner});
   }
-  if (!response.ok) throw new Error(payload?.error || text || t("driver.photoUploadFailed", "Photo upload failed."));
-  if (!payload?.key) throw new Error(t("driver.photoUploadMissingKey", "Photo upload did not return an R2 key."));
-  const objectReference = `r2://${payload.key}`;
+  assertDriverUploadScope(scope);
+}
+
+async function withDriverPhotoReconnect(operation, scope) {
+  const recoveryId = crypto.randomUUID();
+  const startedAt = Date.now();
+  let lastFailure;
+  let attempt = 0;
+  const report = failure => {
+    lastFailure = {...failure, outcome: "failed", recoveryId, ...window.DriverUpload.environmentDiagnostic(failure)};
+    recordDriverUploadFailure(lastFailure, scope.owner);
+  };
+  const result = await window.DriverUpload.reconnect(number => {
+    attempt = number;
+    return operation(report);
+  }, {signal: scope.signal, onRetry: () => renderDriverUploadProgress({phase: "reconnecting", percentage: null, overallPercentage: null})});
+  assertDriverUploadScope(scope);
+  if (lastFailure) recordDriverUploadFailure({...lastFailure, failureId: crypto.randomUUID(), outcome: "recovered",
+    occurredAt: new Date().toISOString(), ...window.DriverUpload.environmentDiagnostic(), attempt,
+    elapsedMs: Math.min(86400000, Math.max(0, Date.now() - startedAt)), httpStatus: 200,
+    errorCode: "driver_upload_recovered", message: "Submission recovered automatically."}, scope.owner);
+  return result;
+}
+
+async function uploadDriverPhoto(photo, context = {}, onProgress = () => {}, scope = driverUploadScope()) {
+  assertDriverUploadScope(scope);
+  if (!photo) return photo;
+  const reference = typeof photo === "string" && photo.startsWith("r2://") ? photo : photo?.objectReference;
+  if (reference) { onProgress({phase: "uploaded", percentage: 100}); return reference; }
+  const captured = photo?.blob instanceof Blob ? photo : {blob: dataUrlToFile(photo)};
+  const objectReference = await withDriverPhotoReconnect(report => window.DriverUpload.upload(captured, {
+    signal: scope.signal,
+    filename: context.filename,
+    context: {...context, planDate: context.planDate || currentJob?.planDate || dayState?.planDate || "", clientVersion: DRIVER_PWA_CLIENT_VERSION},
+    ticket: signal => request("/api/driver/photo-upload-token", {
+      method: "POST", signal, timeoutMs: window.DriverUpload.API_TIMEOUT_MS,
+      body: JSON.stringify({
+        ...context,
+        ...(photo && typeof photo === "object" ? {
+          manifestId: offlineManifest?.manifestId || undefined,
+          photoId: photo.photoId, mimeType: photo.mimeType || "image/jpeg",
+          byteSize: Number(photo.byteSize || photo.blob?.size || 0), sha256: photo.sha256
+        } : {})
+      })
+    }),
+    onProgress,
+    onFailure: report
+  }), scope);
+  assertDriverUploadScope(scope);
   if (photo && typeof photo === "object") {
     photo.objectReference = objectReference;
     if (photo.photoId && offlineStorageAvailable) {
-      await window.DriverOfflineDB.markPhotoUploaded(photo.photoId, objectReference).catch(() => {});
+      await updateDriverPhotoCache(() => window.DriverOfflineDB.markPhotoUploaded(photo.photoId, objectReference), scope);
     }
   }
+  assertDriverUploadScope(scope);
   return objectReference;
 }
 
 async function uploadDriverPhotos(photoValues, context = {}) {
   const uploaded = [];
+  const scope = driverUploadScope();
+  const progress = window.DriverUpload.batchProgress(photoValues.filter(Boolean));
+  let progressIndex = 0;
   for (let index = 0; index < photoValues.length; index += 1) {
+    assertDriverUploadScope(scope);
+    if (!photoValues[index]) { uploaded.push(photoValues[index]); continue; }
     uploaded.push(await uploadDriverPhoto(photoValues[index], {
-      ...context,
-      filename: `${context.recordType || "driver-photo"}-${index + 1}.jpg`
-    }));
+      ...context, filename: `${context.recordType || "driver-photo"}-${index + 1}.jpg`
+    }, value => renderDriverUploadProgress(progress(progressIndex, value)), scope));
+    progressIndex += 1;
   }
+  assertDriverUploadScope(scope);
   return uploaded;
+}
+
+function driverPhotoSaveKey(path, body, job) {
+  return `${path}:${body.type || ""}:${job?.planDate || dayState?.planDate || ""}:${body.type ? dayState?.truckPlate || "" : ""}`;
+}
+
+async function reconcileDriverPhotoSave(key, job, body, scope = driverUploadScope(), automatic = false) {
+  if (!driverUploadSaveChecks.has(key)) return null;
+  return window.DriverUpload.deadline(signal => readDriverPhotoSave(key, job, body, {...scope, signal}, automatic), {
+    signal: scope.signal, timeoutMs: 15000
+  });
+}
+
+async function readDriverPhotoSave(key, job, body, scope, automatic) {
+  renderDriverUploadProgress({phase: "reconciling", percentage: 100, overallPercentage: 100});
+  if (body.type && !job) {
+    const result = await request("/api/driver/day-state", {signal: scope.signal, timeoutMs: 15000});
+    assertDriverUploadScope(scope);
+    const confirmedKey = `/api/driver/dvir:${body.type}:${result.state?.planDate || ""}:${result.state?.truckPlate || ""}`;
+    if (confirmedKey !== key) {
+      throw new Error(t("driver.uploadSaveStillUnknown", "The saved result could not be confirmed. Keep these photos and check with Dispatch before resubmitting."));
+    }
+    const complete = body.type === "post" ? result.state?.postDvirCompletedAt : result.state?.preDvirCompletedAt;
+    if (complete) { driverUploadSaveChecks.delete(key); return {...result, reconciled: true}; }
+    if (!automatic) driverUploadSaveChecks.delete(key);
+    return null;
+  }
+  const history = await request(`/api/driver/history?date=${encodeURIComponent(job.planDate)}&limit=200`, {signal: scope.signal, timeoutMs: 15000});
+  assertDriverUploadScope(scope);
+  const saved = history.records?.find(record => record.details?.jobId === job.jobId && record.status === "complete");
+  if (saved) { driverUploadSaveChecks.delete(key); return {reconciled: true}; }
+  if (automatic) return null;
+  const next = await request("/api/driver/next-job", {signal: scope.signal, timeoutMs: 15000});
+  assertDriverUploadScope(scope);
+  if (next.job?.jobId !== job.jobId || next.job?.status !== "in_progress") {
+    throw new Error(t("driver.uploadSaveStillUnknown", "The saved result could not be confirmed. Keep these photos and check with Dispatch before resubmitting."));
+  }
+  driverUploadSaveChecks.delete(key);
+  return null;
+}
+
+function recordDriverPhotoActionFailure(error, {stage, job, body = {}, startedAt, owner, report = recordDriverUploadFailure}) {
+  report({
+    outcome: "failed", requestId: body.requestId || "", ...window.DriverUpload.environmentDiagnostic(error),
+    failureId: crypto.randomUUID(), stage, occurredAt: new Date().toISOString(),
+    jobId: job?.jobId || "", photoId: "", planDate: job?.planDate || dayState?.planDate || "",
+    recordType: body.type ? `driver-dvir-${body.type}-photo` : "driver-stop-photo",
+    clientVersion: DRIVER_PWA_CLIENT_VERSION, assetVersion: window.DriverUpload.ASSET_VERSION,
+    attempt: 1, byteSize: 0, transferredBytes: 0, percentage: 100,
+    elapsedMs: Math.max(0, Math.min(86400000, Date.now() - startedAt)), httpStatus: Number(error.status || 0),
+    errorCode: error.code || "driver_photo_save_failed", message: window.DriverUpload.safeMessage(error.message)
+  }, owner);
+}
+
+async function finishPendingDriverPhotoCompletion(job, submittedPhotos) {
+  const path = `/api/driver/jobs/${encodeURIComponent(job.jobId)}/${isDriverBinJob(job) ? "bin/complete" : "photos"}`;
+  const key = driverPhotoSaveKey(path, {}, job);
+  if (!driverUploadSaveChecks.has(key)) return false;
+  const scope = driverUploadScope();
+  const startedAt = Date.now();
+  try {
+    const result = await reconcileDriverPhotoSave(key, job, {}, scope);
+    if (!result?.reconciled) return false;
+    assertDriverUploadScope(scope);
+    await clearLegacyDraftPhotos(submittedPhotos);
+    photos = [];
+    driverRemark = "";
+    binDraft = null;
+    photoPromptOpen = false;
+    locationCheck = null;
+    locationOverrideApproval.clear();
+    onlineBinEventAttempts.delete(`${job.jobId}::job_completed`);
+    await loadNextJob();
+    return true;
+  } catch (error) {
+    recordDriverPhotoActionFailure(error, {stage: "reconciling", job, startedAt, owner: scope.owner});
+    showToast(error.message);
+    renderJob();
+    return true;
+  }
+}
+
+async function driverSignaturePayload(saved, job) {
+  if (!saved) return undefined;
+  const owner = driverUploadOwner();
+  const startedAt = Date.now();
+  try {
+    return await window.DriverUpload.deadline(() => window.SorDriverSignature.onlinePayload(saved), {
+      signal: driverRequestController.signal, timeoutMs: window.DriverUpload.API_TIMEOUT_MS
+    });
+  } catch (error) {
+    recordDriverUploadFailure({
+      failureId: crypto.randomUUID(), stage: "signature", occurredAt: new Date().toISOString(),
+      jobId: job.jobId, photoId: saved.photo.photoId, planDate: job.planDate,
+      recordType: "driver-customer-signature", clientVersion: DRIVER_PWA_CLIENT_VERSION,
+      assetVersion: window.DriverUpload.ASSET_VERSION, attempt: 1,
+      byteSize: saved.photo.blob.size, transferredBytes: 0, percentage: null,
+      elapsedMs: Math.max(0, Math.min(86400000, Date.now() - startedAt)), httpStatus: Number(error.status || 0),
+      errorCode: error.code || "driver_signature_read_failed", message: window.DriverUpload.safeMessage(error.message)
+    }, owner);
+    throw error;
+  }
+}
+
+async function saveDriverPhotoAction(path, body, job = null, {reconnect = Boolean(activeDriverMutationToken)} = {}) {
+  if (!reconnect) return saveDriverPhotoAttempt(path, body, job);
+  const scope = driverUploadScope();
+  return withDriverPhotoReconnect(report => saveDriverPhotoAttempt(path, body, job, {reconnect, report}), scope);
+}
+
+function driverPhotoSaveIsExternal(path, body) {
+  return Boolean(body.type) || path.endsWith("/bin/complete");
+}
+
+function driverPhotoSaveResponseIsValid(result, path, body) {
+  return driverPhotoSaveIsExternal(path, body) ? typeof result.state?.planDate === "string"
+    : result.record?.status === "complete" || result.records?.some(record => record.status === "complete");
+}
+
+function driverPhotoSaveTimeout(path, job, reconnect) {
+  return reconnect && job && !path.endsWith("/bin/complete") ? 4000 : window.DriverUpload.SAVE_TIMEOUT_MS;
+}
+
+async function saveDriverPhotoAttempt(path, body, job, {reconnect = false, report = recordDriverUploadFailure} = {}) {
+  if (reconnect) body = {...body, requestId: crypto.randomUUID()};
+  const key = driverPhotoSaveKey(path, body, job);
+  const scope = driverUploadScope();
+  const owner = scope.owner;
+  const startedAt = Date.now();
+  let stage = driverUploadSaveChecks.has(key) ? "reconciling" : "saving";
+  try {
+    const readOnly = reconnect && driverPhotoSaveIsExternal(path, body);
+    const pending = driverUploadSaveChecks.has(key);
+    const reconciled = await reconcileDriverPhotoSave(key, job, body, scope, readOnly);
+    if (reconciled) return reconciled;
+    if (pending && readOnly) throw Object.assign(new Error("Still checking the saved result."), {code: "driver_save_recovery_pending"});
+    stage = "saving";
+    renderDriverUploadProgress({phase: "saving", percentage: 100, overallPercentage: 100});
+    assertDriverUploadScope(scope);
+    const result = await request(path, {method: "POST", body: JSON.stringify(body), signal: scope.signal, timeoutMs: driverPhotoSaveTimeout(path, job, reconnect)});
+    if (!driverPhotoSaveResponseIsValid(result, path, body)) throw Object.assign(new Error("The server did not confirm this submission. Retry to check its saved status."), {code: "driver_photo_save_not_confirmed", status: 200});
+    return result;
+  } catch (error) {
+    if (stage === "saving" && scope.signal.aborted) driverUploadSaveChecks.set(key, true);
+    assertDriverUploadScope(scope);
+    recordDriverPhotoActionFailure(error, {stage, job, body, startedAt, owner, report});
+    if (stage === "saving" && driverPhotoSaveMayHaveCompleted(error)) {
+      driverUploadSaveChecks.set(key, true);
+      try {
+        const confirmed = await reconcileDriverPhotoSave(key, job, body, scope, true);
+        if (confirmed) return confirmed;
+      } catch (checkError) {
+        assertDriverUploadScope(scope);
+        recordDriverPhotoActionFailure(checkError, {stage: "reconciling", job, body, startedAt, owner, report});
+      }
+    }
+    throw error;
+  }
+}
+
+function driverPhotoSaveMayHaveCompleted(error) {
+  return error.isNetworkError || ["driver_upload_timeout", "driver_request_invalid_response", "driver_photo_save_not_confirmed"].includes(error.code)
+    || Number(error.status) === 409 || Number(error.status) >= 500;
 }
 
 function onlineBinEventAttempt(job, eventType) {
@@ -2627,10 +2895,13 @@ function onlineBinPhotoDescriptors(photoValues) {
 }
 
 async function clearLegacyDraftPhotos(photoValues) {
+  const scope = driverUploadScope();
+  const drafts = (photoValues || []).filter(photo => photo?.photoId);
+  if (offlineStorageAvailable && drafts.length) {
+    await updateDriverPhotoCache(() => Promise.all(drafts.map(photo => window.DriverOfflineDB.deleteDraftPhoto(photo.photoId))), scope);
+  }
+  assertDriverUploadScope(scope);
   for (const photo of photoValues || []) {
-    if (photo?.photoId && offlineStorageAvailable) {
-      await window.DriverOfflineDB.deleteDraftPhoto(photo.photoId).catch(() => {});
-    }
     window.DriverOfflinePhotos?.revokePhoto(photo);
   }
   void refreshOfflineHealth();
@@ -2721,6 +2992,8 @@ function clearDriverSessionMemory() {
   }
   driverRequestController.abort();
   driverRequestController = new AbortController();
+  driverUploadSaveChecks.clear();
+  if (uploadStatus) uploadStatus.hidden = true;
   window.DriverOfflinePhotos?.releaseAll();
   disconnectEvents();
   stopOnlineRouteRevalidation();
@@ -5962,13 +6235,8 @@ app.addEventListener("click", async (event) => {
           offlinePartition.partitionKey,
           foregroundEvent.eventId
         );
-        const result = await request("/api/driver/dvir", {
-          method: "POST",
-          body: JSON.stringify({
-            type,
-            photoDataUrls: uploadedPhotos,
-            ...foregroundReceiptContext(foregroundEvent)
-          })
+        const result = await saveDriverPhotoAction("/api/driver/dvir", {
+          type, photoDataUrls: uploadedPhotos, ...foregroundReceiptContext(foregroundEvent)
         });
         await finishForegroundEvent(foregroundEvent, {
           ...result,
@@ -6031,10 +6299,7 @@ app.addEventListener("click", async (event) => {
         dvirType: type
       });
       button.textContent = t("common.saving", "Saving...");
-      const result = await request("/api/driver/dvir", {
-        method: "POST",
-        body: JSON.stringify({ type, photoDataUrls: uploadedPhotos })
-      });
+      const result = await saveDriverPhotoAction("/api/driver/dvir", { type, photoDataUrls: uploadedPhotos });
       dayState = result.state;
       await clearLegacyDraftPhotos(submittedDvirPhotos);
       const warning = result.samsaraError
@@ -6326,6 +6591,7 @@ app.addEventListener("click", async (event) => {
         return renderJob();
       }
     }
+    if (await finishPendingDriverPhotoCompletion(completedJob, submittedJobPhotos)) return;
     if (!(await ensureAuthoritativeJobBeforeAction(completedJob))) return;
     if (!canBeginJobConfirmation(completedJob)) {
       if (completeWaitSeconds(completedJob) > 0) {
@@ -6395,22 +6661,24 @@ app.addEventListener("click", async (event) => {
           loadId: completedJob.loadId
         });
         button.textContent = t("common.saving", "Saving...");
-        const result = await request(`/api/driver/jobs/${encodeURIComponent(completedJob.jobId)}/bin/complete`, {
-          method: "POST",
-          body: JSON.stringify({
-            eventId: attempt.eventId,
-            clientSequence: attempt.clientSequence,
-            photos: onlineBinPhotoDescriptors(submittedJobPhotos),
-            details: {
-              stopType: completedJob.stopType,
-              stopId: completedJob.stopId || null,
-              loadId: completedJob.loadId || null,
-              planId: completedJob.planId || null,
-              driverRemark: submittedDriverRemark,
-              mbt: submittedBinDetails
-            }
-          })
-        });
+        const result = await saveDriverPhotoAction(`/api/driver/jobs/${encodeURIComponent(completedJob.jobId)}/bin/complete`, {
+          eventId: attempt.eventId, clientSequence: attempt.clientSequence,
+          photos: onlineBinPhotoDescriptors(submittedJobPhotos),
+          details: {
+            stopType: completedJob.stopType, stopId: completedJob.stopId || null,
+            loadId: completedJob.loadId || null, planId: completedJob.planId || null,
+            driverRemark: submittedDriverRemark, mbt: submittedBinDetails
+          }
+        }, completedJob);
+        if (result.reconciled) {
+          finishOnlineBinEventAttempt(attempt);
+          await clearLegacyDraftPhotos(submittedJobPhotos);
+          photos = [];
+          binDraft = null;
+          photoPromptOpen = false;
+          await loadNextJob();
+          return;
+        }
         finishOnlineBinEventAttempt(attempt);
         await clearLegacyDraftPhotos(submittedJobPhotos);
         dayState = result.state || dayState;
@@ -6445,18 +6713,22 @@ app.addEventListener("click", async (event) => {
         orderRef: (completedJob.orderRefs || []).join(",")
       });
       button.textContent = t("common.saving", "Saving...");
-      const result = await request(`/api/driver/jobs/${encodeURIComponent(completedJob.jobId)}/photos`, {
-        method: "POST",
-        body: JSON.stringify({
-          photoDataUrls: uploadedPhotos,
-          customerSignature: await window.SorDriverSignature.onlinePayload(submittedSignature),
-          driverRemark: submittedDriverRemark,
-          locationOverride: locationOverrideApproval.isAccepted(completedJob),
-          autoStartNext: true
-        })
-      });
-      await clearLegacyDraftPhotos(submittedJobPhotos);
-      if (submittedSignature) { await window.DriverOfflineDB.deleteDraftPhoto(submittedSignature.photo.photoId); }
+      const result = await saveDriverPhotoAction(`/api/driver/jobs/${encodeURIComponent(completedJob.jobId)}/photos`, {
+        photoDataUrls: uploadedPhotos,
+        customerSignature: await driverSignaturePayload(submittedSignature, completedJob),
+        driverRemark: submittedDriverRemark,
+        locationVerificationId: locationCheck?.verificationId || undefined,
+        locationOverride: locationOverrideApproval.isAccepted(completedJob), autoStartNext: true
+      }, completedJob);
+      if (result.reconciled) {
+        void clearLegacyDraftPhotos([...submittedJobPhotos, submittedSignature?.photo].filter(Boolean)).catch(() => {});
+        photos = [];
+        photoPromptOpen = false;
+        driverRemark = "";
+        await loadNextJob();
+        return;
+      }
+      void clearLegacyDraftPhotos([...submittedJobPhotos, submittedSignature?.photo].filter(Boolean)).catch(() => {});
       currentJob = withManifestJobIdentity(result.nextJob);
       activeRest = acceptDriverRestCandidate(result.rest);
       restSummary = result.restSummary || restSummary;
@@ -6881,6 +7153,7 @@ routeChangeStatus?.addEventListener("click", async (event) => {
 });
 
 async function resumeOnlineDriver(source, { synchronizeProtectedScreen = false } = {}) {
+  void flushDriverUploadFailures();
   if (!(await checkDriverPwaVersion({ force: true, reason: source }))) return false;
   if (!driver || !authToken) return true;
   const protectedScreen = Boolean(activeRest || photoInteractionActive());
@@ -6899,6 +7172,7 @@ async function resumeOnlineDriver(source, { synchronizeProtectedScreen = false }
 }
 
 window.addEventListener("online", () => {
+  void flushDriverUploadFailures();
   void resumeOnlineDriver("online", { synchronizeProtectedScreen: true })
     .then(() => refreshDriverRouteChangeState({ visible: document.visibilityState === "visible" }));
 });
@@ -7019,7 +7293,7 @@ if ("serviceWorker" in navigator) {
     window.setTimeout(requestDriverWorkerVersion, 0);
     window.setTimeout(publishDriverOfflineMode, 0);
   });
-  navigator.serviceWorker.register("/driver-service-worker.js?v=20260924-driver-workflow-v1", {
+  navigator.serviceWorker.register("/driver-service-worker.js?v=20261016-driver-reconnect-v1", {
     scope: "/driver",
     updateViaCache: "none"
   })

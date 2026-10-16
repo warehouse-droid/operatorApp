@@ -3,6 +3,7 @@
 import crypto from "node:crypto";
 
 import { stableCanonicalJson } from "./operator-netsuite-posting-domain.js";
+import { netSuitePostingQuantity, isSmallNetSuiteSqftVariance } from './operator-netsuite-posting-quantity.js';
 
 const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/iu;
 const EPSILON = 0.000001;
@@ -215,6 +216,7 @@ function liveLineMap(lines) {
       itemId: positiveInteger(line?.itemId, "Live NetSuite item ID"),
       remainingQuantity: quantity(line?.remainingQuantity, "Live remaining quantity"),
       fulfilledQuantity: quantity(line?.fulfilledQuantity, "Live fulfilled quantity"),
+      ...(line.unit ? { salesUom: String(line.unit).trim().toUpperCase() } : {}),
       location: optionalPositiveInteger(line?.location, "Live line location")
     });
   }
@@ -248,7 +250,8 @@ export function compareSalesOrderFulfillmentSnapshot({ snapshotLines = [], liveO
       issues.push({ code: 'LIVE_LOCATION_CHANGED', orderLine, snapshotLocation: Number(snapshot.location), liveLocation: current.location });
       continue;
     }
-    if (current.remainingQuantity + EPSILON >= delivered) {continue;}
+    if (current.remainingQuantity + EPSILON >= delivered
+        || isSmallNetSuiteSqftVariance(delivered, current.remainingQuantity, current.salesUom)) {continue;}
     if (current.remainingQuantity <= EPSILON && current.fulfilledQuantity + EPSILON >= delivered) {
       reconciled += 1;
       continue;
@@ -305,13 +308,14 @@ export function resolveSalesOrderFulfillmentLines({ action, snapshotLines = [], 
     if (seen.has(request.orderLine)) {throw failure("SALES_ORDER_IF_INPUT_INVALID", "A fulfillment line was selected more than once.", 400);}
     seen.add(request.orderLine);
     const current = live.get(request.orderLine);
-    if (!current || request.quantity > current.remainingQuantity + EPSILON) {
+    const postingQuantity = current ? netSuitePostingQuantity(request.quantity, current.remainingQuantity, current.salesUom) : request.quantity;
+    if (!current || postingQuantity > current.remainingQuantity + EPSILON) {
       throw failure("SALES_ORDER_IF_QUANTITY_OUT_OF_BOUNDS", `Fulfillment quantity for NetSuite line ${request.orderLine} exceeds its live remainder.`);
     }
     return {
       orderLine: request.orderLine,
       itemId: current.itemId,
-      quantity: request.quantity,
+      quantity: postingQuantity,
       location: current.location
     };
   }).sort((left, right) => left.orderLine - right.orderLine);

@@ -15,6 +15,7 @@ export const OPERATOR_ROLES = Object.freeze([
   "yard_manager",
   "sales",
   "field_sales",
+  "mbr_sales",
   "mbt_frontdesk",
   "mbt_billing",
   "boss"
@@ -56,6 +57,7 @@ export function operatorHomeRoute(value) {
   if (role === "yard_manager") return "/control";
   if (role === "sales") return "/sales";
   if (role === "field_sales") return "/field-sales/";
+  if (role === "mbr_sales") return "/mbr/contracts";
   if (role === "operator" && roles.has("mbt_frontdesk")) return "/mbt/frontdesk";
   if (role === "operator" && roles.has("mbt_billing")) return "/mbt/billing";
   if (role === "operator") return "/operator";

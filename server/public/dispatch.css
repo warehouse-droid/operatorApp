@@ -5464,6 +5464,21 @@ button[data-action="enter-edit-mode"]:disabled:hover {
   line-height: 1.2;
 }
 
+.order-card.delivery-secured {
+  background: #fef9c3;
+  color: #166534;
+}
+
+.order-card.delivery-secured span,
+.order-card.delivery-secured strong {
+  color: #166534;
+}
+
+.order-card.delivery-secured .secured-chip {
+  background: #dcfce7;
+  border: 1px solid #166534;
+}
+
 .chip-row {
   display: flex;
   flex-wrap: wrap;

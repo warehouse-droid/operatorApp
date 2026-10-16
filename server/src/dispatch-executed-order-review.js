@@ -14,7 +14,7 @@ const measureAliases = {
   layers: ["layers", "layerQty", "layer_qty"], sections: ["sections", "sectionQty", "section_qty"],
   pieces: ["pieces", "pieceQty", "piece_qty"], splitQty: ["splitQty", "split_qty"]
 };
-const stable = value => JSON.stringify(value && typeof value === "object" && !Array.isArray(value)
+const stable = value => JSON.stringify(value instanceof Date ? value.toISOString() : value && typeof value === "object" && !Array.isArray(value)
   ? Object.fromEntries(Object.keys(value).sort().map(k => [k, JSON.parse(stable(value[k]) || "null")]))
   : Array.isArray(value) ? value.map(v => JSON.parse(stable(v) || "null")) : value);
 const same = (a, b) => stable(a) === stable(b);
@@ -176,6 +176,7 @@ function compareOrder(before, next, reviews) {
   const review = reviews.find(candidate => key(candidate.orderRef) === key(identity(before)));
   if (review) {
     if (same(itemRows(next.items || []), itemRows(review.sourceOrder.items || []))) {result.items = next.items;}
+    if (Object.hasOwn(next, "raw") && same(next.raw, review.sourceOrder.raw)) {result.raw = next.raw;}
     for (const field of sourceFields) {if (Object.hasOwn(review.sourceOrder, field) && same(next[field], review.sourceOrder[field])) {result[field] = next[field];}}
   }
   if (before.childOrderDetails?.length) {
@@ -183,6 +184,10 @@ function compareOrder(before, next, reviews) {
     if (same(result.childOrderDetails, before.childOrderDetails)) {return result;}
     const aggregateItems = result.childOrderDetails.flatMap(child => child.items || []);
     if (same(itemRows(next.items || []), itemRows(aggregateItems))) {result.items = next.items;}
+    for (const field of ["pallets", "layers", "sections", "pieces", "salesQty", "weight"]) {
+      const total = result.childOrderDetails.reduce((sum, child) => sum + Number(child[field] || 0), 0);
+      if (Object.hasOwn(next, field) && same(next[field], total)) {result[field] = next[field];}
+    }
     const first = result.childOrderDetails[0];
     for (const field of ["address", "destinationAddress"]) {
       if (same(before[field], before.childOrderDetails[0]?.[field] ?? before.childOrderDetails[0]?.address) && same(next[field], first?.[field] ?? first?.address)) {result[field] = next[field];}
@@ -196,10 +201,41 @@ export function reviewedExecutionComparison({ previousPlan = {}, nextPlan = {}, 
   return { ...previousPlan, orders: (previousPlan.orders || []).map(order => compareOrder(order, (nextPlan.orders || []).find(next => key(identity(next)) === key(identity(order))), reviews)) };
 }
 
+// Apply only source-owned fields. Route identities, assignment, timing, and
+// driver execution are deliberately outside this order projection.
+export function applyDispatchSourceOrders(plan = {}, sourceOrders = [], selectedRefs = []) {
+  const selected = new Set(selectedRefs.map(key));
+  const sources = new Map(sourceOrders.map(order => [key(identity(order)), order]));
+  function apply(order) {
+    const source = selected.has(key(identity(order))) ? sources.get(key(identity(order))) : null;
+    const result = { ...order };
+    if (source) {
+      for (const field of ["items", ...sourceFields, "salesQuantities"]) {
+        if (Object.hasOwn(source, field)) {result[field] = structuredClone(source[field]);}
+      }
+    }
+    if (!order.childOrderDetails?.length) {return result;}
+    const children = order.childOrderDetails.map(apply);
+    if (same(children, order.childOrderDetails)) {return result;}
+    result.childOrderDetails = children;
+    result.items = children.flatMap(child => child.items || []);
+    for (const field of ["pallets", "layers", "sections", "pieces", "salesQty", "weight"]) {
+      result[field] = children.reduce((sum, child) => sum + Number(child[field] || 0), 0);
+    }
+    for (const field of ["address", "destinationAddress"]) {
+      if (same(order[field], order.childOrderDetails[0]?.[field] ?? order.childOrderDetails[0]?.address)) {
+        result[field] = children[0]?.[field] ?? children[0]?.address;
+      }
+    }
+    return result;
+  }
+  return { ...plan, orders: (plan.orders || []).map(apply) };
+}
+
 function restoreReviewedOrder(before, submitted, approved) {
   if (!before || !approved) {return submitted;}
   const result = { ...submitted };
-  for (const field of ["items", ...sourceFields]) {
+  for (const field of ["items", "raw", ...sourceFields]) {
     if (same(before[field], approved[field])) {continue;}
     if (Object.hasOwn(before, field)) {result[field] = structuredClone(before[field]);}
     else {delete result[field];}
@@ -211,6 +247,28 @@ function restoreReviewedOrder(before, submitted, approved) {
     ));
   }
   return result;
+}
+
+export function dispatchSourceChangePredatesWork(review, activity = []) {
+  const received = new Date(review.sourceAppliedAt || review.sourceReceivedAt || "").getTime();
+  if (!Number.isFinite(received)) {return false;}
+  const loadIds = new Set((review.contexts || []).map(context => text(context.loadId)));
+  const records = activity.filter(record => loadIds.has(text(record.load_id || record.loadId))
+    && ["in_progress", "complete"].includes(text(record.status)));
+  return records.every(record => {
+    const started = new Date(record.started_at || record.startedAt || record.created_at || "").getTime();
+    return Number.isFinite(started) && received < started;
+  });
+}
+
+export function dispatchSourceReceiptMatchesOrder(source = {}, payload = {}, changes = []) {
+  if (!Array.isArray(payload.lines)) {return false;}
+  const cargoFields = new Set(["quantity", "unit", "itemId", "item_added", "item_removed", "salesQty",
+    "calculated_pallets", "calculated_item_pallets", "layers", "sections", "pieces", "committedQty"]);
+  if (changes.some(change => !cargoFields.has(change.field))) {return false;}
+  const rows = items => items.map(item => ({ id: text(item.lineId), itemId: text(item.itemId),
+    quantity: Number(item.quantity), unit: text(item.unit) })).sort((a, b) => a.id.localeCompare(b.id));
+  return same(rows(source.items || []), rows(payload.lines));
 }
 
 function stopSourceFields(stop) {

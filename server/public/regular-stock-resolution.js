@@ -3,34 +3,37 @@
   const t=(en,zh)=>window.RegularStockUI.t(en,zh);
   /** @param {unknown} value */
   const esc=value=>window.RegularStockUI.esc(value);
-  /** @param {import('../tools/regular-stock-resolution-globals.js').RegularResolutionRequest|null|undefined} request */
-  function eligible(request) {
+  /** @param {import('../tools/regular-stock-resolution-globals.js').RegularResolutionRequest|null|undefined} request @param {import('../tools/regular-stock-resolution-globals.js').RegularResolutionLine|null} [line] */
+  function eligible(request,line) {
     const regular=request?.regular||{},lines=request?.lines||[],active=['submitted','changes_requested','approved'];
+    line=line||(lines.length===1?lines[0]:null);
     return request?.workflowVersion===2&&regular.deliveryMethod==='stocking'&&['submitted','active'].includes(request.status)
-      &&!regular.resolution&&!regular.pickupTransfer&&!regular.handoffStatus&&!(request.transfers||[]).length
-      &&lines.some(line=>active.includes(line.status))&&lines.every(line=>[...active,'rejected','cancelled','closed','received','fulfilled'].includes(line.status))
-      &&!lines.some(line=>line.purchase?.demandId);
+      &&!regular.resolution&&!regular.pickupTransfer&&!regular.handoffStatus&&!!line&&!line.resolution
+      &&active.includes(line.status)&&!line.purchase?.demandId&&!line.transferId
+      &&!(request.transfers||[]).some(transfer=>!transfer.lines?.length||transfer.lines.some(row=>row.id===line.id));
   }
-  /** @param {import('../tools/regular-stock-resolution-globals.js').RegularResolutionRequest|null|undefined} request */
-  function button(request,busy=false) {
-    return eligible(request)?`<button data-scm-stock-action="resolve" type="button" ${busy?'disabled':''}>${t('Resolve','解决')}</button>`:'';
+  /** @param {import('../tools/regular-stock-resolution-globals.js').RegularResolutionRequest|null|undefined} request @param {import('../tools/regular-stock-resolution-globals.js').RegularResolutionLine|null} [line] */
+  function button(request,busy=false,line) {
+    line=line||(request?.lines?.length===1?request.lines[0]:null);
+    return line&&eligible(request,line)?`<button data-scm-stock-action="resolve" data-line-id="${line.id}" type="button" ${busy?'disabled':''}>${t('Resolve','解决')}</button>`:'';
   }
-  /** @param {import('../tools/regular-stock-resolution-globals.js').RegularResolutionRequest} request @param {import('../tools/regular-stock-resolution-globals.js').RegularResolutionDraft|null|undefined} draft */
-  function editor(request,draft,busy=false) {
-    if(!eligible(request)||!draft||draft.requestId!==request.id)return '';
-    return `<form class="stock-request-section stock-request-form" data-regular-resolution-form>
-      <h3>${t('Resolve Stocking request','解决备货申请')}</h3>
-      <p>${t('Reply with an existing PO and ETA. This closes the case and notifies Sales once.','请填写现有采购订单和预计到达日期。此操作将关闭申请并通知销售一次。')}</p>
+  /** @param {import('../tools/regular-stock-resolution-globals.js').RegularResolutionRequest|null|undefined} request @param {import('../tools/regular-stock-resolution-globals.js').RegularResolutionDraft|null|undefined} draft @param {import('../tools/regular-stock-resolution-globals.js').RegularResolutionLine|null} [line] */
+  function editor(request,draft,busy=false,line) {
+    line=line||(request?.lines?.length===1?request.lines[0]:null);
+    if(!request||!line||!eligible(request,line)||!draft||draft.requestId!==request.id||draft.lineId!==line.id&&!(draft.lineId===undefined&&request.lines?.length===1))return '';
+    return `<form class="stock-request-section stock-request-form" data-regular-resolution-form data-line-id="${line.id}">
+      <h3>${t('Resolve material','解决商品')} · ${esc(line.itemName)}</h3>
+      <p>${t('Enter an existing PO and ETA for this material. Other materials stay open.','请填写此商品的现有采购订单和预计到达日期。其他商品保持开放。')}</p>
       <div class="stock-request-line-fields">
         <label><span>${t('Existing PO number','现有采购订单号')}</span><input id="regularResolvePo" data-regular-resolution-field="purchaseOrderRef" maxlength="80" required value="${esc(draft.purchaseOrderRef)}" ${busy?'disabled':''} /></label>
         <label><span>ETA</span><input id="regularResolveEta" data-regular-resolution-field="eta" type="date" required value="${esc(draft.eta)}" ${busy?'disabled':''} /></label>
       </div>
-      <div class="stock-request-actions"><button data-scm-stock-action="cancel-resolve" type="button" ${busy?'disabled':''}>${t('Cancel','取消')}</button><button class="primary" type="submit" ${busy?'disabled':''}>${busy?t('Saving…','保存中…'):t('Resolve request','解决申请')}</button></div>
+      <div class="stock-request-actions"><button data-scm-stock-action="cancel-resolve" type="button" ${busy?'disabled':''}>${t('Cancel','取消')}</button><button class="primary" type="submit" ${busy?'disabled':''}>${busy?t('Saving…','保存中…'):t('Resolve material','解决商品')}</button></div>
     </form>`;
   }
-  /** @param {import('../tools/regular-stock-resolution-globals.js').RegularResolutionRequest|null|undefined} request */
-  function result(request) {
-    const saved=request?.regular?.resolution;
+  /** @param {import('../tools/regular-stock-resolution-globals.js').RegularResolutionRequest|null|undefined} request @param {import('../tools/regular-stock-resolution-globals.js').RegularResolutionLine|null} [line] */
+  function result(request,line) {
+    const saved=line?.resolution||(!line||line.status==='closed'?request?.regular?.resolution:null);
     if(!saved)return '';
     return `<section class="stock-request-notice regular-stock-result" data-regular-resolution-result><strong>${t('Resolved','已解决')}</strong>
       <div class="stock-request-summary"><span><small>PO</small><strong>${esc(saved.purchaseOrderRef)}</strong></span><span><small>ETA</small><strong>${esc(saved.eta)}</strong></span>

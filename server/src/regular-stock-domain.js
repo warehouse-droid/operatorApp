@@ -3,7 +3,7 @@
  * @typedef {{id:number,itemId:number,sourceLocationId:number,salesQty:number,salesUom?:string,itemName?:string,decision?:string,status?:string,destinationLocationId?:number}} RegularLine
  * @typedef {{itemId:number,sourceLocationId:number,availableQuantity:number|null,safetyQuantity:number|null}} StockPolicy
  * @typedef {{remoteLineId:number,restLineId:number,itemId:number,itemType:string,quantity:number,backorderedQuantity:number|null,uom:string|null,locationId:number,remoteLocationId:number,fulfilledQuantity:number,billedQuantity:number,closed:boolean}} KitComponent
- * @typedef {{remoteLineId:number,itemId:number,quantity:number,uom?:string,locationId:number,open:boolean,ancillary?:boolean,itemType?:string,kitComponents?:KitComponent[]}} MaterialLine
+ * @typedef {{remoteLineId:number,itemId:number,quantity:number,fulfilledQuantity?:number,remainingQuantity?:number,closed?:boolean,uom?:string,locationId:number,open:boolean,ancillary?:boolean,itemType?:string,kitComponents?:KitComponent[]}} MaterialLine
  * @typedef {{destinationLocationId:number,lines:RegularLine[],regular?:{customerId?:number}}} RoutingRequest
  * @typedef {{id?:number,ref?:string,locationId:number,customerId?:number,lines:MaterialLine[]}} SalesOrder
  */
@@ -20,6 +20,15 @@ const valid = value => value !== null && value !== undefined && Number.isFinite(
 const cleanUom = value => String(value || '').toUpperCase().replace(/[^A-Z0-9]/g, '');
 /** @param {number} a @param {number} b */
 const sameQty = (a, b) => Math.abs(Number(a) - Number(b)) <= 1e-6;
+
+/** Physical balance in stock units. Older saved snapshots only allowed unfulfilled lines.
+ * @param {{quantity:number,fulfilledQuantity?:number,closed?:boolean}} line */
+export function regularLineRemainingQuantity(line) {
+  if (line.closed === true) return 0;
+  const fulfilled = line.fulfilledQuantity === undefined ? 0 : line.fulfilledQuantity;
+  if (!Number.isFinite(line.quantity) || line.quantity < 0 || !Number.isFinite(fulfilled) || fulfilled < 0) return NaN;
+  return Number(Math.max(line.quantity - fulfilled, 0).toFixed(6));
+}
 
 /** @param {{regular?:{deliveryMethod?:string,pickupTransfer?:unknown,handoffStatus?:string}}} request */
 export function isRegularStockingRequest(request) {
@@ -79,8 +88,7 @@ export function planRegularStockRouting({ request, salesOrder, selectedLineIds =
   if (request.regular?.customerId && Number(request.regular.customerId) !== Number(salesOrder.customerId)) mismatch('The SO customer does not match this request.');
   const approved = request.lines.filter(line => ['stock', 'po'].includes(line.decision||''));
   if (!approved.length || request.lines.some(line => !line.decision && !['rejected', 'cancelled'].includes(line.status||''))) mismatch('Every line needs a decision before linking an SO.');
-  const materials = salesOrder.lines.filter(line => !line.ancillary);
-  if (materials.some(line => !line.open)) mismatch('All SO material lines must be open and unfulfilled.');
+  const materials = salesOrder.lines.filter(line => !line.ancillary && line.open && regularLineRemainingQuantity(line) > 0);
   /** @type {Map<string,RegularLine[]>} */
   const byItem = new Map();
   for (const line of approved) {
@@ -96,19 +104,20 @@ export function planRegularStockRouting({ request, salesOrder, selectedLineIds =
     const matches = materials.filter(candidate => Number(candidate.itemId) === Number(lines[0].itemId)
       && cleanUom(candidate.uom) === cleanUom(lines[0].salesUom)
       && (!selected || Number(candidate.remoteLineId) === Number(selected)));
-    const exact=matches.filter(candidate=>sameQty(candidate.quantity,quantity));
-    const matchedQuantity=matches.reduce((sum,line)=>sum+Number(line.quantity),0);
+    const exact=matches.filter(candidate=>sameQty(regularLineRemainingQuantity(candidate),quantity));
+    const matchedQuantity=matches.reduce((sum,line)=>sum+regularLineRemainingQuantity(line),0);
     const candidates=sameQty(matchedQuantity,quantity)?matches:exact.length===1?exact:[];
     if (!candidates.length && matches.length && !exact.length) {
       const unit=lines[0].salesUom ? ` ${lines[0].salesUom}` : '';
-      mismatch(`Quantity mismatch for ${lines[0].itemName || lines[0].itemId}: the stock request approves ${quantity}${unit}, but ${salesOrder.ref || 'the SO'} has ${matchedQuantity}${unit}. Quantities must match before linking the SO.`);
+      const balanceLabel=matches.some(line=>(line.fulfilledQuantity || 0)>0)?' remaining':'';
+      mismatch(`Quantity mismatch for ${lines[0].itemName || lines[0].itemId}: the stock request approves ${quantity}${unit}, but ${salesOrder.ref || 'the SO'} has ${matchedQuantity}${unit}${balanceLabel}. Quantities must match before linking the SO.`);
     }
     if (!candidates.length) mismatch(`Select the exact open SO line for ${lines[0].itemName || lines[0].itemId} with quantity ${quantity}.`);
     for(const candidate of candidates){
       if (Number(candidate.locationId) !== Number(request.destinationLocationId) || used.has(candidate.remoteLineId)) mismatch('Matched SO lines must still be at your Sales location.');
       used.add(candidate.remoteLineId);
     }
-    let index=0,remaining=Number(candidates[0].quantity);
+    let index=0,remaining=regularLineRemainingQuantity(candidates[0]);
     for (const line of lines) {
       let quantityLeft=Number(line.salesQty);
       while(quantityLeft>1e-6){
@@ -117,7 +126,7 @@ export function planRegularStockRouting({ request, salesOrder, selectedLineIds =
         const allocated=Math.min(remaining,quantityLeft);
         mappings.push({requestLineId:Number(line.id),remoteLineId:Number(candidate.remoteLineId),itemId:Number(line.itemId),quantity:allocated});
         quantityLeft-=allocated;remaining-=allocated;
-        if(remaining<=1e-6){index++;remaining=Number(candidates[index]?.quantity||0);}
+        if(remaining<=1e-6){index++;remaining=candidates[index]?regularLineRemainingQuantity(candidates[index]):0;}
       }
     }
   }

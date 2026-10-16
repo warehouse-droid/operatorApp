@@ -1,7 +1,7 @@
 import {staffReturnPath} from './staff-login-routes.js';
 
 const app=document.getElementById('loginApp');
-const roleRoutes={boss:'/boss',admin:'/admin',operator:'/operator',dispatcher:'/dispatch',scm:'/scm',scm_staff:'/scm',yard_manager:'/control',sales:'/sales',field_sales:'/field-sales/',mbt_frontdesk:'/mbt/frontdesk',mbt_billing:'/mbt/billing'};
+const roleRoutes={boss:'/boss',admin:'/admin',operator:'/operator',dispatcher:'/dispatch',scm:'/scm',scm_staff:'/scm',yard_manager:'/control',sales:'/sales',field_sales:'/field-sales/',mbr_sales:'/mbr/contracts',mbt_frontdesk:'/mbt/frontdesk',mbt_billing:'/mbt/billing'};
 const moduleTokens={admin:'mbbs.control.token',yard_manager:'mbbs.control.token',operator:'mbbs.operator.token',dispatcher:'mbbs.dispatch.token',scm:'mbbs.dispatch.token',scm_staff:'mbbs.dispatch.token',sales:'mbbs.dispatch.token'};
 const staffKeys=['mbbs.staff.token','mbbs.staff.role','mbbs.staff.roles','mbbs.control.token','mbbs.dispatch.token','mbbs.operator.token','mbbs.delivery.token'];
 const cleanRole=value=>String(value||'').trim().toLowerCase().replaceAll('-','_').replaceAll(' ','_');

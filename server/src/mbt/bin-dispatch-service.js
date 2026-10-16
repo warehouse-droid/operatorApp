@@ -338,9 +338,14 @@ async function projectFrontLeg(visit, timelineVisits) {
     || !binType.rowCount
     || !template.rowCount
     || asset.rowCount !== exactAssets.length
-    || (!exactAssets.length && !eligibleAssets.length)
+    || (!exactAssets.length && !eligibleAssets.length && String(visit.service_action) !== "delivery")
   ) {
     throw mbtError(409, "MBT_BIN_FRONT_LEG_INCOMPLETE", "The BIN front leg is missing required dispatch data.");
+  }
+  if (!exactAssets.length && !eligibleAssets.length) {
+    const origin = stops.find((stop) => stop.locationRole === "origin_yard")?.yardCode;
+    throw mbtError(409, "MBT_BIN_FRONT_LEG_INCOMPLETE",
+      `No available ${binType.rows[0].type_code} bin${origin ? ` at yard ${origin}` : ""}. Register an available physical bin in BIN Assets before assigning this delivery.`);
   }
   const contractRow = contract.rows[0];
   const customerSnapshot = objectValue(visit.customer_snapshot || contractRow.customer_snapshot);

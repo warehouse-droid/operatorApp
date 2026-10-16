@@ -1,13 +1,17 @@
 import { query, withTransaction } from './db.js';
+import {salesStockCheckNotices} from './sales-stock-check-notices.js';
+import {submitBackorderRequest,assertRegularNotBackorder,backorderAlerts,acknowledgeBackorderAlert} from './backorder-request-service.js';
 import { createSalesStockRequest, updateSalesStockRequest, getScmStockRequest, getSalesStockRequest, recordStockRequestEvent, decideSalesStockRequestLines } from './stock-request-repository.js';
 import { refreshStockRequestItemsAvailability, refreshPurchaseStockAvailability } from './stock-request-service.js';
 import { normalizeRegularArrival, normalizeRegularLeadHours, normalizeRegularApprovalMinutes } from '../public/regular-stock-input.js';
 import { evaluateRegularStockApproval, regularError, regularApprovalExpired, isRegularStockingRequest } from './regular-stock-domain.js';
-import { assertStockRequestDestinationAccess } from './stock-request-domain.js';
 import { findSpecialCustomer } from './special-stock-customer-directory.js';
 import { normalizeStockingType, isPurchaseStocking } from './regular-stock-purchase-domain.js';
 import { getPurchaseStockEvidence } from './regular-stock-purchase-repository.js';
 import {isWaitlist,waitlistError} from './regular-waitlist-domain.js';
+import {assertRegularStockingDestinationAccess} from './regular-stock-stocking-access.js';
+import {stockRequestSalesScopeSql} from './regular-stock-delivery-access.js';
+import {clearStockingLineReplies,refreshStockingReplyStatus} from './regular-stock-line-actions.js';
 
 export async function regularStockPolicies(itemIds=[]) {
   const { loadSmartScmPlanningDemandStates } = await import('./smart-scm-planning-repository.js');
@@ -27,6 +31,7 @@ async function lockRequest(id, expectedRevision) {
   const result = await query('SELECT * FROM sales_stock_requests WHERE id=$1 FOR UPDATE', [requiredId(id)]);
   const row = result.rows[0];
   if (!row || row.request_type !== 'regular') throw regularError('Regular stock request not found.', 'REGULAR_NOT_FOUND', 404);
+  assertRegularNotBackorder({regular:row.regular_details});
   if (expectedRevision !== undefined && (!Number.isSafeInteger(Number(expectedRevision)) || Number(row.revision) !== Number(expectedRevision))) {
     throw regularError('This request changed. Reload and try again.', 'STOCK_REQUEST_REVISION_CONFLICT');
   }
@@ -79,7 +84,7 @@ async function persistApproval(request, details, evidence, now) {
   const minutes=normalizeRegularApprovalMinutes(setting.rows[0]?.regular_stock_approval_minutes ?? 15);
   const approval = details.stockingType === 'purchase'
     ? {automatic:false,deliveryMethod:'stocking',leadTimeApplies:false,autoApprovalEnabled,evaluatedAt:new Date(now).toISOString(),lines:request.lines.map(line=>({lineId:line.id,...evidence.stocks?.[line.itemId],unit:line.salesUom,reasons:['purchase_scm_review']}))}
-    : evaluateRegularStockApproval({ lines: request.lines, policies: evidence.policies, arrivalAt: details.arrivalAt, deliveryMethod: details.deliveryMethod, leadHours, autoApprovalEnabled, now });
+    : evaluateRegularStockApproval({ lines: /** @type {import('./regular-stock-domain.js').RegularLine[]} */ (request.lines), policies: evidence.policies, arrivalAt: details.arrivalAt, deliveryMethod: details.deliveryMethod, leadHours, autoApprovalEnabled, now });
   const window=approval.automatic?approvalWindow(now,minutes):{approvedAt:null,approvalValidityMinutes:minutes,approvalExpiresAt:null};
   await query(`UPDATE sales_stock_requests SET workflow_version=2,regular_details=$2::jsonb,
     status=$3,first_scm_decision_at=CASE WHEN $4 THEN now() ELSE first_scm_decision_at END WHERE id=$1`,
@@ -94,30 +99,41 @@ async function persistApproval(request, details, evidence, now) {
 }
 
 export async function submitRegularStockRequest(input, context, dependencies = {}) {
+  if (String(input.deliveryMethod || '').trim().toLowerCase()==='backorder') return submitBackorderRequest(input,context);
   if(input.deliveryMethod==='waitlist'){
     const {submitWaitlistRequest}=await import('./regular-waitlist-repository.js');
     return submitWaitlistRequest(input,context);
   }
-  assertStockRequestDestinationAccess(input.destinationLocationId, context.authorizedDestinationLocationIds);
   const details = await inputDetails(input);
+  assertRegularStockingDestinationAccess(details.deliveryMethod,input.destinationLocationId,context.authorizedDestinationLocationIds);
+  if(details.deliveryMethod==='stocking')details.requestingLocationId=context.authorizedDestinationLocationIds.map(Number).find(id=>[1,28,15,26].includes(id));
   const evidence = details.stockingType === 'purchase' ? await purchaseEvidence(input,dependencies) : await collectEvidence((input.lines || []).map(line => line.itemId), dependencies);
   const now = (dependencies.now || (() => new Date()))();
   return withTransaction(async () => {
-    const request = await createSalesStockRequest({...input,deliveryMethod:details.deliveryMethod,stockingType:details.stockingType}, context);
+    const request = await createSalesStockRequest({...input,deliveryMethod:details.deliveryMethod,stockingType:details.stockingType}, {...context,stockingRequestingLocationId:details.requestingLocationId});
     return persistApproval(request, details, evidence, now);
   });
 }
 
 export async function editRegularStockRequest(id, input, context, dependencies = {}) {
   const before = await getSalesStockRequest(id, context);
+  assertRegularNotBackorder(before);
   if(isWaitlist(before))throw waitlistError('Close the waitlist request and submit corrected details.','WAITLIST_WORKFLOW_ONLY',409);
   if(before.regular?.deliveryVersion===1)throw regularError('Delivery items and routing are saved from the SO. Cancel a pending request to start again.','REGULAR_DELIVERY_LOCKED');
   if (before.workflowVersion !== 2) return updateSalesStockRequest(id, input, context);
   const details = await inputDetails({...input,stockingType:input.stockingType??before.regular.stockingType});
+  assertRegularStockingDestinationAccess(details.deliveryMethod,input.destinationLocationId??before.destinationLocationId,context.authorizedDestinationLocationIds);
+  if(details.deliveryMethod==='stocking')Object.assign(details,{requestingLocationId:before.regular.requestingLocationId??context.authorizedDestinationLocationIds.map(Number).find(id=>[1,28,15,26].includes(id)),
+    ...(before.regular.reply?{reply:before.regular.reply,replyStatus:before.regular.replyStatus}:{})});
   const evidence = details.stockingType === 'purchase' ? await purchaseEvidence({...input,destinationLocationId:input.destinationLocationId??before.destinationLocationId},dependencies) : await collectEvidence((input.lines || []).map(line => line.itemId), dependencies);
   return withTransaction(async () => {
     const request = await updateSalesStockRequest(id, {...input,stockingType:details.stockingType}, context);
-    return persistApproval(request, details, evidence, (dependencies.now || (() => new Date()))());
+    const stockingLines=details.deliveryMethod==='stocking'&&before.regular.stockingLines
+      ? Object.fromEntries((/** @type {{id:number}[]} */ (request.lines)).filter(line=>Object.hasOwn(before.regular.stockingLines,line.id)).map(line=>[line.id,before.regular.stockingLines[line.id]])) : undefined;
+    if(stockingLines)Object.assign(details,{stockingLines});
+    const updated=await persistApproval(request, details, evidence, (dependencies.now || (() => new Date()))());
+    if(stockingLines){await refreshStockingReplyStatus(id);return getScmStockRequest(id);}
+    return updated;
   });
 }
 
@@ -144,6 +160,7 @@ export async function reraiseRegularStockRequest(id,input,context,dependencies={
 
 export async function refreshRegularStockEvidence(id, dependencies = {}) {
   const request = await getScmStockRequest(id);
+  if (request.regular?.deliveryMethod === 'backorder') return request;
   if(isWaitlist(request))return request;
   if (isPurchaseStocking(request)) {
     const evidence=await purchaseEvidence({destinationLocationId:request.destinationLocationId,lines:request.lines},{...dependencies,
@@ -157,7 +174,7 @@ export async function refreshRegularStockEvidence(id, dependencies = {}) {
   if (request.workflowVersion !== 2) return request;
   if(request.regular.pickupTransfer || request.regular.handoffStatus==='complete' || request.status==='completed')return request;
   const evidence = await collectEvidence(request.lines.map(line => line.itemId), dependencies);
-  const current = evaluateRegularStockApproval({ lines: request.lines, policies: evidence.policies, arrivalAt: request.regular.arrivalAt,
+  const current = evaluateRegularStockApproval({ lines: /** @type {import('./regular-stock-domain.js').RegularLine[]} */ (request.lines), policies: evidence.policies, arrivalAt: request.regular.arrivalAt,
     deliveryMethod: request.regular.deliveryMethod, leadHours: request.regular.approval.leadHours, autoApprovalEnabled:request.regular.approval.autoApprovalEnabled, now: request.regular.approval.evaluatedAt });
   // Current review evidence is separate from the immutable approval snapshot.
   return { ...request, currentEvidence: current.lines, evidenceError: evidence.error };
@@ -165,6 +182,7 @@ export async function refreshRegularStockEvidence(id, dependencies = {}) {
 
 export async function decideRegularStockRequest(id, input, context, dependencies = {}) {
   const before = await getScmStockRequest(id);
+  assertRegularNotBackorder(before);
   if(isWaitlist(before))throw waitlistError('Use the Waitlist allocation workspace.','WAITLIST_WORKFLOW_ONLY',409);
   if(before.regular?.deliveryVersion===1){
     const {decideDeliveryStockRequest}=await import('./regular-stock-delivery.js');
@@ -188,7 +206,7 @@ export async function decideRegularStockRequest(id, input, context, dependencies
     const pendingStocking=isRegularStockingRequest(request) && !isPurchaseStocking(request) && !request.regular.pickupTransfer && !request.regular.handoffStatus;
     if (selected.length !== lineIds.length || selected.some(line => line.status !== 'submitted' && !(pendingStocking && decision==='reject' && line.status==='approved'))) throw regularError('Only undecided lines can be reviewed.');
     const snapshot = isPurchaseStocking(request) ? {...request.regular.approval,lines:request.lines.map(line=>({lineId:line.id,...evidence.stocks[line.itemId],unit:line.salesUom,reasons:['purchase_scm_review']}))}
-      : evaluateRegularStockApproval({ lines: request.lines, policies: evidence.policies, arrivalAt: request.regular.arrivalAt,
+      : evaluateRegularStockApproval({ lines: /** @type {import('./regular-stock-domain.js').RegularLine[]} */ (request.lines), policies: evidence.policies, arrivalAt: request.regular.arrivalAt,
       deliveryMethod: request.regular.deliveryMethod, leadHours: request.regular.approval.leadHours, now: (dependencies.now || (() => new Date()))() });
     for (const line of selected) await query(`UPDATE sales_stock_request_lines SET regular_decision=$2,status=$3,
       decision_reason=$4,decided_by=$5,decided_at=now(),approval_evidence=$6::jsonb,updated_at=now() WHERE id=$1`,
@@ -203,40 +221,50 @@ export async function decideRegularStockRequest(id, input, context, dependencies
     await query(`UPDATE sales_stock_requests SET revision=revision+1,first_scm_decision_at=COALESCE(first_scm_decision_at,now()),
       manual_decision_event_id=$2,status=CASE WHEN EXISTS(SELECT 1 FROM sales_stock_request_lines WHERE request_id=$1 AND status NOT IN ('rejected','cancelled','fulfilled','received','closed')) THEN 'active' ELSE 'completed' END,
       regular_details=regular_details||$3::jsonb,updated_at=now() WHERE id=$1`, [row.id,event.rows[0].id,JSON.stringify(window)]);
+    if(isRegularStockingRequest(updated))await clearStockingLineReplies(id,lineIds);
     return getScmStockRequest(id);
   });
 }
 
 export async function regularStockAlerts({ scm = false, operatorId, authorizedDestinationLocationIds = [] } = {}) {
+  const backorder=await backorderAlerts({scm,operatorId,authorizedDestinationLocationIds});
   if (scm) {
     const { rows } = await query(`SELECT count(*)::int AS count FROM sales_stock_requests r WHERE r.workflow_version=2 AND r.request_type='regular'
       AND COALESCE(r.regular_details->>'deliveryMethod','')<>'waitlist'
-      AND EXISTS(SELECT 1 FROM sales_stock_request_lines l WHERE l.request_id=r.id AND (l.status='submitted'
+      AND (EXISTS(SELECT 1 FROM sales_stock_request_lines l WHERE l.request_id=r.id AND (l.status='submitted'
         OR (l.status='approved' AND r.regular_details->>'deliveryMethod'='stocking'
           AND COALESCE(r.regular_details->>'stockingType','transfer')<>'purchase'
-          AND NOT r.regular_details ? 'pickupTransfer' AND NOT r.regular_details ? 'handoffStatus')))`);
+          AND NOT r.regular_details ? 'pickupTransfer' AND NOT r.regular_details ? 'handoffStatus')))
+        OR (r.status IN ('submitted','active') AND r.regular_details->>'replyStatus'='pending_scm'))`);
     const returned=(await query(`SELECT p.id,COALESCE(NULLIF(o.dispatch_ref,''),o.tranid) AS po_ref,i.item_name
       FROM regular_waitlist_pools p JOIN purchase_orders o ON o.netsuite_id=p.purchase_order_id JOIN inventory_items i ON i.item_id=p.item_id
       LEFT JOIN regular_waitlist_pool_reads seen ON seen.pool_id=p.id AND seen.operator_id=$1
       WHERE p.last_return_event_id>COALESCE(seen.event_id,0) ORDER BY p.last_return_event_id DESC LIMIT 200`,[operatorId||null])).rows;
-    return { manualReview: rows[0].count, returnedPools:returned.map(p=>({id:Number(p.id),purchaseOrderRef:p.po_ref,itemCode:p.item_name})),total:rows[0].count+returned.length };
+    return { manualReview: rows[0].count+backorder.manualReview, returnedPools:returned.map(p=>({id:Number(p.id),purchaseOrderRef:p.po_ref,itemCode:p.item_name})),total:rows[0].count+backorder.manualReview+returned.length };
   }
   if (!operatorId || !authorizedDestinationLocationIds.length) return { unread: 0, total: 0, requests: [] };
-  const { rows } = await query(`SELECT r.id,r.request_ref,r.manual_decision_event_id FROM sales_stock_requests r
-    LEFT JOIN regular_stock_decision_reads seen ON seen.request_id=r.id AND seen.operator_id=$1
-    WHERE r.workflow_version=2 AND r.request_type='regular' AND r.requested_by=$1 AND r.destination_location_id=ANY($2::bigint[])
-      AND r.manual_decision_event_id>COALESCE(seen.event_id,0) ORDER BY r.manual_decision_event_id DESC`,[operatorId,authorizedDestinationLocationIds]);
-  return { unread: rows.length, total: rows.length, requests: rows.map(row => ({ id: Number(row.id), requestRef: row.request_ref, eventId: Number(row.manual_decision_event_id) })) };
+  const { rows } = await query(`SELECT request.id,request.request_ref,request.manual_decision_event_id,event.event_type,event.details FROM sales_stock_requests request
+    LEFT JOIN regular_stock_decision_reads seen ON seen.request_id=request.id AND seen.operator_id=$1
+    JOIN sales_stock_request_events event ON event.id=request.manual_decision_event_id AND event.request_id=request.id
+    WHERE request.workflow_version=2 AND request.request_type='regular' AND request.requested_by=$1 AND ${stockRequestSalesScopeSql('$2')}
+      AND request.manual_decision_event_id>COALESCE(seen.event_id,0) ORDER BY request.manual_decision_event_id DESC`,[operatorId,authorizedDestinationLocationIds]);
+  const stockChecks=await salesStockCheckNotices({operatorId,authorizedDestinationLocationIds});
+  return { stockChecks, unread: rows.length+backorder.requests.length, total: rows.length+backorder.requests.length, requests: [...backorder.requests,...rows.map(row => ({ id: Number(row.id), requestRef: row.request_ref, eventId: Number(row.manual_decision_event_id),
+    action:row.event_type==='regular_scm_reply'?'reply':row.details.decision||'update',message:['regular_scm_reply','stocking_line_waitlisted'].includes(row.event_type)?row.details.message:null,
+    lineId:row.details.lineId||null,itemName:row.details.itemName||null,
+    eta:row.details.eta||null,purchaseOrderRef:row.details.purchaseOrderRef||null,waitlistRequestId:row.details.waitlistRequestId||null,waitlistRequestRef:row.details.waitlistRequestRef||null }))] };
 }
 
 export async function acknowledgeRegularStockDecisions(id, { eventId }, context) {
+  const detail=await getSalesStockRequest(id,context);
+  if (detail.regular?.deliveryMethod==='backorder') return acknowledgeBackorderAlert(id,eventId,context);
   return withTransaction(async () => {
     const request = await lockRequest(id);
     await getSalesStockRequest(id, context);
     if (request.requested_by !== context.operatorId) throw regularError('Only the requester can acknowledge this decision.', 'REGULAR_ALERT_FORBIDDEN', 403);
     const event = requiredId(eventId);
     const found = await query(`SELECT id FROM sales_stock_request_events WHERE id=$1 AND request_id=$2 AND event_type IN
-      ('regular_manual_decision','waitlist_allocation_confirmed','waitlist_allocation_released','waitlist_allocation_expired','waitlist_rejected')`,[event,id]);
+      ('regular_scm_reply','regular_manual_decision','stocking_line_waitlisted','waitlist_allocation_confirmed','waitlist_allocation_released','waitlist_allocation_expired','waitlist_rejected')`,[event,id]);
     if (!found.rowCount || event > Number(request.manual_decision_event_id)) throw regularError('That decision was not displayed for this request.');
     await query(`INSERT INTO regular_stock_decision_reads(request_id,operator_id,event_id) VALUES($1,$2,$3)
       ON CONFLICT(request_id,operator_id) DO UPDATE SET event_id=GREATEST(regular_stock_decision_reads.event_id,EXCLUDED.event_id),read_at=now()`,[id,context.operatorId,event]);

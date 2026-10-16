@@ -1,11 +1,11 @@
 /* global AbortController */
 const escape = value => String(value ?? '').replace(/[&<>"']/g, char => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[char]));
-export function specialDocumentActions(detail, audience = 'sales') {
+export function specialDocumentActions(detail, audience = 'sales', { showOrderPreviews = true } = {}) {
   const button = (kind, label) => `<button type="button" data-special-document="${kind}" data-case-id="${escape(detail.id)}">${label}</button>`;
   return `<div class="stock-request-actions special-document-actions">
-    ${!detail.salesOrderId ? button('quote', 'Preview saved quote') : ''}
-    ${detail.salesOrderId && !detail.salesOrderSkipped ? button('sales_order', 'Preview SO') : ''}
-    ${audience === 'scm' && detail.purchaseOrderId && !detail.purchaseOrderSkipped ? button('purchase_order', 'Preview PO') : ''}
+    ${button('quote', 'Preview saved quote')}
+    ${showOrderPreviews && detail.salesOrderId && !detail.salesOrderSkipped ? button('sales_order', 'Preview SO') : ''}
+    ${showOrderPreviews && audience === 'scm' && detail.purchaseOrderId && !detail.purchaseOrderSkipped ? button('purchase_order', 'Preview PO') : ''}
   </div>`;
 }
 

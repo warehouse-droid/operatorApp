@@ -1,4 +1,10 @@
+import {traceDriverCompletion} from "./driver-completion-trace.js";
+import {mountStockRequestConversationRoutes} from './stock-request-conversation-router.js';
+import { previewOperatorOrderReopen, reopenOperatorOrder, searchOperatorReopenOrders } from "./operator-order-reopen-repository.js";
+import { createCustomerWebhookRouter } from './netsuite-customer-webhook-router.js';
 import { createPasswordResetRouter } from './password-reset-router.js';
+import { listTransferPostingJobs } from './transfer-order-posting-repository.js';
+import { retryTransferPostingJob } from './transfer-order-posting-service.js';
 import { dispatchDependencyOrderRefs } from './yard-dependency-structure.js';
 import { createBossRepository } from './boss-approval-repository.js';
 import { createBossApprovalService } from './boss-approval-service.js';
@@ -9,14 +15,20 @@ import { createBossApprovalNetSuite } from './netsuite.js';
 import { saveSmartScmProposalLineOrder } from "./smart-scm-line-order-repository.js";
 import {enqueueDeliveryOperation,getDeliveryOperation,activeDeliveryOperation,createDeliveryOperationRuntime} from './regular-stock-delivery-operations.js';
 import {submitRegularStockRequest,editRegularStockRequest,decideRegularStockRequest,refreshRegularStockEvidence,regularStockAlerts,acknowledgeRegularStockDecisions,reraiseRegularStockRequest} from './regular-stock-request-service.js';
+import {mountBackorderRoutes} from './backorder-request-routes.js';
 import {resolveRegularStockRequest} from './regular-stock-resolution.js';
+import {replyRegularStockRequest} from './regular-stock-replies.js';
+import {assertRegularStockingDestinationAccess} from './regular-stock-stocking-access.js';
 import {submitDeliveryStockRequest,retryDeliveryStockRequest,previewDeliveryStockRequest} from './regular-stock-delivery.js';
 import {previewPickupStockTransfers,convertPickupStockTransfers} from './regular-stock-pickup.js';
 import {linkRegularStockSalesOrder,previewRegularStockSalesOrder} from './regular-stock-handoff.js';
 import {releaseRegularReplenishment} from './regular-stock-replenishment.js';
 import {addPurchaseStockProposals,releasePurchaseStockDemand} from './regular-stock-purchase-service.js';
-import {assertStockRequestDestinationAccess} from './stock-request-domain.js';
 import { createSpecialExpiryRuntime } from './special-stock-expiry.js';
+import { createDeliveryRequestService, prioritizeDeliveryOrders } from './delivery-request-repository.js';
+import { createDeliveryRequestRouter } from './delivery-request-router.js';
+import { createDeliveryRequestExpiryRuntime } from './delivery-request-expiry.js';
+import { createMenuOrderRouter } from './menu-order-router.js';
 import {mountWaitlistRoutes} from './regular-waitlist-router.js';
 import {createWaitlistRuntime} from './regular-waitlist-service.js';
 import { specialSalesReps } from './special-stock-sales-reps.js';
@@ -24,6 +36,7 @@ import { operatorNetSuitePriority } from './operator-netsuite-priority-middlewar
 import { createSpecialQuoteService, createSpecialOrderDocumentService } from './special-stock-documents.js';
 import { getSpecialStockAlertCounts, getSpecialSalesAlertCounts } from './special-stock-alerts.js';
 import { listSpecialPoReferenceAlerts, acknowledgeSpecialPoReferenceAlert } from './special-po-reference-alerts.js';
+import { listSpecialDeliveryMethodAlerts, acknowledgeSpecialDeliveryMethodAlert } from './special-delivery-method-alerts.js';
 import { filterSorPlanningOrders } from './sor-feature-gate.js';
 import { createCountSheetRouter, createInventoryDamageRouter } from "./operator-inventory-router.js";
 import { damagePostingTick } from "./inventory-damage-service.js";
@@ -32,7 +45,9 @@ import { damageAdjustmentTick } from "./control-damage-service.js";
 import { assertDamagePhotoAccess } from "./inventory-damage-repository.js";
 import { createAggregateRequestAccessRouter } from "./aggregate-request-access-router.js";
 import { outboundYardLocationId } from "./outbound-location-domain.js";
+import { scopeCustomerPickupOrderYard } from './customer-pickup-yard-scope.js';
 import { createOperatorPreferencesRouter } from "./operator-preferences-router.js";
+import { createOperatorPhonePolicyRouter } from "./operator-phone-policy-router.js";
 import { createAggregateRequestRouter } from "./aggregate-request-router.js";
 import { hasUnappliedDispatchPlanMaintenance, pendingDispatchPlanMaintenance } from "./dispatch-plan-maintenance-queue.js";
 import { configureDispatchMaintenanceEvents, drainDispatchPlanMaintenance } from "./dispatch-plan-maintenance.js";
@@ -46,6 +61,9 @@ import { submitConsolidatedLoad, resumeConsolidatedLoad } from "./consolidation-
 import { assertOperatorYard, operatorYardLocationIds } from "./operator-yard-access.js";
 import express from "express";
 import { createFieldSalesRuntime } from "./field-sales/runtime.js";
+import { createMbrRuntime } from "./mbr/runtime.js";
+import { createStockCheckRuntime } from "./stock-check/runtime.js";
+import { isMbrOnly, staffPathAllowed } from "../public/mbr/domain.js";
 import { decorateSorOrders } from "./sor-rental-repository.js";
 import { resolveSorSignature, assertSorSignaturePhotoAccess } from "./sor-signature-evidence.js";
 import { sorAdminRouter } from "./sor-rental-routes.js";
@@ -139,10 +157,7 @@ import {
   scmReconciliationNightlyTick,
   startScmReconciliationRun
 } from "./scm-reconciliation-service.js";
-import {
-  isBilledSalesOrderIdentifier,
-  listBilledSalesOrderFamilyRefs
-} from "./sales-order-reconciliation-repository.js";
+import { isBilledSalesOrderIdentifier } from "./sales-order-reconciliation-repository.js";
 import { isNetSuiteSalesOrderBilled } from "./sales-order-reconciliation.js";
 import { assertNoClosedNetSuiteOrders } from "./netsuite-closed-order-repository.js";
 import { operationalPlanOrderRefs } from "./netsuite-closed-order-policy.js";
@@ -150,7 +165,9 @@ import { isNetSuiteOperationalWorkActive } from "./netsuite-operational-work.js"
 import { getScmSchedulePreference, normalizeScmSchedulePreferenceSurface, updateScmSchedulePreference } from "./scm-schedule-preference-repository.js";
 import { getScmScheduleFormatting, updateScmScheduleFormatting } from "./scm-schedule-formatting-repository.js";
 import {
+  canSearchAcrossScmScheduleOrders,
   canViewRestrictedScmOrders,
+  filterSearchableScmScheduleOrders,
   filterRestrictedScmOrders,
   isCompletedScmOrder,
   isDispatchExplicitSearchVisibleScmOrder,
@@ -183,6 +200,8 @@ import {
   assertSalesOrderReattemptDriverReady,
   getSalesOrderReattemptCurrentItemCorrectionPreview
 } from "./sales-order-reattempt-correction-repository.js";
+import { getDispatchSplitPreview } from "./dispatch-split-preview-repository.js";
+import { resplitUnfinishedSalesOrder, unsplitSalesOrder } from "./dispatch-sales-resplit-repository.js";
 import { listDeliveryOrders, listVrmaDeliveryPrepOrders, getDeliveryOrder, getFulfillableDeliveryOrder, buildItemFulfillmentPayload, markDeliveryPrepared, updateDeliveryStatus, confirmDeliveryLine, confirmDeliveryLines, setDeliveryLinePackedQuantity, unpackDeliveryLine, unpackDeliveryOrder, recordDeliveryFulfillment, recordDeliveryFulfillmentFailure, recordDeliveryLoad, listDeliveryFulfillments, getDeliveryBootstrap, getDeliveryPrepNotifications, resetDeliveryFulfillmentState, applyConfirmedDispatchPlanToDelivery, deactivateUnplannedDispatchSplitOrders, getNextDispatchSplitSuffix, getCurrentOperatorDeliveryDraft, releaseCurrentDeliveryDraft, listSavedDeliveryOrdersForOperator, listSavedDeliveryOrderKeysForOperator, saveDeliveryOrderForOperator, removeSavedDeliveryOrderForOperator, listDeliveryLoadTrucks, listDeliveryLoadOrders } from "./delivery-repository.js";
 import { getYardMovementDetail, listYardMovementCsvRows, listYardMovements } from "./yard-movement-repository.js";
 import { yardMixedUnits } from "./yard-quantity.js";
@@ -231,6 +250,7 @@ import {
 } from "./dispatch-completion-repository.js";
 import { DISPATCH_VENDOR_WEEK_DAYS, listDispatchVendorYards, listDispatchLocalVendors, saveDispatchVendorYardSchedule, updateDispatchVendorYard, upsertDispatchVendorYard, listDispatchParserRules, updateDispatchParserRule, listOllamaAudit, listDispatchVendorMappings, discoverDispatchVendorMappingsFromPurchaseOrders, updateDispatchVendorMapping, createDispatchLocalVendor, updateDispatchLocalVendor } from "./dispatch-enrichment.js";
 import { listDispatchAudit, writeDispatchAudit } from "./dispatch-audit-repository.js";
+import { recordDriverUploadFailure } from "./driver-upload-failure-repository.js";
 import { repairDispatchCoGroupIdentities } from "./dispatch-co-group-identity-repository.js";
 import {
   deactivateDispatchGlobalOrderDefinitions,
@@ -247,7 +267,7 @@ import {
 } from "./dispatch-actual-arrival-repository.js";
 import { actualArrivalWorkerTick } from "./dispatch-actual-arrival-service.js";
 import { runWithAuditContext } from "./audit-context.js";
-import { DispatchPlanDateMismatchError, StaleDispatchPlanSaveError, applyDispatchPlannedAssignment, cleanupBilledSalesOrderFamiliesFromDispatchPlan, confirmDispatchPlan, createDispatchPlan, dispatchPlannedOrderRefs, getCurrentDispatchPlan, getDispatchPlan, getDispatchPlanRevision, getDispatchPlanSnapshot, listDispatchPlanSnapshots, listDispatchPlans, reopenDispatchPlan, restoreDispatchPlanSnapshot, saveDispatchPlanRecoveryDraft, saveDispatchPlanSnapshot } from "./dispatch-plan-repository.js";
+import { DispatchPlanDateMismatchError, StaleDispatchPlanSaveError, applyDispatchPlannedAssignment, confirmDispatchPlan, createDispatchPlan, dispatchPlannedOrderRefs, getCurrentDispatchPlan, getDispatchPlan, getDispatchPlanRevision, getDispatchPlanSnapshot, listDispatchPlanSnapshots, listDispatchPlans, reopenDispatchPlan, restoreDispatchPlanSnapshot, saveDispatchPlanRecoveryDraft, saveDispatchPlanSnapshot } from "./dispatch-plan-repository.js";
 import {
   advanceDispatchV2Followup,
   applyDispatchV2Command,
@@ -303,10 +323,10 @@ import {
   upsertScmPurchaseOrderCatalog
 } from "./scm-purchase-order-catalog-repository.js";
 import { applyActiveTransitCoMetadata, clearCancelledTransitCoMetadata, evaluateExecutedPrefixPolicy } from "./dispatch-planner-performance.js";
-import { getDispatchExecutedOrderReviews, acknowledgeDispatchExecutedOrderReviews, prepareDispatchExecutedOrderComparison } from "./dispatch-executed-order-review-repository.js";
+import { getDispatchSourceReviewPayload, acknowledgeDispatchExecutedOrderReviews, prepareDispatchExecutedOrderComparison, resolveDispatchSourceOrderReviews } from "./dispatch-executed-order-review-repository.js";
 import { preserveDispatchPlanAddresses } from "./dispatch-address-guard.js";
 import { applyDispatchPlanDelta, buildDispatchPlanDelta } from "./dispatch-planner-optimization.js";
-import { DispatchPlanEditLeaseError, acquireDispatchPlanEditLease, assertDispatchPlanEditLease, getDispatchPlanEditLease, heartbeatDispatchPlanEditLease, releaseDispatchPlanEditLease } from "./dispatch-plan-lease-repository.js";
+import { DispatchPlanEditLeaseError, acquireDispatchPlanEditLease, assertDispatchPlanEditLease, getDispatchPlanEditLease, heartbeatDispatchPlanEditLease, releaseDispatchPlanEditLease, listActiveDispatchPlanEditors, kickDispatchPlanEditor } from "./dispatch-plan-lease-repository.js";
 import { withDispatchPlanWrite, getDispatchPlanWriteReplay } from './dispatch-plan-write.js';
 import {
   executeScmDependencyCommand,
@@ -553,6 +573,7 @@ import {
   refreshSpecialSalesOrder
 } from "./special-stock-request-service.js";
 import { updateSpecialFulfillment } from './special-stock-fulfillment.js';
+import { refreshSpecialOrderStatusCache } from './special-stock-status-refresh.js';
 import { reviewSpecialQuantityChange } from './special-stock-quantity-service.js';
 import { reviewSpecialClosure, requestSpecialClosure as requestSpecialCaseClosure } from './special-stock-closure-service.js';
 import {
@@ -1095,6 +1116,7 @@ function sendDispatchLoadAssignmentConflictResponse(res, conflicts = []) {
 }
 
 const DISPATCH_RECOVERY_EXCLUDED_ERROR_CODES = new Set([
+  "DISPATCH_SPLIT_ALLOCATED",
   "DISPATCH_COMMAND_ID_REUSED",
   "DISPATCH_PLAN_DATE_MISMATCH",
   "DISPATCH_PLAN_FENCE_REQUIRED",
@@ -1958,7 +1980,7 @@ export async function loadDispatchOrdersForResponse({
   const includeCustom = !requestedType || ["SO", "TO", "CUSTOM"].includes(requestedType);
   const historicalDate = historicalDispatchPlanDate(historyPlanDate);
   const revealCompletedScmSearch = Boolean(includeCompletedScmSearch && searchTerm && !historicalDate);
-  const [orders, customOrders, snapshotOrders, initialRestrictedScmRefs, billedSalesOrders, hiddenScmOrders, completedReconciliationRefs] = await Promise.all([
+  const [orders, customOrders, snapshotOrders, initialRestrictedScmRefs, hiddenScmOrders, completedReconciliationRefs] = await Promise.all([
     listDispatchOrders({
       type,
       search: searchTerm,
@@ -1977,7 +1999,6 @@ export async function loadDispatchOrdersForResponse({
     exactIdentityRequest
       ? Promise.resolve(new Set())
       : listRestrictedScmDispatchOrderRefs(),
-    listBilledSalesOrderFamilyRefs(),
     searchTerm && (historicalDate || revealCompletedScmSearch)
       ? listDispatchOrders({
           type,
@@ -2028,16 +2049,6 @@ export async function loadDispatchOrdersForResponse({
     driverCompletedRefs
   });
   const historicalOrders = historicalCandidates.map(decorateHistoricalOrder).filter(Boolean);
-  const billedSalesOrderRefs = new Set(billedSalesOrders.flatMap((order) => [order.ref, order.id])
-    .map((ref) => String(ref || "").trim().toLowerCase())
-    .filter(Boolean));
-  const isBilledSalesOrderFamily = (order) => {
-    const type = String(order?.type || "").trim().toUpperCase();
-    if (type !== "SO" && !Array.isArray(order?.childOrders)) return false;
-    const state = fulfilledSalesOrderState(order, fulfilledSalesStates);
-    if (state?.eligible || ((searchTerm || exactIdentityRequest) && state?.fulfilled && state?.locallyCompleted)) return false;
-    return dispatchOrderLogicalRefs(order).some((ref) => billedSalesOrderRefs.has(ref));
-  };
   const currentOrders = filterDispatchPlanningVisibleOrders([
     ...orders.map(decorateTransfer),
     ...customOrders.filter(order => requestedType !== "SO" || order.orderKind === "sor_rental_return").map(dispatchOrderFromCustomOrder),
@@ -2045,7 +2056,7 @@ export async function loadDispatchOrdersForResponse({
   ]).filter(order => order.type !== "SO" || order.netsuiteActive !== false
     || order.historicalReconciliationComplete === true
     || fulfilledSalesOrderState(order, fulfilledSalesStates)?.fulfilled)
-    .filter((order) => !isBilledSalesOrderFamily(order)).filter((order) => {
+    .filter((order) => {
     if (order.historicalReconciliationComplete === true || order.dispatchFulfilledTransferPlanningEligible === true) return true;
     if (!["PO", "TO", "VRMA"].includes(String(order?.type || "").trim().toUpperCase())) return true;
     return !dispatchOrderScmRestrictionRefs(order).some((ref) => restrictedScmRefs.has(ref));
@@ -2057,7 +2068,7 @@ export async function loadDispatchOrdersForResponse({
     : snapshotOrders;
   const derivedOrders = filterDispatchPlanningVisibleOrders(derivedCandidates.map((order) => (
     decorateTransfer(decorateHistoricalOrder(order) || order)
-  ))).filter((order) => !isBilledSalesOrderFamily(order)).filter((order) => {
+  ))).filter((order) => {
     if (order.historicalReconciliationComplete === true || order.dispatchFulfilledTransferPlanningEligible === true) return true;
     if (!["PO", "TO", "VRMA"].includes(String(order?.type || "").trim().toUpperCase())) return true;
     return !dispatchOrderScmRestrictionRefs(order).some((ref) => restrictedScmRefs.has(ref));
@@ -2147,7 +2158,7 @@ export async function loadDispatchOrdersForResponse({
   const visibleOrders = filterDispatchPlanningVisibleOrders(withReconciliation, {
     includeCompletedScmSearch: revealCompletedScmSearch
   })
-    .filter((order) => !isBilledSalesOrderFamily(order)).filter((order) => {
+    .filter((order) => {
     if (order.historicalReconciliationComplete === true || order.dispatchFulfilledTransferPlanningEligible === true) return true;
     if (!["PO", "TO", "VRMA"].includes(String(order?.type || "").trim().toUpperCase())) return true;
     const restricted = dispatchOrderScmRestrictionRefs(order).some((ref) => restrictedScmRefs.has(ref));
@@ -2178,7 +2189,7 @@ export async function loadDispatchOrdersForResponse({
   });
   const scopedOrders = exactIdentityRequest || historicalDate
     ? planningAnnotatedOrders : await filterSorPlanningOrders(planningAnnotatedOrders);
-  return enrichDispatchOrdersWithCompletionStatus(await decorateSorOrders(scopedOrders));
+  return prioritizeDeliveryOrders(await enrichDispatchOrdersWithCompletionStatus(await decorateSorOrders(scopedOrders)));
 }
 
 const dispatchOrderResponseSingleFlight = createSingleFlight({
@@ -3229,8 +3240,12 @@ function dispatchSplitParentRefs(plan = {}) {
   const visit = (order) => {
     const ref = String(order?.id || "").trim();
     if (!ref) return;
-    const explicitParent = String(order?.originalOrderId || order?.parentOrderRef || "").trim();
-    const inferredParent = String(order?.type || "").trim().toUpperCase() !== "CUSTOM" && /-S\d+$/i.test(ref)
+    const customOrder = String(order?.type || "").trim().toUpperCase() === "CUSTOM"
+      || order?.customOrder === true
+      || String(order?.sourceTable || "").trim().toLowerCase() === "dispatch_custom_orders";
+    // A linked return or re-attempt owns its own route, independently of its source.
+    const explicitParent = customOrder ? "" : String(order?.originalOrderId || order?.parentOrderRef || "").trim();
+    const inferredParent = !customOrder && /-S\d+$/i.test(ref)
       ? ref.replace(/-S\d+$/i, "")
       : "";
     const parent = explicitParent || inferredParent;
@@ -4334,7 +4349,7 @@ async function checkDriverJobLocation(job) {
     };
   }
   const distanceMeters = coordinateDistanceMeters(latitude, longitude, expected.latitude, expected.longitude);
-  const thresholdMeters = 500;
+  const thresholdMeters = 1000;
   const ok = distanceMeters <= thresholdMeters;
   return {
     status: ok ? "ok" : "warning",
@@ -4551,7 +4566,6 @@ export async function completeDriverJobOperationalEffects({
   driverRemark = undefined,
   completionContext = null,
   rejectExistingCompletion = false,
-  strictPlanCleanup = false,
   requireCurrentJob = false
 } = {}) {
   if (!job?.jobId) throw new Error("Driver job is no longer available.");
@@ -4719,19 +4733,6 @@ export async function completeDriverJobOperationalEffects({
       });
     }
     const primary = jobResults.find((result) => String(result.job.jobId) === String(job.jobId)) || jobResults[0];
-    // Commit the intention with Driver evidence. A crash after completion must
-    // not lose cleanup; execution remains outside this critical transaction.
-    if (!strictPlanCleanup && job.planId) {await cleanupBilledSalesOrderFamiliesFromDispatchPlan({
-      planId: job.planId, actor: `driver:${driverLogin}`, queueOnly: true
-    });}
-    const billedSalesOrderPlanCleanup = strictPlanCleanup && job.planId
-      ? await cleanupBilledSalesOrderFamiliesFromDispatchPlan({
-          planId: job.planId,
-          actor: completionContext?.source === "dispatch_historical_assist"
-            ? `operator:${completionContext.actorId}`
-            : `driver:${driverLogin}`
-        })
-      : null;
     return {
       record: primary.record,
       records: jobResults.map((result) => result.record),
@@ -4740,8 +4741,7 @@ export async function completeDriverJobOperationalEffects({
       dependencyWarnings: jobResults.flatMap((result) => result.dependencyWarnings || []),
       completedCustomOrders: uniqueDriverCompletedCustomOrders(
         jobResults.flatMap((result) => result.completedCustomOrders || [])
-      ),
-      billedSalesOrderPlanCleanup
+      )
     };
   });
   if (completion.dependencyWarnings.length) {
@@ -4761,26 +4761,7 @@ export async function completeDriverJobOperationalEffects({
       }
     }).catch(() => null);
   }
-  let billedSalesOrderPlanCleanup = completion.billedSalesOrderPlanCleanup || null;
-  let billedSalesOrderPlanCleanupWarning = "";
-  if (job.planId && !strictPlanCleanup) {
-    try {
-      billedSalesOrderPlanCleanup = await cleanupBilledSalesOrderFamiliesFromDispatchPlan({
-        planId: job.planId,
-        actor: `driver:${driverLogin}`
-      });
-
-    } catch (error) {
-      billedSalesOrderPlanCleanupWarning = String(error?.message || error);
-      console.error("Billed SO plan cleanup after driver completion failed:", error);
-    }
-  }
-  return {
-    ...completion,
-    physicalVisitJobIds: physicalVisitJobs.map((visitJob) => visitJob.jobId),
-    billedSalesOrderPlanCleanup,
-    billedSalesOrderPlanCleanupWarning
-  };
+  return {...completion, physicalVisitJobIds: physicalVisitJobs.map((visitJob) => visitJob.jobId)};
 }
 
 function driverRequestClientVersion(req) {
@@ -5353,7 +5334,8 @@ function operatorPhotoAction(req, functionKey, run, { minimum = 2, batch = null 
   return withOperatorPhotoAction({
     actor: req.operator, requestId: batch?.id || req.body?.requestId, functionKey,
     orderId: req.params.id, orderType: batch ? "consolidation_load" : functionKey === "customer_pickup" ? "sales_order" : req.body?.orderType,
-    locationId: batch?.locationId || (functionKey === "receiving" ? order?.destination_location_id : outboundYardLocationId(order?.outbound_location_id ?? order?.source_location_id)),
+    locationId: batch?.locationId || (functionKey === "receiving" ? order?.destination_location_id
+      : order?.pickup_location_id ?? outboundYardLocationId(order?.outbound_location_id ?? order?.source_location_id)),
     backgroundPhotos, minimum,
     legacyPhotos: backgroundPhotos === undefined ? requiredPhotoDataUrls(batch ? req.body?.photoRefs : req.body?.photoDataUrls, minimum) : []
   }, run);
@@ -6114,6 +6096,10 @@ async function requireOperator(req, res, next) {
       return res.status(401).json({ error: "Login required" });
     }
     req.operator = operator;
+    if (operator.role === "mbr_sales"
+        && !staffPathAllowed(operator, String(req.originalUrl || req.path).split("?")[0].replace(/\/+$/u, ""))) {
+      return sendRoleForbidden(res, operator, "This account has access to MBR Contracts only.");
+    }
     next();
   } catch (error) {
     next(error);
@@ -6361,7 +6347,7 @@ function operatorSafeReturnPayload(value) {
   const safe = {};
   for (const [key, child] of Object.entries(value)) {
     const normalizedKey = key.toLowerCase().replaceAll("_", "");
-    if (Number(value.workflowVersion) >= 2 && ["netsuitetransactionid", "netsuitetransactionref"].includes(normalizedKey)) {
+    if (Number(value.workflowVersion) >= 2 && ["netsuitetransactionid", "netsuitetransactionref", "netsuitestage"].includes(normalizedKey)) {
       safe[key] = child;
       continue;
     }
@@ -6410,6 +6396,7 @@ function dispatchEditLeaseInput(req, planDate = "") {
     planDate: planDate || req.body?.planDate || req.body?.date || req.query?.planDate || req.query?.date || "",
     operatorId: req.operator?.id || "",
     operatorName: req.operator?.display_name || req.operator?.username || "",
+    activityAgeMs: req.body?.activityAgeMs,
     sessionId: req.body?.sessionId || req.body?.audit?.sessionId || req.query?.sessionId || "",
     token: req.body?.editLeaseToken || req.get("x-dispatch-edit-lease") || req.query?.editLeaseToken || ""
   };
@@ -7643,23 +7630,11 @@ async function updateTransferOrderLineFromProgress(orderId, line, stage) {
             to_lyr = COALESCE($14::numeric, to_lyr),
             to_sec = COALESCE($15::numeric, to_sec),
             to_pcs = COALESCE($16::numeric, to_pcs),
-            loaded_qty = CASE WHEN $17::boolean THEN $18 ELSE loaded_qty END,
-            loaded_uom = CASE WHEN $17::boolean THEN COALESCE(NULLIF($5, ''), loaded_uom) ELSE loaded_uom END,
-            packed_pallet_qty = CASE WHEN $17::boolean THEN 0 ELSE packed_pallet_qty END,
-            packed_layer_qty = CASE WHEN $17::boolean THEN 0 ELSE packed_layer_qty END,
-            packed_piece_qty = CASE WHEN $17::boolean THEN 0 ELSE packed_piece_qty END,
-            packed_section_qty = CASE WHEN $17::boolean THEN 0 ELSE packed_section_qty END,
             fulfilled_pallet_qty = CASE WHEN $17::boolean THEN $19 ELSE fulfilled_pallet_qty END,
             fulfilled_layer_qty = CASE WHEN $17::boolean THEN $20 ELSE fulfilled_layer_qty END,
             fulfilled_piece_qty = CASE WHEN $17::boolean THEN $21 ELSE fulfilled_piece_qty END,
             fulfilled_section_qty = CASE WHEN $17::boolean THEN $22 ELSE fulfilled_section_qty END,
             netsuite_received_qty = CASE WHEN $17::boolean THEN netsuite_received_qty ELSE $18 END,
-            received_pallet_qty = CASE WHEN $17::boolean THEN received_pallet_qty ELSE 0 END,
-            received_layer_qty = CASE WHEN $17::boolean THEN received_layer_qty ELSE 0 END,
-            received_piece_qty = CASE WHEN $17::boolean THEN received_piece_qty ELSE 0 END,
-            received_section_qty = CASE WHEN $17::boolean THEN received_section_qty ELSE 0 END,
-            confirmed = false,
-            confirmed_at = null,
             netsuite_active = true,
             sync_exception = null,
             sync_exception_at = null,
@@ -7838,7 +7813,7 @@ async function reconcilePurchaseOrderProgress(progress) {
   return { lines: lines.length, ...summary, receiptStatus };
 }
 
-async function reconcileTransferOrderProgress(progress) {
+export async function reconcileTransferOrderProgress(progress) {
   const outboundLines = transferProgressLinesForStage(progress, "outbound");
   const receivingLines = transferProgressLinesForStage(progress, "receiving");
   for (const line of outboundLines) await updateTransferOrderLineFromProgress(progress.id, line, "outbound");
@@ -7851,12 +7826,8 @@ async function reconcileTransferOrderProgress(progress) {
     `UPDATE transfer_orders
         SET status = COALESCE($2, status),
             status_text = COALESCE($3, status_text),
-            outbound_operator_status = $4,
-            local_yard_order_status = $5,
-            fulfillment_status = $6,
-            receiving_status = $7,
-            fulfilled_at = CASE WHEN $6 IN ('fulfilled', 'partial_fulfilled') THEN COALESCE(fulfilled_at, now()) ELSE fulfilled_at END,
-            received_at = CASE WHEN $7 IN ('received', 'partial_received') THEN COALESCE(received_at, now()) ELSE received_at END,
+            fulfillment_status = $4,
+            fulfilled_at = CASE WHEN $4 IN ('fulfilled', 'partial_fulfilled') THEN COALESCE(fulfilled_at, now()) ELSE fulfilled_at END,
             status_updated_at = now(),
             synced_at = now()
       WHERE netsuite_id = $1`,
@@ -7864,10 +7835,7 @@ async function reconcileTransferOrderProgress(progress) {
       progress.id,
       progress.status || null,
       progress.status_text || null,
-      outboundStatus.operatorStatus,
-      outboundStatus.yardStatus,
-      outboundStatus.fulfillmentStatus,
-      receiptStatus
+      outboundStatus.fulfillmentStatus
     ]
   );
   await enqueueNetSuiteMirrorOrderEvent("transfer_order", progress.id, { changeType: "progress" });
@@ -8727,12 +8695,14 @@ export async function processNetSuiteOrderWebhook(payload = {}, {
   if (type === "sales_order" || type === "purchase_order") {
     specialStockRequest = await reconcileSpecialOrderWebhook({ orderKind: type, orderId: payload.id });
     if (specialStockRequest.matched) {
-      results.push({
-        target: "sales_special_stock_cases",
-        requestId: specialStockRequest.requestId,
-        attention: specialStockRequest.attention === true,
-        remotelyReconciled: specialStockRequest.remotelyReconciled === true
-      });
+      for (const specialCase of specialStockRequest.cases || [specialStockRequest]) {
+        results.push({
+          target: "sales_special_stock_cases",
+          requestId: specialCase.requestId,
+          attention: specialCase.attention === true,
+          remotelyReconciled: specialCase.remotelyReconciled === true
+        });
+      }
     }
   }
 
@@ -8755,17 +8725,30 @@ export async function processNetSuiteOrderWebhook(payload = {}, {
       });
     }
     if (specialStockRequest?.matched) {
-      emitSpecialStockUpdate("netsuite-webhook", {
-        requestId: specialStockRequest.requestId,
-        orderId: payload.id,
-        orderKind: type,
-        attention: specialStockRequest.attention === true
-      });
+      for (const specialCase of specialStockRequest.cases || [specialStockRequest]) {
+        emitSpecialStockUpdate("netsuite-webhook", {
+          requestId: specialCase.requestId,
+          orderId: payload.id,
+          orderKind: type,
+          attention: specialCase.attention === true
+        });
+      }
     }
   }
   return { ok: true, orderId: payload.id, tranid: payload.tranid, recordType: type, results, stockRequestTransfer, specialStockRequest };
 }
 
+// Customer webhooks authenticate and bound their payload before the general parser.
+app.use('/api/webhooks/netsuite/customer', createCustomerWebhookRouter());
+
+const mbrRuntime = createMbrRuntime({ authenticate: requireOperator, config, dataDir });
+// Bound contract inputs before the application-wide large photo parser.
+app.use('/api/mbr', mbrRuntime.router);
+
+const stockCheckRuntime = createStockCheckRuntime({ authenticate: requireOperator, dataDir });
+app.use('/api/scm/stock-check', stockCheckRuntime.router);
+
+app.use("/api/driver/upload-failures", express.json({ limit: "16kb" }));
 app.use(express.json({
   limit: "25mb",
   verify(req, res, buffer) {
@@ -9001,6 +8984,7 @@ app.get("/api/events", async (req, res, next) => {
   try {
     const token = typeof req.query.token === "string" ? req.query.token : "";
     const viewer = token ? await getOperatorByToken(token) : null;
+    if (isMbrOnly(viewer)) return sendRoleForbidden(res, viewer, "This account has access to MBR Contracts only.");
     const driver = token && !viewer ? await getDriverSession(token) : null;
     if (res.destroyed || res.writableEnded) return;
     const detailed = Boolean(driver || operatorHasAnyRole(viewer, ["admin", "dispatcher"]));
@@ -9051,9 +9035,15 @@ app.use((req, res, next) => {
     res.setHeader("Cache-Control", "no-cache, no-store, must-revalidate");
   } else if (req.path === "/field-sales" || req.path.startsWith("/field-sales/")) {
     res.setHeader("Cache-Control", "no-cache, no-store, must-revalidate");
+  } else if (req.path === "/mbr" || req.path.startsWith("/mbr/")) {
+    res.setHeader("Cache-Control", "no-store");
+    res.setHeader("Referrer-Policy", "no-referrer");
+    res.setHeader("X-Content-Type-Options", "nosniff");
+    res.setHeader("X-Frame-Options", "DENY");
+    res.setHeader("Content-Security-Policy", "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; connect-src 'self'; frame-ancestors 'none'; base-uri 'none'; form-action 'self'");
   } else if (req.path === "/mbt" || req.path.startsWith("/mbt/")) {
     res.setHeader("Cache-Control", "no-cache, no-store, must-revalidate");
-  } else if (req.path.endsWith(".webmanifest") || ["/", "/operator", "/driver", "/control", "/control/returns", "/admin", "/admin/accounts", "/admin/sync", "/admin/maps-usage", "/admin/reconciliation", "/admin/printers", "/admin/photo-storage", "/admin/audit", "/admin/return-automation", "/admin/sor-auto-returns", "/admin/mbt-gates", "/dispatch", "/dispatch/custom-orders", "/dispatch/special-stock", "/dispatch/driver-pwa", "/dispatch/offline-review", "/sales", "/sales/planning", "/sales/schedule", "/sales/monitor", "/sales/printing", "/sales/in-outbound-record", "/sales/returns", "/sales/stock-requests", "/sales/delivery-instructions", "/dispatch/loaded-export", "/dispatch/in-outbound-record", "/control/in-outbound-record", "/dispatch/po-to-schedule", "/scm/custom-orders", "/scm/smart", "/scm/stock-requests", "/scm/to-printing", "/scm/dependency-management", "/scm/printers", "/scm/route-rules", "/scm/schedule-formatting", "/operator.html", "/driver.html", "/control.html", "/admin.html", "/dispatch-menu.html", "/dispatch-special-stock.html", "/dispatch-custom-orders.html", "/dispatch-offline-review.html", "/sales.html", "/sales-stock-requests.html", "/sales-delivery-instructions.html", "/sales-printing.html", "/dispatch-loaded-export.html", "/scm-smart.html", "/scm-stock-requests.html", "/scm/to-printing.html", "/scm/dependency-management.html", "/scm-dependency-management.js", "/scm-dependency-management.css", "/scm-printers.html", "/scm-route-rules.html", "/scm-schedule-formatting.html"].includes(req.path)) {
+  } else if (req.path.endsWith(".webmanifest") || ["/", "/operator", "/driver", "/control", "/control/returns", "/admin", "/admin/accounts", "/admin/sync", "/admin/maps-usage", "/admin/reconciliation", "/admin/printers", "/admin/photo-storage", "/admin/audit", "/admin/return-automation", "/admin/sor-auto-returns", "/admin/mbt-gates", "/dispatch", "/dispatch/custom-orders", "/dispatch/special-stock", "/dispatch/driver-pwa", "/dispatch/offline-review", "/sales", "/sales/planning", "/sales/schedule", "/sales/monitor", "/sales/printing", "/sales/in-outbound-record", "/sales/returns", "/sales/stock-requests", "/sales/delivery-instructions", "/dispatch/loaded-export", "/dispatch/in-outbound-record", "/control/in-outbound-record", "/control/order-reopen", "/dispatch/po-to-schedule", "/scm/custom-orders", "/scm/smart", "/scm/stock-requests", "/scm/to-printing", "/scm/dependency-management", "/scm/printers", "/scm/route-rules", "/scm/schedule-formatting", "/operator.html", "/driver.html", "/control.html", "/admin.html", "/dispatch-menu.html", "/dispatch-special-stock.html", "/dispatch-custom-orders.html", "/dispatch-offline-review.html", "/sales.html", "/sales-stock-requests.html", "/sales-delivery-instructions.html", "/sales-printing.html", "/dispatch-loaded-export.html", "/scm-smart.html", "/scm-stock-requests.html", "/scm/to-printing.html", "/scm/dependency-management.html", "/scm-dependency-management.js", "/scm-dependency-management.css", "/scm-printers.html", "/scm-route-rules.html", "/scm-schedule-formatting.html"].includes(req.path)) {
     res.setHeader("Cache-Control", "no-cache, no-store, must-revalidate");
   }
   next();
@@ -9061,6 +9051,10 @@ app.use((req, res, next) => {
 
 app.use("/vendor/qr-scanner", express.static(qrScannerDir));
 app.use("/vendor/quagga2", express.static(quaggaScannerDir));
+app.get('/mbr', (_req, res) => res.redirect(302, '/mbr/contracts'));
+app.get('/mbr/setup', (_req, res) => res.sendFile(path.join(publicDir, 'mbr/contracts.html')));
+app.get(['/mbr/contracts', '/mbr/contracts/:id'], (_req, res) => res.sendFile(path.join(publicDir, 'mbr/contracts.html')));
+app.get('/mbr/sign', (_req, res) => res.sendFile(path.join(publicDir, 'mbr/sign.html')));
 app.use(express.static(publicDir));
 
 const smartScmRawUpload = express.raw({
@@ -10492,6 +10486,8 @@ app.use('/api/admin/boss-approvals',requireOperator,requireAdmin,createBossAppro
 app.use("/api/admin/aggregate-request-access", requireOperator, requireAdmin, createAggregateRequestAccessRouter({
   onChange: () => emitAppEvent("operator.access.updated", {})
 }));
+app.use('/api/navigation/menu-order',createMenuOrderRouter());
+app.use('/api/admin/menu-order',requireOperator,requireAdmin,createMenuOrderRouter({admin:true}));
 app.use("/api/aggregate-requests", requireOperator, createAggregateRequestRouter({
   onChange: (payload) => emitAppEvent("aggregate-request.updated", payload)
 }));
@@ -10546,6 +10542,17 @@ app.post("/api/dispatch/order-completions", requireDispatcher, async (req, res, 
   }
 });
 app.use("/api/sales", requireSalesOperator, requireSalesAccess);
+const deliveryRequestPricing = createFrontdeskPricingAdapter({
+  routeEstimator: input => googleMapsGateway.estimateRoute({ ...input, subsystem: 'support_route' })
+});
+const deliveryRequestService = createDeliveryRequestService({
+  resolveDistance: input => deliveryRequestPricing.resolveDistance(input),
+  emit: event => emitAppEvent('delivery.requests.updated',event)
+});
+app.use('/api/sales/delivery-requests',requirePrivateSalesRecordAccess,
+  createDeliveryRequestRouter({service:deliveryRequestService,audience:'sales'}));
+app.use('/api/dispatch/delivery-requests',requireDispatcher,
+  createDeliveryRequestRouter({service:deliveryRequestService,audience:'dispatch'}));
 const fieldSalesRuntime = createFieldSalesRuntime({ maps: googleMapsGateway, browserMap: authorizeGoogleBrowserMap });
 app.use("/api/field-sales", requireOperator, fieldSalesRuntime.router);
 app.get("/field-sales", (req, res) => res.redirect(302, "/field-sales/"));
@@ -10601,6 +10608,7 @@ async function auditDeliveryInstructionMutation(req, action, detail, source) {
     orderRef: detail.orderRef,
     revision: detail.revision
   });
+  await deliveryRequestService.instructionChanged(detail.orderRef,req.operator?.id);
 }
 
 function deliveryInstructionNoStore(res) {
@@ -11117,7 +11125,6 @@ app.post("/api/dispatch/driver-pwa/historical-assist/:jobId/complete", requireDi
           occurredAt: completedAt,
           completionContext,
           rejectExistingCompletion: true,
-          strictPlanCleanup: true
         });
         return {
           ...completionResult,
@@ -11445,6 +11452,13 @@ app.post("/api/dispatch/driver-pwa/stops/:recordId/reopen", requireDispatcher, a
       reopenedBy: req.operator?.username
         || req.operator?.display_name
         || String(req.operator?.id || "dispatcher")
+    });
+    await refreshDispatchOrderCatalogRefsNow(result.orderRefs || [], { source: "driver-pwa-reopen" });
+    emitAppEvent("dispatch.orders.updated", {
+      source: "driver-pwa-reopen",
+      orderRefs: result.orderRefs || [],
+      refreshOrderPool: true,
+      catalogAlreadyQueued: true
     });
     emitAppEvent("driver.job.reopened", {
       source: "driver_pwa",
@@ -12183,7 +12197,11 @@ function stockRequestYardsForOperator(operator) {
 function emitStockRequestUpdate(source, payload = {}) {
   emitAppEvent("stock-request.updated", { source, ...payload });
 }
+mountStockRequestConversationRoutes(app,{salesGuards:[requireSalesAccess,requirePrivateSalesRecordAccess],scmRead:requireScmAccess,scmWrite:requireSmartScmWriteAccess,
+  salesContext:req=>({operatorId:req.operator.id,authorizedDestinationLocationIds:operatorSalesYardLocationIds(req.operator)}),emit:emitStockRequestUpdate});
 const waitlistRuntime=createWaitlistRuntime({emit:payload=>emitStockRequestUpdate(payload.source,payload)});
+mountBackorderRoutes(app,{salesGuards:[requireSalesAccess,requirePrivateSalesRecordAccess],scmRead:requireScmAccess,scmWrite:requireSmartScmWriteAccess,
+  salesContext:req=>({operatorId:req.operator.id,authorizedDestinationLocationIds:operatorSalesYardLocationIds(req.operator)}),emit:emitStockRequestUpdate});
 mountWaitlistRoutes(app,{salesGuards:[requireSalesAccess,requirePrivateSalesRecordAccess],scmRead:requireScmAccess,scmWrite:requireSmartScmWriteAccess,
   salesContext:req=>({operatorId:req.operator.id,authorizedDestinationLocationIds:operatorSalesYardLocationIds(req.operator)}),emit:emitStockRequestUpdate,runtime:waitlistRuntime});
 
@@ -12202,7 +12220,7 @@ app.post("/api/sales/stock-request-items/:itemId/availability/refresh", requireS
   try {
     res.setHeader("Cache-Control", "private, no-store");
     if(req.body?.stockingType==='purchase'){
-      const yard=assertStockRequestDestinationAccess(req.body.destinationLocationId,operatorSalesYardLocationIds(req.operator));
+      const yard=assertRegularStockingDestinationAccess('stocking',req.body.destinationLocationId,operatorSalesYardLocationIds(req.operator));
       return res.json(await refreshPurchaseStockAvailability(req.params.itemId,yard));
     }
     res.json(await refreshStockRequestItemAvailability(req.params.itemId));
@@ -12219,8 +12237,12 @@ app.get("/api/sales/stock-requests", requireSalesAccess, requirePrivateSalesReco
       listSalesStockRequests({
         authorizedDestinationLocationIds,
         bucket: req.query.bucket,
+        status: req.query.status,
+        type: req.query.type, stage:req.query.stage,
         search: req.query.search,
+        allStatuses: req.query.allStatuses === "1",
         vendor: req.query.vendor,
+        vendors: req.query.vendors,
         requestDate: req.query.requestDate,
         sourceLocationId: req.query.sourceLocationId,
         sourceLocationIds: req.query.sourceLocationIds,
@@ -12232,6 +12254,7 @@ app.get("/api/sales/stock-requests", requireSalesAccess, requirePrivateSalesReco
     ]);
     res.json({
       yards: stockRequestYardsForOperator(req.operator),
+      stockingYards: operatorSalesYardLocationIds(req.operator).length ? SALES_YARDS : [],
       filterOptions,
       ...availabilityPolicy,
       requests
@@ -12290,6 +12313,12 @@ app.get('/api/sales/stock-requests/alerts', requireSalesAccess, requirePrivateSa
 });
 app.post('/api/sales/stock-requests/:id/decisions/read', requireSalesAccess, requirePrivateSalesRecordAccess, async(req,res,next)=>{
   try {res.json(await acknowledgeRegularStockDecisions(req.params.id,req.body||{},{operatorId:req.operator.id,authorizedDestinationLocationIds:operatorSalesYardLocationIds(req.operator)}));} catch(error){next(error);}
+});
+app.post('/api/sales/stock-requests/:id/reply',requireSalesAccess,requirePrivateSalesRecordAccess,async(req,res,next)=>{
+  try{
+    const request=await replyRegularStockRequest(req.params.id,req.body||{},{audience:'sales',operatorId:req.operator.id,authorizedDestinationLocationIds:operatorSalesYardLocationIds(req.operator)});
+    emitStockRequestUpdate('sales-stocking-reply',{requestId:request.id});res.json(request);
+  }catch(error){next(error);}
 });
 app.post('/api/sales/stock-requests/:id/re-raise', requireSalesAccess, requirePrivateSalesRecordAccess, async(req,res,next)=>{
   try {
@@ -12367,7 +12396,9 @@ app.get("/api/scm/stock-requests", requireScmAccess, async (req, res, next) => {
     const [requests, filterOptions] = await Promise.all([
       listScmStockRequests({
         queue: req.query.queue,
+        type: req.query.type, stage:req.query.stage,
         search: req.query.search,
+        allStatuses: req.query.allStatuses === "1",
         vendor: req.query.vendor,
         requestDate: req.query.requestDate,
         sourceLocationId: req.query.sourceLocationId,
@@ -12410,6 +12441,12 @@ app.post('/api/scm/stock-requests/:id/resolve',requireSmartScmWriteAccess,async(
     const outcome=await resolveRegularStockRequest(req.params.id,req.body||{},{operatorId:req.operator.id});
     if(outcome.changed)emitStockRequestUpdate('scm-stocking-resolved',{requestId:outcome.request.id});
     res.json(outcome.request);
+  }catch(error){next(error);}
+});
+app.post('/api/scm/stock-requests/:id/reply',requireSmartScmWriteAccess,async(req,res,next)=>{
+  try{
+    const request=await replyRegularStockRequest(req.params.id,req.body||{},{audience:'scm',operatorId:req.operator.id});
+    emitStockRequestUpdate('scm-stocking-reply',{requestId:request.id});res.json(request);
   }catch(error){next(error);}
 });
 app.post('/api/scm/stock-requests/:id/purchase-release',requireSmartScmWriteAccess,async(req,res,next)=>{
@@ -12607,6 +12644,14 @@ function emitSpecialStockUpdate(source, detail = {}) {
   emitAppEvent("special-stock-request.updated", { source, ...detail });
 }
 
+/** @param {()=>Promise<any>} read */
+async function readSpecialWithCurrentOrderStatuses(read) {
+  const saved = await read();
+  const result = await refreshSpecialOrderStatusCache(Array.isArray(saved) ? saved : [saved]);
+  if (result.updated) emitSpecialStockUpdate('order-status-refresh');
+  return result.attempted ? read() : saved;
+}
+
 app.get('/api/sales/special-stock-requests/sales-reps', requirePrivateSalesRecordAccess, requireSpecialStockWorkflow, async (_req, res, next) => {
   try { specialStockNoStore(res); res.json({ salesReps: await specialSalesReps.list() }); }
   catch (error) { next(error); }
@@ -12681,12 +12726,12 @@ app.get("/api/sales/special-stock-requests", requirePrivateSalesRecordAccess, re
     res.json({
       yards: stockRequestYardsForOperator(req.operator),
       vendors: await listSpecialCaseVendors({authorizedStoreLocationIds:operatorSalesYardLocationIds(req.operator),requestedByOperatorId:req.query.mine === "1" ? req.operator.id : undefined}),
-      requests: await listSpecialStockCases({
+      requests: await readSpecialWithCurrentOrderStatuses(() => listSpecialStockCases({
         ...req.query,
         audience: "sales",
         requestedByOperatorId: req.query.mine === "1" ? req.operator.id : undefined,
         authorizedStoreLocationIds: operatorSalesYardLocationIds(req.operator)
-      })
+      }))
     });
   } catch (error) {
     next(error);
@@ -12702,6 +12747,23 @@ app.post("/api/sales/special-stock-requests", requirePrivateSalesRecordAccess, r
   } catch (error) {
     next(error);
   }
+});
+
+app.get('/api/scm/special-stock-requests/delivery-method-alerts', requireScmAccess, requireSpecialStockWorkflow, async (req,res,next) => {
+  try { specialStockNoStore(res); res.json(await listSpecialDeliveryMethodAlerts({operatorId:/** @type {any} */ (req).operator.id,audience:'scm'})); }
+  catch (error) { next(error); }
+});
+app.post('/api/scm/special-stock-requests/delivery-method-alerts/:id/ack', requireScmAccess, requireSpecialStockWorkflow, async (req,res,next) => {
+  try { specialStockNoStore(res); res.json(await acknowledgeSpecialDeliveryMethodAlert(req.params.id,req.body || {},{operatorId:/** @type {any} */ (req).operator.id,audience:'scm'})); }
+  catch (error) { next(error); }
+});
+app.get('/api/dispatch/special-stock-requests/delivery-method-alerts', requireDispatcher, requireSpecialStockWorkflow, async (req,res,next) => {
+  try { specialStockNoStore(res); res.json(await listSpecialDeliveryMethodAlerts({operatorId:/** @type {any} */ (req).operator.id,audience:'dispatch'})); }
+  catch (error) { next(error); }
+});
+app.post('/api/dispatch/special-stock-requests/delivery-method-alerts/:id/ack', requireDispatcher, requireSpecialStockWorkflow, async (req,res,next) => {
+  try { specialStockNoStore(res); res.json(await acknowledgeSpecialDeliveryMethodAlert(req.params.id,req.body || {},{operatorId:/** @type {any} */ (req).operator.id,audience:'dispatch'})); }
+  catch (error) { next(error); }
 });
 
 app.get('/api/sales/special-stock-requests/alerts', requirePrivateSalesRecordAccess, requireSpecialStockWorkflow, async(req,res,next)=>{
@@ -12735,10 +12797,10 @@ app.put('/api/sales/special-stock-requests/:id/expiry', requirePrivateSalesRecor
 app.get("/api/sales/special-stock-requests/:id", requirePrivateSalesRecordAccess, requireSpecialStockWorkflow, async (req, res, next) => {
   try {
     specialStockNoStore(res);
-    res.json(await getSpecialStockCase(req.params.id, {
+    res.json(await readSpecialWithCurrentOrderStatuses(() => getSpecialStockCase(req.params.id, {
       audience: "sales",
       authorizedStoreLocationIds: operatorSalesYardLocationIds(req.operator)
-    }));
+    })));
   } catch (error) {
     next(error);
   }
@@ -12883,6 +12945,9 @@ app.post("/api/sales/special-stock-requests/:id/sales-order/link", requirePrivat
 
 app.post("/api/sales/special-stock-requests/:id/sales-order/refresh", requirePrivateSalesRecordAccess, requireSpecialStockWorkflow, async (req, res, next) => {
   try {
+    await refreshSpecialOrderStatusCache([await getSpecialStockCase(req.params.id, {
+      audience: 'sales', authorizedStoreLocationIds: operatorSalesYardLocationIds(req.operator)
+    })], { force: true });
     const detail = await refreshSpecialSalesOrder(req.params.id, specialStockSalesContext(req));
     emitSpecialStockUpdate("sales-order-refresh", { requestId: detail.id });
     res.json(detail);
@@ -13009,7 +13074,7 @@ app.get("/api/scm/special-stock-requests/order-links", requireSpecialStockWorkfl
 app.get("/api/scm/special-stock-requests", requireSpecialStockWorkflow, async (req, res, next) => {
   try {
     specialStockNoStore(res);
-    res.json({ yards: SALES_YARDS, vendors: await listSpecialCaseVendors(), requests: await listSpecialStockCases({ ...req.query, audience: "scm", authorizedStoreLocationIds: undefined, requestedByOperatorId: undefined }) });
+    res.json({ yards: SALES_YARDS, vendors: await listSpecialCaseVendors(), requests: await readSpecialWithCurrentOrderStatuses(() => listSpecialStockCases({ ...req.query, audience: "scm", authorizedStoreLocationIds: undefined, requestedByOperatorId: undefined })) });
   } catch (error) {
     next(error);
   }
@@ -13025,7 +13090,7 @@ app.get('/api/scm/special-stock-requests/alerts', requireSpecialStockWorkflow, a
 app.get("/api/scm/special-stock-requests/:id", requireSpecialStockWorkflow, async (req, res, next) => {
   try {
     specialStockNoStore(res);
-    res.json(await getSpecialStockCase(req.params.id, { audience: "scm" }));
+    res.json(await readSpecialWithCurrentOrderStatuses(() => getSpecialStockCase(req.params.id, { audience: "scm" })));
   } catch (error) {
     next(error);
   }
@@ -13059,6 +13124,7 @@ app.post("/api/scm/special-stock-requests/:id/lines/:lineId/response", requireSm
 
 app.post("/api/scm/special-stock-requests/:id/sales-order/refresh", requireSmartScmWriteAccess, requireSpecialStockWorkflow, async (req, res, next) => {
   try {
+    await refreshSpecialOrderStatusCache([await getSpecialStockCase(req.params.id, { audience: 'scm' })], { force: true });
     const detail = await refreshSpecialSalesOrder(req.params.id, { operatorId: req.operator.id });
     emitSpecialStockUpdate("scm-so-refresh", { requestId: detail.id });
     res.json(detail);
@@ -13243,8 +13309,15 @@ app.get("/api/sales/schedule", async (req, res, next) => {
   try {
     const requestedView = String(req.query.view || "yard manager").trim().toLowerCase();
     const includeRestricted = canViewRestrictedScmOrders(req.operator);
+    const searchAcrossOrders = canSearchAcrossScmScheduleOrders(req.operator, {
+      search: req.query.search,
+      surface: "sales"
+    });
     const view = includeRestricted && requestedView === "completed" ? "completed" : "yard manager";
-    const rows = await listScmSchedule({
+    const rows = await listScmSchedule(searchAcrossOrders ? {
+      search: req.query.search,
+      audience: "schedule_search"
+    } : {
       search: req.query.search || "",
       status: req.query.status || "",
       method: req.query.method || "",
@@ -13257,17 +13330,19 @@ app.get("/api/sales/schedule", async (req, res, next) => {
       audience: includeRestricted ? "scm" : "operations"
     });
     const yardCodes = operatorSalesYardCodes(req.operator);
-    const scoped = rows.filter((row) => salesScheduleRowMatchesYards(row, yardCodes));
+    const scoped = searchAcrossOrders ? rows : rows.filter((row) => salesScheduleRowMatchesYards(row, yardCodes));
     const canSeeReconciliationDetails = operatorHasAnyRole(req.operator, ["admin"]);
     const reconciliationPreference = canSeeReconciliationDetails
       ? await getScmReconciliationPreference(req.operator?.id)
       : { showDetails: false };
     const reconciled = await enrichScmScheduleWithReconciliation(scoped, {
       includeDetails: canSeeReconciliationDetails && reconciliationPreference.showDetails,
-      view,
-      reviewOnly: String(req.query.reconciliationStatus || "").toLowerCase() === "review"
+      view: searchAcrossOrders ? "" : view,
+      reviewOnly: !searchAcrossOrders && String(req.query.reconciliationStatus || "").toLowerCase() === "review"
     });
-    const visibleRows = includeRestricted
+    const visibleRows = searchAcrossOrders
+      ? filterSearchableScmScheduleOrders(reconciled)
+      : includeRestricted
       ? reconciled
       : filterRestrictedScmOrders(reconciled, { includeRestricted: false });
     res.json(visibleRows);
@@ -14059,6 +14134,33 @@ app.get("/api/dispatch/plan-edit-lease", requireOperator, requireDispatcher, asy
   }
 });
 
+app.get("/api/admin/dispatch-plan-editors", requireOperator, requireAdmin, async (_req, res, next) => {
+  try {
+    dispatchPrivateNoStore(res);
+    res.json({ editors: await listActiveDispatchPlanEditors() });
+  } catch (error) { next(error); }
+});
+
+async function kickDispatchPlanEditorRoute(req, res, next) {
+  try {
+    dispatchPrivateNoStore(res);
+    const removed = await kickDispatchPlanEditor(req.body, {
+      id: req.operator.id, name: req.operator.display_name || req.operator.username,
+      admin: req.path.startsWith("/api/admin/")
+    });
+    if (removed) {
+      emitAppEvent("dispatch.plan.edit_lease_changed", { planDate: removed.planDate, lease: null, reason: "kicked" });
+      void dispatchMaintenanceTick({ planDate: removed.planDate });
+    }
+    res.json({ released: Boolean(removed) });
+  } catch (error) {
+    if (error instanceof DispatchPlanEditLeaseError) return sendDispatchPlanEditLeaseError(res, error);
+    next(error);
+  }
+}
+app.post("/api/admin/dispatch-plan-editors/kick", requireOperator, requireAdmin, kickDispatchPlanEditorRoute);
+app.post("/api/dispatch/plan-edit-lease/kick", requireOperator, requireDispatcher, kickDispatchPlanEditorRoute);
+
 app.post("/api/dispatch/plan-edit-lease/acquire", requireOperator, requireDispatcher, async (req, res, next) => {
   try {
     const acquired = await acquireDispatchPlanEditLease(dispatchEditLeaseInput(req));
@@ -14331,7 +14433,7 @@ app.get("/api/dispatch/plans/:id/shipped-orders.csv", async (req, res, next) => 
 app.get("/api/dispatch/plans/:id/executed-order-reviews", requireOperator, requireDispatcher, async (req, res, next) => {
   try {
     dispatchPrivateNoStore(res);
-    res.json({ reviews: await getDispatchExecutedOrderReviews(req.params.id) });
+    res.json(await getDispatchSourceReviewPayload(req.params.id, { baseRevision: req.query.baseRevision }));
   } catch (error) { next(error); }
 });
 
@@ -14339,6 +14441,13 @@ app.post("/api/dispatch/plans/:id/executed-order-reviews", requireOperator, requ
   try {
     dispatchPrivateNoStore(res);
     if (req.body?.confirm !== true) {return res.status(400).json({ code: "DISPATCH_EXECUTED_SOURCE_CONFIRM_REQUIRED", error: "Confirm that you have reviewed the displayed source updates." });}
+    if (Object.hasOwn(req.body || {}, "decision")) {
+      const result = await resolveDispatchSourceOrderReviews({ planId: req.params.id, tokens: req.body?.tokens,
+        decision: req.body.decision, baseRevision: req.body.baseRevision,
+        actorId: req.operator.id, actorName: req.operator.display_name || req.operator.username,
+        editLease: dispatchEditLeaseInput(req) });
+      return res.json(result);
+    }
     const reviews = await acknowledgeDispatchExecutedOrderReviews({ planId: req.params.id, tokens: req.body?.tokens,
       actorId: req.operator.id, actorName: req.operator.display_name || req.operator.username,
       editLease: dispatchEditLeaseInput(req) });
@@ -16470,7 +16579,14 @@ app.post("/api/scm/to-printing/transfer-orders/:id/print", async (req, res, next
 app.get("/api/scm/schedule", async (req, res, next) => {
   try {
     const includeRestricted = canViewRestrictedScmOrders(req.operator);
-    const rows = await listScmSchedule({
+    const searchAcrossOrders = canSearchAcrossScmScheduleOrders(req.operator, {
+      search: req.query.search,
+      surface: req.query.surface
+    });
+    const rows = await listScmSchedule(searchAcrossOrders ? {
+      search: req.query.search,
+      audience: "schedule_search"
+    } : {
       search: req.query.search || "",
       status: req.query.status || "",
       method: req.query.method || "",
@@ -16500,10 +16616,12 @@ app.get("/api/scm/schedule", async (req, res, next) => {
       : { showDetails: false };
     const reconciled = await enrichScmScheduleWithReconciliation(rows, {
       includeDetails: canSeeDetails && preference.showDetails,
-      view: req.query.view || "",
-      reviewOnly: String(req.query.reconciliationStatus || "").toLowerCase() === "review"
+      view: searchAcrossOrders ? "" : req.query.view || "",
+      reviewOnly: !searchAcrossOrders && String(req.query.reconciliationStatus || "").toLowerCase() === "review"
     });
-    res.json(filterRestrictedScmOrders(reconciled, { includeRestricted }));
+    res.json(searchAcrossOrders
+      ? filterSearchableScmScheduleOrders(reconciled)
+      : filterRestrictedScmOrders(reconciled, { includeRestricted }));
   } catch (error) {
     next(error);
   }
@@ -17357,7 +17475,7 @@ app.get("/api/dispatch/scm/v2/purchase-orders/:ref", async (req, res, next) => {
     dispatchPrivateNoStore(res);
     const includeRestricted = canViewRestrictedScmOrders(req.operator);
     let order = await getScmPurchaseOrderCatalogOrder(req.params.ref, { includeRestricted });
-    if (!order) {
+    if (!order || (order.items || []).some((line) => !Object.hasOwn(line, "netsuiteDestinationYard"))) {
       order = (await targetedScmPurchaseOrdersForResponse([req.params.ref], req.operator))
         .find((candidate) => String(candidate.id || "").toLowerCase() === String(req.params.ref || "").toLowerCase()) || null;
       if (order) {
@@ -17399,6 +17517,7 @@ app.post("/api/dispatch/scm/purchase-order-splits", async (req, res, next) => {
       newPoRef: req.body?.newPoRef,
       pickupPoint: req.body?.pickupPoint,
       destinationLocationId: req.body?.destinationLocationId,
+      retainNetSuiteDestination: req.body?.retainNetSuiteDestination,
       status: req.body?.status,
       remarkOverride: req.body?.remarkOverride,
       lines: req.body?.lines,
@@ -17666,6 +17785,15 @@ app.delete("/api/dispatch/scm/purchase-order-splits/:ref", async (req, res, next
 app.get("/api/dispatch/planned-assignments", async (req, res, next) => {
   try {
     res.json(await listDispatchPlannedAssignments());
+  } catch (error) {
+    next(error);
+  }
+});
+
+app.get("/api/dispatch/orders/:id/split-preview", async (req, res, next) => {
+  try {
+    dispatchPrivateNoStore(res);
+    res.json(await getDispatchSplitPreview({ orderRef: req.params.id, type: String(req.query.type || "") }));
   } catch (error) {
     next(error);
   }
@@ -17995,9 +18123,38 @@ app.delete("/api/dispatch/po-allocations/:allocationId", async (req, res, next) 
   }
 });
 
+app.post("/api/dispatch/split-orders/resplit", async (req, res, next) => {
+  try {
+    await requireDispatchPlanEditLease(req);
+    const result = await resplitUnfinishedSalesOrder({
+      orderRef: req.body?.orderRef, planId: req.body?.planId, planDate: req.body?.planDate,
+      expectedItems: req.body?.expectedItems, parts: req.body?.parts,
+      actor: (/** @type {any} */ (req)).operator, sessionId: req.body?.audit?.sessionId,
+      assertEditLease: () => requireDispatchPlanEditLease(req)
+    });
+    emitAppEvent("dispatch.orders.updated", { orderId: req.body?.orderRef, change: "order_resplit",
+      retiredGlobalOrderRefs: result.retiredGlobalOrderRefs, sourceSessionId: req.body?.audit?.sessionId, refreshOrderPool: true });
+    res.json(result);
+  } catch (error) {
+    next(error);
+  }
+});
+
 app.post("/api/dispatch/split-orders/unsplit", async (req, res, next) => {
   try {
     await requireDispatchPlanEditLease(req);
+    if (String(req.body?.orderType || "").toUpperCase() === "SO") {
+      const result = await unsplitSalesOrder({ ...req.body, actor: (/** @type {any} */ (req)).operator,
+        sessionId: req.body?.audit?.sessionId,
+        assertEditLease: () => requireDispatchPlanEditLease(req),
+        assertEditable: (/** @type {string[]} */ orderRefs) => assertScmReconciliationOrderEditable({ kind: "SO", orderRefs }) });
+      emitAppEvent("dispatch.orders.updated", { orderId: result.restoredOrder.id, change: "order_unsplit",
+        planId: req.body?.planId, planDate: req.body?.planDate, revision: result.planRevision,
+        retiredGlobalOrderRefs: result.deactivated, reactivatedGlobalOrderRefs: result.reactivatedGlobalOrderRefs,
+        sourceSessionId: req.body?.audit?.sessionId, refreshOrderPool: true });
+      res.json(result);
+      return;
+    }
     await assertScmReconciliationOrderEditable({
       kind: req.body?.orderType,
       orderRefs: [
@@ -18431,6 +18588,7 @@ app.get([
   "/control",
   "/control/returns",
   "/control/order-locks",
+  "/control/order-reopen",
   "/control/item-classification",
   "/control/vendor-mapping",
   "/control/operator-warnings",
@@ -18465,6 +18623,11 @@ app.get("/admin/mbt-gates", (_req, res) => {
   res.sendFile(path.join(publicDir, "mbt-gates.html"));
 });
 
+app.get('/admin/menu-order',(_req,res) => {
+  res.setHeader('Cache-Control','no-store');
+  res.sendFile(path.join(publicDir,'menu-order-admin.html'));
+});
+
 app.get(["/sales", "/sales/returns"], (req, res) => {
   res.sendFile(path.join(publicDir, "sales.html"));
 });
@@ -18475,6 +18638,10 @@ app.get("/sales/stock-requests", (req, res) => {
 
 app.get("/sales/delivery-instructions", (req, res) => {
   res.sendFile(path.join(publicDir, "sales-delivery-instructions.html"));
+});
+app.get(['/sales/delivery-requests','/dispatch/delivery-requests'], (_req,res) => {
+  res.setHeader('Cache-Control','no-store');
+  res.sendFile(path.join(publicDir,'delivery-requests.html'));
 });
 
 app.get("/sales/planning", (req, res) => {
@@ -18543,6 +18710,10 @@ app.get("/dispatch/scm", (req, res) => {
 
 app.get("/scm", (req, res) => {
   res.sendFile(path.join(publicDir, "scm-menu.html"));
+});
+
+app.get(["/scm/stock-check", "/scm/stock-check/test", "/scm/stock-check/history", "/scm/stock-check/setup"], (_req, res) => {
+  res.sendFile(path.join(publicDir, "scm-stock-check.html"));
 });
 
 app.get("/scm/POsplit", (req, res) => {
@@ -18711,7 +18882,7 @@ app.post("/api/auth/login", async (req, res, next) => {
 });
 
 app.get("/api/auth/me", requireOperator, (req, res) => {
-  res.json({ operator: req.operator });
+  res.json({ operator: req.operator, mbrContractsEnabled: config.mbr.enabled });
 });
 
 app.post("/api/auth/logout", requireOperator, async (req, res, next) => {
@@ -18731,6 +18902,7 @@ app.post("/api/auth/logout", requireOperator, async (req, res, next) => {
 
 // Account preferences are independent of the currently selected yard.
 app.use("/api/operator/preferences", requireOperator, requireOperatorAccess, createOperatorPreferencesRouter());
+app.use("/api/operator/phone-layout-policy", requireOperator, requireOperatorAccess, createOperatorPhonePolicyRouter());
 
 app.use("/api/operator", requireOperator, requireOperatorAccess, requireOperatorYardRequest, operatorNetSuitePriority);
 
@@ -19131,6 +19303,21 @@ app.delete("/api/driver/route-push/subscription", requireDriver, async (req, res
       driverLogin: req.driverLogin,
       deviceId,
       endpoint: String(req.body?.endpoint || "").trim()
+    }));
+  } catch (error) {
+    next(error);
+  }
+});
+
+app.post("/api/driver/upload-failures", requireDriver, async (req, res, next) => {
+  try {
+    const deviceId = driverDeviceId(req, { required: true, allowBody: false });
+    res.json(await recordDriverUploadFailure({
+      sessionId: req.driverSession.sessionId,
+      driverLogin: req.driverLogin,
+      deviceId,
+      clientVersion: req.get(DRIVER_PWA_VERSION_HEADER),
+      failure: req.body
     }));
   } catch (error) {
     next(error);
@@ -21506,6 +21693,9 @@ app.post("/api/driver/jobs/:jobId/location-check", requireDriver, async (req, re
 });
 
 app.post("/api/driver/jobs/:jobId/photos", requireDriver, async (req, res, next) => {
+  const trace = traceDriverCompletion({driverLogin: req.driverLogin, deviceId: driverDeviceId(req),
+    jobId: req.params.jobId, requestId: req.body?.requestId, clientVersion: driverRequestClientVersion(req)}, res, writeAudit);
+  res.setHeader("X-MBBS-Request-Id", trace.requestId);
   try {
     const jobContext = await getDriverNextJobContext(req.driverLogin);
     const job = jobContext.job;
@@ -21520,6 +21710,7 @@ app.post("/api/driver/jobs/:jobId/photos", requireDriver, async (req, res, next)
     if (!Number.isFinite(secondsSinceStart) || secondsSinceStart < 10) {
       return res.status(409).json({ error: "Please wait 10 seconds after starting the job before confirming it." });
     }
+    trace.mark("job_validated");
     const verificationId = String(req.body?.locationVerificationId || "").trim();
     const reusedVerification = verificationId
       ? await consumeDriverLocationVerification(verificationId, {
@@ -21540,6 +21731,7 @@ app.post("/api/driver/jobs/:jobId/photos", requireDriver, async (req, res, next)
         locationCheck
       });
     }
+    trace.mark("location_verified");
     const completion = await completeDriverJobOperationalEffects({
       driverLogin: req.driverLogin,
       job,
@@ -21549,6 +21741,7 @@ app.post("/api/driver/jobs/:jobId/photos", requireDriver, async (req, res, next)
       customerSignature: await resolveSorSignature(req.body?.customerSignature, {job}),
       requireCurrentJob: true
     });
+    trace.mark("evidence_committed");
     const {
       record,
       records,
@@ -21653,6 +21846,7 @@ app.post("/api/driver/jobs/:jobId/photos", requireDriver, async (req, res, next)
           job: nextJob
         });
         await startDriverPhysicalVisitJobs(req.driverLogin, nextJob, nextJobContext.jobs || [], { requireCurrentJob: true });
+        trace.mark("next_job_started");
         const startedNextJob = await getNextDriverJob(req.driverLogin);
         nextJob = startedNextJob
           ? { ...startedNextJob, dependencyWarnings: nextDependencyWarnings }
@@ -21680,8 +21874,10 @@ app.post("/api/driver/jobs/:jobId/photos", requireDriver, async (req, res, next)
     const restSummary = await getDriverRestSummary(req.driverLogin, {
       planDate: rest?.planDate || nextJob?.planDate || job?.planDate || ""
     });
-    res.json({ record, records, physicalVisitJobIds: completion.physicalVisitJobIds, nextJob, rest, restSummary, locationCheck, dependencyUpdate, dependencyWarnings, nextStartBlock, completedCustomOrders });
+    trace.mark("response_ready");
+    res.json({ requestId: trace.requestId, record, records, physicalVisitJobIds: completion.physicalVisitJobIds, nextJob, rest, restSummary, locationCheck, dependencyUpdate, dependencyWarnings, nextStartBlock, completedCustomOrders });
   } catch (error) {
+    trace.fail(error);
     next(error);
   }
 });
@@ -22346,6 +22542,35 @@ async function releaseOperatorOrderLock({ orderType, orderId, actorOperatorId })
   emitAppEvent("delivery.order.updated", { orderId, source: "control-lock-release" });
   return result.rows[0];
 }
+
+app.get("/api/control/operator-orders", requireOperator, requireControlAccess, async (req, res, next) => {
+  try {
+    res.setHeader("Cache-Control", "no-store");
+    res.json(await searchOperatorReopenOrders({ search: String(req.query.search || ""), actor: (/** @type {any} */ (req)).operator }));
+  } catch (error) { next(error); }
+});
+
+app.get("/api/control/operator-orders/:orderRef/reopen-preview", requireOperator, requireControlAccess, async (req, res, next) => {
+  try {
+    res.setHeader("Cache-Control", "no-store");
+    res.json(await previewOperatorOrderReopen({ orderRef: req.params.orderRef, actor: (/** @type {any} */ (req)).operator }));
+  } catch (error) { next(error); }
+});
+
+app.post("/api/control/operator-orders/:orderRef/reopen", requireOperator, requireControlAccess, async (req, res, next) => {
+  try {
+    const result = await reopenOperatorOrder({ orderRef: req.params.orderRef, actor: (/** @type {any} */ (req)).operator,
+      expectedStateHash: req.body?.expectedStateHash, requestId: req.body?.requestId, reason: req.body?.reason });
+    await refreshDispatchOrderCatalogRefsNow(result.orderRefs).catch(error => console.error("Reopened order catalog refresh failed:", error.message));
+    for (const orderId of result.orderIds) {
+      emitAppEvent("delivery.order.unpacked", { orderId, operatorId: (/** @type {any} */ (req)).operator.id, source: "control-order-reopen", correctionId: result.correctionId });
+    }
+    emitAppEvent("dispatch.orders.updated", { source: "control-order-reopen", refreshOrderPool: true, orderRefs: result.orderRefs });
+    emitAppEvent("yard.movement.updated", { source: "control-order-reopen", orderRefs: result.orderRefs });
+    res.setHeader("Cache-Control", "no-store");
+    res.json(result);
+  } catch (error) { next(error); }
+});
 
 app.get("/api/control/order-locks", requireOperator, requireControlAccess, async (req, res, next) => {
   try {
@@ -23347,11 +23572,25 @@ app.get("/api/admin/operator-netsuite-posting/attention", requireOperator, requi
     res.setHeader("cache-control", "no-store");
     res.json({
       schemaVersion: "operator-netsuite-posting-attention-v1",
-      commands: await listPublicOperatorNetSuitePostingAttentionCommands()
+      commands: await listPublicOperatorNetSuitePostingAttentionCommands(),
+      transferJobs: await listTransferPostingJobs()
     });
   } catch (error) {
     next(error);
   }
+});
+
+app.post('/api/admin/transfer-order-posting/:id/retry', requireOperator, requireAdmin, async (req,res,next)=>{
+  try {
+    const reason=String(req.body?.reason || '').trim();
+    if(!reason){throw Object.assign(new Error('An audit reason is required to retry transfer posting.'),{status:400});}
+    const job=await withTransaction(async()=>{
+      const result=await retryTransferPostingJob(req.params.id);
+      await writeAudit({actorOperatorId:operatorId(req),source:'admin',action:'transfer_order_posting.retried',details:{jobId:req.params.id,reason}});
+      return result;
+    });
+    res.setHeader('cache-control','no-store');res.json({job});
+  }catch(error){next(error);}
 });
 
 app.post("/api/admin/operator-netsuite-posting/:id/resume", requireOperator, requireAdmin, async (req, res, next) => {
@@ -23531,7 +23770,7 @@ app.post("/api/customer-pickup/lookup", async (req, res, next) => {
       await markMissingOutboundOrderLines(order.id, lines.map((line) => line.line_id));
       orderId = order.id;
     }
-    const detail = await assertOperatorOrderYard(req.operator, orderId);
+    const detail = await assertOperatorOrderYard(req.operator, orderId, { customerPickup: true, destinationLocationId: locationId });
     if (!detail || !isPickupDeliveryMethod(detail.delivery_method)) {
       return res.status(409).json({ error: "This sales order is not a customer pickup order." });
     }
@@ -23548,12 +23787,26 @@ app.post("/api/customer-pickup/lookup", async (req, res, next) => {
   }
 });
 
+app.get("/api/customer-pickup/orders/:id", async (req, res, next) => {
+  try {
+    const detail = await getDeliveryOrder(req.params.id);
+    if (!detail) return res.status(404).json({ error: "Pickup sales order not found." });
+    if (detail.order_type !== "sales_order" || !isPickupDeliveryMethod(detail.delivery_method)) {
+      return res.status(409).json({ error: "This sales order is not a customer pickup order." });
+    }
+    res.setHeader("Cache-Control", "no-store");
+    res.json(scopeCustomerPickupOrderYard(detail, req.operatorYardOrder.pickup_location_id));
+  } catch (error) {
+    next(error);
+  }
+});
+
 app.post("/api/customer-pickup/orders/:id/lines/:lineId/confirm", async (req, res, next) => {
   try {
     await assertOperatorNetSuitePostingOrderMutable({ functionKey: "customer_pickup", orderId: req.params.id, orderType: "sales_order" });
     await confirmCustomerPickupLine(req.params.id, req.params.lineId, req.body || {}, operatorId(req));
     emitAppEvent("delivery.line.confirmed", { orderId: req.params.id, lineId: req.params.lineId, source: "customer-pickup", operatorId: operatorId(req) });
-    res.json(await getDeliveryOrder(req.params.id));
+    res.json(scopeCustomerPickupOrderYard(await getDeliveryOrder(req.params.id), req.operatorYardOrder.pickup_location_id));
   } catch (error) {
     next(error);
   }
@@ -23563,7 +23816,7 @@ app.post("/api/customer-pickup/orders/:id/lines/confirm-page", async (req, res, 
   try {
     await assertOperatorNetSuitePostingOrderMutable({ functionKey: "customer_pickup", orderId: req.params.id, orderType: "sales_order" });
     const result = await confirmCustomerPickupLines(req.params.id, req.body?.lines || [], operatorId(req));
-    const order = await getDeliveryOrder(req.params.id);
+    const order = scopeCustomerPickupOrderYard(await getDeliveryOrder(req.params.id), req.operatorYardOrder.pickup_location_id);
     emitAppEvent("delivery.line.confirmed", {
       orderId: req.params.id,
       count: result.confirmed,
@@ -23580,7 +23833,7 @@ app.post("/api/customer-pickup/orders/:id/lines/confirm-page", async (req, res, 
 app.post("/api/customer-pickup/orders/:id/clear-draft", async (req, res, next) => {
   try {
     await assertOperatorNetSuitePostingOrderMutable({ functionKey: "customer_pickup", orderId: req.params.id, orderType: "sales_order" });
-    const order = await clearCustomerPickupDraft(req.params.id, operatorId(req));
+    const order = await clearCustomerPickupDraft(req.params.id, operatorId(req), { locationId: req.operatorYardOrder.pickup_location_id });
     emitAppEvent("delivery.line.updated", { orderId: req.params.id, source: "customer-pickup-clear", operatorId: operatorId(req) });
     res.json(order);
   } catch (error) {
@@ -23597,14 +23850,15 @@ app.post("/api/customer-pickup/orders/:id/load", async (req, res, next) => {
       functionKey: "customer_pickup",
       orderId: req.params.id,
       orderType: "sales_order",
-      clientLocationId: req.body?.locationId,
+      clientLocationId: req.operatorYardOrder.pickup_location_id,
       photoRefs: photoDataUrls,
       expectedPolicy: req.body?.netSuitePostingPolicy || req.body?.postingPolicy
     });
     const posting = operatorNetSuitePostingHttpResult(admission);
     if (posting) return posting;
     const result = await recordCustomerPickupLoad(req.params.id, operatorId(req), {
-      photoDataUrls
+      photoDataUrls,
+      locationId: req.operatorYardOrder.pickup_location_id
     });
     emitAppEvent("delivery.order.loaded", { orderId: req.params.id, source: "customer-pickup", operatorId: operatorId(req), result });
     return result;
@@ -25166,8 +25420,11 @@ export async function startServer() {
     setTimeout(() => void sorReturnTick(), 7000);
     setInterval(() => void sorReturnTick(), 30000);
     createSpecialExpiryRuntime({emit:requestIds=>emitSpecialStockUpdate('automatic-expiry',{requestIds})}).start();
+    createDeliveryRequestExpiryRuntime({service:deliveryRequestService}).start();
     waitlistRuntime.start();
     fieldSalesRuntime.start();
+    mbrRuntime.start();
+    stockCheckRuntime.start();
     startOperatorNetSuitePostingRuntime();
     deliveryOperationRuntime.start();
     startPostingPhotoWorker();

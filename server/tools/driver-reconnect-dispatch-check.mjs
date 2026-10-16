@@ -1,0 +1,20 @@
+import fs from "node:fs";
+import assert from "node:assert/strict";
+import {spawnSync} from "node:child_process";
+
+const files = fs.readdirSync("test/dispatch/unit").filter(name => name.endsWith(".test.js")).sort().map(name => `test/dispatch/unit/${name}`);
+const result = spawnSync(process.execPath, ["--test", "--test-concurrency=1", ...files], {encoding: "utf8", timeout: 120000, maxBuffer: 16 * 1024 * 1024});
+const log = result.stdout + result.stderr;
+fs.writeFileSync("test-artifacts/final/dispatch-regressions.log", log);
+const failures = text => [...text.matchAll(/^not ok \d+ - (.+)$/gmu)].map(value => value[1]);
+const baselineFailures = failures(fs.readFileSync("test-artifacts/dispatch-baseline/checks.log", "utf8"));
+const currentFailures = failures(log);
+const counts = Object.fromEntries([...log.matchAll(/^# (tests|pass|fail|cancelled|skipped) (\d+)$/gmu)].map(value => [value[1], Number(value[2])]));
+const newFailures = currentFailures.filter(value => !baselineFailures.includes(value));
+const report = {counts, baselineFailures, currentFailures, newFailures, exitCode: result.status};
+fs.writeFileSync("test-artifacts/final/dispatch-regressions.json", JSON.stringify(report, null, 2) + "\n");
+console.log(JSON.stringify(report));
+assert.ok([0, 1].includes(result.status));
+assert.equal(counts.tests, 394);
+assert.equal(counts.fail, currentFailures.length);
+assert.equal(newFailures.length, 0);

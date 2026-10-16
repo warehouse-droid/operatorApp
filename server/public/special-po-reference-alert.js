@@ -1,5 +1,5 @@
 /* global HTMLElement */
-import { poReferenceAlertAudience } from './special-stock-po-reference.js';
+import { poReferenceAlertAudiences } from './special-stock-po-reference.js';
 
 const appWindow=/** @type {Window & Record<string,any>} */ (window);
 const tokenKeys=['mbbs.staff.token','mbbs.dispatch.token','mbbs.control.token','mbbs.operator.token'];
@@ -30,19 +30,30 @@ function validNotice(value) {
   return value && Number.isSafeInteger(value.requestId) && value.requestId>0
     && typeof value.requestRef==='string' && typeof value.displayRef==='string'
     && typeof value.noticeKey==='string' && /^[a-f0-9]{64}$/.test(value.noticeKey)
-    && audiences.includes(value.audience) && poReferenceAlertAudience(value.fulfillmentMethod)===value.audience;
+    && audiences.includes(value.audience) && poReferenceAlertAudiences(value.fulfillmentMethod).includes(value.audience);
+}
+/** @param {string} method */
+function salesInstruction(method) {
+  if(method==='vendor_pickup') return 'Your special order is queued. Contact the customer to arrange pickup at vendor yard.';
+  if(method==='yard_pickup') return 'Your special order is queued for customer pickup at our yard.';
+  return 'Your special order is queued for delivery.';
 }
 function paint() {
+  for(const notice of alerts) {
+    void appWindow.MBBSOSNotifications?.notify({id:`special-po-reference:${notice.audience}:${notice.requestId}:${notice.noticeKey}`,title:'PO Ref received',
+      body:`${notice.requestRef} · ${notice.displayRef} · ${notice.audience==='sales'?salesInstruction(notice.fulfillmentMethod):'Dispatch: arrange pickup or delivery.'}`,
+      url:notice.audience==='sales'?'/sales/stock-requests?tab=special&search='+encodeURIComponent(notice.requestRef):'/dispatch/special-stock',session});
+  }
   if (document.hidden || dialog || !alerts.length || document.querySelector('dialog[open], [role="dialog"][aria-modal="true"]')) return;
   const notice=alerts[0], ownGeneration=generation; shown=notice;
   previousFocus=document.activeElement instanceof HTMLElement ? document.activeElement : null;
   const modal=document.createElement('dialog'); dialog=modal;
-  modal.className='special-po-reference-dialog'; modal.setAttribute('aria-labelledby','special-po-reference-title');
+  modal.className='special-po-reference-dialog';modal.dataset.osNotificationId=`special-po-reference:${notice.audience}:${notice.requestId}:${notice.noticeKey}`; modal.setAttribute('aria-labelledby','special-po-reference-title');
   const title=document.createElement('h2'); title.id='special-po-reference-title'; title.textContent='PO Ref received';
   const reference=document.createElement('p'); reference.className='special-po-reference-value';
   reference.textContent=notice.requestRef+' · '+notice.displayRef;
   const instruction=document.createElement('p');
-  instruction.textContent=notice.audience==='sales' ? 'Contact the customer to arrange pickup at vendor yard.'
+  instruction.textContent=notice.audience==='sales' ? salesInstruction(notice.fulfillmentMethod)
     : `Dispatch: arrange ${notice.fulfillmentMethod==='yard_pickup' ? 'pickup at our yard' : 'delivery'}.`;
   const message=document.createElement('p'); message.setAttribute('role','status');
   const actions=document.createElement('div'); actions.className='special-po-reference-actions';
@@ -77,7 +88,7 @@ function paint() {
 /** @returns {Promise<void>} */
 async function refresh() {
   if (readToken()!==session) return checkSession();
-  if (!audiences.length || document.hidden) return;
+  if (!audiences.length) return;
   if (refreshing) { again=true; return; }
   refreshing=true; const ownGeneration=generation;
   try {

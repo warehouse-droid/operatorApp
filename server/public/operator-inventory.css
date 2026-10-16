@@ -2,7 +2,7 @@
 .inventory-toolbar,.inventory-actions { display:flex;align-items:center;gap:10px;flex-wrap:wrap; }
 .inventory-toolbar { flex:0 0 auto; }
 .inventory-toolbar label { display:grid;gap:4px;font-weight:800; }
-.inventory-toolbar input,.damage-search input,.damage-quantity-panel select { border:2px solid var(--line,#ccd7de);border-radius:8px;padding:10px;min-height:44px;font-size:17px;background:white; }
+.inventory-toolbar input,.damage-search input,.damage-quantity-panel select { border:2px solid var(--line,#ccd7de);border-radius:8px;padding:10px;min-height:44px;font-size:25px;background:white; }
 .damage-search { position:relative;flex:1;min-width:220px;display:grid;gap:4px; }
 .damage-search label { font-weight:800; }
 #damageSuggestions { position:absolute;top:100%;left:0;right:0;z-index:12;max-height:300px;overflow:auto;box-shadow:0 8px 20px #0002;background:white; }
@@ -59,8 +59,8 @@
   .damage-camera-panel,.damage-quantity-panel { padding:6px; }
   .damage-quantity-panel .stepper { grid-template-columns:28px minmax(0,1fr) 28px; }
   .damage-quantity-panel .stepper button { font-size:18px; }
-  .damage-quantity-panel .stepper input { font-size:16px;padding:2px; }
-  .damage-quantity-panel select { font-size:13px;padding:4px;width:100%; }
+  .damage-quantity-panel .stepper input { font-size:25px;padding:2px; }
+  .damage-quantity-panel select { font-size:25px;padding:4px;width:100%; }
   .damage-camera-panel h2,.damage-quantity-panel h2 { font-size:15px; }
   .inventory-workspace .cycle-grid { grid-template-columns:minmax(0,1fr);overflow:auto; }
   .inventory-workspace .cycle-list-panel { max-height:240px; }

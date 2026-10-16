@@ -2,7 +2,6 @@ import { specialRestUnitId } from './special-stock-netsuite-adapter.js';
 /** @typedef {{line:number,remoteLineId:number,itemId:number,closed:boolean,queryOnly?:boolean,queryFingerprint:string|null,quantity?:number|null,unitId?:string|number,rate?:string|null,description?:string}} ClosureLine */
 /** @typedef {Record<string,any>} Raw */
 /** @typedef {{id:number,kind:string}} Identity */
-/** @typedef {Identity & {lines:{remoteLineId:number,itemId:number,quantity:number,unitId?:number,description?:string}[],discountCount?:number}} InputOrder */
 /** @typedef {Identity & {lines:ClosureLine[]}} PreparedOrder */
 /** @typedef {{rest:(path:string,options?:{method?:string,body?:Raw})=>Promise<{data?:Raw}>,queryAll:(sql:string)=>Promise<Raw[]>}} Boundary */
 /** @param {string} message */
@@ -114,22 +113,15 @@ function assertClosureOrders(orders) {
     throw conflict('The exact linked Sales Order and any linked Purchase Order are required.');
   }
 }
-/** @param {{orders:InputOrder[]}} input @param {Boundary} boundary */
+/** @param {{orders:Identity[]}} input @param {Boundary} boundary */
 export async function prepareSpecialClosurePlan({ orders }, boundary) {
   assertClosureOrders(orders);
   const prepared = [];
   for (const order of orders) {
     path(order);
     const lines = await read(order, boundary);
-    const discounts=lines.filter(line=>line.itemId===10716);
-    if (discounts.length !== (order.discountCount || 0) || order.lines.length !== lines.length-discounts.length) throw conflict('The complete NetSuite order must match this request.');
-    for (const expected of order.lines) {
-      const line = lines.find(row => row.remoteLineId === id(expected.remoteLineId));
-      if (!line || line.itemId !== Number(expected.itemId) || (!line.queryOnly && (line.quantity !== Number(expected.quantity)
-        || line.description !== String(expected.description || '') || Number(line.unitId) !== Number(expected.unitId)))) {
-        throw conflict('The exact linked NetSuite lines no longer match this request.');
-      }
-    }
+    // Closing targets the complete current order, including edits made in NetSuite.
+    // The request's saved lines are only historical; they do not define this action.
     prepared.push({ id: id(order.id), kind: order.kind, lines });
   }
   return { version: 1, orders: prepared.sort((a,b) => (a.kind === 'purchase_order' ? 0 : 1) - (b.kind === 'purchase_order' ? 0 : 1)) };

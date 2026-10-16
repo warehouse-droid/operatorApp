@@ -4,6 +4,7 @@ import crypto from "node:crypto";
 
 import { query } from "../db.js";
 import { DISPATCH_FLEET_PLANNING_LOCK } from "../dispatch-fleet-status.js";
+import { assertFrontdeskBinDelivered } from "./frontdesk-bin-readiness.js";
 import { createDispatchCustomOrder } from "../dispatch-custom-order-repository.js";
 import { executeMbtCommand } from "./command-repository.js";
 import {
@@ -4277,6 +4278,7 @@ export async function exchangeFrontdeskServiceLine(input) {
     requestId: requiredText(input.requestId, "Request ID"),
     mutation: async () => {
       const locked = await lockContractServiceLine(contractId, serviceLineId, expectedRevision);
+      await assertFrontdeskBinDelivered(serviceLineId, { lock: true });
       const incomingType = await query(
         `SELECT type.bin_type_id::text, type.type_code, type.display_name,
                 item.item_code AS local_item_code
@@ -4476,6 +4478,7 @@ export async function collectFrontdeskServiceLine(input) {
     requestId: requiredText(input.requestId, "Request ID"),
     mutation: async () => {
       const locked = await lockContractServiceLine(contractId, serviceLineId, expectedRevision);
+      await assertFrontdeskBinDelivered(serviceLineId, { lock: true });
       const returnVisit = await lockReturnVisitForLine(serviceLineId);
       if (locked.lineRow.planned_delivery_at && startAt <= new Date(locked.lineRow.planned_delivery_at)) {
         throw failure(400, "MBT_FRONTDESK_INPUT_INVALID", "The collection window must follow the delivery date.");

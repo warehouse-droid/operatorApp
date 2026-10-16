@@ -82,7 +82,7 @@ export function compactDispatchOrderCard(order = {}) {
     "customer", "customerName", "address", "dropAddress", "destinationAddress", "pickupAddress",
     "pickupAddressOverride", "dispatchDetailsOverride", "sourceAddress", "dropoffLocation", "pickupLocation", "pickupLocations",
     "sourceYard", "destinationYard", "destinationLocationId", "expectedDeliveryDate", "windowStart",
-    "windowEnd", "pallets", "layers", "salesQty", "weight", "totalWeightLbs", "status", "statusText",
+    "windowEnd", "deliveryRequestOriginalWindow", "pallets", "layers", "salesQty", "weight", "totalWeightLbs", "status", "statusText",
     "localDispatchStatus", "dispatchRef", "originalPoRef", "sourcePoRef", "sourcePoRefs",
     "correspondingPoRefs", "originalOrderId", "sourceOrderId",
     "relatedSoId", "childOrders", "groupAliases", "groupPlanId", "groupPlanDate", "planOwned",

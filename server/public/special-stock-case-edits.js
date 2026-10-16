@@ -1,10 +1,11 @@
+import { specialLineFieldValues, changedSpecialLineFields } from './special-stock-line-fields.js';
 /* global HTMLElement */
 import { canAddSpecialItems } from './special-stock-request-actions.js';
 import { normalizeSpecialRate, specialQuantity, specialPalletQuantity, specialLineSubtotal, specialDiscountLineSubtotal } from './special-stock-pricing.js';
 import { savedSpecialDeliveryFee } from './special-stock-delivery-fee.js';
 
-/** @typedef {{lineId:number,productName:string,quantity:number,rate:number,nameChanged:boolean,quantityChanged:boolean,rateChanged:boolean}} CaseLineEdit */
-/** @typedef {{expectedRevision:number,lines:Array<{lineId:number,productName:string,quantity:number|string,rate:number|string}>,decisions:Array<{lineId:number,declined:boolean}>,pallet:{quantity:number|string,rate:number|string|null},deliveryFeeRate?:number|string|null}} CaseEditDraft */
+/** @typedef {{lineId:number,productName:string,quantity:number,rate:number,nameChanged:boolean,quantityChanged:boolean,rateChanged:boolean,fields:Record<string,any>,reviewChanged:boolean}} CaseLineEdit */
+/** @typedef {{expectedRevision:number,lines:Array<{lineId:number,productName:string,quantity:number|string,rate:number|string}&Record<string,any>>,decisions:Array<{lineId:number,declined:boolean}>,pallet:{quantity:number|string,rate:number|string|null},deliveryFeeRate?:number|string|null}} CaseEditDraft */
 
 /** @param {Record<string,any>|null} detail */
 export function canEditSpecialCaseLines(detail) {
@@ -20,7 +21,7 @@ function currentPallet(detail) {
 /** @param {Record<string,any>} detail @returns {CaseEditDraft} */
 export function specialCaseEditDraft(detail) {
   return { expectedRevision: detail.revision,
-    lines: detail.lines.map(/** @param {Record<string,any>} line */ line => ({ lineId: line.id, productName: line.productName,
+    lines: detail.lines.map(/** @param {Record<string,any>} line */ line => ({ ...specialLineFieldValues(line), lineId: line.id, productName: line.productName,
       quantity: line.packageQuantity ?? line.quantity, rate: line.originalRate ?? '' })),
     decisions: detail.lines.map(/** @param {Record<string,any>} line */ line => ({ lineId: line.id, declined: line.salesDecision === 'declined' })),
     pallet: currentPallet(detail),
@@ -37,7 +38,7 @@ export function revokeSpecialLineDecision(line) {
 
 /** @param {Record<string,any>} detail @param {string} derivedStage @returns {string} */
 export function specialCaseStageAfterEdits(detail, derivedStage) {
-  if (['closed', 'completed', 'pending_update'].includes(derivedStage)
+  if (['closed', 'completed', 'pending_update', 'confirmed'].includes(derivedStage)
     || detail.salesOrderId || detail.purchaseOrderId || detail.salesOrderSkipped || detail.purchaseOrderSkipped) return derivedStage;
   const state = detail.lineEditState;
   return state && Number(state.revision) === Number(detail.revision)
@@ -56,7 +57,7 @@ function assertCaseEditTotal(detail, changes, pallet, deliveryFeeRate, taxBps) {
     if (rate == null) continue;
     const quantity = change?.quantity ?? line.packageQuantity ?? line.quantity;
     gross += BigInt(Math.round(specialLineSubtotal(quantity, rate) * 100));
-    net += BigInt(Math.round(specialDiscountLineSubtotal(quantity, rate, line.discountPercent) * 100));
+    net += BigInt(Math.round(specialDiscountLineSubtotal(quantity, rate, change?.fields.discountPercent ?? line.discountPercent) * 100));
   }
   if (pallet.quantity > 0 && pallet.rate != null) {
     const amount = BigInt(Math.round(specialLineSubtotal(pallet.quantity, pallet.rate) * 100)); gross += amount; net += amount;
@@ -98,12 +99,15 @@ export function planSpecialCaseEdits(detail, input, { taxBps = 0 } = {}) {
     }
     const quantity = specialQuantity(value.quantity);
     const nameChanged = productName !== before.productName, quantityChanged = quantity !== Number(before.packageQuantity ?? before.quantity);
-    if (before.originalRate == null && (value.rate == null || value.rate === '') && !nameChanged && !quantityChanged) continue;
+    const fields = changedSpecialLineFields(value, before, { sales: true });
+    delete fields.productName; delete fields.quantity;
+    const reviewChanged = nameChanged || quantityChanged || Object.keys(fields).some(field => !['discountPercent', 'customerNote'].includes(field));
+    if (before.originalRate == null && (value.rate == null || value.rate === '') && !nameChanged && !quantityChanged && !Object.keys(fields).length) continue;
     const rate = normalizeSpecialRate(value.rate);
-    specialLineSubtotal(quantity, rate, before.discountPercent ?? 0);
-    const change = { lineId, productName, quantity, rate, nameChanged, quantityChanged,
+    specialLineSubtotal(quantity, rate, fields.discountPercent ?? before.discountPercent ?? 0);
+    const change = { lineId, productName, quantity, rate, nameChanged, quantityChanged, fields, reviewChanged,
       rateChanged: before.originalRate == null || rate !== Number(before.originalRate) };
-    if (change.nameChanged || change.quantityChanged || change.rateChanged) lines.push(change);
+    if (change.reviewChanged || change.rateChanged || Object.keys(fields).length) lines.push(change);
   }
   /** @type {Array<{lineId:number,declined:boolean}>} */
   const decisions = [];
@@ -117,7 +121,7 @@ export function planSpecialCaseEdits(detail, input, { taxBps = 0 } = {}) {
       if (!Number.isSafeInteger(lineId) || !before || decisionIds.has(lineId)) throw invalid('Each decision must belong to this request exactly once.');
       decisionIds.add(lineId);
       // A material change clears the old review, so retain an explicitly staged decline after that reset.
-      const reviewReset = lines.some(change => change.lineId === lineId && (change.nameChanged || change.quantityChanged));
+      const reviewReset = lines.some(change => change.lineId === lineId && change.reviewChanged);
       if (value.declined === (before.salesDecision === 'declined') && !(value.declined && reviewReset)) continue;
       if (before.salesDecision === 'closed') throw invalid('A closed line cannot be declined or reopened.');
       decisions.push({ lineId, declined: value.declined });
@@ -145,7 +149,7 @@ export function planSpecialCaseEdits(detail, input, { taxBps = 0 } = {}) {
     }
   }
   if (lines.length || pallet || deliveryFeeRate !== undefined) assertCaseEditTotal(detail, lines, pallet || currentPallet(detail), deliveryFeeRate ?? savedFee, taxBps);
-  return { lines, pallet, ...(decisions.length ? { decisions } : {}), ...(deliveryFeeRate !== undefined ? { deliveryFeeRate } : {}), restart: lines.some(change => change.nameChanged || change.quantityChanged) };
+  return { lines, pallet, ...(decisions.length ? { decisions } : {}), ...(deliveryFeeRate !== undefined ? { deliveryFeeRate } : {}), restart: lines.some(change => change.reviewChanged) };
 }
 
 /** @returns {Promise<boolean>} */
@@ -155,7 +159,7 @@ export function confirmSpecialCaseRestart() {
   dialog.setAttribute('aria-labelledby', 'specialCaseRestartTitle');
   dialog.innerHTML = `<div class="special-add-items-warning-icon" aria-hidden="true">!</div>
     <h2 id="specialCaseRestartTitle">Return to New enquiry?</h2>
-    <p>Changing a material name or quantity returns this request to New enquiry. The changed items need a new SCM stock check and customer confirmation.</p>
+    <p>Changing material details, quantity, UOM, required date or packing returns this request to New enquiry. The changed items need a new SCM stock check and customer confirmation.</p>
     <div class="regular-dialog-actions"><button type="button" data-case-edit-cancel>Cancel</button><button type="button" class="primary" data-case-edit-confirm>Save and restart enquiry</button></div>`;
   document.body.append(dialog);
   return new Promise(resolve => {

@@ -4,6 +4,7 @@ import {searchWaitlistPurchaseOrders} from './regular-waitlist-supply.js';
 import {createWaitlistPool,getWaitlistPool,listWaitlistPools,listWaitlistRequests,allocateWaitlistPool,releaseWaitlistAllocation,
   closeWaitlistRequest,rejectWaitlistRequest,claimWaitlistConversion,getWaitlistRequest,getWaitlistConversion,acknowledgeWaitlistPool} from './regular-waitlist-repository.js';
 import {waitlistError} from './regular-waitlist-domain.js';
+import {moveStockingLineToWaitlist} from './regular-stock-waitlist-transition.js';
 
 const route=handler=>async(req,res,next)=>{try{res.setHeader('Cache-Control','private, no-store');await handler(req,res);}catch(error){next(error);}};
 export function mountWaitlistRoutes(app,{salesGuards,scmRead,scmWrite,salesContext,emit,runtime}){
@@ -24,6 +25,11 @@ export function mountWaitlistRoutes(app,{salesGuards,scmRead,scmWrite,salesConte
   app.use('/api/sales/stock-requests/:id/waitlist',sales);
   const scm=Router();scm.use(scmRead);
   const context=req=>({operatorId:req.operator.id});
+  scm.get('/customers',scmWrite,route(async(req,res)=>res.json({customers:await searchSpecialCustomerDirectory(req.query.search)})));
+  scm.post('/stocking-requests/:id/lines/:lineId',scmWrite,route(async(req,res)=>{
+    const result=await moveStockingLineToWaitlist(req.params.id,req.params.lineId,req.body||{},context(req));
+    emit('stocking-line-waitlisted',{requestId:result.request.id,waitlistRequestId:result.waitlistRequest.id});res.status(201).json(result);
+  }));
   scm.get('/purchase-orders',route(async(req,res)=>res.json({purchaseOrders:await searchWaitlistPurchaseOrders(req.query.search)})));
   scm.get('/requests',route(async(req,res)=>res.json({requests:await listWaitlistRequests({search:req.query.search,includeClosed:req.query.includeClosed==='true'})})));
   scm.get('/requests/:id',route(async(req,res)=>res.json(await getWaitlistRequest(req.params.id))));

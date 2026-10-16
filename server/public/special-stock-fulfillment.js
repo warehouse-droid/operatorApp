@@ -1,5 +1,6 @@
 import { canEditSpecialCaseLines } from './special-stock-case-edits.js';
-import { specialSalesInternalRemarkField, specialSalesInternalRemarkForm } from './special-stock-internal-remark.js';
+import { savedSpecialDeliveryFee } from './special-stock-delivery-fee.js';
+import { canEditSpecialSalesInternalRemark, specialSalesInternalRemarkField, specialSalesInternalRemarkForm } from './special-stock-internal-remark.js';
 export { syncSpecialInternalRemarkForm } from './special-stock-internal-remark.js';
 /** @typedef {Record<string, any>} CaseDetail Application API case JSON. */
 /** @param {unknown} value */
@@ -28,15 +29,24 @@ export function normalizeSpecialHeaderNote(value) {
 export function specialFulfillmentEditor(detail, {before='',after=''} = {}) {
   /** @param {string} method */
   const summary = method => `<div class="stock-request-summary">${before}${method}${after}</div>`;
-  const note = `<div class="stock-request-notice"><small>Note</small><div class="special-header-note-content">${escape(detail.remarks || '—')}</div></div>`;
+  const note = canEditSpecialSalesInternalRemark(detail)
+    ? `<form class="stock-request-form" data-special-note-form data-special-header-form>
+      <input type="hidden" name="expectedRevision" value="${escape(detail.revision)}">
+      <label><span>Note</span><textarea name="remarks" rows="4" maxlength="8000">\n${escape(detail.remarks)}</textarea></label>
+      <p class="stock-request-error" data-special-header-conflict hidden>This request changed. Your note is kept. Reload the note before saving.</p>
+      <div class="stock-request-actions"><button type="submit" class="primary">Save note</button><button type="button" data-special-sales-action="reload-note" hidden>Reload note</button></div>
+    </form>`
+    : `<div class="stock-request-notice"><small>Note</small><div class="special-header-note-content">${escape(detail.remarks || '—')}</div></div>`;
   const savedNotes = `<div class="special-request-notes">${note}${specialSalesInternalRemarkForm(detail)}</div>`;
   if(!canEditSpecialFulfillment(detail)) return summary(`<span><small>Delivery method</small><strong>${escape(specialFulfillmentLabel(detail.fulfillmentMethod))}</strong></span>`) + savedNotes;
   const header = canEditSpecialHeader(detail);
   const pending=['applying','attention'].includes(detail.fulfillmentChange?.status),draft=pending?detail.fulfillmentChange.target:detail;
+  const deliveryFeeRate = savedSpecialDeliveryFee(detail);
   return `<form class="stock-request-form special-summary-form" data-special-fulfillment-form ${header ? 'data-special-header-form' : ''}>
     ${header ? `<input type="hidden" name="expectedRevision" value="${escape(detail.revision)}"><p class="stock-request-error" data-special-header-conflict hidden>This request changed. Your header entries are kept. Reload the header before saving.</p>` : ''}
     ${summary(`<span class="special-summary-delivery"><small>Delivery method</small><select name="fulfillmentMethod" aria-label="Delivery method" required ${pending?'disabled':''}>${Object.entries(methods).map(([value,label])=>`<option value="${value}" ${draft.fulfillmentMethod===value?'selected':''}>${label}</option>`).join('')}</select>
       <button type="submit" class="primary" ${pending?'title="Retry the saved delivery update"':''}>${header ? 'Save header' : 'Save'}</button></span>`)}
+    ${header ? '' : '<p class="stock-request-muted">Delivery method can change after SO and PO linking and PO reference updates. SCM and Dispatch are alerted when the method changes. Yard pickup uses the inquired MBBS yard.</p>'}
     ${header ? `<div class="special-request-notes"><label><span>Note</span><textarea name="remarks" rows="4" maxlength="8000">\n${escape(detail.remarks)}</textarea></label>${specialSalesInternalRemarkField(detail)}</div><button type="button" data-special-sales-action="reload-header" hidden>Reload header</button>` : ''}
     ${pending?`<p class="stock-request-error">Delivery update incomplete. Retry the saved change. ${escape(detail.fulfillmentChange.error)}</p>`:''}
     <fieldset class="stock-request-line-fields special-fulfillment-fields" data-special-delivery-fields ${pending?'disabled':''} ${draft.fulfillmentMethod==='mbt_delivery'?'':'hidden'}>
@@ -44,6 +54,7 @@ export function specialFulfillmentEditor(detail, {before='',after=''} = {}) {
       <label><span>Contact name</span><input name="deliveryContactName" value="${escape(draft.deliveryContactName)}"></label>
       <label><span>Contact phone</span><input name="deliveryContactPhone" value="${escape(draft.deliveryContactPhone)}"></label>
       <label><span>Preferred delivery date</span><input type="date" name="deliveryDate" value="${escape(draft.deliveryDate)}"></label>
+      ${header ? `<label><span>Delivery fee rate ($)${deliveryFeeRate == null ? '' : ' *'}</span><input name="deliveryFeeRate" type="number" min="0" max="1000000000" step="0.000001" ${deliveryFeeRate == null ? '' : 'required'} value="${escape(deliveryFeeRate)}"><small>Enter the customer charge. Use 0 for free delivery.</small></label>` : ''}
       <label><span>Window start</span><input type="time" name="windowStart" value="${escape(draft.windowStart)}"></label>
       <label><span>Window end</span><input type="time" name="windowEnd" value="${escape(draft.windowEnd)}"></label>
       <label class="stock-request-wide"><span>Delivery instructions</span><textarea name="deliveryInstructions">${escape(draft.deliveryInstructions)}</textarea></label>
@@ -57,7 +68,7 @@ export function syncSpecialFulfillmentForm(form, revision) {
     const stale = Number(expected.value) !== revision;
     /** @type {HTMLButtonElement} */ (form.querySelector('[type=submit]')).disabled = stale;
     /** @type {HTMLElement} */ (form.querySelector('[data-special-header-conflict]')).hidden = !stale;
-    /** @type {HTMLButtonElement} */ (form.querySelector('[data-special-sales-action=reload-header]')).hidden = !stale;
+    /** @type {HTMLButtonElement} */ (form.querySelector('[data-special-sales-action=reload-header], [data-special-sales-action=reload-note]')).hidden = !stale;
   }
   const select=form.querySelector('select'),fields=/** @type {HTMLElement|null} */(form.querySelector('[data-special-delivery-fields]'));
   if (!select || !fields) return;

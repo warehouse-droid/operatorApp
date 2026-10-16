@@ -1,8 +1,9 @@
 import {deliveryProgress} from './regular-stock-delivery-progress.js';
 import {query,withTransaction} from './db.js';
-import {deliveryRoute,deliveryMaterials,deliveryBaseYard} from './regular-stock-delivery-domain.js';
+import {deliveryRoute,deliveryMaterials,deliveryBaseYard,normalizeDeliveryLineSelection} from './regular-stock-delivery-domain.js';
 import {regularError} from './regular-stock-domain.js';
-import {assertStockRequestDestinationAccess,groupStockRequestLinesForTransfer} from './stock-request-domain.js';
+import {groupStockRequestLinesForTransfer} from './stock-request-domain.js';
+import {assertDeliveryStockRequestDestinationAccess} from './regular-stock-delivery-access.js';
 import {createDeliveryStockRequestFromOrder,calculateDeliveryStockRequest,getScmStockRequest,getSalesStockRequest,recordStockRequestEvent} from './stock-request-repository.js';
 import {refreshStockRequestItemsAvailability} from './stock-request-service.js';
 import {readRegularStockSalesOrderFromNetSuite} from './netsuite.js';
@@ -18,8 +19,8 @@ function requireDelivery(request) {
   if (request.regular?.deliveryVersion !== 1) throw regularError('This request does not use SO-based Delivery.', 'REGULAR_DELIVERY_REQUIRED');
 }
 
-async function existingRequest(order, route, context) {
-  const existing = (await query(`SELECT h.request_id FROM regular_stock_handoffs h
+async function existingRequest(order, route, context, selectedRemoteLineIds) {
+  const existing = (await query(`SELECT h.request_id,h.plan FROM regular_stock_handoffs h
     WHERE h.sales_order_id=$1 OR upper(btrim(h.sales_order_ref))=upper(btrim($2))`, [order.id,order.ref])).rows[0];
   if (!existing) return null;
   const request = await getScmStockRequest(existing.request_id);
@@ -27,18 +28,23 @@ async function existingRequest(order, route, context) {
       || request.regular.sourceLocationId !== route.sourceLocationId || request.destinationLocationId !== route.destinationLocationId) {
     throw regularError('This SO is already linked to another stock request.', 'REGULAR_SO_REUSED');
   }
+  if (selectedRemoteLineIds !== undefined && (selectedRemoteLineIds.length !== existing.plan.materialLineIds.length
+      || selectedRemoteLineIds.some(id => !existing.plan.materialLineIds.includes(id)))) {
+    throw regularError('This SO already has a saved transfer with different selected lines. Open its existing request to check progress.', 'REGULAR_DELIVERY_SELECTION_CONFLICT');
+  }
   return request;
 }
 
 async function saveRequest(order, route, materials, context) {
   return withTransaction(async () => {
     await query('SELECT pg_advisory_xact_lock(hashtextextended($1,0))', [`regular-stock-so:${order.id}`]);
-    const existing = await existingRequest(order,route,context);
+    const existing = await existingRequest(order,route,context,materials.map(line=>line.remoteLineId));
     if (existing) return existing;
     const request = await createDeliveryStockRequestFromOrder(route,materials,context);
     const approval = {automatic:route.automatic,rule:'delivery_yards',sourceName:route.sourceName,destinationName:route.destinationName};
     const details = {deliveryVersion:1,deliveryMethod:'delivery',sourceLocationId:route.sourceLocationId,sourceName:route.sourceName,
       salesOrderId:order.id,salesOrderRef:order.ref,customerId:order.customerId,approval,palletQuantity:request.deliveryCalculation.palletQuantity,
+      selectedRemoteLineIds:materials.map(line=>line.remoteLineId),
       deliveryApproval:route.automatic ? 'approved' : 'pending',approvedAt:route.automatic ? new Date().toISOString() : null};
     await query(`UPDATE sales_stock_requests SET workflow_version=2,regular_details=$2::jsonb,status=$3,
       first_scm_decision_at=CASE WHEN $4 THEN now() ELSE NULL END WHERE id=$1`,
@@ -60,15 +66,16 @@ async function saveRequest(order, route, materials, context) {
 }
 
 export async function submitDeliveryStockRequest(input, context, dependencies = {}) {
-  assertStockRequestDestinationAccess(input.destinationLocationId,context.authorizedDestinationLocationIds);
+  assertDeliveryStockRequestDestinationAccess(input.sourceLocationId,input.destinationLocationId,context.authorizedDestinationLocationIds);
   const route = deliveryRoute(input.sourceLocationId,input.destinationLocationId);
   const ref = reference(input.salesOrderRef);
   if (input.lines !== undefined) throw regularError('Delivery items and quantities come from the Sales Order.', 'REGULAR_DELIVERY_SO_ITEMS', 400);
+  const selection = normalizeDeliveryLineSelection(input.selectedRemoteLineIds);
   await deliveryProgress('checking_so');
   const order = await (dependencies.readOrder || readRegularStockSalesOrderFromNetSuite)(ref);
-  const existing = await existingRequest(order,route,context);
+  const existing = await existingRequest(order,route,context,selection);
   if (existing) return existing.regular.deliveryApproval === 'approved' ? retryDeliveryStockRequest(existing.id,context,dependencies) : existing;
-  const materials = deliveryMaterials(order,route.destinationLocationId);
+  const materials = deliveryMaterials(order,route.destinationLocationId,selection);
   await deliveryProgress('checking_stock');
   await (dependencies.refreshAvailability || refreshStockRequestItemsAvailability)(materials.map(line=>line.itemId));
   await deliveryProgress('calculating');
@@ -80,15 +87,25 @@ export async function previewDeliveryStockRequest(input, context, dependencies =
   await deliveryProgress('checking_so');
   const order = await (dependencies.readOrder || readRegularStockSalesOrderFromNetSuite)(reference(input.salesOrderRef));
   const base = deliveryBaseYard(order);
-  assertStockRequestDestinationAccess(base.locationId,context.authorizedDestinationLocationIds);
-  const materials = deliveryMaterials(order,base.locationId);
-  const result = {salesOrderRef:order.ref,baseLocationId:base.locationId,baseName:base.yardCode};
+  assertDeliveryStockRequestDestinationAccess(input.sourceLocationId,base.locationId,context.authorizedDestinationLocationIds,{preview:true});
+  const candidates = deliveryMaterials(order,base.locationId);
+  const noneSelected = Array.isArray(input.selectedRemoteLineIds) && input.selectedRemoteLineIds.length === 0;
+  const materials = noneSelected ? [] : deliveryMaterials(order,base.locationId,input.selectedRemoteLineIds);
+  const result = {salesOrderRef:order.ref,baseLocationId:base.locationId,baseName:base.yardCode,
+    candidates:candidates.map(line=>({remoteLineId:line.remoteLineId,itemId:line.itemId,itemName:line.itemName || String(line.itemId),
+      quantity:line.quantity,backorderedQuantity:line.backorderedQuantity,uom:line.uom})),selectedRemoteLineIds:materials.map(line=>line.remoteLineId)};
   if (!input.sourceLocationId || [base.locationId,String(base.locationId)].includes(input.sourceLocationId)) return result;
   const route = deliveryRoute(input.sourceLocationId,base.locationId);
+  if (noneSelected) return result;
   await deliveryProgress('checking_stock');
   await (dependencies.refreshAvailability || refreshStockRequestItemsAvailability)(materials.map(line=>line.itemId));
   await deliveryProgress('calculating');
-  return {...result,...await calculateDeliveryStockRequest(route,materials)};
+  try {
+    return {...result,...await calculateDeliveryStockRequest(route,materials)};
+  } catch (error) {
+    if (!['REGULAR_DELIVERY_STOCK_SHORTAGE','REGULAR_DELIVERY_PALLET_CONVERSION'].includes(error.code)) throw error;
+    return {...result,calculationError:error.message,calculationCode:error.code};
+  }
 }
 
 export async function retryDeliveryStockRequest(id, context, dependencies = {}) {

@@ -523,6 +523,9 @@ let deliveryInstructionEditorState = {
   notice: "",
   generation: 0
 };
+let splitStatusLoading = false;
+let splitStatusError = "";
+let splitStatusRequestSequence = 0;
 let splitParts = 2;
 let splitDraft = { orderId: "", parts: 0, items: {} };
 let poAllocationOptions = null;
@@ -642,6 +645,7 @@ const DISPATCH_PLAN_DATE_KEY = "mbbs.dispatch.planDate";
 const sharedPlanningDate = new URLSearchParams(window.location.search).get("planDate") || "";
 let currentPlanDate = /^\d{4}-\d{2}-\d{2}$/.test(sharedPlanningDate)
   ? sharedPlanningDate : dispatchStorageGet(DISPATCH_PLAN_DATE_KEY, "") || todayLocalDate();
+/** @type {any} */
 let currentPlan = null;
 let dispatchPlannerSnapshotState = "loading";
 let dispatchPlannerSnapshotError = "";
@@ -651,6 +655,42 @@ let planEditLeaseToken = "";
 let planEditMode = false;
 let planEditHeartbeatTimer = null;
 let planEditHeartbeatInFlight = false;
+const dispatchEditActivity = window.DispatchEditActivity.create({
+  isEditing: () => hasDispatchEditLeaseCredentials(),
+  onIdle: expireDispatchEditMode,
+  onActivity: () => { void heartbeatDispatchEditLease(); }
+});
+
+function expireDispatchEditMode() {
+  const payload = { planDate: currentPlanDate, sessionId: dispatchSessionId, editLeaseToken: planEditLeaseToken };
+  queueDispatchDraftJournal();
+  leaveDispatchEditMode({ clearLease: true });
+  routeNotice = "Edit Mode ended after 10 minutes without activity. Enter Edit Mode to continue.";
+  render({ save: false });
+  if (payload.editLeaseToken) {
+    void fetch("/api/dispatch/plan-edit-lease/release", {
+      method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(payload), keepalive: true
+    }).catch(() => null);
+  }
+}
+
+async function kickDispatchPlanEditorFromScreen() {
+  const selected = planEditLease;
+  if (!selected?.active || SALES_PLANNING_HOST) {return;}
+  if (!window.confirm(`Kick ${selected.operatorName || "this user"} out of Edit Mode for ${selected.planDate}? Their editing access will end.`)) {return;}
+  const response = await fetch("/api/dispatch/plan-edit-lease/kick", {
+    method: "POST", headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ planDate: selected.planDate, operatorId: selected.operatorId,
+      sessionId: selected.sessionId, acquiredAt: selected.acquiredAt, selectionId: selected.selectionId })
+  });
+  if (!response.ok) {
+    await refreshDispatchPlanEditLease();
+    throw await dispatchLeaseResponseError(response);
+  }
+  await refreshDispatchPlanEditLease();
+  routeNotice = `${selected.operatorName || "The editor"} has been kicked out of Edit Mode.`;
+  render({ save: false });
+}
 
 function dispatchEditModeMessage() {
   const owner = planEditLease?.active ? (planEditLease.operatorName || "another dispatcher") : "";
@@ -680,6 +720,7 @@ function isDispatchPlanEditor() {
     planEditMode
     && hasDispatchEditLeaseCredentials()
     && dispatchEditLeaseIsLocallyActive()
+    && !dispatchEditActivity.isIdle()
   );
 }
 
@@ -848,6 +889,7 @@ function clearPlanEditHeartbeat() {
 
 function leaveDispatchEditMode({ clearLease = false, clearStoredLease = true } = {}) {
   clearPlanEditHeartbeat();
+  dispatchEditActivity.stop();
   planEditMode = false;
   planEditLeaseToken = "";
   if (clearStoredLease) clearStoredDispatchEditLease();
@@ -875,6 +917,7 @@ async function renewDispatchEditLease({
     body: JSON.stringify({
       planDate,
       sessionId: dispatchSessionId,
+      activityAgeMs: dispatchEditActivity.ageMs(),
       editLeaseToken
     })
   });
@@ -904,11 +947,15 @@ async function resumeStoredDispatchEditLease(planDate = currentPlanDate, serverL
   planEditLease = serverLease;
   planEditLeaseToken = stored.editLeaseToken;
   planEditMode = false;
+  dispatchEditActivity.start(Date.parse(serverLease.heartbeatAt || ""));
+  if (dispatchEditActivity.isIdle()) {return false;}
   try {
     const renewed = await renewDispatchEditLease({
       planDate,
       editLeaseToken: stored.editLeaseToken
     });
+    if (planDate !== currentPlanDate || planEditLeaseToken !== stored.editLeaseToken) {return false;}
+    if (dispatchEditActivity.isIdle()) {expireDispatchEditMode(); return false;}
     if (!renewed?.active) throw Object.assign(new Error("The server did not renew the saved edit lease."), { status: 409 });
     planEditLease = renewed;
     planEditMode = true;
@@ -958,10 +1005,14 @@ async function refreshDispatchPlanEditLease(planDate = currentPlanDate) {
 
 async function heartbeatDispatchEditLease() {
   if (!hasDispatchEditLeaseCredentials() || planEditHeartbeatInFlight) return;
+  if (dispatchEditActivity.isIdle()) {expireDispatchEditMode(); return;}
+  const requestedToken = planEditLeaseToken, requestedDate = currentPlanDate;
   planEditHeartbeatInFlight = true;
   try {
     const recovering = !planEditMode;
     const renewed = await renewDispatchEditLease();
+    if (requestedToken !== planEditLeaseToken || requestedDate !== currentPlanDate) {return;}
+    if (dispatchEditActivity.isIdle()) {expireDispatchEditMode(); return;}
     if (!renewed?.active) throw Object.assign(new Error("The server did not renew the edit lease."), { status: 409 });
     planEditLease = renewed;
     planEditMode = true;
@@ -969,6 +1020,7 @@ async function heartbeatDispatchEditLease() {
     if (recovering) routeNotice = "Edit Mode connection restored.";
     if (recovering) render({ save: false });
   } catch (error) {
+    if (requestedToken !== planEditLeaseToken || requestedDate !== currentPlanDate) {return;}
     if (isAuthoritativeDispatchLeaseFailure(error)) {
       leaveDispatchEditMode();
       routeNotice = `Edit Mode ended: ${error.message}`;
@@ -1013,6 +1065,7 @@ async function enterDispatchEditMode() {
   planEditLeaseToken = payload.editLeaseToken || "";
   planEditMode = false;
   if (!hasDispatchEditLeaseCredentials()) {throw new Error("The server did not grant an edit lease.");}
+  dispatchEditActivity.start();
   persistStoredDispatchEditLease();
   startDispatchEditHeartbeat();
   // A maintenance worker may have committed just before lease acquisition.
@@ -2863,28 +2916,18 @@ function movementText(order) {
   return order.address;
 }
 
+/** @param {Record<string, any>} [order] */
 function isReviewOnlyOrder(order = {}) {
-  const localStatus = String(order.localYardOrderStatus || "").toLowerCase();
-  const operatorStatus = String(order.operatorStatus || "").toLowerCase();
-  const fulfillmentStatus = String(order.fulfillmentStatus || order.raw?.fulfillment_status || "").toLowerCase();
-  const statusText = String(order.netsuiteStatusText || order.raw?.status_text || "").toLowerCase();
-  if (["loaded", "shipped", "received"].includes(localStatus)) return true;
-  if (["loaded", "shipped", "received"].includes(operatorStatus)) return true;
-  if (["fulfilled", "shipped", "received", "billed"].includes(fulfillmentStatus)) return true;
-  return statusText.includes("pending billing")
-    || statusText.includes("billed")
-    || statusText.includes("fulfilled")
-    || statusText.includes("received");
+  // Dispatch completion is independent of NetSuite and Operator execution.
+  return order.dispatchPlanningRestricted === true || (order.dispatchCompletionStatus === "completed"
+    && order.dispatchFulfilledSalesPlanningEligible !== true
+    && order.dispatchFulfilledTransferPlanningEligible !== true
+    && order.dispatchReconciliationPlanningEligible !== true);
 }
 
+/** @param {Record<string, any>} [order] */
 function reviewOnlyText(order = {}) {
-  const groupedReconciliationStatus = order.childOrders?.length
-    ? String(order.reconciliationApplicationStatus || "").trim()
-    : "";
-  if (groupedReconciliationStatus) return groupedReconciliationStatus;
-  const localStatus = String(order.localYardOrderStatus || order.operatorStatus || "").trim();
-  const statusText = String(order.netsuiteStatusText || order.raw?.status_text || "").replace(/^(Sales Order|Transfer Order|Purchase Order)\s*:\s*/i, "").trim();
-  return localStatus || statusText || "Review only";
+  return order.dispatchPlanningRestricted === true ? dispatchPlanningRestrictionText(order) : "Delivery completed";
 }
 
 function isScmReconciliationBlocked(order = {}) {
@@ -2936,21 +2979,17 @@ function splitBlockReason(order) {
 
 async function refreshDispatchSplitOrder(order) {
   if (!order) throw new Error("Select an order to split.");
-  // Local groups retain their draft membership. Canonical SO/TO packing status
-  // must be read from the source feed, even when catalog details were hydrated.
   if (!["SO", "TO"].includes(order.type) || order.childOrders?.length) return order;
-  const request = dispatchOrderFeedRequest({ search: order.id });
-  const response = await fetch(request.url, { headers: request.headers, cache: "no-store" });
+  const response = await fetch(`/api/dispatch/orders/${encodeURIComponent(order.id)}/split-preview?type=${encodeURIComponent(order.type)}`, { cache: "no-store" });
   if (!response.ok) throw new Error(await dispatchErrorMessage(response));
-  const feed = await response.json();
-  const fresh = (Array.isArray(feed) ? feed : []).find((candidate) =>
-    String(candidate.id || "").toUpperCase() === String(order.id).toUpperCase()
-  );
-  if (!fresh || typeof fresh.operatorStatus !== "string") {
+  const fresh = await response.json();
+  if (String(fresh?.id || "").toUpperCase() !== String(order.id).toUpperCase() || typeof fresh.operatorStatus !== "string") {
     throw new Error(`${order.id} current packing status could not be verified. Refresh Orders and try again.`);
   }
-  mergeDispatchOrderSearchFeed([fresh]);
-  return orderById(order.id);
+  const oldItems = new Map((order.items || []).map((/** @type {any} */ item, /** @type {number} */ index) => [splitItemKey(item, index), item]));
+  return { ...order, ...fresh, items: (fresh.items || order.items || []).map((/** @type {any} */ item, /** @type {number} */ index) => ({
+    ...(oldItems.get(splitItemKey(item, index)) || {}), ...item
+  })) };
 }
 
 function normalizeText(value) {
@@ -3282,7 +3321,8 @@ function flattenDispatchGroupMembers(order = {}) {
     for (const childId of childIds) {
       const detail = detailById.get(childId) || {
         id: childId,
-        type: canonicalDispatchOrderType(fallbackType === "CO" ? "" : fallbackType, childId)
+        type: canonicalDispatchOrderType(fallbackType === "CO" ? "" : fallbackType, childId),
+        catalogHydrated: false
       };
       const preserveDirectCo = canonicalDispatchOrderType(order.type, order.id) === "CO"
         && canonicalDispatchOrderType(detail.type, detail.id) === "CO"
@@ -3438,6 +3478,9 @@ function effectiveOrderPalletQuantity(order = {}, items = [], childOrderDetails 
     return Number(order.pallets || 0);
   }
   if (Array.isArray(childOrderDetails) && childOrderDetails.length) {
+    if (childOrderDetails.some((child) => child.catalogHydrated === false && !child.items?.length)) {
+      return Number(order.pallets || 0);
+    }
     return Number(childOrderDetails.reduce((sum, child) => {
       const specialPallets = specialOrderPalletItemQuantity(child.items || []);
       return sum + (child.specialPalletTotal ?? specialPallets ?? Number(child.pallets || 0));
@@ -3557,7 +3600,7 @@ function normalizeOrder(order) {
     ? order.pickupLocations
     : order.sourceYard
       ? [order.sourceYard]
-      : type === "SO"
+      : type === "SO" && order.catalogHydrated !== false
         ? ["3445"]
         : [];
   const pickupLocations = activeTransitPickupLocations({ ...order, directPickupManifest }, basePickupLocations);
@@ -7799,6 +7842,8 @@ async function loadPlanHistory() {
 
 async function createPlanForDate(planDate = currentPlanDate) {
   if (!ensureDispatchPlanEditor()) throw new Error(dispatchEditModeMessage());
+  const requestedDate = currentPlanDate;
+  const requestedGeneration = localPlanGeneration;
   const response = await fetch("/api/dispatch/plans", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
@@ -7811,6 +7856,20 @@ async function createPlanForDate(planDate = currentPlanDate) {
   });
   if (!response.ok) throw new Error(await response.text());
   const plan = await response.json();
+  if (currentPlanDate !== requestedDate || localPlanGeneration !== requestedGeneration) {
+    throw new Error("The plan changed while opening it. Your draft has been retained.");
+  }
+  if (!plan?.id || plan.planDate !== planDate || !Array.isArray(plan.orders) || !Array.isArray(plan.trucks)) {
+    throw new Error("The server did not return a valid Dispatch plan for the selected date.");
+  }
+  const hasSavedPlan = Number(plan.revision) > 0 || plan.orders.length > 0 || plan.trucks.length > 0;
+  if (hasSavedPlan && localPlanDirty) {
+    throw new Error("A saved plan already exists for this date. Your draft has been retained. Reload the saved plan before applying these changes.");
+  }
+  if (hasSavedPlan) {
+    applyDispatchPlanSnapshotResult({ exists: true, plan: { ...plan, assignedOrderSnapshots: plan.orders } });
+    resetUndoHistory();
+  }
   currentPlan = compactCurrentPlan(plan);
   currentPlanDate = plan.planDate || planDate;
   dispatchStorageSet(DISPATCH_PLAN_DATE_KEY, currentPlanDate);
@@ -8057,16 +8116,17 @@ async function runQueuedDispatchOrderPoolRefresh() {
     return;
   }
   orderPoolRefreshInFlight = true;
-  const reason = orderPoolRefreshReason;
   const splitOrderTarget = modalType === "split" ? orderById(modalOrderId) : null;
   try {
     void loadExecutedOrderReviews({ force: true });
     if (!await loadDispatchOrders()) throw new Error("the order feed request failed");
     if (splitOrderTarget) {
-      await refreshDispatchSplitOrder(splitOrderTarget);
-      if (modalType === "split" && modalOrderId === splitOrderTarget.id) renderDispatchModalInPlace();
+      const fresh = await refreshDispatchSplitOrder(splitOrderTarget);
+      if (modalType === "split" && modalOrderId === splitOrderTarget.id && !splitStatusLoading) {
+        mergeDispatchOrderSearchFeed([fresh]);
+        renderDispatchModalInPlace();
+      }
     }
-    if (reason) routeNotice = reason;
     renderDispatchNoticePatch();
     renderDispatchOrderPoolPatch();
     if (modalType === "to-link") {
@@ -8217,6 +8277,13 @@ function connectEvents() {
       return;
     }
 
+    if (event.type === "dispatch.orders.updated" && payload.change === "order_unsplit") {
+      for (const ref of Array.isArray(payload.reactivatedGlobalOrderRefs) ? payload.reactivatedGlobalOrderRefs : []) {
+        setAuthoritativeOrderRetirement(ref, false);
+        applyTargetedDispatchOrderUpdate(ref).catch(() => null);
+      }
+    }
+
     if (
       event.type === "dispatch.orders.updated"
       && Array.isArray(payload.retiredGlobalOrderRefs)
@@ -8235,6 +8302,7 @@ function connectEvents() {
       "delivery.line.updated",
       "dispatch.operator_request.created",
       "dispatch.orders.updated",
+      "delivery.requests.updated",
       "receiving.order.received"
     ].includes(event.type)) {
       queueDispatchOrderPoolRefresh(
@@ -8401,7 +8469,7 @@ function openOrders() {
         : activeOrderType === "SO"
           ? order.type === "SO" || isSalesOrderReattempt(order)
           : order.type === activeOrderType;
-  });
+  }).sort((left,right) => Number(right.deliveryApprovalPriority === true) - Number(left.deliveryApprovalPriority === true));
 }
 
 function matchesSearch(order) {
@@ -11414,6 +11482,7 @@ function planModeControlHtml() {
   const historicalPlan = isHistoricalDispatchPlanDate(currentPlanDate);
   return `
     <span class="dispatch-mode-pill viewing">${lockedByOther ? `${owner} editing` : historicalPlan ? "History view" : "View mode"}</span>
+    ${lockedByOther ? `<button data-action="kick-plan-editor" type="button">Kick out ${owner}</button>` : ""}
     <button class="primary" data-action="enter-edit-mode" type="button" ${lockedByOther || dispatchPlannerSnapshotState !== "ready" ? `disabled title="${lockedByOther ? `${owner} is already editing this plan` : "Wait for the current snapshot to load"}"` : ""}>${historicalPlan ? "Enter History Edit" : "Enter Edit Mode"}</button>
   `;
 }
@@ -11570,10 +11639,11 @@ async function loadExecutedOrderReviews({ force = false } = {}) {
   executedOrderReviewPlanId = planId;
   executedOrderReviewLoadedAt = Date.now();
   try {
-    const response = await fetch(`/api/dispatch/plans/${encodeURIComponent(planId)}/executed-order-reviews`);
+    const response = await fetch(`/api/dispatch/plans/${encodeURIComponent(planId)}/executed-order-reviews?baseRevision=${encodeURIComponent(currentPlan.revision || 0)}`);
     if (!response.ok) {throw new Error(`Review information could not be loaded (${response.status}).`);}
     const payload = await response.json();
     if (String(currentPlan?.id || "") !== planId) {return;}
+    if (payload.orders && !saveInFlight && !confirmInFlight) {applyDispatchSourceDecisionResult(payload);}
     executedOrderReviews = Array.isArray(payload.reviews) ? payload.reviews : [];
     executedOrderReviewError = "";
   } catch (error) {
@@ -11583,20 +11653,59 @@ async function loadExecutedOrderReviews({ force = false } = {}) {
   renderDispatchNoticePatch();
 }
 
-async function confirmExecutedOrderReview(token) {
+function applyDispatchSourceDecisionResult(payload) {
+  const fields = ["items", "address", "destinationAddress", "dropAddress", "sourceYard", "sourceAddress",
+    "pickupLocations", "destinationYard", "destinationLocationId", "toLocation", "pallets", "layers",
+    "sections", "pieces", "salesQty", "weight", "committedQty", "salesQuantities"];
+  const selected = new Set((payload.orderRefs || []).map(value => String(value).toUpperCase()));
+  const replacements = new Map((payload.orders || []).map(order => [order.id, order]));
+  function patch(existing, replacement, root = false) {
+    if (!replacement) {return existing;}
+    const affected = root || selected.has(String(existing.id).toUpperCase())
+      || (existing.childOrderDetails || []).some(child => selected.has(String(child.id).toUpperCase()));
+    if (!affected) {return existing;}
+    const result = { ...existing };
+    for (const field of fields) {
+      if (Object.hasOwn(replacement, field)) {result[field] = structuredClone(replacement[field]);}
+    }
+    if (existing.childOrderDetails?.length) {
+      result.childOrderDetails = existing.childOrderDetails.map(child => patch(child,
+        replacement.childOrderDetails?.find(candidate => candidate.id === child.id)));
+    }
+    return result;
+  }
+  orders = orders.map(order => patch(order, replacements.get(order.id), true));
+  orderCatalog = orderCatalog.map(order => patch(order, replacements.get(order.id), true));
+  if (payload.plan?.safeToAdvanceRevision !== false && String(payload.plan?.id || "") === String(currentPlan?.id || "")) {
+    Object.assign(currentPlan, payload.plan);
+    currentPlan.orders = (currentPlan.orders || []).map(order => replacements.get(order.id) || order);
+  }
+  rememberAssignedOrderEvidence(orders);
+  return orders;
+}
+
+async function confirmExecutedOrderReview(token, decision = "") {
   const planId = String(currentPlan?.id || "");
-  const review = executedOrderReviews.find(item => item.token === token && !item.acknowledged);
+  const review = executedOrderReviews.find(item => item.token === token && (!item.acknowledged || item.decisionRequired));
   if (!review || executedOrderReviewPlanId !== planId || executedOrderReviewConfirming) {return;}
+  if (saveInFlight || confirmInFlight) {
+    executedOrderReviewError = "Wait for the current plan save to finish before confirming this choice.";
+    renderDispatchNoticePatch();
+    return;
+  }
+  confirmInFlight = true;
   executedOrderReviewConfirming = token;
   renderDispatchNoticePatch();
   try {
     const response = await fetch(`/api/dispatch/plans/${encodeURIComponent(planId)}/executed-order-reviews`, {
       method: "POST", headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(dispatchLeaseRequestPayload({ tokens: [token], confirm: true, sessionId: dispatchSessionId }))
+      body: JSON.stringify(dispatchLeaseRequestPayload({ tokens: [token], confirm: true, sessionId: dispatchSessionId,
+        ...(decision ? { decision, baseRevision: currentPlan.revision } : {}) }))
     });
     const payload = await response.json();
     if (!response.ok) {throw new Error(payload.error || "The source update could not be confirmed.");}
     if (String(currentPlan?.id || "") !== planId) {return;}
+    if (payload.orders) {applyDispatchSourceDecisionResult(payload);}
     executedOrderReviews = payload.reviews || [];
     executedOrderReviewError = "";
   } catch (error) {
@@ -11605,8 +11714,9 @@ async function confirmExecutedOrderReview(token) {
       executedOrderReviewError = error.message;
     }
   } finally {
+    confirmInFlight = false;
     executedOrderReviewConfirming = "";
-    renderDispatchNoticePatch();
+    render({ save: false });
   }
 }
 
@@ -11621,7 +11731,7 @@ function readDismissedExecutedOrderReviews() {
 
 function visibleExecutedOrderReviewHistory() {
   if (executedOrderReviewPlanId !== String(currentPlan?.id || "")) return [];
-  return executedOrderReviews.filter(review => review.acknowledged
+  return executedOrderReviews.filter(review => review.notifyDispatcher !== false && review.acknowledged && !review.decisionRequired
     && !dismissedExecutedOrderReviews.has(`${executedOrderReviewPlanId}:${review.token}`));
 }
 
@@ -11634,17 +11744,36 @@ function dismissExecutedOrderReviewHistory() {
   dispatchStorageSet(DISMISSED_SOURCE_REVIEWS_KEY, JSON.stringify(stored));
 }
 
+function formatSourceReviewTime(value) {
+  const date = new Date(value);
+  if (!value || !Number.isFinite(date.getTime())) {return "";}
+  return date.toLocaleString("en-CA", { timeZone: "America/Toronto", dateStyle: "medium", timeStyle: "medium" });
+}
+
 function renderExecutedOrderReviews() {
   if (executedOrderReviewPlanId !== String(currentPlan?.id || "")) {return "";}
-  const pending = executedOrderReviews.filter(review => !review.acknowledged);
+  const pending = executedOrderReviews.filter(review => {
+    if (review.acknowledged && !review.decisionRequired || review.notifyDispatcher === false) return false;
+    // Older responses remain readable during rollback; current responses carry eligibility.
+    if (review.notifyDispatcher !== true) return true;
+    const refs = new Set([review.orderRef, review.groupRef].filter(Boolean).map(value => String(value).trim().toUpperCase()));
+    return trucks.some(truck => (truck.loads || []).some((/** @type {any} */ load) => (load.stops || []).some((/** @type {any} */ stop) =>
+      ["pick", "pickup", "drop", "dropoff", "delivery", "return", "yard", "bin_delivery", "bin_exchange", "bin_collection"].includes(stop.type)
+      && [stop.orderId, stop.orderRef, ...(stop.orderRefs || [])].some(ref => refs.has(String(ref || "").trim().toUpperCase())))));
+  });
   const warnings = pending.map(review => {
     const context = [...new Set((review.contexts || []).map(item => `${item.driverName || item.driverLogin}, ${item.truckPlate}, ${item.loadName}, ${item.stopType || "stop"} ${item.stopId}`))].join("; ");
     const request = review.replanRequested ? "re-plan requested" : "review needed";
     const guidance = review.replanRequested ? " Review the affected remaining work and re-plan where needed." : "";
-    return `<details data-executed-source-review data-review-token="${escapeHtml(review.token)}" ${executedOrderReviewExpanded.has(review.token) ? "open" : ""}><summary><strong>${escapeHtml(review.orderRef)}${review.groupRef ? ` (${escapeHtml(review.groupRef)})` : ""}: source update — ${request}</strong></summary><p>${escapeHtml(context)}</p><ul>${(review.changes || []).map(change => `<li>${escapeHtml(change.message || "Source details updated")}</li>`).join("")}</ul><p>Source updates and planning saves continue.${guidance} Confirm that you have reviewed these changes. Recorded driver work and photos are retained.</p><button type="button" data-action="confirm-executed-source-update" data-review-token="${escapeHtml(review.token)}" ${!dispatchEditLeaseIsLocallyActive() || executedOrderReviewConfirming || review.sourceAvailable === false ? "disabled" : ""}>${executedOrderReviewConfirming === review.token ? "Confirming…" : "Confirm updated information"}</button>${!dispatchEditLeaseIsLocallyActive() ? "<span> Enter Edit Mode to confirm.</span>" : ""}${review.sourceAvailable === false ? "<p>The current source record is unavailable. Refresh source data to review its latest information.</p>" : ""}</details>`;
+    const disabled = !dispatchEditLeaseIsLocallyActive() || executedOrderReviewConfirming || review.sourceAvailable === false ? "disabled" : "";
+    const timestamps = review.sourceModifiedAt ? `<p>NetSuite changed: ${escapeHtml(formatSourceReviewTime(review.sourceModifiedAt))} (Toronto time).${review.sourceReceivedAt ? ` Received: ${escapeHtml(formatSourceReviewTime(review.sourceReceivedAt))}.` : ""}</p>` : "";
+    if (review.decision === "accept_netsuite_change" && !review.acknowledged) {
+      return `<details data-executed-source-review data-review-token="${escapeHtml(review.token)}" ${executedOrderReviewExpanded.has(review.token) ? "open" : ""}><summary><strong>${escapeHtml(review.orderRef)}${review.groupRef ? ` (${escapeHtml(review.groupRef)})` : ""}: NetSuite change accepted — dispatch acknowledgement needed</strong></summary><p>${escapeHtml(context)}</p>${timestamps}<ul>${(review.noticeChanges || review.changes || []).map(change => `<li>${escapeHtml(change.message || "Source details updated")}</li>`).join("")}</ul><p>The change arrived before driver work started and was accepted automatically. Recorded driver work and photos are retained. Acknowledge that dispatch has reviewed the change.</p><button type="button" data-action="confirm-executed-source-update" data-review-token="${escapeHtml(review.token)}" ${disabled}>${executedOrderReviewConfirming === review.token ? "Confirming…" : "Acknowledge change"}</button>${!dispatchEditLeaseIsLocallyActive() ? "<span> Enter Edit Mode to acknowledge.</span>" : ""}</details>`;
+    }
+    return `<details data-executed-source-review data-review-token="${escapeHtml(review.token)}" ${executedOrderReviewExpanded.has(review.token) ? "open" : ""}><summary><strong>${escapeHtml(review.orderRef)}${review.groupRef ? ` (${escapeHtml(review.groupRef)})` : ""}: source update — ${request}</strong></summary><p>${escapeHtml(context)}</p>${timestamps}<ul>${(review.noticeChanges || review.changes || []).map(change => `<li>${escapeHtml(change.message || "Source details updated")}</li>`).join("")}</ul><p>Source updates and planning saves continue.${guidance} Protect driver work to keep the saved order details, or accept the NetSuite change to apply the displayed source details. Recorded driver work and photos are retained with either choice.</p><div class="dispatch-draft-actions"><button type="button" data-action="protect-executed-source-update" data-review-decision="protect_driver_work" data-review-token="${escapeHtml(review.token)}" ${disabled}>Protect driver work</button><button type="button" data-action="confirm-executed-source-update" data-review-decision="accept_netsuite_change" data-review-token="${escapeHtml(review.token)}" ${disabled}>${executedOrderReviewConfirming === review.token ? "Confirming…" : "Accept NetSuite change"}</button></div>${!dispatchEditLeaseIsLocallyActive() ? "<span> Enter Edit Mode to confirm.</span>" : ""}${review.sourceAvailable === false ? "<p>The current source record is unavailable. Refresh source data to review its latest information.</p>" : ""}</details>`;
   }).join("");
   const confirmed = visibleExecutedOrderReviewHistory();
-  const history = confirmed.length ? `<details><summary>${confirmed.length} source update${confirmed.length === 1 ? "" : "s"} reviewed</summary>${confirmed.map(review => `<p><strong>${escapeHtml(review.orderRef)}</strong> — ${escapeHtml(review.acknowledgedBy || "Dispatcher")}: ${(review.changes || []).map(change => escapeHtml(change.message || "")).join("; ")}</p>`).join("")}</details>` : "";
+  const history = confirmed.length ? `<details><summary>${confirmed.length} source update${confirmed.length === 1 ? "" : "s"} reviewed</summary>${confirmed.map(review => `<p><strong>${escapeHtml(review.orderRef)}</strong> — ${escapeHtml(review.acknowledgedBy || "Dispatcher")}${review.decision ? `: ${review.decision === "protect_driver_work" ? "Driver work protected" : "NetSuite change accepted"}` : ""}: ${(review.noticeChanges || review.changes || []).map(change => escapeHtml(change.message || "")).join("; ")}</p>`).join("")}</details>` : "";
   return `${executedOrderReviewError ? `<p role="alert">${escapeHtml(executedOrderReviewError)}</p>` : ""}${pending.length ? "<p>Source changes need review. You can continue planning and saving.</p>" : ""}${warnings}${history}`;
 }
 
@@ -12056,17 +12185,21 @@ function renderSelectedOrderActions() {
   }
   const groupedCount = order.childOrders?.length || 0;
   const reviewOnly = selected.some((item) => isReviewOnlyOrder(item));
+  const billingOnly = selected.every((item) => item.type === "SO"
+    && /^(?:Sales Order\s*:\s*)?Billed$/i.test(String(item.netsuiteStatusText || item.raw?.status_text || "").trim()));
   const reconciliationBlocked = selected.some((item) => isScmReconciliationBlocked(item));
   const blockedUngroup = groupedCount && groupedOrderTransitCoId(order);
   const dispatchCompleted = order.dispatchCompletionStatus === "completed"
     && order.dispatchReconciliationPlanningEligible !== true
+    && (order.dispatchPlanningRestricted === true || order.dispatchFulfilledSalesPlanningEligible !== true)
     && order.dispatchFulfilledTransferPlanningEligible !== true;
   const transitCoSupported = selected.length === 1 && supportsTransitCoForOrder(order);
   return `
     <div class="selected-order-actions">
       <span>${escapeHtml(label)}</span>
       ${dispatchCompleted ? `<span class="chip">Dispatch completed ${escapeHtml(displayDateTime(order.dispatchCompletedAt || ""))}</span>` : ""}
-      ${reviewOnly ? `<span>Loaded/shipped history</span>` : ""}
+      ${billingOnly ? `<span>Billed in NetSuite</span>` : reviewOnly ? `<span>Delivery history</span>` : ""}
+      ${order.localOrderReopened === true && !reviewOnly ? `<span>Reopened locally</span>` : ""}
       ${reconciliationBlocked ? `<span class="chip warn">${escapeHtml(scmReconciliationBlockText(selected.find(isScmReconciliationBlocked)))}</span>` : ""}
       ${reconciliationBlocked ? "" : groupedCount ? `<button data-action="ungroup-order" data-order-ref="${escapeHtml(order.id)}" ${blockedUngroup ? `disabled title="Cancel ${escapeHtml(blockedUngroup)} before ungrouping"` : ""} type="button">Ungroup</button>` : selected.length > 1 && !includesCustomOrder ? `<button data-action="open-group-modal" data-order-ref="${escapeHtml(order.id)}" type="button">Group</button>` : ""}
       ${blockedUngroup ? `<span>Cancel ${escapeHtml(blockedUngroup)} before ungrouping</span>` : ""}
@@ -12075,10 +12208,9 @@ function renderSelectedOrderActions() {
       ${!reviewOnly && !reconciliationBlocked && order.type === "PO" && order.sourceTable !== "scm_vrma_orders" ? `<button data-action="open-po-yard-modal" data-order-ref="${escapeHtml(order.id)}" type="button">Set Yard</button>` : ""}
       ${!reviewOnly && order.type === "SO" ? `<button data-action="open-po-link-modal" data-order-ref="${escapeHtml(order.id)}" type="button">Link PO</button>` : ""}
       ${!reviewOnly && order.type === "SO" ? `<button data-action="open-to-link-modal" data-order-ref="${escapeHtml(order.id)}" type="button">Link TO</button>` : ""}
-      ${!reviewOnly && !reconciliationBlocked && !["CO", "CUSTOM"].includes(order.type) && order.sourceTable !== "scm_vrma_orders" && !order.originalOrderId ? `<button data-action="open-split-modal" data-order-ref="${escapeHtml(order.id)}" ${groupedCount ? 'disabled title="Ungroup first, then split the child order"' : ""} type="button">Split</button>` : ""}
+      ${!reviewOnly && !reconciliationBlocked && !["CO", "CUSTOM"].includes(order.type) && order.sourceTable !== "scm_vrma_orders" && (!order.originalOrderId || order.type === "SO") ? `<button data-action="open-split-modal" data-order-ref="${escapeHtml(order.id)}" ${groupedCount ? 'disabled title="Ungroup first, then split the child order"' : ""} type="button">Split</button>` : ""}
       ${!reviewOnly && !reconciliationBlocked && order.type !== "CUSTOM" && order.originalOrderId ? `<button data-action="unsplit-order" data-order-ref="${escapeHtml(order.id)}" type="button">Unsplit</button>` : ""}
       ${!reviewOnly && canConsolidatePick(order) ? `<button data-action="open-consolidate-modal" data-order-ref="${escapeHtml(order.id)}" ${groupedCount ? 'disabled title="Ungroup first, then consolidate the child order that needs stock"' : ""} type="button">Consolidate Pick</button>` : ""}
-      ${!SALES_PLANNING_HOST && !dispatchCompleted && !reviewOnly && !reconciliationBlocked && !groupedCount && selected.length === 1 && dispatchCompletionOrderKind(order) ? `<button data-action="manual-complete-order" data-order-ref="${escapeHtml(order.id)}" type="button" title="Use only when the Driver physically completed this order but forgot to submit the PWA stop">Mark completed</button>` : ""}
     </div>
   `;
 }
@@ -12125,10 +12257,11 @@ function renderOrderCard(order, assignments = null) {
   const reconciliationBlocked = isScmReconciliationBlocked(order);
   const dispatchCompleted = order.dispatchCompletionStatus === "completed"
     && order.dispatchReconciliationPlanningEligible !== true
+    && (order.dispatchPlanningRestricted === true || order.dispatchFulfilledSalesPlanningEligible !== true)
     && order.dispatchFulfilledTransferPlanningEligible !== true;
   const planningRestricted = isDispatchPlanningRestricted(order);
   const reconciliationPlanningEligible = order.dispatchReconciliationPlanningEligible === true;
-  const fulfilledDeliveryPlanningEligible = !planningRestricted && (
+  const fulfilledDeliveryPlanningEligible = !order.localOrderReopened && !planningRestricted && (
     (order.type === "SO" && order.dispatchFulfilledSalesPlanningEligible === true)
     || (order.type === "TO" && order.dispatchFulfilledTransferPlanningEligible === true));
   const dragBlocked = anyPlanned || dependencyLinked || reconciliationBlocked || planningRestricted;
@@ -12140,8 +12273,9 @@ function renderOrderCard(order, assignments = null) {
     : orderPlannedElsewhereText(order);
   const poReferenceText = poSourceReferenceText(order);
   return `
-    <article class="order-card status-${executionStatus} ${selectedOrderIds.has(order.id) ? "selected" : ""} ${planned ? "planned" : ""} ${plannedElsewhere ? "planned-elsewhere" : ""} ${dependencyLinked && !dependencyParentPlanned ? "dependency-linked" : ""} ${dependencyParentPlanned ? "dependency-parent-planned" : ""} ${reviewOnly ? "review-only" : ""} ${planningRestricted ? "search-only" : ""} ${reconciliationBlocked || planningRestricted || missingAddress || transitBlocked || order.dependencyAttention ? "warning" : ""}" draggable="${dragBlocked ? "false" : "true"}" data-order="${escapeHtml(order.id)}" data-planned="${anyPlanned ? "true" : "false"}" data-dependency-linked="${dependencyLinked ? "true" : "false"}" data-review-only="${reviewOnly ? "true" : "false"}" data-reconciliation-blocked="${reconciliationBlocked ? "true" : "false"}" data-planning-restricted="${planningRestricted ? "true" : "false"}" data-planned-elsewhere="${plannedElsewhere ? "true" : "false"}">
+    <article class="order-card status-${executionStatus} ${order.deliveryApprovalPriority === true ? "delivery-secured" : ""} ${selectedOrderIds.has(order.id) ? "selected" : ""} ${planned ? "planned" : ""} ${plannedElsewhere ? "planned-elsewhere" : ""} ${dependencyLinked && !dependencyParentPlanned ? "dependency-linked" : ""} ${dependencyParentPlanned ? "dependency-parent-planned" : ""} ${reviewOnly ? "review-only" : ""} ${planningRestricted ? "search-only" : ""} ${reconciliationBlocked || planningRestricted || missingAddress || transitBlocked || order.dependencyAttention ? "warning" : ""}" draggable="${dragBlocked ? "false" : "true"}" data-order="${escapeHtml(order.id)}" data-planned="${anyPlanned ? "true" : "false"}" data-dependency-linked="${dependencyLinked ? "true" : "false"}" data-review-only="${reviewOnly ? "true" : "false"}" data-reconciliation-blocked="${reconciliationBlocked ? "true" : "false"}" data-planning-restricted="${planningRestricted ? "true" : "false"}" data-planned-elsewhere="${plannedElsewhere ? "true" : "false"}">
       <strong>${escapeHtml(order.id)} | ${escapeHtml(order.customer)}</strong>
+      ${order.deliveryApprovalPriority === true ? '<span class="chip secured-chip">Secured</span>' : ""}
       ${globalThis.MbbsBinPlanning?.cardActions(order) || ""}
       ${poReferenceText ? `<span class="order-compact-line po-source-reference">${escapeHtml(poReferenceText)}</span>` : ""}
       <span>${plannedElsewhere ? escapeHtml(orderPlannedElsewhereText(order)) : missingAddress ? "Missing delivery address" : transitBlocked ? escapeHtml(transitMessage) : escapeHtml(movementText(order))}</span>
@@ -12155,8 +12289,9 @@ function renderOrderCard(order, assignments = null) {
         ${order.historicalReconciliationComplete ? `<span class="chip history-chip">Reconciliation history</span>` : ""}
         ${executionStatus === "complete" ? `<span class="chip complete-chip">Completed</span>` : executionStatus === "in_progress" ? `<span class="chip progress-chip">In progress</span>` : ""}
         ${reviewOnly ? `<span class="chip complete-chip">${escapeHtml(reviewOnlyText(order))}</span>` : ""}
+        ${order.localOrderReopened === true && !planningRestricted ? `<span class="chip">${escapeHtml(order.localYardOrderStatus || "Open")} locally</span>` : ""}
         ${planningRestricted ? `<span class="chip ${dispatchCompleted ? "complete-chip" : "warn"}" title="${escapeHtml(dispatchPlanningRestrictionText(order))}">${dispatchCompleted ? "Completed · search only" : "Planning restricted"}</span>` : ""}
-        ${fulfilledDeliveryPlanningEligible ? `<span class="chip complete-chip" title="NetSuite fulfillment is complete; Driver delivery is still pending.">Completed · delivery pending</span>` : ""}
+        ${fulfilledDeliveryPlanningEligible ? `<span class="chip complete-chip" title="Driver delivery is still pending.">Delivery pending</span>` : ""}
         ${reconciliationPlanningEligible ? `<span class="chip warn" title="${escapeHtml(order.dispatchReconciliationPlanningReason || "Receipt reconciliation is complete, but Driver delivery is still pending.")}">Reconciled · dispatch pending</span>` : ""}
         ${reconciliationBlocked ? `<span class="chip warn" title="${escapeHtml(scmReconciliationBlockText(order))}">Reconcile Review</span>` : ""}
         ${anyPlanned ? `<span class="chip planned-chip">${escapeHtml(plannedText)}</span>` : ""}
@@ -14337,6 +14472,15 @@ function renderModal() {
     `;
   }
   if (modalType === "split") {
+    if (splitStatusLoading || splitStatusError) {
+      return `<div class="modal-backdrop show"><section class="dispatch-modal">
+        <div class="modal-header"><div><h2>Split Order</h2><p>${escapeHtml(order.id)}</p></div>
+          <button data-action="close-modal" type="button">Close</button></div>
+        <div class="modal-body"><div data-split-status-loading role="status">${escapeHtml(splitStatusError || "Checking current packing status…")}</div></div>
+        <div class="modal-footer"><button data-action="close-modal" type="button">Cancel</button>
+          <button class="primary" data-action="confirm-split" data-order="${escapeHtml(order.id)}" disabled type="button">Create Split Orders</button></div>
+      </section></div>`;
+    }
     const blockReason = splitBlockReason(order);
     if (blockReason) {
       return `
@@ -14985,6 +15129,39 @@ function prepareUnsplitOrder(splitOrderId) {
   };
 }
 
+/** @param {any} order @param {any} button */
+async function unsplitSelectedSalesOrder(order, button) {
+  const planId = String(currentPlan?.id || ""), planDate = currentPlanDate;
+  button.disabled = true;
+  try {
+    const saved = await saveCurrentPlanNow();
+    if (saved?.recoverySaved || String(currentPlan?.id || "") !== planId || currentPlanDate !== planDate) {
+      throw new Error("The current plan changed. Refresh before using Unsplit.");
+    }
+    const response = await fetch("/api/dispatch/split-orders/unsplit", {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ orderRef: order.id, orderType: "SO", planId, planDate,
+        editLeaseToken: planEditLeaseToken, audit: { sessionId: dispatchSessionId } })
+    });
+    if (!response.ok) throw new Error(await dispatchErrorMessage(response));
+    const result = await response.json();
+    if (!result.restoredOrder?.id || !result.deactivated?.includes(order.id)) {
+      throw new Error("The Unsplit result could not be verified. Refresh Orders.");
+    }
+    result.deactivated.forEach(queueGlobalOrderRetirement);
+    if (result.restoredOrder.originalOrderId) queueGlobalOrderReactivation(result.restoredOrder.id);
+    const siblings = orders.filter(item => result.deactivated.includes(item.id));
+    applyUnsplitOrder({ parent: result.restoredOrder, siblings, siblingIds: result.deactivated,
+      before: siblings.map(summarizeOrder), firstIndex: orders.findIndex(item => result.deactivated.includes(item.id)) });
+    currentPlan.revision = result.planRevision ?? currentPlan.revision;
+    currentPlan.digest = result.planDigest || currentPlan.digest;
+    requestTargetedOrderPoolRefresh([result.restoredOrder.id]);
+    commitPlanMutation("unsplit_order");
+  } finally {
+    button.disabled = false;
+  }
+}
+
 function applyUnsplitOrder(prepared) {
   if (!prepared?.parent || !prepared?.siblingIds?.length) return false;
   const siblingIds = new Set(prepared.siblingIds);
@@ -15336,6 +15513,39 @@ function groupedOrderTransitCoId(order) {
     || String(item.relatedToId || "") === String(order.id || "")
   ));
   return relatedCo?.id || "";
+}
+
+async function ungroupOrderWithPoCheck(orderId) {
+  const grouped = orderById(orderId);
+  if (!grouped?.childOrders?.length) return false;
+  try {
+    const refreshRefs = [...grouped.childOrders];
+    if (grouped.type === "SO" || grouped.childOrderDetails?.some((child) => child.type === "SO")) {
+      await saveCurrentPlanNow();
+      const params = new URLSearchParams({ planDate: currentPlanDate });
+      const response = await fetch(`/api/dispatch/orders/${encodeURIComponent(orderId)}/po-allocations?${params}`);
+      if (!response.ok) throw new Error(await dispatchErrorMessage(response));
+      const allocations = (await response.json()).allocations || [];
+      const purchaseRefs = [...new Set(allocations.map((allocation) => allocation.poOrderRef).filter(Boolean))];
+      refreshRefs.push(...purchaseRefs);
+      if (allocations.length && !confirm(`Ungroup ${orderId}?\n\nThis group has ${allocations.length} PO allocation${allocations.length === 1 ? "" : "s"}${purchaseRefs.length ? ` linked to ${purchaseRefs.join(", ")}` : ""}. Ungrouping will remove all of these PO allocations.\n\nContinue?`)) {
+        return false;
+      }
+    }
+    const restored = ungroupOrder(orderId);
+    if (!restored) {
+      render({ save: false });
+      return false;
+    }
+    queueGlobalOrderRetirement(orderId);
+    requestTargetedOrderPoolRefresh(refreshRefs);
+    commitPlanMutation("ungroup_order");
+    return true;
+  } catch (error) {
+    routeNotice = `Unable to check PO allocations for ${orderId}: ${error.message}`;
+    render({ save: false });
+    return false;
+  }
 }
 
 function ungroupOrder(orderId) {
@@ -16238,6 +16448,9 @@ app.addEventListener("toggle", (event) => {
 app.addEventListener("click", async (event) => {
   if (event.target.dataset?.action === "close-modal") {
     resetActiveLinkModalState();
+    splitStatusRequestSequence += 1;
+    splitStatusLoading = false;
+    splitStatusError = "";
     modalType = "";
     modalOrderId = "";
     modalLoadId = "";
@@ -16401,13 +16614,20 @@ app.addEventListener("click", async (event) => {
     });
     return;
   }
-  if (action === "confirm-executed-source-update") {
-    void confirmExecutedOrderReview(button.dataset.reviewToken);
+  if (["confirm-executed-source-update", "protect-executed-source-update"].includes(action)) {
+    void confirmExecutedOrderReview(button.dataset.reviewToken, button.dataset.reviewDecision);
     return;
   }
   if (action === "enter-edit-mode") {
     enterDispatchEditMode().catch((error) => {
       routeNotice = `Cannot enter Edit Mode: ${error.message}`;
+      render({ save: false });
+    });
+    return;
+  }
+  if (action === "kick-plan-editor") {
+    kickDispatchPlanEditorFromScreen().catch((error) => {
+      routeNotice = `Cannot kick out editor: ${error.message}`;
       render({ save: false });
     });
     return;
@@ -16604,19 +16824,18 @@ app.addEventListener("click", async (event) => {
     return;
   }
   if (action === "ungroup-order") {
-    const grouped = orderById(actionOrderId);
-    const refreshRefs = [...(grouped?.childOrders || [])];
-    const restored = ungroupOrder(actionOrderId);
-    if (!restored) {
-      render({ save: false });
-      return;
-    }
-    queueGlobalOrderRetirement(actionOrderId);
-    requestTargetedOrderPoolRefresh(refreshRefs);
-    commitPlanMutation("ungroup_order");
+    await ungroupOrderWithPoCheck(actionOrderId);
     return;
   }
   if (action === "unsplit-order") {
+    const order = orderById(actionOrderId);
+    if (order?.type === "SO") {
+      unsplitSelectedSalesOrder(order, button).catch((error) => {
+        routeNotice = `Unsplit failed: ${error.message}`;
+        render({ save: false });
+      });
+      return;
+    }
     const prepared = prepareUnsplitOrder(actionOrderId);
     if (!prepared) {
       render({ save: false });
@@ -16651,23 +16870,33 @@ app.addEventListener("click", async (event) => {
   if (action === "open-split-modal") {
     const requestedPlanDate = currentPlanDate;
     const requestedSelection = selectedOrderId;
-    button.disabled = true;
-    let splitOrderTarget;
-    try {
-      splitOrderTarget = await refreshDispatchSplitOrder(orderById(actionOrderId));
-    } catch (error) {
-      routeNotice = `Split status check failed: ${error.message}`;
-      renderDispatchNoticePatch();
-      return;
-    } finally {
-      button.disabled = false;
-    }
-    if (currentPlanDate !== requestedPlanDate || selectedOrderId !== requestedSelection || !splitOrderTarget) return;
-    modalType = "split";
-    modalOrderId = actionOrderId;
-    splitParts = Math.max(2, Math.ceil((orderFootprintPallets(splitOrderTarget) || 2) / 10));
-    ensureSplitDraft(splitOrderTarget, true);
+    const requestSequence = ++splitStatusRequestSequence;
+    splitStatusLoading = true;
+    splitStatusError = "";
+    modalType = "split"; modalOrderId = actionOrderId;
     renderDispatchModalInPlace();
+    try {
+      const splitOrderTarget = await refreshDispatchSplitOrder(orderById(actionOrderId));
+      if (requestSequence !== splitStatusRequestSequence || currentPlanDate !== requestedPlanDate
+          || selectedOrderId !== requestedSelection || modalType !== "split" || modalOrderId !== actionOrderId) return;
+      mergeDispatchOrderSearchFeed([splitOrderTarget]);
+      splitParts = Math.max(2, Math.ceil((orderFootprintPallets(splitOrderTarget) || 2) / 10));
+      ensureSplitDraft(splitOrderTarget, true);
+    } catch (error) {
+      if (requestSequence === splitStatusRequestSequence) {
+        splitStatusError = `Split status check failed: ${error instanceof Error ? error.message : String(error)}`;
+      }
+    } finally {
+      if (requestSequence === splitStatusRequestSequence) {
+        splitStatusLoading = false;
+        if (modalType === "split" && modalOrderId === actionOrderId) {
+          if (currentPlanDate !== requestedPlanDate || selectedOrderId !== requestedSelection) {
+            modalType = ""; modalOrderId = "";
+          }
+          renderDispatchModalInPlace();
+        }
+      }
+    }
     return;
   }
   if (action === "open-consolidate-modal") {
@@ -16879,7 +17108,37 @@ app.addEventListener("click", async (event) => {
     return;
   }
   if (action === "confirm-split") {
+    if (splitStatusLoading || splitStatusError) return;
     const order = orderById(button.dataset.order);
+    if (order?.type === "SO" && splitParentOrderId(order)) {
+      button.disabled = true;
+      try {
+        const parts = Array.from({ length: splitParts }, (_value, index) => splitTotalsForPart(order, index));
+        const response = await fetch("/api/dispatch/split-orders/resplit", {
+          method: "POST", headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ orderRef: order.id, planId: currentPlan?.id, planDate: currentPlanDate,
+            editLeaseToken: planEditLeaseToken, expectedItems: order.items, parts, audit: { sessionId: dispatchSessionId } })
+        });
+        if (!response.ok) { throw new Error(await dispatchErrorMessage(response)); }
+        const result = await response.json();
+        orders = orders.filter(candidate => candidate.id !== order.id);
+        orders.push(...result.orders.map(normalizeOrder));
+        result.retiredGlobalOrderRefs.forEach(queueGlobalOrderRetirement);
+        requestTargetedOrderPoolRefresh([order.id, ...result.orders.map((/** @type {any} */ candidate) => candidate.id)]);
+        currentPlan.revision = result.planRevision ?? currentPlan.revision;
+        selectedOrderId = result.orders[0].id;
+        selectedOrderIds = new Set([selectedOrderId]);
+        modalType = ""; modalOrderId = "";
+        routeNotice = `${order.id} split into ${result.orders.map((/** @type {any} */ candidate) => candidate.id).join(", ")}. Completed siblings retained.`;
+        commitPlanMutation("split_order");
+      } catch (error) {
+        routeNotice = `Split failed: ${error instanceof Error ? error.message : String(error)}`;
+        renderDispatchNoticePatch();
+      } finally {
+        button.disabled = false;
+      }
+      return;
+    }
     const before = summarizeOrder(order);
     fetch(`/api/dispatch/orders/${encodeURIComponent(button.dataset.order)}/split-seed?type=${encodeURIComponent(order?.type || "")}`)
       .then((response) => {

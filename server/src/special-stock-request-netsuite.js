@@ -11,6 +11,14 @@ function remoteError(message, code, status = 409) {
   return Object.assign(new Error(message), { code, status, specialStockAttention: true });
 }
 
+/** @param {any} error */
+export function isDefinitiveSpecialOrderRejection(error) {
+  return Boolean(error?.netsuiteResponseReceived === true
+    && [400, 401, 403, 404, 422].includes(Number(error.status))
+    && Array.isArray(error.netsuiteErrorCodes)
+    && !error.netsuiteErrorCodes.some(/** @param {string} code */ code => /DUP|EXIST/i.test(code)));
+}
+
 function reference(id) {
   return { id: String(id) };
 }
@@ -52,7 +60,8 @@ export function buildSpecialSalesOrderPayload({
   subsidiaryId = null,
   deliveryMethodId = null,
   pickupMethodId = null,
-  discountMode = 'total'
+  discountMode = 'total',
+  preserveZeroDeliveryFees = false
 } = {}) {
   const marker = specialSalesOrderMarker(caseId);
   const delivery = draft?.fulfillmentMethod === "mbt_delivery";
@@ -71,6 +80,7 @@ export function buildSpecialSalesOrderPayload({
     : "";
   const payload = {
     externalId: marker,
+    toBeEmailed: false,
     entity: reference(draft.customerId),
     location: reference(netsuiteLocationId),
     custbody3: reference(deliveryMethod),
@@ -83,7 +93,8 @@ export function buildSpecialSalesOrderPayload({
           return discount && discountMode === 'line' ? [material, { item: reference(10716), price: reference(-1), location: reference(netsuiteLocationId),
             rate: specialDiscountLineAmount(material.quantity, material.rate, discount) }] : [material];
         }),
-        ...(draft.ancillaryLines || []).map(line => itemPayload(line, { netsuiteLocationId }))
+        ...(draft.ancillaryLines || []).filter(line => preserveZeroDeliveryFees || Number(line.itemId) !== 1987 || Number(line.rate) !== 0)
+          .map(line => itemPayload(line, { netsuiteLocationId }))
       ]
     }
   };
@@ -96,9 +107,10 @@ export function buildSpecialSalesOrderPayload({
     throw remoteError("The Special Item Sales Order has no lines.", "SPECIAL_REMOTE_PAYLOAD_INVALID", 400);
   }
   if (subsidiaryId) payload.subsidiary = reference(subsidiaryId);
+  const orderNotes = [instructions, String(draft?.remarks || "").trim()].filter(Boolean).join("\n\n");
+  if (orderNotes) payload.custbody7 = orderNotes;
   if (delivery) {
     if (draft.deliveryDate) payload.custbody4 = draft.deliveryDate;
-    payload.custbody7 = instructions;
     // `shipAddress` is the rendered summary returned by NetSuite. A custom
     // transaction address is written through the shippingAddress subrecord.
     payload.shipOverride = true;
@@ -110,13 +122,14 @@ export function buildSpecialSalesOrderPayload({
   return payload;
 }
 
-/** @param {{caseId?:number,vendorId?:number,netsuiteLocationId?:number,subsidiaryId?:string|number|null,salesOrderRef?:string|null,lines?:any[],vendorDiscountReview?:any}} input */
+/** @param {{caseId?:number,vendorId?:number,netsuiteLocationId?:number,subsidiaryId?:string|number|null,salesOrderRef?:string|null,remarks?:string|null,lines?:any[],vendorDiscountReview?:any}} input */
 export function buildSpecialPurchaseOrderPayload({
   caseId,
   vendorId,
   netsuiteLocationId,
   subsidiaryId = null,
   salesOrderRef = '',
+  remarks = '',
   lines = [],
   vendorDiscountReview = null
 } = {}) {
@@ -133,6 +146,7 @@ export function buildSpecialPurchaseOrderPayload({
   }
   /** @type {Record<string,any>} */
   const payload = {
+    toBeEmailed: false,
     entity: reference(vendorId),
     location: reference(netsuiteLocationId),
     externalId: marker,
@@ -141,7 +155,8 @@ export function buildSpecialPurchaseOrderPayload({
   };
   if (subsidiaryId) payload.subsidiary = reference(subsidiaryId);
   const salesOrderNumber = String(salesOrderRef || '').trim();
-  if (salesOrderNumber) payload.custbody7 = `for ${salesOrderNumber}`;
+  const orderNotes = [salesOrderNumber ? `for ${salesOrderNumber}` : "", String(remarks || "").trim()].filter(Boolean).join("\n\n");
+  if (orderNotes) payload.custbody7 = orderNotes;
   return payload;
 }
 

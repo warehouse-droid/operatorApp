@@ -58,7 +58,8 @@ function snapshotLine(line, row) {
     rate: percentage === null ? String(Number(line.rate)) : `${Number((percentage * 100).toPrecision(12))}%`,
     description: String(line.description || ''), locationId: line.location?.id ? id(line.location.id) : null,
     taxCode: String(line.taxCode?.id || ''), createdPoId: line.createdPo?.id ? id(line.createdPo.id) : null,
-    createPo: String(line.createPo?.id ?? line.createPo ?? '') };
+    createPo: String(line.createPo?.id ?? line.createPo ?? ''),
+    ...(Number(line.item.id) === 2055 ? { pack: Object.fromEntries(Object.entries(SPECIAL_PACK_FIELDS).map(([field, native]) => [field, Number(line[native] ?? 0)])) } : {}) };
 }
 /** @param {Identity} order @param {Transport} transport @returns {Promise<{record:Raw,snapshot:Snapshot}>} */
 export async function readSpecialRestOrder(order, { rest, queryAll }) {
@@ -120,7 +121,11 @@ function assertAllowedChange(order) {
     }
     const mutableRate = sales ? [2055, 10716].includes(before.itemId) : before.itemId === 4981;
     const mutableQuantity = before.itemId === 2055 || (sales && before.itemId === 1784);
-    if (immutable.some(field => before[field] !== after[field]) || (!mutableRate && before.rate !== after.rate)
+    const reviewed = before.itemId === 2055 ? order.reviewedFields?.find(line => line.remoteLineId === before.remoteLineId) : null;
+    const allowedDescription = reviewed?.description ?? before.description;
+    const allowedPack = { ...before.pack, ...reviewed?.pack };
+    if (after.description !== allowedDescription || Object.keys(SPECIAL_PACK_FIELDS).some(field => Number(after.pack?.[field] ?? 0) !== Number(allowedPack[field] ?? 0))
+      || immutable.some(field => field !== 'description' && before[field] !== after[field]) || (!mutableRate && before.rate !== after.rate)
       || (!mutableQuantity && before.quantity !== after.quantity)) throw conflict('Unreviewed fields and PO costs must remain unchanged.');
   }
   for (const [index, line] of target.lines.entries()) {
@@ -161,6 +166,10 @@ function itemPayload(line, source, sales) {
     /** @type {Raw} */
     const payload = { line: Number(source.line) };
     if (line.quantity !== null) payload.quantity = line.quantity;
+    if (line.description !== String(source.description || '')) payload.description = line.description;
+    for (const [field, native] of Object.entries(SPECIAL_PACK_FIELDS)) {
+      if (line.pack && Number(line.pack[field] ?? 0) !== Number(source[native] ?? 0)) payload[native] = line.pack[field] ?? 0;
+    }
     if (!line.rate.endsWith('%') && (Number(source.rate) !== Number(line.rate) || line.itemId === 10716)) {
       payload.rate = Number(line.rate);
       if (sales) payload.price = ref(-1);
@@ -228,9 +237,9 @@ export async function verifySpecialRestSalesOrder(orderId, payload, transport) {
     || (payload.discountItem && Number(payload.discountRate) !== Number(current.header.discountRate))
     || current.header.entity !== String(payload.entity.id) || current.header.location !== String(payload.location.id)
     || current.lines.length !== expected.length || expected.some((line, index) => {
-      const actual = current.lines[index], itemId = Number(line.item.id);
+      const actual = current.lines[index], itemId = Number(line.item.id), unit = specialRestUnitId(line.units);
       return Object.values(SPECIAL_PACK_FIELDS).some(field => line[field] != null && Number(record.item.items[index][field] ?? 0) !== Number(line[field]))
         || actual.itemId !== itemId || actual.rate !== String(line.rate)
-        || (itemId !== 10716 && (actual.quantity !== line.quantity || actual.unitId !== Number(line.units) || actual.description !== line.description));
+        || (itemId !== 10716 && (actual.quantity !== line.quantity || actual.unitId !== (unit == null ? null : Number(unit)) || actual.description !== line.description));
     })) throw Object.assign(Error('The existing SO does not match the reviewed items, quantities, UOM, prices and discount amounts.'), { status: 409, code: 'SPECIAL_SO_PRICE_CONFLICT' });
 }

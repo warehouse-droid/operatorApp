@@ -40,7 +40,7 @@ import { getOperatorNetSuitePostingPolicy } from "./operator-netsuite-posting-po
 import { assertExpectedOperatorNetSuitePostingPolicy } from "./operator-netsuite-posting-policy.js";
 import { confirmedReturnPolicy, remainingPalletReservation, verifyReturnAuthorizationSnapshot } from "./return-ra-workflow.js";
 import { admitReturnBatchAuthorization, findReturnBatchAuthorization, synchronizeReturnBatchAuthorization,
-  assertSharedReturnCanVoid } from "./return-batch-ra-service.js";
+  assertSharedReturnCanVoid, returnBatchTransactionType, reconcileMissingPalletCreditMemos } from "./return-batch-ra-service.js";
 import { assertReturnDraftMutable, stageReturnBatchRecords, retainFailedReturnDraft } from "./return-submission-draft.js";
 
 export const RETURN_YARDS = Object.freeze([
@@ -308,31 +308,44 @@ export async function updateReturnYardSettings(locationId, input = {}, {
 export async function localPalletReserved(customerId, observedExternalIds = [], observedTransactionIds = [], linkedCredits = []) {
   const result = await query(
     `SELECT r.pallet_quantity, r.workflow_version, a.batch_id AS shared_batch_id,
+            COALESCE(a.intent_snapshot->>'transactionType',r.netsuite_stage) AS transaction_type,
+            COALESCE(a.external_id,r.external_id) AS external_id,
             COALESCE(a.netsuite_transaction_id,r.netsuite_transaction_id) AS netsuite_transaction_id
        FROM return_records r
        LEFT JOIN return_batch_authorizations a ON a.batch_id=r.batch_id
       WHERE r.record_type = 'pallet'
         AND r.customer_id = $1
         AND r.status NOT IN ('rejected', 'voided')
+        AND COALESCE(a.sync_status,r.netsuite_sync_status,'') <> 'cancelled'
         AND (a.batch_id IS NOT NULL OR r.workflow_version = 2 OR (
           NOT (r.external_id = ANY($2::text[]))
           AND (r.netsuite_transaction_id IS NULL
             OR NOT (r.netsuite_transaction_id = ANY($3::bigint[])))
         ))
       UNION ALL
-      SELECT (line->>'returnedSalesQuantity')::numeric,3,a.batch_id,a.netsuite_transaction_id
+      SELECT (line->>'returnedSalesQuantity')::numeric,3,a.batch_id,
+        COALESCE(a.intent_snapshot->>'transactionType','return_authorization'),a.external_id,a.netsuite_transaction_id
       FROM return_batch_authorizations a CROSS JOIN LATERAL jsonb_array_elements(a.intent_snapshot->'lines') line
-      WHERE a.draft_id IS NOT NULL AND a.intent_snapshot->>'customerId'=$1::text AND line->>'kind'='pallet'`,
+      WHERE a.draft_id IS NOT NULL AND a.intent_snapshot->>'customerId'=$1::text AND line->>'kind'='pallet'
+        AND a.sync_status <> 'cancelled'`,
     [
       customerId,
       observedExternalIds.map(String).filter(Boolean),
       observedTransactionIds.map(Number).filter((id) => Number.isSafeInteger(id) && id > 0)
     ]
   );
-  return result.rows.reduce((total, row) => total + (row.shared_batch_id || Number(row.workflow_version) === 2
+  const observedIds = new Set(observedTransactionIds.map(Number));
+  const observedExternal = new Set(observedExternalIds.map(String));
+  return result.rows.reduce((total, row) => {
+    if (row.transaction_type === "credit_memo") {
+      const observed = observedIds.has(Number(row.netsuite_transaction_id)) || observedExternal.has(row.external_id);
+      return total + (observed ? 0 : Number(row.pallet_quantity));
+    }
+    return total + (row.shared_batch_id || Number(row.workflow_version) === 2
     ? remainingPalletReservation({ palletQuantity: row.pallet_quantity,
       netSuiteTransactionId: row.netsuite_transaction_id }, linkedCredits, observedTransactionIds)
-    : Number(row.pallet_quantity)), 0);
+    : Number(row.pallet_quantity));
+  }, 0);
 }
 
 export async function localStockReserved(sourceLineIds = [], observedExternalIds = [], observedTransactionIds = [], observedReturns = new Map()) {
@@ -348,6 +361,7 @@ export async function localStockReserved(sourceLineIds = [], observedExternalIds
         AND a.batch_id IS NULL
         AND l.approval_status = ANY($2::text[])
         AND r.status NOT IN ('rejected', 'voided')
+        AND COALESCE(r.netsuite_sync_status,'') <> 'cancelled'
         AND NOT (COALESCE(a.external_id,r.external_id) = ANY($3::text[]))
         AND (
           COALESCE(a.netsuite_transaction_id,r.netsuite_transaction_id) IS NULL
@@ -368,12 +382,14 @@ export async function localStockReserved(sourceLineIds = [], observedExternalIds
     JOIN return_batch_authorizations a ON a.batch_id=r.batch_id
     WHERE l.source_sales_order_line_id=ANY($1::bigint[]) AND l.approval_status=ANY($2::text[])
       AND r.status NOT IN ('rejected','voided')
+      AND a.sync_status <> 'cancelled'
     GROUP BY r.id,l.source_sales_order_line_id,a.netsuite_transaction_id,a.external_id
     UNION ALL
     SELECT (line->>'sourceSalesOrderLineId')::bigint,a.netsuite_transaction_id,a.external_id,
       SUM((line->>'returnedSalesQuantity')::numeric)
     FROM return_batch_authorizations a CROSS JOIN LATERAL jsonb_array_elements(a.intent_snapshot->'lines') line
     WHERE a.draft_id IS NOT NULL AND line->>'kind'='stock'
+      AND a.sync_status <> 'cancelled'
       AND (line->>'sourceSalesOrderLineId')::bigint=ANY($1::bigint[])
     GROUP BY a.batch_id,line->>'sourceSalesOrderLineId',a.netsuite_transaction_id,a.external_id`, [lineIds, RESERVING_APPROVAL_STATUSES]);
   for (const row of shared.rows) {
@@ -399,20 +415,23 @@ async function returnPolicies(itemIds = []) {
   return new Map(result.rows.map((row) => [String(row.item_id), row]));
 }
 
-async function customerPalletBalance(customer, remoteBalance = null, { force = false } = {}) {
+async function customerPalletBalance(customer, remoteBalance = null, { force = true } = {}) {
   const customerId = customer.id || customer.internalId;
   const remote = remoteBalance || await fetchPalletBalanceFromNetSuite(
     customerId,
     { force }
   );
+  await reconcileMissingPalletCreditMemos(customerId, remote);
   const authorizations = await query(
     `SELECT COALESCE(a.netsuite_transaction_id,r.netsuite_transaction_id) AS netsuite_transaction_id
        FROM return_records r LEFT JOIN return_batch_authorizations a ON a.batch_id=r.batch_id
       WHERE r.customer_id = $1 AND r.record_type = 'pallet' AND (a.batch_id IS NOT NULL OR r.workflow_version = 2)
+        AND COALESCE(a.intent_snapshot->>'transactionType',r.netsuite_stage,'return_authorization') <> 'credit_memo'
         AND r.status NOT IN ('rejected', 'voided') AND COALESCE(a.netsuite_transaction_id,r.netsuite_transaction_id) IS NOT NULL
        UNION
        SELECT a.netsuite_transaction_id FROM return_batch_authorizations a
-       WHERE a.draft_id IS NOT NULL AND a.intent_snapshot->>'customerId'=$1::text AND a.netsuite_transaction_id IS NOT NULL`,
+       WHERE a.draft_id IS NOT NULL AND a.intent_snapshot->>'customerId'=$1::text AND a.netsuite_transaction_id IS NOT NULL
+         AND COALESCE(a.intent_snapshot->>'transactionType','return_authorization') <> 'credit_memo'`,
     [customerId]
   );
   const linkedCredits = await fetchPalletReturnCreditsFromNetSuite(
@@ -501,7 +520,7 @@ export async function lookupReturnSalesOrder({
   includeNetSuiteOrderLines = false,
   includePalletBalance = true,
   enforceYardRestriction = true,
-  forcePalletBalance = false
+  forcePalletBalance = true
 } = {}) {
   const receiving = yard(receivingLocationId);
   let [order, settings] = await Promise.all([
@@ -2565,8 +2584,10 @@ export async function linkReturnNetSuiteTransaction({
   const type = String(transactionType || "").trim().toLowerCase().replaceAll("-", "_");
   const recordKey = positiveId(recordId, "return record ID");
   const id = positiveId(netsuiteId, "NetSuite transaction ID");
-  if (await findReturnBatchAuthorization(recordKey)) {
-    if (type !== "return_authorization") {throw httpError(400, "This batch must link to a Return Authorization.");}
+  const batch = await findReturnBatchAuthorization(recordKey);
+  if (batch) {
+    const expected = returnBatchTransactionType(batch);
+    if (type !== expected) {throw httpError(400, `This batch must link to a ${expected === "credit_memo" ? "Credit Memo" : "Return Authorization"}.`);}
     await synchronizeReturnBatchAuthorization({ recordId: recordKey, actorOperatorId,
       manualTransactionId: id, manualTransactionRef: netsuiteTranid });
     return getReturnRecordDetail(recordKey);

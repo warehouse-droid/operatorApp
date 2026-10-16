@@ -1,0 +1,201 @@
+/* Every rule is confined to the phone layout; the tablet styles are unchanged. */
+html[data-operator-phone="true"] #app.tablet-shell {
+  overflow-y: auto;
+  overflow-x: hidden;
+  overscroll-behavior-y: contain;
+  scroll-padding-top: var(--operator-phone-header, 150px);
+  padding-bottom: max(12px, env(safe-area-inset-bottom, 0px));
+}
+
+html[data-operator-phone="true"][data-operator-keyboard="true"] #app.tablet-shell {
+  padding-bottom: calc(var(--operator-keyboard-space, 0px) + 24px + env(safe-area-inset-bottom, 0px));
+  scroll-padding-block: 12px calc(var(--operator-keyboard-space, 0px) + 24px);
+}
+
+/* Free the small visible area for entry while the device keyboard is open. */
+html[data-operator-phone="true"][data-operator-keyboard="true"] #app > .topbar {
+  position: relative;
+}
+
+html[data-operator-phone="true"] #app > .topbar {
+  position: sticky;
+  top: 0;
+  z-index: 40;
+  grid-template-columns: auto minmax(0, 1fr) auto;
+  grid-template-areas: "title title language" "location actions actions";
+  grid-template-rows: auto auto;
+  gap: 8px;
+  padding: 10px 12px;
+  padding-top: max(10px, env(safe-area-inset-top, 0px));
+  box-shadow: 0 3px 12px #0b11150a;
+}
+
+html[data-operator-phone="true"] #app .topbar-start { display: contents; }
+html[data-operator-phone="true"] #app .topbar-title { grid-area: title; min-width: 0; }
+html[data-operator-phone="true"] #app .topbar-title p { display: none; }
+html[data-operator-phone="true"] #app .topbar-title h1 { font-size: 21px; line-height: 1.2; white-space: normal; overflow-wrap: anywhere; }
+html[data-operator-phone="true"] #app .topbar-title span { font-size: 12px; margin-top: 3px; }
+html[data-operator-phone="true"] #app .topbar-location { grid-area: location; max-width: none; }
+html[data-operator-phone="true"] #app .location-button { min-height: 44px; padding: 0 8px; font-size: 14px; }
+html[data-operator-phone="true"] #app .topbar-language { grid-area: language; position: static; transform: none; justify-self: end; }
+html[data-operator-phone="true"] #app .topbar-actions { grid-area: actions; gap: 6px; overflow-x: auto; scrollbar-width: thin; justify-content: flex-start; }
+html[data-operator-phone="true"] #app .topbar-actions > * { margin-inline-start: 0; min-height: 44px; }
+html[data-operator-phone="true"] #app .topbar-actions button { padding-inline: 10px; font-size: 14px; }
+html[data-operator-phone="true"] #app .topbar-actions > :is([data-action="main-menu"],[data-action="cancel-fulfill"],[data-action="cancel-receive"],[data-action="return-back-select"],[data-action="customer-pickup-back"],.display-settings-back) { order: -2; }
+html[data-operator-phone="true"] #app .topbar-actions > :is(.notification-button,.install-status) { order: 10; }
+html[data-operator-phone="true"] #app .notification-button { width: 44px; min-width: 44px; padding: 0; font-size: 0; }
+html[data-operator-phone="true"] #app .notification-button::before { content: "🔔"; font-size: 20px; }
+html[data-operator-phone="true"] #app .notification-button:disabled::before { opacity: .5; }
+html[data-operator-phone="true"] #app button:focus-visible { outline: 3px solid var(--blue); outline-offset: 2px; }
+
+html[data-operator-phone="true"] #app :is(button,input,select,textarea) { touch-action: manipulation; }
+html[data-operator-phone="true"] #app button { min-height: 44px; }
+html[data-operator-phone="true"] #app :is(input,select,textarea):not([type="checkbox"]):not([type="color"]) { font-size: 25px; max-width: 100%; }
+html[data-operator-phone="true"] #app :is(section,aside,article,label,fieldset) { min-width: 0; }
+html[data-operator-phone="true"] #app :is(.sync-alert,.empty-state,.selected-header,.panel-title) { overflow-wrap: anywhere; }
+
+/* Let the whole screen scroll, instead of squeezing several tablet panels. */
+html[data-operator-phone="true"] #app > :is(.module-menu,.delivery-grid,.receiving-shell,.cycle-shell,.fulfillment-screen,.consolidation-screen,.consolidation-load-screen,.return-lookup-grid,.return-form-shell,.return-review-shell,.return-success-shell,.return-records-shell,.history-shell,.inventory-workspace,.display-settings) {
+  flex: 0 0 auto;
+  height: auto;
+  min-height: 0;
+  max-height: none;
+  padding: 12px;
+  overflow: visible;
+}
+
+html[data-operator-phone="true"] #app :is(.module-menu,.receiving-option-grid,.delivery-grid,.receiving-grid,.receiving-detail-grid,.cycle-grid,.work-area,.consolidation-workspace,.consolidation-review-workspace,.return-lookup-grid,.return-form-grid,.return-quantity-grid,.return-review-shell,.return-records-shell,.history-work-area,.damage-entry-grid,.damage-review-grid) {
+  grid-template-columns: minmax(0, 1fr);
+  grid-template-rows: auto;
+  grid-auto-rows: auto;
+  gap: 12px;
+  flex: 0 0 auto;
+  overflow: visible;
+}
+
+html[data-operator-phone="true"] #app .module-menu { align-content: start; }
+html[data-operator-phone="true"] #app .module-tile { min-height: 94px; padding: 16px 18px; gap: 6px; border-radius: 12px; }
+html[data-operator-phone="true"] #app .module-tile strong { font-size: 21px; overflow-wrap: anywhere; }
+html[data-operator-phone="true"] #app .module-tile span { font-size: 14px; line-height: 1.4; }
+html[data-operator-phone="true"] #app .delivery-notification { margin: 10px 12px 0; }
+
+html[data-operator-phone="true"] #app :is(.order-panel,.detail-panel,.selected-panel,.cycle-list-panel,.consolidation-item-panel,.consolidation-allocation-panel,.return-card,.return-section,.return-selected-editor,.return-line-selector,.return-photo-workspace,.return-review-aside,.return-record-detail,.history-detail-card,.damage-camera-panel,.damage-quantity-panel,.damage-review-list,.damage-review-details) {
+  height: auto;
+  min-height: 0;
+  max-height: none;
+  overflow: visible;
+}
+
+html[data-operator-phone="true"] #app :is(.order-list,.line-list,.inventory-list,.cycle-option-grid,.cycle-summary,.consolidation-item-list,.consolidation-allocation-list,.consolidation-review-order-list,.consolidation-queue-list,.return-line-list,.return-record-list,.return-review-detail-scroll,.return-review-lines,.return-customer-results,.history-list,.history-list-column,.history-detail,.inventory-sheet-list) {
+  height: auto;
+  min-height: 0;
+  max-height: none;
+  flex: 0 0 auto;
+  overflow: visible;
+}
+
+html[data-operator-phone="true"] #app :is(.detail-header,.return-header-fields,.return-quality-fields,.return-line-entry-row,.return-calculated-qty,.return-pallet-compact,.consolidation-selected-item,.consolidation-allocation,.consolidation-queue-row,.consolidation-review-order) { grid-template-columns: minmax(0, 1fr); }
+html[data-operator-phone="true"] #app :is(.status-actions,.selected-actions,.inventory-actions,.cycle-crumbs,.history-toolbar,.consolidation-toolbar,.consolidation-intro,.return-yard-banner,.return-panel-heading,.return-review-header,.return-evidence-heading) { flex-wrap: wrap; }
+html[data-operator-phone="true"] #app :is(.status-actions,.inventory-actions) > button { flex: 1 1 130px; }
+html[data-operator-phone="true"] #app .panel-title { align-items: start; gap: 8px; flex-wrap: wrap; }
+html[data-operator-phone="true"] #app .panel-title > :is(.order-panel-title,.order-panel-heading-actions) { width: 100%; }
+html[data-operator-phone="true"] #app .order-panel-heading-actions { justify-content: flex-start; flex-wrap: wrap; }
+html[data-operator-phone="true"] #app .order-card { padding-block: 12px; }
+html[data-operator-phone="true"] #app .save-star-button { width: 44px; height: 44px; }
+html[data-operator-phone="true"] #app .pagination-row { gap: 8px; padding: 10px; }
+html[data-operator-phone="true"] #app .pagination-row button { padding-inline: 8px; }
+html[data-operator-phone="true"] #app .line-card { height: auto; min-height: 0; padding: 12px; grid-template-columns: minmax(0, 1fr); gap: 10px; }
+html[data-operator-phone="true"] #app .line-info > span { display: block; max-height: none; -webkit-line-clamp: unset; }
+html[data-operator-phone="true"] #app .line-info { overflow-wrap: anywhere; }
+html[data-operator-phone="true"] #app :is(.required-measures,.selected-measures,.return-stock-balance-grid,.return-pallet-compact-balance,.history-meta) { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+html[data-operator-phone="true"] #app .measure { min-width: 0; overflow-wrap: anywhere; }
+html[data-operator-phone="true"] #app .selected-header p { max-height: none; display: block; -webkit-line-clamp: unset; }
+html[data-operator-phone="true"] #app :is(.stepper,.damage-quantity-panel .stepper) { grid-template-columns: 44px minmax(0, 1fr) 44px; }
+html[data-operator-phone="true"] #app .stepper :is(button,input) { height: 46px; }
+html[data-operator-phone="true"] #app .stepper input { width: 100%; }
+html[data-operator-phone="true"] #app .selected-actions { position: static; background: white; padding: 10px 0; }
+html[data-operator-phone="true"] #app .selected-panel > .selected-actions { order: 10; margin-top: 8px; }
+html[data-operator-phone="true"] #app :is(.selected-panel,.detail-panel,.return-selected-editor,.history-detail,.consolidation-allocation-panel,.consolidation-review-selected-line) { scroll-margin-top: 12px; }
+html[data-operator-phone="true"] #app .selected-actions > button { width: 100%; }
+
+/* Receiving and counting keep search, items and quantity entry in reading order. */
+html[data-operator-phone="true"] #app .receiving-toolbar { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+html[data-operator-phone="true"] #app .receiving-search { grid-column: 1 / -1; }
+html[data-operator-phone="true"] #app .receiving-toolbar > button:last-child { grid-column: 2; grid-row: 1; }
+html[data-operator-phone="true"] #app .receiving-main { flex: 0 0 auto; }
+html[data-operator-phone="true"] #app .receiving-detail-grid .receiving-lines { min-height: 0; }
+html[data-operator-phone="true"] #app .cycle-toolbar { grid-template-columns: minmax(0, 1fr); }
+html[data-operator-phone="true"] #app .cycle-toolbar > button { justify-self: start; }
+html[data-operator-phone="true"] #app .cycle-option-grid { grid-template-columns: minmax(0, 1fr); }
+html[data-operator-phone="true"] #app .inventory-toolbar { align-items: stretch; }
+html[data-operator-phone="true"] #app .inventory-toolbar > label { width: 100%; }
+html[data-operator-phone="true"] #app .damage-search { flex-basis: 100%; min-width: 0; }
+html[data-operator-phone="true"] #app :is(.damage-camera-panel,.damage-quantity-panel) { padding: 12px; }
+html[data-operator-phone="true"] #app :is(.damage-camera-panel,.damage-quantity-panel) h2 { font-size: 19px; }
+html[data-operator-phone="true"] #app .inventory-sheet-card { flex-wrap: wrap; padding: 12px; }
+html[data-operator-phone="true"] #app .inventory-sheet-card > button { width: 100%; }
+html[data-operator-phone="true"] #app .damage-photos figure { width: calc((100% - 16px) / 3); }
+html[data-operator-phone="true"] #app .damage-photos button { min-height: 44px; }
+
+/* Consolidated picking, review and load selection. */
+html[data-operator-phone="true"] #app .consolidation-selected-actions { min-width: 0; justify-items: stretch; }
+html[data-operator-phone="true"] #app .consolidation-allocation > .primary-button { grid-column: 1; width: 100%; }
+html[data-operator-phone="true"] #app .consolidation-unit-grid { grid-template-columns: minmax(0, 1fr); }
+html[data-operator-phone="true"] #app .consolidation-summary { justify-content: flex-start; flex-wrap: wrap; gap: 8px; }
+html[data-operator-phone="true"] #app .consolidation-stage-tabs { width: 100%; }
+html[data-operator-phone="true"] #app .consolidation-stage-tabs button { flex: 1; padding: 8px; }
+html[data-operator-phone="true"] #app .consolidation-intro > button { width: 100%; }
+html[data-operator-phone="true"] #app .consolidation-load-date-controls { grid-template-columns: minmax(0, 1fr); }
+html[data-operator-phone="true"] #app .consolidation-load-footer { position: static; }
+html[data-operator-phone="true"] #app .consolidation-load-tray { padding: 10px; }
+html[data-operator-phone="true"] #app .consolidation-load-selected > button { width: 100%; }
+
+/* Photo capture, including load proof and receiving confirmation. */
+html[data-operator-phone="true"] #app .fulfillment-screen {
+  grid-template-columns: minmax(0, 1fr);
+  grid-template-rows: auto;
+  grid-auto-rows: auto;
+  grid-template-areas: none;
+  align-content: start;
+}
+html[data-operator-phone="true"] #app .fulfillment-screen > * { grid-area: auto; grid-column: 1; min-height: 0; }
+html[data-operator-phone="true"] #app .fulfillment-screen > .fulfillment-card { min-height: 0; overflow: visible; }
+html[data-operator-phone="true"] #app .fulfillment-card { padding: 12px; }
+html[data-operator-phone="true"] #app .fulfillment-card > strong { font-size: 23px; }
+html[data-operator-phone="true"] #app .fulfillment-lines { max-height: none; overflow: visible; flex: 0 0 auto; }
+html[data-operator-phone="true"] #app .camera-actions { grid-template-columns: minmax(0, 1fr); }
+html[data-operator-phone="true"] #app :is(.photo-slot-row,.return-photo-slots) { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+html[data-operator-phone="true"] #app :is(.photo-placeholder,.camera-preview,.photo-preview) { min-height: 160px; max-height: 320px; }
+html[data-operator-phone="true"] #app .fulfillment-summary-row { flex-wrap: wrap; }
+
+/* Returns: lookup, quantity entry, evidence, review, success and saved records. */
+html[data-operator-phone="true"] #app :is(.return-card,.return-section,.return-selected-editor,.return-photo-workspace,.return-review-aside,.return-review-shell,.return-record-detail) { padding: 12px; }
+html[data-operator-phone="true"] #app :is(.return-customer-summary,.return-review-meta,.return-review-entry-fields,.return-created-records,.return-line-inputs,.return-evidence-targets,.return-bottom-actions,.return-review-actions) { grid-template-columns: minmax(0, 1fr); }
+html[data-operator-phone="true"] #app .return-line-card { height: auto; grid-template-columns: minmax(0, 1fr); gap: 8px; padding: 12px; }
+html[data-operator-phone="true"] #app :is(.return-line-identity,.return-customer-summary) :is(strong,span,em) { white-space: normal; overflow-wrap: anywhere; }
+html[data-operator-phone="true"] #app .return-line-card-measures { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+html[data-operator-phone="true"] #app .return-review-line { grid-template-columns: minmax(0, 1fr) auto; }
+html[data-operator-phone="true"] #app .return-review-line > div { grid-column: 1 / -1; }
+html[data-operator-phone="true"] #app .return-review-photos > div { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+html[data-operator-phone="true"] #app .return-evidence-targets { max-height: none; overflow: visible; }
+html[data-operator-phone="true"] #app .return-quantity-stepper { grid-template-columns: 44px minmax(0, 1fr) 44px; }
+html[data-operator-phone="true"] #app .return-quantity-stepper :is(button,input) { min-height: 46px; }
+html[data-operator-phone="true"] #app :is(.return-bottom-actions,.return-review-actions) { position: static; padding: 10px 0; background: white; }
+html[data-operator-phone="true"] #app .return-record-list { padding: 8px; }
+
+/* History and display preferences. */
+html[data-operator-phone="true"] #app .history-shell { grid-template-rows: auto auto; }
+html[data-operator-phone="true"] #app .display-settings form { width: 100%; }
+html[data-operator-phone="true"] #app .display-settings-group { margin-block: 12px; padding: 12px; }
+html[data-operator-phone="true"] #app .display-style-row { grid-template-columns: minmax(0, 1fr); }
+html[data-operator-phone="true"] #app .display-style-controls { grid-template-columns: minmax(0, 1fr); }
+html[data-operator-phone="true"] #app .display-spacing { grid-template-columns: minmax(0, 1fr); }
+html[data-operator-phone="true"] #app .display-settings-actions { bottom: 0; padding: 12px 0; }
+html[data-operator-phone="true"] #app .display-settings-actions button { flex: 1 1 120px; }
+html[data-operator-phone="true"] .toast { bottom: max(16px, env(safe-area-inset-bottom, 0px)); max-width: calc(100vw - 24px); overflow-wrap: anywhere; }
+html[data-operator-phone="true"] .urgent-delivery-alert { top: 140px; right: 12px; width: calc(100vw - 24px); }
+
+@media (max-height: 500px) {
+  html[data-operator-phone="true"] #app > .topbar { position: relative; }
+  html[data-operator-phone="true"] #app { scroll-padding-top: 12px; }
+}

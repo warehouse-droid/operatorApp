@@ -1,16 +1,18 @@
-const CACHE_NAME = "mbbs-yard-operator-20261003-staff-reset-1";
+const CACHE_NAME = "mbbs-yard-operator-20261015-pickup-remaining-packs";
 const OPERATOR_CACHE_PREFIX = "mbbs-yard-operator-";
 const APP_SHELL = [
   "/operator",
   "/operator.html",
-  "/operator-inventory.css?v=20260923-operator-inventory-v1",
+  "/operator-phone.css?v=20261008-input-font25-v1",
+  "/operator-phone.js?v=20261008-phone-keyboard-v1",
+  "/operator-inventory.css?v=20261008-input-font25-v1",
   "/counting-calculator.js?v=20260923-operator-inventory-v1",
   "/damage-draft-cache.js?v=20261001-damage-retry-v1",
   "/operator-inventory.js?v=20261003-packed-count-v1",
-  "/operator-display-settings.css?v=20260918-operator-topbar-v2",
-  "/operator-display-settings.js?v=20260918-operator-topbar-v2",
-  "/operator-order-keypad.js?v=20260918-operator-display-settings-v1",
-  "/operator.css?v=20260930-if-loading-layout-v1",
+  "/operator-display-settings.css?v=20261008-input-font25-v1",
+  "/operator-display-settings.js?v=20261008-input-font25-v1",
+  "/operator-order-keypad.js?v=20261008-phone-keyboard-v1",
+  "/operator.css?v=20261009-pickup-floating-message-v1",
   "/operator-viewport.js?v=20260930-android-bottom-bar-v1",
   "/i18n.css?v=20260701-i18n-v2",
   "/operator-receiving-confirmation.css?v=20260917-receiving-followup-v1",
@@ -19,7 +21,7 @@ const APP_SHELL = [
   "/operator-load-summary.js?v=20260918-operator-display-settings-v1",
   "/operator-photo-outbox.js?v=20260917-background-photos-v1",
   "/operator-delivery-refresh.js?v=20260924-operator-responsiveness-v1",
-  "/operator.js?v=20261003-staff-reset-1",
+  "/operator.js?v=20261015-pickup-remaining-packs",
   "/manifest.webmanifest",
   "/icons/mbbs-yard-192.png",
   "/icons/mbbs-yard-512.png",
@@ -76,6 +78,7 @@ self.addEventListener("notificationclick", (event) => {
 
 self.addEventListener("fetch", (event) => {
   const url = new URL(event.request.url);
+  if (url.pathname === "/mbr" || url.pathname.startsWith("/mbr/")) return;
   if (url.pathname === "/boss" || url.pathname.startsWith("/boss") || url.pathname === "/admin/boss-approvals") return;
   if (url.pathname === "/field-sales" || url.pathname.startsWith("/field-sales/")) return;
   if (url.protocol !== "http:" && url.protocol !== "https:") return;

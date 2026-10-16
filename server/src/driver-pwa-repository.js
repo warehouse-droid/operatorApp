@@ -4,6 +4,7 @@ import { writeDispatchAudit } from "./dispatch-audit-repository.js";
 import { DISPATCH_FLEET_PLANNING_LOCK } from "./dispatch-fleet-status.js";
 import { getDriverDayJobs } from "./driver-repository.js";
 import { supersedeDriverOfflineManifests } from "./driver-offline-repository.js";
+import { enqueueDispatchOrderCatalogRefresh } from "./dispatch-order-catalog-repository.js";
 import {
   DRIVER_COMPLETED_VISIT_MAX_PHOTOS,
   retainedDriverPhotoRequirement,
@@ -636,6 +637,7 @@ export async function reopenDriverPwaStop({
       action: "reopen",
       recordId: id,
       recordIds: memberRows.map((member) => Number(member.id)),
+      orderRefs: [...new Set(memberRows.flatMap((member) => member.order_refs || []))],
       jobId: row.job_id,
       physicalVisitJobIds,
       driverLogin: row.driver_login,
@@ -661,6 +663,9 @@ export async function reopenDriverPwaStop({
       after,
       result: response
     });
+    for (const orderRef of response.orderRefs) {
+      await enqueueDispatchOrderCatalogRefresh({ orderRef, source: "driver-pwa-reopen" });
+    }
     await writeDispatchAudit({
       action: "driver_pwa_stop_reopened",
       entityType: "driver_job",

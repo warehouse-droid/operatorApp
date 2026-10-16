@@ -9,6 +9,7 @@ const VERSION_EXEMPT_PATHS = new Set([
   "/me",
   "/logout",
   "/sync-status",
+  "/upload-failures",
   // Evidence-drain routes stay available to an older worker so a deployment
   // cannot strand locally saved events or photos. Interactive routes below
   // still force that client to close and reopen before it can continue.

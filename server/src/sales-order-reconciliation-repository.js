@@ -1,5 +1,6 @@
 import crypto from "node:crypto";
 import { query, withTransaction } from "./db.js";
+import { locallyReopenedSalesOrderSql, locallyReopenedSalesOrderIds } from "./local-sales-order-reopen.js";
 import { reconcileSalesOrderFamilyInDispatchPlans } from "./dispatch-plan-repository.js";
 import {
   deriveSalesOrderReconciliationState,
@@ -186,18 +187,21 @@ export async function listBilledSalesOrderFamilyRefs() {
     `SELECT sales_order.netsuite_id, sales_order.tranid
        FROM sales_orders sales_order
       WHERE ${exactBilledSql("sales_order")}
+        AND NOT ${locallyReopenedSalesOrderSql("sales_order")}
      UNION
      SELECT split_order.netsuite_id, split_order.tranid
        FROM dispatch_scm_so_splits split
        JOIN sales_orders source_order ON source_order.netsuite_id = split.source_so_id
        JOIN sales_orders split_order ON split_order.netsuite_id = split.split_so_id
       WHERE ${exactBilledSql("source_order")}
+        AND NOT ${locallyReopenedSalesOrderSql("split_order")}
      UNION
      SELECT source_order.netsuite_id, source_order.tranid
        FROM dispatch_scm_so_splits split
        JOIN sales_orders source_order ON source_order.netsuite_id = split.source_so_id
        JOIN sales_orders split_order ON split_order.netsuite_id = split.split_so_id
       WHERE ${exactBilledSql("split_order")}
+        AND NOT ${locallyReopenedSalesOrderSql("source_order")}
      ORDER BY tranid`
   );
   return result.rows.map((row) => ({
@@ -221,6 +225,7 @@ export async function isBilledSalesOrderIdentifier(value) {
         ($1::bigint IS NOT NULL AND sales_order.netsuite_id = $1)
         OR upper(sales_order.tranid) = upper($2)
       )
+        AND NOT ${locallyReopenedSalesOrderSql("sales_order")}
         AND (
           ${exactBilledSql("sales_order")}
           OR ${exactBilledSql("source_order")}
@@ -651,13 +656,16 @@ export async function reconcileSalesOrderFromNetSuite({
   const excludedLines = sourceLines.filter((line) => !isSalesOrderInventoryLine(line));
   const billed = isNetSuiteSalesOrderBilled(order);
   const closed = isNetSuiteSalesOrderClosed(order);
-  const fulfilledByHeader = isNetSuiteSalesOrderFulfilled(order);
+  const billingOnly = billed && !closed
+    && !sourceLines.some((/** @type {{cumulativeProgressQuantity?: unknown, netsuite_received_qty?: unknown, quantityshiprecv?: unknown}} */ line) => quantity(line.cumulativeProgressQuantity ?? line.netsuite_received_qty ?? line.quantityshiprecv) > 0);
+  const locallyReopened = billingOnly && (await locallyReopenedSalesOrderIds([orderId])).has(String(orderId));
+  const fulfilledByHeader = isNetSuiteSalesOrderFulfilled(order) && !locallyReopened;
   const progressMetadata = salesOrderProgress(inventoryLines, {
     forceComplete: fulfilledByHeader
   });
   const derivedState = deriveSalesOrderReconciliationState({
     lines: inventoryLines,
-    billed,
+    billed: billed && !locallyReopened,
     fulfilledByHeader,
     closed
   });
@@ -675,10 +683,11 @@ export async function reconcileSalesOrderFromNetSuite({
     familyOrderRefs: family.familyRefs,
     dryRun: Boolean(dryRun),
     billed,
+    locallyReopened,
     closed,
     fulfilledByHeader,
     reconciliationStatus: draftBlocked ? "review" : "current",
-    applicationStatus: billed ? "Billed" : calculatedApplicationStatus,
+    applicationStatus: billed && !locallyReopened ? "Billed" : calculatedApplicationStatus,
     calculatedApplicationStatus,
     reason: draftBlocked
       ? `Sales Order family reconciliation is blocked by an active operator packing draft on ${draft.orderRef || orderRef}.`
@@ -735,6 +744,11 @@ export async function reconcileSalesOrderFromNetSuite({
       [family.familyIds, family.familyRefs]
     );
     void lockedFamilyRows;
+    if (billingOnly && (await locallyReopenedSalesOrderIds([orderId])).has(String(orderId)) !== locallyReopened) {
+      throw Object.assign(new Error("Local reopen state changed during reconciliation; refresh before retrying."), {
+        status: 409, code: "SO_LOCAL_REOPEN_CHANGED"
+      });
+    }
     const liveDraft = await activeSalesOrderFamilyDraft(family);
     if (liveDraft.blocked && !closed) {
       const blocked = {
@@ -775,11 +789,6 @@ export async function reconcileSalesOrderFromNetSuite({
     planCleanup = await reconcileSalesOrderFamilyInDispatchPlans({
       canonicalRef: family.sourceOrderRef || orderRef,
       familyRefs: family.familyRefs,
-      // Fulfilled/Pending Billing is terminal evidence, but it is not a reason
-      // to delete that child from an existing group. Keep it in the snapshot
-      // so the group can roll up to Partially Done/Completed; only an actual
-      // Billed header uses the destructive dispatch-plan scrub.
-      billed,
       closed,
       reconciliationStatus: "current",
       reconciliationReason: "",

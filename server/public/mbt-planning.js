@@ -45,6 +45,23 @@
     renumberDriverLoads();
     if (!findLoad(selectedLoadId).load || (!loadPreviewOpen && !isMbtPlanningLoad(findLoad(selectedLoadId).load))) {selectedLoadId = trucks.flatMap(t => t.loads || []).find(isMbtPlanningLoad)?.id || "";}
   }
+  function mergePlanningFleet(availableTrucks) {
+    for (const available of availableTrucks) {
+      const vehicle = { ...available, id: String(available.id), baseYard: available.base,
+        binServiceEnabled: true };
+      const plate = normalizedTruckPlate(vehicle.plate);
+      const fleetIndex = fleet.findIndex(item => normalizedTruckPlate(item.plate) === plate);
+      if (fleetIndex < 0) {fleet.push(vehicle);}
+      else {fleet[fleetIndex] = { ...fleet[fleetIndex], ...vehicle };}
+      const existing = trucks.find(item => normalizedTruckPlate(item.plate) === plate);
+      if (existing) {
+        Object.assign(existing, { id: vehicle.id, truckType: "bin", binServiceEnabled: true,
+          binSlotCapacity: vehicle.binSlotCapacity, supportedBinTypeCodes: vehicle.supportedBinTypeCodes });
+      } else {
+        trucks.push(makeTruckFromFleet(vehicle, trucks.length, { id: vehicle.id, loads: [] }));
+      }
+    }
+  }
   async function refreshFeed({ append = false, renderAfter = true, adopt = false } = {}) {
     if (state.loadingDate && !adopt) {return false;}
     const date = currentPlanDate; const sequence = ++state.request; mbtBinDispatchLoading = true;
@@ -54,6 +71,7 @@
       if (!response.ok) {throw new Error(data.error || "BIN orders could not be loaded.");}
       if (sequence !== state.request || date !== currentPlanDate) {return false;}
       state.truckIds = new Set(data.trucks.map(truck => String(truck.id)));
+      mergePlanningFleet(data.trucks);
       for (const card of [...data.pool.items, ...data.assigned]) {
         const prior = state.cards.get(card.mbt.visitId);
         if (!prior || card.mbt.visitRevision >= prior.mbt.visitRevision) {state.cards.set(card.mbt.visitId, card);}
@@ -78,7 +96,9 @@
   }
   function orderList() {
     const cards = poolCards().map(card => renderOrderCard(orderForCard(card))).join("");
-    return `${cards || `<div class="empty-drop">${mbtBinDispatchLoading ? "Loading BIN orders…" : mbtBinDispatchError ? escapeHtml(mbtBinDispatchError) : "No available BIN orders match the filter."}</div>`}
+    const setup = !mbtBinDispatchLoading && !mbtBinDispatchError && !state.truckIds.size
+      ? '<p class="empty-drop">No BIN trucks are configured. Register a truck as Bin with its base yard and supported sizes in <a href="/dispatch/setup">Dispatch Setup</a>.</p>' : "";
+    return `${setup}${cards || `<div class="empty-drop">${mbtBinDispatchLoading ? "Loading BIN orders…" : mbtBinDispatchError ? escapeHtml(mbtBinDispatchError) : "No available BIN orders match the filter."}</div>`}
       ${state.nextOffset !== null ? '<button class="order-pool-load-more" data-action="bin-load-more" type="button">Load more</button>' : ""}`;
   }
   function cardActions(order) {

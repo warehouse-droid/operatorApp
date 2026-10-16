@@ -13,3 +13,9 @@ export function poReferenceAlertAudience(method) {
   if (method === 'yard_pickup' || method === 'mbt_delivery') return 'dispatch';
   return null;
 }
+
+/** @param {unknown} method @returns {('sales'|'dispatch')[]} */
+export function poReferenceAlertAudiences(method) {
+  const primary=poReferenceAlertAudience(method);
+  return primary==='dispatch' ? ['sales','dispatch'] : primary ? [primary] : [];
+}

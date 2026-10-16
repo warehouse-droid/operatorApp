@@ -1,6 +1,6 @@
 // @ts-check
 import {STOCK_REQUEST_YARDS,STOCK_REQUEST_MAX_QUANTITY} from './stock-request-domain.js';
-import {regularError} from './regular-stock-domain.js';
+import {regularError,regularLineRemainingQuantity} from './regular-stock-domain.js';
 /** @typedef {import('./regular-stock-domain.js').MaterialLine & {backorderedQuantity:number|null,itemName?:string}} DeliveryLine */
 /** @typedef {Omit<import('./regular-stock-domain.js').SalesOrder,'lines'> & {lines:DeliveryLine[]}} DeliveryOrder */
 
@@ -22,15 +22,26 @@ export function deliveryRoute(source, destination) {
 
 /** @param {DeliveryOrder} order */
 export function deliveryBaseYard(order) {
-  const locations = new Set(order?.lines?.filter(line => !line.ancillary).map(line => line.locationId));
+  const locations = new Set(order?.lines?.filter(line => !line.ancillary && regularLineRemainingQuantity(line) > 0).map(line => line.locationId));
   const base = yard([...locations][0]);
   if (locations.size !== 1 || !base) throw regularError('All SO material line locations must match one supported Base Yard.', 'REGULAR_SO_MISMATCH');
   return base;
 }
 
-/** @param {DeliveryOrder} order @param {number} destination */
-export function deliveryMaterials(order, destination) {
-  const lines = order?.lines?.filter(line => !line.ancillary) || [];
+/** @param {unknown} value @returns {number[]|undefined} */
+export function normalizeDeliveryLineSelection(value) {
+  if (value === undefined) return undefined;
+  if (!Array.isArray(value) || !value.length || value.length > 100
+      || value.some(id => !Number.isSafeInteger(id) || id <= 0) || new Set(value).size !== value.length) {
+    throw regularError('Select at least one valid backordered SO line to transfer.', 'REGULAR_DELIVERY_SELECTION_INVALID', 400);
+  }
+  return value;
+}
+
+/** @param {DeliveryOrder} order @param {number} destination @param {unknown} [selectedRemoteLineIds] */
+export function deliveryMaterials(order, destination, selectedRemoteLineIds) {
+  const lines = order?.lines?.filter(line => !line.ancillary && !line.closed
+    && (line.quantity <= 0 || regularLineRemainingQuantity(line) !== 0)) || [];
   for (const line of lines.filter(line => line.itemType === 'Kit')) {
     if (line.backorderedQuantity !== 0 || !line.kitComponents?.length
         || line.kitComponents.some(component => ['InvtPart','Assembly'].includes(component.itemType)
@@ -43,15 +54,21 @@ export function deliveryMaterials(order, destination) {
       || lines.some(line => !Number.isSafeInteger(line.remoteLineId) || line.remoteLineId <= 0
         || !Number.isSafeInteger(line.itemId) || line.itemId <= 0 || line.locationId !== destination
         || typeof line.backorderedQuantity !== 'number' || !Number.isFinite(line.backorderedQuantity)
-        || line.backorderedQuantity < 0 || line.backorderedQuantity > line.quantity
+        || !Number.isFinite(regularLineRemainingQuantity(line))
+        || line.backorderedQuantity < 0 || line.backorderedQuantity > regularLineRemainingQuantity(line)
         || (line.backorderedQuantity > 0 && line.open !== true)
         || !Number.isFinite(line.quantity) || line.quantity <= 0 || line.quantity > STOCK_REQUEST_MAX_QUANTITY
         || (line.itemType !== 'Kit' && !String(line.uom || '').trim()))) {
-    throw regularError('SO material lines must match Base Yard and have valid quantities, backorders and units. Backordered lines must be open and unfulfilled.', 'REGULAR_SO_MISMATCH');
+    throw regularError('SO material lines must match Base Yard and have valid quantities, backorders and units. Backordered lines must be open with enough unfulfilled quantity.', 'REGULAR_SO_MISMATCH');
   }
   const selected = lines.filter(line => Number(line.backorderedQuantity) > 0);
   if (!selected.length) throw regularError('This SO has no backordered material lines at Base Yard. No transfer is needed.', 'REGULAR_DELIVERY_NO_BACKORDER');
-  return selected;
+  const selection = normalizeDeliveryLineSelection(selectedRemoteLineIds);
+  if (selection === undefined) return selected;
+  if (selection.some(id => !selected.some(line => line.remoteLineId === id))) {
+    throw regularError('A selected SO line is no longer eligible for transfer. Refresh the SO and select its backordered lines.', 'REGULAR_DELIVERY_SELECTION_INVALID', 400);
+  }
+  return selected.filter(line => selection.includes(line.remoteLineId));
 }
 
 /** @param {DeliveryLine[]} materials @param {{itemId:number,requestableAvailable:number}[]} availability */
@@ -68,11 +85,12 @@ export function deliveryQuantities(materials, availability) {
     remaining.set(itemId,available-minimum);
   }
   // Preserve enough stock for every selected line's backorder before upgrading
-  // individual lines to their full SO quantity, in SO line order.
+  // individual lines to their remaining SO quantity, in SO line order.
   return materials.map(line => {
-    const extra = line.quantity-Number(line.backorderedQuantity);
+    const balance = regularLineRemainingQuantity(line);
+    const extra = balance-Number(line.backorderedQuantity);
     const full = Number(remaining.get(line.itemId)) >= extra;
     if (full) remaining.set(line.itemId,Number(remaining.get(line.itemId))-extra);
-    return {...line,soQuantity:line.quantity,quantity:full?line.quantity:Number(line.backorderedQuantity),quantityBasis:full?'whole_line':'backorder'};
+    return {...line,soQuantity:line.quantity,quantity:full?balance:Number(line.backorderedQuantity),quantityBasis:full?'whole_line':'backorder'};
   });
 }

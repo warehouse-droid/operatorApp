@@ -1,5 +1,5 @@
-import { fulfilledSalesDeliveryPlanningRefs, overlayFulfilledSalesDeliveryPlanning, assertSalesDeliveryPlanningAllowed } from "./dispatch-fulfilled-so-repository.js";
-import { specialPlannedOrderRefs } from './special-stock-planning.js';
+import { overlayFulfilledSalesDeliveryPlanning, assertSalesDeliveryPlanningAllowed } from "./dispatch-fulfilled-so-repository.js";
+import { isSalesPackingReconciliationReview } from "./dispatch-fulfilled-so-policy.js";
 import { query, withTransaction } from "./db.js";
 import { deferDispatchPlanMaintenance, enqueueDispatchPlanMaintenance } from "./dispatch-plan-maintenance-queue.js";
 import { applyPendingDispatchPlanMaintenance, notifyDispatchPlanMaintenance } from "./dispatch-plan-maintenance.js";
@@ -591,43 +591,8 @@ async function assertCustomOrderPlanDateExclusivity(plan = {}, { previousPlan = 
   if (conflicts.length) throw new DispatchCustomOrderDateConflictError(conflicts);
 }
 
-export async function assertSpecialStockHandoffPlanning(plan = {}, { previousPlan = null } = {}) {
-  const previousRefs = previousPlan ? specialPlannedOrderRefs(previousPlan) : new Set();
-  const refs = [...specialPlannedOrderRefs(plan)].filter((ref) => !previousRefs.has(ref));
-  if (!refs.length) return;
-  const result = await query(
-    `SELECT special.request_id, special.sales_order_ref, special.purchase_order_ref,
-            special.post_po_change_pending, special.attention, special.fulfillment_method, special.quantity_review, special.fulfillment_change, special.close_status, approval.approved AS purchase_approved,
-            EXISTS(SELECT 1 FROM sales_special_stock_lines line WHERE line.request_id=special.request_id
-              AND line.sales_decision='accepted' AND line.supply_status IS DISTINCT FROM 'in_stock') AS waiting_for_production
-       FROM sales_special_stock_cases special
-       LEFT JOIN purchase_orders purchase ON purchase.netsuite_id = special.purchase_order_netsuite_id
-       JOIN special_stock_purchase_approval approval ON approval.request_id = special.request_id
-      WHERE lower(btrim(special.sales_order_ref)) = ANY($1::text[])
-         OR lower(btrim(special.purchase_order_ref)) = ANY($1::text[])
-         OR lower(btrim(purchase.dispatch_ref)) = ANY($1::text[])
-      FOR SHARE OF special`,
-    [refs.map((ref) => ref.trim().toLowerCase())]
-  );
-  for (const row of result.rows) {
-    if (!row.purchase_approved) throw Object.assign(new Error('The Special Purchase Order requires NetSuite approval before planning.'), {status:409,code:'SPECIAL_PO_APPROVAL_REQUIRED'});
-    if (['applying','attention'].includes(row.fulfillment_change?.status)) throw Object.assign(new Error('Sales must finish the delivery update before planning.'), {status:409,code:'SPECIAL_FULFILLMENT_PENDING'});
-    if (row.close_status !== 'active') {
-      throw Object.assign(new Error('This Special Item request is closing or closed and cannot be planned.'), { status: 409, code: 'SPECIAL_CLOSURE_PENDING' });
-    }
-    if (['pending','applying','attention'].includes(row.quantity_review?.status)) {
-      throw Object.assign(new Error('SCM must finish the quantity review before Dispatch planning.'), { status: 409, code: 'SPECIAL_QUANTITY_REVIEW_REQUIRED' });
-    }
-    if (row.waiting_for_production || row.fulfillment_method === 'vendor_pickup') {
-      throw Object.assign(new Error('Special Item stock must be ready and require transport before planning.'), { status: 409, code: 'SPECIAL_STOCK_NOT_READY' });
-    }
-    if (row.attention === true || row.post_po_change_pending === true) {
-      throw Object.assign(new Error(`${row.sales_order_ref} has an unresolved Special Item Attention state.`), {
-        status: 409,
-        code: "SPECIAL_PLAN_ATTENTION"
-      });
-    }
-  }
+// Compatibility hook: Special request facts do not constrain Dispatch planning.
+export async function assertSpecialStockHandoffPlanning(_plan = {}, _options = {}) {
 }
 
 function collectPlanOrderRefs(plan) {
@@ -658,125 +623,8 @@ function collectPlanOrderRefs(plan) {
   return [...refs];
 }
 
-function exactBilledSalesOrderSql(alias) {
-  return `(
-    UPPER(BTRIM(COALESCE(${alias}.status, ''))) = 'G'
-    OR UPPER(REGEXP_REPLACE(
-         REGEXP_REPLACE(BTRIM(COALESCE(${alias}.status_text, '')), '\\s*:\\s*', ':', 'g'),
-         '\\s+', ' ', 'g'
-       ))
-       IN ('BILLED', 'SALES ORDER:BILLED')
-  )`;
-}
-
-async function billedSalesOrderFamiliesInPlan(plan = {}) {
-  const refs = collectPlanOrderRefs(plan).map((ref) => ref.toUpperCase());
-  if (!refs.length) return [];
-  const result = await query(
-    `WITH matched_canonical AS (
-       SELECT DISTINCT COALESCE(own_split.source_so_id, candidate.netsuite_id) AS source_so_id
-         FROM sales_orders candidate
-         LEFT JOIN dispatch_scm_so_splits own_split
-           ON own_split.split_so_id = candidate.netsuite_id
-        WHERE upper(candidate.tranid) = ANY($1::text[])
-          AND (candidate.netsuite_id > 0 OR own_split.source_so_id IS NOT NULL)
-     ),
-     billed_canonical AS (
-       SELECT source_order.netsuite_id AS source_so_id,
-              source_order.tranid AS source_so_ref
-         FROM matched_canonical matched
-         JOIN sales_orders source_order
-           ON source_order.netsuite_id = matched.source_so_id
-        WHERE ${exactBilledSalesOrderSql("source_order")}
-           OR EXISTS (
-             SELECT 1
-               FROM dispatch_scm_so_splits billed_split
-               JOIN sales_orders split_order
-                 ON split_order.netsuite_id = billed_split.split_so_id
-              WHERE billed_split.source_so_id = source_order.netsuite_id
-                AND ${exactBilledSalesOrderSql("split_order")}
-           )
-     )
-     SELECT billed.source_so_id,
-            billed.source_so_ref,
-            child.split_so_ref
-       FROM billed_canonical billed
-       LEFT JOIN dispatch_scm_so_splits child
-         ON child.source_so_id = billed.source_so_id
-      ORDER BY billed.source_so_id, child.created_at, child.id`,
-    [refs]
-  );
-  const families = new Map();
-  for (const row of result.rows) {
-    const key = String(row.source_so_id);
-    if (!families.has(key)) {
-      families.set(key, {
-        canonicalRef: String(row.source_so_ref || "").toUpperCase(),
-        familyRefs: []
-      });
-    }
-    const family = families.get(key);
-    family.familyRefs = uniqueTextValues([
-      ...family.familyRefs,
-      row.source_so_ref,
-      row.split_so_ref
-    ]).map((ref) => ref.toUpperCase());
-  }
-  return [...families.values()];
-}
-
-async function activeDriverJobsForSalesOrderFamily(refs = []) {
-  const familyRefs = uniqueTextValues(refs).map((ref) => ref.toUpperCase());
-  if (!familyRefs.length) return [];
-  const result = await query(
-    `SELECT job.job_id, job.plan_id, job.load_id, job.stop_id, job.order_refs
-       FROM driver_job_records job
-      WHERE job.status = 'in_progress'
-        AND (
-          EXISTS (
-            SELECT 1
-              FROM jsonb_array_elements_text(COALESCE(job.order_refs, '[]'::jsonb)) ref(value)
-             WHERE upper(BTRIM(ref.value)) = ANY($1::text[])
-          )
-          OR EXISTS (
-            SELECT 1
-              FROM dispatch_plan_snapshots snapshot,
-                   LATERAL jsonb_array_elements(COALESCE(snapshot.trucks, '[]'::jsonb)) truck,
-                   LATERAL jsonb_array_elements(COALESCE(truck->'loads', '[]'::jsonb)) load
-             WHERE snapshot.plan_id::text = job.plan_id::text
-               AND NULLIF(BTRIM(job.load_id), '') IS NOT NULL
-               AND upper(BTRIM(COALESCE(load->>'id', ''))) = upper(BTRIM(job.load_id))
-               AND EXISTS (
-                 SELECT 1
-                   FROM unnest($2::text[]) token(value)
-                  WHERE strpos(upper(load::text), token.value) > 0
-               )
-          )
-        )
-      ORDER BY job.started_at, job.id`,
-    [familyRefs, familyRefs.map((ref) => JSON.stringify(ref).toUpperCase())]
-  );
-  return result.rows;
-}
-
-export async function scrubBilledSalesOrderFamiliesFromPlan(plan = {}) {
-  let cleanPlan = plan;
-  for (const family of await billedSalesOrderFamiliesInPlan(plan)) {
-    const activeJobs = await activeDriverJobsForSalesOrderFamily(family.familyRefs);
-    const scrubbed = scrubBilledSalesOrderFamilyFromPlan(cleanPlan, {
-      canonicalRef: family.canonicalRef,
-      familyRefs: family.familyRefs,
-      preservedOrderRefs: await fulfilledSalesDeliveryPlanningRefs(family.familyRefs),
-      inProgressOrderRefs: activeJobs.length ? family.familyRefs : []
-    });
-    if (scrubbed.changed) {
-      const policy = await evaluateDispatchExecutedPrefixPreservation({ previousPlan: cleanPlan, nextPlan: scrubbed.plan });
-      if (!policy.allowed) {continue;}
-    }
-    cleanPlan = scrubbed.plan;
-  }
-  return cleanPlan;
-}
+// Compatibility for older callers. Billing is not a planning constraint.
+export async function scrubBilledSalesOrderFamiliesFromPlan(plan = {}) { return plan; }
 
 async function pickupSalesOrderRefs(plan) {
   const refs = collectPlanOrderRefs(plan);
@@ -887,12 +735,11 @@ async function sanitizeDispatchPlan(plan) {
       ]
     }
   };
-  const billedSanitizedPlan = await scrubBilledSalesOrderFamiliesFromPlan(pickupSanitizedPlan);
-  const groupedRefs = groupedSalesOrderChildRefs(billedSanitizedPlan);
-  const annotatedPlan = { ...billedSanitizedPlan, orders: await overlayFulfilledSalesDeliveryPlanning(billedSanitizedPlan.orders || [], { preserveUnchanged: true }) };
+  const groupedRefs = groupedSalesOrderChildRefs(pickupSanitizedPlan);
+  const annotatedPlan = { ...pickupSanitizedPlan, orders: await overlayFulfilledSalesDeliveryPlanning(pickupSanitizedPlan.orders || [], { preserveUnchanged: true }) };
   if (!groupedRefs.length) return annotatedPlan;
   return refreshGroupedSalesOrderReconciliationInPlan(annotatedPlan, {
-    childSnapshots: await groupedSalesOrderChildSnapshots(billedSanitizedPlan),
+    childSnapshots: await groupedSalesOrderChildSnapshots(pickupSanitizedPlan),
     targetRefs: groupedRefs
   }).plan;
 }
@@ -1060,23 +907,9 @@ async function groupedSalesOrderChildSnapshots(plan = {}, {
   const result = await query(
     `SELECT netsuite_id, tranid, status, status_text, fulfillment_status,
             netsuite_active, operator_status, local_yard_order_status,
-            preparing_operator_id,
             reconciliation_state.application_status AS reconciliation_application_status,
             reconciliation_state.reconciliation_status AS calculation_reconciliation_status,
-            reconciliation_state.reconciliation_reason AS calculation_reconciliation_reason,
-            EXISTS (
-              SELECT 1
-                FROM sales_order_lines line
-               WHERE line.sales_order_id = sales_order.netsuite_id
-                 AND (
-                   COALESCE(line.confirmed, false) = true
-                   OR COALESCE(line.packed_pallet_qty, 0) > 0
-                   OR COALESCE(line.packed_layer_qty, 0) > 0
-                   OR COALESCE(line.packed_section_qty, 0) > 0
-                   OR COALESCE(line.packed_piece_qty, 0) > 0
-                   OR COALESCE(line.packed_sales_qty, 0) > 0
-                 )
-            ) AS has_unsubmitted_line_progress
+            reconciliation_state.reconciliation_reason AS calculation_reconciliation_reason
        FROM sales_orders sales_order
        LEFT JOIN scm_reconciliation_order_state reconciliation_state
          ON reconciliation_state.order_kind = 'SO'
@@ -1086,24 +919,15 @@ async function groupedSalesOrderChildSnapshots(plan = {}, {
   );
   const snapshots = new Map(result.rows.map((row) => {
     const ref = String(row.tranid || "").trim().toUpperCase();
-    const fulfillmentStatus = String(row.fulfillment_status || "not_fulfilled").trim().toLowerCase();
-    const localStatus = String(row.local_yard_order_status || "Open").trim().toLowerCase();
-    const operatorStatus = String(row.operator_status || "").trim().toLowerCase();
-    const calculationReconciliationStatus = String(
+    const packingReview = isSalesPackingReconciliationReview({
+      tranid: row.tranid,
+      reconciliation_status: row.calculation_reconciliation_status,
+      reconciliation_reason: row.calculation_reconciliation_reason
+    });
+    const calculationReconciliationStatus = packingReview ? "current" : String(
       row.calculation_reconciliation_status || ""
     ).trim().toLowerCase();
-    const calculationReview = ["review", "missing", "error"].includes(
-      calculationReconciliationStatus
-    );
-    const activeDraft = !["loaded", "shipped", "fulfilled"].includes(localStatus)
-      && fulfillmentStatus !== "fulfilled"
-      && (
-        row.preparing_operator_id != null
-        || operatorStatus === "preparing"
-        // Completed packing is ready for dispatch. Its confirmed quantities
-        // still protect reconciliation writes, but are not an active draft here.
-        || (operatorStatus !== "packed" && row.has_unsubmitted_line_progress === true)
-      );
+    const calculationReview = ["review", "missing", "error"].includes(calculationReconciliationStatus);
     return [ref, {
       id: row.tranid || "",
       netsuiteId: Number(row.netsuite_id),
@@ -1115,18 +939,14 @@ async function groupedSalesOrderChildSnapshots(plan = {}, {
       netsuiteActive: row.netsuite_active !== false,
       operatorStatus: row.operator_status || "",
       localYardOrderStatus: row.local_yard_order_status || "Open",
-      reconciliationApplicationStatus: activeDraft || calculationReview
+      reconciliationApplicationStatus: calculationReview
         ? "Reconcile Review"
-        : row.reconciliation_application_status || "",
-      reconciliationStatus: activeDraft || calculationReview
+        : packingReview ? "" : row.reconciliation_application_status || "",
+      reconciliationStatus: calculationReview
         ? "review"
         : calculationReconciliationStatus || "current",
-      reconciliationBlocked: activeDraft || calculationReview,
-      reconciliationReason: activeDraft
-        ? `Sales Order family reconciliation is blocked by an active operator packing draft on ${row.tranid || ref}.`
-        : calculationReview
-          ? row.calculation_reconciliation_reason || ""
-          : "",
+      reconciliationBlocked: calculationReview,
+      reconciliationReason: calculationReview ? row.calculation_reconciliation_reason || "" : "",
       raw: {
         status: row.status || "",
         status_text: row.status_text || "",
@@ -1142,13 +962,16 @@ async function groupedSalesOrderChildSnapshots(plan = {}, {
     const ref = String(targetRef || "").trim().toUpperCase();
     if (!ref || !groupRefs.has(ref)) continue;
     const snapshot = snapshots.get(ref) || { id: targetRef, type: "SO", raw: {} };
-    const review = ["review", "missing", "error"].includes(normalizedReconciliationStatus);
+    const packingReview = isSalesPackingReconciliationReview({
+      tranid: targetRef, reconciliation_status: normalizedReconciliationStatus, reconciliation_reason: reconciliationReason
+    });
+    const review = !packingReview && ["review", "missing", "error"].includes(normalizedReconciliationStatus);
     snapshots.set(ref, {
       ...snapshot,
       reconciliationApplicationStatus: review
         ? "Reconcile Review"
-        : normalizedApplicationStatus || snapshot.reconciliationApplicationStatus || "",
-      reconciliationStatus: normalizedReconciliationStatus || "current",
+        : packingReview ? "" : normalizedApplicationStatus || snapshot.reconciliationApplicationStatus || "",
+      reconciliationStatus: packingReview ? "current" : normalizedReconciliationStatus || "current",
       reconciliationBlocked: review,
       reconciliationReason: review ? String(reconciliationReason || "").trim() : ""
     });
@@ -1156,31 +979,22 @@ async function groupedSalesOrderChildSnapshots(plan = {}, {
   return snapshots;
 }
 
-// Re-read source state when queued work runs; a billed/closed/review flag
-// recorded yesterday must not undo a subsequently reopened order.
+// Old queued billing requests must not delete stops. Closed/cancelled orders
+// still use the existing family removal and executed-prefix safeguards.
 export async function applyDispatchSalesFamilyMaintenance(plan, request) {
   const refs = uniqueTextValues([request.canonicalRef, ...(request.refs || [])]);
   const refreshed = refreshGroupedSalesOrderReconciliationInPlan(plan, {
     childSnapshots: await groupedSalesOrderChildSnapshots(plan), targetRefs: refs
   });
-  const closed = (await listClosedNetSuiteOrders(refs)).length > 0;
-  const families = await billedSalesOrderFamiliesInPlan({ ...plan,
-    orders: [...(plan.orders || []), ...refs.map(id => ({ id }))] });
-  const family = families.find(entry => entry.canonicalRef === request.canonicalRef);
-  if (!closed && !family) {return { plan: refreshed.plan };}
-  const familyRefs = family?.familyRefs || refs;
-  const activeJobs = closed ? [] : await activeDriverJobsForSalesOrderFamily(familyRefs);
+  if (!(await listClosedNetSuiteOrders(refs)).length) return {plan: refreshed.plan};
   return scrubBilledSalesOrderFamilyFromPlan(refreshed.plan, {
-    canonicalRef: request.canonicalRef, familyRefs,
-    preservedOrderRefs: closed ? [] : await fulfilledSalesDeliveryPlanningRefs(familyRefs),
-    inProgressOrderRefs: activeJobs.length ? familyRefs : []
+    canonicalRef: request.canonicalRef, familyRefs: refs
   });
 }
 
 export async function reconcileSalesOrderFamilyInDispatchPlans({
   canonicalRef = "",
   familyRefs = [],
-  billed = false,
   closed = false,
   reconciliationStatus = "current",
   reconciliationReason = "",
@@ -1192,7 +1006,6 @@ export async function reconcileSalesOrderFamilyInDispatchPlans({
   if (!refs.length) return { changedPlans: [], deferred: false, familyRefs: [] };
   return withTransaction(async () => {
     await lockDispatchFleetPlanning();
-    const activeJobs = billed && !closed ? await activeDriverJobsForSalesOrderFamily(refs) : [];
 
     const snapshots = await query(
       `SELECT p.id, p.plan_date::text AS plan_date, p.revision, p.status, p.note,
@@ -1220,7 +1033,6 @@ export async function reconcileSalesOrderFamilyInDispatchPlans({
         ORDER BY p.plan_date, p.id`,
       [refs]
     );
-    const preservedOrderRefs = billed && !closed ? await fulfilledSalesDeliveryPlanningRefs(refs) : [];
     const changedPlans = [];
     const deferredPlans = [];
     for (const row of snapshots.rows) {
@@ -1247,11 +1059,10 @@ export async function reconcileSalesOrderFamilyInDispatchPlans({
         }),
         targetRefs: refs
       });
-      const scrubbed = billed || closed
+      const scrubbed = closed
         ? scrubBilledSalesOrderFamilyFromPlan(refreshed.plan, {
             canonicalRef,
-            familyRefs: refs,
-            preservedOrderRefs
+            familyRefs: refs
           })
         : {
             plan: refreshed.plan,
@@ -1261,9 +1072,8 @@ export async function reconcileSalesOrderFamilyInDispatchPlans({
       if (!refreshed.changed && !scrubbed.changed) continue;
       const maintenance = { kind: "sales_family", canonicalRef: String(canonicalRef).toUpperCase(), refs };
       const editing = await deferDispatchPlanMaintenance(originalPlan, maintenance);
-      if (editing || activeJobs.length) {
-        if (!editing) {await enqueueDispatchPlanMaintenance(row.id, maintenance);}
-        deferredPlans.push({ planId: String(row.id), planDate: row.plan_date, reason: editing ? "editing" : "driver_active" });
+      if (editing) {
+        deferredPlans.push({ planId: String(row.id), planDate: row.plan_date, reason: "editing" });
         continue;
       }
       await query("SELECT id FROM dispatch_plans WHERE id=$1 FOR UPDATE", [row.id]);
@@ -1298,7 +1108,7 @@ export async function reconcileSalesOrderFamilyInDispatchPlans({
           row.saved_at,
           closed
             ? "before_closed_so_reconciliation"
-            : billed ? "before_billed_so_reconciliation" : "before_grouped_so_reconciliation",
+            : "before_grouped_so_reconciliation",
           String(actor || "scm-reconciliation")
         ]
       );
@@ -1347,62 +1157,17 @@ export async function reconcileSalesOrderFamilyInDispatchPlans({
       changedPlans,
       deferred: deferredPlans.length > 0,
       deferredPlans,
-      ...(activeJobs.length ? { activeJobs: activeJobs.map(row => ({ jobId: row.job_id, planId: row.plan_id,
-        loadId: row.load_id, stopId: row.stop_id, orderRefs: row.order_refs || [] })) } : {}),
       familyRefs: refs
     };
   });
 }
 
-export async function cleanupBilledSalesOrderFamilyFromDispatchPlans({
-  canonicalRef = "",
-  familyRefs = [],
-  actor = "scm-reconciliation",
-  queueOnly = false
-} = {}) {
-  return reconcileSalesOrderFamilyInDispatchPlans({
-    canonicalRef,
-    familyRefs,
-    billed: true,
-    actor,
-    queueOnly
-  });
+// Retained export contracts for callers from older releases; no billing work.
+export async function cleanupBilledSalesOrderFamilyFromDispatchPlans({familyRefs = []} = {}) {
+  return {changedPlans: [], deferred: false, familyRefs};
 }
-
-export async function cleanupBilledSalesOrderFamiliesFromDispatchPlan({
-  planId,
-  actor = "driver-completion",
-  queueOnly = false
-} = {}) {
-  const result = await query(
-    `SELECT p.id, p.plan_date::text AS plan_date, p.status, p.revision,
-            s.orders, s.trucks, s.summary, s.saved_at
-       FROM dispatch_plans p
-       JOIN dispatch_plan_snapshots s ON s.plan_id = p.id
-      WHERE p.id = $1
-      LIMIT 1`,
-    [planId]
-  );
-  const plan = planRow(result.rows[0]);
-  if (!plan) return { changedPlans: [], deferredFamilies: [], familyCount: 0 };
-  const families = await billedSalesOrderFamiliesInPlan(plan);
-  const changedPlans = [];
-  const deferredFamilies = [];
-  for (const family of families) {
-    const cleanup = await cleanupBilledSalesOrderFamilyFromDispatchPlans({
-      canonicalRef: family.canonicalRef,
-      familyRefs: family.familyRefs,
-      actor,
-      queueOnly
-    });
-    changedPlans.push(...(cleanup.changedPlans || []));
-    if (cleanup.deferred) deferredFamilies.push(family.familyRefs);
-  }
-  return {
-    changedPlans,
-    deferredFamilies,
-    familyCount: families.length
-  };
+export async function cleanupBilledSalesOrderFamiliesFromDispatchPlan() {
+  return {changedPlans: [], deferredFamilies: [], familyCount: 0};
 }
 
 export async function listDispatchPlanSnapshots({ planDate } = {}) {
@@ -1651,7 +1416,7 @@ export async function saveDispatchPlanSnapshot(planId, {
       rejectRetiredGlobalOrderRefs: true
     });
     // Driver completion uses this same fleet lock. Recheck after acquiring it,
-    // before billed cleanup or persistence can accept a stale browser decision.
+    // before persistence can accept a stale browser decision.
     const previousRefs = new Set([...dispatchPlannedOrderRefs(previousPlan)].map(ref => ref.toLowerCase()));
     await assertSalesDeliveryPlanningAllowed([...dispatchPlannedOrderRefs(canonicalPlan)]
       .filter(ref => !previousRefs.has(ref.toLowerCase())), "save this plan");

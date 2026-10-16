@@ -1,0 +1,88 @@
+{
+  "validatedAtToronto": "2026-10-16T02:00:15.706458-04:00",
+  "deployed": true,
+  "deployedAtToronto": "2026-10-16T02:01:14.721355-04:00",
+  "releaseChecks": {
+    "focused": 94,
+    "integration": 24,
+    "mobile": 10,
+    "workerBilling": 10,
+    "changedLinesCovered": 180,
+    "changedLinesTotal": 180
+  },
+  "completionTimingMs": [
+    {
+      "elapsedMs": 258.7882019999997,
+      "status": "complete",
+      "nextStatus": "in_progress"
+    },
+    {
+      "elapsedMs": 446.33570599999985,
+      "status": "complete",
+      "nextStatus": "in_progress"
+    }
+  ],
+  "completionTimingSource": "Final release candidate Chromium/WebKit browser run; after photo upload.",
+  "browserRunStartedAtToronto": "2026-10-16T01:56:25.230000-04:00",
+  "toolVersions": {
+    "node": "v20.20.2",
+    "@playwright/test": "1.62.1",
+    "fast-check": "4.9.0",
+    "eslint": "10.8.0",
+    "typescript": "7.0.2",
+    "c8": "12.0.0"
+  },
+  "mutationResult": {
+    "killedByProperties": 4,
+    "killedByUnits": 1,
+    "total": 4,
+    "restored": true,
+    "source": "Final release candidate mutations.json"
+  },
+  "regressionBaselines": {
+    "driverExistingFailures": 7,
+    "dispatchExistingFailures": 22,
+    "newFailures": 0
+  },
+  "realStorageReplay": {
+    "engines": [
+      "Chromium",
+      "WebKit"
+    ],
+    "maximumPhotoEdge": 2048,
+    "connectionFailureBeforeUpload": true,
+    "storedObjectAcknowledgementLost": true,
+    "nativeReplayReadbackHashesVerified": true,
+    "manualCleanupPrefix": "driver-reconnect-test/"
+  },
+  "workerReconstruction": {
+    "verified": true,
+    "files": 1357,
+    "removedFromApp": 56
+  },
+  "limitations": [
+    "Historical six-incident root causes remain unproven.",
+    "Five-second completion timing was verified after upload in isolated tests; outages have no latency guarantee.",
+    "The PWA must be open to recover; operating-system suspension resumes on return.",
+    "Lost R2 acknowledgements can create extra storage objects; job completion is protected from duplication.",
+    "Existing open PWAs need an online reload to use the new JavaScript.",
+    "Full-repository and physical-device tests were not performed."
+  ],
+  "reproduction": "See README.md; raw replay and production audit records are deliberately excluded.",
+  "deploymentChecks": {
+    "appConfigurationPreserved": true,
+    "workerConfigurationPreserved": true,
+    "databaseAndOllamaUnchanged": true,
+    "appRuntimeFilesVerified": 1411,
+    "workerRuntimeFilesVerified": 1355,
+    "driverShell": "v47",
+    "assetVersion": "20261016-driver-reconnect-v1",
+    "existingOpenPwaNeedsReload": true
+  },
+  "migration": {
+    "filename": "295_driver_upload_recovery_audit.sql",
+    "registered": 1,
+    "indexValid": true,
+    "indexReady": true
+  }
+}

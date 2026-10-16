@@ -80,6 +80,25 @@ function smartProposalUrgencyScore(proposal = {}) {
   return candidates.length ? Math.max(...candidates) : 0;
 }
 
+function smartProposalTruckCapacity(proposal, weight) {
+  return Number(proposal.utilization) > 0
+    ? weight / Number(proposal.utilization)
+    : Number(smartState.plan?.settingsSnapshot?.truck_capacity_lbs || 78000);
+}
+
+function smartProposalUltimateLoadPriority(proposal = {}) {
+  const lines = (proposal.lines || []).filter((line) => Number(line.proposedPallets) > 0);
+  if (!lines.length || lines.some((line) => smartLineUrgencyLevel(line) !== "ultimate_urgent")) {
+    return 1;
+  }
+  const weight = Number(proposal.totalWeightLbs || 0);
+  const capacity = smartProposalTruckCapacity(proposal, weight);
+  const smallestPallet = Math.min(...lines.map((line) => Number(line.palletWeightLbs ?? line.palletWeight ?? 0)
+    + Number(line.reason?.physicalPalletWeightLbs ?? line.physicalPalletWeightLbs ?? 0)));
+  return weight > 0 && smallestPallet > 0 && weight <= capacity + 0.000001
+    && capacity - weight + 0.000001 < smallestPallet ? 0 : 1;
+}
+
 function smartNormalizedVendor(value) {
   return String(value || "").trim().replace(/\s+/g, " ").toLocaleLowerCase();
 }
@@ -558,6 +577,7 @@ smartFilteredProposals = function smartFilteredProposalsV2() {
     : (proposal) => proposal.sourceName || proposal.vendor || "";
   return proposals.sort((left, right) => Number(Boolean(right.regularReplenishmentId))-Number(Boolean(left.regularReplenishmentId)) || smartProposalManualPriority(left) - smartProposalManualPriority(right)
     || smartUrgencyRank(smartProposalUrgencyLevel(right)) - smartUrgencyRank(smartProposalUrgencyLevel(left))
+    || smartProposalUltimateLoadPriority(left) - smartProposalUltimateLoadPriority(right)
     || smartProposalDestinationPriority(left) - smartProposalDestinationPriority(right)
     || smartProposalUrgencyScore(right) - smartProposalUrgencyScore(left)
     || primary(left).localeCompare(primary(right), undefined, { numeric: true })

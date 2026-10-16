@@ -2,12 +2,17 @@ import { query } from './db.js';
 
 const ref = value => String(value || '').trim().toUpperCase();
 
-export async function readSpecialDispatchPlans() {
+/** @param {{forShare?: boolean, orderRefs?: unknown[]}} [options] */
+export async function readSpecialDispatchPlans({forShare = false, orderRefs} = {}) {
+  const wanted = orderRefs === undefined ? null : new Set(orderRefs.map(ref).filter(Boolean));
+  if (wanted && !wanted.size) return [];
   // Read only identity/schedule fields, not the large item/address snapshots.
   return (await query(`WITH RECURSIVE active AS (
     SELECT plan.id,plan.plan_date::text,plan.status,snapshot.orders,snapshot.trucks
       FROM dispatch_plans plan JOIN dispatch_plan_snapshots snapshot ON snapshot.plan_id=plan.id
       WHERE plan.status <> 'cancelled' AND jsonb_array_length(snapshot.trucks)>0
+      ${wanted ? 'AND dispatch_snapshot_planning_refs(snapshot.orders,snapshot.trucks) && $1::text[]' : ''}
+      ${forShare ? 'FOR SHARE OF plan,snapshot' : ''}
   ), nodes(plan_id,order_ref,type,"originalOrderId","childOrders","childOrderDetails") AS (
     SELECT active.id,node.* FROM active CROSS JOIN LATERAL jsonb_to_recordset(orders)
       AS node(id text, type text, "originalOrderId" text, "childOrders" jsonb, "childOrderDetails" jsonb)
@@ -27,7 +32,9 @@ export async function readSpecialDispatchPlans() {
       FROM active CROSS JOIN LATERAL jsonb_array_elements(trucks) truck
       CROSS JOIN LATERAL jsonb_array_elements(CASE WHEN jsonb_typeof(truck->'loads')='array' THEN truck->'loads' ELSE '[]'::jsonb END) load GROUP BY id
   ) SELECT active.id,active.plan_date,active.status,COALESCE(identities.orders,'[]') AS orders,schedules.trucks
-    FROM active JOIN schedules USING(id) LEFT JOIN identities USING(id)`)).rows.map(plan => ({ ...plan, plannedOrderReferences: plannedReferences(plan) }));
+    FROM active JOIN schedules USING(id) LEFT JOIN identities USING(id)`,
+    wanted ? [[...wanted, '__MBBS_ANY_REFERENCE__']] : [])).rows.map(plan => ({ ...plan, plannedOrderReferences: plannedReferences(plan) }))
+    .filter(plan => !wanted || [...wanted].some(value => plan.plannedOrderReferences.has(value)));
 }
 
 function plannedReferences(plan) {

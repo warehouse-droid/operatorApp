@@ -1,6 +1,6 @@
 import { createHash } from 'node:crypto';
 import { query, withTransaction } from './db.js';
-import { specialPurchaseOrderDisplayRef, poReferenceAlertAudience } from '../public/special-stock-po-reference.js';
+import { specialPurchaseOrderDisplayRef } from '../public/special-stock-po-reference.js';
 
 /** @param {string} message @param {number} status */
 const error = (message,status) => Object.assign(Error(message), { status, code:'SPECIAL_PO_REFERENCE_ALERT' });
@@ -24,16 +24,32 @@ async function readAlerts(context, requestId=null, lock=false) {
       AND btrim(COALESCE(po.dispatch_ref,''))<>''
       AND NOT EXISTS (SELECT 1 FROM dispatch_scm_po_splits split WHERE split.split_po_id=po.netsuite_id)
       AND ($1::bigint IS NULL OR request.id=$1)
-      AND (($2='sales' AND special.fulfillment_method='vendor_pickup' AND request.requested_by=$3
+      AND (($2='sales' AND special.fulfillment_method IN ('vendor_pickup','yard_pickup','mbt_delivery') AND request.requested_by=$3
         AND request.destination_location_id=ANY($4::bigint[]))
         OR ($2='dispatch' AND special.fulfillment_method IN ('yard_pickup','mbt_delivery')))
     ORDER BY po.dispatch_ref_updated_at DESC NULLS LAST, request.id DESC
     ${lock ? 'FOR SHARE OF request, special, po' : ''}`,
   [requestId,audience,operatorId,authorizedStoreLocationIds]);
-  return rows.map(/** @param {any} row */ row => ({ requestId:Number(row.id), requestRef:row.request_ref,
-    audience:poReferenceAlertAudience(row.fulfillment_method), fulfillmentMethod:row.fulfillment_method,
+  const eligible=await queuedSalesReferences(rows,audience);
+  return eligible.map(/** @param {any} row */ row => ({ requestId:Number(row.id), requestRef:row.request_ref,
+    audience, fulfillmentMethod:row.fulfillment_method,
     displayRef:specialPurchaseOrderDisplayRef({purchaseOrderRef:row.tranid,purchaseOrderReference:row.dispatch_ref}),
     noticeKey:createHash('sha256').update(JSON.stringify([row.id,row.netsuite_id,row.tranid,row.dispatch_ref,row.reference_updated_at,row.fulfillment_method])).digest('hex') }));
+}
+
+/** @param {any[]} rows @param {string|undefined} audience */
+async function queuedSalesReferences(rows,audience) {
+  if(audience!=='sales' || !rows.length) return rows;
+  // Reuse the same local status projection as SCM, including holds and planned/completed orders.
+  const {listScmSchedule}=await import('./dispatch-repository.js');
+  const queued=new Set();
+  for(let index=0;index<rows.length;index+=200) {
+    const statuses=await listScmSchedule({exactRefs:rows.slice(index,index+200).map(row=>row.dispatch_ref),statusProjectionOnly:true});
+    for(const order of statuses) {
+      if(order.calculatedStatus==='Queued' && !order.dispatchPlanned) queued.add(order.orderRef.toLowerCase());
+    }
+  }
+  return rows.filter(row=>queued.has(row.dispatch_ref.toLowerCase()));
 }
 
 /** @param {{audience?:string,operatorId?:string,authorizedStoreLocationIds?:number[]}} context */

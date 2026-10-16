@@ -29,26 +29,47 @@
   }
 
   function install(app) {
-    const selections = new Map();
+    const selections = new WeakMap();
+    const carets = new WeakMap();
+    const phoneLayout = () => document.documentElement.dataset.operatorPhone === "true";
+    const selection = (input) => {
+      if (phoneLayout() && document.activeElement !== input) {
+        const saved = carets.get(input);
+        // An unfocused input's DOM selection can reset between touch taps.
+        return saved?.value === input.value ? [saved.caret, saved.caret] : [input.value.length, input.value.length];
+      }
+      return [input.selectionStart, input.selectionEnd];
+    };
     // Remember the caret before touch moves focus to a keypad button.
     app.addEventListener("pointerdown", (event) => {
+      // A deliberate tap on the field opts into the device keyboard, even
+      // when the saved tablet preference uses only the application keypad.
+      if (phoneLayout() && targets.has(event.target.id)) event.target.inputMode = "text";
       const button = event.target.closest("[data-order-key]");
       if (!button) return;
       const input = document.getElementById(button.dataset.orderTarget);
-      if (input) selections.set(input.id, [input.selectionStart, input.selectionEnd]);
-      if (event.pointerType === "mouse") event.preventDefault();
+      if (input) selections.set(input, selection(input));
+      if (event.pointerType === "mouse" && !phoneLayout()) event.preventDefault();
     });
     app.addEventListener("click", (event) => {
       const button = event.target.closest("[data-order-key]");
       if (!button || button.disabled) return;
       const input = document.getElementById(button.dataset.orderTarget);
       if (!input || input.disabled) return;
-      const [start, end] = selections.get(input.id) || [input.selectionStart, input.selectionEnd];
-      selections.delete(input.id);
+      const [start, end] = selections.get(input) || selection(input);
+      selections.delete(input);
       const result = edit(input.value, button.dataset.orderKey, start ?? input.value.length, end ?? input.value.length);
       input.value = result.value;
-      input.focus({ preventScroll: true });
+      if (phoneLayout()) {
+        // WebKit does not always move focus to a tapped button. Explicitly
+        // dismiss a keyboard already opened by tapping the field.
+        input.blur();
+        button.focus({ preventScroll: true });
+      } else {
+        input.focus({ preventScroll: true });
+      }
       input.setSelectionRange(result.caret, result.caret);
+      carets.set(input, result);
       input.dispatchEvent(new Event("input", { bubbles: true }));
     });
   }

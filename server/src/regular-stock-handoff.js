@@ -2,14 +2,14 @@ import {deliveryProgress} from './regular-stock-delivery-progress.js';
 import { randomUUID } from 'node:crypto';
 import { pool, query, withTransaction } from './db.js';
 import { config } from './config.js';
-import { planRegularStockRouting, regularError, requireRegularStockApproval } from './regular-stock-domain.js';
+import { planRegularStockRouting, regularError, requireRegularStockApproval, regularLineRemainingQuantity } from './regular-stock-domain.js';
 import { getSalesStockRequest, getScmStockRequest, convertSalesStockRequestLines, recordStockRequestEvent } from './stock-request-repository.js';
 import { confirmAndPrintStockTransfer, refreshStockRequestItemsAvailability } from './stock-request-service.js';
 import { readRegularStockSalesOrderFromNetSuite, applyRegularStockSalesOrderLocationInNetSuite, createTransferOrderInNetSuite, fetchDeliveryOrderFromNetSuite, fetchDeliveryOrderDetailsFromNetSuite } from './netsuite.js';
 import { upsertSalesOrders, upsertSalesOrderLines } from './order-sync-repository.js';
 import { createOrderDependency } from './order-dependency-repository.js';
 import {describeRegularStockAction,regularStockConfirmationToken,requireRegularStockConfirmation} from './regular-stock-confirmation.js';
-import {regularStockKitComponentsMatch} from './regular-stock-netsuite-adapter.js';
+import {regularStockKitComponentsMatch,regularStockPhysicalProgressMatches} from './regular-stock-netsuite-adapter.js';
 
 // Delivery uses SO line locations as its Base Yard; the SO header may differ.
 const describeHandoff = plan => describeRegularStockAction(plan.delivery
@@ -50,7 +50,7 @@ async function claim(id, input, context, readOrder, now) {
       await query('SELECT pg_advisory_xact_lock(hashtextextended($1,0))',[`regular-stock-so:${order.id}`]);
       requireRegularStockApproval(request,now());
       await requireUnusedSalesOrder(id,order.ref,order.id);
-      const plan = { ...planRegularStockRouting({ request, salesOrder: order, selectedLineIds: input.selectedLineIds || {} }), order };
+      const plan = { ...planRegularStockRouting(/** @type {Parameters<typeof planRegularStockRouting>[0]} */ ({ request, salesOrder: order, selectedLineIds: input.selectedLineIds || {} })), order };
       requireRegularStockConfirmation(id,plan,input.confirmationToken);
       for (const remoteLineId of plan.materialLineIds) {
         const owner = await query('SELECT request_id FROM regular_stock_so_line_owners WHERE sales_order_id=$1 AND remote_line_id=$2',[order.id,remoteLineId]);
@@ -188,13 +188,18 @@ async function executeHandoff(id, input, context, dependencies) {
     if(handoff.plan.mode==='transfer'){
       const fresh=await (dependencies.readOrder||readRegularStockSalesOrderFromNetSuite)(handoff.sales_order_ref);
       const original=handoff.plan.order;
-      if(fresh.id!==original.id||fresh.customerId!==original.customerId||fresh.locationId!==original.locationId||fresh.lines.length!==original.lines.length||original.lines.some(line=>{
+      // Delivery approval covers the saved selection, not unrelated SO lines.
+      const checkedLines=handoff.plan.delivery
+        ? original.lines.filter((/** @type {{remoteLineId:number}} */ line)=>handoff.plan.materialLineIds.includes(line.remoteLineId)) : original.lines;
+      if(fresh.id!==original.id||fresh.customerId!==original.customerId||fresh.locationId!==original.locationId||
+        (!handoff.plan.delivery && fresh.lines.length!==original.lines.length)||checkedLines.some(line=>{
         const current=fresh.lines.find(row=>row.remoteLineId===line.remoteLineId);
         return !current||current.itemId!==line.itemId||current.quantity!==line.quantity||current.locationId!==line.locationId
+          ||!regularStockPhysicalProgressMatches(line,current)
           ||!regularStockKitComponentsMatch(line,current)
           ||current.uom!==line.uom||current.restQuantity!==line.restQuantity
           ||(handoff.plan.delivery&&!line.ancillary&&current.backorderedQuantity!==line.backorderedQuantity)
-          ||(!current.ancillary&&!current.open&&(!handoff.plan.delivery||handoff.plan.materialLineIds.includes(line.remoteLineId)));
+          ||(!current.ancillary&&!current.open&&handoff.plan.materialLineIds.includes(line.remoteLineId));
       }))throw regularError('The SO changed after approval was linked. Resolve its lines before retrying.','REGULAR_SO_MISMATCH');
       await executeTransfers(id,handoff,context,dependencies);
     }
@@ -240,10 +245,10 @@ export async function previewRegularStockSalesOrder(id,input,context,{readOrder=
   const items=new Set(request.lines.filter(line=>['stock','po'].includes(line.decision)).map(line=>line.itemId));
   for(const itemId of items){
     const quantity=request.lines.filter(line=>line.itemId===itemId&&['stock','po'].includes(line.decision)).reduce((sum,line)=>sum+line.salesQty,0);
-    const matches=order.lines.filter(line=>!line.ancillary&&line.open&&line.itemId===itemId&&Math.abs(line.quantity-quantity)<1e-6);
-    if(matches.length>1&&!input.selectedLineIds?.[itemId])choices.push({itemId,itemName:matches[0].itemName,lines:matches.map(line=>({id:line.remoteLineId,quantity:line.quantity,uom:line.uom}))});
+    const matches=order.lines.filter(line=>!line.ancillary&&line.open&&line.itemId===itemId&&Math.abs(regularLineRemainingQuantity(line)-quantity)<1e-6);
+    if(matches.length>1&&!input.selectedLineIds?.[itemId])choices.push({itemId,itemName:matches[0].itemName,lines:matches.map(line=>({id:line.remoteLineId,quantity:regularLineRemainingQuantity(line),uom:line.uom}))});
   }
   if(choices.length)return {salesOrderRef:order.ref,choices};
-  const plan={...planRegularStockRouting({request,salesOrder:order,selectedLineIds:input.selectedLineIds || {}}),order};
+  const plan={...planRegularStockRouting(/** @type {Parameters<typeof planRegularStockRouting>[0]} */ ({request,salesOrder:order,selectedLineIds:input.selectedLineIds || {}})),order};
   return {salesOrderRef:order.ref,choices:[],action:describeRegularStockAction(plan),confirmationToken:regularStockConfirmationToken(id,plan),approvalExpiresAt:request.regular.approvalExpiresAt};
 }

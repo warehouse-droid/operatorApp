@@ -1,0 +1,8 @@
+.stock-conversation{border:1px solid #cbd5e1;border-radius:12px;padding:18px;margin:16px 0;background:#f8fafc;color:#0f172a}
+.stock-conversation h3{margin:0;font-size:18px}.stock-conversation-subtitle{font-size:12px;color:#64748b;margin:3px 0 12px}
+.stock-conversation-messages{display:grid;gap:10px;max-height:380px;overflow-y:auto;overscroll-behavior:contain;padding:2px 4px 8px}
+.stock-conversation-message{padding:11px 13px;border:1px solid #cbd5e1;border-left:3px solid #2563eb;background:#eff6ff;border-radius:8px;min-width:0}
+.stock-conversation-scm{border-left-color:#0f766e;background:#f0fdfa}.stock-conversation-meta{display:flex;gap:10px;justify-content:space-between;flex-wrap:wrap;font-size:12px}.stock-conversation-meta time{color:#64748b;font-size:11px}
+.stock-conversation-message p{white-space:pre-wrap;overflow-wrap:anywhere;margin:8px 0 0;font-size:14px;line-height:1.5}.stock-conversation-message small{color:#475569}
+.stock-conversation form{display:grid;gap:7px;margin-top:12px}.stock-conversation label{font-size:13px;font-weight:600}.stock-conversation textarea{box-sizing:border-box;width:100%;resize:vertical;min-height:76px;border:1px solid #94a3b8;border-radius:7px;padding:10px;font:inherit;background:white;color:#0f172a}
+.stock-conversation-status{font-size:13px;color:#b91c1c;margin:0}.stock-conversation-status:empty{display:none}.stock-conversation button{min-height:36px}.stock-conversation :focus-visible{outline:2px solid #0f766e;outline-offset:2px}

@@ -109,25 +109,45 @@ export function createSalesOrderAutoFulfillmentProcessor({
   // eslint-disable-next-line complexity
   async function process(candidateId) {
     let candidate = await repository.prepare(candidateId);
-    if (!candidate || !["queued", "discovered", "waiting_evidence", "uncertain"].includes(candidate.status)) {
+    if (!candidate || !["queued", "uncertain"].includes(candidate.status)) {
       return candidate;
     }
     if (candidate.status === "uncertain" && rawResolutionAction(candidate) !== "recover") {
       return candidate;
     }
     const splitRecovery = await adapter.hasSplitPlan?.(candidate) === true;
-    const recoveryPayload = rawResolutionAction(candidate) === "recover" || splitRecovery
+    const explicitRecovery = rawResolutionAction(candidate) === "recover";
+    const recoveryPayload = explicitRecovery || splitRecovery
       ? retainedRecoveryPayload(candidate)
       : null;
     // An Admin recovery first checks the immutable external identity. When the
     // remote IF exists, live remaining quantity is expected to be zero and
     // must not erase the transaction evidence as a generic reconciliation.
-    const preRecoveredRecord = recoveryPayload
-      ? await adapter.findByExternalId(candidate)
-      : null;
-    const liveOrder = preRecoveredRecord
-      ? (candidate.liveSnapshot || {})
-      : await fetchLiveOrder(candidate);
+    let preRecoveredRecord = null;
+    if (explicitRecovery && !recoveryPayload) {
+      return repository.attention({candidateId:candidate.id,recoveryRequired:true,
+        error:'Recovery requires the retained original payload. No fulfillment was sent.'});
+    }
+    try {
+      preRecoveredRecord = recoveryPayload ? await adapter.findByExternalId(candidate) : null;
+    } catch (error) {
+      return repository.attention({candidateId:candidate.id,recoveryRequired:true,
+        error:`NetSuite recovery lookup failed: ${error instanceof Error ? error.message : String(error)}. No fulfillment was sent.`});
+    }
+    // A durable location plan verifies and leases each part independently. Its
+    // adapter can resume an unattempted/definitively rejected part, but refuses
+    // another transform for any uncertain or already posted part.
+    if (explicitRecovery && !preRecoveredRecord && !splitRecovery) {
+      return repository.attention({candidateId:candidate.id,recoveryRequired:true,
+        error:'The original NetSuite fulfillment could not be verified. Recovery cannot create another fulfillment.'});
+    }
+    let liveOrder;
+    try {
+      liveOrder = preRecoveredRecord ? (candidate.liveSnapshot || {}) : await fetchLiveOrder(candidate);
+    } catch (error) {
+      return repository.attention({candidateId:candidate.id,sourceReadFailed:true,
+        error:error instanceof Error?error.message:String(error),issues:[{code:'source_read_failed'}]});
+    }
     const snapshotLines = /** @type {LooseRecord[]} */ (candidate.lineSnapshot || []);
     const liveLines = /** @type {LooseRecord[]} */ (liveOrder.lines || []);
     const snapshotOrderLines = new Set(snapshotLines.map((line) => Number(line.orderLine)));
@@ -164,7 +184,7 @@ export function createSalesOrderAutoFulfillmentProcessor({
     }
     const payload = recoveryPayload || buildSalesOrderItemFulfillmentPayload({
       selectedLines,
-      availableLines: liveOrder.lines,
+      availableLines: [...(liveOrder.lines || []), ...(liveOrder.excludedLines || [])],
       externalId: candidate.externalId
     });
     candidate = await repository.claim({

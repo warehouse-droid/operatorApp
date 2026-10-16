@@ -3,6 +3,7 @@ import {getScmStockRequest,recordStockRequestEvent} from './stock-request-reposi
 import {regularError} from './regular-stock-domain.js';
 import {isPurchaseStocking,purchaseReviewQuantity} from './regular-stock-purchase-domain.js';
 import {lockPurchaseStock,purchaseDemandRows,reconcilePurchaseStockAllocations,retirePurchaseStockProposals} from './regular-stock-purchase-repository.js';
+import {clearStockingLineReplies} from './regular-stock-line-actions.js';
 
 async function purchaseRun(runId) {
   const settings=(await query('SELECT * FROM scm_smart_settings WHERE id=1')).rows[0];
@@ -111,7 +112,8 @@ export async function addPurchaseStockProposals(id,input,context,dependencies={}
     const event=await query(`INSERT INTO sales_stock_request_events(request_id,event_type,actor_id,details)
       VALUES($1,'regular_manual_decision',$2,$3::jsonb) RETURNING id`,[id,context.operatorId,JSON.stringify({decision:'po',stockingType:'purchase',lineIds:selected.map(line=>Number(line.lineId))})]);
     await query(`UPDATE sales_stock_requests SET status='active',revision=revision+1,first_scm_decision_at=COALESCE(first_scm_decision_at,now()),
-      manual_decision_event_id=$2,updated_at=now() WHERE id=$1`,[id,event.rows[0].id]);
+      manual_decision_event_id=$2,regular_details=regular_details||'{"replyStatus":null}'::jsonb,updated_at=now() WHERE id=$1`,[id,event.rows[0].id]);
+    await clearStockingLineReplies(id,selected.map(/** @param {{lineId:number|string}} line */ line=>Number(line.lineId)));
     return getScmStockRequest(id);
   });
 }

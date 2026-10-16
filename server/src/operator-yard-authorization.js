@@ -9,6 +9,7 @@ import { operatorRequestPath, operatorRouteId } from "./operator-yard-route.js";
 import { outboundOrderYards, outboundYardLocationId } from './outbound-location-domain.js';
 import { ensureOutboundLocationDirectory } from './outbound-location-runtime.js';
 import { receivingOrderYards, scopeReceivingOrderYard } from './receiving-yard-scope.js';
+import { customerPickupOrderYards, scopeCustomerPickupOrderYard } from './customer-pickup-yard-scope.js';
 
 /** @param {any} row */
 function found(row) {
@@ -17,24 +18,36 @@ function found(row) {
 }
 
 /** @param {import("./operator-yard-access.js").OperatorYardAccount} operator @param {any} id
- * @param {{receiving?: boolean, orderType?: string, destinationLocationId?: unknown}} [options] */
-export async function assertOperatorOrderYard(operator, id, { receiving = false, orderType = "", destinationLocationId = null } = {}) {
+ * @param {{receiving?: boolean, customerPickup?: boolean, orderType?: string, destinationLocationId?: unknown, refreshDirectory?: boolean}} [options] */
+export async function assertOperatorOrderYard(operator, id, { receiving = false, customerPickup, orderType = "", destinationLocationId = null, refreshDirectory = true } = {}) {
   let order;
   if (receiving) {
     order = await readReceivingIdentity(id, orderType);
   } else {
-    await ensureOutboundLocationDirectory();
+    if (refreshDirectory) {await ensureOutboundLocationDirectory();}
     order = await getDeliveryOrder(id, { includeNetSuiteClosed: true });
   }
   found(order);
   if (receiving) {
     order = receivingOrderForOperator(operator, order, destinationLocationId);
     assertOperatorChildOrderYards(operator, order);
+  } else if (customerPickup) {
+    order = customerPickupOrderForOperator(operator, order, destinationLocationId);
   } else {
     if (!deliveryOrderWithinYards(order, operatorYardLocationIds(operator))) throw operatorYardForbidden();
     for (const yard of outboundOrderYards(order)) assertOperatorYard(operator, yard);
   }
   return order;
+}
+
+/** @param {import("./operator-yard-access.js").OperatorYardAccount} operator
+ * @param {any} order @param {unknown} locationId */
+function customerPickupOrderForOperator(operator, order, locationId) {
+  const allowed = operatorYardLocationIds(operator);
+  const candidates = customerPickupOrderYards(order).filter(yard => allowed.includes(yard));
+  const yard = locationId ?? (candidates.length === 1 ? candidates[0] : null);
+  assertOperatorYard(operator, yard);
+  return scopeCustomerPickupOrderYard(order, yard);
 }
 
 /** @param {any} id @param {string} orderType */
@@ -76,10 +89,16 @@ export async function assertOperatorUploadYard(operator, body = {}) {
   if (!body.orderId) throw Object.assign(new Error("An order is required for this photo."), { status: 400 });
   const order = await assertOperatorOrderYard(operator, body.orderId, {
     receiving: String(body.recordType).includes("receiving"), orderType: body.orderType,
+    customerPickup: body.recordType === 'operator-customer-pickup-photo',
     destinationLocationId: body.destinationLocationId ?? body.locationId ?? null
   });
   return String(body.recordType).includes('receiving') ? Number(order.destination_location_id)
-    : outboundYardLocationId(order.outbound_location_id ?? order.source_location_id);
+    : outboundPhotoYard(order);
+}
+
+/** @param {any} order */
+function outboundPhotoYard(order) {
+  return order.pickup_location_id ?? outboundYardLocationId(order.outbound_location_id ?? order.source_location_id);
 }
 
 /** @param {import("./operator-yard-access.js").OperatorYardAccount} operator @param {string} reference */
@@ -97,7 +116,14 @@ export async function assertOperatorOrderPhotoYard(operator, reference) {
   const result = await query(`SELECT netsuite_id::text AS id FROM sales_orders WHERE tranid=$1
     UNION ALL SELECT netsuite_id::text FROM transfer_orders WHERE tranid=$1
     UNION ALL SELECT netsuite_id::text FROM purchase_orders WHERE tranid=$1`, [ref]);
-  await assertOperatorOrderYard(operator, result.rows[0]?.id || ref, { receiving });
+  const id = result.rows[0]?.id || ref;
+  if (parts[1] === 'operator-customer-pickup-photo') {
+    const order = found(await getDeliveryOrder(id, { includeNetSuiteClosed: true }));
+    await ensureOutboundLocationDirectory();
+    if (!customerPickupOrderYards(order).some(yard => operatorYardLocationIds(operator).includes(yard))) { throw operatorYardForbidden(); }
+    return;
+  }
+  await assertOperatorOrderYard(operator, id, { receiving });
 }
 
 /** @param {any} req @param {string[]} keys */
@@ -263,12 +289,29 @@ async function authorizeOperatorRequest(req, pathname, jobs) {
 /** @param {any} req @param {string} pathname @param {RegExpMatchArray} match */
 async function authorizeOrderRequest(req, pathname, match) {
   const authorized = await assertOperatorOrderYard(req.operator, operatorRouteId(match[2]), {
+    refreshDirectory: !localDeliveryCompletion(req, pathname),
     receiving: match[1] === 'receiving', orderType: req.body?.orderType || req.query.orderType,
+    customerPickup: match[1] === 'customer-pickup',
     destinationLocationId: req.body?.destinationLocationId ?? req.body?.locationId
       ?? req.query?.destinationLocationId ?? req.query?.locationId ?? null
   });
-  if (match[1] === 'receiving') {assertReceivingRequestLines(req, pathname, authorized);}
+  assertScopedOrderRequestLines(req, pathname, authorized, match[1]);
   return authorized;
+}
+
+/** @param {any} req @param {string} pathname @param {any} order @param {string | undefined} kind */
+function assertScopedOrderRequestLines(req, pathname, order, kind) {
+  if (kind === 'receiving') { assertReceivingRequestLines(req, pathname, order); }
+  if (kind === 'customer-pickup') { assertCustomerPickupRequestLines(req, pathname, order); }
+}
+
+/** @param {any} req @param {string} pathname @param {any} order */
+function assertCustomerPickupRequestLines(req, pathname, order) {
+  const single = pathname.match(/\/lines\/([^/]+)\/confirm$/);
+  const ids = single ? [operatorRouteId(single[1])]
+    : pathname.endsWith('/lines/confirm-page') ? (req.body?.lines || []).map((/** @type {any} */ line) => line.lineId || line.id) : [];
+  const own = new Set((order.lines || []).map((/** @type {any} */ line) => String(line.id)));
+  if (ids.some((/** @type {any} */ id) => !own.has(String(id)))) { throw operatorYardForbidden(); }
 }
 
 /** @param {any} req @param {string} pathname @param {any} order */
@@ -290,9 +333,16 @@ export function createOperatorYardGuard({ receivingJobs = new Map(), fulfillment
       if (controlInventorySync(req, pathname)) return next();
       requireAssignedOperatorYards(req.operator);
       suppliedYards(req, ["locationId", "destinationLocationId"]);
-      if (/^\/api\/(?:delivery|customer-pickup)\//.test(pathname)) await ensureOutboundLocationDirectory();
+      if (/^\/api\/(?:delivery|customer-pickup)\//.test(pathname) && !localDeliveryCompletion(req, pathname)) await ensureOutboundLocationDirectory();
       req.operatorYardOrder = await authorizeOperatorRequest(req, pathname, { receivingJobs, fulfillmentJobs });
       next();
     } catch (error) { next(error); }
   };
+}
+
+/** Local completion still checks all server-owned yards against the retained directory. */
+/** @param {any} req @param {string} pathname */
+function localDeliveryCompletion(req,pathname) {
+  if(req.method === 'GET' && /^\/api\/delivery\/consolidation-loads\/[^/]+$/.test(pathname)) {return true;}
+  return req.method === 'POST' && /^\/api\/delivery\/(?:orders\/[^/]+\/load|consolidation-loads\/[^/]+\/(?:submit|resume))$/.test(pathname);
 }

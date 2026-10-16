@@ -1,5 +1,7 @@
 // @ts-check
 
+import { netSuitePostingQuantitiesMatch, isSmallNetSuiteSqftVariance } from './operator-netsuite-posting-quantity.js';
+
 /** @param {string} message */
 function mismatch(message) {
   return Object.assign(new Error(message), {
@@ -96,7 +98,8 @@ function itemsByUniqueLine(items, subject) {
 
 /** @param {number} orderLine @param {Record<string, any>} expected @param {Record<string, any> | undefined} actual */
 function assertMatchingLine(orderLine, expected, actual) {
-  if (!actual || Math.abs(Number(actual.quantity) - Number(expected.quantity)) > 0.000001) {
+  if (!actual || !netSuitePostingQuantitiesMatch(expected.quantity, actual.quantity,
+    actual.unitsDisplay ?? actual.units?.refName)) {
     throw mismatch(`The recovered NetSuite quantity for line ${orderLine} does not match.`);
   }
   if (expected.location === null || expected.location === undefined) {return;}
@@ -109,7 +112,18 @@ function assertMatchingLine(orderLine, expected, actual) {
 }
 
 /** @param {any} step @param {number} orderLine @param {any} actual */
+function assertMatchingUnits(step, orderLine, actual) {
+  const units = String(actual.unitsDisplay ?? actual.units?.refName ?? '').trim().toUpperCase();
+  const expectedUnits = (step.lineSnapshot || []).filter((/** @type {any} */ line) => Number(line.orderLine) === orderLine)
+    .map((/** @type {any} */ line) => line.salesUom).filter(Boolean);
+  if (expectedUnits.some((/** @type {string} */ unit) => unit !== units)) {
+    throw mismatch(`The recovered NetSuite units for line ${orderLine} do not match.`);
+  }
+}
+
+/** @param {any} step @param {number} orderLine @param {any} actual */
 function assertMatchingItem(step, orderLine, actual) {
+  assertMatchingUnits(step, orderLine, actual);
   const identities = (step.lineSnapshot || []).filter((/** @type {any} */ line) => line.orderLine === orderLine)
     .map((/** @type {any} */ line) => line.kit?.definition?.parent?.itemId ?? line.itemId).filter(Boolean);
   for (const itemId of identities) {
@@ -140,9 +154,26 @@ function assertConfirmedNonInventoryLine(step, orderLine, actual) {
   assertMatchingItem(step, orderLine, actual);
 }
 
+/** @param {number} orderLine @param {any} expected @param {any} actual */
+function verifiedQuantityAdjustment(orderLine, expected, actual) {
+  if (Math.abs(Number(expected.quantity) - Number(actual.quantity)) <= 0.000001
+      || !isSmallNetSuiteSqftVariance(expected.quantity, actual.quantity, actual.unitsDisplay ?? actual.units?.refName)) {
+    return null;
+  }
+  return { orderLine, requestedQuantity: Number(expected.quantity),
+    netSuiteQuantity: Number(actual.quantity), salesUom: 'SQFT' };
+}
+
+/** @param {number} id @param {any} record @param {any[]} quantityAdjustments */
+function verifiedPostingResult(id, record, quantityAdjustments) {
+  return { id, transactionRef: String(record.tranId ?? record.tranid ?? record.transactionRef ?? id),
+    ...(quantityAdjustments.length ? { quantityAdjustments } : {}) };
+}
+
 /**
  * A recovered record is acceptable only when it proves the same source,
- * transaction type, external identity, and exact positive line quantities.
+ * transaction type, external identity, and positive line quantities within
+ * the SQFT rounding rule or the strict comparison for other sales units.
  *
  * @param {Record<string, any>} step
  * @param {Record<string, any>} record
@@ -167,8 +198,7 @@ export function verifyOperatorNetSuitePostingRecord(step, record) {
     assertMatchingLine(orderLine, expected, actualByLine.get(orderLine));
     assertMatchingItem(step, orderLine, actualByLine.get(orderLine));
   }
-  return {
-    id,
-    transactionRef: String(record.tranId ?? record.tranid ?? record.transactionRef ?? id)
-  };
+  const quantityAdjustments = Array.from(expectedByLine, ([orderLine, expected]) =>
+    verifiedQuantityAdjustment(orderLine, expected, actualByLine.get(orderLine))).filter(Boolean);
+  return verifiedPostingResult(id, record, quantityAdjustments);
 }

@@ -3767,6 +3767,18 @@ export async function reconcileScmOrderFamily({
         receivingLines.reduce((sum, line) => sum + reconciliationQuantity(line.cumulativeProgressQuantity), 0)
       );
 
+  const transferLifecycle = classifyNetSuiteLifecycle(order.statusText, order.status);
+  const netSuiteTransferMovement = ["D", "E", "F", "G"].includes(text(order.status).toUpperCase())
+    || transferLifecycle.pendingReceipt || transferLifecycle.partiallyFulfilled
+    || transferLifecycle.partiallyReceived || transferLifecycle.received || transferLifecycle.fulfilled;
+  const transferMovementRecorded = order.kind === "TO" && (netSuiteTransferMovement || [
+    fulfilledTotal, receivedTotal, eventFulfilledTotal, eventReceivedTotal,
+    previous?.fulfilled_qty, previous?.received_qty,
+    ...(localOrder?.lines || []).map(line => line.cumulativeProgressQuantity),
+    ...(localOrder?.historicalLines || []).map(line => line.cumulativeProgressQuantity)
+  ].some(value => reconciliationQuantity(value) > EPSILON));
+  const destinationChangeRequiresReview = order.kind !== "TO" || transferMovementRecorded;
+
   const previousTargets = previous?.quantity_summary?.targets || {};
   const [pinned, activeToSplits] = await Promise.all([
     pinnedAllocationsForOrder(order),
@@ -3833,6 +3845,7 @@ export async function reconcileScmOrderFamily({
       localDestinationId
       && authoritativeDestinationId
       && localDestinationId !== authoritativeDestinationId
+      && destinationChangeRequiresReview
     ) {
       reasons.push(
         "The NetSuite destination changed after the parent order was planned or became operational."
@@ -3883,10 +3896,12 @@ export async function reconcileScmOrderFamily({
     && positiveId(previous.destination_location_id)
     && positiveId(order.destinationLocationId)
     && positiveId(previous.destination_location_id) !== positiveId(order.destinationLocationId)
+    && destinationChangeRequiresReview
     && (
       reconciliationQuantity(previous.fulfilled_qty) > EPSILON
       || reconciliationQuantity(previous.received_qty) > EPSILON
       || order.dispatchPlanned
+      || transferMovementRecorded
     )
   ) {
     reasons.push("The destination changed after planning or operational progress.");
@@ -6690,6 +6705,7 @@ export async function enrichScmScheduleWithReconciliation(rows = [], {
   return enriched;
 }
 
+/** @param {{kind?: string, orderRef?: string | number, orderRefs?: Array<string | number>}} [input] */
 export async function assertScmReconciliationOrderEditable({
   kind = "",
   orderRef = "",

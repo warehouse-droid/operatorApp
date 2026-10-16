@@ -1,7 +1,13 @@
-const salesStockYardFilterReady = import('/stock-request-yard-filter.js?v=20260927');
+const salesStockYardFilterReady = import('/stock-request-yard-filter.js?v=20260927&filterApply=20261010-v1');
+const salesStockStatusReady = import('/sales-stock-status-filter.js?v=20261009-workflow');
+const salesStockFiltersReady = import('/sales-stock-list-filters.js?v=20261009-multi&filterApply=20261010-v1');
 let salesStockYardFilterHtml = () => '';
+let salesStockListFiltersHtml = /** @type {typeof import('./sales-stock-list-filters.js').salesStockListFiltersHtml} */ (() => '');
+let salesStockRequestStatus = (request) => request.displayStatus || request.bucket || request.status;
+let salesStockStatusLabels = {};
 window.MBBSSalesStockActiveTab = new URLSearchParams(location.search).get("tab") === "regular" ? "regular" : "special";
 const salesStockRequestApp = document.getElementById("salesStockRequestApp");
+const salesStockUpdates = window.StockRequestView?.create({mount:salesStockRequestApp,active:()=>window.MBBSSalesStockActiveTab === 'regular'});
 const salesStockT = (key, fallback) => window.MBBS_I18N?.t(key, fallback) || fallback;
 const salesStockTf = (key, fallback, variables) => window.MBBS_I18N?.format(key, fallback, variables) || fallback;
 const salesStockMessage = (value) => window.MBBS_I18N?.message(value) || String(value || "");
@@ -9,18 +15,24 @@ const salesStockMessage = (value) => window.MBBS_I18N?.message(value) || String(
 const salesStockState = {
   operator: null,
   yards: [],
-  bucket: localStorage.getItem("mbbs.sales.stockRequests.bucket") || "pending",
+  stockingYards: [],
+  bucket: localStorage.getItem("mbbs.sales.stockRequests.bucket") ?? "pending",
   search: "",
-  vendorFilter: "",
+  requestTypeFilter: /** @type {string[]} */ ([]),
+  backorderStageFilter: /** @type {string[]} */ ([]),
+  vendorFilter: /** @type {string[]} */ ([]),
   requestDateFilter: "",
   sourceLocationFilter: "",
+  destinationLocationFilter:"",
+  readDecisions:new Set(),
   filterOptions: { vendors: [], sourceYards: [] },
   allowOverAvailability: false,
   availabilityGateRevision: null,
-  requests: [],
+  requests: /** @type {Array<Record<string,any>&{id:number,revision:number,workflowVersion:number,status:string,regular:Record<string,any>}>} */ ([]),
   selectedId: Number(localStorage.getItem("mbbs.sales.stockRequests.selected")) || null,
-  detail: null,
-  composer: null,
+  detail: /** @type {Record<string,any>&{id:number,revision:number,workflowVersion:number,status:string,regular:Record<string,any>}|null} */ (null),
+  composer: /** @type {Record<string,any>|null} */ (null),
+  replyDraft: /** @type {import('../tools/regular-stock-resolution-globals.js').StockingReplyDraft|null} */ (null),
   suggestions: new Map(),
   loading: true,
   saving: false,
@@ -51,6 +63,8 @@ function salesStockNumber(value) {
 
 function salesStockStatusLabel(value) {
   const status = String(value || "unknown").trim().toLowerCase();
+  if (salesStockStatusLabels[status]) return salesStockStatusLabels[status][window.MBBS_I18N?.language?.() === 'zh-CN' ? 1 : 0];
+  if(window.RegularStockReply?.label(status))return window.RegularStockReply.label(status);
   if (status === "expired") return window.RegularStockUI.t("Approval expired", "批准已过期");
   if (status === "pending") return salesStockT("salesStock.status.pending", "Pending");
   if (status === "approved") return window.RegularStockUI.t("Approved · awaiting SO", "已批准 · 待销售订单");
@@ -166,17 +180,16 @@ function salesStockLineCount(request) {
 }
 
 function salesStockList() {
-  if (salesStockState.loading) return `<div class="stock-request-empty"><strong>${salesStockT("salesStock.loadingRequests", "Loading requests…")}</strong></div>`;
+  salesStockState.requests = window.StockRequestConversation?.order(salesStockState.requests) || salesStockState.requests;
+  if (salesStockState.loading && !salesStockState.requests.length) return `<div class="stock-request-empty"><strong>${salesStockT("salesStock.loadingRequests", "Loading requests…")}</strong></div>`;
   if (!salesStockState.requests.length) {
-    return `<div class="stock-request-empty"><strong>${salesStockTf("salesStock.noBucketRequests", "No {bucket} requests", {
-      bucket: salesStockStatusLabel(salesStockState.bucket)
-    })}</strong><span>${salesStockT("salesStock.authorizedYardsEmpty", "Requests for your authorized destination yard(s) will appear here.")}</span></div>`;
+    return `<div class="stock-request-empty"><strong>${window.RegularStockUI.t("No requests match these filters", "没有符合筛选条件的申请")}</strong><span>${salesStockT("salesStock.authorizedYardsEmpty", "Requests for your authorized destination yard(s) will appear here.")}</span></div>`;
   }
   return salesStockState.requests.map((request) => `
     <button class="stock-request-card ${salesStockRequestNeedsAttention(request) ? "stock-request-card-attention" : ""} ${Number(request.id) === Number(salesStockState.selectedId) ? "selected" : ""}" data-sales-stock-action="select" data-id="${Number(request.id)}" type="button">
-      <span class="stock-request-status-line"><strong>${salesStockEscape(request.requestRef)}</strong>${salesStockPill(window.RegularStockUI.approvalExpired(request) ? "expired" : salesStockRequestNeedsAttention(request) ? "changes_requested" : request.bucket || request.status)}</span>
+      <span class="stock-request-status-line"><strong>${salesStockEscape(request.requestRef)}</strong>${salesStockPill(salesStockRequestStatus(request))}</span>
       <span>${salesStockEscape(request.destinationName)} · ${salesStockTf("salesStock.lineCount", "{count} line(s)", { count: salesStockLineCount(request) })}</span>
-      ${window.RegularStockUI.customer(request)}
+      ${window.RegularStockUI.customer(request)}${request.workflowKind==='backorder'?`<small>Backorder · ${salesStockEscape(request.stage.replaceAll("_"," "))}</small>`:""}
       <small>${salesStockEscape(request.requestedByName || request.requestedBy || "")} · ${salesStockDate(request.updatedAt)}</small>
     </button>
   `).join("");
@@ -219,10 +232,17 @@ function salesStockTransferProgress(transfer) {
   return `<div class="stock-request-status-line">${milestones.map(([done, label]) => `<span class="stock-request-pill ${done ? "completed" : ""}">${done ? "✓" : "○"} ${salesStockEscape(label)}</span>`).join("")}</div>`;
 }
 
+/** @type {ReturnType<typeof import('./backorder-stock-requests.js').createBackorderUI>|undefined} */
+let salesBackorderUI;
+const salesBackorderReady=()=>import(new URL('/backorder-stock-requests.js?transferEta=20261016&conversation=20261016&v=20261014-material-layout&salesStatus=20261009',location.href).href).then(({createBackorderUI})=>{
+  salesBackorderUI=createBackorderUI({mount:salesStockRequestApp,audience:'sales',api:salesStockApi,getDetail:()=>/** @type {import('./backorder-workflow.js').BackorderRequest|null} */ (salesStockState.detail),
+    setDetail:(/** @type {import('./backorder-workflow.js').BackorderRequest} */ request)=>{salesStockState.detail=request;salesStockState.requests=salesStockState.requests.map(row=>row.id===request.id?request:row);},render:renderSalesStockRequests,getYards:()=>salesStockState.yards,getDefaultDestination:()=>salesStockState.composer?.destinationLocationId || salesStockState.detail?.destinationLocationId || ''});
+});
 function salesStockDetail() {
   const request = salesStockState.detail;
+  if(salesBackorderUI?.isBackorder(request))return salesBackorderUI.detail(/** @type {import('./backorder-workflow.js').BackorderRequest} */ (request));
   if(window.RegularWaitlist?.isWaitlist(request))return window.RegularWaitlist.detail(request);
-  if(window.RegularPurchaseUI?.purchase(request))return window.RegularPurchaseUI.detail(request);
+  if(window.RegularPurchaseUI?.purchase(request))return window.RegularPurchaseUI.detail(request,false,{replyDraft:salesStockState.replyDraft,busy:salesStockState.saving,operatorId:salesStockState.operator?.id});
   if (!request) {
     return `<div class="stock-request-empty"><strong>${salesStockT("salesStock.selectRequest", "Select a request")}</strong><span>${salesStockT("salesStock.selectRequestHelp", "Line decisions, Transfer Orders, dispatch, driver, and receiving milestones will appear here.")}</span></div>`;
   }
@@ -230,7 +250,7 @@ function salesStockDetail() {
   const returnedLines = request.lines.filter((line) => line.status === "changes_requested");
   return `<div class="stock-request-heading">
       <div><h2>${salesStockEscape(request.requestRef)}</h2><p>${salesStockEscape(request.requestedByName || request.requestedBy || "")} · ${salesStockDate(request.createdAt)}</p></div>
-      ${salesStockPill(request.bucket || request.status)}
+      ${salesStockPill(window.RegularStockReply?.status(request)||request.bucket||request.status)}
     </div>
     <div class="stock-request-summary">
       <span><small>${salesStockT("salesStock.destination", "Destination")}</small><strong>${salesStockEscape(request.destinationName)}</strong></span>
@@ -240,6 +260,7 @@ function salesStockDetail() {
     </div>
     ${request.workflowVersion===2?window.RegularStockUI.summary(request):""}
     ${request.workflowVersion===2?window.RegularStockUI.salesOrder(request,salesStockState.saving):""}
+    ${window.RegularStockReply?.panel(request,'sales',null,salesStockState.saving,salesStockState.operator?.id,{showButton:false})||''}
     ${request.remarks ? `<div class="stock-request-notice"><strong>${salesStockT("salesStock.salesRemark", "Sales remark:")}</strong> ${salesStockEscape(request.remarks)}</div>` : ""}
     <div class="stock-request-actions">
       ${(editableBeforeDecision || returnedLines.length) && !window.RegularStockDelivery?.simple(request) ? `<button data-sales-stock-action="edit" type="button">${returnedLines.length ? salesStockT("salesStock.editReturnedLines", "Edit returned line(s)") : salesStockT("salesStock.editRequest", "Edit request")}</button>` : ""}
@@ -249,8 +270,9 @@ function salesStockDetail() {
     <section class="stock-request-section">
       <h3>${salesStockT("salesStock.requestedItems", "Requested items")}</h3>
       <div class="stock-request-lines">${request.lines.map((line) => `
-        <article class="stock-request-line">
-          <header><div><strong>${salesStockEscape(line.itemName)}</strong><div class="stock-request-muted">${salesStockEscape(line.itemDescription || "")}</div></div>${salesStockPill(line.status)}</header>
+        <article class="stock-request-line" data-sales-stock-line-id="${line.id}">
+          <header><div><strong>${salesStockEscape(line.itemName)}</strong><div class="stock-request-muted">${salesStockEscape(line.itemDescription || "")}</div></div>${salesStockPill(window.RegularStockWaitlistTransition?.lineStatus(request,line)==='waitlisted'?'waitlisted':window.RegularStockReply?.lineStatus(request,line)||line.status)}</header>
+          ${window.RegularStockWaitlistTransition?.result(request,line,'sales')||''}
           <div class="stock-request-summary">
             <span><small>${salesStockT("salesStock.from", "From")}</small><strong>${salesStockEscape(line.sourceName)}</strong></span>
             <span><small>${salesStockT("salesStock.to", "To")}</small><strong>${salesStockEscape(line.destinationName)}</strong></span>
@@ -260,6 +282,8 @@ function salesStockDetail() {
           ${line.decision ? `<p><strong>${window.RegularStockUI.decision(line.decision)}</strong></p>` : ""}
           ${request.workflowVersion===2 && (request.regular?.handoffStatus==='complete' || request.status==='completed') ? window.RegularStockUI.safety(request,line) : ''}
           ${line.decisionReason ? `<div class="stock-request-notice"><strong>${salesStockT("salesStock.scmUpdate", "SCM update:")}</strong> ${salesStockEscape(line.decisionReason)}</div>` : ""}
+          ${window.RegularStockResolution?.result(request,line)||''}
+          ${window.RegularStockReply?.panel(request,'sales',salesStockState.replyDraft,salesStockState.saving,salesStockState.operator?.id,{line})||''}
         </article>
       `).join("")}</div>
     </section>
@@ -298,7 +322,8 @@ function salesStockNewLine(overrides = {}) {
 }
 
 function salesStockStartNew() {
-  if (salesStockState.loading || !salesStockState.yards.length) return;
+  if (salesStockState.loading) return;
+  salesStockState.replyDraft=null;
   salesStockState.composer = {
     workflowVersion:2, stockingType:"transfer", customerName:"", customerId:null, operationKey:crypto.randomUUID(), deliveryMethod:"", arrivalDate:"", arrivalTime:"",
     requestId: null,
@@ -314,14 +339,22 @@ function salesStockStartNew() {
 
 function salesStockSupportedDestinationLocationId(value) {
   const locationId = Number(value);
+  const validatedDeliveryBase = window.RegularStockDelivery?.composing(salesStockState.composer)
+    && Number(salesStockState.composer.deliveryPreview?.baseLocationId) === locationId
+    && [1, 28, 15, 26].includes(locationId);
   return Number.isInteger(locationId)
-    && salesStockState.yards.some((yard) => Number(yard.locationId) === locationId)
+    && (salesStockDestinationYards().some((yard) => Number(yard.locationId) === locationId) || validatedDeliveryBase)
     ? locationId
     : null;
 }
 
+function salesStockDestinationYards() {
+  return salesStockState.composer?.workflowVersion===2&&salesStockState.composer.deliveryMethod==='stocking'
+    ?salesStockState.stockingYards:salesStockState.yards;
+}
+
 function salesStockReconcileNewComposerDestination() {
-  const composer = salesStockState.composer;
+  const composer = /** @type {Record<string,any>} */ (salesStockState.composer);
   if (!composer || composer.requestId || salesStockSupportedDestinationLocationId(composer.destinationLocationId)) return;
   const destinationLocationId = salesStockSupportedDestinationLocationId(salesStockState.yards[0]?.locationId);
   if (!destinationLocationId) return;
@@ -397,7 +430,7 @@ function salesStockQuantityFields(line) {
 
 function salesStockComposerLine(line, index) {
   const suggestions = salesStockState.suggestions.get(line.key) || [];
-  const purchase=window.RegularPurchaseUI?.purchase(salesStockState.composer)||window.RegularWaitlist?.isWaitlist(salesStockState.composer);
+  const purchase=window.RegularPurchaseUI?.purchase(salesStockState.composer)||window.RegularWaitlist?.isWaitlist(salesStockState.composer)||salesBackorderUI?.isBackorder(salesStockState.composer);
   return `<article class="stock-request-line" data-sales-stock-line="${salesStockEscape(line.key)}">
     <header><strong>${salesStockTf("salesStock.lineNumber", "Line {number}", { number: index + 1 })}${line.id ? ` · #${Number(line.id)}` : ""}</strong>${salesStockState.composer.lines.length > 1 && !salesStockState.composer.partial ? `<button class="danger" data-sales-stock-action="remove-line" type="button">${salesStockT("salesStock.remove", "Remove")}</button>` : ""}</header>
     <div class="stock-request-line-fields">
@@ -405,28 +438,29 @@ function salesStockComposerLine(line, index) {
         ${suggestions.length ? `<div class="stock-request-suggestions">${suggestions.map((item) => `<button data-sales-stock-action="choose-item" data-item-id="${Number(item.itemId)}" type="button"><strong>${salesStockEscape(item.itemCode)}</strong><small>${salesStockEscape(item.description || item.displayName || "")}</small></button>`).join("")}</div>` : ""}
       </label>
       ${purchase?'':`<label><span>${salesStockT("salesStock.requestFromYard", "Request from yard")}</span><select data-sales-stock-field="sourceLocationId" ${line.loadingAvailability || !line.item ? "disabled" : ""}><option value="">${line.loadingAvailability ? salesStockT("salesStock.refreshingYards", "Refreshing all yards…") : salesStockT("salesStock.selectSourceYard", "Select source yard")}</option>${salesStockYardOptions(line, salesStockState.composer.destinationLocationId)}</select></label>`}
-      ${salesStockQuantityFields(line)}
+      ${salesStockQuantityFields(line)}${salesBackorderUI?.isBackorder(salesStockState.composer)?salesBackorderUI.composerLine(line):""}
     </div>
-    ${line.availability ? `<div class="stock-request-availability">${purchase?window.RegularPurchaseUI.stock({onHand:line.availability.yards[0]?.syncedAt?line.availability.yards[0].onHand:null,available:line.availability.yards[0]?.syncedAt?line.availability.yards[0].requestableAvailable:null,preferredStock:line.availability.yards[0]?.preferredStock},line.item.salesUom):line.availability.yards.map((yard) => salesStockAvailabilityCard(line.item, yard)).join("")}</div>` : ""}
+    ${line.availability && !salesBackorderUI?.isBackorder(salesStockState.composer) ? `<div class="stock-request-availability">${purchase?window.RegularPurchaseUI.stock({onHand:line.availability.yards[0]?.syncedAt?line.availability.yards[0].onHand:null,available:line.availability.yards[0]?.syncedAt?line.availability.yards[0].requestableAvailable:null,preferredStock:line.availability.yards[0]?.preferredStock},line.item.salesUom):line.availability.yards.map((yard) => salesStockAvailabilityCard(line.item, yard)).join("")}</div>` : ""}
   </article>`;
 }
 
 function salesStockComposer() {
-  const composer = salesStockState.composer;
+  const composer = /** @type {Record<string,any>} */ (salesStockState.composer);
   if(window.RegularStockDelivery?.composing(composer))return window.RegularStockDelivery.composer(composer,salesStockState.yards,salesStockState.saving);
   const purchase=window.RegularPurchaseUI?.purchase(composer);
   const waitlist=window.RegularWaitlist?.isWaitlist(composer);
-  const singleYard = salesStockState.yards.length === 1;
+  const destinationYards=salesStockDestinationYards();
+  const singleYard = destinationYards.length === 1;
   const supportedDestinationLocationId = salesStockSupportedDestinationLocationId(composer.destinationLocationId);
   return `<div class="stock-request-heading"><div><h2>${composer.requestId ? salesStockT("salesStock.editTitle", "Edit stock request") : salesStockT("salesStock.newTitle", "New regular stock request")}</h2><p>${waitlist ? "One waitlist request contains one item. Submit the customer’s required quantity in the item sales unit." : composer.partial ? salesStockT("salesStock.returnedOnly", "Only lines returned by SCM are unlocked.") : salesStockT("salesStock.multiLineHint", "One request can contain multiple independently sourced items.")}</p></div><button data-sales-stock-action="close-composer" type="button">${salesStockT("salesStock.close", "Close")}</button></div>
-    <form class="stock-request-form" data-sales-stock-form>
+    <form class="stock-request-form ${salesBackorderUI?.isBackorder(composer)?'backorder-composer':''}" data-sales-stock-form>
       <div class="stock-request-form-head">
-        <label><span>${salesStockT("salesStock.yourDestination", "Your destination yard")}</span><select data-sales-stock-destination ${singleYard || composer.partial ? "disabled" : ""}>${supportedDestinationLocationId ? "" : `<option value="" selected>${salesStockT("salesStock.selectDestinationYard", "Select destination yard")}</option>`}${salesStockState.yards.map((yard) => `<option value="${Number(yard.locationId)}" ${supportedDestinationLocationId === Number(yard.locationId) ? "selected" : ""}>${salesStockEscape(yard.yardCode)}</option>`).join("")}</select></label>
-        <div class="stock-request-notice">${waitlist?"Saved locally. SCM assigns stock from a PO before Sales creates an SO.":purchase?window.RegularStockUI.t('SCM reviews every Purchase item and adds accepted quantities to PO/TO proposals.','每项采购申请均由 SCM 审核，接受后加入采购 / 调货建议。'):composer.workflowVersion===2 ? window.RegularStockUI.t("Approval checks safety stock and arrival time. NetSuite commits stock when the SO or TO is processed.","审批将检查安全库存和预计到达时间，处理销售订单或调货单时由 NetSuite 承诺库存。") : salesStockT("salesStock.availabilityNotice", "Availability is refreshed from NetSuite through the backend when an item is selected. Submitting does not reserve inventory; SCM conversion does.")}</div>
+        <label><span>${composer.deliveryMethod==='stocking'?window.RegularStockUI.t('Stocking destination yard','备货目的货场'):salesStockT("salesStock.yourDestination", "Your destination yard")}</span><select data-sales-stock-destination ${singleYard || composer.partial ? "disabled" : ""}>${supportedDestinationLocationId ? "" : `<option value="" selected>${salesStockT("salesStock.selectDestinationYard", "Select destination yard")}</option>`}${destinationYards.map((yard) => `<option value="${Number(yard.locationId)}" ${supportedDestinationLocationId === Number(yard.locationId) ? "selected" : ""}>${salesStockEscape(yard.yardCode)}</option>`).join("")}</select></label>
+        <div class="stock-request-notice">${salesBackorderUI?.isBackorder(composer)?"SCM reviews each regular material. Sales and SCM manually link existing orders.":waitlist?"Saved locally. SCM assigns stock from a PO before Sales creates an SO.":purchase?window.RegularStockUI.t('SCM reviews every Purchase item and adds accepted quantities to PO/TO proposals.','每项采购申请均由 SCM 审核，接受后加入采购 / 调货建议。'):composer.workflowVersion===2 ? window.RegularStockUI.t("Approval checks safety stock and arrival time. NetSuite commits stock when the SO or TO is processed.","审批将检查安全库存和预计到达时间，处理销售订单或调货单时由 NetSuite 承诺库存。") : salesStockT("salesStock.availabilityNotice", "Availability is refreshed from NetSuite through the backend when an item is selected. Submitting does not reserve inventory; SCM conversion does.")}</div>
         ${salesStockState.allowOverAvailability&&!purchase&&!waitlist ? `<div class="stock-request-notice stock-request-availability-override"><strong>${salesStockT("salesStock.overAvailabilityEnabled", "Admin override enabled:")}</strong> ${salesStockT("salesStock.overAvailabilityHelp", "You may request more than this yard currently has. SCM can convert the full requested quantity; the shortage will remain visible as a Transfer Order backorder.")}</div>` : ""}
       </div>
-      ${composer.workflowVersion===2?window.RegularStockUI.fields(composer):""}
-      <label class="stock-request-remark"><span>${salesStockT("salesStock.remarkOptional", "Request remark (optional)")}</span><textarea name="remarks" data-sales-stock-remarks maxlength="2000" rows="3" ${composer.partial ? "readonly" : ""}>${salesStockEscape(composer.remarks)}</textarea></label>
+      ${composer.workflowVersion===2?window.RegularStockUI.fields(composer):""}${salesBackorderUI?.isBackorder(composer)?salesBackorderUI.composerFields(/** @type {Record<string,any>} */ (composer)):""}
+      ${salesBackorderUI?.isBackorder(composer)?'':`<label class="stock-request-remark"><span>${salesStockT("salesStock.remarkOptional", "Request remark (optional)")}</span><textarea name="remarks" data-sales-stock-remarks maxlength="2000" rows="3" ${composer.partial ? "readonly" : ""}>${salesStockEscape(composer.remarks)}</textarea></label>`}
       <div class="stock-request-lines">${composer.lines.map(salesStockComposerLine).join("")}</div>
       <div class="stock-request-actions">
         ${composer.partial||waitlist ? "" : `<button data-sales-stock-action="add-line" type="button">${salesStockT("salesStock.addLine", "Add another line")}</button>`}
@@ -441,6 +475,9 @@ function salesStockFocusSnapshot() {
   let selector = "";
   if (active.matches("[data-sales-stock-search]")) {
     selector = "[data-sales-stock-search]";
+  } else if (active.matches('[data-sales-stock-filter]')) {
+    selector = `[data-sales-stock-filter="${CSS.escape(active.dataset.salesStockFilter)}"]`;
+    if (active.type === 'checkbox') selector += `[value="${CSS.escape(active.value)}"]`;
   } else if (active.matches('[data-regular-field]')) {
     selector = `[data-regular-field="${CSS.escape(active.dataset.regularField)}"]`;
   } else if (active.matches('[data-regular-so]')) {
@@ -476,30 +513,26 @@ function salesStockRestoreFocus(snapshot) {
 }
 
 function salesStockScrollSnapshot() {
-  return {
-    list: salesStockRequestApp.querySelector(".stock-request-list")?.scrollTop || 0,
-    detail: salesStockRequestApp.querySelector(".stock-request-detail")?.scrollTop || 0
-  };
+  return window.StockRequestView?.preserveScroll(salesStockRequestApp);
 }
 
 function salesStockRestoreScroll(snapshot) {
-  if (!snapshot) return;
-  const list = salesStockRequestApp.querySelector(".stock-request-list");
-  const detail = salesStockRequestApp.querySelector(".stock-request-detail");
-  if (list) list.scrollTop = snapshot.list;
-  if (detail) detail.scrollTop = snapshot.detail;
+  snapshot?.();
 }
 
-function salesStockVendorFilterOptions() {
-  return (salesStockState.filterOptions.vendors || []).map((vendor) => `<option value="${salesStockEscape(vendor)}" ${salesStockState.vendorFilter === vendor ? "selected" : ""}>${salesStockEscape(vendor)}</option>`).join("");
+function salesStockSaveFilters() {
+  const {requestTypeFilter,backorderStageFilter,vendorFilter} = salesStockState;
+  localStorage.setItem('mbbs.sales.stockRequests.filters', JSON.stringify({requestTypeFilter,backorderStageFilter,vendorFilter}));
 }
 
-function renderSalesStockRequests() {
+function renderSalesStockRequests({detailOnly=false} = {}) {
   if (window.MBBSSalesStockActiveTab !== "regular") return;
   const focusSnapshot = salesStockFocusSnapshot();
+  const openFilters = [...salesStockRequestApp.querySelectorAll('[data-sales-multi-filter][open]')].map(filter=>filter.dataset.salesMultiFilter);
   const scrollSnapshot = salesStockScrollSnapshot();
   const navigationDisabled = salesStockState.composer ? "disabled" : "";
   document.title = salesStockT("salesStock.title", "MBBS Sales Request Stock");
+  if (!detailOnly || !window.StockRequestView?.renderDetail(salesStockRequestApp, salesStockState.composer ? salesStockComposer() : salesStockDetail(), salesStockState.selectedId)) {
   salesStockRequestApp.innerHTML = `${salesStockHeader()}
     <section class="stock-request-page">
       <div class="stock-request-tabs" role="tablist" aria-label="${salesStockT("salesStock.requestType", "Stock request type")}">
@@ -507,15 +540,13 @@ function renderSalesStockRequests() {
         <button aria-selected="true" type="button">${salesStockT("salesStock.regular", "Regular")}</button>
       </div>
       <div class="stock-request-toolbar">
-        <div class="stock-request-tabs" role="tablist" aria-label="${salesStockT("salesStock.regularStatus", "Regular request status")}">
-          ${["pending", "accepted", "completed"].map((bucket) => `<button data-sales-stock-action="bucket" data-bucket="${bucket}" aria-selected="${salesStockState.bucket === bucket}" type="button" ${navigationDisabled}>${salesStockStatusLabel(bucket)}</button>`).join("")}
-        </div>
-        <div class="stock-request-actions"><input class="stock-request-search" data-sales-stock-search type="search" value="${salesStockEscape(salesStockState.search)}" placeholder="${salesStockT("salesStock.searchPlaceholder", "Search request or item")}" ${navigationDisabled} /><button class="primary" data-sales-stock-action="new" type="button" ${salesStockState.loading || !salesStockState.yards.length || salesStockState.composer ? "disabled" : ""}>${salesStockT("salesStock.newRequest", "New request")}</button><button data-sales-stock-action="refresh" type="button" ${navigationDisabled}>${salesStockT("salesStock.refresh", "Refresh")}</button></div>
+        <div class="stock-request-actions"><input class="stock-request-search" data-sales-stock-search type="search" value="${salesStockEscape(salesStockState.search)}" placeholder="${salesStockT("salesStock.searchPlaceholder", "Search request or item")}" ${navigationDisabled} /><button class="primary" data-sales-stock-action="new" type="button" ${salesStockState.loading || salesStockState.composer ? "disabled" : ""}>${salesStockT("salesStock.newRequest", "New request")}</button><button data-sales-stock-action="refresh" type="button" ${navigationDisabled}>${salesStockT("salesStock.refresh", "Refresh")}</button></div>
         <div class="stock-request-filters">
-          <label><span>${salesStockT("salesStock.itemVendor", "Item vendor")}</span><select name="vendor" data-sales-stock-filter="vendorFilter" ${navigationDisabled}><option value="">${salesStockT("salesStock.allVendors", "All vendors")}</option>${salesStockVendorFilterOptions()}</select></label>
+          ${salesStockListFiltersHtml({...salesStockState,availableVendors:salesStockState.filterOptions.vendors,disabled:Boolean(salesStockState.composer),language:window.MBBS_I18N?.language?.() || 'en'})}
           <label><span>${salesStockT("salesStock.requestDate", "Request date")}</span><input name="requestDate" data-sales-stock-filter="requestDateFilter" type="date" value="${salesStockEscape(salesStockState.requestDateFilter)}" ${navigationDisabled} /></label>
           ${salesStockYardFilterHtml(salesStockState.filterOptions.sourceYards || [], salesStockState.sourceLocationFilter, {label: salesStockT("salesStock.fromYard", "From yard"), name: "sourceLocationId", attribute: 'data-sales-stock-filter="sourceLocationFilter"', disabled: Boolean(salesStockState.composer)})}
-          <button data-sales-stock-action="clear-filters" type="button" ${navigationDisabled}>${salesStockT("salesStock.clearFilters", "Clear filters")}</button>
+          <div class="stock-request-filter-actions"><button data-sales-stock-action="clear-filters" type="button" ${navigationDisabled}>${salesStockT("salesStock.clearFilters", "Clear filters")}</button>
+          <button class="primary" data-sales-stock-action="apply-filters" type="button" ${navigationDisabled}>${window.RegularStockUI.t('Apply', '应用')}</button></div>
         </div>
       </div>
       <div class="stock-request-feedback">
@@ -526,8 +557,19 @@ function renderSalesStockRequests() {
         <section class="stock-request-panel stock-request-detail">${salesStockState.composer ? salesStockComposer() : salesStockDetail()}</section>
       </div>
     </section>`;
+  }
+  for (const name of openFilters) {
+    const filter = salesStockRequestApp.querySelector(`[data-sales-multi-filter="${name}"]`);
+    if (filter) filter.open = true;
+  }
+  window.StockRequestConversation?.watchQueue(salesStockRequestApp, {url:salesStockState.conversationQueueUrl, requests:salesStockState.requests,
+    active:()=>window.MBBSSalesStockActiveTab === 'regular', read:salesStockApi, error:()=>salesStockUpdates?.changed(),
+    accept:requests=>{salesStockState.requests=requests; const list=salesStockRequestApp.querySelector('.stock-request-list'); if(list)list.innerHTML=salesStockList();}});
+  window.StockRequestConversation?.render(salesStockRequestApp, salesStockState.composer ? null : salesStockState.detail, 'sales', {onWorkflowUpdated:async()=>{await salesStockLoadDetail(salesStockState.detail.id);renderSalesStockRequests({detailOnly:true});}});
   salesStockRestoreFocus(focusSnapshot);
   salesStockRestoreScroll(scrollSnapshot);
+  if (detailOnly) window.StockRequestView?.setError(salesStockRequestApp, salesStockState.error);
+  salesStockUpdates?.paint();
   const displayed=salesStockState.detail;
   if(!salesStockState.composer&&!salesStockState.loading&&!document.hidden && displayed?.manualDecisionEventId && displayed.requestedBy===salesStockState.operator?.id){
     const key=`${displayed.id}:${displayed.manualDecisionEventId}`;
@@ -540,15 +582,24 @@ function renderSalesStockRequests() {
   }
 }
 
-async function salesStockLoadDetail(id) {
+async function salesStockLoadDetail(id, {selection=false} = {}) {
   if (!id) {
     salesStockState.detail = null;
     return;
   }
   const generation = ++salesStockState.loadGeneration;
-  const detail = await salesStockApi(`/api/sales/stock-requests/${encodeURIComponent(id)}`);
+  const edits = salesStockUpdates?.editVersion, version = salesStockUpdates?.version;
+  let detail;
+  try {detail = await salesStockApi(`/api/sales/stock-requests/${encodeURIComponent(id)}`);}
+  catch (error) {if (generation !== salesStockState.loadGeneration) return;throw error;}
   if (generation !== salesStockState.loadGeneration) return;
+  if (selection && (salesStockState.composer || salesStockState.replyDraft || salesStockState.saving || edits !== salesStockUpdates?.editVersion || version !== salesStockUpdates?.version)) {
+    salesStockUpdates?.changed();
+    return;
+  }
   salesStockState.detail = detail;
+  salesStockState.requests = salesStockState.requests.map(row => Number(row.id) === Number(id) ? detail : row);
+  if (selection) renderSalesStockRequests({detailOnly:true});
 }
 
 async function salesStockLoad({ preserveSelection = true, background = false } = {}) {
@@ -558,25 +609,33 @@ async function salesStockLoad({ preserveSelection = true, background = false } =
     return false;
   }
   const generation = ++salesStockState.loadGeneration;
+  const version = salesStockUpdates?.version;
   if (!background) {
     salesStockState.loading = true;
     renderSalesStockRequests();
   }
-  const params = new URLSearchParams({ bucket: salesStockState.bucket, limit: "100" });
+  const params = new URLSearchParams({ bucket: "", limit: "100" });
+  if(salesStockState.requestTypeFilter.length)params.set("type",salesStockState.requestTypeFilter.join(','));
+  if(salesStockState.backorderStageFilter.length)params.set("stage",salesStockState.backorderStageFilter.join(','));
   if (salesStockState.search.trim()) params.set("search", salesStockState.search.trim());
-  if (salesStockState.vendorFilter) params.set("vendor", salesStockState.vendorFilter);
+  if (salesStockState.search.trim()) params.set("allStatuses", "1");
+  if (salesStockState.vendorFilter.length) params.set("vendors", JSON.stringify(salesStockState.vendorFilter));
   if (salesStockState.requestDateFilter) params.set("requestDate", salesStockState.requestDateFilter);
   if (salesStockState.sourceLocationFilter) params.set("sourceLocationIds", salesStockState.sourceLocationFilter);
   const payload = await salesStockApi(`/api/sales/stock-requests?${params}`);
   if (generation !== salesStockState.loadGeneration) return;
+  salesStockState.conversationQueueUrl = `/api/sales/stock-requests?${params}`;
   const requests = payload.requests || [];
   let selectedId = salesStockState.selectedId;
   if (!preserveSelection || !requests.some((request) => Number(request.id) === Number(selectedId))) {
     selectedId = requests[0]?.id || null;
   }
-  const detail = selectedId
+  const selected = requests.find((request) => Number(request.id) === Number(selectedId)) || null;
+  // Backorder and Waitlist queues contain the complete authorized detail.
+  // Stocking detail additionally reads current availability and purchasing evidence.
+  const detail = selected && !["backorder", "waitlist"].includes(selected.regular?.deliveryMethod)
     ? await salesStockApi(`/api/sales/stock-requests/${encodeURIComponent(selectedId)}`)
-    : null;
+    : selected;
   if (generation !== salesStockState.loadGeneration) return;
   const filterOptions = payload.filterOptions || { vendors: [], sourceYards: [] };
   const allowOverAvailability = payload.allowOverAvailability === true;
@@ -597,6 +656,7 @@ async function salesStockLoad({ preserveSelection = true, background = false } =
       salesStockState.composer.destinationLocationId
     );
     salesStockState.yards = payload.yards || [];
+  salesStockState.stockingYards=payload.stockingYards||salesStockState.yards;
     salesStockState.filterOptions = filterOptions;
     salesStockState.allowOverAvailability = allowOverAvailability;
     salesStockState.availabilityGateRevision = availabilityGateRevision;
@@ -616,6 +676,7 @@ async function salesStockLoad({ preserveSelection = true, background = false } =
   }
   const dataChanged = dataSignature !== salesStockState.dataSignature;
   salesStockState.yards = payload.yards || [];
+  salesStockState.stockingYards=payload.stockingYards||salesStockState.yards;
   salesStockReconcileNewComposerDestination();
   salesStockState.filterOptions = filterOptions;
   salesStockState.allowOverAvailability = allowOverAvailability;
@@ -628,6 +689,7 @@ async function salesStockLoad({ preserveSelection = true, background = false } =
   if (selectedId) localStorage.setItem("mbbs.sales.stockRequests.selected", String(selectedId));
   salesStockState.loading = false;
   salesStockState.error = "";
+  salesStockUpdates?.acknowledge(version);
   if (!background || dataChanged) renderSalesStockRequests();
   return dataChanged;
 }
@@ -664,7 +726,7 @@ async function salesStockChooseItem(line, itemId) {
   const item = (salesStockState.suggestions.get(line.key) || []).find((candidate) => Number(candidate.itemId) === Number(itemId))
     || (Number(line.item?.itemId)===Number(itemId)?line.item:null);
   if (!item) return;
-  const composer = salesStockState.composer;
+  const composer = /** @type {Record<string,any>} */ (salesStockState.composer);
   const availabilityGeneration = Number(line.availabilityGeneration || 0) + 1;
   line.availabilityGeneration = availabilityGeneration;
   const selectedPurchase=window.RegularPurchaseUI?.purchase(composer), selectedDestination=composer?.destinationLocationId;
@@ -678,7 +740,7 @@ async function salesStockChooseItem(line, itemId) {
   line.loadingAvailability = true;
   line.availability = null;
   salesStockState.suggestions.delete(line.key);
-  if(window.RegularWaitlist?.isWaitlist(composer)){line.loadingAvailability=false;line.sourceLocationId='';renderSalesStockRequests();return;}
+  if(window.RegularWaitlist?.isWaitlist(composer)||salesBackorderUI?.isBackorder(composer)){line.loadingAvailability=false;line.sourceLocationId='';renderSalesStockRequests();return;}
   renderSalesStockRequests();
   const operation=window.RegularStockDialog.begin(selectedPurchase?window.RegularStockUI.t('Refreshing current-yard stock…','正在刷新当前货场库存…'):window.RegularStockUI.t('Refreshing availability at all yards…','正在刷新所有货场的可用库存…'),{lockFields:true});
   try {
@@ -712,7 +774,7 @@ async function salesStockRefreshComposerItems() {
 function salesStockLinePayload(line) {
   if (!line.item?.itemId) throw new Error("Select an item on every request line.");
   if(window.RegularWaitlist?.isWaitlist(salesStockState.composer))return {itemId:Number(line.item.itemId),salesQty:Number(line.salesQty)};
-  const purchase=window.RegularPurchaseUI?.purchase(salesStockState.composer);
+  const purchase=window.RegularPurchaseUI?.purchase(salesStockState.composer)||salesBackorderUI?.isBackorder(salesStockState.composer);
   if (!purchase&&!line.sourceLocationId) throw new Error(`Select a source yard for ${line.item.itemCode}.`);
   const conversions = [line.item.toPlt, line.item.toLyr, line.item.toSec, line.item.toPcs].some((value) => Number(value) > 0);
   const payload = {
@@ -727,12 +789,12 @@ function salesStockLinePayload(line) {
   } else {
     payload.salesQty = Number(line.salesQty);
   }
-  return payload;
+  return salesBackorderUI?.isBackorder(salesStockState.composer)?salesBackorderUI.linePayload(line,payload):payload;
 }
 
 async function salesStockSaveComposer() {
   if(salesStockState.saving || window.RegularStockDialog.isBusy())return;
-  const composer = salesStockState.composer;
+  const composer = /** @type {Record<string,any>} */ (salesStockState.composer);
   const visibleDestinationLocationId = salesStockRequestApp.querySelector("[data-sales-stock-destination]")?.value;
   if (visibleDestinationLocationId !== undefined) composer.destinationLocationId = visibleDestinationLocationId;
   salesStockState.error = "";
@@ -746,10 +808,12 @@ async function salesStockSaveComposer() {
     if (!destinationLocationId) throw new Error("Select a valid supported destination yard.");
     const simpleDelivery=window.RegularStockDelivery?.composing(composer);
     if(composer.workflowVersion===2&&!simpleDelivery)await window.RegularStockUI.normalize(composer,salesStockRequestApp);
-    const body = simpleDelivery ? {deliveryMethod:'delivery',sourceLocationId:Number(composer.sourceLocationId),destinationLocationId,salesOrderRef:composer.salesOrderRef} : {
+    const body = simpleDelivery ? {deliveryMethod:'delivery',sourceLocationId:Number(composer.sourceLocationId),destinationLocationId,salesOrderRef:composer.salesOrderRef,
+      selectedRemoteLineIds:composer.selectedRemoteLineIds} : {
       ...(composer.workflowVersion===2?{customerName:composer.customerName,deliveryMethod:composer.deliveryMethod,stockingType:composer.stockingType||"transfer",
         ...(window.RegularWaitlist?.isWaitlist(composer)?{customerId:composer.customerId,operationKey:composer.operationKey}:{}),
         ...(composer.deliveryMethod==='delivery'?{arrivalDate:composer.arrivalDate,arrivalTime:composer.arrivalTime}:{})}:{}),
+      ...(salesBackorderUI?.isBackorder(composer)?salesBackorderUI.composerPayload(composer):{}),
       destinationLocationId,
       remarks: composer.remarks,
       lines: composer.lines.map(salesStockLinePayload),
@@ -780,6 +844,7 @@ async function salesStockSaveComposer() {
 }
 
 salesStockRequestApp.addEventListener("input", (event) => {
+  if(event.target instanceof HTMLInputElement || event.target instanceof HTMLTextAreaElement){if(event.target.dataset.regularReplyField&&salesStockState.replyDraft){salesStockState.replyDraft[/** @type {'message'|'eta'|'salesOrderRef'} */ (event.target.dataset.regularReplyField)]=event.target.value;return;}}
   if(event.target.matches('[data-regular-so]') && salesStockState.detail?.regular){
     const regular=salesStockState.detail.regular;
     regular.soInput=event.target.value;
@@ -826,13 +891,18 @@ salesStockRequestApp.addEventListener("input", (event) => {
 });
 
 salesStockRequestApp.addEventListener("change", (event) => {
+  if(event.target.matches('[data-delivery-line-id]')&&salesStockState.composer){
+    void window.RegularStockDelivery.selectLine(salesStockState.composer,Number(event.target.dataset.deliveryLineId),event.target.checked,salesStockApi,renderSalesStockRequests);
+    return;
+  }
   if(event.target.dataset.regularField && salesStockState.composer){
     const field=event.target.dataset.regularField;
     salesStockState.composer[field]=event.target.value;
-    if(['deliveryMethod','stockingType'].includes(field)){
+    if(['deliveryMethod','stockingType','fulfillmentMethod'].includes(field)){
       const composer=salesStockState.composer;
       if(composer.deliveryMethod==='waitlist'){composer.lines=composer.lines.slice(0,1);composer.customerId=null;composer.operationKey=crypto.randomUUID();}
       if(field==='deliveryMethod'&&composer.deliveryMethod!=='stocking')composer.stockingType='transfer';
+      if(field==='deliveryMethod')salesStockReconcileNewComposerDestination();
       for(const line of composer.lines){line.availabilityGeneration++;line.loadingAvailability=false;line.availability=null;}
       renderSalesStockRequests();
       void salesStockRefreshComposerItems();
@@ -841,11 +911,17 @@ salesStockRequestApp.addEventListener("change", (event) => {
     return;
   }
   if (event.target.matches("[data-sales-stock-filter]")) {
-    const filterName = event.target.dataset.salesStockFilter;
+    const filterName = /** @type {"requestTypeFilter"|"backorderStageFilter"|"vendorFilter"|"requestDateFilter"|"sourceLocationFilter"|"destinationLocationFilter"|"search"} */ (event.target.dataset.salesStockFilter);
+    if (filterName === 'requestTypeFilter' || filterName === 'backorderStageFilter' || filterName === 'vendorFilter') {
+      salesStockState[filterName] = [...salesStockRequestApp.querySelectorAll(`[data-sales-stock-filter="${filterName}"]:checked`)].map(input=>input.value);
+      salesStockSaveFilters();
+    } else {
+      const yardName = event.target.type === 'checkbox' ? event.target.name : null;
+      salesStockState[filterName] = yardName
+        ? [...salesStockRequestApp.querySelectorAll(`[name="${yardName}"]:checked`)].map(input => input.value).join(',')
+        : event.target.value;
+    }
     const yardName = event.target.type === 'checkbox' ? event.target.name : null;
-    salesStockState[filterName] = yardName
-      ? [...salesStockRequestApp.querySelectorAll(`[name="${yardName}"]:checked`)].map(input => input.value).join(',')
-      : event.target.value;
     salesStockLoad({ preserveSelection: false }).then(() => {
       const filter = yardName && salesStockRequestApp.querySelector(`[data-yard-filter="${yardName}"]`);
       if (filter) filter.open = true;
@@ -862,7 +938,7 @@ salesStockRequestApp.addEventListener("change", (event) => {
       if (String(line.sourceLocationId) === String(event.target.value)) line.sourceLocationId = "";
     }
     renderSalesStockRequests();
-    if(window.RegularPurchaseUI?.purchase(salesStockState.composer))void salesStockRefreshComposerItems();
+    if(window.RegularPurchaseUI?.purchase(salesStockState.composer)||salesBackorderUI?.isBackorder(salesStockState.composer))void salesStockRefreshComposerItems();
     return;
   }
   const line = salesStockComposerLineElement(event.target);
@@ -883,16 +959,46 @@ salesStockRequestApp.addEventListener('focusout',async event=>{
   }
 });
 salesStockRequestApp.addEventListener("submit", (event) => {
+  if(event.target.matches('[data-regular-reply-form]')){event.preventDefault();void salesStockSendReply(event.target);return;}
   if (!event.target.matches("[data-sales-stock-form]")) return;
   event.preventDefault();
   salesStockSaveComposer();
 });
 
+async function salesStockSendReply(form) {
+  const request=/** @type {import('../tools/regular-stock-resolution-globals.js').RegularResolutionRequest|null} */ (salesStockState.detail),draft=salesStockState.replyDraft;
+  if(salesStockState.saving||!form.reportValidity()||!request||!draft||draft.requestId!==request.id)return;
+  salesStockState.saving=true;salesStockState.error='';renderSalesStockRequests({detailOnly:true});
+  try{
+    salesStockState.detail=await salesStockApi(`/api/sales/stock-requests/${request.id}/reply`,{method:'POST',body:JSON.stringify(draft)});
+    salesStockState.replyDraft=null;salesStockState.requests=salesStockState.requests.map(row=>row.id===request.id?salesStockState.detail||row:row);
+  }catch(error){salesStockState.error=error.message;}
+  finally{salesStockState.saving=false;renderSalesStockRequests();}
+}
+
 salesStockRequestApp.addEventListener("click", async (event) => {
-  const button = event.target.closest('[data-sales-stock-action], [data-yard-filter-clear="sourceLocationId"]');
+  const button = event.target.closest('[data-sales-stock-action], [data-yard-filter-clear="sourceLocationId"], [data-sales-filter-clear], [data-yard-filter-apply="sourceLocationId"], [data-sales-filter-apply]');
   if (!button || window.RegularStockDialog.isBusy()) return;
   const action = button.dataset.salesStockAction;
+  if(action==='reply'){
+    const request=/** @type {import('../tools/regular-stock-resolution-globals.js').RegularResolutionRequest|null} */ (salesStockState.detail),line=request?.lines?.find(line=>line.id===Number(button.dataset.lineId));
+    if(!request||!line||!window.RegularStockReply?.eligible(request,'sales',(/** @type {{id:string}|null} */ (salesStockState.operator))?.id,line))return;
+    salesStockState.replyDraft={requestId:request.id,lineId:line.id,expectedRevision:request.revision,message:'',salesOrderRef:''};
+    renderSalesStockRequests({detailOnly:true});salesStockRequestApp.querySelector('[data-regular-reply-field="message"]')?.focus();return;
+  }
+  if(action==='cancel-reply'){salesStockState.replyDraft=null;salesStockState.error='';renderSalesStockRequests({detailOnly:true});return;}
   try {
+    if (action === 'apply-filters' || button.hasAttribute('data-sales-filter-apply') || button.hasAttribute('data-yard-filter-apply')) {
+      if (button.disabled || salesStockState.composer) return;
+      window.clearTimeout(salesStockState.refreshTimer);
+      salesStockRequestApp.querySelectorAll('.stock-request-yard-filter[open]').forEach(filter => filter.removeAttribute('open'));
+      return await salesStockLoad({preserveSelection: false});
+    }
+    if (button.dataset.salesFilterClear) {
+      salesStockState[button.dataset.salesFilterClear] = [];
+      salesStockSaveFilters();
+      return salesStockLoad({preserveSelection:false});
+    }
     if (button.dataset.yardFilterClear) {
       salesStockState[button.dataset.yardFilterClear === 'sourceLocationId' ? 'sourceLocationFilter' : 'destinationLocationFilter'] = '';
       return salesStockLoad({preserveSelection: false});
@@ -921,25 +1027,27 @@ salesStockRequestApp.addEventListener("click", async (event) => {
       return renderSalesStockRequests();
     }
     if (action === "choose-item") return salesStockChooseItem(salesStockComposerLineElement(button), button.dataset.itemId);
-    if (action === "bucket") {
-      salesStockState.bucket = button.dataset.bucket;
-      localStorage.setItem("mbbs.sales.stockRequests.bucket", salesStockState.bucket);
-      salesStockState.composer = null;
-      return salesStockLoad({ preserveSelection: false });
-    }
     if (action === "refresh") return salesStockLoad({ preserveSelection: true });
     if (action === "clear-filters") {
-      salesStockState.vendorFilter = "";
+      salesStockState.bucket = "";
+      localStorage.setItem("mbbs.sales.stockRequests.bucket", "");
+      salesStockState.requestTypeFilter=[];salesStockState.backorderStageFilter=[];
+      salesStockState.vendorFilter = [];
+      salesStockSaveFilters();
       salesStockState.requestDateFilter = "";
       salesStockState.sourceLocationFilter = "";
       return salesStockLoad({ preserveSelection: false });
     }
     if (action === "select") {
+      if (Number(button.dataset.id) === salesStockState.selectedId && !salesStockState.composer) return;
+      salesStockState.replyDraft=null;
       salesStockState.selectedId = Number(button.dataset.id);
       localStorage.setItem("mbbs.sales.stockRequests.selected", String(salesStockState.selectedId));
       salesStockState.composer = null;
-      await salesStockLoadDetail(salesStockState.selectedId);
-      return renderSalesStockRequests();
+      salesStockState.detail = structuredClone(salesStockState.requests.find(row => Number(row.id) === salesStockState.selectedId) || null);
+      salesStockState.error = '';
+      renderSalesStockRequests({detailOnly:true});
+      return await salesStockLoadDetail(salesStockState.selectedId, {selection:true});
     }
     if(action==='delivery-preview-retry')return window.RegularStockDelivery.refresh(salesStockState.composer,salesStockApi,renderSalesStockRequests);
     if(action==='delivery-retry'){
@@ -1008,19 +1116,27 @@ salesStockRequestApp.addEventListener("click", async (event) => {
     }
   } catch (error) {
     salesStockState.error = error.message;
-    renderSalesStockRequests();
+    if (action === 'select') {
+      window.StockRequestView?.setError(salesStockRequestApp, salesStockMessage(error.message));
+      salesStockUpdates?.paint();
+    } else renderSalesStockRequests();
   }
 });
 
 window.setInterval(()=>{
-  if(!salesStockState.composer && !window.RegularStockDialog.isBusy() && window.RegularStockUI.approvalExpired(salesStockState.detail) && salesStockRequestApp.querySelector('[data-regular-so]'))renderSalesStockRequests();
+  if(window.MBBSSalesStockActiveTab !== 'regular' || salesStockState.composer || window.RegularStockDialog.isBusy() || !window.RegularStockUI.approvalExpired(salesStockState.detail)) return;
+  const form = salesStockRequestApp.querySelector('.regular-stock-so:not([data-expired])');
+  if (!form) return;
+  form.dataset.expired = '';
+  for (const control of form.querySelectorAll('input,select,button')) control.disabled = true;
+  salesStockUpdates?.changed();
 },1000);
 
 let salesPrintRefreshing=false;
 window.setInterval(async()=>{
-  if(salesPrintRefreshing||salesStockState.composer||salesStockState.saving||window.RegularStockDialog.isBusy()||!window.RegularStockDelivery.printing(salesStockState.detail))return;
+  if(window.MBBSSalesStockActiveTab !== 'regular'||salesStockUpdates?.pending||salesPrintRefreshing||salesStockState.composer||salesStockState.saving||window.RegularStockDialog.isBusy()||!window.RegularStockDelivery.printing(salesStockState.detail))return;
   salesPrintRefreshing=true;
-  try{await salesStockLoadDetail(salesStockState.selectedId);renderSalesStockRequests();}catch{/* Keep last known printer state; Refresh remains available. */}
+  try{const detail=await salesStockApi(`/api/sales/stock-requests/${salesStockState.selectedId}`);if(JSON.stringify(detail)!==JSON.stringify(salesStockState.detail))salesStockUpdates?.changed();}catch{/* Keep last known printer state; Refresh remains available. */}
   finally{salesPrintRefreshing=false;}
 },3000);
 
@@ -1030,16 +1146,8 @@ function salesStockConnectEvents() {
   salesStockState.eventSource.addEventListener("app-event", (message) => {
     let event;
     try { event = JSON.parse(message.data || "{}"); } catch { return; }
-    if (event.type !== "stock-request.updated" && event.type !== "dispatch.orders.updated" && event.type !== "driver.job.completed") return;
-    if (salesStockState.composer || salesStockState.saving) {
-      salesStockState.refreshPending = true;
-      return;
-    }
-    window.clearTimeout(salesStockState.refreshTimer);
-    salesStockState.refreshTimer = window.setTimeout(() => salesStockLoad({
-      preserveSelection: true,
-      background: true
-    }).catch(() => {}), 400);
+    if (!window.StockRequestView?.regularEventRelevant(event, salesStockState.requests)) return;
+    salesStockUpdates?.changed();
   });
 }
 
@@ -1064,22 +1172,28 @@ requireDispatchLogin({
   allowPublicSales: false,
   async onReady(operator) {
     salesStockState.operator = operator;
+    await salesBackorderReady();
     window.RegularWaitlist.configure({api:salesStockApi,getRequest:()=>salesStockState.detail,getComposer:()=>salesStockState.composer,
       setRequest:request=>{salesStockState.detail=request;salesStockState.bucket=request.bucket;},render:renderSalesStockRequests,
       reload:()=>salesStockLoad({preserveSelection:true}),error:message=>{salesStockState.error=message;renderSalesStockRequests();}});
     window.RegularStockDelivery.configure(operator.id);
     try {
       ({yardFilterHtml: salesStockYardFilterHtml} = await salesStockYardFilterReady);
+      ({salesStockRequestStatus, SALES_STOCK_STATUSES: salesStockStatusLabels} = await salesStockStatusReady);
+      const filters = await salesStockFiltersReady;
+      salesStockListFiltersHtml = filters.salesStockListFiltersHtml;
+      Object.assign(salesStockState, filters.restoreSalesStockFilters(localStorage.getItem('mbbs.sales.stockRequests.filters')));
       if (window.MBBSSalesStockActiveTab === "special") await window.MBBSSalesSpecialStock.open({operator});
       else {
         const linkedId=Number(new URLSearchParams(location.search).get('requestId'));
-        if(linkedId>0){const linked=await salesStockApi(`/api/sales/stock-requests/${linkedId}`);salesStockState.bucket=linked.bucket;salesStockState.selectedId=linked.id;}
+        if(linkedId>0){const linked=await salesStockApi(`/api/sales/stock-requests/${linkedId}`);salesStockState.bucket=linked.bucket;salesStockState.selectedId=linked.id;salesStockState.requestTypeFilter=[];salesStockState.backorderStageFilter=[];salesStockState.vendorFilter=[];}
         await salesStockLoad({ preserveSelection: true });
       }
       if(window.MBBSSalesStockActiveTab!=='special'){
         const resumed=await window.RegularStockDelivery.resume(salesStockApi,'sales',(input,preview,error='')=>{
           salesStockStartNew();Object.assign(salesStockState.composer,{workflowVersion:2,deliveryMethod:'delivery',...input,
-            sourceLocationId:String(input.sourceLocationId||'')===String(preview?.baseLocationId)?'':String(input.sourceLocationId||''),destinationLocationId:String(preview?.baseLocationId||''),deliveryPreview:preview,deliveryError:error});renderSalesStockRequests();
+            sourceLocationId:String(input.sourceLocationId||'')===String(preview?.baseLocationId)?'':String(input.sourceLocationId||''),destinationLocationId:String(preview?.baseLocationId||''),deliveryPreview:preview,
+            deliverySelectionRef:String(input.salesOrderRef||'').trim().toUpperCase(),selectedRemoteLineIds:preview?.selectedRemoteLineIds||input.selectedRemoteLineIds,deliveryError:error});renderSalesStockRequests();
         });
         if(resumed){salesStockState.selectedId=resumed.id;salesStockState.bucket=resumed.bucket;await salesStockLoad({preserveSelection:true});}
       }

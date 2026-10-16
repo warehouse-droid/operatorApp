@@ -1,4 +1,5 @@
 // @ts-check
+import { assertFrontdeskBinDelivered } from "./frontdesk-bin-readiness.js";
 
 import crypto from "node:crypto";
 
@@ -976,7 +977,25 @@ async function currentContractTotalMinor(contract) {
         AND request_kind <> 'initial_bin'`,
     [contract.contract_id]
   );
-  return safeAdd(base, Number(additions.rows[0].total_minor), "Current contract total");
+  const adjustments = await query(
+    `SELECT COALESCE(sum((after_snapshot->>'customerChargeAdjustmentMinor')::bigint), 0) AS total_minor
+       FROM mbt_contract_amendments
+      WHERE contract_id = $1::uuid
+        AND status = 'approved'
+        AND amendment_type = 'other'
+        AND after_snapshot->>'schemaVersion' = 'mbt-frontdesk-charge-adjustment-v1'`,
+    [contract.contract_id]
+  );
+  const gross = safeAdd(base, Number(additions.rows[0].total_minor), "Current contract total");
+  return nonnegativeInteger(
+    safeAdd(gross, Number(adjustments.rows[0].total_minor), "Adjusted contract total"),
+    "Active contract total"
+  );
+}
+
+/** @param {Record<string, any>} contract */
+export async function currentFrontdeskContractTotal(contract) {
+  return currentContractTotalMinor(contract);
 }
 
 /** @param {string} customerNetsuiteId */
@@ -1617,6 +1636,9 @@ export async function previewFrontdeskChargeRequest(input) {
           );
           if (!line.rowCount || Number(line.rows[0].revision) !== expectedServiceLineRevision) {
             throw failure(409, "MBT_STALE_REVISION", "The service line changed. Refresh and recalculate the request.");
+          }
+          if (kind === "exchange_bin") {
+            await assertFrontdeskBinDelivered(serviceLineId);
           }
         }
       } else {

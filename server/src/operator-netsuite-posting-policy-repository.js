@@ -25,25 +25,25 @@ export async function getOperatorNetSuitePostingPolicy({
 } = {}) {
   const gateKey = operatorNetSuitePostingGateKey({ functionKey, locationId });
   let flag = null;
+  let creditMemoFlag = null;
   if (gateKey) {
+    const creditMemoKey = gateKey.includes("_return_ra_") ? gateKey.replace("_return_ra_", "_return_cm_") : null;
     const result = await query(
-      `SELECT enabled, revision
+      `SELECT flag_key, enabled, revision
          FROM mbt_feature_flags
-        WHERE flag_key = $1
+        WHERE flag_key = ANY($1::text[])
+        ORDER BY flag_key
         ${lock ? "FOR SHARE" : ""}`,
-      [gateKey]
+      [[gateKey, creditMemoKey].filter(Boolean)]
     );
-    if (result.rows[0]) {
-      flag = {
-        enabled: result.rows[0].enabled === true,
-        revision: Number(result.rows[0].revision)
-      };
-    }
+    flag = result.rows.find(row => row.flag_key === gateKey) || null;
+    creditMemoFlag = result.rows.find(row => row.flag_key === creditMemoKey) || null;
   }
   return materializeOperatorNetSuitePostingPolicy({
     functionKey,
     locationId,
     flag,
+    creditMemoFlag,
     directAccessEnabled: directAccessEnabled === true
   });
 }

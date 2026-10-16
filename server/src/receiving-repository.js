@@ -1,11 +1,26 @@
 import { isBackgroundPhotoReference } from "./operator-background-photos.js";
 import { query, withTransaction } from "./db.js";
+import { captureTransferPosting,readTransferReceiptProgress,applyTransferReceiptProgress,
+  readTransferLoadedQuantities,applyTransferLoadedQuantities } from './transfer-order-posting-repository.js';
 import { readReceivingReceiptProgress, applyReceivingReceiptProgress, receivingQuantityAfterReceipt } from "./receiving-receipt-progress.js";
 import { readReceivingPoSplitReservations, applyReceivingPoSplitReservations } from "./receiving-po-split-progress.js";
 import { writeAudit } from "./auth-repository.js";
 import { netSuiteClosedOrderFamilySql } from "./netsuite-closed-order-policy.js";
+import { netSuiteReceivedTransferOrderSql } from "./operator-transfer-completion.js";
 import { assertNoClosedNetSuiteOrders, listClosedNetSuiteOrders } from "./netsuite-closed-order-repository.js";
 import { receivingOrderYards, scopeReceivingOrderYard } from "./receiving-yard-scope.js";
+import { isSmallNetSuiteSqftVariance } from './operator-netsuite-posting-quantity.js';
+
+function transferLocalLoadExistsSql() {
+  return `(EXISTS (SELECT 1 FROM operator_load_records load
+    WHERE load.order_id=t.netsuite_id AND load.order_family='transfer_order' AND load.load_type='transfer_order_load')
+    OR EXISTS (SELECT 1 FROM delivery_audit_log legacy
+      WHERE legacy.order_id=t.netsuite_id AND legacy.actor_type='system' AND legacy.source='admin'
+        AND legacy.action='operator.to.legacy_receiving_enabled'
+        AND legacy.details->>'orderRef'=t.tranid
+        AND legacy.details->>'sourceNetSuiteId'=t.netsuite_id::text
+        AND jsonb_array_length(COALESCE(legacy.details->'verifiedLoadLines','[]'::jsonb))>0))`;
+}
 
 function normalizeNumber(value) {
   if (value === null || value === undefined || value === "") return null;
@@ -328,11 +343,13 @@ export async function listReceivingSources({ destinationLocationId = null } = {}
               from_location AS source_location,
               to_location_id AS destination_location_id,
               status_text,
+              ${transferLocalLoadExistsSql()} AS has_local_load,
               netsuite_active
 	       FROM transfer_orders t
 	       WHERE t.to_location_id IS NOT NULL
            AND t.receiving_status IS DISTINCT FROM 'received'
 	         AND NOT ${netSuiteClosedOrderFamilySql("t", "TO")}
+	         AND NOT ${netSuiteReceivedTransferOrderSql("t")}
          AND NOT EXISTS (
            SELECT 1 FROM order_dependencies d
             WHERE d.transfer_order_id = t.netsuite_id
@@ -341,7 +358,7 @@ export async function listReceivingSources({ destinationLocationId = null } = {}
          )
      ) transfer_receiving_source
      WHERE netsuite_active = true
-       AND (status_text ILIKE '%Pending Receipt%' OR status_text ILIKE '%Partially Received%')
+       AND has_local_load
        ${destinationClause}
      GROUP BY source_location_id, source_location
      ORDER BY source_location`,
@@ -353,7 +370,8 @@ export async function listReceivingSources({ destinationLocationId = null } = {}
 export async function listReceivingOrders({ orderType, vendor = null, sourceLocationId = null, destinationLocationId = null, search = null, itemSearch = null } = {}) {
   const params = [orderType];
   let destinationParameter = null;
-  const clauses = ["ro.order_type = $1", "ro.netsuite_active = true", "ro.receipt_status IS DISTINCT FROM 'received'", "(ro.status_text ILIKE '%Pending Receipt%' OR ro.status_text ILIKE '%Partially Received%')"];
+  const clauses = ["ro.order_type = $1", "ro.netsuite_active = true", "ro.receipt_status IS DISTINCT FROM 'received'",
+    "((ro.order_type='transfer_order' AND ro.has_local_load) OR (ro.order_type='purchase_order' AND (ro.status_text ILIKE '%Pending Receipt%' OR ro.status_text ILIKE '%Partially Received%')))"];
   if (vendor) {
     params.push(vendor);
     clauses.push(`ro.vendor = $${params.length}`);
@@ -398,7 +416,7 @@ export async function listReceivingOrders({ orderType, vendor = null, sourceLoca
               COALESCE(${scheduleDestinationLocationIdSql("schedule.dropoff_point")}, po.destination_location_id) AS destination_location_id,
               COALESCE(NULLIF(BTRIM(schedule.dropoff_point), ''), po.destination_location) AS destination_location,
               NULLIF(BTRIM(schedule.dropoff_point), '') AS destination_override,
-              po.netsuite_active, po.synced_at, po.receipt_status, po.memo, po.expected_delivery_date,
+              false AS has_local_load, po.netsuite_active, po.synced_at, po.receipt_status, po.memo, po.expected_delivery_date,
               po.dispatch_vendor_yard, po.dispatch_address, po.dispatch_window_start,
               po.dispatch_window_end, po.dispatch_instructions
 	       FROM purchase_orders po
@@ -416,13 +434,14 @@ export async function listReceivingOrders({ orderType, vendor = null, sourceLoca
               from_location_id AS source_location_id, from_location AS source_location,
               to_location_id AS destination_location_id, to_location AS destination_location,
               NULL::text AS destination_override,
-              netsuite_active, synced_at, receiving_status AS receipt_status, memo, expected_delivery_date,
+              ${transferLocalLoadExistsSql()} AS has_local_load, netsuite_active, synced_at, receiving_status AS receipt_status, memo, expected_delivery_date,
               NULL::text AS dispatch_vendor_yard, dispatch_address, dispatch_window_start,
               dispatch_window_end, dispatch_instructions
 	       FROM transfer_orders t
 	       WHERE t.to_location_id IS NOT NULL
            AND t.receiving_status IS DISTINCT FROM 'received'
 	         AND NOT ${netSuiteClosedOrderFamilySql("t", "TO")}
+	         AND NOT ${netSuiteReceivedTransferOrderSql("t")}
          AND NOT EXISTS (
            SELECT 1 FROM order_dependencies d
             WHERE d.transfer_order_id = t.netsuite_id
@@ -470,7 +489,7 @@ export async function getReceivingOrder(orderId, { includeNetSuiteClosed = false
               COALESCE(${scheduleDestinationLocationIdSql("schedule.dropoff_point")}, po.destination_location_id) AS destination_location_id,
               COALESCE(NULLIF(BTRIM(schedule.dropoff_point), ''), po.destination_location) AS destination_location,
               NULLIF(BTRIM(schedule.dropoff_point), '') AS destination_override,
-              po.netsuite_active, po.synced_at, po.receipt_status, po.memo, po.expected_delivery_date,
+              false AS has_local_load, po.netsuite_active, po.synced_at, po.receipt_status, po.memo, po.expected_delivery_date,
               po.dispatch_vendor_yard, po.dispatch_address, po.dispatch_window_start,
               po.dispatch_window_end, po.dispatch_instructions
 	       FROM purchase_orders po
@@ -488,7 +507,7 @@ export async function getReceivingOrder(orderId, { includeNetSuiteClosed = false
               from_location_id AS source_location_id, from_location AS source_location,
               to_location_id AS destination_location_id, to_location AS destination_location,
               NULL::text AS destination_override,
-              netsuite_active, synced_at, receiving_status AS receipt_status, memo, expected_delivery_date,
+              ${transferLocalLoadExistsSql()} AS has_local_load, netsuite_active, synced_at, receiving_status AS receipt_status, memo, expected_delivery_date,
               NULL::text AS dispatch_vendor_yard, dispatch_address, dispatch_window_start,
               dispatch_window_end, dispatch_instructions
 	       FROM transfer_orders t
@@ -532,8 +551,8 @@ export async function getReceivingOrder(orderId, { includeNetSuiteClosed = false
               item_type_text, item_description, sku, quantity, unit, location_id, location,
               pallet_qty, layer_qty, piece_qty, section_qty, to_plt, to_lyr, to_sec, to_pcs,
               netsuite_active, sync_exception, synced_at, received_pallet_qty,
-              received_layer_qty, received_piece_qty, received_section_qty, NULL::timestamptz AS confirmed_at,
-              NULL::text AS confirmed_by, netsuite_received_qty,
+              received_layer_qty, received_piece_qty, received_section_qty, confirmed_at,
+              confirmed_by, netsuite_received_qty,
               netsuite_received_qty AS netsuite_received_baseline_qty, pack_quantity_source, received_sales_qty
        FROM transfer_order_lines
        WHERE line_stage = 'receiving'
@@ -554,12 +573,16 @@ export async function getReceivingOrder(orderId, { includeNetSuiteClosed = false
   const receivingOrder = order.rows[0];
   const receipts = receivingOrder.order_type === "purchase_order"
     ? await readReceivingReceiptProgress(query, orderId) : null;
+  const transferReceipts = receivingOrder.order_type === 'transfer_order' ? await readTransferReceiptProgress(orderId) : new Map();
   const splitReservations = receipts ? await readReceivingPoSplitReservations(query, orderId) : new Map();
   const overrideLocationId = receivingOrder.order_type === "purchase_order"
     ? supportedReceivingDestinationLocationId(receivingOrder.destination_override)
     : null;
   const overrideLocation = supportedReceivingDestinationLocation(overrideLocationId);
-  const projectedLines = lines.rows.map((line) => overrideLocationId
+  const loadedLines = receivingOrder.order_type==='transfer_order' && !includeNetSuiteClosed
+    ? applyTransferLoadedQuantities(lines.rows.map(line=>applyTransferReceiptProgress(line,transferReceipts,true)),await readTransferLoadedQuantities(orderId))
+    : lines.rows;
+  const projectedLines = loadedLines.map((line) => overrideLocationId
     ? {
         ...line,
         netsuite_location_id: line.location_id,
@@ -574,7 +597,7 @@ export async function getReceivingOrder(orderId, { includeNetSuiteClosed = false
       receiving_yard_location_ids: receivingOrderYards({ ...receivingOrder, lines: projectedLines })
     } : {}),
     lines: projectedLines.map((/** @type {Record<string,any>} */ line) => applyPoAllocationFields(receipts
-      ? applyReceivingPoSplitReservations(applyReceivingReceiptProgress(line, receipts), splitReservations) : line))
+      ? applyReceivingPoSplitReservations(applyReceivingReceiptProgress(line, receipts), splitReservations) : applyTransferReceiptProgress(line,transferReceipts,!includeNetSuiteClosed)))
       .filter(hasReceivingDisplayQuantity)
   };
   return destinationLocationId === null ? result : scopeReceivingOrderYard(result, destinationLocationId);
@@ -628,9 +651,13 @@ export async function confirmReceivingLine(orderId, lineRowId, values, operatorI
   if (!line.rowCount) throw new Error("Receiving line not found.");
   const raw = line.rows[0];
   const receipts = raw.order_type === "purchase_order" ? await readReceivingReceiptProgress(query, orderId) : null;
+  const transferReceipts = raw.order_type === 'transfer_order' ? await readTransferReceiptProgress(orderId) : new Map();
   const splitReservations = receipts ? await readReceivingPoSplitReservations(query, orderId) : new Map();
-  const current = applyPoAllocationFields(receipts
-    ? applyReceivingPoSplitReservations(applyReceivingReceiptProgress(raw, receipts), splitReservations) : raw);
+  const current = raw.order_type==='transfer_order'
+    ? {...(await getReceivingOrder(orderId))?.lines.find(line=>String(line.id)===String(lineRowId)),order_type:raw.order_type}
+    : applyPoAllocationFields(receipts
+      ? applyReceivingPoSplitReservations(applyReceivingReceiptProgress(raw, receipts), splitReservations) : applyTransferReceiptProgress(raw,transferReceipts));
+  if(!current.id){throw new Error('This transfer line has no loaded quantity available to receive.');}
   const available = receivingUnitAvailability(current);
   const salesOnly = isSalesQuantityOnlyLine(current);
   const pallets = salesOnly ? 0 : Math.min(positiveQuantity(values.pallets), available.pallets);
@@ -809,6 +836,9 @@ export async function unconfirmReceivingLine(orderId, lineRowId, operatorId) {
 export async function getReceivableReceivingOrder(orderId, { includeNetSuiteClosed = false, destinationLocationId = null } = {}) {
   const order = await getReceivingOrder(orderId, { includeNetSuiteClosed });
   if (!order) throw new Error("Receiving order not found.");
+  if(order.order_type==='transfer_order' && !includeNetSuiteClosed && !order.has_local_load) {
+    throw Object.assign(new Error('The outbound yard must load this Transfer Order before it can be received.'),{status:409,code:'TRANSFER_NOT_LOADED'});
+  }
   if (order.receipt_status === "received") {
     throw Object.assign(new Error("This order has already been received. Return to Receiving for open orders."), {
       status: 409, code: "RECEIVING_ALREADY_COMPLETED"
@@ -1513,6 +1543,19 @@ export async function receiveLocalCoOrder(coRefOrId, operatorId, { photoDataUrls
   };
 }
 
+async function transferReceiptCompletionLines(orderId) {
+  const lines=(await query(`SELECT line_id,quantity,item_type,netsuite_active
+    FROM transfer_order_lines WHERE transfer_order_id=$1 AND line_stage='receiving'`,[orderId])).rows;
+  const progress=await readTransferReceiptProgress(orderId);
+  return lines.map(line=>applyTransferReceiptProgress(line,progress,true));
+}
+
+function hasVerifiedRoundingCompletion(line, quantity, remainder, verifiedSalesQuantities) {
+  return Object.hasOwn(verifiedSalesQuantities, String(line.id))
+    && Number(verifiedSalesQuantities[String(line.id)]) === quantity
+    && isSmallNetSuiteSqftVariance(quantity + remainder, quantity, line.unit);
+}
+
 async function recordReceivingReceiptUnlocked(orderId, operatorId, {
   photoDataUrls,
   payload,
@@ -1520,7 +1563,8 @@ async function recordReceivingReceiptUnlocked(orderId, operatorId, {
   itemReceiptId,
   itemReceiptTranid,
   allowNetSuiteCompleted = false,
-  verifiedDirectCompletionEventId = null
+  verifiedDirectCompletionEventId = null,
+  verifiedSalesQuantities = {}
 }) {
   if (!allowNetSuiteCompleted) {
     await assertNoClosedNetSuiteOrders([orderId], "be received");
@@ -1544,6 +1588,9 @@ async function recordReceivingReceiptUnlocked(orderId, operatorId, {
   }
   const order = await getReceivingOrder(orderId, { includeNetSuiteClosed: allowNetSuiteCompleted });
   if (!order) throw new Error("Receiving order not found.");
+  if(order.order_type==='transfer_order' && !allowNetSuiteCompleted && !order.has_local_load) {
+    throw Object.assign(new Error('The outbound yard must load this Transfer Order before it can be received.'),{status:409,code:'TRANSFER_NOT_LOADED'});
+  }
   const receivedQuantities = new Map((payload?.item?.items || [])
     .filter((/** @type {Record<string,any>} */ item) => item.itemReceive !== false && item.itemreceive !== false && positiveQuantity(item.quantity) > 0)
     .map((/** @type {Record<string,any>} */ item) => [String(item.orderLine), positiveQuantity(item.quantity)]));
@@ -1552,22 +1599,36 @@ async function recordReceivingReceiptUnlocked(orderId, operatorId, {
     .map((item) => Number(item.orderLine))
     .filter((id) => Number.isInteger(id));
 
-  const remainingLines = (order.lines || []).filter((line) => {
+  if(order.order_type==='transfer_order' && !allowNetSuiteCompleted) {
+    if(!receivedQuantities.size){throw new Error('No loaded transfer quantity was selected to receive.');}
+    for(const [key,quantity] of receivedQuantities) {
+      const line=order.lines.find(candidate=>String(candidate.line_id)===key);
+      if(!line || quantity>remainingSalesQuantity(line)+0.000001) {
+        throw Object.assign(new Error('Received quantity cannot exceed the locally loaded transfer quantity.'),{status:409});
+      }
+    }
+  }
+
+  const completionLines=order.order_type==='transfer_order' && !allowNetSuiteCompleted
+    ? await transferReceiptCompletionLines(orderId) : order.lines || [];
+  const remainingLines = completionLines.filter((line) => {
     if (!line.netsuite_active || !["InvtPart", "NonInvtPart"].includes(line.item_type || "")) return false;
     if (order.order_type === "purchase_order") {
-      return receivingQuantityAfterReceipt(line, receivedQuantities.get(String(line.line_id)) || 0) > 0.000001;
+      const quantity = receivedQuantities.get(String(line.line_id)) || 0;
+      const remainder = receivingQuantityAfterReceipt(line, quantity);
+      return remainder > 0.000001 && !hasVerifiedRoundingCompletion(line, quantity, remainder, verifiedSalesQuantities);
     }
-    if (!receivedIds.includes(Number(line.line_id))) return true;
-    if (receivedSalesQuantity(line) + 0.000001 < remainingSalesQuantity(line)) return true;
+    if ((receivedQuantities.get(String(line.line_id)) || 0) + netsuiteReceivedBaseline(line) + 0.000001
+      < positiveQuantity(line.transfer_order_quantity ?? line.original_quantity ?? line.quantity)) return true;
     return false;
   });
   const receiptStatus = remainingLines.length ? "partial_received" : "received";
 
-  await query(
+  const receiptRecord = await query(
     `INSERT INTO receiving_receipt_records (
        order_id, operator_id, item_receipt_id, item_receipt_tranid,
        receipt_status, photo_data_urls, payload, response
-     ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8)`,
+     ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8) RETURNING id`,
     [
       orderId,
       operatorId || null,
@@ -1581,6 +1642,16 @@ async function recordReceivingReceiptUnlocked(orderId, operatorId, {
   );
 
   if (order.order_type === "transfer_order") {
+    if (!itemReceiptId && !allowNetSuiteCompleted) {
+      const selected=(order.lines || []).filter(line=>receivedQuantities.has(String(line.line_id)));
+      await captureTransferPosting({order,operatorId,recordId:receiptRecord.rows[0].id,transactionType:'IR',
+        lines:selected.map(line=>({lineId:line.id,sourceLineKey:String(line.line_id),itemId:Number(line.item_id),
+          quantity:receivedQuantities.get(String(line.line_id)),
+          cumulativeQuantity:roundQuantity(netsuiteReceivedBaseline(line)+receivedQuantities.get(String(line.line_id)))}))});
+      await query(`UPDATE transfer_order_lines SET received_pallet_qty=0,received_layer_qty=0,received_section_qty=0,
+        received_piece_qty=0,received_sales_qty=0,confirmed_at=NULL,confirmed_by=NULL
+        WHERE transfer_order_id=$1 AND line_stage='receiving' AND line_id=ANY($2::bigint[])`,[orderId,receivedIds]);
+    }
     await query(
       `UPDATE transfer_orders
        SET receiving_status = $2,
@@ -1612,7 +1683,7 @@ async function recordReceivingReceiptUnlocked(orderId, operatorId, {
 }
 
 /** @param {string|number} orderId @param {string|null} operatorId
- * @param {{photoDataUrls:any,payload:any,response:any,itemReceiptId:any,itemReceiptTranid:any,allowNetSuiteCompleted?:boolean}} options */
+ * @param {{photoDataUrls:any,payload:any,response:any,itemReceiptId:any,itemReceiptTranid:any,allowNetSuiteCompleted?:boolean,verifiedSalesQuantities?:Record<string,number>}} options */
 export async function recordReceivingReceipt(orderId, operatorId, options) {
   return withTransaction(async () => {
     await query("SELECT pg_advisory_xact_lock(hashtextextended($1,0))", [`receiving-receipt:${orderId}`]);
@@ -1698,7 +1769,7 @@ export async function searchReceivingItems({ orderType, vendor = null, sourceLoc
   const clauses = [
     "ro.order_type = $1",
     "ro.netsuite_active = true",
-    "(ro.status_text ILIKE '%Pending Receipt%' OR ro.status_text ILIKE '%Partially Received%')",
+    "((ro.order_type='transfer_order' AND ro.has_local_load) OR (ro.order_type='purchase_order' AND (ro.status_text ILIKE '%Pending Receipt%' OR ro.status_text ILIKE '%Partially Received%')))",
     "rol.netsuite_active = true",
     "(rol.item_name ILIKE $2 OR rol.item_description ILIKE $2)"
   ];
@@ -1721,7 +1792,7 @@ export async function searchReceivingItems({ orderType, vendor = null, sourceLoc
               NULL::bigint AS source_location_id,
               COALESCE(${scheduleDestinationLocationIdSql("schedule.dropoff_point")}, po.destination_location_id) AS destination_location_id,
               NULLIF(BTRIM(schedule.dropoff_point), '') AS destination_override,
-              po.status_text, po.netsuite_active
+              po.status_text, false AS has_local_load, po.netsuite_active
 	       FROM purchase_orders po
          LEFT JOIN scm_transport_schedule schedule
            ON schedule.order_kind = 'PO'
@@ -1732,11 +1803,12 @@ export async function searchReceivingItems({ orderType, vendor = null, sourceLoc
        SELECT netsuite_id, 'transfer_order'::text AS order_type, NULL::text AS vendor,
               from_location_id AS source_location_id, to_location_id AS destination_location_id,
               NULL::text AS destination_override,
-              status_text, netsuite_active
+              status_text, ${transferLocalLoadExistsSql()} AS has_local_load, netsuite_active
 	       FROM transfer_orders t
 	       WHERE t.to_location_id IS NOT NULL
            AND t.receiving_status IS DISTINCT FROM 'received'
 	         AND NOT ${netSuiteClosedOrderFamilySql("t", "TO")}
+	         AND NOT ${netSuiteReceivedTransferOrderSql("t")}
          AND NOT EXISTS (
            SELECT 1 FROM order_dependencies d
             WHERE d.transfer_order_id = t.netsuite_id

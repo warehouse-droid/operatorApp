@@ -42,6 +42,13 @@ x-test-environment: &test-environment
 
 x-test-service: &test-service
   image: mbbs-mbt-p1-test-test:latest
+  cgroup_parent: mbbs-tests.slice
+  init: true
+  cpus: "2.0"
+  mem_limit: 2g
+  mem_reservation: 512m
+  memswap_limit: 2g
+  pids_limit: 512
   build:
     context: ./server
     dockerfile: Dockerfile.test
@@ -54,8 +61,8 @@ x-test-service: &test-service
     - mbt_test_internal
   read_only: true
   tmpfs:
-    - /app/data:uid=1000,gid=1000,mode=0700
-    - /tmp:uid=1000,gid=1000,mode=1777
+    - /app/data:uid=1000,gid=1000,mode=0700,size=128m
+    - /tmp:uid=1000,gid=1000,mode=1777,size=512m
   volumes:
     - ./server/test-artifacts:/app/test-artifacts
     - ./.github/workflows:/workspace/.github/workflows:ro
@@ -66,6 +73,13 @@ x-test-service: &test-service
 services:
   db:
     image: postgres:18-alpine@sha256:9a8afca54e7861fd90fab5fdf4c42477a6b1cb7d293595148e674e0a3181de15
+    cgroup_parent: mbbs-tests.slice
+    init: true
+    cpus: "1.0"
+    mem_limit: 1g
+    mem_reservation: 256m
+    memswap_limit: 1g
+    pids_limit: 256
     environment:
       POSTGRES_DB: mbt_test
       POSTGRES_USER: mbt_test
@@ -74,7 +88,7 @@ services:
     networks:
       - mbt_test_internal
     tmpfs:
-      - /var/lib/postgresql
+      - /var/lib/postgresql:size=768m
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U mbt_test -d mbt_test"]
       interval: 2s

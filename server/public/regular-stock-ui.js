@@ -14,11 +14,11 @@
     if(composer.workflowVersion !== 2)return '';
     return `<div class="stock-request-line-fields regular-stock-fields">
       ${composer.deliveryMethod==='waitlist'?window.RegularWaitlist.customerFields(composer):`<label><span>${t('Customer (optional)','客户（选填）')}</span><input data-regular-field="customerName" maxlength="200" value="${esc(composer.customerName)}" /></label>`}
-      <label><span>${t('Type','类型')} *</span><select data-regular-field="deliveryMethod" required><option value="">${t('Select…','请选择…')}</option><option value="pickup" ${composer.deliveryMethod==='pickup'?'selected':''}>${t('Pickup','自取')}</option><option value="delivery" ${composer.deliveryMethod==='delivery'?'selected':''}>${t('Delivery','送货')}</option><option value="stocking" ${composer.deliveryMethod==='stocking'?'selected':''}>${t('Stocking','备货')}</option><option value="waitlist" ${composer.deliveryMethod==='waitlist'?'selected':''}>${t('Waitlist','候补')}</option></select></label>
+      <label><span>${t('Type','类型')} *</span><select data-regular-field="deliveryMethod" required><option value="">${t('Select…','请选择…')}</option><option value="pickup" ${composer.deliveryMethod==='pickup'?'selected':''}>${t('Pickup','自取')}</option><option value="delivery" ${composer.deliveryMethod==='delivery'?'selected':''}>${t('Delivery','送货')}</option><option value="stocking" ${composer.deliveryMethod==='stocking'?'selected':''}>${t('Stocking','备货')}</option><option value="backorder" ${composer.deliveryMethod==='backorder'?'selected':''}>${t('Backorder','欠货')}</option><option value="waitlist" ${composer.deliveryMethod==='waitlist'?'selected':''}>${t('Waitlist','候补')}</option></select></label>
       ${composer.deliveryMethod==='stocking'?`<label><span>${t('Stocking type','备货类型')}</span><select data-regular-field="stockingType"><option value="transfer" ${composer.stockingType!=='purchase'?'selected':''}>${t('Transfer','调货')}</option><option value="purchase" ${composer.stockingType==='purchase'?'selected':''}>${t('Purchase','采购')}</option></select></label>`:''}
       ${composer.deliveryMethod==='delivery'?`<label><span>${t('Expected arrival date','预计到达日期')} *</span><input data-regular-field="arrivalDate" autocomplete="off" required placeholder="YYYY-MM-DD" value="${esc(composer.arrivalDate)}" /></label>
       <label><span>${t('Expected arrival time (Toronto)','预计到达时间（多伦多）')} *</span><input data-regular-field="arrivalTime" autocomplete="off" required placeholder="15:00 / 3pm" value="${esc(composer.arrivalTime)}" /></label>`:''}
-      <p class="stock-request-wide regular-stock-method-help">${t('Pickup: pre-approval, then Sales enters the SO; no minimum lead time. Delivery: Base Yard, Target Yard and SO number; approval follows the yard route. Stocking: choose Transfer or Purchase; SCM review is required. Transfer creates TOs; Purchase adds quantities to PO proposals.','自取：预先批准后由销售输入 SO，无需最短提前时间。送货：输入基础货场、目标货场及 SO 号，按路线审核。备货：选择调货或采购，须 SCM 人工审核。调货建立 TO，采购加入采购建议。')}</p>
+      ${composer.deliveryMethod==='backorder'?'':`<p class="stock-request-wide regular-stock-method-help">${t('Pickup: pre-approval, then Sales enters the SO; no minimum lead time. Delivery: Base Yard, Target Yard and SO number; approval follows the yard route. Stocking: choose Transfer or Purchase; SCM review is required. Transfer creates TOs; Purchase adds quantities to PO proposals.','自取：预先批准后由销售输入 SO，无需最短提前时间。送货：输入基础货场、目标货场及 SO 号，按路线审核。备货：选择调货或采购，须 SCM 人工审核。调货建立 TO，采购加入采购建议。')}</p>`}
     </div>`;
   }
   const stocking=request=>(request?.regular?.deliveryMethod==='stocking'||!!request?.regular?.pickupTransfer)&&!request.regular.handoffStatus;
@@ -44,7 +44,7 @@
   }
   function summary(request) {
     if(request?.workflowVersion!==2)return '';
-    if(request.regular?.resolution)return customer(request)+(window.RegularStockResolution?.result(request)||'');
+    if(request.regular?.resolution)return customer(request);
     if(window.RegularStockDelivery?.simple(request))return window.RegularStockDelivery.summary(request);
     const r=request.regular||{}, a=r.approval||{}, reasons=reviewReasons(request);
     return `<div class="stock-request-summary regular-stock-summary">

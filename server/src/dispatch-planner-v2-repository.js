@@ -25,8 +25,7 @@ import {
   dispatchPlannedAssignmentMap,
   assertSpecialStockHandoffPlanning,
   dispatchPlanV2Summary,
-  refreshDispatchPlanAuthoritativeOrderProjection,
-  scrubBilledSalesOrderFamiliesFromPlan
+  refreshDispatchPlanAuthoritativeOrderProjection
 } from "./dispatch-plan-repository.js";
 import {
   applyDispatchPlanDelta,
@@ -437,13 +436,13 @@ function nestedOrderMap(plan = {}) {
 }
 
 function splitParentRef(order = {}, orderReference = "") {
-  const explicitParent = text(order?.originalOrderId || order?.parentOrderRef);
-  if (explicitParent) {return explicitParent;}
   if (
     text(order?.type).toUpperCase() === "CUSTOM"
     || order?.customOrder === true
     || text(order?.sourceTable).toLowerCase() === "dispatch_custom_orders"
   ) {return "";}
+  const explicitParent = text(order?.originalOrderId || order?.parentOrderRef);
+  if (explicitParent) {return explicitParent;}
   const ref = text(orderReference || order?.id || order?.orderId || order?.orderRef);
   return /-S\d+$/iu.test(ref) ? ref.replace(/-S\d+$/iu, "") : "";
 }
@@ -999,7 +998,6 @@ export async function applyDispatchV2Command({ planId, command = {}, actorId = n
         rejectRetiredGlobalOrderRefs: true
       });
       result.plan = await applyPendingDispatchPlanMaintenance(result.plan);
-      result.plan = await scrubBilledSalesOrderFamiliesFromPlan(result.plan);
       // Global definitions can replace hydrated group lines with raw allocation
       // quantities. Refresh relationships after that replacement, just as a full
       // save does, before deciding which physical pickups are actually required.

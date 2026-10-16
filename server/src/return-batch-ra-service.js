@@ -1,6 +1,7 @@
 import { query, withTransaction, withIndependentTransaction } from "./db.js";
 import { writeAudit } from "./auth-repository.js";
 import { createOrUpdateReturnAuthorizationInNetSuite, createStandaloneReturnAuthorizationInNetSuite,
+  createOrUpdateCreditMemoInNetSuite, fetchCreditMemoFromNetSuite,
   fetchReturnAuthorizationFromNetSuite, suiteqlAll } from "./netsuite.js";
 import { findReturnTransactionByExternalId } from "./return-netsuite.js";
 import { withNetSuiteOperationalWork } from "./netsuite-operational-work.js";
@@ -9,6 +10,14 @@ import { assertStagedReturnBatch, finalizeStagedReturnBatch } from "./return-sub
 
 function error(message, code = "RETURN_BATCH_RA_BLOCKED") {
   return Object.assign(new Error(message), { status: 409, code });
+}
+
+export function returnBatchTransactionType(batch) {
+  return batch.intent_snapshot.transactionType || "return_authorization";
+}
+
+function transactionLabel(batch) {
+  return returnBatchTransactionType(batch) === "credit_memo" ? "Credit Memo" : "Return Authorization";
 }
 
 export async function findReturnBatchAuthorization(recordId, { batchId = null } = {}) {
@@ -25,6 +34,11 @@ export async function admitReturnBatchAuthorization({ records, postingPolicies }
     return policy?.effective === true && Number(policy.locationId) === intent.receivingLocationId
       && policy.functionKey === `${record.recordType}_return`;
   });
+  const types = new Set(records.map(record => postingPolicies[`${record.recordType}_return`]?.transactionType || "RA"));
+  if (effective && types.size !== 1) {
+    throw error("Stock and PALLET posting modes differ. Enable both Credit Memo gates or both RA modes before confirming a combined return.", "RETURN_POSTING_TYPE_MISMATCH");
+  }
+  intent.transactionType = types.size === 1 && types.has("CM") ? "credit_memo" : "return_authorization";
   if (records.some(record => record.netSuiteTransactionId || record.netSuiteRaAttemptedAt)) {
     throw error("A return already has a NetSuite transaction or an uncertain creation attempt.");
   }
@@ -32,7 +46,9 @@ export async function admitReturnBatchAuthorization({ records, postingPolicies }
     (batch_id,external_id,intent_snapshot,posting_policy,sync_status)
     VALUES($1,$2,$3::jsonb,$4::jsonb,$5) RETURNING *`, [intent.batchId, intent.externalId, JSON.stringify(intent),
     JSON.stringify({ effective, locationId: intent.receivingLocationId, components: postingPolicies }), effective ? "pending" : "disabled"]);
-  await query("UPDATE return_records SET netsuite_sync_status=$2 WHERE batch_id=$1", [intent.batchId, result.rows[0].sync_status]);
+  await query(`UPDATE return_records SET netsuite_sync_status=$2,
+    netsuite_stage=CASE WHEN $3='credit_memo' THEN $3 ELSE netsuite_stage END WHERE batch_id=$1`,
+    [intent.batchId, result.rows[0].sync_status, intent.transactionType]);
   return result.rows[0];
 }
 
@@ -45,44 +61,53 @@ function transactionStatusOf(snapshot) {
 
 function transactionRefOf(snapshot) { return snapshot?.tranId || snapshot?.tranid || null; }
 
-async function setState(batchId, status, { message = null, snapshot = null, resetAttempt = false, actorOperatorId = null } = {}) {
+async function setState(batchId, status, { message = null, snapshot = null, resetAttempt = false, actorOperatorId = null, transactionStatus = null } = {}) {
   const reference = transactionRefOf(snapshot);
-  const transactionStatus = transactionStatusOf(snapshot);
+  const remoteStatus = transactionStatus || transactionStatusOf(snapshot);
   await checkpoint(async q => {
     await q(`UPDATE return_batch_authorizations SET sync_status=$2,sync_error=$3,
       netsuite_transaction_ref=COALESCE($4,netsuite_transaction_ref),
       netsuite_transaction_status=COALESCE($5,netsuite_transaction_status),
       netsuite_snapshot=COALESCE($6::jsonb,netsuite_snapshot),
       attempted_at=CASE WHEN $7 THEN NULL ELSE attempted_at END,last_synced_at=now(),updated_at=now()
-      WHERE batch_id=$1`, [batchId, status, message, reference, transactionStatus, snapshot ? JSON.stringify(snapshot) : null, resetAttempt]);
+      WHERE batch_id=$1`, [batchId, status, message, reference, remoteStatus, snapshot ? JSON.stringify(snapshot) : null, resetAttempt]);
     await q(`UPDATE return_records r SET netsuite_sync_status=a.sync_status,netsuite_sync_error=a.sync_error,
       netsuite_transaction_ref=a.netsuite_transaction_ref,netsuite_transaction_status=a.netsuite_transaction_status,
-      netsuite_stage=CASE WHEN a.netsuite_transaction_id IS NOT NULL THEN 'return_authorization' ELSE r.netsuite_stage END,
+      netsuite_stage=COALESCE(a.intent_snapshot->>'transactionType','return_authorization'),
       netsuite_snapshot=a.netsuite_snapshot,netsuite_last_synced_at=a.last_synced_at,updated_at=now()
       FROM return_batch_authorizations a WHERE a.batch_id=$1 AND r.batch_id=a.batch_id`, [batchId]);
     await q(`INSERT INTO return_sync_events(return_record_id,event_type,status,request_snapshot,response_snapshot,error,actor_operator_id)
-      SELECT id,'batch_return_authorization',$2,jsonb_build_object('batchId',$1::bigint),$3::jsonb,$4,$5
-      FROM return_records WHERE batch_id=$1`, [batchId, status, JSON.stringify({ reference }), message, actorOperatorId]);
+      SELECT r.id,'batch_' || COALESCE(a.intent_snapshot->>'transactionType','return_authorization'),$2,
+        jsonb_build_object('batchId',$1::bigint),$3::jsonb,$4,$5
+      FROM return_records r JOIN return_batch_authorizations a ON a.batch_id=r.batch_id
+      WHERE r.batch_id=$1`, [batchId, status, JSON.stringify({ reference }), message, actorOperatorId]);
   });
 }
 
-async function identify(batchId, transactionId) {
+async function identify(batch, transactionId) {
+  const batchId = batch.batch_id;
   const id = Number(transactionId);
-  if (!Number.isSafeInteger(id) || id <= 0) {throw error("NetSuite Return Authorization creation is unconfirmed.", "RETURN_RA_CREATION_UNCERTAIN");}
+  if (!Number.isSafeInteger(id) || id <= 0) {throw uncertainCreation(batch);}
   await checkpoint(q => q(`UPDATE return_batch_authorizations SET netsuite_transaction_id=$2,updated_at=now()
     WHERE batch_id=$1 AND (netsuite_transaction_id IS NULL OR netsuite_transaction_id=$2) RETURNING batch_id`, [batchId, id])
     .then(result => {
-      if (!result.rowCount) {throw error("This return batch already has a different Return Authorization.");}
+      if (!result.rowCount) {throw error(`This return batch already has a different ${transactionLabel(batch)}.`);}
     }));
   return id;
 }
 
-async function markAttempt(batchId) {
+function uncertainCreation(batch) {
+  return error(`NetSuite ${transactionLabel(batch)} creation is unconfirmed. Recheck this return; another transaction will not be created.`,
+    returnBatchTransactionType(batch) === "credit_memo" ? "RETURN_CM_CREATION_UNCERTAIN" : "RETURN_RA_CREATION_UNCERTAIN");
+}
+
+async function markAttempt(batch) {
+  const batchId = batch.batch_id;
   await checkpoint(async q => {
     const marked = await q(`UPDATE return_batch_authorizations SET attempted_at=now(),sync_attempts=sync_attempts+1,
       sync_status='pending',sync_error=NULL,updated_at=now()
       WHERE batch_id=$1 AND attempted_at IS NULL AND netsuite_transaction_id IS NULL RETURNING batch_id`, [batchId]);
-    if (!marked.rowCount) {throw error("NetSuite Return Authorization creation is unconfirmed.", "RETURN_RA_CREATION_UNCERTAIN");}
+    if (!marked.rowCount) {throw uncertainCreation(batch);}
     await q("UPDATE return_records SET netsuite_sync_attempts=netsuite_sync_attempts+1 WHERE batch_id=$1", [batchId]);
   });
 }
@@ -94,28 +119,38 @@ function definiteRejection(problem) {
 
 async function postOrRecover(batch) {
   const intent = batch.intent_snapshot;
+  const transactionType = returnBatchTransactionType(batch);
   let found = batch.netsuite_transaction_id;
-  if (!found) {found = (await findReturnTransactionByExternalId(batch.external_id, "return_authorization"))?.id;}
+  if (!found) {found = (await findReturnTransactionByExternalId(batch.external_id, transactionType))?.id;}
   if (!found) {
-    if (batch.attempted_at) {throw error("NetSuite RA creation is unconfirmed. Recheck this return; another RA will not be created.", "RETURN_RA_CREATION_UNCERTAIN");}
-    await markAttempt(batch.batch_id);
+    if (batch.attempted_at) {throw uncertainCreation(batch);}
+    await markAttempt(batch);
     try {
       const payload = buildReturnBatchPayload(intent);
-      const created = intent.sourceSalesOrderId
+      const created = transactionType === "credit_memo"
+        ? await createOrUpdateCreditMemoInNetSuite({ payload }) : intent.sourceSalesOrderId
         ? await createOrUpdateReturnAuthorizationInNetSuite({ salesOrderId: intent.sourceSalesOrderId, payload })
         : await createStandaloneReturnAuthorizationInNetSuite(payload);
-      found = created.id || (await findReturnTransactionByExternalId(batch.external_id, "return_authorization"))?.id;
+      found = created.id || (await findReturnTransactionByExternalId(batch.external_id, transactionType))?.id;
     } catch (problem) {
       problem.returnRaCreationRejected = definiteRejection(problem);
       throw problem;
     }
   }
-  const transactionId = await identify(batch.batch_id, found);
+  const transactionId = await identify(batch, found);
   const snapshot = await readBatchSnapshot(batch, transactionId);
   return { transactionId, snapshot };
 }
 
 async function readBatchSnapshot(batch, transactionId) {
+  if (returnBatchTransactionType(batch) === "credit_memo") {
+    const creditMemo = await fetchCreditMemoFromNetSuite(transactionId, { strictMissing: true });
+    if (!creditMemo && !batch.draft_id && Number(batch.netsuite_snapshot?.id) === Number(transactionId)) {
+      throw error("The previously verified Credit Memo was deleted in NetSuite.", "RETURN_CM_DELETED");
+    }
+    if (!creditMemo) { throw error("The NetSuite Credit Memo could not be read back."); }
+    return creditMemo;
+  }
   const snapshot = await fetchReturnAuthorizationFromNetSuite(transactionId);
   if (!snapshot) {throw error("The NetSuite Return Authorization could not be read back.");}
   const intent = batch.intent_snapshot;
@@ -138,20 +173,20 @@ async function activeMembers(batch) {
   const ids = result.rows.map(row => Number(row.id));
   if (JSON.stringify(ids) !== JSON.stringify(batch.intent_snapshot.recordIds)
       || result.rows.some(row => ["voided", "rejected", "pending_approval", "partially_pending"].includes(row.status))) {
-    throw error("This return batch changed or has unfinished decisions; its Return Authorization cannot be posted.");
+    throw error(`This return batch changed or has unfinished decisions; its ${transactionLabel(batch)} cannot be posted.`);
   }
 }
 
 async function verifyManualCandidate(batch, manualTransactionId, manualTransactionRef) {
   if (batch.netsuite_transaction_id && Number(batch.netsuite_transaction_id) !== Number(manualTransactionId)) {
-    throw error("This return batch already has a different Return Authorization.");
+    throw error(`This return batch already has a different ${transactionLabel(batch)}.`);
   }
   const candidate = await readBatchSnapshot(batch, manualTransactionId);
   verifyReturnBatchSnapshot({ ...batch.intent_snapshot, netSuiteTransactionId: manualTransactionId }, candidate);
   if (manualTransactionRef && String(transactionRefOf(candidate)).toUpperCase() !== String(manualTransactionRef).trim().toUpperCase()) {
-    throw error("NetSuite Return Authorization number does not match.");
+    throw error(`NetSuite ${transactionLabel(batch)} number does not match.`);
   }
-  await identify(batch.batch_id, manualTransactionId);
+  await identify(batch, manualTransactionId);
   return { transactionId: manualTransactionId, snapshot: candidate };
 }
 
@@ -159,14 +194,67 @@ function allowInactiveBatch(batch, reconcile) {
   return !batch.draft_id && (reconcile || Boolean(batch.netsuite_transaction_id));
 }
 
+async function recordSynchronizationFailure(batch, problem, { manualTransactionId, actorOperatorId }) {
+  if (!manualTransactionId && problem.code === "RETURN_CM_DELETED") {
+    await recordDeletedCreditMemo(batch, actorOperatorId);
+    return true;
+  }
+  // A rejected replacement link must not invalidate a previously verified
+  // transaction or remove it from the reconciliation queue.
+  if (manualTransactionId && ["succeeded", "manual_linked", "cancelled"].includes(batch.sync_status)) { return; }
+  await setState(batch.batch_id, "failed", { message: String(problem.message || problem).slice(0, 4000),
+    resetAttempt: problem.returnRaCreationRejected === true, actorOperatorId });
+}
+
+function alreadyDeletedCreditMemo(batch, manualTransactionId) {
+  return !manualTransactionId && batch.sync_status === "cancelled" && batch.netsuite_transaction_status === "Deleted";
+}
+
+function canReuseVerifiedBatch(batch, reconcile, manualTransactionId) {
+  return !reconcile && !manualTransactionId && ["succeeded", "manual_linked"].includes(batch.sync_status);
+}
+
+async function recordDeletedCreditMemo(batch, actorOperatorId) {
+  await setState(batch.batch_id, "cancelled", {
+    message: "Credit Memo was deleted in NetSuite. Its return reservation has been released.",
+    transactionStatus: "Deleted", actorOperatorId
+  });
+  await writeAudit({ actorOperatorId, source: "returns", action: "returns.netsuite.batch_cm.deleted",
+    details: { batchId: Number(batch.batch_id), recordIds: batch.intent_snapshot.recordIds,
+      transactionId: Number(batch.netsuite_transaction_id), transactionRef: batch.netsuite_transaction_ref } });
+}
+
+export async function reconcileMissingPalletCreditMemos(customerId, remoteBalance) {
+  const result = await query(`SELECT a.batch_id,a.external_id,a.netsuite_transaction_id
+    FROM return_batch_authorizations a
+    WHERE a.intent_snapshot->>'customerId'=$1::text AND a.intent_snapshot->>'transactionType'='credit_memo'
+      AND a.draft_id IS NULL AND a.sync_status <> 'cancelled'
+      AND a.netsuite_transaction_id IS NOT NULL
+      AND a.netsuite_snapshot->>'id'=a.netsuite_transaction_id::text
+      AND EXISTS(SELECT 1 FROM return_records r WHERE r.batch_id=a.batch_id
+        AND r.record_type='pallet' AND r.status NOT IN ('rejected','voided'))`, [customerId]);
+  const ids = new Set((remoteBalance.transactionIds || []).map(Number));
+  const externalIds = new Set((remoteBalance.externalIds || []).map(String));
+  for (const row of result.rows) {
+    if (!ids.has(Number(row.netsuite_transaction_id)) && !externalIds.has(row.external_id)) {
+      // Absence from SuiteQL alone is insufficient: an unindexed CM still
+      // reserves its quantity. Read its exact ID through the recovery path.
+      await synchronizeReturnBatchAuthorization({ batchId: row.batch_id, reconcile: true });
+    }
+  }
+}
+
 export async function synchronizeReturnBatchAuthorization({ recordId, batchId = null, actorOperatorId = null, reconcile = false, manualTransactionId = null, manualTransactionRef = "" }) {
   const initial = await findReturnBatchAuthorization(recordId, { batchId });
-  if (!initial) {throw error("Shared Return Authorization was not found.");}
+  if (!initial) {throw error("Shared return transaction was not found.");}
   const outcome = await withTransaction(async () => {
     await query("SELECT pg_advisory_xact_lock(hashtext($1))", [`return-batch-ra:${initial.batch_id}`]);
     const batch = await findReturnBatchAuthorization(recordId, { batchId });
     if (!batch) { return { error: error("Return submission changed. Retry its saved draft.") }; }
-    if (!reconcile && !manualTransactionId && ["succeeded", "manual_linked"].includes(batch.sync_status)) {
+    if (alreadyDeletedCreditMemo(batch, manualTransactionId)) {
+      return {};
+    }
+    if (canReuseVerifiedBatch(batch, reconcile, manualTransactionId)) {
       await finalizeStagedReturnBatch(batch);
       return {};
     }
@@ -181,15 +269,16 @@ export async function synchronizeReturnBatchAuthorization({ recordId, batchId = 
       const inactive = /cancel|void|reject/i.test(transactionStatusOf(snapshot));
       await setState(batch.batch_id, inactive ? "cancelled" : manualTransactionId ? "manual_linked" : "succeeded", { snapshot, actorOperatorId });
       await finalizeStagedReturnBatch(batch);
-      await writeAudit({ actorOperatorId, source: "returns", action: "returns.netsuite.batch_ra.linked",
+      await writeAudit({ actorOperatorId, source: "returns",
+        action: returnBatchTransactionType(batch) === "credit_memo" ? "returns.netsuite.batch_cm.linked" : "returns.netsuite.batch_ra.linked",
         orderId: batch.intent_snapshot.sourceSalesOrderId,
         details: { batchId: Number(batch.batch_id), recordIds: batch.intent_snapshot.recordIds, transactionId,
+          transactionType: returnBatchTransactionType(batch),
           transactionRef: transactionRefOf(snapshot), receivingLocationId: batch.intent_snapshot.receivingLocationId } });
       return {};
     } catch (problem) {
-      await setState(batch.batch_id, "failed", { message: String(problem.message || problem).slice(0, 4000),
-        resetAttempt: problem.returnRaCreationRejected === true, actorOperatorId });
-      return { error: problem };
+      const retired = await recordSynchronizationFailure(batch, problem, { manualTransactionId, actorOperatorId });
+      return retired ? {} : { error: problem };
     }
   });
   if (outcome.error) {throw outcome.error;}
@@ -202,9 +291,9 @@ export async function assertSharedReturnCanVoid(recordId) {
   await query("SELECT pg_advisory_xact_lock(hashtext($1))", [`return-batch-ra:${batch.batch_id}`]);
   const current = await findReturnBatchAuthorization(recordId);
   if (current.attempted_at && !current.netsuite_transaction_id) {
-    throw error("NetSuite RA creation is unconfirmed. Recover the transaction before voiding this return.", "RETURN_RA_CREATION_UNCERTAIN");
+    throw uncertainCreation(current);
   }
   if (current.netsuite_transaction_id && current.sync_status !== "cancelled") {
-    throw error(`Cancel or void NetSuite Return Authorization ${current.netsuite_transaction_ref || current.netsuite_transaction_id} before voiding this return.`);
+    throw error(`Cancel or void NetSuite ${transactionLabel(current)} ${current.netsuite_transaction_ref || current.netsuite_transaction_id} before voiding this return.`);
   }
 }

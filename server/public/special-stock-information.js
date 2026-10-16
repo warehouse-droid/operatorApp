@@ -5,6 +5,7 @@ const escape = value => String(value ?? '').replace(/[&<>"']/g, char => entities
 
 /** @param {Record<string,any>} detail @param {string} audience */
 export function specialInformationPanel(detail, audience) {
+  if (window.StockRequestConversation) return '';
   const info = detail.informationRequest;
   const active = detail.closeStatus === 'active' && !['closed', 'completed'].includes(detail.stage);
   if (info?.status === 'pending') {

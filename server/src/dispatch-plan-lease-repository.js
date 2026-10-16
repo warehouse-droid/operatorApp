@@ -1,5 +1,6 @@
 import crypto from "node:crypto";
 import { query, withTransaction } from "./db.js";
+import { writeDispatchAudit } from "./dispatch-audit-repository.js";
 
 export const DISPATCH_PLAN_EDIT_LEASE_SECONDS = 10 * 60;
 
@@ -49,6 +50,7 @@ function leaseRow(row, { active = false } = {}) {
     acquiredAt: row.acquired_at || "",
     heartbeatAt: row.heartbeat_at || "",
     expiresAt: row.expires_at || "",
+    selectionId: tokenHash(row.token_hash),
     active
   };
 }
@@ -66,9 +68,9 @@ export class DispatchPlanEditLeaseError extends Error {
 export async function getDispatchPlanEditLease(planDate) {
   const cleanDate = cleanPlanDate(planDate);
   const result = await query(
-    `SELECT plan_date::text, operator_id, operator_name, session_id,
+    `SELECT plan_date::text, operator_id, operator_name, session_id, token_hash,
             acquired_at, heartbeat_at, expires_at,
-            expires_at > now() AS active
+            expires_at > clock_timestamp() AS active
        FROM dispatch_plan_edit_leases
       WHERE plan_date = $1::date`,
     [cleanDate]
@@ -115,7 +117,7 @@ export async function acquireDispatchPlanEditLease({ planDate, operatorId, opera
                 expires_at = now() + ($2::int * interval '1 second'),
                 updated_at = now()
           WHERE plan_date = $1::date
-          RETURNING plan_date::text, operator_id, operator_name, session_id, acquired_at, heartbeat_at, expires_at`,
+          RETURNING plan_date::text, operator_id, operator_name, session_id, token_hash, acquired_at, heartbeat_at, expires_at`,
         [cleanDate, DISPATCH_PLAN_EDIT_LEASE_SECONDS, nextTokenHash]
       );
       return { lease: leaseRow(renewed.rows[0], { active: true }), token: nextToken, renewed: true, replacedExpired: false };
@@ -136,30 +138,39 @@ export async function acquireDispatchPlanEditLease({ planDate, operatorId, opera
              heartbeat_at = now(),
              expires_at = now() + ($6::int * interval '1 second'),
              updated_at = now()
-       RETURNING plan_date::text, operator_id, operator_name, session_id, acquired_at, heartbeat_at, expires_at`,
+       RETURNING plan_date::text, operator_id, operator_name, session_id, token_hash, acquired_at, heartbeat_at, expires_at`,
       [cleanDate, cleanOperatorId, String(operatorName || "").trim(), cleanSession, nextTokenHash, DISPATCH_PLAN_EDIT_LEASE_SECONDS]
     );
     return { lease: leaseRow(saved.rows[0], { active: true }), token: nextToken, renewed: false, replacedExpired };
   });
 }
 
-export async function heartbeatDispatchPlanEditLease({ planDate, operatorId, sessionId, token }) {
+export async function heartbeatDispatchPlanEditLease({ planDate, operatorId, sessionId, token, activityAgeMs = undefined }) {
   const cleanDate = cleanPlanDate(planDate);
   const cleanSession = cleanSessionId(sessionId);
+  if (activityAgeMs !== undefined && (typeof activityAgeMs !== "number" || !Number.isFinite(activityAgeMs) || activityAgeMs < 0)) {
+    throw Object.assign(new Error("A valid activity age is required."), { status: 400 });
+  }
+  if (activityAgeMs >= DISPATCH_PLAN_EDIT_LEASE_SECONDS * 1000) {
+    throw new DispatchPlanEditLeaseError("Edit Mode ended after 10 minutes without activity.", { code: "DISPATCH_PLAN_EDIT_LEASE_EXPIRED" });
+  }
   return withTransaction(async () => {
   await lockDispatchPlanEditLeaseDate(cleanDate);
   const result = await query(
     `UPDATE dispatch_plan_edit_leases
-        SET heartbeat_at = now(),
-            expires_at = now() + ($5::int * interval '1 second'),
+        SET heartbeat_at = CASE WHEN $6::double precision IS NULL THEN heartbeat_at
+              ELSE GREATEST(heartbeat_at, clock_timestamp() - ($6::double precision * interval '1 millisecond')) END,
+            expires_at = CASE WHEN $6::double precision IS NULL THEN expires_at
+              ELSE GREATEST(heartbeat_at, clock_timestamp() - ($6::double precision * interval '1 millisecond'))
+                   + ($5::int * interval '1 second') END,
             updated_at = now()
       WHERE plan_date = $1::date
         AND operator_id = $2
         AND session_id = $3
         AND token_hash = $4
         AND expires_at > clock_timestamp()
-      RETURNING plan_date::text, operator_id, operator_name, session_id, acquired_at, heartbeat_at, expires_at`,
-    [cleanDate, String(operatorId || ""), cleanSession, tokenHash(token), DISPATCH_PLAN_EDIT_LEASE_SECONDS]
+      RETURNING plan_date::text, operator_id, operator_name, session_id, token_hash, acquired_at, heartbeat_at, expires_at`,
+    [cleanDate, String(operatorId || ""), cleanSession, tokenHash(token), DISPATCH_PLAN_EDIT_LEASE_SECONDS, activityAgeMs ?? null]
   );
   if (!result.rows[0]) {
     const lease = await getDispatchPlanEditLease(cleanDate);
@@ -176,7 +187,7 @@ export async function assertDispatchPlanEditLease({ planDate, operatorId, sessio
   const cleanDate = cleanPlanDate(planDate);
   const cleanSession = cleanSessionId(sessionId);
   const result = await query(
-    `SELECT plan_date::text, operator_id, operator_name, session_id, acquired_at, heartbeat_at, expires_at
+    `SELECT plan_date::text, operator_id, operator_name, session_id, token_hash, acquired_at, heartbeat_at, expires_at
        FROM dispatch_plan_edit_leases
       WHERE plan_date = $1::date
         AND operator_id = $2
@@ -203,9 +214,41 @@ export async function releaseDispatchPlanEditLease({ planDate, operatorId, sessi
         AND operator_id = $2
         AND session_id = $3
         AND token_hash = $4
-      RETURNING plan_date::text, operator_id, operator_name, session_id, acquired_at, heartbeat_at, expires_at`,
+      RETURNING plan_date::text, operator_id, operator_name, session_id, token_hash, acquired_at, heartbeat_at, expires_at`,
     [cleanDate, String(operatorId || ""), cleanSession, tokenHash(token)]
   );
   return leaseRow(result.rows[0], { active: false });
+  });
+}
+
+export async function listActiveDispatchPlanEditors() {
+  const result = await query(`SELECT plan_date::text, operator_id, operator_name, session_id, token_hash,
+      acquired_at, heartbeat_at, expires_at FROM dispatch_plan_edit_leases
+      WHERE expires_at > clock_timestamp() ORDER BY plan_date, operator_name`);
+  return result.rows.map(row => leaseRow(row, { active: true }));
+}
+
+export async function kickDispatchPlanEditor(input, actor) {
+  const planDate = cleanPlanDate(input?.planDate);
+  const sessionId = cleanSessionId(input?.sessionId);
+  if (!input?.operatorId || !input?.acquiredAt || !Number.isFinite(Date.parse(input.acquiredAt))
+      || !/^[a-f0-9]{64}$/.test(String(input.selectionId || ""))) {
+    throw Object.assign(new Error("Refresh the editor list and select the user to kick out."), { status: 400 });
+  }
+  return withTransaction(async () => {
+    await lockDispatchPlanEditLeaseDate(planDate);
+    const current = await getDispatchPlanEditLease(planDate);
+    if (!current?.active) {return null;}
+    if (current.operatorId !== input.operatorId || current.sessionId !== sessionId || current.selectionId !== input.selectionId) {
+      throw new DispatchPlanEditLeaseError("The editor changed. Refresh and confirm the current user.", {
+        code: "DISPATCH_PLAN_EDIT_LEASE_CHANGED", lease: current
+      });
+    }
+    await query("DELETE FROM dispatch_plan_edit_leases WHERE plan_date=$1::date", [planDate]);
+    await writeDispatchAudit({ action: actor.admin ? "dispatch_plan_edit_lease_admin_kicked" : "dispatch_plan_edit_lease_kicked",
+      entityType: "plan", entityId: planDate, planDate, operatorId: actor.id, operatorName: actor.name,
+      source: actor.admin ? "admin" : "dispatch", before: current,
+      details: { removedOperatorId: current.operatorId, removedOperatorName: current.operatorName, removedSessionId: current.sessionId } });
+    return current;
   });
 }

@@ -1,6 +1,7 @@
 // @ts-check
 import { buildOperatorNetSuitePostingDraft } from './operator-netsuite-posting-domain.js';
 import { isFulfillableNetSuiteLine, isCompletedNetSuitePostingOrder } from './netsuite-fulfillable-items.js';
+import {netSuitePostingQuantity} from './operator-netsuite-posting-quantity.js';
 
 /** @param {string} message */
 function invalid(message) {return Object.assign(new Error(message),{code:'DIRECT_PO_IR_SOURCE_INVALID',status:409,postingNotAttempted:true});}
@@ -23,16 +24,20 @@ export function buildDirectPoReceiptDraft(input) {
     const live=matches[0];
     if(Number(live.itemId)!==Number(line.item_id)){throw invalid('The direct PO item identity changed.');}
     const quantity=positive(line.quantity);
-    if(quantity>Number(live.orderedQuantity ?? live.quantity)+0.000001){throw invalid('The delivered quantity exceeds the live PO line quantity.');}
+    const salesUom = live.unit || line.unit;
+    const postingQuantity = netSuitePostingQuantity(quantity, live.remainingQuantity, salesUom);
+    if(postingQuantity>Number(live.orderedQuantity ?? live.quantity)+0.000001){throw invalid('The delivered quantity exceeds the live PO line quantity.');}
     if(Number(line.location_id)!==Number(live.location)){throw invalid('The direct PO line location changed.');}
     return {orderLine:sourceId(live.restOrderLine),quantity,location:Number(live.location),sourceLineKey:stable,
+      ...(salesUom ? {salesUom} : {}),
       itemId:Number(line.item_id),localOrderKey:key,localLineId:String(line.id),directCompletionEventId:sourceId(evidence.completionEventId)};
   });
   if(!selectedLines.length){throw invalid('No receivable direct PO lines are available.');}
   const availableLines=(source.lines || []).filter((/** @type {Record<string,any>} */ line)=>Number.isSafeInteger(Number(line.restOrderLine)) && Number(line.restOrderLine)>0).map((/** @type {Record<string,any>} */ line)=>({
     orderLine:Number(line.restOrderLine),sourceLineKey:line.sourceLineKey,sourceLineAliases:line.sourceLineAliases,
     location:line.location,orderedQuantity:Number(line.orderedQuantity ?? line.quantity),completedQuantity:Number(line.completedQuantity),
-    remainingQuantity:Number(line.remainingQuantity),linkedTransactions:line.linkedTransactions || []}));
+    remainingQuantity:Number(line.remainingQuantity),linkedTransactions:line.linkedTransactions || [],
+    ...(line.unit ? {salesUom:line.unit} : {})}));
   const localPayload={item:{items:selectedLines.map((/** @type {Record<string,any>} */ selected)=>{
     const local=input.lines.find((/** @type {Record<string,any>} */ line)=>String(line.id)===selected.localLineId);
     const live=availableLines.find((/** @type {Record<string,any>} */ line)=>line.orderLine===selected.orderLine);

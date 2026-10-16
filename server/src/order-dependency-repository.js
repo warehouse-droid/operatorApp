@@ -1,11 +1,14 @@
 import crypto from "node:crypto";
 import { config, isNetSuiteSandboxEnvironment } from "./config.js";
 import { query, withTransaction } from "./db.js";
+import { completeDirectTransfersForDependencies } from "./direct-to-completion-repository.js";
 import { projectDirectTransferResidual } from "./dispatch-to-route-projection.js";
 import { completedTransferUnlinkAllowed } from "./scm-dependency-management-policy.js";
 import { writeDispatchAudit } from "./dispatch-audit-repository.js";
 import { resolveDispatchSalesTarget } from "./dispatch-order-target-repository.js";
+import { reconcileLinkedDirectShipQuantities } from "./linked-direct-ship-sync-repository.js";
 import { dispatchLoadAssignment } from "./dispatch-load-assignment.js";
+import { DISPATCH_FLEET_PLANNING_LOCK } from "./dispatch-fleet-status.js";
 import {
   dependencyHasEffectiveMaterial,
   dependencyQuantityConversionDisplay as conversionDisplay,
@@ -4343,8 +4346,15 @@ async function loadDependencyMutationContext(
   requestedPlanDate,
   { allowHistoricalGroupTarget = false } = {}
 ) {
+  const lockTarget = (await query(
+    "SELECT COALESCE(dispatch_target_ref,sales_order_ref) AS ref FROM order_dependencies WHERE id=$1",
+    [Number(dependencyId)]
+  )).rows[0]?.ref;
+  if (lockTarget) {
+    await query("SELECT pg_advisory_xact_lock(hashtextextended($1,0))", [`order-dependency:${text(lockTarget).toLowerCase()}`]);
+  }
   const result = await query(
-    `SELECT id, status, dispatch_target_ref, dispatch_target_kind,
+    `SELECT id, status, sales_order_ref, dispatch_target_ref, dispatch_target_kind,
             planned_plan_id, planned_date::text AS planned_date
        FROM order_dependencies
       WHERE id = $1
@@ -4357,6 +4367,10 @@ async function loadDependencyMutationContext(
     throw error;
   }
   const dependency = result.rows[0];
+  if (lockTarget && text(dependency.dispatch_target_ref || dependency.sales_order_ref) !== text(lockTarget)) {
+    throw Object.assign(new Error("This dependency moved to another target. Refresh its current link before retrying."),
+      {status:409,code:"ORDER_DEPENDENCY_TARGET_CHANGED"});
+  }
   if (
     dependency.status === "cancelled"
     || dependency.dispatch_target_kind !== "group"
@@ -4467,6 +4481,9 @@ export async function updateOrderDependencyMode(
       [Number(dependencyId), normalizedMode, operatorId]
     );
     if (!result.rowCount) throw new Error("This dependency has already started and its mode cannot be changed.");
+    if (normalizedMode === "direct_to_customer") {
+      await reconcileLinkedDirectShipQuantities({ transferOrderId: Number(result.rows[0].transfer_order_id) });
+    }
     return (await loadDependencies({ salesOrderRef: result.rows[0].dispatch_target_ref || result.rows[0].sales_order_ref })).find((row) => String(row.id) === String(dependencyId));
   });
 }
@@ -4933,10 +4950,48 @@ export async function validateDispatchPlanDependencies(plan = {}) {
   return conflicts;
 }
 
+async function dependencyFollowupPlanIsCurrent(plan) {
+  // Serialize with plan saves through the revision check and all dependency
+  // writes, so an ungroup cannot commit underneath an older grouping follow-up.
+  await query("SELECT pg_advisory_xact_lock(hashtext($1))", [DISPATCH_FLEET_PLANNING_LOCK]);
+  if (plan.revision === undefined || plan.revision === null || !Number(plan.id)) { return true; }
+  const current = await query("SELECT revision FROM dispatch_plans WHERE id=$1 FOR UPDATE", [plan.id]);
+  return current.rowCount > 0 && Number(current.rows[0].revision) === Number(plan.revision);
+}
+
+async function retiredDependencyGroups(plan, dependencies) {
+  const refs = [...new Set([
+    ...normalDispatchGroupTargets(plan).values(),
+    ...dependencies.filter(dependency => dependency.dispatchTargetKind === "group")
+      .map(dependency => dependency.dispatchTargetRef)
+  ].map(ref => text(ref).toLowerCase()).filter(Boolean))];
+  if (!refs.length) { return new Map(); }
+  const result = await query(
+    `SELECT group_ref, full_order->'childOrders' AS member_refs
+       FROM dispatch_global_order_groups
+      WHERE active=false AND lower(group_ref)=ANY($1::text[])`,
+    [refs]
+  );
+  return new Map(result.rows.map(row => [
+    text(row.group_ref).toLowerCase(),
+    (Array.isArray(row.member_refs) ? row.member_refs : []).map(ref => text(ref).toLowerCase())
+  ]));
+}
+
+function retiredDependencyHasSingleSource(dependency, retiredGroups) {
+  const canonicalRef = text(dependency.canonicalSalesOrderRef).toLowerCase();
+  const members = retiredGroups.get(text(dependency.dispatchTargetRef).toLowerCase()) || [];
+  const allocations = dependency.lines.filter(line => line.lineRole === "sales_allocation");
+  return members.includes(canonicalRef) && allocations.length > 0
+    && allocations.every(line => line.salesLineId && text(line.sourceOrderRef).toLowerCase() === canonicalRef);
+}
+
 export async function syncOrderDependenciesFromDispatchPlan(plan = {}, {
-  allowEstablishedUngroupTargets = []
+  allowEstablishedUngroupTargets = [],
+  dependencyIds = null
 } = {}) {
   return withTransaction(async () => {
+    if (!await dependencyFollowupPlanIsCurrent(plan)) { return { remapped: [], released: [], superseded: true }; }
     const assignments = loadSequenceIndex(plan);
     const groupTargets = normalDispatchGroupTargets(plan);
     const establishedUngroupTargets = new Map(
@@ -4944,7 +4999,13 @@ export async function syncOrderDependenciesFromDispatchPlan(plan = {}, {
         .map((target) => [text(target?.sourceOrderRef), text(target?.groupRef)])
         .filter(([sourceOrderRef, groupRef]) => sourceOrderRef && groupRef)
     );
-    const dependencies = await loadDependencies();
+    const selectedIds = dependencyIds === null ? null : new Set(dependencyIds.map(String));
+    const dependencies = (await loadDependencies())
+      .filter(dependency => selectedIds === null || selectedIds.has(String(dependency.id)));
+    const retiredGroups = await retiredDependencyGroups(plan, dependencies);
+    for (const [sourceRef, groupRef] of groupTargets) {
+      if (retiredGroups.has(groupRef.toLowerCase())) { groupTargets.delete(sourceRef); }
+    }
     const remapped = [];
     const released = [];
     for (const dependency of dependencies) {
@@ -5031,7 +5092,8 @@ export async function syncOrderDependenciesFromDispatchPlan(plan = {}, {
       }
       if (
         !groupRef
-        && establishedUngroupTargets.get(canonicalRef) === currentTargetRef
+        && (establishedUngroupTargets.get(canonicalRef) === currentTargetRef
+          || retiredDependencyHasSingleSource(dependency, retiredGroups))
         && dependency.dispatchTargetKind === "group"
         && dependency.mode === "yard_replenishment"
         && ["active", "attention", "packed"].includes(dependency.status)
@@ -5121,6 +5183,10 @@ export async function syncOrderDependenciesFromDispatchPlan(plan = {}, {
           [dependency.id]
         );
       }
+    }
+    const changedIds = new Set([...remapped, ...released].map(change => String(change.dependencyId)));
+    for (const dependency of dependencies.filter(row => changedIds.has(String(row.id)) && row.mode === "direct_to_customer")) {
+      await reconcileLinkedDirectShipQuantities({ transferOrderId: Number(dependency.transferOrderId), palletOnly: true });
     }
     return { remapped, released };
   });
@@ -5327,6 +5393,7 @@ export async function completeDirectDependenciesForSalesOrderDrop({
       );
       completed.push(result);
     }
+    await completeDirectTransfersForDependencies(rows.rows);
     return { completed, alreadyCompleted };
   });
 }

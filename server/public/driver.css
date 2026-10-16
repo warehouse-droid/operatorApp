@@ -2115,3 +2115,27 @@ body.driver-sync-input-locked #driverToast {
     justify-self: stretch;
   }
 }
+/* Upload status survives photo-form rendering while each request is active. */
+.driver-upload-status {
+  position: fixed;
+  left: 50%;
+  top: calc(env(safe-area-inset-top, 0px) + 76px);
+  transform: translateX(-50%);
+  width: min(420px, calc(100% - 32px));
+  z-index: 4000;
+  box-sizing: border-box;
+  padding: 14px 18px;
+  border: 1px solid #b9d6d2;
+  border-radius: 12px;
+  background: #fff;
+  color: #123d3a;
+  box-shadow: 0 8px 24px #123d3a26;
+  pointer-events: none;
+}
+.driver-upload-status[hidden] { display: none; }
+.driver-upload-status strong,
+.driver-upload-status span { display: block; }
+.driver-upload-status progress { width: 100%; height: 14px; margin: 8px 0; accent-color: #006f6b; }
+.driver-upload-status span { font-size: 14px; }
+
+.driver-upload-status button { pointer-events: auto; margin-top: 8px; padding: 8px 12px; }

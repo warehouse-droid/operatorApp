@@ -465,6 +465,13 @@ function contractLineContent(line) {
     || (String(line.dumpItemCode || "").toLowerCase().includes("soil") ? "soil" : "garbage");
 }
 
+function binAvailableForService(line) {
+  const latest = state.visits.filter((visit) => visit.serviceLineId === line.serviceLineId
+    && ["delivery", "exchange_bin"].includes(visit.serviceAction) && visit.status !== "cancelled")
+    .sort((left, right) => right.visitNumber - left.visitNumber)[0];
+  return latest?.status === "completed";
+}
+
 function renderContract() {
   contractCard.replaceChildren();
   contractCard.hidden = !state.contract;
@@ -482,6 +489,7 @@ function renderContract() {
   const lines = element("section", "", "mbt-service-line-list");
   lines.append(element("h3", "Physical bin service lines"));
   for (const line of state.serviceLines) {
+    if (line.status === "cancelled") continue;
     const card = element("section", "", "mbt-service-line-card");
     card.append(
       element("h3", `Line ${line.lineNumber} · ${line.binTypeCode || "Bin"}`),
@@ -492,11 +500,13 @@ function renderContract() {
     );
     if (!["closed", "cancelled"].includes(line.status)) {
       const actions = element("div", "", "mbt-quote-actions");
-      actions.append(
-        button("Extend return", () => openExtension(line.serviceLineId), "mbt-button-secondary"),
-        button("Exchange bin", () => openCustomerChargeDialog(line, "exchange_bin"), "mbt-button-secondary"),
-        button("Collect bin", () => openServiceLineAction(line, "collection"), "mbt-button-secondary")
-      );
+      const exchange = button("Exchange bin", () => openCustomerChargeDialog(line, "exchange_bin"), "mbt-button-secondary");
+      const collect = button("Collect bin", () => openServiceLineAction(line, "collection"), "mbt-button-secondary");
+      exchange.disabled = collect.disabled = !binAvailableForService(line);
+      actions.append(button("Extend return", () => openExtension(line.serviceLineId), "mbt-button-secondary"), exchange, collect);
+      if (exchange.disabled) {
+        actions.append(element("p", "Exchange and collection become available after the driver completes delivery.", "mbt-frontdesk-muted"));
+      }
       if (line.customerConfirmation?.status === "required") {
         actions.append(button("Record customer confirmation", () => openServiceLineAction(line, "confirmation")));
       }
@@ -659,6 +669,10 @@ function initialSiteSelection(addressText) {
 }
 
 async function openCustomerChargeDialog(line, kind) {
+  if (kind === "exchange_bin" && !binAvailableForService(line)) {
+    setMessage("Wait for Dispatch and the driver to complete this bin's delivery before requesting an exchange.", "attention");
+    return;
+  }
   if (!state.selectedCustomer || (kind !== "initial_bin" && kind !== "aggregate_order" && !state.contract)) {
     setMessage("Select a customer and contract before pricing this request.", "attention");
     return;
@@ -698,9 +712,9 @@ async function openCustomerChargeDialog(line, kind) {
     billingAddressText.value = fullAddress(state.selectedCustomer.sites?.[0]) || serviceAddressText.value;
     chargeServiceCode.value = service?.rateCardVersionId || "";
     populateDeliverySelect(chargeDeliveryItemCode);
-    chargeDeliveryItemCode.value = line?.pricing?.deliveryItemCode
-      || state.contract?.pricing?.deliveryItemCode
-      || state.configuration.deliveryItems?.[0]?.itemCode
+    chargeDeliveryItemCode.value = (!workflowIsSelectable && (line?.pricing?.deliveryItemCode
+      || state.contract?.pricing?.deliveryItemCode))
+      || state.configuration.deliveryItems?.find((item) => item.itemCode.toUpperCase() === "DELIVERY_CHARGE_MBT")?.itemCode
       || "";
     const outgoingContent = line ? contractLineContent(line) : "garbage";
     populateContentAndBins(configuration, outgoingContent, line?.binItemCode || "");
@@ -721,8 +735,8 @@ async function openCustomerChargeDialog(line, kind) {
       control.disabled = aggregateOnly;
     });
     chargeWorkflowFields.hidden = !["initial_bin", "aggregate_order"].includes(kind);
-    chargeOrderFrom150.checked = aggregateOnly;
-    chargeOrderFrom150.disabled = aggregateOnly;
+    chargeOrderFrom150.checked = false;
+    chargeOrderFrom150.disabled = false;
     if (aggregateOnly) addAggregateRow();
     customerChargeTitle.textContent = kind === "initial_bin"
       ? "New BIN contract price"
@@ -744,9 +758,6 @@ async function openCustomerChargeDialog(line, kind) {
 
 function chargeCommonBody() {
   const aggregateLines = requestedAggregateLines();
-  if (aggregateLines.length && !chargeOrderFrom150.checked) {
-    throw new Error("Select Order from 150 whenever aggregate ships with a bin.");
-  }
   const body = {
     paymentMethod: paymentMethod.value,
     billingAddressText: billingAddressText.value.trim(),

@@ -354,6 +354,7 @@ export async function listOperatorHistory({ operatorId, date = "", limit = 100, 
               'vehiclePlate', r.vehicle_plate,
               'palletQuantity', r.pallet_quantity,
               'netSuiteSyncStatus', r.netsuite_sync_status,
+              'netSuiteStage', CASE WHEN ra.batch_id IS NOT NULL OR r.workflow_version=2 THEN r.netsuite_stage END,
               'workflowVersion', CASE WHEN ra.batch_id IS NOT NULL THEN 3 ELSE r.workflow_version END,
               'netSuiteTransactionRef', CASE WHEN ra.batch_id IS NOT NULL OR r.workflow_version=2 THEN r.netsuite_transaction_ref END,
               'lines', COALESCE(lines.lines, '[]'::jsonb)

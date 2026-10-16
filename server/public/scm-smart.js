@@ -53,6 +53,49 @@ let smartCompositionFlushTimer = null;
 let smartRenderedTab = smartState.tab;
 let smartEventSource = null;
 let smartVendorEventRefreshTimer = null;
+const smartFontScales = [0.8, 0.9, 1, 1.1, 1.2, 1.3, 1.4, 1.5, 1.6];
+let smartFontStep = 2;
+let smartHeaderSizeObserver = null;
+
+function smartFontStorageKey() {
+  return `mbbs.smartScm.fontSize.${smartState.operator?.id || 'default'}`;
+}
+
+function smartApplyFontSize() {
+  document.body.style.setProperty('--smart-font-scale', String(smartFontScales[smartFontStep]));
+  const value = smartScmApp.querySelector('[data-smart-font-value]');
+  if (value) value.textContent = `${Math.round(smartFontScales[smartFontStep] * 100)}%`;
+  for (const button of smartScmApp.querySelectorAll('[data-smart-font-step]')) {
+    button.disabled = Number(button.dataset.smartFontStep) < 0 ? smartFontStep === 0 : smartFontStep === smartFontScales.length - 1;
+  }
+}
+
+function smartLoadFontSize() {
+  smartFontStep = 2;
+  try {
+    const saved = localStorage.getItem(smartFontStorageKey());
+    if (saved !== null && /^\d+$/.test(saved) && Number(saved) < smartFontScales.length) smartFontStep = Number(saved);
+  } catch { /* Use the default when browser storage is unavailable. */ }
+  smartApplyFontSize();
+}
+
+function smartAdjustFontSize(delta) {
+  smartFontStep = Math.max(0, Math.min(smartFontScales.length - 1, smartFontStep + delta));
+  try { localStorage.setItem(smartFontStorageKey(), String(smartFontStep)); } catch { /* The current page still adjusts. */ }
+  smartApplyFontSize();
+}
+
+function smartObserveHeaderSize() {
+  smartHeaderSizeObserver?.disconnect();
+  const header = smartScmApp.querySelector('.dispatch-topbar');
+  if (!header) return;
+  const measure = () => smartScmApp.style.setProperty('--smart-topbar-height', `${Math.ceil(header.getBoundingClientRect().height)}px`);
+  measure();
+  if (typeof ResizeObserver !== 'undefined') {
+    smartHeaderSizeObserver = new ResizeObserver(measure);
+    smartHeaderSizeObserver.observe(header);
+  }
+}
 
 function smartEscape(value) {
   return String(value ?? "")
@@ -242,6 +285,11 @@ function smartHeader() {
       </div>
       <span class="smart-mode ${settings.executionMode === "live" ? "live" : ""}">${smartEscape(settings.executionMode || "loading")} execution</span>
       <div class="topbar-actions">
+        <div class="smart-font-controls" role="group" aria-label="Font size">
+          <button type="button" data-smart-font-step="-1" aria-label="Decrease font size" title="Decrease font size">A−</button>
+          <output data-smart-font-value aria-live="polite">${Math.round(smartFontScales[smartFontStep] * 100)}%</output>
+          <button type="button" data-smart-font-step="1" aria-label="Increase font size" title="Increase font size">A+</button>
+        </div>
         <span class="dispatch-user">${smartEscape(smartState.operator?.display_name || smartState.operator?.username || "")}</span>
         <button type="button" onclick="location.href='/scm/route-rules'">Route rules</button>
         <button type="button" onclick="location.href='/scm'">SCM menu</button>
@@ -956,6 +1004,8 @@ function smartRender() {
   smartDeferredRender = false;
   const focusedControl = smartCaptureFocusedControl();
   smartScmApp.innerHTML = `${smartHeader()}${smartFloatingNotices()}<div class="smart-main">${smartTabs()}${smartContent()}</div>`;
+  smartApplyFontSize();
+  smartObserveHeaderSize();
   smartRenderedTab = smartState.tab;
   smartRestoreFocusedControl(focusedControl);
   smartScheduleNoticeDismissal();
@@ -981,6 +1031,11 @@ async function smartWork(label, task, success = "Saved") {
 }
 
 smartScmApp.addEventListener("click", async (event) => {
+  const fontButton = event.target.closest('[data-smart-font-step]');
+  if (fontButton) {
+    smartAdjustFontSize(Number(fontButton.dataset.smartFontStep));
+    return;
+  }
   const tab = event.target.closest("[data-smart-tab]");
   if (tab) {
     smartState.tab = tab.dataset.smartTab;
@@ -1419,6 +1474,7 @@ smartScmApp.addEventListener("submit", async (event) => {
 
 window.addEventListener("mbbs-language-changed", smartRender);
 window.addEventListener("beforeunload", () => {
+  smartHeaderSizeObserver?.disconnect();
   clearTimeout(smartVendorEventRefreshTimer);
   smartEventSource?.close();
 });
@@ -1428,6 +1484,7 @@ requireDispatchLogin({
   roles: ["admin", "scm", "scm_staff", "dispatcher", "yard_manager"],
   async onReady(operator) {
     smartState.operator = operator;
+    smartLoadFontSize();
     smartRender();
     smartConnectEvents();
     try {

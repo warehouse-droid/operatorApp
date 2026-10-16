@@ -1,4 +1,5 @@
 import { specialPurchaseOrderDisplayRef } from './special-stock-po-reference.js';
+import { specialSalesOrderFulfilled } from './special-stock-workflow.js';
 const escape = value => String(value ?? '').replace(/[&<>"']/g, char => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[char]));
 
 export function specialClosureNeedsScm(detail) {
@@ -36,23 +37,57 @@ function estimatedArrivalLabel(plan) {
 /** @param {Record<string,any>} detail */
 function salesFulfillment(detail) {
   const label = String(detail.salesOrderFulfillmentStatus || detail.salesOrderStatus || '').replaceAll('_', ' ').replace(/^.*: */, '').trim();
-  const partial = /partial/i.test(label);
-  const fulfilled = !partial && Boolean(detail.salesOrderFulfilledAt || detail.salesOrderPickupCompletedAt
-    || detail.operationalCompletionSource === 'yard_pickup' || /^(fully )?(fulfilled|billed)$|^pending billing$/i.test(label));
+  const fulfilled = specialSalesOrderFulfilled(detail);
   return { fulfilled, label: fulfilled ? 'Fulfilled' : label || 'Pending fulfillment' };
 }
 
 /** @typedef {{planned?:boolean,plans?:Array<{planDate?:string,estimatedArrivalMinute?:number|null}>}} PlanningState */
 /** @typedef {[string,number|null|undefined,PlanningState|undefined,string|undefined,string,boolean|undefined]} PlanningOrder */
+/** @param {unknown} value */
+function completionTime(value) {
+  if (!value || !['string','number','object'].includes(typeof value)) return '';
+  const date = new Date(/** @type {any} */ (value));
+  if (!Number.isFinite(date.getTime())) return '';
+  const parts = Object.fromEntries(new Intl.DateTimeFormat('en-CA', { timeZone:'America/Toronto', year:'numeric',month:'2-digit',day:'2-digit',
+    hour:'2-digit',minute:'2-digit',second:'2-digit',hourCycle:'h23',timeZoneName:'short' }).formatToParts(date).map(part=>[part.type,part.value]));
+  return `<time datetime="${date.toISOString()}">${parts.year}-${parts.month}-${parts.day} ${parts.hour}:${parts.minute}:${parts.second} ${escape(parts.timeZoneName)}</time>`;
+}
+
+/** @param {Record<string,any>} detail @param {string} label */
+function physicalProgress(detail, label) {
+  /** @param {string} text @param {unknown} completedAt */
+  const progress = (text,completedAt,success=true) => ({text,completedAt,success,arrival:''});
+  if (label === 'SO' && detail.fulfillmentMethod === 'mbt_delivery') {
+    if (detail.operationallyComplete) return progress('SO delivery: Delivered',detail.operationallyCompletedAt);
+    if (detail.salesOrderPickedUpAt) return progress('SO: Picked up by driver',detail.salesOrderPickedUpAt);
+  }
+  if (label === 'SO' && detail.fulfillmentMethod === 'yard_pickup' && detail.salesOrderPickupCompletedAt) {
+    return progress('SO pickup: Picked up by customer',detail.salesOrderPickupCompletedAt);
+  }
+  if (label === 'PO') {
+    if (detail.handoffRoute === 'direct') {
+      if (detail.purchaseOrderDropoffAt || detail.operationallyComplete) return progress('PO delivery: Delivered',detail.purchaseOrderDropoffAt || detail.operationallyCompletedAt);
+    } else {
+      if (detail.purchaseOrderReceiptStatus === 'partial_received') return progress('PO receipt: Partially arrived at yard',null,false);
+      if (detail.purchaseOrderDropoffAt || detail.purchaseOrderReceiptStatus === 'received') return progress('PO receipt: Arrived at yard',detail.purchaseOrderDropoffAt || detail.purchaseOrderReceivedAt);
+    }
+    if (detail.purchaseOrderPickedUpAt) return progress('PO: Picked up by driver',detail.purchaseOrderPickedUpAt);
+  }
+  return null;
+}
+
 /** @param {Record<string,any>} detail @param {string} label @param {PlanningState|undefined} state @param {boolean|undefined} skipped @param {boolean} compact @param {string} audience */
 function orderProgress(detail, label, state, skipped, compact, audience) {
   if (skipped) return { success: false, text: 'Test step completed', arrival: '' };
+  const physical = physicalProgress(detail,label);
+  if (physical) return physical;
   if (audience === 'sales' && label === 'SO' && detail.fulfillmentMethod === 'yard_pickup') {
     const fulfillment = salesFulfillment(detail);
     return { success: fulfillment.fulfilled, text: `SO fulfillment: ${fulfillment.label}`, arrival: '' };
   }
   if (audience === 'sales' && label === 'SO' && detail.fulfillmentMethod === 'vendor_pickup') {
-    return { success: false, text: detail.salesOrderStatus || 'Pending sync', arrival: '' };
+    return { success: Boolean(detail.operationallyComplete), text: detail.operationallyComplete ? 'Collected at vendor' : 'Awaiting vendor pickup',
+      completedAt: detail.operationallyComplete ? detail.operationallyCompletedAt : null, arrival: '' };
   }
   const dates = [...new Set((state?.plans || []).map(plan => plan.planDate).filter(Boolean))];
   const status = state?.planned ? `Planned${!compact && dates.length ? ` (${dates.join(', ')})` : ''}` : 'Not planned';
@@ -68,15 +103,17 @@ function planningOrderCard(detail, value, compact, { audience, showOrderPreviews
   const tag = compact ? 'span' : 'div';
   const preview = showOrderPreviews && !compact && !skipped && id && (audience === 'scm' || kind === 'sales_order');
   const nativeStatus = label === 'SO' ? detail.salesOrderStatus : detail.purchaseOrderStatus;
+  const completed = completionTime(/** @type {any} */ (progress).completedAt);
   return `<${tag} class="special-planning-order${progress.success ? ' is-planned' : ''}"><span><strong>${label} ${escape(skipped ? 'creation skipped (test)' : reference || id)}</strong><small class="special-planning-order-status">${escape(progress.text)}</small>
-    ${!compact && nativeStatus ? `<small>${escape(nativeStatus)}</small>` : ''}
+    ${completed ? `<small class="special-planning-completed-time">${completed}</small>` : ''}
+    ${!compact && audience !== 'sales' && nativeStatus ? `<small>NetSuite: ${escape(nativeStatus)}</small>` : ''}
     ${progress.arrival ? `<small class="special-planning-eta">${escape(progress.arrival)}</small>` : ''}</span>
     ${preview ? `<button type="button" data-special-document="${kind}" data-case-id="${escape(detail.id)}">Preview ${label}</button>` : ''}</${tag}>`;
 }
 
 /** @param {Record<string,any>} detail */
-export function specialPlanningStatus(detail, compact = false, { showOrderPreviews = false, audience = 'scm' } = {}) {
-  const notice = detail.purchaseOrderId && detail.purchaseOrderApproved === false && !['closed','completed'].includes(detail.stage)
+export function specialPlanningStatus(detail, compact = false, { showOrderPreviews = false, audience = 'scm', showApprovalNotice = true } = {}) {
+  const notice = showApprovalNotice && detail.purchaseOrderId && detail.purchaseOrderApproved === false && !['closed','completed'].includes(detail.stage)
     ? `<div class="stock-request-notice" role="status">${detail.purchaseOrderPendingApproval ? 'PO approval pending' : 'PO approval not confirmed'}${compact ? '' : ' — request remains Confirmed until NetSuite approval. Status updates automatically.'}</div>` : '';
   const planning = detail.dispatchPlanning;
   /** @type {PlanningOrder[]} */
@@ -90,11 +127,14 @@ export function specialPlanningStatus(detail, compact = false, { showOrderPrevie
     return `${notice}<${tag} class="special-planning-status special-planning-documents${salesClasses}${planning?.anyPlanned ? ' is-planned' : ''}">${compact ? '' : `<strong>${audience === 'sales' ? 'Orders' : 'Dispatch planning'}</strong>`}${orders.join('')}</${tag}>`;
   }
   const labels = values.filter(([,id])=>id).map(([label,,state,reference]) => {
+    const physical = physicalProgress(detail,label);
+    if (physical) return `${physical.text}${reference ? ` · ${reference}` : ''}`;
     const dates = [...new Set((state?.plans || []).map(plan=>plan.planDate).filter(Boolean))];
     return `${label}: ${state?.planned ? `Planned${!compact && dates.length ? ` (${dates.join(', ')})` : ''}` : 'Not planned'}${label === 'PO' && reference ? ` · ${reference}` : ''}`;
   });
   if (!labels.length) return notice;
-  return `${notice}<${compact ? 'small' : 'div'} class="special-planning-status${planning?.anyPlanned ? ' is-planned' : ''}">Dispatch · ${escape(labels.join(' · '))}</${compact ? 'small' : 'div'}>`;
+  const times = values.filter(([,id])=>id).map(([label])=>({label,time:completionTime(physicalProgress(detail,label)?.completedAt)})).filter(value=>value.time);
+  return `${notice}<${compact ? 'small' : 'div'} class="special-planning-status${planning?.anyPlanned ? ' is-planned' : ''}">Dispatch · ${escape(labels.join(' · '))}${times.map(value=>`<span class="special-planning-completed-time">${escape(value.label)} · ${value.time}</span>`).join('')}</${compact ? 'small' : 'div'}>`;
 }
 
 export function specialClosureStatus(detail, audience) {

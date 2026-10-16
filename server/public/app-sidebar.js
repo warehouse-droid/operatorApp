@@ -10,7 +10,8 @@
   let offlineReviewRefreshTimer = null;
   let offlineReviewEventSource = null;
   let sidebarOperator = null;
-  if (!path.startsWith("/admin") && !path.startsWith("/control") && !path.startsWith("/dispatch") && !path.startsWith("/scm") && !path.startsWith("/sales") && !path.startsWith("/mbt") && !path.startsWith("/aggregate-requests")) return;
+  let mbrContractsEnabled = false;
+  if (!path.startsWith("/admin") && !path.startsWith("/control") && !path.startsWith("/dispatch") && !path.startsWith("/scm") && !path.startsWith("/sales") && !path.startsWith("/mbr") && !path.startsWith("/mbt") && !path.startsWith("/aggregate-requests")) return;
 
   function t(key, fallback) {
     return window.MBBS_I18N?.t?.(key, fallback) || fallback;
@@ -43,6 +44,7 @@
     if (item.href === "/admin") return path.startsWith("/admin");
     if (item.href === "/dispatch") return path === "/dispatch";
     if (item.href === "/scm") return path === "/scm";
+    if (item.href === "/scm/stock-check") return path === item.href || path.startsWith(item.href + "/");
     if (item.href === "/sales") return path === "/sales";
     return path === item.href;
   }
@@ -55,6 +57,7 @@
     { label: "SCM", href: "/scm", icon: "SC", authorities: ["admin", "dispatcher", "scm", "scm_staff", "yard_manager"] },
     { label: "Sales", href: "/sales", icon: "SA", authorities: ["admin", "sales"] },
     { label: "Field Sales", href: "/field-sales/", icon: "FS", authorities: ["admin", "field_sales"] },
+    { label: "MBR", href: "/mbr", icon: "MR", authorities: ["admin", "mbr_sales"] },
     { label: "MBT", href: "/mbt", icon: "MB", authorities: ["admin", "dispatcher", "mbt_frontdesk", "mbt_billing"] },
     { label: "Aggregate Requests", href: "/aggregate-requests", icon: "AG", staffOnly: true, authorities: ["admin", "sales", "operator", "yard_manager"] },
     { label: "Operator", href: "/operator", icon: "OP", authorities: ["admin", "operator", "yard_manager"] }
@@ -63,6 +66,7 @@
   const dispatchItems = [
     { label: "Menu", href: "/dispatch", icon: "MN" },
     { label: "Planning", href: "/dispatch/planning", icon: "PL" },
+    { label: "Delivery Requests", href: "/dispatch/delivery-requests", icon: "DR" },
     { label: "Custom Orders", href: "/dispatch/custom-orders", icon: "CU" },
     { label: "Sp. O", href: "/dispatch/special-stock", icon: "SP" },
     { label: "Monitor", href: "/dispatch/monitor", icon: "MO" },
@@ -79,6 +83,7 @@
   const scmItems = [
     { label: "SCM Menu", href: "/scm", icon: "SM", authorities: ["admin", "dispatcher", "scm", "scm_staff", "yard_manager"] },
     { label: "Stock Requests", href: "/scm/stock-requests", icon: "SR", scmWriteOnly: true, authorities: ["admin", "scm", "scm_staff"] },
+    { label: "Stock Check", href: "/scm/stock-check", icon: "SK", scmWriteOnly: true, authorities: ["admin", "scm", "scm_staff"] },
     { label: "TO Printing", href: "/scm/to-printing", icon: "TP", scmWriteOnly: true, authorities: ["admin", "scm", "scm_staff"] },
     { label: "Custom Orders", href: "/scm/custom-orders", icon: "CU", scmWriteOnly: true, authorities: ["admin", "scm", "scm_staff"] },
     { label: "Smart SCM", href: "/scm/smart", icon: "AI", authorities: ["admin", "dispatcher", "scm", "scm_staff", "yard_manager"] },
@@ -95,6 +100,7 @@
 
   const salesItems = [
     { label: "Sales Menu", href: "/sales", icon: "SM" },
+    { label: "Delivery Requests", href: "/sales/delivery-requests", icon: "DR", staffOnly: true },
     { label: "Delivery Instructions", href: "/sales/delivery-instructions", icon: "DI", staffOnly: true },
     { label: "Request Stock", href: "/sales/stock-requests", icon: "RS", staffOnly: true },
     { label: "Return Records", href: "/sales/returns", icon: "RR", staffOnly: true },
@@ -109,6 +115,7 @@
     { label: "Dashboard", href: "/control", controlSection: "dashboard", icon: "DB" },
     { label: "Return Management", href: "/control/returns", controlSection: "returns", icon: "RM" },
     { label: "Order Locks", href: "/control/order-locks", controlSection: "locks", icon: "LK" },
+    { label: "Order Reopen", href: "/control/order-reopen", controlSection: "reopen", icon: "RO" },
     { label: "Item Classification", href: "/control/item-classification", controlSection: "classification", icon: "CL" },
     { label: "Vendor Mapping", href: "/control/vendor-mapping", controlSection: "vendor-mapping", icon: "VM" },
     { label: "Operator Warnings", href: "/control/operator-warnings", controlSection: "warnings", icon: "WN" },
@@ -121,6 +128,7 @@
 
   const adminItems = [
     { label: "BOSS setup", href: "/admin/boss-approvals", icon: "BO" },
+    { label: "Menu order", href: "/admin/menu-order", icon: "MO" },
     { label: "SOR Auto Returns", href: "/admin/sor-auto-returns", controlSection: "sor-auto-returns", icon: "SR" },
     { label: "Overview", href: "/admin", controlSection: "dashboard", icon: "OV" },
     { label: "Accounts", href: "/admin/accounts", controlSection: "operators", icon: "AC" },
@@ -180,6 +188,7 @@
     const aggregateAccess = operator?.aggregateRequestYardLocationIds?.length
       && ["operator", "sales", "yard_manager"].some(role => roles.has(role));
     return mainItems.filter((item) => (!item.staffOnly || !operator?.publicSales)
+      && (item.href !== "/mbr" || mbrContractsEnabled)
       && (item.href !== "/aggregate-requests" || aggregateAccess) && itemAllowedByAuthority(item, roles));
   }
 
@@ -194,6 +203,7 @@
   }
 
   function currentItems() {
+    if (path.startsWith("/mbr")) return { title: "MBR", items: [{ label: "Contract", href: "/mbr/contracts", icon: "CT" }, { label: "MBR Setup", href: "/mbr/setup", icon: "SE" }] };
     if (path.startsWith("/aggregate-requests")) return {
       title: "Aggregate Requests", items: [{ label: "Requests", href: "/aggregate-requests", icon: "AG" }]
     };
@@ -252,7 +262,7 @@
       }
       .app-sidebar-head {
         display: grid;
-        grid-template-columns: minmax(0, 1fr) 34px;
+        grid-template-columns: minmax(0, 1fr) 34px 34px;
         gap: 8px;
         align-items: center;
         min-height: 58px;
@@ -279,7 +289,8 @@
         font-size: 11px;
         font-weight: 900;
       }
-      .app-sidebar-toggle {
+      .app-sidebar-toggle,
+      .app-sidebar-preferences {
         min-width: 34px;
         min-height: 34px;
         padding: 0;
@@ -288,6 +299,21 @@
         background: rgba(255, 255, 255, 0.08);
         color: #fff;
         font-size: 18px;
+        cursor: pointer;
+      }
+      .app-sidebar-preferences {
+        display: inline-grid;
+        place-items: center;
+      }
+      .app-sidebar-preferences:hover {
+        background: rgba(255, 255, 255, 0.16);
+      }
+      .app-sidebar-preferences:focus-visible {
+        outline: 3px solid #58d3b3;
+        outline-offset: 2px;
+      }
+      .app-sidebar-preferences[hidden] {
+        display: none;
       }
       .app-sidebar-scroll {
         min-height: 0;
@@ -420,7 +446,8 @@
       body.app-sidebar-collapsed .app-sidebar-foot {
         padding: 8px 6px;
       }
-      body.app-sidebar-collapsed .app-sidebar-toggle {
+      body.app-sidebar-collapsed .app-sidebar-toggle,
+      body.app-sidebar-collapsed .app-sidebar-preferences {
         width: 42px;
       }
       @media (max-width: 760px) {
@@ -440,14 +467,30 @@
           inset: auto 0 0 0;
           width: 100%;
           height: calc(72px + env(safe-area-inset-bottom));
-          display: block;
+          display: flex;
           border-top: 1px solid #c6d3da;
           border-right: 0;
           box-shadow: 0 -8px 20px rgba(15, 37, 47, 0.18);
         }
         body.admin-sync-page .app-sidebar-head,
+        body.scm-transfer-dependencies-page .app-sidebar-head {
+          display: flex;
+          flex: 0 0 46px;
+          box-sizing: border-box;
+          justify-content: center;
+          padding: 5px 6px calc(5px + env(safe-area-inset-bottom));
+          border-right: 1px solid rgba(255, 255, 255, 0.14);
+          border-bottom: 0;
+        }
+        body.admin-sync-page .app-sidebar-preferences,
+        body.scm-transfer-dependencies-page .app-sidebar-preferences {
+          width: 34px;
+        }
+        body.admin-sync-page .app-sidebar-brand,
+        body.admin-sync-page .app-sidebar-toggle,
         body.admin-sync-page .app-sidebar-foot,
-        body.scm-transfer-dependencies-page .app-sidebar-head,
+        body.scm-transfer-dependencies-page .app-sidebar-brand,
+        body.scm-transfer-dependencies-page .app-sidebar-toggle,
         body.scm-transfer-dependencies-page .app-sidebar-foot {
           display: none;
         }
@@ -456,6 +499,8 @@
         body.admin-sync-page.app-sidebar-collapsed .app-sidebar-scroll,
         body.scm-transfer-dependencies-page.app-sidebar-collapsed .app-sidebar-scroll {
           height: 100%;
+          flex: 1 1 auto;
+          min-width: 0;
           display: flex;
           overflow-x: auto;
           overflow-y: hidden;
@@ -577,7 +622,7 @@
 
   function connectOfflineReviewEvents() {
     if (!("EventSource" in window) || offlineReviewEventSource || !path.startsWith("/dispatch") || !operatorCanReviewOffline(window.MBBS_DISPATCH_OPERATOR)) return;
-    offlineReviewEventSource = new EventSource("/api/events?client=offline-review-sidebar");
+    offlineReviewEventSource = window.MBBSAppEventStream?.connect("/api/events?client=offline-review-sidebar") || new EventSource("/api/events?client=offline-review-sidebar");
     offlineReviewEventSource.addEventListener("app-event", (message) => {
       let event;
       try {
@@ -604,6 +649,8 @@
 
   function render() {
     const scoped = currentItems();
+    const group = ['admin','dispatch','scm','sales','mbr','mbt'].find(key => path.startsWith(`/${key}`)) || 'control';
+    const ordered = (key,items) => window.MBBSMenuOrder?.sort(key,items) || items;
     const storedCollapsed = localStorage.getItem(STORAGE_KEY);
     const collapsed = storedCollapsed === "true"
       || (storedCollapsed === null
@@ -627,16 +674,22 @@
           <strong>MBBS</strong>
           <span>${escapeHtml(scoped.title)}</span>
         </div>
+        <button class="app-sidebar-preferences" data-personal-preferences type="button" title="Personal preferences" aria-label="Personal preferences" aria-haspopup="dialog" hidden>
+          <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linejoin="round" aria-hidden="true" focusable="false">
+            <path d="M10 2h4l1 3 2 1 3-1 2 4-2 2v2l2 2-2 4-3-1-2 1-1 3h-4l-1-3-2-1-3 1-2-4 2-2v-2L2 9l2-4 3 1 2-1Z" />
+            <circle cx="12" cy="12" r="3" />
+          </svg>
+        </button>
         <button class="app-sidebar-toggle" data-sidebar-toggle type="button" title="${collapsed ? "Expand" : "Collapse"}">${collapsed ? ">" : "<"}</button>
       </div>
       <div class="app-sidebar-scroll">
         <nav class="app-sidebar-section" aria-label="Main modules">
           <div class="app-sidebar-section-title">Modules</div>
-          ${visibleMainItems().map(linkHtml).join("")}
+          ${ordered('main',visibleMainItems()).map(linkHtml).join("")}
         </nav>
         <nav class="app-sidebar-section" aria-label="${escapeHtml(scoped.title)} pages">
           <div class="app-sidebar-section-title">${escapeHtml(scoped.title)}</div>
-          ${scoped.items.map(linkHtml).join("")}
+          ${ordered(group,scoped.items).map(linkHtml).join("")}
         </nav>
       </div>
       <div class="app-sidebar-foot">
@@ -680,6 +733,7 @@
       if (!response.ok) return;
       const payload = await response.json();
       sidebarOperator = payload.operator || null;
+      mbrContractsEnabled = payload.mbrContractsEnabled === true;
       render();
     } catch {
       // Retain the stored authority view while the live session check is temporarily unavailable.
@@ -692,18 +746,53 @@
   }
 
   function init() {
+    if(!document.querySelector('link[rel="manifest"]')) {
+      const staffManifest=document.createElement('link');staffManifest.rel='manifest';
+      staffManifest.href='/staff-manifest.webmanifest';document.head.appendChild(staffManifest);
+    }
+    const alertSound=document.createElement('script');
+    alertSound.async=false;alertSound.src='/app-alert-sound.js?v=20261014-attention';
+    document.head.appendChild(alertSound);
+    const osNotifications = document.createElement('script');
+    osNotifications.async = false;
+    osNotifications.src = '/app-notifications.js?v=20261014-preferences';
+    document.head.appendChild(osNotifications);
+    const menuOrder = document.createElement('script');
+    menuOrder.type = 'module';
+    menuOrder.src = '/menu-order.js?v=20261006';
+    document.head.appendChild(menuOrder);
+    const appEventStream = document.createElement('script');
+    appEventStream.src = '/app-event-stream.js?v=20261005';
+    appEventStream.async = false;
+    document.head.appendChild(appEventStream);
     const regularAlert = document.createElement("script");
-    regularAlert.src = "/regular-stock-alert.js?v=20260929";
+    regularAlert.async = false;
+    regularAlert.src = "/regular-stock-alert.js?v=20261014-os-notifications&stockingReply=20261006-v1&backorder=20261007-v1&stockCheck=20261009";
     document.head.appendChild(regularAlert);
     const aggregateAlert = document.createElement("script");
-    aggregateAlert.src = "/scm-aggregate-alert.js?v=20260925-aggregate-alert-v1";
+    aggregateAlert.async = false;
+    aggregateAlert.src = "/scm-aggregate-alert.js?v=20261005-shared-events";
     document.head.appendChild(aggregateAlert);
     const specialAlert = document.createElement("script");
-    specialAlert.src = "/scm-special-alert.js?v=20260928-special-alert-v1";
+    specialAlert.async = false;
+    specialAlert.src = "/scm-special-alert.js?v=20261005-shared-events";
     document.head.appendChild(specialAlert);
     const salesSpecialAlert = document.createElement("script");
-    salesSpecialAlert.src = "/sales-special-alert.js?v=20261002-stock-updates-v1";
+    salesSpecialAlert.async = false;
+    salesSpecialAlert.src = "/sales-special-alert.js?v=20261005-shared-events";
     document.head.appendChild(salesSpecialAlert);
+    const specialDeliveryAlert = document.createElement('script');
+    specialDeliveryAlert.type = 'module';
+    specialDeliveryAlert.src = '/special-delivery-method-alert.js?v=20261014-os-notifications';
+    document.head.appendChild(specialDeliveryAlert);
+    const deliveryAlert = document.createElement('script');
+    deliveryAlert.async = false;
+    deliveryAlert.src = '/delivery-request-alert.js?v=20261015-transfer-orders';
+    document.head.appendChild(deliveryAlert);
+    const conversationAlert = document.createElement('script');
+    conversationAlert.async = false;
+    conversationAlert.src = '/stock-request-conversation-alert.js?v=20261016';
+    document.head.appendChild(conversationAlert);
     installStyle();
     render();
     void refreshSidebarAuthority();
@@ -718,6 +807,7 @@
       handleControlSection(event);
     });
     window.addEventListener("mbbs-language-changed", render);
+    window.addEventListener('mbbs-menu-order-changed',render);
     window.addEventListener("mbbs-auth-operator-changed", handleSidebarAuthChange);
     window.addEventListener("mbbs-auth-operator-changed", handleOfflineReviewAuthChange);
     window.addEventListener("mbbs-offline-review-count-changed", refreshOfflineReviewCount);

@@ -24,7 +24,7 @@ export function savedSpecialDeliveryFee(detail) {
 /** @param {Record<string,any>} detail */
 export function specialDeliveryFeeDisplay(detail) {
   const rate = savedSpecialDeliveryFee(detail);
-  if (rate == null) return '';
+  if (rate == null || rate === 0) return '';
   const amount = new Intl.NumberFormat('en-CA', { style: 'currency', currency: 'CAD' }).format(rate);
   return `<article class="stock-request-line" data-special-delivery-fee-line>
     <header><strong>Delivery fee</strong></header><div class="stock-request-line-fields">

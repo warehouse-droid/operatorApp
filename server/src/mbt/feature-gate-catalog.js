@@ -3,6 +3,7 @@
 import {
   OPERATOR_NETSUITE_GATE_DEFINITIONS,
   OPERATOR_NETSUITE_RETURN_GATE_DEFINITIONS,
+  OPERATOR_NETSUITE_RETURN_CREDIT_MEMO_GATE_DEFINITIONS,
   OPERATOR_NETSUITE_YARDS
 } from "../operator-netsuite-posting-policy.js";
 
@@ -48,6 +49,16 @@ export const MBT_ADMIN_GATE_DEFINITIONS = Object.freeze([
     lockReason: null
   }),
   Object.freeze({
+    flagKey: "operator_phone_layout",
+    label: "Operator phone version",
+    description: "Enable phone layouts and native iPhone photo and barcode capture. Existing tablet layouts and tablet camera behavior are retained. When off, devices use the existing Operator interface.",
+    environmentProperty: null,
+    independent: true,
+    configuredDefault: false,
+    locked: false,
+    lockReason: null
+  }),
+  Object.freeze({
     flagKey: "sales_stock_request_over_availability",
     label: "Sales stock request over availability",
     description: "Allow Sales to request more than the selected source yard's current availability for SCM review. SCM can intentionally convert the full demand; any shortage is shown and retained as a Transfer Order backorder.",
@@ -86,7 +97,8 @@ export const MBT_ADMIN_GATE_DEFINITIONS = Object.freeze([
     locked: false,
     lockReason: null
   }),
-  ...[...OPERATOR_NETSUITE_GATE_DEFINITIONS, ...OPERATOR_NETSUITE_RETURN_GATE_DEFINITIONS].map((definition) => Object.freeze({
+  ...[...OPERATOR_NETSUITE_GATE_DEFINITIONS, ...OPERATOR_NETSUITE_RETURN_GATE_DEFINITIONS,
+    ...OPERATOR_NETSUITE_RETURN_CREDIT_MEMO_GATE_DEFINITIONS].map((definition) => Object.freeze({
     ...definition,
     environmentProperty: "netSuiteDirectAccessEnabled",
     gateGroup: "operator_netsuite_posting"

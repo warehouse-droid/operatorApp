@@ -67,11 +67,13 @@ function salesReturnReference(record) {
 
 function salesReturnStatus(record) {
   const syncStatus = String(salesFirst(record, ["netSuiteSyncStatus", "netsuite_sync_status"], "")).toLowerCase();
+  const creditMemo = salesFirst(record, ["netSuiteStage", "netsuite_stage"], "") === "credit_memo";
   if (syncStatus === "failed") {
-    return salesReturnType(record) === "pallet" && Number(record.workflowVersion || 1) < 2 ? "credit_memo_creation_failed" : "ra_creation_failed";
+    return creditMemo || (salesReturnType(record) === "pallet" && Number(record.workflowVersion || 1) < 2) ? "credit_memo_creation_failed" : "ra_creation_failed";
   }
   if (Number(record.workflowVersion) >= 2 && !["voided", "rejected"].includes(record.status)) {
-    const result = { disabled: "local_only", pending: "ra_pending", succeeded: "ra_created", manual_linked: "ra_created" }[syncStatus];
+    const prefix = creditMemo ? "credit_memo" : "ra";
+    const result = { disabled: "local_only", pending: `${prefix}_pending`, succeeded: `${prefix}_created`, manual_linked: `${prefix}_created` }[syncStatus];
     if (result) {return result;}
   }
   return String(salesFirst(record, ["status", "returnStatus", "return_status", "approvalStatus", "approval_status"], "unknown"))
@@ -97,6 +99,8 @@ function salesReturnStatusLabel(recordOrStatus) {
     ra_created: "RA Created",
     ra_creation_failed: "RA Creation Failed",
     credit_memo_creation_failed: "Credit Memo Creation Failed",
+    credit_memo_pending: "Credit Memo Pending",
+    credit_memo_created: "Credit Memo Created",
     sync_failed: "NetSuite Sync Failed",
     synced: "Synced",
     linked: "Linked",
@@ -306,8 +310,11 @@ function renderSalesMenu() {
         <p>${operator.publicSales ? "Available" : "Authorized"} yards: ${salesEscape(yards.join(", ") || "None assigned")}</p>
       </div>
       ${yards.length ? "" : `<div class="route-notice"><span>No Sales yards are assigned to this account. Ask an administrator to update Account Management.</span></div>`}
-      <div class="dispatch-menu-grid">
+      <div class="dispatch-menu-grid" data-menu-group="sales">
         ${operator.publicSales ? "" : `
+          <button class="dispatch-menu-card primary-card" onclick="location.href='/sales/delivery-requests'" type="button">
+            <strong>Delivery Requests</strong><span>Calculate delivery charges, request a timeslot, and secure Dispatch approval with Sales Orders.</span>
+          </button>
           <button class="dispatch-menu-card primary-card" onclick="location.href='/sales/delivery-instructions'" type="button">
             <strong>${salesT("deliveryInstruction.title", "Delivery Instructions")}</strong><span>${salesT("deliveryInstruction.menuHelp", "Add driver call-ahead, placement, image, and video instructions to retained Delivery Sales Orders.")}</span>
           </button>
@@ -328,7 +335,7 @@ function renderSalesMenu() {
           <strong>Truck Monitor</strong><span>View live truck locations, active loads, and stop progress.</span>
         </button>
         <button class="dispatch-menu-card" onclick="location.href='/sales/printing'" type="button">
-          <strong>Sales Order Printing</strong><span>Find Delivery orders by ordering location, preview the selected line-yard ticket, and review every stored print snapshot.</span>
+          <strong>Sales Order Printing</strong><span>Find delivery and pickup orders by ordering location, preview the selected line-yard ticket, and review every stored print snapshot.</span>
         </button>
         ${operator.publicSales ? "" : `
           <button class="dispatch-menu-card" onclick="location.href='/sales/in-outbound-record'" type="button">

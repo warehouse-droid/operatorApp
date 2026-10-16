@@ -106,7 +106,7 @@
     paint();
     if (!timer) { timer = window.setInterval(refresh, 30000); }
     if (!events && 'EventSource' in window) {
-      events = new EventSource('/api/events?client=scm-special-alert');
+      events = window.MBBSAppEventStream?.connect('/api/events?client=scm-special-alert') || new EventSource('/api/events?client=scm-special-alert');
       events.addEventListener('open', refresh);
       events.addEventListener('app-event', message => {
         try {

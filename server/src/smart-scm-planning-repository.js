@@ -1210,8 +1210,8 @@ function proposalUnitWeightSort(left, right) {
   return 0;
 }
 
-function packProposalUnits(units = [], truckCapacity = 0, maxStops = 2) {
-  const loads = [];
+function packProposalUnits(units = [], truckCapacity = 0, maxStops = 2, initialLoads = []) {
+  const loads = [...initialLoads];
   for (const unit of units) {
     const destinationId = Number(unit.line.destinationLocationId);
     const unitWeight = smartScmProposalLineLoadWeightLbs(unit.line);
@@ -1356,9 +1356,60 @@ function samePackedLineTotals(leftLoads = [], rightLoads = []) {
   return true;
 }
 
+function stablePriorityUnitSort(left, right) {
+  return proposalUnitWeightSort(left, right)
+    || Number(left.line.destinationLocationId) - Number(right.line.destinationLocationId)
+    || Number(left.line.itemId) - Number(right.line.itemId);
+}
+
+function wholeUrgentRemainderLoads(partials = [], truckCapacity = 0, maxStops = 2) {
+  const loads = [];
+  const ordered = [...partials].sort((left, right) => right.totalWeight - left.totalWeight
+    || Number(left.lines[0].destinationLocationId) - Number(right.lines[0].destinationLocationId));
+  for (const partial of ordered) {
+    const target = loads.find((load) => load.totalWeight + partial.totalWeight <= truckCapacity + EPSILON
+      && new Set([...loadDestinationIds(load), ...loadDestinationIds(partial)]).size <= maxStops);
+    if (!target) {
+      loads.push({ ...partial, lines: [...partial.lines], units: [...partial.units] });
+      continue;
+    }
+    for (const line of partial.lines) {
+      combineLoadLine(target.lines, line);
+    }
+    target.units.push(...partial.units);
+    target.totalWeight = round(target.totalWeight + partial.totalWeight);
+  }
+  return loads;
+}
+
+function ultimatePriorityProposalLoads(baselineLoads = [], truckCapacity = 0, maxStops = 2) {
+  // Reuse routed pallet units so a second proportional split cannot change
+  // quantities or the routing decisions already made for partial vendor loads.
+  const units = baselineLoads.flatMap((load) => load.units);
+  const ultimate = units.filter((unit) => smartScmUrgencyRank(unit.line.urgencyLevel, unit.line.urgent) === 3)
+    .sort(stablePriorityUnitSort);
+  const lower = units.filter((unit) => smartScmUrgencyRank(unit.line.urgencyLevel, unit.line.urgent) < 3)
+    .sort(stablePriorityUnitSort);
+  const destinationLoads = packProposalUnits(ultimate, truckCapacity, 1);
+  const fullUltimate = destinationLoads.filter((load) => operationallyFullLoad(load, truckCapacity));
+  const remainders = wholeUrgentRemainderLoads(destinationLoads
+    .filter((load) => !operationallyFullLoad(load, truckCapacity)), truckCapacity, maxStops);
+  fullUltimate.push(...remainders.filter((load) => operationallyFullLoad(load, truckCapacity)));
+  const partialUltimate = remainders.filter((load) => !operationallyFullLoad(load, truckCapacity));
+  const lowerLoads = destinationFirstProposalLoads(lower, truckCapacity, maxStops);
+  const fullLower = lowerLoads.filter((load) => operationallyFullLoad(load, truckCapacity));
+  const lowerRemainders = lowerLoads.filter((load) => !operationallyFullLoad(load, truckCapacity))
+    .flatMap((load) => load.units).sort(stablePriorityUnitSort);
+  const filledRemainders = packProposalUnits(lowerRemainders, truckCapacity, maxStops, partialUltimate);
+  return [...fullUltimate, ...filledRemainders, ...fullLower];
+}
+
 function criticalAffinityProposalLoads(baselineLoads = [], truckCapacity = 0, maxStops = 2, routeRule = {}) {
   const finalizedLines = baselineLoads.flatMap((load) => load.lines || []);
   if (!finalizedLines.some((line) => smartScmUrgencyRank(line.urgencyLevel, line.urgent) >= 2)) return baselineLoads;
+  if (finalizedLines.some((line) => smartScmUrgencyRank(line.urgencyLevel, line.urgent) === 3)) {
+    return ultimatePriorityProposalLoads(baselineLoads, truckCapacity, maxStops);
+  }
   const units = finalizedLines.flatMap((line) => palletUnits({ lines: [line] }));
   const critical = units
     .filter((unit) => smartScmUrgencyRank(unit.line.urgencyLevel, unit.line.urgent) >= 2)
@@ -2136,6 +2187,15 @@ async function proposalRows({ proposalId = null, runId = null, status = "", stat
           WHEN 'urgent' THEN 1
           ELSE 0
         END DESC,
+        CASE WHEN p.urgency_level = 'ultimate_urgent' AND (
+          SELECT bool_and(priority_line.urgency_level = 'ultimate_urgent' AND priority_line.pallet_weight_lbs > 0)
+            AND p.total_weight_lbs <= COALESCE(NULLIF((planning_run.settings_snapshot->>'truck_capacity_lbs')::numeric, 0), 78000) + 0.000001
+            AND COALESCE(NULLIF((planning_run.settings_snapshot->>'truck_capacity_lbs')::numeric, 0), 78000)
+              - p.total_weight_lbs + 0.000001 < MIN(priority_line.pallet_weight_lbs
+                + COALESCE((priority_line.reason->>'physicalPalletWeightLbs')::numeric, 0))
+            FROM scm_smart_proposal_lines priority_line
+           WHERE priority_line.proposal_id = p.id AND priority_line.proposed_pallets > 0
+        ) THEN 0 ELSE 1 END,
         p.urgency_score DESC, p.id`}
       LIMIT $${params.length}`,
     params

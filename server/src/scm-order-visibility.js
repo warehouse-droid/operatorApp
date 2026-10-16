@@ -84,6 +84,23 @@ export function canViewRestrictedScmOrders(operator = null) {
   return roles.some((role) => RESTRICTED_SCM_VIEW_ROLES.has(role));
 }
 
+export function canSearchAcrossScmScheduleOrders(operator = null, { search = "", surface = "" } = {}) {
+  if (!String(search || "").trim()) return false;
+  const roles = new Set([
+    ...(Array.isArray(operator?.roles) ? operator.roles : []),
+    operator?.role
+  ].map(normalizedVisibilityValue).filter(Boolean));
+  const cleanSurface = normalizedVisibilityValue(surface);
+  return roles.has("dispatcher")
+    || (cleanSurface === "sales" && (roles.has("sales") || roles.has("admin")))
+    || (cleanSurface === "dispatch" && canViewRestrictedScmOrders(operator));
+}
+
+export function filterSearchableScmScheduleOrders(rows = []) {
+  return (Array.isArray(rows) ? rows : []).filter((row) =>
+    String(row.calculatedStatus || row.calculated_status || effectiveScmStatus(row)).trim().toLowerCase() !== "hold");
+}
+
 export function isRestrictedScmOrder(row = {}) {
   return isBlanketScmOrder(row) || RESTRICTED_SCM_STATUSES.has(effectiveScmStatus(row));
 }

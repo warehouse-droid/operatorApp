@@ -15,6 +15,55 @@ sessionStorage.setItem(SNAPSHOT_EDIT_SESSION_KEY, snapshotSessionId);
 let snapshotLease = null;
 let snapshotLeaseToken = "";
 let snapshotLeaseHeartbeatTimer = null;
+let snapshotLeaseHeartbeatInFlight = false;
+const snapshotEditActivity = window.DispatchEditActivity.create({
+  isEditing: () => Boolean(snapshotLeaseToken && snapshotLease?.active),
+  onIdle: expireSnapshotEditMode,
+  onActivity: () => {void heartbeatSnapshotEditLease();}
+});
+
+function expireSnapshotEditMode() {
+  const payload = { planDate: snapshotDate, sessionId: snapshotSessionId, editLeaseToken: snapshotLeaseToken };
+  snapshotLeaseToken = "";
+  snapshotLease = null;
+  snapshotEditActivity.stop();
+  window.clearInterval(snapshotLeaseHeartbeatTimer);
+  snapshotLeaseHeartbeatTimer = null;
+  snapshotNotice = "Edit Mode ended after 10 minutes without activity. Enter Edit Mode to continue.";
+  renderSnapshotApp();
+  if (payload.editLeaseToken) {
+    void snapshotApi("/api/dispatch/plan-edit-lease/release", {
+      method: "POST", body: JSON.stringify(payload), keepalive: true
+    }).catch(() => null);
+  }
+}
+
+async function heartbeatSnapshotEditLease() {
+  if (!snapshotLeaseToken || snapshotLeaseHeartbeatInFlight) {return;}
+  if (snapshotEditActivity.isIdle()) {expireSnapshotEditMode(); return;}
+  const token = snapshotLeaseToken, date = snapshotDate;
+  snapshotLeaseHeartbeatInFlight = true;
+  try {
+    const heartbeat = await snapshotApi("/api/dispatch/plan-edit-lease/heartbeat", {
+      method: "POST", body: JSON.stringify({ planDate: date, sessionId: snapshotSessionId,
+        editLeaseToken: token, activityAgeMs: snapshotEditActivity.ageMs() })
+    });
+    if (token !== snapshotLeaseToken || date !== snapshotDate) {return;}
+    if (snapshotEditActivity.isIdle()) {expireSnapshotEditMode(); return;}
+    snapshotLease = heartbeat.lease || snapshotLease;
+  } catch (error) {
+    if (token !== snapshotLeaseToken || date !== snapshotDate) {return;}
+    if (error.status >= 400 && error.status < 500) {
+      snapshotLeaseToken = "";
+      snapshotLease = null;
+      snapshotEditActivity.stop();
+      window.clearInterval(snapshotLeaseHeartbeatTimer);
+      snapshotLeaseHeartbeatTimer = null;
+      snapshotNotice = "Edit Mode ended. The date plan was released or another user took over.";
+    }
+    renderSnapshotApp();
+  } finally {snapshotLeaseHeartbeatInFlight = false;}
+}
 
 function escapeHtml(value) {
   return String(value ?? "")
@@ -46,13 +95,19 @@ function snapshotApi(path, options = {}) {
 }
 
 function snapshotCanEdit() {
-  return Boolean(snapshotLeaseToken && snapshotLease?.active && snapshotLease.sessionId === snapshotSessionId);
+  return Boolean(snapshotLeaseToken && snapshotLease?.active && snapshotLease.sessionId === snapshotSessionId
+    && Date.parse(snapshotLease.expiresAt) > Date.now() && !snapshotEditActivity.isIdle());
 }
 
 async function refreshSnapshotLease() {
   const payload = await snapshotApi(`/api/dispatch/plan-edit-lease?planDate=${encodeURIComponent(snapshotDate)}`);
   snapshotLease = payload.lease || null;
-  if (!snapshotLease?.active || snapshotLease.sessionId !== snapshotSessionId) snapshotLeaseToken = "";
+  if (!snapshotLease?.active || snapshotLease.sessionId !== snapshotSessionId) {
+    snapshotLeaseToken = "";
+    snapshotEditActivity.stop();
+    window.clearInterval(snapshotLeaseHeartbeatTimer);
+    snapshotLeaseHeartbeatTimer = null;
+  }
 }
 
 async function enterSnapshotEditMode() {
@@ -62,22 +117,9 @@ async function enterSnapshotEditMode() {
   });
   snapshotLease = payload.lease || null;
   snapshotLeaseToken = payload.editLeaseToken || "";
+  snapshotEditActivity.start();
   window.clearInterval(snapshotLeaseHeartbeatTimer);
-  snapshotLeaseHeartbeatTimer = window.setInterval(async () => {
-    if (!snapshotCanEdit()) return;
-    try {
-      const heartbeat = await snapshotApi("/api/dispatch/plan-edit-lease/heartbeat", {
-        method: "POST",
-        body: JSON.stringify({ planDate: snapshotDate, sessionId: snapshotSessionId, editLeaseToken: snapshotLeaseToken })
-      });
-      snapshotLease = heartbeat.lease || snapshotLease;
-    } catch {
-      snapshotLeaseToken = "";
-      window.clearInterval(snapshotLeaseHeartbeatTimer);
-      snapshotLeaseHeartbeatTimer = null;
-      renderSnapshotApp();
-    }
-  }, 30000);
+  snapshotLeaseHeartbeatTimer = window.setInterval(heartbeatSnapshotEditLease, 30000);
 }
 
 async function releaseSnapshotEditMode() {
@@ -89,6 +131,7 @@ async function releaseSnapshotEditMode() {
   });
   snapshotLease = null;
   snapshotLeaseToken = "";
+  snapshotEditActivity.stop();
   window.clearInterval(snapshotLeaseHeartbeatTimer);
   snapshotLeaseHeartbeatTimer = null;
 }

@@ -1,12 +1,18 @@
 .stock-request-shell {
   min-width: 0;
+  height: auto;
+  min-height: 100vh;
+  grid-template-rows: 58px auto;
 }
+
+body.sales-stock-requests-page,
+body.scm-stock-requests-page { overflow: auto; }
 
 .stock-request-page {
   min-height: 0;
-  overflow: hidden;
+  overflow: visible;
   display: grid;
-  grid-template-rows: auto auto auto minmax(0, 1fr);
+  grid-template-rows: auto auto auto auto;
   gap: 12px;
   padding: 14px;
 }
@@ -91,6 +97,7 @@
   display: grid;
   grid-template-columns: minmax(280px, 34%) minmax(0, 1fr);
   gap: 12px;
+  align-items: start;
 }
 
 .stock-request-feedback {
@@ -110,16 +117,19 @@
 }
 
 .stock-request-list {
-  height: 100%;
+  position: sticky;
+  top: 12px;
+  height: auto;
+  max-height: calc(100dvh - 24px);
   overflow-y: auto;
-  overscroll-behavior: contain;
+  overscroll-behavior: auto;
   padding: 8px;
 }
 
 .stock-request-detail {
-  height: 100%;
-  overflow-y: auto;
-  overscroll-behavior: contain;
+  height: auto;
+  overflow: visible;
+  overscroll-behavior: auto;
   padding: 14px;
 }
 
@@ -235,6 +245,33 @@
   text-transform: uppercase;
 }
 
+.stock-request-summary[data-special-supply-status="in_stock"],
+.stock-request-summary[data-special-supply-status="low_inventory"] {
+  --special-supply-background: #15803d;
+  --special-supply-color: #fff;
+}
+
+.stock-request-summary[data-special-supply-status="production"],
+.stock-request-summary[data-special-supply-status="vendor_transfer"] {
+  --special-supply-background: #f59e0b;
+  --special-supply-color: #000;
+}
+
+.stock-request-summary[data-special-supply-status="no_stock"] {
+  --special-supply-background: #b91c1c;
+  --special-supply-color: #fff;
+}
+
+.stock-request-summary[data-special-supply-status] > span {
+  background: var(--special-supply-background, #f7fafb);
+  border-color: var(--special-supply-background, #d8e1e5);
+  color: var(--special-supply-color, inherit);
+}
+
+.stock-request-summary[data-special-supply-status] > span small {
+  color: var(--special-supply-color, #5b6c75);
+}
+
 .stock-request-lines {
   display: grid;
   gap: 10px;
@@ -284,6 +321,64 @@
   display: grid;
   grid-template-columns: repeat(auto-fit, minmax(105px, 1fr));
   gap: 8px;
+}
+
+.backorder-composer .stock-request-line-fields,
+.stock-request-line-fields.backorder-fields {
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 12px;
+  align-items: start;
+}
+
+.backorder-notes {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 12px;
+}
+
+.backorder-fields[hidden] {
+  display: none;
+}
+
+.backorder-material-heading {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  align-items: start;
+  gap: 12px;
+}
+
+.backorder-material-summary { min-width: 0; overflow-wrap: anywhere; }
+.backorder-material-summary p { margin: 4px 0 0; font-size: 13px; }
+.regular-stock-safety.backorder-material-stock { margin: 0; padding: 10px; grid-template-columns: repeat(3, minmax(75px, 1fr)); }
+.backorder-material-review { margin: 0; padding: 0; border: 0; }
+.backorder-review-grid > [data-backorder-review-fields],
+.backorder-review-grid [data-backorder-projection-fields] { display: contents; }
+.backorder-review-grid [data-backorder-review-fields][hidden],
+.backorder-review-grid [data-backorder-projection-fields][hidden] { display: none; }
+.backorder-review-grid > button { align-self: end; }
+.backorder-review-grid label { min-width: 0; }
+.backorder-review-grid input, .backorder-review-grid select { min-width: 0; width: 100%; box-sizing: border-box; }
+
+.backorder-notes textarea,
+.backorder-fields textarea {
+  width: 100%;
+  box-sizing: border-box;
+}
+
+@media (max-width: 900px) {
+  .backorder-composer .stock-request-line-fields,
+  .stock-request-line-fields.backorder-fields {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+  .backorder-material-heading { grid-template-columns: minmax(0, 1fr); }
+}
+
+@media (max-width: 600px) {
+  .backorder-composer .stock-request-line-fields,
+  .stock-request-line-fields.backorder-fields,
+  .backorder-notes {
+    grid-template-columns: minmax(0, 1fr);
+  }
 }
 
 .special-case-initial-grid {
@@ -396,6 +491,22 @@
   color: #43555e;
   font-size: 12px;
   font-weight: 900;
+}
+
+.stock-request-form .regular-delivery-line-option {
+  display: flex;
+  align-items: flex-start;
+  gap: 10px;
+}
+
+.stock-request-form .regular-delivery-line-option input[type="checkbox"] {
+  width: 18px;
+  min-height: 18px;
+  height: 18px;
+  flex: 0 0 18px;
+  margin: 2px 0 0;
+  padding: 0;
+  accent-color: #087a5b;
 }
 
 .stock-request-line-fields input,
@@ -635,8 +746,11 @@
   }
 
   .stock-request-list {
+    position: static;
     max-height: 42vh;
   }
+
+  .stock-request-detail { overflow: visible; overscroll-behavior: auto; }
 
   .stock-request-form-head {
     grid-template-columns: minmax(0, 1fr);
@@ -680,6 +794,15 @@
 .stock-request-yard-filter label { display: flex; gap: .5rem; align-items: center; padding: .35rem; }
 .special-stage-filter input,
 .stock-request-yard-filter input { width: auto; min-height: auto; }
+.stock-request-filter-actions { display: flex; align-items: center; gap: 8px; margin-top: 8px; }
+.sales-stock-filter > div { left: 0; right: auto; max-height: min(60vh, 380px); overflow-y: auto; min-width: 220px; max-width: min(360px, calc(100vw - 24px)); }
+.sales-stock-filter label { white-space: normal; overflow-wrap: anywhere; }
+.sales-stock-filter input { flex-shrink: 0; }
+body.sales-stock-requests-page .stock-request-toolbar { display: flex; align-items: end; }
+body.sales-stock-requests-page .stock-request-filters { flex-wrap: wrap; }
+@media (max-width: 600px) {
+  .sales-stock-requests-page .sales-stock-filter > div { position: fixed; z-index: 4300; left: 12px; right: 12px; width: auto; max-width: none; min-width: 0; max-height: 50vh; }
+}
 .special-sales-order-documents { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 16px; }
 .special-sales-order-documents > div { min-width: 0; display: grid; gap: 8px; align-content: start; }
 .special-sales-order-documents h3 { margin: 0; }
@@ -781,3 +904,5 @@
 .regular-stock-so label {display:inline-flex;flex-direction:column;gap:6px;margin-right:12px}
 .regular-stock-fields {margin:18px 0}
 .stock-request-pill.approved,.stock-request-pill.fulfilled {background:#dcfce7;color:#14532d}
+
+.stock-request-tabs[hidden] { display: none; }

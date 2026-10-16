@@ -2,6 +2,7 @@ import {createHash,randomUUID} from 'node:crypto';
 import {query,withTransaction} from './db.js';
 import {createSalesStockRequest,getScmStockRequest} from './stock-request-repository.js';
 import {assertStockRequestDestinationAccess} from './stock-request-domain.js';
+import {canSalesAccessStockingRequest} from './regular-stock-stocking-access.js';
 import {findSpecialCustomer} from './special-stock-customer-directory.js';
 import {isWaitlist,waitlistError,waitlistQuantity,waitlistId,waitlistText,waitlistKey,roundWaitlistQuantity,
   waitlistTotals,waitlistPoolBalance,rankWaitlistRequests,assertWaitlistSelectionPriority,
@@ -10,6 +11,12 @@ import {resolveWaitlistPo,waitlistPoolSupply,normalizedWaitlistUnit,recentQueued
 
 const iso=value=>value?new Date(value).toISOString():null;
 const activeConversions="('pending','preparing','submitted','uncertain')";
+
+function assertSalesWaitlistAccess(row,context){
+  if(!context)return;
+  if(canSalesAccessStockingRequest({requestType:row.request_type,workflowVersion:row.workflow_version,regular:row.regular_details},context.authorizedDestinationLocationIds||[]))return;
+  assertStockRequestDestinationAccess(row.destination_location_id,context.authorizedDestinationLocationIds);
+}
 
 // All local ledger writes share a short transaction. No network calls run here.
 export function withWaitlistTransaction(callback){
@@ -27,7 +34,7 @@ async function requestRow(id,context){
     FROM regular_waitlist_requests w JOIN sales_stock_requests r ON r.id=w.request_id
     JOIN sales_stock_request_lines l ON l.id=w.request_line_id WHERE r.id=$1 FOR UPDATE OF r,w`,[id])).rows[0];
   if(!row)throw waitlistError('Waitlist request was not found.','WAITLIST_NOT_FOUND',404);
-  if(context)assertStockRequestDestinationAccess(row.destination_location_id,context.authorizedDestinationLocationIds);
+  assertSalesWaitlistAccess(row,context);
   return row;
 }
 async function assertNotConverting(id){
@@ -119,7 +126,7 @@ export async function decorateWaitlistRequest(request){
 export async function getWaitlistRequest(id,context){
   const request=await getScmStockRequest(waitlistId(id));
   if(!isWaitlist(request))throw waitlistError('Waitlist request was not found.','WAITLIST_NOT_FOUND',404);
-  if(context)assertStockRequestDestinationAccess(request.destinationLocationId,context.authorizedDestinationLocationIds);
+  assertSalesWaitlistAccess({request_type:request.requestType,workflow_version:request.workflowVersion,regular_details:request.regular,destination_location_id:request.destinationLocationId},context);
   return request;
 }
 export async function listWaitlistRequests({itemId=null,includeClosed=false,search='',includeSupply=true}={}){

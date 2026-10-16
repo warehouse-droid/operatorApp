@@ -1,0 +1,45 @@
+{
+  "tier": 3,
+  "spec approval": "not obtained (autonomous run)",
+  "reportTimezone": "America/Toronto",
+  "setup": "Use existing Node, Playwright, fast-check, ESLint and TypeScript. Preserve baseline hashes and logs. All tests use bounded disposable containers in mbbs-tests.slice with teardown registered before launch. No new dependencies or commits. Test data is synthetic. Real R2 replay uses narrowly scoped test upload/read/delete tickets, registers cleanup before uploads, deletes every created object and verifies absence. Production secrets and data volumes are not mounted into test containers.",
+  "behaviors": [
+    "An interrupted upload automatically retries the same retained photo, using fresh authorization, and skips already acknowledged photos.",
+    "Connection retries use increasing delays capped at 30 seconds; online, pageshow and visible/resume events wake a pending retry. A single operation never overlaps attempts.",
+    "A standard stop save checks its result after a 15-second response deadline. After uncertainty it reads saved history before any replay and accepts only the matching completed job.",
+    "A lost status-read response is retried automatically. A standard stop may replay only after the existing reconciliation verifies that the exact same job is still current and in progress. Server transaction locking must prevent duplicate completion.",
+    "DVIR and BIN completion uncertainty triggers read-only recovery, never automatic repetition of external writes. Conflicts, authentication failures and permanent validation failures remain actionable errors.",
+    "The driver can pause automatic recovery without deleting evidence; logout, cancellation and session replacement stop the old operation. Resume events detect overdue wall-clock deadlines even if a browser timer was suspended.",
+    "Each failed attempt is retained locally with stable diagnostic identity, recovery correlation, stage, timing, app visibility, connectivity hint and version. Recovery success is a separate audit action. Pending diagnostics upload automatically after connectivity returns and duplicate delivery cannot duplicate audit entries.",
+    "Retain the existing 2048-pixel maximum edge, approximate 1 MB target and 2 MB hard limit. Real R2 replay verifies compressed bytes can be uploaded/read back and all test objects are deleted.",
+    "Version the changed Driver shell assets together; preserve the offline protocol, GPS radius, authorization, photo evidence, and unrelated application behavior."
+  ],
+  "failureModel": {
+    "duplicate completion": "Real PostgreSQL concurrent completion and read-before-replay assertions; generated network sequences and mutation tests",
+    "lost evidence or wrong driver": "Retained-photo, cancellation, session and identity tests; actual mobile browser workflows",
+    "retry storms or permanent-error loops": "Clock-controlled backoff, maximum delay, no-overlap and terminal-error tests",
+    "silent or duplicate diagnostics": "Offline queue/reload, failed acknowledgement, database uniqueness and recovery outcome tests",
+    "stale browser callbacks": "Delayed timers, resume events, late responses and cancellation race tests",
+    "real storage residue": "Pre-registered cleanup journal, exact-key deletion and authenticated read-back proving absence",
+    "cleanup crash or race": "Transactional outbox rollback, coalescing generation, retry, concurrent worker and completion latency tests"
+  },
+  "knownLimits": [
+    "HTTP status 0 and failed fetch do not identify the physical cause of a production network interruption.",
+    "Browser code cannot reconnect while the operating system has suspended or terminated the PWA. Pending work resumes when execution returns; retained photos survive supported storage operations.",
+    "The existing failure stream does not prove which driver saw a blocking error. New recovery outcome records make this distinction explicit."
+  ],
+  "changesToEarlierSpec": [
+    "The user now requests automatic reconnect. The existing single-attempt functions remain available; the foreground UI opts into an automatic recovery wrapper.",
+    "A matching current standard stop may be replayed after an authoritative read; the earlier blanket prohibition on all automatic completion POST retries is replaced by transaction-protected read-before-replay. DVIR/BIN external-action retries remain prohibited.",
+    "User requires completion acknowledgement and starting the next eligible job within five seconds on a working connection. Replace the earlier 15-second standard-stop response deadline with four seconds, leaving time for a status check. Move billed-order cleanup off the completion path using a transactionally durable outbox; preserve strict historical cleanup, route eligibility, and external-action guards. Five seconds is an acceptance target under tested conditions, not a promise during service outages.",
+    "User correction: Dispatch and Driver must not depend on NetSuite billed/unbilled state. Supersedes moving billed-family cleanup to an outbox: remove billing-only cleanup from Driver completion and billing-only availability filtering in Dispatch/Driver. Preserve execution evidence and independent route constraints. Clarification on NetSuite closed/cancelled states is pending; do not broaden their handling without a reply.",
+    "User confirmed: ignore billed/unbilled only; keep NetSuite closed/cancelled safeguards. No new billing cleanup outbox will be added.",
+    "PWA keeps only upload, one completion request, and displaying the server-started next job in its foreground flow. Both sides retain correlated step diagnostics. Server response-finished records must never be described as client acknowledgements. Billing reconciliation is removed, not deferred, from Driver and Dispatch planning.",
+    "User authorized keeping synthetic R2 replay objects under one dedicated folder for manual deletion after the configured worker DELETE route proved unavailable. Report the driver-reconnect-test/ prefix, exact keys, count and verified read-back; do not claim these objects were deleted.",
+    "A successful server confirmation must advance the PWA immediately even when local draft-photo deletion stalls. Keep cleanup bounded and diagnostic, but run it after confirmation without blocking the next-job screen. A two-second UI-transition assertion checks this separately from server completion latency.",
+    "Existing Dispatch maintenance regression fixtures used billing as their cleanup trigger. Update that trigger to closed status, retaining the same editor, execution-prefix, retry and rollback assertions. Replace the obsolete Driver billing-outbox expectation with an assertion that no billing work is queued, as explicitly requested by the user.",
+    "The broad maintenance-fixture conversion was abandoned: closed orders have distinct save safeguards and cannot substitute for billed orders in old autosave scenarios. Restore those unrelated fixtures unchanged. The final billing-removal acceptance is the dedicated driver-billing-independent real-database suite; older scenarios explicitly requiring billing cleanup are superseded by the user policy and are not claimed to pass.",
+    "Deployment review found an additional billing-family filter in the complete Dispatch response after the repository lookup. Remove that billing-only query and all three response filters. A real-database regression calls loadDispatchOrdersForResponse and requires the same held order to stay visible before and after billing, with its hold restriction intact; closed/cancelled orders remain excluded. Operator Delivery and Customer Pickup billing gates are outside Driver/Dispatch planning and remain unchanged.",
+    "The complete Dispatch response must also retain a saved snapshot-derived delivery group when a child becomes billed. Its independent child hold restriction remains active, and cancelling the source plan prevents its stale snapshot from restoring that group. Verify this through the real database and complete response, separately from ordinary source-order lookup."
+  ]
+}

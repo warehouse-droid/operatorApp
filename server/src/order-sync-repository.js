@@ -4,6 +4,7 @@ import { query, afterTransactionCommit, hasActiveTransaction } from "./db.js";
 import { readNetSuiteOrderLine } from "./netsuite-order-line.js";
 import { enrichPurchaseOrderDispatch, enrichSalesOrderDispatch, enrichTransferDispatch } from "./dispatch-enrichment.js";
 import { syncOrderDependenciesForTransferOrder } from "./order-dependency-repository.js";
+import { reconcileLinkedDirectShipQuantities } from "./linked-direct-ship-sync-repository.js";
 import { enqueueNetSuiteMirrorOrderEvent } from "./netsuite-mirror-repository.js";
 import { resumeSmartScmBlanketCoveredPlanningExclusions } from "./smart-scm-planning-exclusion-repository.js";
 
@@ -870,6 +871,7 @@ export async function upsertSalesOrderLines(orderId, lines = []) {
       detailsKey: "line"
     });
   }
+  await reconcileLinkedDirectShipQuantities({ salesOrderId: Number(orderId) });
   await enqueueNetSuiteMirrorOrderEvent("sales_order", orderId);
 }
 
@@ -994,7 +996,7 @@ async function upsertTransferOrderLines(orderId, lines = [], stage) {
         normalized.to_lyr,
         normalized.to_sec,
         normalized.to_pcs,
-        stage === "outbound" ? normalized.netsuite_received_qty : 0,
+        0, // Truck loading is a local Operator milestone, independent of NetSuite fulfillment.
         normalized.unit,
         JSON.stringify(normalized.raw || {}),
         normalized.item_type,
@@ -1023,6 +1025,7 @@ async function upsertTransferOrderLines(orderId, lines = [], stage) {
     });
   }
   await syncOrderDependenciesForTransferOrder(orderId);
+  await reconcileLinkedDirectShipQuantities({ transferOrderId: Number(orderId) });
   await enqueueNetSuiteMirrorOrderEvent("transfer_order", orderId);
 }
 
@@ -1144,6 +1147,8 @@ export async function markMissingOutboundOrderLines(orderId, activeLineIds = [])
       details: row
     });
   }
+  await reconcileLinkedDirectShipQuantities(orderType === "transfer_order"
+    ? { transferOrderId: Number(orderId) } : { salesOrderId: Number(orderId) });
   await enqueueNetSuiteMirrorOrderEvent(orderType, orderId, { changeType: result.rowCount ? "missing" : "upsert" });
 }
 
@@ -1553,7 +1558,7 @@ export async function listExistingInboundOrderIds({ orderFamily, sourceLocationI
   const params = [];
   const clauses = [];
   if (isTransfer) {
-    clauses.push("receiving_status IS NOT NULL");
+    clauses.push("to_location_id IS NOT NULL");
     if (sourceLocationId) {
       params.push(sourceLocationId);
       clauses.push(`from_location_id = $${params.length}`);
@@ -1579,77 +1584,11 @@ export async function listExistingInboundOrderIds({ orderFamily, sourceLocationI
   return result.rows.map((row) => row.netsuite_id);
 }
 
-export async function markMissingInboundOrders({ orderFamily, activeOrderIds = [], sourceLocationId = null, destinationLocationId = null } = {}) {
-  const ids = activeOrderIds.map((id) => Number(id)).filter((id) => Number.isInteger(id));
-  const isTransfer = orderFamily === "transfer_order";
-  const params = [ids];
-  const clauses = ["netsuite_id > 0", "NOT (netsuite_id = ANY($1::bigint[]))"];
-  if (isTransfer) {
-    clauses.push("receiving_status IS NOT NULL");
-    if (sourceLocationId) {
-      params.push(sourceLocationId);
-      clauses.push(`from_location_id = $${params.length}`);
-    }
-    if (destinationLocationId) {
-      params.push(destinationLocationId);
-      clauses.push(`to_location_id = $${params.length}`);
-    }
-  } else if (destinationLocationId) {
-    params.push(destinationLocationId);
-    clauses.push(`destination_location_id = $${params.length}`);
-  }
-  if (!isTransfer) {
-    // The NetSuite PO discovery query only returns currently open receipts. Once a
-    // PO enters local tracking, absence from that result cannot mean deletion: it
-    // may have been received in NetSuite while local split work is still active.
-    return;
-  }
-
-  await query(
-    `UPDATE transfer_order_lines
-        SET netsuite_active = false,
-            sync_exception = CASE WHEN (
-              COALESCE(received_pallet_qty, 0)
-              + COALESCE(received_layer_qty, 0)
-              + COALESCE(received_section_qty, 0)
-              + COALESCE(received_piece_qty, 0)
-            ) > 0 THEN 'line_deleted' ELSE sync_exception END,
-            sync_exception_at = CASE WHEN (
-              COALESCE(received_pallet_qty, 0)
-              + COALESCE(received_layer_qty, 0)
-              + COALESCE(received_section_qty, 0)
-              + COALESCE(received_piece_qty, 0)
-            ) > 0 THEN now() ELSE sync_exception_at END,
-            synced_at = now()
-      WHERE line_stage = 'receiving'
-        AND transfer_order_id IN (
-          SELECT netsuite_id
-            FROM transfer_orders
-           WHERE ${clauses.join(" AND ")}
-        )
-        AND netsuite_active = true`,
-    params
-  );
-
-  const missingOrders = await query(
-    `UPDATE transfer_orders
-        SET netsuite_active = false,
-            netsuite_missing_at = now(),
-            synced_at = now()
-      WHERE ${clauses.join(" AND ")}
-        AND NOT EXISTS (
-          SELECT 1
-            FROM transfer_order_lines l
-           WHERE l.transfer_order_id = transfer_orders.netsuite_id
-             AND l.netsuite_active = true
-        )
-      RETURNING netsuite_id`,
-    params
-  );
-  for (const row of missingOrders.rows) {
-    await syncOrderDependenciesForTransferOrder(row.netsuite_id);
-    await enqueueNetSuiteMirrorOrderEvent("transfer_order", row.netsuite_id, { changeType: "missing" });
-  }
+export async function markMissingInboundOrders(_options = {}) {
+  // Open-receipt discovery is not a deletion feed. Keep locally tracked PO/TO
+  // work across remote statuses; individual refresh and Closed-order checks
+  // remain responsible for source availability.
+  return;
 }
 
 export async function markMissingInboundOrderLines(orderId, activeLineIds = []) {
