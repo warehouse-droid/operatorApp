@@ -1187,11 +1187,11 @@ test("Sales and SCM list filters are combined server-side and returned requests 
   assert.deepEqual(allOptions.destinationYards.map((yard) => yard.locationId), [1, 28, 15, 26]);
   const salesOptions = await listStockRequestFilterOptions({ authorizedDestinationLocationIds: [1] });
   assert(salesOptions.vendors.includes(`Vendor Paver ${seed}`));
-  assert.deepEqual(salesOptions.destinationYards.map((yard) => yard.locationId), [1]);
+  assert.deepEqual(salesOptions.destinationYards.map((yard) => yard.locationId), [1, 28]);
   const noYardOptions = await listStockRequestFilterOptions({ authorizedDestinationLocationIds: [] });
   assert.deepEqual(noYardOptions.vendors, []);
   assert.deepEqual(noYardOptions.sourceYards.map((yard) => yard.locationId), [1, 28, 15, 26]);
-  assert.deepEqual(noYardOptions.destinationYards, []);
+  assert.deepEqual(noYardOptions.destinationYards.map((yard) => yard.locationId), [1, 28]);
   await assert.rejects(
     () => listScmStockRequests({ queue: "request", requestDate: "2040-99-99" }),
     /valid request date/i

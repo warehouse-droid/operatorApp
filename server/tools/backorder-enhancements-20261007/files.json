@@ -1,0 +1,14 @@
+[
+  "migrations/269_backorder_line_routing.sql",
+  "src/backorder-request-service.js",
+  "src/special-stock-request-domain.js",
+  "src/special-stock-request-repository.js",
+  "src/stock-request-repository.js",
+  "public/backorder-stock-requests.js",
+  "public/sales-stock-requests.js",
+  "public/scm-stock-requests.js",
+  "public/stock-requests.css",
+  "public/sales-stock-requests.html",
+  "public/scm-stock-requests.html",
+  "public/regular-stock-ui.js"
+]

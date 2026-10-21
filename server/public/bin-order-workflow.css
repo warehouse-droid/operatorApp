@@ -1,0 +1,13 @@
+.bin-workflow-dialog { width: min(760px, 94vw); max-height: 90vh; border: 1px solid #cbd5e1; border-radius: 14px; padding: 24px; color: #172b43; }
+.bin-workflow-dialog::backdrop { background: #16213680; }
+.bin-workflow-dialog header { display: flex; justify-content: space-between; align-items: start; gap: 18px; }
+.bin-workflow-dialog h2 { margin: 0 0 12px; }
+.bin-workflow-dialog fieldset { border: 1px solid #cbd5e1; border-radius: 8px; padding: 16px; margin: 16px 0; }
+.bin-workflow-dialog legend { font-weight: 700; padding: 0 6px; }
+.bin-workflow-dialog label { display: grid; gap: 6px; margin: 8px 0; }
+.bin-workflow-dialog select, .bin-workflow-dialog input { min-height: 42px; padding: 8px; max-width: 100%; font: inherit; border: 1px solid #94a3b8; border-radius: 6px; background: white; color: #172b43; }
+.bin-workflow-dialog button { cursor: pointer; min-height: 40px; padding: 8px 16px; font: inherit; border-radius: 6px; border: 1px solid #94a3b8; }
+.bin-workflow-dialog .primary { background: #174e76; color: white; }
+.bin-workflow-dialog [data-error] { color: #ac2735; }
+.bin-workflow-dialog [hidden] { display: none !important; }
+.bin-workflow-note { color: #475569; font-size: 12px; margin: 6px 0; white-space: normal; }

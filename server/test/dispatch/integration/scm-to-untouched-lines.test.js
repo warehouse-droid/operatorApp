@@ -83,11 +83,12 @@ async function sourceCo(f) {
     ] } });
 }
 
-test("TO links protect a selected line already packed on its source CO after the SO is released", () => rollback(async () => {
+test("TO links accept a selected packed source CO line without changing its packing", () => rollback(async () => {
   const f = await seed();
   const co = await sourceCo(f);
   await query("UPDATE local_co_order_lines SET packed_layer_qty=1,confirmed_at=now() WHERE co_id=$1 AND item_id=1356", [co.id]);
-  await blocked(await command(f));
+  assert.equal((await previewScmDependencyMutation(await command(f))).allowed,true);
+  assert.equal(Number((await query("SELECT packed_layer_qty FROM local_co_order_lines WHERE co_id=$1 AND item_id=1356",[co.id])).rows[0].packed_layer_qty),1);
 }));
 
 test("TO links still accept an untouched CO line when a different CO line is packed", () => rollback(async () => {
@@ -97,7 +98,7 @@ test("TO links still accept an untouched CO line when a different CO line is pac
   assert.equal((await previewScmDependencyMutation(await command(f))).allowed, true);
 }));
 
-test("TO linking waits for CO operator packing before checking the selected line", async () => {
+test("TO linking serializes with CO packing and preserves the selected packed line", async () => {
   const f = await seed();
   const co = await sourceCo(f);
   const c = await command(f);
@@ -123,8 +124,10 @@ test("TO linking waits for CO operator packing before checking the selected line
     await client.query("COMMIT");
     const result = await checking;
     assert.equal(waiting, true);
-    assert.equal(result.allowed, false);
-    assert.ok(result.blockers.some(row => row.code === "OPERATOR_ACTIVITY_STARTED"));
+    assert.equal(result.allowed, true);
+    assert.equal(Number((await query("SELECT packed_layer_qty FROM local_co_order_lines WHERE co_id=$1 AND item_id=1356",[co.id])).rows[0].packed_layer_qty),1);
+    await query("UPDATE local_co_orders SET status='loaded',loaded_at=now() WHERE id=$1",[co.id]);
+    await blocked(c);
   } finally {
     await client.query("ROLLBACK");
     client.release();
@@ -204,17 +207,23 @@ for (const mode of ["direct_to_customer", "yard_replenishment"]) {
 }
 
 for (const column of activityColumns) {
-  test(`selected line with ${column} is blocked`, () => rollback(async () => {
+  test(`selected line with ${column} follows the packing-independent execution rule`, () => rollback(async () => {
     const f = await seed();
     const value = column === "confirmed" ? "true" : column === "confirmed_at" ? "now()" : "1";
     await query(`UPDATE sales_order_lines SET ${column}=${value} WHERE id=$1`, [f.materialId]);
-    await blocked(await command(f));
+    if (column === "loaded_qty") { await blocked(await command(f)); }
+    else {
+      const before = await sources(f);
+      assert.equal((await previewScmDependencyMutation(await command(f))).allowed,true);
+      assert.deepEqual(await sources(f),before);
+    }
   }));
 }
 
-test("mixed selection including the packed pallet is rejected without writing a link", () => rollback(async () => {
+test("mixed selection including a loaded pallet is rejected without writing a link", () => rollback(async () => {
   const f = await seed();
   const c = await command(f);
+  await query("UPDATE sales_order_lines SET loaded_qty=1 WHERE id=$1",[f.palletId]);
   c.payload.allocations.push({ salesLineId: f.palletId, quantities: { salesQty: 1 } });
   c.payloadHash = scmDependencyPayloadHash(c);
   const before = await sources(f);
@@ -223,7 +232,7 @@ test("mixed selection including the packed pallet is rejected without writing a 
   assert.equal((await query("SELECT id FROM order_dependencies WHERE transfer_order_ref=$1", [f.transferRef])).rowCount, 0);
 }));
 
-for (const status of ["open", "confirmed", "packed"]) {
+for (const status of ["open", "confirmed", "packed", "preparing"]) {
   test(`aggregate ${status} permits explicit untouched lines`, () => rollback(async () => {
     const f = await seed();
     await query("UPDATE sales_orders SET operator_status=$2,local_yard_order_status=$2 WHERE netsuite_id=$1", [f.salesId, status]);
@@ -231,7 +240,7 @@ for (const status of ["open", "confirmed", "packed"]) {
   }));
 }
 
-for (const status of ["preparing", "loaded", "fulfilled", "shipped", "received", "complete", "completed"]) {
+for (const status of ["loaded", "fulfilled", "shipped", "received", "complete", "completed"]) {
   test(`whole-order ${status} remains protected`, () => rollback(async () => {
     const f = await seed();
     await query("UPDATE sales_orders SET operator_status=$2 WHERE netsuite_id=$1", [f.salesId, status]);
@@ -240,10 +249,11 @@ for (const status of ["preparing", "loaded", "fulfilled", "shipped", "received",
 }
 
 for (const update of ["preparing_operator_id='untouched-test'", "preparing_started_at=now()", "local_yard_order_status='Loaded'"]) {
-  test(`whole-order lock ${update} remains protected`, () => rollback(async () => {
+  test(`whole-order state ${update} follows the packing-independent execution rule`, () => rollback(async () => {
     const f = await seed();
     await query(`UPDATE sales_orders SET ${update} WHERE netsuite_id=$1`, [f.salesId]);
-    await blocked(await command(f));
+    if (update === "local_yard_order_status='Loaded'") { await blocked(await command(f)); }
+    else { assert.equal((await previewScmDependencyMutation(await command(f))).allowed,true); }
   }));
 }
 
@@ -263,6 +273,7 @@ test("key-first and legacy line identities inspect exactly the row relationship 
   c.payloadHash = scmDependencyPayloadHash(c);
   assert.equal((await executeScmDependencyCommand(c)).status, "applied");
   c.payload.allocations[0].salesLineId = f.palletId;
+  await query("UPDATE sales_order_lines SET loaded_qty=1 WHERE id=$1",[f.palletId]);
   await blocked(c);
 }));
 
@@ -270,6 +281,7 @@ for (const allocations of [undefined, [], [{ targetLineKey: "unknown" }], [null]
   test(`ambiguous allocation ${JSON.stringify(allocations)} retains whole-order protection`, () => rollback(async () => {
     const f = await seed();
     const c = await command(f);
+    await query("UPDATE sales_order_lines SET loaded_qty=1 WHERE id=$1",[f.palletId]);
     c.payload.allocations = allocations;
     await blocked(c);
   }));
@@ -278,6 +290,7 @@ for (const allocations of [undefined, [], [{ targetLineKey: "unknown" }], [null]
 test("partly valid allocations cannot bypass the whole-order check", () => rollback(async () => {
   const f = await seed();
   const c = await command(f);
+  await query("UPDATE sales_order_lines SET loaded_qty=1 WHERE id=$1",[f.palletId]);
   c.payload.allocations.push({ salesLineId: -1 });
   await blocked(c);
   c.action = "link_po";
@@ -295,8 +308,8 @@ test("PO preview retains its existing confirmation-timestamp behavior", () => ro
 }));
 
 for (const [scenario, update, code] of [
-  ["TO outbound", "UPDATE transfer_order_lines SET packed_sales_qty=1 WHERE transfer_order_id=$1 AND line_stage='outbound'", "OPERATOR_ACTIVITY_STARTED"],
-  ["TO header", "UPDATE transfer_orders SET outbound_operator_status='packed' WHERE netsuite_id=$1", "OPERATOR_ACTIVITY_STARTED"],
+  ["TO outbound loading", "UPDATE transfer_order_lines SET loaded_qty=1 WHERE transfer_order_id=$1 AND line_stage='outbound'", "OPERATOR_ACTIVITY_STARTED"],
+  ["TO loaded header", "UPDATE transfer_orders SET outbound_operator_status='loaded' WHERE netsuite_id=$1", "OPERATOR_ACTIVITY_STARTED"],
   ["TO receiving", "UPDATE transfer_order_lines SET received_sales_qty=1 WHERE transfer_order_id=$1 AND line_stage='receiving'", "SCM_RECEIVING_ACTIVITY_STARTED"],
   ["closed TO", "UPDATE transfer_orders SET status='H',status_text='Transfer Order : Closed' WHERE netsuite_id=$1", "ORDER_CLOSED"]
 ]) {
@@ -330,7 +343,7 @@ for (const kind of ["group", "split"]) {
     await query("INSERT INTO dispatch_plan_snapshots (plan_id,orders,trucks,summary) VALUES ($1,$2::jsonb,'[]','{}')", [plan.id, JSON.stringify([order])]);
     const c = await command(f, { targetRef });
     assert.equal((await previewScmDependencyMutation(c)).allowed, true);
-    await query("UPDATE sales_order_lines SET packed_sales_qty=1 WHERE id=$1", [f.materialId]);
+    await query("UPDATE sales_order_lines SET loaded_qty=1 WHERE id=$1", [f.materialId]);
     await blocked(c);
   }));
 }
@@ -379,19 +392,20 @@ test("generated selected/unrelated activity obeys both allow and block invariant
       await query("UPDATE sales_orders SET operator_status=$2,preparing_operator_id=$3 WHERE netsuite_id=$1",
         [f.salesId, status, preparing ? "busy" : null]);
       const preview = await previewScmDependencyMutation(c);
-      assert.equal(preview.allowed, !(selected || loaded || preparing));
+      assert.equal(preview.allowed, !loaded);
+      assert.equal(preview.blockers.some(row => row.code === "OPERATOR_ACTIVITY_STARTED"),loaded);
     }
   ), { seed: 88381102, numRuns: 64 });
 }));
 
-test("commit activity check waits for operator locks and rechecks committed packing", async () => {
+test("commit activity check waits for operator locks and rechecks committed loading", async () => {
   const f = await withTransaction(seed);
   const client = await pool.connect();
   try {
     const c = await command(f);
     await client.query("BEGIN");
     await client.query("SELECT pg_advisory_xact_lock(hashtextextended($1,0))", [`operator-delivery-load:${f.salesId}`]);
-    await client.query("UPDATE sales_order_lines SET packed_sales_qty=1 WHERE id=$1", [f.materialId]);
+    await client.query("UPDATE sales_order_lines SET loaded_qty=1 WHERE id=$1", [f.materialId]);
     const checking = withTransaction(async () => {
       const pid = (await query("SELECT pg_backend_pid() AS pid")).rows[0].pid;
       waitingPid = pid;

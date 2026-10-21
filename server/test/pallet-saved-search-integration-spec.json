@@ -1,0 +1,42 @@
+{
+  "feature": "Use the deployed NetSuite pallet saved search as the operator balance source",
+  "tier": 3,
+  "specApproval": "not obtained (autonomous run); user requested switching to the NetSuite balance to speed up pallet returns",
+  "setup": {
+    "dependencies": "No new packages. Use the existing Node/PostgreSQL/fast-check/c8/ESLint/TypeScript toolchain.",
+    "git": "No commits or branch changes; preserve unrelated workspace and production changes.",
+    "isolation": "Standard isolated Compose, mbbs-tests.slice and existing resource bounds; register teardown before startup and remove all disposable containers, databases, volumes and networks.",
+    "deployment": "Only the tested changed files over a fresh captured live image; app-only restart, active-operation preflight, hash/configuration checks and automatic rollback.",
+    "netsuite": "Use the existing authenticated backend connection and the user's deployed read-only script 505/deployment 1. No script re-upload, NetSuite business writes or OAuth changes.",
+    "artifacts": "Persist source hashes, baseline/RED/final logs, property/mutation results, release and live timing evidence."
+  },
+  "acceptance": [
+    "S1 Parse the observed customsearch503 schema by column identity, require the requested customer, and read Returnable Quantity SUM(quantity). Customer 5240 gives netBalance=13; customer 1959 gives netBalance=2.",
+    "S2 Reject wrong customer/search/version, extra grouping or columns, duplicate/missing balance columns, inconsistent row counts, multiple rows, nonnumeric/nonfinite quantities and stale/future response timestamps.",
+    "S3 A structurally valid empty report means no pallet allowance, with balanceFound=false. It does not become an upstream error or a positive entitlement. Upstream failures never become empty reports.",
+    "S4 Preserve signed and fractional report quantities; available=max(netBalance-localReserved,0). Do not invent fulfilled or returned totals from a net amount. Legacy stock and transaction balances keep their existing response semantics.",
+    "N1 Authenticated read-only GET uses the same-account RESTlet URL, existing credentials, shared request queue and timeouts. Foreign URLs and redirects must not receive credentials. HTTP errors/malformed JSON fail explicitly.",
+    "N2 Configured saved-search mode never runs the historical fulfillment aggregate, never silently falls back to that different calculation, and performs no credit-identity query when the customer has no local pallet returns.",
+    "N3 When local pallet returns exist, read qualifying credit identities before the saved-search balance. Preserve credit-ID/external-ID deduplication, linked RA partial credits, missing/deleted credit reconciliation and local reservations.",
+    "R1 Every enquiry and submission uses a fresh report. A successful prior lookup must not hide a later report failure or quota decrease.",
+    "R2 Under the existing customer lock, re-evaluate saved-search netBalance minus current local reservations. Concurrent submissions cannot exceed that allowance.",
+    "R3 Preserve operator/yard authentication, idempotency, posting gates, stock-return behavior and all affected return regressions with zero new failures.",
+    "L1 After deployment the live operator function uses saved-search source metadata and matches the current report for 5240 and 1959, less uncredited local reservations.",
+    "P1 Record before/after live timings and network request counts. No arbitrary latency SLA; the no-local-return path must omit the historical aggregate and credit-identity reads."
+  ],
+  "failureModel": [
+    {"risk": "A changed report schema or wrong customer grants another customer's balance", "check": "Strict parser contract, hostile payload cases and generated schema/identity cases."},
+    {"risk": "A credit posted between independent reads releases a reservation before the base balance reflects it", "check": "Credit identities must precede the report; network-order and concurrent-credit regression."},
+    {"risk": "Returning the summary alone subtracts completed credits twice or releases pending RAs", "check": "Direct credits, unindexed/deleted credits, local-only returns and partial RA credit tests."},
+    {"risk": "Old arithmetic under the submission lock ignores the new net-balance source", "check": "Real isolated database admission and competing submission tests."},
+    {"risk": "Saved-search outage silently changes business semantics", "check": "Freshness/failure tests reject lookup and admission without historical-query fallback."},
+    {"risk": "Deployment includes other workspace changes or interrupts an executing write", "check": "Captured-image overlay, exact candidate hashes, active-operation checks, rollback and health verification."}
+  ],
+  "limits": [
+    "The user's saved search is the requested business source. Its current result is 13 for 800909 while the physical fulfillment calculation is 12; these are intentionally different sources.",
+    "The current RESTlet returns a summary, not transaction membership. Retain the existing customer/item/status credit-evidence rules; report owners must preserve the intended credit/date/location scope.",
+    "A valid empty report grants no pallets. This refines the exploratory adapter's earlier no-result guidance for safe operator use without blocking stock-only work.",
+    "Full affected return-domain suite, not the unrelated entire application. Record existing UI harness and type diagnostics and require zero new findings.",
+    "No dependency audit needed if dependency files remain unchanged. Local tests use synthetic data and mocked network boundaries; real reads separately verify NetSuite behavior."
+  ]
+}

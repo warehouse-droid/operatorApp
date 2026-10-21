@@ -1,0 +1,10 @@
+[
+  "src/delivery-instruction-netsuite.js",
+  "src/delivery-instruction-repository.js",
+  "src/netsuite.js",
+  "src/server.js",
+  "public/sales-delivery-instructions.js",
+  "public/sales-delivery-instructions.html",
+  "public/delivery-instructions.css",
+  "public/i18n.js"
+]

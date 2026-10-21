@@ -1,0 +1,420 @@
+{
+  "task": "Hide cancelled split lifecycles from PO/TO Schedule",
+  "spec approval": "not obtained (autonomous run)",
+  "tier": 2,
+  "spec": "test/scm-cancelled-split-schedule-spec.json",
+  "runtimeChange": {
+    "files": [
+      "src/dispatch-repository.js"
+    ],
+    "sourceHash": "920c3d1e17d3d7c15d05976662d83e794f303197864d4898eb9a6f6e6739ea50",
+    "candidateTreeHash": "ac03a2e02242ec99441cda54678435652467a03d4a27c53c109b76b4c196da6d",
+    "predicateLines": 6
+  },
+  "reproduce": "python3 server/tools/scm-cancelled-split-check.py final",
+  "testImage": {
+    "tag": "mbbs-delivery-requests:static",
+    "id": "sha256:00298a2e1676ab6b8713f91d26fd46c6dcc23cfa8b708bfa370585753d3b4383"
+  },
+  "layers": [
+    {
+      "name": "focused",
+      "exitCode": 0,
+      "tests": 12,
+      "passed": 12,
+      "failed": 0,
+      "failures": []
+    },
+    {
+      "name": "regressions",
+      "exitCode": 0,
+      "tests": 150,
+      "passed": 150,
+      "failed": 0,
+      "failures": []
+    },
+    {
+      "name": "types",
+      "exitCode": 1,
+      "tests": 0,
+      "passed": 0,
+      "failed": 0,
+      "failures": []
+    },
+    {
+      "name": "coverage",
+      "exitCode": 0,
+      "tests": 12,
+      "passed": 12,
+      "failed": 0,
+      "failures": []
+    },
+    {
+      "name": "mutation-missing-filter",
+      "exitCode": 1,
+      "tests": 12,
+      "passed": 3,
+      "failed": 9,
+      "failures": [
+        "reference reuse hides the cancelled lifecycle and preserves the active replacement",
+        "a cancelled split with no replacement stays absent from global search",
+        "a cancelled split with no replacement stays absent from completed search",
+        "a cancelled split with no replacement stays absent from completed filter",
+        "a cancelled split with no replacement stays absent from completed view",
+        "a cancelled split with no replacement stays absent from exact-reference batch",
+        "a cancelled split with no replacement stays absent from status projection",
+        "authenticated schedule HTTP search returns the replacement and denies anonymous access",
+        "multiple cancelled lifecycles never hide their active replacement despite stale flags"
+      ]
+    },
+    {
+      "name": "mutation-match-shared-reference",
+      "exitCode": 1,
+      "tests": 12,
+      "passed": 8,
+      "failed": 4,
+      "failures": [
+        "reference reuse hides the cancelled lifecycle and preserves the active replacement",
+        "source, active split, empty purchase order and transfer order remain visible",
+        "authenticated schedule HTTP search returns the replacement and denies anonymous access",
+        "multiple cancelled lifecycles never hide their active replacement despite stale flags"
+      ]
+    },
+    {
+      "name": "mutation-hide-active-splits",
+      "exitCode": 1,
+      "tests": 12,
+      "passed": 8,
+      "failed": 4,
+      "failures": [
+        "reference reuse hides the cancelled lifecycle and preserves the active replacement",
+        "source, active split, empty purchase order and transfer order remain visible",
+        "authenticated schedule HTTP search returns the replacement and denies anonymous access",
+        "multiple cancelled lifecycles never hide their active replacement despite stale flags"
+      ]
+    },
+    {
+      "name": "mutation-hide-ordinary-orders",
+      "exitCode": 1,
+      "tests": 12,
+      "passed": 10,
+      "failed": 2,
+      "failures": [
+        "source, active split, empty purchase order and transfer order remain visible",
+        "ordinary inactive completed purchase orders remain searchable and visible in history"
+      ]
+    },
+    {
+      "name": "mutation-destructive-history-cleanup",
+      "exitCode": 1,
+      "tests": 12,
+      "passed": 11,
+      "failed": 1,
+      "failures": [
+        "schedule reads retain the original records and cancellation history"
+      ]
+    },
+    {
+      "name": "reordered-migrate",
+      "exitCode": 0,
+      "tests": 0,
+      "passed": 0,
+      "failed": 0,
+      "failures": []
+    },
+    {
+      "name": "reordered-01",
+      "exitCode": 0,
+      "tests": 20,
+      "passed": 20,
+      "failed": 0,
+      "failures": []
+    },
+    {
+      "name": "reordered-02",
+      "exitCode": 0,
+      "tests": 15,
+      "passed": 15,
+      "failed": 0,
+      "failures": []
+    },
+    {
+      "name": "reordered-03",
+      "exitCode": 0,
+      "tests": 1,
+      "passed": 1,
+      "failed": 0,
+      "failures": []
+    },
+    {
+      "name": "reordered-04",
+      "exitCode": 0,
+      "tests": 2,
+      "passed": 2,
+      "failed": 0,
+      "failures": []
+    },
+    {
+      "name": "reordered-05",
+      "exitCode": 0,
+      "tests": 8,
+      "passed": 8,
+      "failed": 0,
+      "failures": []
+    },
+    {
+      "name": "reordered-06",
+      "exitCode": 0,
+      "tests": 2,
+      "passed": 2,
+      "failed": 0,
+      "failures": []
+    },
+    {
+      "name": "reordered-07",
+      "exitCode": 0,
+      "tests": 7,
+      "passed": 7,
+      "failed": 0,
+      "failures": []
+    },
+    {
+      "name": "reordered-08",
+      "exitCode": 0,
+      "tests": 1,
+      "passed": 1,
+      "failed": 0,
+      "failures": []
+    },
+    {
+      "name": "reordered-09",
+      "exitCode": 0,
+      "tests": 2,
+      "passed": 2,
+      "failed": 0,
+      "failures": []
+    },
+    {
+      "name": "reordered-10",
+      "exitCode": 0,
+      "tests": 5,
+      "passed": 5,
+      "failed": 0,
+      "failures": []
+    },
+    {
+      "name": "reordered-11",
+      "exitCode": 0,
+      "tests": 3,
+      "passed": 3,
+      "failed": 0,
+      "failures": []
+    },
+    {
+      "name": "reordered-12",
+      "exitCode": 0,
+      "tests": 10,
+      "passed": 10,
+      "failed": 0,
+      "failures": []
+    },
+    {
+      "name": "reordered-13",
+      "exitCode": 0,
+      "tests": 23,
+      "passed": 23,
+      "failed": 0,
+      "failures": []
+    },
+    {
+      "name": "reordered-14",
+      "exitCode": 0,
+      "tests": 49,
+      "passed": 49,
+      "failed": 0,
+      "failures": []
+    },
+    {
+      "name": "reordered-15",
+      "exitCode": 0,
+      "tests": 1,
+      "passed": 1,
+      "failed": 0,
+      "failures": []
+    },
+    {
+      "name": "reordered-16",
+      "exitCode": 0,
+      "tests": 1,
+      "passed": 1,
+      "failed": 0,
+      "failures": []
+    }
+  ],
+  "mapping": {
+    "referenceReuse": "reference reuse hides the cancelled lifecycle and preserves the active replacement",
+    "allViews": "six cancelled-split view and lookup cases",
+    "staleFlags": "multiple cancelled lifecycles never hide their active replacement despite stale flags",
+    "ordinaryOrders": "source/active/empty/TO visibility and ordinary inactive completed PO cases",
+    "http": "authenticated schedule HTTP search returns the replacement and denies anonymous access",
+    "history": "schedule reads retain the original records and cancellation history",
+    "releaseScope": "manifest, image check, deployment-result and live-before/live-after checks"
+  },
+  "coverage": {
+    "changedPredicateLines": 6,
+    "uncovered": [],
+    "note": "SQL execution coverage is paired with assertions against real PostgreSQL query results."
+  },
+  "mutations": [
+    {
+      "name": "missing-filter",
+      "killed": true,
+      "failures": [
+        "reference reuse hides the cancelled lifecycle and preserves the active replacement",
+        "a cancelled split with no replacement stays absent from global search",
+        "a cancelled split with no replacement stays absent from completed search",
+        "a cancelled split with no replacement stays absent from completed filter",
+        "a cancelled split with no replacement stays absent from completed view",
+        "a cancelled split with no replacement stays absent from exact-reference batch",
+        "a cancelled split with no replacement stays absent from status projection",
+        "authenticated schedule HTTP search returns the replacement and denies anonymous access",
+        "multiple cancelled lifecycles never hide their active replacement despite stale flags"
+      ]
+    },
+    {
+      "name": "match-shared-reference",
+      "killed": true,
+      "failures": [
+        "reference reuse hides the cancelled lifecycle and preserves the active replacement",
+        "source, active split, empty purchase order and transfer order remain visible",
+        "authenticated schedule HTTP search returns the replacement and denies anonymous access",
+        "multiple cancelled lifecycles never hide their active replacement despite stale flags"
+      ]
+    },
+    {
+      "name": "hide-active-splits",
+      "killed": true,
+      "failures": [
+        "reference reuse hides the cancelled lifecycle and preserves the active replacement",
+        "source, active split, empty purchase order and transfer order remain visible",
+        "authenticated schedule HTTP search returns the replacement and denies anonymous access",
+        "multiple cancelled lifecycles never hide their active replacement despite stale flags"
+      ]
+    },
+    {
+      "name": "hide-ordinary-orders",
+      "killed": true,
+      "failures": [
+        "source, active split, empty purchase order and transfer order remain visible",
+        "ordinary inactive completed purchase orders remain searchable and visible in history"
+      ]
+    },
+    {
+      "name": "destructive-history-cleanup",
+      "killed": true,
+      "failures": [
+        "schedule reads retain the original records and cancellation history"
+      ]
+    }
+  ],
+  "properties": {
+    "seed": 1400761,
+    "cases": 16
+  },
+  "baselineDiagnostics": {
+    "types": 7377,
+    "lint": 4
+  },
+  "finalDiagnostics": {
+    "types": 7377,
+    "lint": 4,
+    "new": 0
+  },
+  "resolvedValidationIssues": [
+    "Initial transfer fixture lacked a required destination ID. Added realistic location IDs before implementation; assertions unchanged; corrected RED run had nine expected failures.",
+    "Repeating legacy suites against the same database collided with retained fixed fixture identities. Moved the seeded order check to a fresh disposable database; unchanged assertions and runtime candidate."
+  ],
+  "skipped": {
+    "unrelatedApplicationSuites": "Change is one read-only SCM query; ran all 16 selected split/schedule/visibility regression files (150 tests), plus new checks.",
+    "browserRendering": "No browser code changed; exercised the authenticated schedule HTTP endpoint.",
+    "dependencyAudit": "No dependency or capability changes.",
+    "migrationRollback": "No schema or business-data mutation in this release."
+  },
+  "capabilityReview": "Only a SQL visibility predicate was added. No network, environment, filesystem or subprocess capability added to runtime.",
+  "live": {
+    "mode": "after",
+    "passed": true,
+    "ledger": [
+      {
+        "id": "357",
+        "split_po_id": "-15818547222947",
+        "status": "cancelled",
+        "netsuite_active": false,
+        "saved_line_count": 7
+      },
+      {
+        "id": "358",
+        "split_po_id": "-21242780387343",
+        "status": "active",
+        "netsuite_active": true,
+        "saved_line_count": 8
+      }
+    ],
+    "rows": [
+      {
+        "sourceId": "-21242780387343",
+        "sourceRef": "POB04015",
+        "orderRef": "SN1400761",
+        "content": "UNI-TV60S-RDM-STORM 6 PLT\nUNI-URBAN60S-1836-STER 12 PLT\nUNI-UCARA-SFP6-SM-IB 8 PLT\nUNI-UCARA-COR-SM-IB 3 PLT\nUNI-UCARA-SFP6-SM-GF 3 PLT\nUNI-UCARA-COR-SM-GF 1 PLT\nPALLET 40 EACH\nUNI-WIN70T-RDM-GN 7 PLT",
+        "status": "Queued",
+        "totalPalletQty": 40,
+        "weightLbs": 78071.2248
+      }
+    ]
+  },
+  "deployment": {
+    "deployed": true,
+    "at": "2026-10-08T19:16:59.509129+00:00",
+    "imageId": "sha256:0c33812758c20c095a24501172d238c71bff3ad53b7336832fb73f0fa4497b54",
+    "files": [
+      "src/dispatch-repository.js"
+    ],
+    "configurationPreserved": true,
+    "dependenciesPreserved": true,
+    "productionHealthy": true,
+    "http": {
+      "http://127.0.0.1:3000": {
+        "health": 200,
+        "publicAssetsVerified": 0,
+        "anonymousApisDenied": 2
+      },
+      "https://test.mbbsoperation.com": {
+        "health": 200,
+        "publicAssetsVerified": 0,
+        "anonymousApisDenied": 2
+      }
+    }
+  },
+  "cleanup": {
+    "running": [
+      "mbbs-operator-app-app-1 Up 35 seconds (healthy)",
+      "mbbs-operator-app-webhook-worker-1 Up 41 hours",
+      "mbbs-operator-app-ollama-1 Up 5 weeks (healthy)",
+      "mbbs-operator-app-db-1 Up 7 weeks (healthy)"
+    ],
+    "all": [
+      "mbbs-operator-app-app-1 Up 35 seconds (healthy)",
+      "mbbs-operator-app-webhook-worker-1 Up 41 hours",
+      "mbbs-operator-app-ollama-1 Up 5 weeks (healthy)",
+      "mbbs-operator-app-db-1 Up 7 weeks (healthy)"
+    ]
+  },
+  "artifacts": "test-artifacts/scm-cancelled-split-20261008",
+  "toolHashes": {
+    "scm-cancelled-split-check.py": "fae81c8594a373c0b71e65a86c46a92cf84da211821269971994315d93e49498",
+    "scm-cancelled-split-gauntlet.mjs": "765962c151963cdd6ebf0c5eb5ef51a003fbcbd7e8b386b03ec0402f91d323de",
+    "scm-cancelled-split-release.py": "89832d296fab39bf44745622bf712f223d1b9a9216d8f45d92713d2683c7b4fd",
+    "scm-cancelled-split-live.mjs": "e68bef66f03c0a7a380d27c5e5a71dd1506a728912a6a9b80169e533878525f6",
+    "scm-cancelled-split-postdeploy.py": "80f04991655aca35f5aef889ad319e710131793db6436e9ff18fab7d69e7478e"
+  }
+}

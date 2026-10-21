@@ -1,0 +1,10 @@
+[
+  "src/special-stock-request-repository.js",
+  "src/server.js",
+  "public/special-stock-fulfillment.js",
+  "public/sales-special-stock-requests.js",
+  "public/app-sidebar.js",
+  "src/special-delivery-method-alerts.js",
+  "public/special-delivery-method-alert.js",
+  "migrations/277_special_delivery_method_alerts.sql"
+]

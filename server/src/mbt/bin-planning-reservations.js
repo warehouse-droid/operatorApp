@@ -6,6 +6,7 @@ import { planningError } from "./bin-planning-repository.js";
 
 /** @param {any} visit @param {any} input */
 export async function releasePlanningReservations(visit, input) {
+  await query("UPDATE mbt_bin_workflow_claims SET released_at=now() WHERE visit_id=$1 AND released_at IS NULL",[visit.service_visit_id]);
   const reservations = await query(`SELECT r.*,s.lifecycle_status,s.location_kind,
       GREATEST(now(),m.occurred_at) AS occurred_at
     FROM mbt_bin_asset_reservations r JOIN mbt_bin_asset_state s ON s.asset_id=r.asset_id

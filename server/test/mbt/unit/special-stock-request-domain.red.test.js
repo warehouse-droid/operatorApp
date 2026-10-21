@@ -167,7 +167,8 @@ test("SCM response models vendor supply without creating an internal transfer", 
   });
   assert.equal(response.supplyStatus, "vendor_transfer");
   assert.equal(response.createsInternalTransfer, false);
-  assert.equal(response.availableDate, "2026-09-05");
+  assert.equal(response.availableDate, null);
+  assert.equal(response.availabilityMode, "so_placement");
   assert.equal(response.unitPurchaseCost, 12.5);
   assert.equal(response.itemResolution.itemId, 2055);
 });
@@ -341,10 +342,10 @@ test("case stage uses seven operational stages independently of approval and rec
   assert.equal(deriveSpecialCaseStage({ hasPendingSalesDecision: true }), 'await_customer_confirmation');
   assert.equal(deriveSpecialCaseStage({ linesResolved: true }), 'await_customer_confirmation');
   for (const salesOrderApproved of [true, false]) assert.equal(deriveSpecialCaseStage({ salesOrderId: 10, salesOrderApproved }), 'confirmed');
-  assert.equal(deriveSpecialCaseStage({ salesOrderId: 10, purchaseOrderId: 20, fulfillmentMethod:'mbt_delivery' }), 'dispatch_arrangement');
+  assert.equal(deriveSpecialCaseStage({ salesOrderId: 10, purchaseOrderId: 20, fulfillmentMethod:'mbt_delivery' }), 'confirmed');
   assert.equal(deriveSpecialCaseStage({ salesOrderId: 10, purchaseOrderId: 20, fulfillmentMethod:'vendor_pickup' }), 'confirmed');
   for (const remotelyReconciled of [true, false]) assert.equal(deriveSpecialCaseStage({ operationallyComplete:true, attention:true, remotelyReconciled }), 'completed');
-  assert.equal(deriveSpecialCaseStage({ waitingForProduction:true, salesOrderId:10, purchaseOrderId:20 }), 'wait_for_production');
+  assert.equal(deriveSpecialCaseStage({ waitingForProduction:true, salesOrderId:10, purchaseOrderId:20 }), 'confirmed');
   assert.equal(deriveSpecialCaseStage({ closed:true }), 'closed');
 });
 

@@ -69,7 +69,7 @@ test("D2 exact readback accepts reordered rows and rejects identity, yard, quant
     value => { value.externalId = "OTHER"; }, value => { value.createdFrom.id = "999"; },
     value => { value.item.items[1].quantity += 1; }, value => { value.item.items[1].rate = 1; },
     value => { value.item.items[1].custcol_atlas_rc_so.id = "10"; },
-    value => { value.item.items[1].units.id = "9"; }, value => { value.item.items[1].location.id = "1"; },
+    value => { value.item.items[1].units = "9"; }, value => { value.item.items[1].location.id = "1"; },
     value => { value.item.items.pop(); }, value => { value.tranId = ""; },
     value => { value.status.refName = "Cancelled"; }, value => { value.item.items.find(line => line.orderLine === 1).orderLine = 2; },
     value => { value.item.items[1].description = "wrong source"; }

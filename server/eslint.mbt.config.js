@@ -27,6 +27,8 @@ export default [
       "src/mbt/**/*.js",
       "src/operator-customer-pickup-photo-policy.js",
       "src/operator-netsuite-posting-*.js",
+      "src/customer-pickup-yard-scope.js",
+      "src/operator-yard-authorization.js",
       "src/operator-linked-quantity-domain.js",
       "src/sales-order-auto-fulfillment-*.js",
       "src/driver-historical-assist-*.js",

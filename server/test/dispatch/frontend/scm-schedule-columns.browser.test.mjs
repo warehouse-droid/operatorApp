@@ -214,3 +214,200 @@ test("malformed stored choices and unavailable storage do not break the grid", a
   await expect(page.locator('.scm-sheet-header[data-column-key="timing"]')).toBeHidden();
   await assertAligned(page);
 });
+
+const sortRows = [
+  { ...row, orderRef: "PO-A", orderKind: "PO", brand: "A", method: "MBT", dropoffPoint: "3445", weightLbs: 10, queuedDate: "2026-10-03" },
+  { ...row, orderRef: "VRMA-B", orderKind: "VRMA", brand: "B", method: "Vendor", dropoffPoint: "12441", weightLbs: 2, queuedDate: "2026-10-02" },
+  { ...row, orderRef: "PO-B", orderKind: "PO", brand: "B", method: "Vendor", dropoffPoint: "2967 + 3445", weightLbs: 100, queuedDate: "2026-10-01" },
+  { ...row, orderRef: "VRMA-A", orderKind: "VRMA", brand: "A", method: "Customer Pickup", dropoffPoint: "150", weightLbs: 20, queuedDate: "2026-10-04" }
+];
+
+async function useFixtureRows(page, rows = sortRows) {
+  const scheduleRequests = [];
+  let preference = { persisted: false };
+  await page.route(/\/api\/scm\/schedule-preferences\/(?:scm|dispatch)$/, async (route) => {
+    if (route.request().method() === "PUT") preference = { ...route.request().postDataJSON(), persisted: true };
+    await route.fulfill({ json: preference });
+  });
+  await page.route(/\/api\/(scm|sales)\/schedule(?:\?|$)/, async (route) => {
+    const params = new URL(route.request().url()).searchParams;
+    scheduleRequests.push(params);
+    const kinds = params.getAll("kind");
+    const methods = params.getAll("method");
+    const dropoffs = params.getAll("dropoffPoint");
+    await route.fulfill({ json: { rows: rows.filter((item) =>
+      (!kinds.length || kinds.some((kind) => kind === "Sp.O" ? item.isSpecialOrder && item.orderKind === "PO" : item.orderKind === kind))
+      && (!methods.length || methods.includes(item.method))
+      && (!dropoffs.length || dropoffs.some((yard) => item.dropoffPoint.replace(/\s/g, "").split("+").includes(yard)))
+      && (params.get("view") !== "dispatch" || item.method === "MBT")) } });
+  });
+  await page.evaluate(() => loadScmSchedule());
+  return scheduleRequests;
+}
+
+test("automatic special orders show Sp.O and keep the SO prefix separate from editable remarks", async (t) => {
+  const page = await openSchedule(t);
+  await page.setViewportSize({ width: 2400, height: 700 });
+  const special = { ...row, isSpecialOrder: true, isAutomaticSpecialOrder: true,
+    remarkPrefix: "For SOB12345", remark: "For SOB12345 Original remark", netSuiteMemo: "Vendor memo" };
+  await useFixtureRows(page, [special]);
+  const scheduleRow = page.locator(".scm-sheet-row");
+  await expect(scheduleRow.locator('[data-column-key="type"] > strong')).toHaveText("Sp.O");
+  await expect(scheduleRow.locator('[data-field="isSpecialOrder"]')).toBeChecked();
+  await expect(scheduleRow.locator('[data-field="isSpecialOrder"]')).toBeDisabled();
+  await expect(scheduleRow.locator('[data-column-key="remark"] .scm-readonly-value')).toHaveText("For SOB12345");
+  const remark = scheduleRow.locator('[data-field="remarkOverride"]');
+  await expect(remark).toHaveValue("Original remark");
+  await remark.fill("Call vendor");
+  const patch = await page.evaluate(() => collectRowPatch(scheduleRowId(scmScheduleRows[0])));
+  assert.equal(patch.remarkOverride, "Call vendor");
+  assert.equal(Object.hasOwn(patch, "isSpecialOrder"), false, "Saving an automatic classification must not persist a manual flag");
+  await page.evaluate(() => setScmScheduleRowControlsDisabled(scheduleRowId(scmScheduleRows[0]), false));
+  await expect(scheduleRow.locator('[data-field="isSpecialOrder"]')).toBeDisabled();
+  await remark.fill("");
+  await expect(remark).toHaveAttribute("placeholder", "Vendor memo");
+  await expect(scheduleRow.locator('[data-column-key="remark"] .scm-readonly-value')).toHaveText("For SOB12345");
+  await mkdir("test-artifacts/scm-auto-special-order", { recursive: true });
+  await page.screenshot({ path: "test-artifacts/scm-auto-special-order/schedule.png", fullPage: true });
+});
+
+test("read-only schedules display the combined SO remark and special-order type", async (t) => {
+  const page = await openSchedule(t, "/dispatch/po-to-schedule");
+  await useFixtureRows(page, [{ ...row, method: "MBT", isSpecialOrder: true, isAutomaticSpecialOrder: true,
+    remarkPrefix: "For SOB12345", remark: "For SOB12345 Call vendor", remarkOverride: "Call vendor", remarkSource: "local" }]);
+  const scheduleRow = page.locator(".scm-sheet-row");
+  await expect(scheduleRow.locator('[data-column-key="type"] > strong')).toHaveText("Sp.O");
+  await expect(scheduleRow.locator('[data-column-key="remark"]')).toContainText("For SOB12345 Call vendor");
+});
+
+async function displayedRefs(page) {
+  return page.locator(".scm-sheet-row").evaluateAll((elements) => elements.map((element) => element.dataset.rowRef));
+}
+
+async function sortColumn(page, key) {
+  await page.locator(`[data-action="sort-column"][data-sort-key="${key}"]`).first().click();
+}
+
+test("spreadsheet sort sequence matters and each header shows direction and priority", async (t) => {
+  const page = await openSchedule(t);
+  const requests = await useFixtureRows(page);
+  assert.deepEqual(await displayedRefs(page), ["PO-B", "VRMA-B", "PO-A", "VRMA-A"]);
+  await sortColumn(page, "type");
+  await sortColumn(page, "brand");
+  assert.deepEqual(await displayedRefs(page), ["PO-A", "VRMA-A", "PO-B", "VRMA-B"]);
+  await expect(page.locator('[data-sort-key="brand"] [data-sort-indicator]')).toHaveText("↑1");
+  await expect(page.locator('[data-sort-key="type"] [data-sort-indicator]')).toHaveText("↑2");
+  await page.getByRole("button", { name: "Reset sort", exact: true }).click();
+  await sortColumn(page, "brand");
+  await sortColumn(page, "type");
+  assert.deepEqual(await displayedRefs(page), ["PO-A", "PO-B", "VRMA-A", "VRMA-B"]);
+  await sortColumn(page, "brand");
+  assert.deepEqual(await displayedRefs(page), ["PO-B", "VRMA-B", "PO-A", "VRMA-A"]);
+  await expect(page.locator('[data-sort-key="brand"] [data-sort-indicator]')).toHaveText("↓1");
+  await expect(page.locator('[data-sort-key="type"] [data-sort-indicator]')).toHaveText("↑2");
+  await expect(page.locator('[data-sort-key="date"] [data-sort-indicator]')).toHaveText("↑3");
+  await expect(page.locator('[data-schedule-sort-summary], .scm-sort-summary')).toHaveCount(0);
+  assert.equal(requests.length, 1, "Sorting should not reload the schedule");
+  await assertAligned(page);
+  if (process.env.SCHEDULE_SCREENSHOT_DIR) {
+    await page.screenshot({ path: `${process.env.SCHEDULE_SCREENSHOT_DIR}/sort-priorities.png` });
+  }
+});
+
+test("sorting preserves row nodes, drafts, selection, filter drafts, hidden columns and expanded details", async (t) => {
+  const page = await openSchedule(t);
+  await useFixtureRows(page);
+  await page.evaluate(() => {
+    scmScheduleShowReconciliationDetails = true;
+    scmScheduleExpandedReconciliationRows.add("PO::PO-A");
+    renderScmSchedule();
+    window.originalScheduleRow = document.querySelector('[data-schedule-row="PO::PO-A"]');
+  });
+  const remark = page.locator('[data-row="PO::PO-A"][data-field="remarkOverride"]');
+  await remark.fill("Keep my unsaved edit");
+  await page.locator('[data-row="PO::PO-A"][data-field="packingSlipRef"]').fill("DRAFT-PACK");
+  await page.locator('[data-row="PO::PO-A"][data-action="select-row"]').check();
+  await (await columns(page)).getByLabel("Remark", { exact: true }).uncheck();
+  await page.locator("[data-schedule-columns] > summary").click();
+  const kindFilter = page.locator('[data-multi-filter="kind"]');
+  await kindFilter.locator("summary").click();
+  await kindFilter.getByLabel("TO", { exact: true }).check();
+  await kindFilter.locator("summary").click();
+  await sortColumn(page, "weight");
+  assert.deepEqual(await displayedRefs(page), ["VRMA-B", "PO-A", "VRMA-A", "PO-B"]);
+  await expect(remark).toHaveValue("Keep my unsaved edit");
+  await expect(remark).toBeHidden();
+  await expect(page.locator('[data-row="PO::PO-A"][data-field="packingSlipRef"]')).toHaveValue("DRAFT-PACK");
+  await expect(page.locator('[data-row="PO::PO-A"][data-action="select-row"]')).toBeChecked();
+  assert.equal(await page.evaluate(() => window.originalScheduleRow === document.querySelector('[data-schedule-row="PO::PO-A"]')), true);
+  assert.equal(await page.evaluate(() => window.originalScheduleRow.nextElementSibling.dataset.reconciliationDetail), "PO::PO-A");
+  await expect(kindFilter.getByLabel("TO", { exact: true })).toBeChecked();
+  assert.deepEqual(await page.evaluate(() => scmScheduleFilters.kind), []);
+  await assertAligned(page);
+  const weight = page.locator('[data-sort-key="weight"]');
+  await weight.focus();
+  await page.keyboard.press("Enter");
+  await expect(weight).toBeFocused();
+  assert.deepEqual(await displayedRefs(page), ["PO-B", "VRMA-A", "PO-A", "VRMA-B"]);
+});
+
+test("Method, Type and Drop-off multi-selects apply together, persist and clear", async (t) => {
+  const page = await openSchedule(t);
+  const requests = await useFixtureRows(page, [...sortRows,
+    { ...row, orderRef: "SPECIAL", orderKind: "PO", isSpecialOrder: true, method: "Vendor", dropoffPoint: "12441 + 150" }
+  ]);
+  for (const [field, values] of [["method", ["MBT", "Vendor"]], ["kind", ["PO", "Sp.O"]], ["dropoffPoint", ["3445", "150"]]]) {
+    const filter = page.locator(`[data-multi-filter="${field}"]`);
+    await filter.locator("summary").click();
+    for (const value of values) await filter.getByLabel(value, { exact: true }).check();
+    await filter.locator("summary").click();
+  }
+  assert.equal(requests.length, 1, "Checking options should not apply them yet");
+  const dropoff = page.locator('[data-multi-filter="dropoffPoint"]');
+  await dropoff.locator("summary").click();
+  await dropoff.getByRole("button", { name: "Apply", exact: true }).click();
+  await expect(page.locator(".scm-sheet-row")).toHaveCount(3);
+  assert.deepEqual(new Set(await displayedRefs(page)), new Set(["PO-A", "PO-B", "SPECIAL"]));
+  assert.deepEqual(requests.at(-1).getAll("method"), ["MBT", "Vendor"]);
+  assert.deepEqual(requests.at(-1).getAll("kind"), ["PO", "Sp.O"]);
+  assert.deepEqual(requests.at(-1).getAll("dropoffPoint"), ["150", "3445"]);
+  await page.reload();
+  await page.evaluate(() => window.scheduleReady);
+  await expect(page.locator(".scm-sheet-row")).toHaveCount(3);
+  for (const field of ["method", "kind", "dropoffPoint"]) {
+    await expect(page.locator(`[data-multi-filter="${field}"] input:checked`)).toHaveCount(2);
+  }
+  const method = page.locator('[data-multi-filter="method"]');
+  await method.locator("summary").click();
+  await method.getByRole("button", { name: "Clear", exact: true }).click();
+  await expect(method.locator("input:checked")).toHaveCount(0);
+  await method.getByRole("button", { name: "Apply", exact: true }).click();
+  await expect.poll(() => requests.at(-1).getAll("method")).toEqual([]);
+  await page.getByRole("button", { name: "Clear column filters", exact: true }).click();
+  await expect(page.locator(".scm-sheet-row")).toHaveCount(5);
+  await expect(page.getByRole("button", { name: "Clear column filters", exact: true })).toHaveCount(0);
+});
+
+test("only the Dispatch view hides Method; Completed supports multiple methods on the Dispatch page", async (t) => {
+  const page = await openSchedule(t, "/dispatch/po-to-schedule");
+  const requests = await useFixtureRows(page);
+  await expect(page.locator('[data-multi-filter="method"]')).toHaveCount(0);
+  await expect(page.locator('[data-multi-filter="kind"], [data-multi-filter="dropoffPoint"]')).toHaveCount(2);
+  for (const key of ["method", "eta", "driver", "sla", "weight"]) {
+    await expect(page.locator(`[data-action="sort-column"][data-sort-key="${key}"]`).first()).toBeVisible();
+  }
+  await page.locator('[data-filter="view"]').selectOption("completed");
+  await expect(page.locator('[data-multi-filter="method"]')).toHaveCount(1);
+  const method = page.locator('[data-multi-filter="method"]');
+  await method.locator("summary").click();
+  for (const value of ["MBT", "Vendor"]) await method.getByLabel(value, { exact: true }).check();
+  await method.getByRole("button", { name: "Apply", exact: true }).click();
+  await expect.poll(() => requests.at(-1).getAll("method")).toEqual(["MBT", "Vendor"]);
+  await expect(page.locator(".scm-sheet-row")).toHaveCount(3);
+  await page.reload();
+  await page.evaluate(() => window.scheduleReady);
+  await expect(page.locator('[data-multi-filter="method"]')).toHaveCount(0);
+  assert.deepEqual(requests.at(-1).getAll("method"), []);
+  await page.locator('[data-filter="view"]').selectOption("completed");
+  await expect(page.locator('[data-multi-filter="method"] input:checked')).toHaveCount(2);
+});

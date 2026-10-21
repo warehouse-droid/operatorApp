@@ -7,8 +7,8 @@ importScripts("/driver-offline-sync.js?v=20260910-route-prefix-cursor-v1");
 
 const DRIVER_PWA_CLIENT_VERSION = "2026.08.12.3";
 const DRIVER_CACHE_PREFIX = "mbbs-driver-shell-";
-const DRIVER_CACHE_NAME = `${DRIVER_CACHE_PREFIX}v47`;
-const DRIVER_REFRESH_CACHE_NAME = `${DRIVER_CACHE_PREFIX}refresh-v47`;
+const DRIVER_CACHE_NAME = `${DRIVER_CACHE_PREFIX}v48`;
+const DRIVER_REFRESH_CACHE_NAME = `${DRIVER_CACHE_PREFIX}refresh-v48`;
 const DRIVER_OFFLINE_MODE_REQUEST = "/__mbbs_driver_offline_mode__";
 const DRIVER_SHELL = [
   "/driver",
@@ -23,7 +23,7 @@ const DRIVER_SHELL = [
   "/driver-upload.js?v=20261016-driver-reconnect-v1",
   "/driver-bin-ui.js?v=20260910-route-prefix-cursor-v1",
   "/driver-location-override.js?v=20260910-route-prefix-cursor-v1",
-  "/driver.js?v=20261016-driver-reconnect-v1",
+  "/driver.js?v=20261020-bin-workflows",
   "/sor-rentals.css?v=20260924-sor-v1",
   "/sor-signature.js?v=20260924-sor-v1",
   "/sor-driver-signature.js?v=20260924-sor-v1",

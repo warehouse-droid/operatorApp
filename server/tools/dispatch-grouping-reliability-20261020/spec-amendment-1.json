@@ -1,0 +1,6 @@
+{
+  "reason": "Existing contract requires fresh assignment ownership before editing. Preserve that behavior with a payload that omits full cargo snapshots, rather than removing ownership validation.",
+  "behavior": "Edit entry awaits lightweight authoritative ownership and retains existing lease and snapshot checks. Default full assignment endpoint remains compatible.",
+  "testUpdate": "The existing source contract will assert refreshPlannedAssignments({ includeSnapshots: false }); its ownership requirement is unchanged.",
+  "groupingConcurrency": "Unrelated refreshes are queued during explicit grouping reads; selected-order events invalidate the current attempt and cause bounded rehydration. Plan, draft, and selection changes still reject."
+}

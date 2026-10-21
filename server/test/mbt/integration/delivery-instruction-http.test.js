@@ -259,3 +259,57 @@ test("the narrow Driver instruction endpoint still requires a current client and
   });
   assert.equal(unassigned.response.status, 404);
 });
+
+test("Sales and Dispatch keep split instructions editable until every dropoff is complete", async () => {
+  const id = BASE_ID + 10;
+  const ref = `DIHTTP-${RUN_ID.slice(0, 12)}-SPLIT`;
+  const splitRefs = [`${ref}-S1`, `${ref}-S2`];
+  for (const [index, orderRef] of [ref, ...splitRefs].entries()) {
+    await query(`INSERT INTO sales_orders
+      (netsuite_id,tranid,trandate,status,status_text,order_location_id,sales_order_type,netsuite_active)
+      VALUES ($1,$2,current_date,'B','Pending Fulfillment',1,'Delivery',true)`,
+    [index ? -(id + index) : id, orderRef]);
+    if (index) {
+      await query(`INSERT INTO dispatch_scm_so_splits
+        (source_so_id,source_so_ref,split_so_id,split_so_ref) VALUES ($1,$2,$3,$4)`,
+      [id, ref, -(id + index), orderRef]);
+    }
+  }
+  const salesToken = tokens.get(USERS.salesOne);
+  const dispatchToken = tokens.get(USERS.dispatcher);
+  await query(`INSERT INTO driver_job_records (job_id,driver_login,stop_type,order_refs,status,completed_at)
+    VALUES ($1,'di-http-driver','dropoff',$2::jsonb,'complete',now())`,
+  [`di-http-split-first-${RUN_ID}`, JSON.stringify([splitRefs[0]])]);
+  const listed = await request(`/api/sales/delivery-instructions/orders?search=${ref}`, { token: salesToken });
+  assert.equal(listed.response.status, 200);
+  assert.equal(listed.payload.length, 1);
+  assert.equal(listed.payload[0].editable, true);
+  assert.equal(listed.payload[0].dropoffCompleted, false);
+  const saved = await request(`/api/sales/delivery-instructions/orders/${id}`, {
+    token: salesToken, method: "PUT",
+    body: { expectedRevision: 0, additionalText: "Instructions for the remaining delivery." }
+  });
+  assert.equal(saved.response.status, 200, JSON.stringify(saved.payload));
+  const shared = await request(`/api/dispatch/orders/${splitRefs[1]}/delivery-instructions`, { token: dispatchToken });
+  assert.equal(shared.response.status, 200);
+  assert.equal(shared.payload.orderId, id);
+  assert.equal(shared.payload.additionalText, saved.payload.additionalText);
+  assert.equal(shared.payload.editable, true);
+  await query(`INSERT INTO driver_job_records (job_id,driver_login,stop_type,order_refs,status,completed_at)
+    VALUES ($1,'di-http-driver','dropoff',$2::jsonb,'complete',now())`,
+  [`di-http-split-last-${RUN_ID}`, JSON.stringify([splitRefs[1]])]);
+  for (const [routePath, token] of [
+    [`/api/sales/delivery-instructions/orders/${id}`, salesToken],
+    [`/api/dispatch/orders/${splitRefs[1]}/delivery-instructions`, dispatchToken]
+  ]) {
+    const locked = await request(routePath, { token });
+    assert.equal(locked.response.status, 200);
+    assert.equal(locked.payload.editable, false);
+    assert.equal(locked.payload.dropoffCompleted, true);
+    const rejected = await request(routePath, {
+      token, method: "PUT", body: { expectedRevision: 1, additionalText: "Must remain read-only." }
+    });
+    assert.equal(rejected.response.status, 409);
+    assert.equal(rejected.payload.code, "DELIVERY_INSTRUCTION_READ_ONLY");
+  }
+});

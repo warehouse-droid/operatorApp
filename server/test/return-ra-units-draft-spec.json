@@ -1,0 +1,19 @@
+{
+  "task": "Correct REST return units and preserve failed submissions as drafts",
+  "tier": 3,
+  "specApproval": "not obtained (autonomous run)",
+  "authorization": "User authorized retrying SR-000005 until success and requested that NetSuite failures retain a draft instead of a local return record.",
+  "criteria": [
+    "RA stock lines send the existing source unit ID as a REST scalar string, preserving quantity, rate and orderLine.",
+    "Readback verifies unit IDs for scalar, numeric and historical reference-shaped responses, rejecting mismatches.",
+    "A definite NetSuite creation rejection retains quantities and photos in a retryable draft and keeps no submitted return record.",
+    "Unknown creation outcomes preserve durable recovery identity and cannot cause a second RA.",
+    "Repeated and concurrent confirmation uses the same submission identity and creates one verified RA.",
+    "The authorized retry recovers SR-000005 and verifies its actual NetSuite RA without changing the submitted quantities."
+  ],
+  "constraints": [
+    "Use existing dependencies and isolated PostgreSQL for tests.",
+    "Preserve unrelated workspace changes; deploy only tested scoped files over current live images.",
+    "Never erase an uncertain attempt or recreate an already identified RA."
+  ]
+}

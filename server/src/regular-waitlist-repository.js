@@ -8,6 +8,7 @@ import {isWaitlist,waitlistError,waitlistQuantity,waitlistId,waitlistText,waitli
   waitlistTotals,waitlistPoolBalance,rankWaitlistRequests,assertWaitlistSelectionPriority,
   waitlistReleaseEligibility,normalizeWaitlistFulfillment,WAITLIST_AUTO_RELEASE_MS} from './regular-waitlist-domain.js';
 import {resolveWaitlistPo,waitlistPoolSupply,normalizedWaitlistUnit,recentQueuedWaitlistPurchaseOrders} from './regular-waitlist-supply.js';
+import {regularStockStatusSummary,parseRegularStatusFilters,matchesRegularStatusSummary} from '../public/regular-stock-status.js';
 
 const iso=value=>value?new Date(value).toISOString():null;
 const activeConversions="('pending','preparing','submitted','uncertain')";
@@ -129,26 +130,37 @@ export async function getWaitlistRequest(id,context){
   assertSalesWaitlistAccess({request_type:request.requestType,workflow_version:request.workflowVersion,regular_details:request.regular,destination_location_id:request.destinationLocationId},context);
   return request;
 }
-export async function listWaitlistRequests({itemId=null,includeClosed=false,search='',includeSupply=true}={}){
+export async function listWaitlistRequests({itemId=null,includeClosed=false,search='',includeSupply=true,unifiedStatus=undefined,outcome=undefined,waitingReason=undefined}={}){
+  const filters=parseRegularStatusFilters({unifiedStatus,outcome,waitingReason});
+  const terminalHistory=includeClosed||filters.enabled&&['all','completed','closed'].includes(filters.unifiedStatus);
   const rows=(await query(`SELECT r.id,r.request_ref,r.revision,r.destination_location_id,r.destination_name,r.created_at,r.regular_details,
-    w.closed_at,l.item_id,l.item_name,l.sales_qty,l.sales_uom,i.vendor_id,i.vendor,i.display_name,
+    r.status,w.closed_at,l.item_id,l.item_name,l.sales_qty,l.sales_uom,i.vendor_id,i.vendor,i.display_name,
     COALESCE(SUM(a.quantity) FILTER(WHERE a.status IN ('reserved','converting')),0) AS held,
     COALESCE(SUM(a.quantity) FILTER(WHERE a.status='committed'),0) AS converted,
-    EXISTS(SELECT 1 FROM regular_waitlist_conversions c WHERE c.request_id=r.id AND c.status IN ${activeConversions}) AS converting
+    EXISTS(SELECT 1 FROM regular_waitlist_conversions c WHERE c.request_id=r.id AND c.status IN ${activeConversions}) AS converting,
+    EXISTS(SELECT 1 FROM regular_waitlist_conversions c WHERE c.request_id=r.id AND c.status<>'completed' AND c.error IS NOT NULL) AS conversion_attention,
+    EXISTS(SELECT 1 FROM sales_stock_request_events e WHERE e.request_id=r.id AND e.event_type='waitlist_rejected') AS rejected
     FROM regular_waitlist_requests w JOIN sales_stock_requests r ON r.id=w.request_id
     JOIN sales_stock_request_lines l ON l.id=w.request_line_id LEFT JOIN inventory_items i ON i.item_id=l.item_id
     LEFT JOIN regular_waitlist_allocations a ON a.request_id=r.id
     WHERE ($1::bigint IS NULL OR l.item_id=$1) AND ($2 OR (w.closed_at IS NULL AND r.status<>'completed'))
     AND ($3='' OR strpos(lower(r.request_ref||' '||COALESCE(r.regular_details->>'customerName','')||' '||l.item_name),lower($3))>0)
-    GROUP BY r.id,w.request_id,l.id,i.vendor_id,i.vendor,i.display_name ORDER BY r.created_at,r.id`,[itemId,includeClosed,String(search).slice(0,120)])).rows;
+    GROUP BY r.id,w.request_id,l.id,i.vendor_id,i.vendor,i.display_name ORDER BY r.created_at,r.id`,[itemId,terminalHistory,String(search).slice(0,120)])).rows;
   const recent=includeSupply?await recentQueuedWaitlistPurchaseOrders(rows.map(row=>Number(row.item_id))):new Map();
-  return rows.map(row=>({id:Number(row.id),requestRef:row.request_ref,revision:Number(row.revision),sellingYardId:Number(row.destination_location_id),
+  const requests=rows.map(row=>{
+    const totals=waitlistTotals({requested:Number(row.sales_qty),held:Number(row.held),committed:Number(row.converted),closed:Boolean(row.closed_at)});
+    const state=row.closed_at?'closed':row.converting?'converting':totals.remainingQty===0?'completed':totals.heldQty>0?(totals.waitingQty>0?'partially_allocated':'allocated'):'waiting';
+    const request={id:Number(row.id),requestRef:row.request_ref,revision:Number(row.revision),sellingYardId:Number(row.destination_location_id),
     sellingYard:row.destination_name,createdAt:iso(row.created_at),itemId:Number(row.item_id),itemCode:row.item_name,itemDisplayName:row.display_name||row.item_name,salesUom:row.sales_uom,
     vendorId:row.vendor_id?Number(row.vendor_id):null,vendorName:row.vendor||'',vendorKey:row.vendor_id?String(row.vendor_id):row.vendor?'name:'+row.vendor.toLowerCase():'none',
     recentQueuedPurchaseOrders:recent.get(Number(row.item_id))||[],
     customerId:row.regular_details.customerId,customerName:row.regular_details.customerName,converting:row.converting,closed:Boolean(row.closed_at),
-    destinationLocationId:Number(row.destination_location_id),waitlist:{waitingQty:Math.max(0,Number(row.sales_qty)-Number(row.held)-Number(row.converted))},
-    ...waitlistTotals({requested:Number(row.sales_qty),held:Number(row.held),committed:Number(row.converted),closed:Boolean(row.closed_at)})}));
+    destinationLocationId:Number(row.destination_location_id),regular:row.regular_details,status:row.status,
+    waitlist:{...totals,state,closureType:row.closed_at?(row.rejected?'rejected':'closed'):null,conversionNeedsAttention:row.conversion_attention},...totals};
+    request.statusSummary=regularStockStatusSummary(request);
+    return request;
+  });
+  return filters.enabled?requests.filter(request=>matchesRegularStatusSummary(request.statusSummary,filters)):requests;
 }
 async function poolRow(id){
   const row=(await query(`SELECT p.*,COALESCE(NULLIF(o.dispatch_ref,''),o.tranid) AS po_ref,o.expected_delivery_date,

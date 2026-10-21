@@ -71,12 +71,12 @@ test('Toronto dates and weekend reminder boundaries are explicit', () => {
   assert.equal(reminderDate('2026-09-27'),'2026-09-23');
   assert.throws(()=>parseStages('attention'),/supported/);
 });
-test('property: postponement cannot hide a due alert, readiness clears it, and waiting dominates order stages', () => {
+test('property: postponement cannot hide a due alert, readiness clears it, and accepted ETAs stay Confirmed', () => {
   fc.assert(fc.property(fc.integer({min:1,max:28}),fc.boolean(),fc.boolean(),(day,so,po)=>{
     const due=`2026-09-${String(day).padStart(2,'0')}`;
     assert.equal(nextReminderDate({previousDue:due,eta:'2099-10-01',ready:false,today:'2026-09-30'}),due);
     assert.equal(nextReminderDate({previousDue:due,eta:'2099-10-01',ready:true,today:'2026-09-30'}),null);
-    assert.equal(specialStage({waitingForProduction:true,salesOrderId:so?1:null,purchaseOrderId:po?2:null}),'wait_for_production');
+    assert.equal(specialStage({waitingForProduction:true,salesOrderId:so?1:null,purchaseOrderId:po?2:null}),'confirmed');
   }),{seed:24092026,numRuns:200});
 });
 
@@ -108,10 +108,10 @@ test('boundary refuses missing metadata and invalid or conflicting remote line i
     calls++; const result=await rest(...args);return calls===3?{data:{item:{items:[]}}}:result;
   }}),/verification failed/);
 });
-test('the filter exposes seven labelled choices, retains multiple selections and allows clearing', async () => {
+test('the filter exposes eight labelled choices, retains multiple selections and allows clearing', async () => {
   const {stageFilterHtml}=await import('../../../public/special-stock-workflow.js');
   const html=stageFilterHtml(['new_enquiry','completed']);
-  assert.equal((html.match(/type="checkbox"/g)||[]).length,7);
+  assert.equal((html.match(/type="checkbox"/g)||[]).length,8);
   assert.equal((html.match(/checked/g)||[]).length,2);
   assert.match(html,/Clear selection/);assert.match(stageFilterHtml(''),/All/);
   assert.deepEqual(parseStages(['confirmed','confirmed']),['confirmed']);

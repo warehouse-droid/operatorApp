@@ -1,0 +1,14 @@
+{
+  "extends": "./regular-stock-delivery-simple-tsconfig.json",
+  "files": [
+    "../public/regular-stock-input.js",
+    "../src/regular-stock-domain.js",
+    "../src/regular-stock-delivery-domain.js",
+    "../src/regular-stock-delivery-progress.js"
+  ],
+  "compilerOptions": {
+    "types": [
+      "node"
+    ]
+  }
+}

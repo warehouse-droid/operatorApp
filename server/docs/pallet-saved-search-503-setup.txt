@@ -1,0 +1,141 @@
+Use MB - Pallet balance of clients as the operator balance source
+Updated 2026-10-20. RESTlet and application integration deployed and verified.
+Application cutover completed at 17:36 UTC. Deployment state is recorded in
+deployments/pallet-saved-search-20261020/deployment-result.json.
+
+Known identifiers
+  Saved search: customsearch503 (internal ID 503), Transaction search.
+  Customer: 5240, displayed as 800909 Chuangsen Landscaping.
+  PALLET item: 1784.
+  Yard 150: location 26.
+  Send customerId=5240. The displayed account code 800909 is not the internal ID.
+  Customer 1959 is displayed as 800809 Stone Heaven Landscaping Ltd.
+  Deployment External URL:
+    https://6518947.restlets.api.netsuite.com/app/site/hosting/restlet.nl?script=505&deploy=1
+
+What is already fixed
+  Production now counts physical fulfillment/credit lines once, using iscogs=F.
+  It retains real fulfillment rows whose mainline flag is T.
+  The live operator balance was verified as 206 - 194 - 0 = 12 at
+  2026-10-20T14:14:26.214Z. The balance remains customer-wide.
+  At 17:29 UTC the physical balance was 207 - 194 = 13. The user's accepted
+  saved-search balance is also 13; the earlier 12 was an earlier snapshot.
+
+Why use a RESTlet for the report
+  Native REST can execute saved searches at:
+    GET /services/rest/query/v1/savedsearch/customsearch503/result
+  This account's endpoint returned HTTP 500 UNEXPECTED_ERROR during investigation,
+  for both script/internal IDs and synchronous/asynchronous requests. Listing the
+  search succeeded. The deployed RESTlet subsequently returned the actual schema.
+  Native REST also cannot override saved-search criteria.
+  The supplied SuiteScript loads the original saved search with N/search, adds a
+  customer filter in memory, and runs it. It never calls save() or writes records.
+
+NetSuite setup
+  1. Upload server/netsuite-pallet-balance-search-restlet.js to the File Cabinet's
+     SuiteScripts folder. Create a RESTlet script record using that file.
+  2. Create a deployment for the integration role/user. Test it under that role,
+     then release it for the intended integration audience. The role needs access
+     to customsearch503 and the transactions/customers used by the report.
+     Use the account-specific External URL displayed on the deployment.
+  3. Use OAuth 2.0 with the RESTlets scope enabled on the integration and included
+     in its token grant. Reuse existing credentials only if they support this
+     scope; do not reset existing integration credentials. A Web Services Only
+     role cannot call RESTlets. Match the report user's relevant subsidiary and
+     location access when comparing results.
+  4. Make an authenticated GET request to the deployment External URL, appending:
+       &customerId=5240
+     Headers:
+       Authorization: Bearer <OAuth 2.0 access token with restlets scope>
+       Accept: application/json
+       Content-Type: application/json
+     Keep authentication in the backend, never in the operator browser.
+
+Response contract
+  savedSearchId: customsearch503
+  customerId: "5240"
+  generatedAt: time the RESTlet ran
+  found/rowCount: whether/how many rows the report returned
+  columns: ordered index, name, label, join, summary, formula and sort metadata
+  rows: ordered arrays of raw values corresponding to columns
+
+  The verified balance column is quantity, label "Returnable Quantity",
+  summary SUM, empty join and formula. It is index 2 in the current response.
+  The adapter locates it by column identity, so column order is not assumed.
+  The other columns are entity GROUP, mainline GROUP (twice), and
+  phone GROUP with join customerMain. The complete grouping is validated.
+  Verified results: customer 5240 = 13 and customer 1959 = 2.
+  The script does not guess a column name or add numeric columns together.
+  Repeated formula column names remain distinct.
+
+  Verify the row grouping, units, saved location/date/item criteria, summary
+  filters and role visibility against the UI report before selecting a column.
+  Temporary UI filters are not automatically saved-search criteria.
+  No extra yard-150 filter is added: the search's saved criteria remain intact.
+  If there are multiple rows, determine their grouping before choosing a total.
+  A structurally valid missing row grants zero allowance and retains
+  balanceFound=false. Search/permission errors propagate as errors.
+  More than 50 customer rows fail rather than truncate in the RESTlet;
+  the app requires at most one customer result row.
+  Pin the chosen column's name/join/summary/formula and expected grouping in the
+  backend adapter; reject changes instead of silently reading another column.
+
+OperatorApp integration
+  A. For account 6518947, config.netsuite.palletBalanceRestletUrl defaults to
+     the verified deployment above. NETSUITE_PALLET_BALANCE_RESTLET_URL can
+     override it; an explicit empty value disables the saved-search mode.
+     Other accounts have no default. URL validation requires the configured
+     account's HTTPS RESTlet domain and path before requesting a token.
+  B. Use the numeric report net balance as the NetSuite base amount:
+       operator available = max(saved search net balance
+                                - local returns not yet reflected in NetSuite, 0)
+     The response includes netBalance, source="netsuite_saved_search",
+     savedSearchId="customsearch503", balanceFound and lookedUpAt.
+     fulfilled and netsuiteReturned are null in this mode because the report
+     does not provide those separate totals. The operator uses available.
+  C. Retain the existing credit-memo ID/external-ID and linked-credit queries.
+     They identify which local returns are already included in NetSuite, so
+     those returns are not subtracted twice. A summary report alone does not
+     necessarily provide this transaction identity evidence.
+     Skip the identity query when no local pallet returns exist. Otherwise
+     read identities BEFORE the report, retaining conservative reservations
+     if a credit is posted between the two reads.
+  D. Keep existing local reservation, customer locking, duplicate-return and
+     freshness checks. Recheck the NetSuite amount on submission. Never treat
+     an unavailable/ambiguous report or a stale cache as fresh return entitlement.
+     Enquiries and submissions fetch fresh reports. Report errors never trigger
+     a silent fallback to the historical transaction calculation.
+
+No further NetSuite upload or OAuth change is required for the verified deployment.
+The existing M2M integration has rest_webservices and restlets scopes, with access
+through role 1067 (OAuth2.0). Credentials remain on the backend.
+
+Operational limitations
+  Saved-search criteria and role access define the balance. No extra receiving-
+  yard filter is added. The current RESTlet returns a summary, not the individual
+  transactions included. Keep its intended credit, date, item and location scope
+  compatible with the credit-evidence rules before editing report criteria.
+  Schema or grouping changes fail explicitly until the adapter is reviewed.
+  NetSuite latency varies; see live-before.json/live-after.json in the release
+  directory for measured timings, rather than assuming this source is faster.
+  The post-deployment sample returned 13 for 800909 and 2 for 800809, with zero
+  local reservations. Warm median lookup was 1.395 seconds versus 0.586 seconds
+  before switching. This change aligns the source with the report; it did not
+  improve lookup latency in the measured sample.
+
+Verification
+  From server/:
+    bash tools/pallet-saved-search-20261020/test.sh final \
+      node tools/pallet-saved-search-20261020/checks.mjs
+  Evidence and disposable-test teardown logs:
+    test-artifacts/pallet-saved-search-20261020/final/
+  The runner uses the captured release candidate and removes its test databases,
+  containers and networks automatically.
+
+Official references
+  https://docs.oracle.com/en/cloud/saas/netsuite/ns-online-help/article_0804090827.html
+  https://docs.oracle.com/en/cloud/saas/netsuite/ns-online-help/section_4345775360.html
+  https://docs.oracle.com/en/cloud/saas/netsuite/ns-online-help/section_458440490721.html
+  https://docs.oracle.com/en/cloud/saas/netsuite/ns-online-help/section_46988464355.html
+  https://docs.oracle.com/en/cloud/saas/netsuite/ns-online-help/chapter_1529417663.html
+  https://docs.oracle.com/en/cloud/saas/netsuite/ns-online-help/section_157771863841.html

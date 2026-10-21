@@ -58,6 +58,7 @@
   function noticeMessage(row) {
     const actions={submit:'A new delivery request is awaiting Dispatch.',confirm:'Dispatch pre-approved delivery. Sales must add Sales or Transfer Orders before expiry.',
       reply:'A new message was added to the Sales and Dispatch conversation.',
+      'set-expiry':'Dispatch changed the approval deadline for this request. Add Sales or Transfer Orders before the new expiry.',
       propose:'Dispatch proposed another timeslot. Review and accept or counter.',accept:'Sales accepted the proposed timeslot.',secure:'Sales linked orders. Approval is secured and its expiry clock has stopped.',
       relink:'Sales changed the linked orders. The approved delivery time is unchanged.',
       'request-time-change':'Sales requested a new timeslot. The approved time remains active until Dispatch accepts.',

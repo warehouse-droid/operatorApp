@@ -1,4 +1,5 @@
 import { calculateLocalRate } from './mbt/local-rate-calculator.js';
+import {deliveryExpiryDeadline} from '../public/delivery-request-expiry-time.js';
 
 /**
  * @typedef {{pos:number,bin:number}} DeliveryCapacities
@@ -17,8 +18,8 @@ import { calculateLocalRate } from './mbt/local-rate-calculator.js';
  * @typedef {{providerMetres:number,destinationSnapshot?:{addressText?:string,[key:string]:unknown},[key:string]:unknown}} DeliveryRouteEvidence
  * @typedef {{requestingYardLocationId:number,status:string,revision:number,requestedWindow:DeliveryWindow,
  *   proposedWindow:DeliveryWindow|null,confirmedWindow:DeliveryWindow|null,pendingWindow?:DeliveryWindow|null,pendingWindowProposedBy?:string|null,approvalExpiresAt:string|null,
- *   reminderAt:string|null,reminderSentAt:string|null,securedAt?:string|null,salesOrderRefs:string[],[key:string]:unknown}} DeliveryRequest
- * @typedef {{expectedRevision:number,window?:DeliveryWindow,salesOrderRefs?:unknown[],message?:unknown}} DeliveryTransitionInput
+ *   reminderAt:string|null,reminderSentAt:string|null,securedAt?:string|null,approvalSettings?:DeliverySettings,salesOrderRefs:string[],[key:string]:unknown}} DeliveryRequest
+ * @typedef {{expectedRevision:number,window?:DeliveryWindow,salesOrderRefs?:unknown[],message?:unknown,expiryTime?:unknown}} DeliveryTransitionInput
  * @typedef {{now?:string|Date,settings?:DeliverySettings}} DeliveryTransitionOptions
  * @typedef {{now:string,settings?:DeliverySettings}} ResolvedTransitionOptions
  */
@@ -390,18 +391,20 @@ function clearApproval(row) {
   return { ...row, approvalExpiresAt: null, reminderAt: null, reminderSentAt: null, confirmedWindow: null,
     proposedWindow: null, securedAt: null, salesOrderRefs: [] };
 }
-/** @param {DeliveryRequest} row @param {DeliverySettings} settings @param {string} now @returns {DeliveryRequest} */
-function startApproval(row, settings, now) {
+/** @param {DeliveryRequest} row @param {DeliverySettings} settings @param {string} now @param {unknown} [expiryTime] @returns {DeliveryRequest} */
+function startApproval(row, settings, now, expiryTime) {
   const config = normalizeDeliverySettings(settings);
-  const deadline = new Date(now).getTime() + config.approvalHours * 3600000;
+  const override=expiryTime===undefined || expiryTime===''?null:deliveryExpiryDeadline(expiryTime,now);
+  if(expiryTime!==undefined && expiryTime!=='' && !override) {invalid('Enter a valid expiry time, such as until 05:30 pm. The time must exist in Toronto.');}
+  const instant=new Date(now).getTime(),deadline=override?new Date(override).getTime():instant+config.approvalHours*3600000;
   return { ...row, approvalSettings: config, approvalExpiresAt: new Date(deadline).toISOString(),
-    reminderAt: new Date(deadline - config.reminderHours * 3600000).toISOString(), reminderSentAt: null };
+    reminderAt: new Date(Math.max(instant,deadline - config.reminderHours * 3600000)).toISOString(), reminderSentAt: null };
 }
 /** @param {DeliveryRequest} row @param {DeliveryTransitionInput} input
  * @param {ResolvedTransitionOptions} options @param {string} action @returns {DeliveryRequest} */
 function dispatchApproval(row,input,options,action) {
   if(!['submitted','proposed','preapproved'].includes(row.status)) {conflict('Dispatch cannot approve this request in its current state.');}
-  const next=startApproval(clearApproval(row),options.settings || DELIVERY_DEFAULT_SETTINGS,options.now);
+  const next=startApproval(clearApproval(row),options.settings || DELIVERY_DEFAULT_SETTINGS,options.now,input.expiryTime);
   next.status=action==='confirm'?'preapproved':'proposed';
   if(action==='confirm') {next.confirmedWindow=normalizeDeliveryWindow(row.requestedWindow);}
   else {next.proposedWindow=normalizeDeliveryWindow(input.window);}
@@ -438,6 +441,15 @@ const transitions={
   reply(row,input) {normalizeDeliveryReply(input.message);return row;},
   confirm:(row,input,options)=>dispatchApproval(row,input,options,'confirm'),
   propose:(row,input,options)=>dispatchApproval(row,input,options,'propose'),
+  'set-expiry'(row,input,options) {
+    if(!['proposed','preapproved'].includes(row.status)) {conflict('Only an active approval can change its expiry.');}
+    if(typeof input.expiryTime!=='string' || !input.expiryTime.trim()) {invalid('Enter an expiry time before saving.');}
+    return startApproval(row,row.approvalSettings || options.settings || DELIVERY_DEFAULT_SETTINGS,options.now,input.expiryTime);
+  },
+  expire(row) {
+    if(!['submitted','proposed','preapproved'].includes(row.status)) {conflict('Only an unsecured delivery request can be expired.');}
+    return {...row,status:'expired',approvalExpiresAt:null,reminderAt:null,reminderSentAt:null};
+  },
   accept(row) {
     if(row.status!=='proposed') {conflict('There is no proposed time to accept.');}
     return {...row,status:'preapproved',confirmedWindow:normalizeDeliveryWindow(row.proposedWindow)};
@@ -500,7 +512,7 @@ export function transitionDeliveryRequest(row, action, input, actor, audience, o
   assertDeliveryYard(actor, row.requestingYardLocationId, audience);
   if (input.expectedRevision !== row.revision) {throw new DeliveryRequestError('DELIVERY_STALE_REVISION', 'This request changed. Refresh before replying.', 409);}
   const salesActions = ['edit', 'accept', 'counter', 'secure', 'relink', 'reraise', 'request-time-change', 'withdraw-time-change','accept-counter-time-change'];
-  const dispatchActions = ['confirm', 'propose', 'accept-time-change', 'decline-time-change','counter-time-change','withdraw-counter-time-change'];
+  const dispatchActions = ['confirm', 'propose', 'accept-time-change', 'decline-time-change','counter-time-change','withdraw-counter-time-change','set-expiry','expire'];
   if ((salesActions.includes(action) && audience !== 'sales') || (dispatchActions.includes(action) && audience !== 'dispatch')) {
     throw new DeliveryRequestError('DELIVERY_ACCESS_DENIED', 'This action belongs to the other team.', 403);
   }

@@ -12,16 +12,21 @@ export async function getMbtBinPlanning(input, boundary) {
   const limit = Math.min(100, Math.max(1, Number.parseInt(input.limit, 10) || 40));
   const search = String(input.search || "").trim().slice(0, 200);
   const params = [search];
-  const predicate = `v.bin_type_id IS NOT NULL AND v.dispatch_plan_id IS NULL AND v.status IN ('ready','in_progress','evidence_pending')
+  const predicate = `v.bin_type_id IS NOT NULL AND v.dispatch_plan_id IS NULL
+    AND v.status IN ('tentative','ready','in_progress','evidence_pending')
+    AND (part.visit_id IS NOT NULL OR (bin_order.order_id IS NOT NULL AND bin_order.configuration IS NULL)
+      OR (bin_order.order_id IS NULL AND v.status<>'tentative'
     AND (v.predecessor_visit_id IS NULL OR predecessor.status IN ('completed','cancelled'))
     AND NOT EXISTS (SELECT 1 FROM mbt_service_visits earlier WHERE earlier.contract_id=v.contract_id
       AND earlier.service_line_id IS NOT DISTINCT FROM v.service_line_id
-      AND earlier.visit_number<v.visit_number AND earlier.status NOT IN ('completed','cancelled'))
-    AND ($1='' OR concat_ws(' ',v.visit_reference,v.service_action,c.contract_number,v.customer_snapshot::text,
+      AND earlier.visit_number<v.visit_number AND earlier.status NOT IN ('completed','cancelled'))))
+    AND ($1='' OR concat_ws(' ',v.visit_reference,part.display_reference,bin_order.display_reference,v.service_action,c.contract_number,v.customer_snapshot::text,
       v.site_snapshot::text,(SELECT string_agg(a.asset_code,' ') FROM mbt_bin_assets a
         WHERE a.asset_id IN (v.expected_asset_id,v.outgoing_asset_id,v.incoming_asset_id))) ILIKE '%' || $1 || '%')`;
   const from = `FROM mbt_service_visits v JOIN mbt_contracts c ON c.contract_id=v.contract_id
-    LEFT JOIN mbt_service_visits predecessor ON predecessor.service_visit_id=v.predecessor_visit_id`;
+    LEFT JOIN mbt_service_visits predecessor ON predecessor.service_visit_id=v.predecessor_visit_id
+    LEFT JOIN mbt_bin_order_parts part ON part.visit_id=v.service_visit_id
+    LEFT JOIN mbt_bin_orders bin_order ON bin_order.order_id=v.service_visit_id`;
   const candidates = await query(`SELECT v.*,c.contract_number ${from} WHERE ${predicate}
     ORDER BY v.scheduled_start_at NULLS LAST,v.service_visit_id LIMIT $2 OFFSET $3`, [...params, limit, offset]);
   const count = await query(`SELECT count(*)::int AS total ${from} WHERE ${predicate}`, params);
@@ -59,6 +64,8 @@ export async function getMbtBinPlanningVisit(input, boundary) {
   const assignments = await query("SELECT generation,plan_date,load_id,driver_id,truck_id,created_at,released_at,withdrawn_at,withdrawal_reason FROM mbt_bin_planning_assignments WHERE service_visit_id=$1 ORDER BY generation DESC", [input.visitId]);
   const events = await query("SELECT action,actor_id,details,created_at FROM mbt_bin_planning_events WHERE service_visit_id=$1 ORDER BY created_at DESC", [input.visitId]);
   const evidence = await query("SELECT evidence_id,evidence_type,captured_at,recorded_at FROM mbt_evidence WHERE service_visit_id=$1 ORDER BY captured_at", [input.visitId]);
+  const workflowEvents=await query(`SELECT action,details,created_at FROM mbt_bin_workflow_events
+    WHERE visit_id=$1 OR order_id=$1 ORDER BY created_at DESC LIMIT 100`,[input.visitId]);
   return { visit: await projectMbtBinPlanningCard(rows[0]), steps: steps.rows, history: history.rows,
-    assignments: assignments.rows, events: events.rows, evidence: evidence.rows };
+    assignments: assignments.rows, events: [...events.rows,...workflowEvents.rows], evidence: evidence.rows };
 }

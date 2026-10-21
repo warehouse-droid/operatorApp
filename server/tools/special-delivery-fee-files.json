@@ -1,0 +1,18 @@
+[
+  "src/special-stock-request-domain.js",
+  "src/special-stock-request-repository.js",
+  "src/special-stock-documents.js",
+  "src/special-stock-netsuite-adapter.js",
+  "public/sales-special-stock-requests.js",
+  "public/scm-special-stock-requests.js",
+  "public/special-stock-pallet-display.js",
+  "public/special-stock-request-actions.js",
+  "public/sales-stock-requests.html",
+  "public/scm-stock-requests.html",
+  "public/special-stock-delivery-fee.js",
+  "migrations/251_special_delivery_fee.sql",
+  "src/special-stock-sales-reps.js",
+  "src/server.js",
+  "migrations/252_special_sales_rep_cache.sql",
+  "migrations/253_special_custom_po_linkage.sql"
+]

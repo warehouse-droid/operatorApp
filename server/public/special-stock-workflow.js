@@ -3,6 +3,7 @@ export const SPECIAL_STAGES = Object.freeze({
   pending_update: 'Pending Update',
   await_customer_confirmation: 'Await Customer Confirmation',
   confirmed: 'Confirmed',
+  waiting_vendor_confirmation: 'Waiting Vendor Confirmation',
   dispatch_arrangement: 'Dispatch Arrangement',
   wait_for_production: 'Wait for production / Transfer',
   closed: 'Closed',
@@ -35,22 +36,23 @@ export function specialPurchaseOrderDispatchReady(evidence = {}) {
       .includes(String(evidence.purchaseOrderDispatchStatus || '').trim().toLowerCase());
 }
 
-/** @param {{closed?:boolean,cancelled?:boolean,operationallyComplete?:boolean,pendingUpdate?:boolean,waitingForProduction?:boolean,purchaseOrderId?:number|null,purchaseOrderApproved?:boolean,purchaseOrderReference?:unknown,purchaseOrderDispatchStatus?:unknown,salesOrderId?:number|null,salesOrderSkipped?:boolean,purchaseOrderSkipped?:boolean,fulfillmentMethod?:string,hasPendingSalesDecision?:boolean,linesResolved?:boolean,hasAcceptedLines?:boolean}} evidence */
+/** @param {{closed?:boolean,cancelled?:boolean,operationallyComplete?:boolean,pendingUpdate?:boolean,waitingForProduction?:boolean,purchaseOrderId?:number|null,purchaseOrderApproved?:boolean,purchaseOrderSentToVendorAt?:unknown,purchaseOrderReference?:unknown,purchaseOrderDispatchStatus?:unknown,salesOrderId?:number|null,salesOrderSkipped?:boolean,purchaseOrderSkipped?:boolean,fulfillmentMethod?:string,hasPendingSalesDecision?:boolean,linesResolved?:boolean,hasAcceptedLines?:boolean}} evidence */
 export function specialStage(evidence = {}) {
   if (evidence.closed || evidence.cancelled) return 'closed';
   if (evidence.operationallyComplete) return 'completed';
   if (evidence.pendingUpdate) return 'pending_update';
+  if (!evidence.salesOrderId && !evidence.salesOrderSkipped) {
+    return evidence.purchaseOrderId || evidence.purchaseOrderSkipped || evidence.waitingForProduction
+      || evidence.hasPendingSalesDecision || evidence.linesResolved ? 'await_customer_confirmation' : 'new_enquiry';
+  }
   if (evidence.purchaseOrderId) {
     if (evidence.purchaseOrderApproved !== false && specialPurchaseOrderDispatchReady(evidence)
         && evidence.fulfillmentMethod !== 'vendor_pickup') return 'dispatch_arrangement';
-    return 'confirmed';
+    return evidence.purchaseOrderSentToVendorAt ? 'waiting_vendor_confirmation' : 'confirmed';
   }
-  // This flag represents resolved customer decisions with an accepted stock ETA.
   if (evidence.waitingForProduction) return 'confirmed';
   if (evidence.purchaseOrderSkipped && evidence.fulfillmentMethod !== 'vendor_pickup') return 'dispatch_arrangement';
-  if (evidence.salesOrderId || evidence.salesOrderSkipped || (evidence.linesResolved && evidence.hasAcceptedLines)) return 'confirmed';
-  if (evidence.hasPendingSalesDecision || evidence.linesResolved) return 'await_customer_confirmation';
-  return 'new_enquiry';
+  return 'confirmed';
 }
 
 export function torontoDate(now = new Date()) {

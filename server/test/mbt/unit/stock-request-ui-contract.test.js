@@ -2,11 +2,12 @@ import assert from "node:assert/strict";
 import fs from "node:fs";
 import test from "node:test";
 import vm from "node:vm";
+import {salesStockListFiltersHtml} from '../../../public/sales-stock-list-filters.js';
 
 const publicUrl = new URL("../../../public/", import.meta.url);
 const readPublic = (name) => fs.readFileSync(new URL(name, publicUrl), "utf8");
 
-test("Sales Request Stock page is private, yard-aware, multi-line, and exposes the approved status tabs", () => {
+test("Sales Request Stock page is private, yard-aware, multi-line, and exposes the approved statuses", () => {
   const html = readPublic("sales-stock-requests.html");
   const source = readPublic("sales-stock-requests.js");
   assert.match(html, /salesStockRequestApp/);
@@ -38,10 +39,12 @@ test("Sales regular stock request cannot retain an empty destination while an au
     },
     addEventListener() {},
     contains() { return false; },
+    querySelectorAll() { return []; },
     querySelector() { return null; }
   };
   const context = vm.createContext({
     console,
+    testSalesFilters: salesStockListFiltersHtml,
     crypto: { randomUUID: () => "race-line" },
     CSS: { escape: (value) => String(value) },
     document: {
@@ -55,15 +58,21 @@ test("Sales regular stock request cannot retain an empty destination while an au
       return responsePromise;
     },
     localStorage: { getItem: () => null, setItem() {} },
+    location: {search: '?tab=regular'},
     requireDispatchLogin() {},
     URLSearchParams,
     window: {
       addEventListener() {},
+      setInterval() {},
+      RegularStockUI: {t: english=>english},
+      RegularStockDialog: {isBusy:()=>false,begin:()=>({close(){}})},
       clearTimeout,
       setTimeout
     }
   });
-  vm.runInContext(source, context, { filename: "sales-stock-requests.js" });
+  // This test isolates composer state. The shared yard menu is exercised in the browser.
+  vm.runInContext(source.replace(/import\('\/(?:stock-request-yard-filter|sales-stock-status-filter|sales-stock-list-filters)\.js\?v=[^']+'\)/g, 'Promise.resolve({})'), context, { filename: "sales-stock-requests.js" });
+  vm.runInContext('salesStockListFiltersHtml = testSalesFilters', context);
 
   const loading = vm.runInContext("salesStockLoad()", context);
   assert.match(app.innerHTML, /data-sales-stock-action="new"[^>]*disabled/);
@@ -92,7 +101,7 @@ test("Sales regular stock request cannot retain an empty destination while an au
 
   assert.equal(vm.runInContext("salesStockState.composer.destinationLocationId", context), "28");
   assert.match(app.innerHTML, /value="28" selected>2967/);
-  assert.match(app.innerHTML, /data-sales-stock-action="bucket"[^>]*disabled/);
+  assert.match(app.innerHTML, /data-sales-stock-filter="backorderStageFilter"[^>]*disabled/);
 
   const composingRenderCount = renderCount;
   assert.equal(await vm.runInContext("salesStockLoad({ background: true })", context), false);
@@ -248,25 +257,31 @@ test("Sales highlights returned requests and all Sales buckets expose persistent
   assert.match(source, /vendorFilter/);
   assert.match(source, /requestDateFilter/);
   assert.match(source, /sourceLocationFilter/);
-  assert.match(source, /name="vendor"/);
+  assert.match(salesStockListFiltersHtml({requestTypeFilter:[],backorderStageFilter:[],vendorFilter:[],availableVendors:['TEST Vendor']}), /data-sales-stock-filter="vendorFilter"/);
   assert.match(source, /name="requestDate"/);
-  assert.match(source, /name="sourceLocationId"/);
+  assert.match(source, /salesStockYardFilterHtml\([^\n]+name: "sourceLocationId"/);
+  assert.match(source, /params\.set\("sourceLocationIds", salesStockState\.sourceLocationFilter\)/);
 });
 
 test("SCM exposes Request, Pending TO, Rejected, and Closed queues with the required filters", () => {
   const source = readPublic("scm-stock-requests.js");
 
+  const queueFilter = readPublic("stock-request-queue-filter.js");
   for (const label of ["Request", "Pending TO", "Rejected", "Closed"]) {
-    assert.match(source, new RegExp(`>${label}<`));
+    assert.ok(queueFilter.includes(label));
   }
+  assert.match(source, /scmStockQueueFilterHtml\(scmStockState.queue\)/);
+  assert.match(queueFilter, /type="checkbox"/);
   assert.match(source, /vendorFilter/);
   assert.match(source, /requestDateFilter/);
   assert.match(source, /sourceLocationFilter/);
   assert.match(source, /destinationLocationFilter/);
   assert.match(source, /name="vendor"/);
   assert.match(source, /name="requestDate"/);
-  assert.match(source, /name="sourceLocationId"/);
-  assert.match(source, /name="destinationLocationId"/);
+  assert.match(source, /scmStockYardFilterHtml\([^\n]+name: "sourceLocationId"/);
+  assert.match(source, /scmStockYardFilterHtml\([^\n]+name: "destinationLocationId"/);
+  assert.match(source, /params\.set\("sourceLocationIds", scmStockState\.sourceLocationFilter\)/);
+  assert.match(source, /params\.set\("destinationLocationIds", scmStockState\.destinationLocationFilter\)/);
 });
 
 test("SCM can reverse a returned decision and reject only an unconfirmed local pending TO", () => {
@@ -390,5 +405,5 @@ test("Sales Request Stock has complete Simplified Chinese UI and validation cove
   assert.equal(i18n.message("Select a source yard for ABC."), "请为 ABC 选择来源堆场。");
   assert.equal(i18n.message("Requested quantity 20 exceeds requestable availability 10."), "申请数量 20 超过可申请库存 10。");
   assert.match(html, /i18n\.js\?v=20260815-customer-pickup-photo-gate-v1/);
-  assert.match(html, /sales-stock-requests\.js\?v=20260821-stock-composer-stability-v1/);
+  assert.match(html, /sales-stock-requests\.js\?v=20260927-yard-layout-v1/);
 });

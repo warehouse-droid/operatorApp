@@ -1,0 +1,17 @@
+{
+  "finalFailures": [
+    "PO preparation stores one reviewed PALLET, replaces it on retry and removes it at zero",
+    "missing PALLET review with SO pallets fails, and invalid review rolls back all PO edits",
+    "PALLET review uses the same stale case revision and post-submission protections",
+    "migration preserves material rules, rejects other PO ancillary items and duplicate PALLET rows",
+    "enquiry retains initial fulfillment and SCM reply moves to customer confirmation",
+    "accepted ETA needs no mapping and survives a revised SCM ETA",
+    "SO draft resolves fixed product once and retains one pallet line across saves",
+    "SCM can close a no-stock no-ETA request with a reason",
+    "due reminder persists on postponement and clears only on explicit readiness",
+    "stage OR filter is applied before the requested page limit",
+    "yard completion requires final customer collection evidence, independent of NetSuite fulfillment",
+    "real order service persists submission and recovers after SO patch success before PO creation",
+    "SCM vendor discount confirmation persists gross and net costs privately and leaves the Sales discount intact"
+  ]
+}

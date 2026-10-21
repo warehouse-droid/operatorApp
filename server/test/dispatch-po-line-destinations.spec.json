@@ -1,0 +1,28 @@
+{
+  "tier": 3,
+  "specApproval": "not obtained (autonomous run)",
+  "problem": "SN1401728 loses 3445 when the compact response omits full PO dropoffs and direct-pickup residuals are rebuilt from the header-only fallback.",
+  "scenarios": [
+    "PDD-1 compact assigned snapshots retain full dropoffs and delivery address metadata",
+    "PDD-2 compact response, browser normalization, and direct-pickup recalculation retain 2967 and 3445",
+    "PDD-3 a stale header-only drop list is rebuilt from each PO line's destination",
+    "PDD-4 header delivery overrides apply only to their own yard",
+    "PDD-5 direct-pickup quantities and source lines remain unchanged",
+    "PDD-6 randomized destination and allocation quantities conserve cargo through repeated reloads"
+  ],
+  "failureModel": {
+    "lostDestination": "compact response and save/reload round-trip regressions",
+    "misdirectedAddress": "header override and different-yard address assertions",
+    "doubleCountedCargo": "exact SN1401728 quantities and property-based conservation checks",
+    "executedRouteChanged": "existing executed-prefix and recorded-projection suites plus live unstarted-load check",
+    "concurrentEditOverwritten": "live repair locks and revision precondition; use existing save guards",
+    "unrelatedReleaseOverwritten": "baseline hashes, additive image overlay, and preserved container configuration"
+  },
+  "setup": {
+    "dependencies": [],
+    "git": "preserve existing uncommitted work; no commits",
+    "tooling": "existing isolated Docker runner, node:test, fast-check, c8, eslint, and TypeScript",
+    "artifacts": "regression test, reproducible verification tool, source hashes, deployment and repair backups"
+  },
+  "clarifications": ["PDD-6 begins with a stale header-only drop list and verifies its correction over three reloads.", "Coverage is enforced on every changed line; a global branch threshold for the entire existing repository is outside this fix's scope."]
+}

@@ -35,10 +35,10 @@ async function draft({ fulfillmentMethod = 'yard_pickup', production = false } =
     materialLines: [{ caseLineId: detail.lines[0].id, itemId: 2055, quantity: 24, packageQuantity: 2, conversionToPc: 12, uom: 'PC', rate: 144, description: 'TEST product in pieces' }] }, context);
 }
 async function skip(detail, orderKind = 'sales_order', extra = {}, caller = context) {
-  return repository.skipSpecialOrderCreation(detail.id, { expectedRevision: detail.revision, orderKind, ...extra }, caller);
+  return repository.skipSpecialOrderCreation(detail.id, { expectedRevision: detail.revision, orderKind, vendorDiscountAmount: 0, ...extra }, caller);
 }
 function purchaseLines(detail) {
-  return detail.purchaseOrderLines.map(line => ({ caseLineId: line.caseLineId, description: 'TEST revised purchase description', quantity: 2, uom: 'PC', unitPurchaseCost: 4 }));
+  return detail.purchaseOrderLines.map(line => ({ caseLineId: line.caseLineId, description: 'TEST revised purchase description', quantity: 2, uom: 'PC', vendorDiscountPercent:0,unitPurchaseCost: 4 }));
 }
 
 test('skip requires the gate, yard access and a saved SO draft', () => fixture(async () => {
@@ -98,22 +98,22 @@ test('PO test skip is atomic on invalid review and blocked for real or uncertain
   await assert.rejects(() => skip(detail), { code: 'SPECIAL_SO_ALREADY_LINKED' });
   await query('UPDATE sales_special_stock_cases SET sales_order_netsuite_id=null,sales_order_ref=null WHERE request_id=$1', [detail.id]);
   detail = await skip(detail);
-  await assert.rejects(() => skip(detail, 'purchase_order', { lines: [{ ...purchaseLines(detail)[0], unitPurchaseCost: '' }] }), { code: 'SPECIAL_PO_LINES_INVALID' });
+  await assert.rejects(() => skip(detail, 'purchase_order', { lines: [{ ...purchaseLines(detail)[0], vendorDiscountPercent:0,unitPurchaseCost: '' }] }), { code: 'SPECIAL_PO_LINES_INVALID' });
   const current = await repository.getSpecialStockCase(detail.id);
   assert.equal(current.revision, detail.revision);
   assert.equal(current.purchaseOrderSkipped, false);
   assert.equal(current.purchaseOrderLines[0].description, detail.purchaseOrderLines[0].description);
 }));
 
-test('test skips preserve production waiting and allow evidence-backed vendor collection', () => fixture(async () => {
+test('test skips keep accepted production ETAs Confirmed and vendor collection waits for native order completion', () => fixture(async () => {
   let detail = await draft({ fulfillmentMethod: 'vendor_pickup', production: true });
   await query('UPDATE mbt_feature_flags SET enabled=true WHERE flag_key=$1', [gate]);
   detail = await skip(detail);
   detail = await skip(detail, 'purchase_order', { lines: purchaseLines(detail) });
-  assert.equal(detail.stage, 'wait_for_production');
+  assert.equal(detail.stage, 'confirmed');
   detail = await repository.checkSpecialStockReadiness(detail.id, detail.lines[0].id, { expectedRevision: detail.revision, ready: true }, context);
   assert.equal(detail.stage, 'confirmed');
   detail = await repository.completeSpecialVendorPickup(detail.id, { expectedRevision: detail.revision, pickupDate: '2099-01-21', pickupReference: 'TEST collection only' }, context);
-  assert.equal(detail.stage, 'completed');
-  assert.equal((await repository.listSpecialStockCases({ stages: ['completed'], limit: 150 })).some(row => row.id === detail.id), true);
+  assert.equal(detail.stage, 'confirmed');
+  assert.equal((await repository.listSpecialStockCases({ stages: ['confirmed'], limit: 150 })).some(row => row.id === detail.id), true);
 }));

@@ -121,8 +121,8 @@ test("split PO details do not render an Update action", () => {
 });
 
 test("the PO-split page requests the fixed client with a new cache key", () => {
-  assert.match(page, /dispatch-scm\.js\?v=20260903-po-line-sequence-v1/);
-  assert.match(page, /dispatch\.css\?v=20260903-po-line-sequence-v1/);
+  assert.match(page, /dispatch-scm\.js\?v=20261015-retain-netsuite-destination-v1/);
+  assert.match(page, /dispatch\.css\?v=\d{8}-[^"\s]+/);
 });
 
 test("the PO Split schedule panel uses a responsive two-row layout", () => {
@@ -154,6 +154,31 @@ test("PO Split renders canonical completion instead of retaining a Planned badge
 
   assert.match(html, /scm-completed-badge[^>]*>Completed</);
   assert.doesNotMatch(html, /scm-planned-badge[^>]*>Planned</);
+});
+
+test("PO Split card badges use the current status even when notes and an ETA exist", () => {
+  const context = clientContext();
+  for (const status of ["Queued", "Hold", "Planned", "Partially Done", "Cancelled", "Reconcile Review"]) {
+    context.__status = status;
+    const html = vm.runInContext(`
+      scmLoading = false;
+      scmOrders = [{id: "SN1401822", type: "PO", dispatchPlanned: false,
+        scm: {status: __status, etaDate: "2026-10-01", notes: "Existing supplier note"}}];
+      renderOrderList();
+    `, context);
+    assert.match(html, new RegExp(`scm-planned-badge[^>]*>${status}<`));
+    if (status !== "Planned") assert.doesNotMatch(html, /scm-planned-badge[^>]*>Planned</);
+  }
+});
+
+test("PO Split shows its current status when planning details are empty", () => {
+  const context = clientContext();
+  const html = vm.runInContext(`
+    scmLoading = false;
+    scmOrders = [{id: "SN1401822", type: "PO", dispatchPlanned: false, scm: {status: "Queued"}}];
+    renderOrderList();
+  `, context);
+  assert.match(html, /scm-planned-badge[^>]*>Queued</);
 });
 
 test("split quantity editor submits complete desired state with its optimistic revision", async () => {
@@ -379,6 +404,39 @@ async function captureCreatePayload({
   return JSON.parse(context.__capturedRequest.options.body);
 }
 
+test("retaining NetSuite destinations submits an explicit choice without a yard override", async () => {
+  const payload = await captureCreatePayload({ liveDestination: "netsuite", stateDestination: "1" });
+  assert.equal(payload.retainNetSuiteDestination, true);
+  assert.equal(payload.destinationLocationId, null);
+  assert.deepEqual(payload.lines.map((line) => line.lineRowId), [91]);
+  const defaultPayload = await captureCreatePayload({ stateDestination: "" });
+  assert.equal(defaultPayload.retainNetSuiteDestination, true);
+  assert.equal(defaultPayload.destinationLocationId, null);
+});
+
+test("the split summary defaults to retained line destinations and previews a yard override", () => {
+  const context = clientContext();
+  const html = vm.runInContext(`
+    scmSummaryOpen = true;
+    selectedScmOrderId = "POB04006";
+    scmOrders = [{id: "POB04006", destinationLocationId: 1, destinationYard: "3445",
+      items: [
+        {lineRowId: 1, sku: "STORM", quantity: 10, pallets: 1, toPlt: 10,
+         destinationYard: "3445", netsuiteDestinationYard: "2967"},
+        {lineRowId: 2, sku: "DUNE", quantity: 10, pallets: 1, toPlt: 10,
+         destinationYard: "3445", netsuiteDestinationYard: "3445"}
+      ]}];
+    scmLineInputs = {"1": {pallets: 1}, "2": {pallets: 1}};
+    renderScmSplitModal();
+  `, context);
+  assert.match(html, /<option value="netsuite" selected>Retain NetSuite destination<\/option>/);
+  assert.match(html, /Destination Yard: 2967<\/small>/);
+  assert.match(html, /Destination Yard: 3445<\/small>/);
+  const overridden = vm.runInContext('scmDestinationLocationId = "15"; renderScmSplitModal()', context);
+  assert.equal((overridden.match(/Destination Yard: 12441<\/small>/g) || []).length, 2);
+  assert.doesNotMatch(overridden, /Destination Yard: (2967|3445)<\/small>/);
+});
+
 test("all supported create-yard combinations round-trip from the live modal", async () => {
   const destinations = ["1", "15", "28", "26"];
   const pickups = ["PERMACON Bolton", "PERMACON Milton"];
@@ -391,6 +449,7 @@ test("all supported create-yard combinations round-trip from the live modal", as
         statePickup: pickupPoint === "PERMACON Bolton" ? "PERMACON Milton" : "PERMACON Bolton"
       });
       assert.equal(payload.destinationLocationId, destinationLocationId);
+      assert.equal(payload.retainNetSuiteDestination, false);
       assert.equal(payload.pickupPoint, pickupPoint);
     }
   }
@@ -860,7 +919,7 @@ test("successful Schedule Save applies its authoritative row without a stale cat
 });
 
 test("locked split remark save keeps the authoritative remark visible", async () => {
-  const remark = { value: "Driver confirmed revised dock" };
+  const remark = { value: "Driver confirmed revised dock", dataset: {scmField: "remarkOverride"} };
   const controls = new Map([['[data-scm-field="remarkOverride"]', remark]]);
   const context = clientContext(controls);
   vm.runInContext(`

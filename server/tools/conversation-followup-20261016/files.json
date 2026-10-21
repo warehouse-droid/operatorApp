@@ -1,0 +1,15 @@
+[
+  "src/stock-request-conversation.js",
+  "src/stock-request-conversation-router.js",
+  "src/stock-request-repository.js",
+  "src/special-stock-request-repository.js",
+  "src/sales-stock-status-query.js",
+  "src/stock-request-conversation-queue.js",
+  "public/stock-request-conversation.js",
+  "public/sales-stock-requests.js",
+  "public/scm-stock-requests.js",
+  "public/sales-special-stock-requests.js",
+  "public/scm-special-stock-requests.js",
+  "public/sales-stock-requests.html",
+  "public/scm-stock-requests.html"
+]

@@ -55,11 +55,12 @@ test("stock-request list APIs forward every supported server-side filter", () =>
   const salesRoute = serverSource.match(/app\.get\("\/api\/sales\/stock-requests"[\s\S]*?\n}\);/)?.[0] || "";
   const scmRoute = serverSource.match(/app\.get\("\/api\/scm\/stock-requests"[\s\S]*?\n}\);/)?.[0] || "";
 
-  for (const field of ["vendor", "requestDate", "sourceLocationId"]) {
+  for (const field of ["vendor", "requestDate", "sourceLocationId", "sourceLocationIds"]) {
     assert.match(salesRoute, new RegExp(`${field}: req\\.query\\.${field}`));
     assert.match(scmRoute, new RegExp(`${field}: req\\.query\\.${field}`));
   }
   assert.match(scmRoute, /destinationLocationId: req\.query\.destinationLocationId/);
+  assert.match(scmRoute, /destinationLocationIds: req\.query\.destinationLocationIds/);
   assert.match(salesRoute, /filterOptions/);
   assert.match(scmRoute, /filterOptions/);
 });

@@ -1,0 +1,27 @@
+{
+  "tier": 3,
+  "authorization": "User explicitly approved local reconciliation and requested that extra NetSuite lines not block the IR number, including partial receiving.",
+  "specApproval": "Detailed executable spec not separately approved (autonomous run).",
+  "scopeAddition": "The completed POB04042 incident recovery is extended with a deployed application fix for source-verified additional purchase charge lines.",
+  "setup": "Use existing Node, TypeScript, ESLint, fast-check and c8 dependencies. Capture the live application image, add a scoped overlay, validate in the standard bounded isolated Compose stack, deploy the application only with rollback available. No NetSuite writes, database migrations, dependency changes or git commits.",
+  "acceptance": [
+    "Actual IR15183 verifies against its original five-line request when the additional freight line is verified against its source PO.",
+    "Only PO item receipts can accept additional Other Charge purchase lines; require source line, item, quantity bounds, units, location, rate and amount agreement.",
+    "The original immutable request and inventory quantities remain unchanged; store accepted extra charge evidence on the posting step.",
+    "The source PO is read only for additional purchase charge lines; ordinary IF, TO IR and PO IR paths retain their request counts and strict matching.",
+    "A partial inventory receipt plus freight completes the posting job and returns its IR number, leaves the order partially received, and preserves the unreceived balance.",
+    "A later receipt consumes only the remaining quantity and preserves the first receipt and its IR number.",
+    "Lost-response recovery verifies the same existing IR with no second transform; repeated and concurrent processing cannot create duplicate local receipts.",
+    "Unverified extra inventory, wrong source or external identity, wrong quantity, invalid charges, duplicate line identities and unreadable source evidence fail closed.",
+    "The deployed application returns IR15183 in the completed POB04042 job and receipt history; production health passes and every task-created test resource is removed."
+  ],
+  "failureModel": {
+    "inventoryOverreceipt": "Strict existing inventory checks retained; unit attacks and partial/follow-up integration tests.",
+    "unverifiedFinancialLine": "Source-backed charge proof, amount/rate tests, property tests and manual mutations.",
+    "wrongRecord": "Existing external ID, source PO and transaction type validation retained and exercised.",
+    "partialMarkedComplete": "Real repository/finalizer tests with nonzero balances and a later receipt.",
+    "duplicateAfterRecovery": "Original posting state machine and lease retained; recovery and concurrency regression tests.",
+    "performanceRegression": "No additional source read without candidate charge lines; request-count assertions.",
+    "deploymentRegression": "Capture current image; compare affected files, scoped overlay, full selected posting/receiving suite, image hash verification, healthy app-only cutover and rollback."
+  }
+}

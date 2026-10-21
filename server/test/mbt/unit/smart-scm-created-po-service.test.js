@@ -10,6 +10,7 @@ import { isOperatorNetSuiteRequest } from "../../../src/operator-netsuite-reques
 const original = { id:991607,tranid:'POB03875',lastModifiedAt:'2026-09-15',status:'B',statusText:'Pending Receipt',memo:'old',lines:[] };
 function service({ remote=original, failLines=false }={}) {
   const writes=[];
+  const canonicalHeaders=[];
   let transactions=0;
   let saved=false;
   const history={id:55,purchaseOrderId:991607,current:{active:true},remoteLastModifiedAt:original.lastModifiedAt};
@@ -23,7 +24,7 @@ function service({ remote=original, failLines=false }={}) {
     fetchPurchaseOrderHistorySnapshotsFromNetSuite:async () => [remote],
     listScmNetSuitePoHistoryReconciliationCandidates:async () => [{historyId:55,purchaseOrderId:991607}],
     updatePurchaseOrderHistoryInNetSuite:async (id,changes) => {writes.push({id,changes});saved=true;},
-    upsertPurchaseOrders:async () => {},
+    upsertPurchaseOrders:async rows => {canonicalHeaders.push(...rows);},
     upsertPurchaseOrderLines:async () => {if(failLines) {throw new Error('line persistence failure');}},
     markMissingInboundOrderLines:async () => {},
     persistScmNetSuitePoSnapshot:async () => history,
@@ -35,8 +36,16 @@ function service({ remote=original, failLines=false }={}) {
   const source=fs.readFileSync(serviceUrl,'utf8')
     .replace(/^import[\s\S]*?from "[^"]+";\n/gm,(part)=>part.replace(/[^\r\n]/g," ")).replace(/^export /gm,'       ');
   const api=vm.runInNewContext(`${source}\n({updateScmNetSuitePoHistory,refreshScmNetSuitePoHistory})`,context,{filename:serviceUrl.pathname});
-  return {api,writes,transactions:()=>transactions};
+  return {api,writes,canonicalHeaders,transactions:()=>transactions};
 }
+
+test('history refresh carries the actual PO Note into canonical sync separately from memo',async()=>{
+  const {api,canonicalHeaders}=service({remote:{...original,note:'for SOB121819',lastModifiedAt:null}});
+  await api.refreshScmNetSuitePoHistory(55);
+  assert.equal(canonicalHeaders.length,1);
+  assert.equal(canonicalHeaders[0].netsuite_note,'for SOB121819');
+  assert.equal(canonicalHeaders[0].memo,'old');
+});
 
 test('the existing editor can update an unarchived created PO and reads back the same PO',async () => {
   const {api,writes}=service();

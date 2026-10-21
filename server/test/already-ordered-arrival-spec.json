@@ -1,0 +1,36 @@
+{
+  "spec approval": "not obtained (autonomous run)",
+  "tier": 3,
+  "scope": "Already Ordered Sales Order reference, independent supply arrival status, and Sales receipt alerts",
+  "acceptance": [
+    "Sales can save a trimmed SO number instead of the quotation field on a Backorder containing Already Ordered materials, including a Completed request. Saving is local, scoped, audited and revision checked; it does not reopen completed work or complete other pending materials.",
+    "The original quotation remains in history/storage. A conflicting canonical SO cannot be overwritten. Non-Already-Ordered and closed requests do not gain the action.",
+    "After an SO is attached, Completed remains the main status. Supply waiting is Waiting for arrival until all attached Already Ordered POs are fully received, then Arrived. The same badges and supply filters work in Sales and SCM.",
+    "Use a unique exact PO-number match in the existing NetSuite mirror. Unknown/ambiguous/inactive POs and partial receipts stay waiting. Confirmed receipt drafts and closure alone are not proof of arrival.",
+    "Alert the requesting Sales user within their yard scope when a tracked PO becomes fully received. Multiple POs can arrive independently. Alerts deduplicate across polling and acknowledgement; a later PO arrival alerts again. Ordinary SO/PO workflows and input alerts remain available.",
+    "Reading projections causes no business-state writes. Explicit acknowledgement stores an arrival key separately from revision-based notices, so reading before arrival cannot hide the receipt alert.",
+    "The Sales mobile/desktop form replaces the quotation control, preserves the number after refresh, displays arrival progress and opens the received request from its alert."
+  ],
+  "assumptions": [
+    "Fully received, rather than a partial receipt, triggers arrival unless the user specifies otherwise.",
+    "SO number is an optional locally attached reference, matching the replaced quotation field's behavior. No remote order creation or mutation is requested."
+  ],
+  "setup": "Existing cached toolchain in standard isolated Compose with mbbs-tests.slice and teardown registered first. No dependencies or commits. Preserve dirty workspace snapshots. One additive alert-read column, compatible with rollback. Validate exact production overlay before app-only release.",
+  "failure_model": {
+    "false arrival": "missing/ambiguous/cancelled PO, partial receipt, zero/invalid quantities and generated receipt properties",
+    "reopened or prematurely completed work": "completed and mixed-request HTTP/database assertions",
+    "lost or repeated alert": "read-before-receipt, idempotent ack, multiple-PO progression, foreign requester and stale receipt-key checks",
+    "concurrent overwrite": "request locks, stale revision and racing SO saves",
+    "shared workflow regression": "existing Backorder, unified-status and regular-stock alert suites",
+    "release mismatch": "snapshot hashes, exact candidate rerun, runtime/asset verification and rollback"
+  },
+  "confirmed decisions": [
+    "User confirmed Fully received on 2026-10-20. Partial receipts remain Waiting for arrival."
+  ],
+  "clarifications": [
+    "Receipt tracking begins from the PO attached to an Already Ordered material even before Sales adds the optional SO reference. This avoids making supply progress or receipt alerts depend on an optional field.",
+    "Live aggregate inspection found NetSuite labels prefixed with Purchase Order :. Normalize that prefix; billing status alone is not receipt proof, but full canonical received quantities remain proof after billing.",
+    "Exclude inactive removed PO lines and non-receivable item types from canonical receipt totals, consistent with Receiving. A live billed PO contained an inactive unreceived former line.",
+    "Update the terminal UI property test: replace the old always-present quotation assertion with a positive SO-reference assertion for Completed Already Ordered, absence for closed/SCM, and preserved quotation for other Backorders. Canonical SO/PO links remain blocked on terminal requests."
+  ]
+}

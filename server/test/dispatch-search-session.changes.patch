@@ -1,0 +1,89 @@
+--- a/public/dispatch.js
++++ b/public/dispatch.js
+@@ -1153,15 +1153,28 @@
+   return isDispatchPlanEditor() && isHistoricalDispatchPlanDate(currentPlanDate);
+ }
+ 
+-function dispatchOrderFeedRequest({ sync = false, search = "" } = {}) {
++function dispatchOrderFeedRequest({ sync = false, search = "", versioned = false, type = "", cursor = "" } = {}) {
+   const params = new URLSearchParams();
+   const searchTerm = String(search || "").trim();
+   if (searchTerm) params.set("search", searchTerm);
+-  if (isDispatchHistoryEditMode()) params.set("historyPlanDate", currentPlanDate);
++  if (versioned && !sync) {
++    const poolParams = { type, limit: "200", cursor };
++    for (const [key, value] of Object.entries(poolParams)) {
++      if (value) params.set(key, value);
++    }
++  }
++  const historyEditMode = isDispatchHistoryEditMode();
++  if (historyEditMode) {
++    params.set("historyPlanDate", currentPlanDate);
++    params.set("sessionId", dispatchSessionId);
++  }
++  const endpoint = sync ? "/api/dispatch/sync" : versioned ? "/api/dispatch/v2/order-pool" : "/api/dispatch/orders";
+   const query = params.toString();
++  /** @type {Record<string, string>} */
++  const headers = historyEditMode ? { "x-dispatch-edit-lease": planEditLeaseToken } : {};
+   return {
+-    url: `${sync ? "/api/dispatch/sync" : "/api/dispatch/orders"}${query ? `?${query}` : ""}`,
+-    headers: isDispatchHistoryEditMode() ? { "x-dispatch-edit-lease": planEditLeaseToken } : {}
++    url: `${endpoint}${query ? `?${query}` : ""}`,
++    headers
+   };
+ }
+ 
+@@ -4597,13 +4610,8 @@
+     orderSearchAbortController = new AbortController();
+     const optimizedPool = dispatchConfig.plannerOrderPoolMode === "on";
+     const versionedPool = optimizedPool || dispatchConfig.plannerOrderPoolMode === "shadow";
+-    const request = dispatchOrderFeedRequest({ search: term });
+-    const params = new URLSearchParams({ search: term, limit: "200" });
+-    if (isDispatchHistoryEditMode()) params.set("historyPlanDate", currentPlanDate);
+-    const response = await fetch(
+-      versionedPool ? `/api/dispatch/v2/order-pool?${params.toString()}` : request.url,
+-      { headers: request.headers, signal: orderSearchAbortController.signal }
+-    );
++    const request = dispatchOrderFeedRequest({ search: term, versioned: versionedPool });
++    const response = await fetch(request.url, { headers: request.headers, signal: orderSearchAbortController.signal });
+     if (!response.ok) throw new Error(await response.text());
+     const payload = await response.json();
+     const feed = versionedPool ? payload.orders : payload;
+@@ -4722,11 +4730,11 @@
+       const optimizedPool = !sync && dispatchConfig.plannerOrderPoolMode === "on";
+       const versionedPool = optimizedPool
+         || (!sync && dispatchConfig.plannerOrderPoolMode === "shadow");
+-      const request = dispatchOrderFeedRequest({ sync });
+-      const params = new URLSearchParams({ type: requestedType, limit: "200" });
+-      if (append && dispatchOrderPoolNextCursor) params.set("cursor", dispatchOrderPoolNextCursor);
+-      if (isDispatchHistoryEditMode()) params.set("historyPlanDate", currentPlanDate);
+-      const response = await fetch(versionedPool ? `/api/dispatch/v2/order-pool?${params.toString()}` : request.url, {
++      const request = dispatchOrderFeedRequest({
++        sync, versioned: versionedPool, type: requestedType,
++        cursor: append ? dispatchOrderPoolNextCursor : ""
++      });
++      const response = await fetch(request.url, {
+         method: sync ? "POST" : "GET",
+         headers: request.headers
+       });
+@@ -4774,8 +4782,8 @@
+   try {
+     const term = searchText.trim();
+     if (term && dispatchConfig.plannerOrderPoolMode === "on") {
+-      const params = new URLSearchParams({ search: term, limit: "200", cursor: dispatchOrderPoolNextCursor });
+-      const response = await fetch(`/api/dispatch/v2/order-pool?${params.toString()}`);
++      const request = dispatchOrderFeedRequest({ search: term, versioned: true, cursor: dispatchOrderPoolNextCursor });
++      const response = await fetch(request.url, { headers: request.headers });
+       if (!response.ok) throw new Error(await dispatchErrorMessage(response));
+       const payload = await response.json();
+       mergeDispatchOrderSearchFeed(payload.orders || []);
+--- a/public/dispatch.html
++++ b/public/dispatch.html
+@@ -15,6 +15,6 @@
+     <script src="/dispatch-auth.js?v=20260724-sales-auth-v2"></script>
+     <script src="/delivery-instruction-upload.js?v=20260812-delivery-image-720p-v1"></script>
+     <script src="/dispatch-address-guard.js?v=20260920-executed-review-v1"></script>
+-    <script src="/dispatch.js?v=20260928-pickup-override-v1"></script>
++    <script src="/dispatch.js?v=20260930-search-session-v1"></script>
+   </body>
+ </html>

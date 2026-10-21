@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import test, { after } from "node:test";
+import { transferPhysicalEvidence } from '../../support/to-physical-lines.mjs';
 import fc from "fast-check";
 import { query, withTransaction, closeDb } from "../../../src/db.js";
 import { buildOperatorNetSuitePostingDraft } from "../../../src/operator-netsuite-posting-domain.js";
@@ -86,9 +87,9 @@ test("direct SN1400625 uses saved parent orderLine and preserves the exact recei
     assert.equal(step.sourceNetSuiteId,parentId);
     assert.equal(step.payload.memo,"SN1400625");assert.equal(step.payload.custbody9,"SN1400625");
     assert.deepEqual(step.payload.item.items,[
-      {orderLine:1,location:1,itemReceive:true,quantity:360},
-      {orderLine:24,location:1,itemReceive:true,quantity:360},
-      {orderLine:25,location:1,itemReceive:true,quantity:288},
+      {orderLine:1,location:1,itemReceive:true,quantity:360,custcol_plt:0,custcol_lyr:0,custcol_sec:0,custcol_pcs:0},
+      {orderLine:24,location:1,itemReceive:true,quantity:360,custcol_plt:0,custcol_lyr:0,custcol_sec:0,custcol_pcs:0},
+      {orderLine:25,location:1,itemReceive:true,quantity:288,custcol_plt:0,custcol_lyr:0,custcol_sec:0,custcol_pcs:0},
       {orderLine:34,location:1,itemReceive:false}
     ]);
     assert.ok(command.claims.includes("source:IR:PO:939701"));
@@ -151,6 +152,10 @@ test("stored SO and TO sources preserve repeated items and transfer stages witho
       await query(`INSERT INTO transfer_order_lines(transfer_order_id,line_stage,line_id,item_id,item_type,quantity,netsuite_order_line,netsuite_active)
         VALUES($1,$2,$3,42,'InvtPart',5,7,true),($1,$2,$4,42,'InvtPart',6,19,true),($1,$2,333,42,'InvtPart',1,NULL,false)`,
       [id, stage, stage === "outbound" ? 111 : 112, stage === "outbound" ? 222 : 223]);
+      for(const [key,sourceLine,postingLine] of stage==='outbound'?[[111,7,8],[222,19,20]]:[[112,7,9],[223,19,21]]) {
+        await query('UPDATE transfer_order_lines SET raw=$4::jsonb WHERE transfer_order_id=$1 AND line_stage=$2 AND line_id=$3',
+          [id,stage,key,JSON.stringify(transferPhysicalEvidence({id,itemId:42,key,sourceLine,postingLine,stage}))]);
+      }
     }
     const source = createOperatorNetSuitePostingRealSourceResolver({ query, useStoredOrderLines: true,
       fetchLiveSource: async () => { throw new Error("Unexpected NetSuite read"); } });
@@ -160,7 +165,7 @@ test("stored SO and TO sources preserve repeated items and transfer stages witho
     for (const functionKey of ["delivery_prep", "receiving"]) {
       const to = await source({ netsuite_id: id, order_type: "transfer_order" }, { functionKey });
       assert.deepEqual(to.availableLines.map(line => [line.sourceLineKey, line.orderLine]), functionKey === "receiving"
-        ? [["112", 7], ["223", 19]] : [["111", 7], ["222", 19]]);
+        ? [["112", 9], ["223", 21]] : [["111", 8], ["222", 20]]);
     }
     const split = (await query(`INSERT INTO dispatch_scm_to_splits(source_to_id,source_to_ref,split_to_id,split_to_ref)
       VALUES($1,'DIRECT-TO',$2,'DIRECT-SPLIT-TO') RETURNING id`, [id, -id])).rows[0];
@@ -172,7 +177,7 @@ test("stored SO and TO sources preserve repeated items and transfer stages witho
     await query("INSERT INTO dispatch_scm_to_split_lines(split_id,source_line_id,split_line_id) VALUES($1,$2,$3)", [split.id, parent.id, child.id]);
     const mapped = await source(order, { functionKey: "delivery_prep" });
     assert.equal(mapped.sourceNetSuiteId, id);
-    assert.deepEqual(mapped.availableLines.find(line => line.orderLine === 19).sourceLineAliases, ["222", "-777"]);
+    assert.deepEqual(mapped.availableLines.find(line => line.orderLine === 20).sourceLineAliases, ["222", "-777"]);
   }, { rollback: true });
 });
 

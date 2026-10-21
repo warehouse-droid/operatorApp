@@ -1,0 +1,7 @@
+# PO/TO Schedule deployment
+
+The user explicitly requested deployment of the pending PO/TO Schedule change in addition to the PO Note change. Spec approval: not obtained (autonomous deployment preparation). Use the existing implementation and tests; no new dependencies or live test orders.
+
+Acceptance: multiple Type/Method/Drop-off selections use OR within a column and AND across columns, with Special Orders and combined yards supported. Dispatch ignores its hidden Method filter. Saved preferences preserve multiple selections, legacy choices, and account/surface isolation. Header clicks sort by explicit priorities and directions while retaining row editors, selections, hidden columns and expanded details. Existing compact columns, keyboard controls and numeric/date sorting remain functional.
+
+Deploy only the six files in `tools/scm-schedule-multi-sort-files.json` over the just-deployed PO Note app. Migration 248 adds array preference columns and backfills existing scalar selections. Validate migration idempotence, real PostgreSQL filters/preferences, browser flows, existing row-save/column regressions and the PO Note suite. Preserve the Note code, PALLET behavior, app configuration, webhook worker, database container and Ollama container. Retain the Note app as the rollback image; rollback keeps the additive preference columns. Do not run fixture-creating checks against production or modify real NetSuite orders for verification.

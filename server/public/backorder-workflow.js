@@ -4,25 +4,25 @@ import {specialStage,specialPurchaseOrderDispatchReady} from './special-stock-wo
 /** @param {Record<string,any>|null|undefined} request */
 export const isBackorder = request => request?.workflowKind === 'backorder'
   || request?.regular?.deliveryMethod === 'backorder' || request?.deliveryMethod === 'backorder';
-/** @param {Record<string,any>} detail */
-export function backorderPurchaseReady(detail) {
+/** @param {Record<string,any>} detail @param {{allowPendingSalesDecision?:boolean}} [options] */
+export function backorderPurchaseReady(detail, {allowPendingSalesDecision = false} = {}) {
   const open = (/** @type {Array<Record<string,any>>} */ (detail.lines || [])).filter(line => line.supplyStatus !== 'already_ordered' && !['declined','closed'].includes(line.salesDecision));
-  return open.length > 0 && open.every(line => line.salesDecision === 'accepted'
+  return open.length > 0 && open.every(line => (line.salesDecision === 'accepted'
+    || allowPendingSalesDecision && line.salesDecision === 'pending')
     && Boolean(line.supplyStatus && line.stockCheckedAt));
 }
 /** @param {Record<string,any>} detail @param {'sales_order'|'purchase_order'} kind */
 export function canLinkBackorderOrder(detail, kind) {
-  return kind === 'purchase_order' ? backorderPurchaseReady(detail)
-    : Boolean(detail.purchaseOrderId && detail.dispatchPlanning?.purchaseOrder?.planned === true);
+  // Stock updates reset Sales decisions; an existing SO keeps the subsequent PO reference link available.
+  return ['sales_order','purchase_order'].includes(kind) && backorderPurchaseReady(detail, {
+    allowPendingSalesDecision: kind === 'purchase_order' && Boolean(detail.salesOrderId)
+  });
 }
 /** @param {Record<string,any>} detail @param {'sales_order'|'purchase_order'} kind */
 export function assertBackorderOrderLink(detail, kind) {
   if (isBackorder(detail) && !canLinkBackorderOrder(detail, kind)) {
-    const salesOrder = kind === 'sales_order';
-    throw Object.assign(new Error(salesOrder
-      ? 'The linked PO must be planned before Sales can link the SO.'
-      : 'SCM must review stock and Sales must accept every open material before linking a PO.'),
-    {status:409,code:salesOrder ? 'BACKORDER_PO_PLANNING_REQUIRED' : 'BACKORDER_SALES_ACCEPTANCE_REQUIRED'});
+    throw Object.assign(new Error('SCM must review stock and Sales must accept every open material before linking an order.'),
+    {status:409,code:'BACKORDER_SALES_ACCEPTANCE_REQUIRED'});
   }
 }
 /** @param {Parameters<typeof specialStage>[0]&Record<string,any>} evidence */

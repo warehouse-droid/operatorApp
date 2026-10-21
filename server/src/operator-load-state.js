@@ -24,6 +24,8 @@ export function deliveryLoadConfirmation(order) {
   const outstanding = (order?.lines || []).filter(outstandingLoadLine);
   const missing = outstanding.filter((/** @type {any} */ line) => !PACKED_FIELDS.some(field => positive(line[field]) > 0));
   return { orderId: String(order?.netsuite_id || ''), orderRef: String(order?.tranid || ''),
+    ...(order?.order_type === 'vrma_order' && order.vrma_local_only === true && order.vrma_reference_only !== true
+      ? { finalizesEstimatedQuantity: true } : {}),
     total: outstanding.length, confirmed: outstanding.length - missing.length,
     missing: missing.map((/** @type {any} */ line) => ({ id: String(line.id), sku: String(line.sku || line.item_name || 'Item') })) };
 }

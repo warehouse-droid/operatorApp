@@ -1,0 +1,28 @@
+{
+  "tier": 3,
+  "specApproval": "not obtained (autonomous run); implementing the user's explicit null/zero rule",
+  "scenarios": [
+    "PLT, LYR, SEC and PCS accept missing, null, empty and whitespace input; each normalizes to null.",
+    "Numeric zero, negative zero and numeric text zero normalize to null independently for each pack field.",
+    "Positive whole and fractional quantities remain exact, including numeric text input.",
+    "Negative, nonfinite, oversized and nonnumeric pack values remain invalid.",
+    "New requests and additional lines store null pack values; edits can clear a pack value and render it blank.",
+    "Every REST SO creation path (direct, estimate conversion, discounted and waitlist) posts explicit null for missing/zero custom pack columns.",
+    "The SuiteScript SO creation paths leave empty pack columns blank and retain supplied positive quantities.",
+    "Sales quantity, price, discount, item identity, UOM, purchase-order payloads and duplicate-order protection remain unchanged."
+  ],
+  "failureModel": {
+    "zero sent or sourced on SO": "outbound transport and SuiteScript record-boundary assertions",
+    "positive pack count lost": "property tests for exact preservation and independent fields",
+    "pricing changed": "existing SO pricing suites and unchanged financial field assertions",
+    "invalid values silently coerced": "adversarial input cases",
+    "null rejected by storage": "isolated repository workflow test"
+  },
+  "setup": {
+    "dependencies": "existing Node, node:test, fast-check, c8, TypeScript, ESLint and Playwright only; no additions",
+    "git": "preserve all pre-existing changes; no commit or reset",
+    "tests": "bounded disposable containers in mbbs-tests.slice, standard isolated Compose database, registered teardown before launch",
+    "artifacts": "server/test-artifacts/sales-order-null-packs-20261016; reproducible runner and checks under server/tools/sales-order-null-packs-20261016",
+    "production": "no live sales orders or production database changes during verification"
+  }
+}

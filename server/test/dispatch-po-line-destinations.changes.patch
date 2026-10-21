@@ -1,0 +1,25 @@
+--- a/src/dispatch-repository.js
++++ b/src/dispatch-repository.js
+@@ -8217 +8217,7 @@
+-    const projected = projectPurchaseOrderRouteResidual(targetEnriched, poAllocations, {
++    const routeOrder = { ...targetEnriched, dropoffs: purchaseOrderDropoffs(targetEnriched.items, {
++      destinationLocationId: targetEnriched.destinationLocationId,
++      destinationYard: targetEnriched.destinationYard,
++      destinationAddress: targetEnriched.defaultDestinationAddress || targetEnriched.destinationAddress,
++      destinationAddressOverride: targetEnriched.deliveryAddressOverride
++    }) };
++    const projected = projectPurchaseOrderRouteResidual(routeOrder, poAllocations, {
+--- a/src/dispatch-planner-v2-repository.js
++++ b/src/dispatch-planner-v2-repository.js
+@@ -148,0 +149 @@
++    "dropoffs", "defaultDestinationAddress", "deliveryAddressOverride",
+--- a/src/dispatch-po-route-projection.js
++++ b/src/dispatch-po-route-projection.js
+@@ -178,0 +179,4 @@
++    const headerLocationId = text(order.destinationLocationId ?? order.destination_location_id);
++    const matchesHeaderDestination = headerLocationId && text(destinationLocationId)
++      ? headerLocationId === text(destinationLocationId)
++      : destinationYard.toLowerCase() === text(order.destinationYard ?? order.destination_yard).toLowerCase();
+@@ -185 +189 @@
+-      address: text(order.deliveryAddressOverride ?? order.delivery_address_override)
++      address: (matchesHeaderDestination ? text(order.deliveryAddressOverride ?? order.delivery_address_override) : "")

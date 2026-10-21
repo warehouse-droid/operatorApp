@@ -1,0 +1,30 @@
+{
+  "task": "Manual SO linking and SQFT preservation",
+  "assurance": "old-coder Tier 3; autonomous spec, user requested one field and no item-mapping check",
+  "setup": "Reuse cached Node/PostgreSQL/Playwright/type/lint tools; isolated standard Compose project under mbbs-tests.slice; no dependencies, migrations or commits; scoped overlay on live app and webhook-worker images; teardown registered before tests.",
+  "acceptance": [
+    "Manual link accepts one SO number, resolves its exact canonical identity case-insensitively, and rejects blank, unknown, ambiguous or conflicting identities.",
+    "Accepted enquiry lines without NetSuite mappings and without an SO draft can manually link an existing active SO. Missing or mismatched line coverage does not block the manual link or cause later webhook attention.",
+    "Manual links retain yard access, active order, existing owner, case closure, pending operation and quantity-review checks; nonmanual creation retains strict mapping and draft requirements.",
+    "Original enquiry data, quantities, rates, decisions and packing remain unchanged; linking writes app metadata and an audit event without modifying the NetSuite order.",
+    "Customer handling for a different billed account is pending the user's explicit choice.",
+    "The actual browser displays one searchable SO-number input and submits that reference without requiring an internal ID.",
+    "New SQFT enquiries stay SQFT on preview, draft save and NetSuite payload, preserving quantity, unit rate, quoted subtotal and discounts. SQFT rejects a nonidentity PC conversion.",
+    "Packaging enquiries retain the existing explicit PC conversion and price precision protections; already issued orders are not converted.",
+    "Test resources are removed on success, failure and interruption; docker ps and docker ps -a show only production containers after teardown."
+  ],
+  "clarifications": [
+    "The billed-account question is optional under the user's explicit choice of SOB122110 and one-field manual linking. Default: if no SO billed account was explicitly selected in a saved draft, adopt the chosen canonical SO's existing billed account, keeping the original enquiry customer unchanged. An explicitly selected SO account still must match. No NetSuite customer or SO record is changed.",
+    "The user explicitly confirmed: Use the selected SO's billed account; preserve the enquiry customer. For SPREQ-000043 use SOB122110, existing NetSuite bill-to 12712 (333333), and retain enquiry customer 3435 (Beneworks Construction).",
+    "Reference-only manual links without a saved SO draft must preserve the existing SO's delivery details, including during webhook/status reconciliation. Existing saved-draft delivery behavior remains.",
+    "User steering: no need to check. Stop extended validation; retain the completed 23/23 focused results, finish scoped deployment and the approved link. Extended suite, static, coverage and mutation layers are not claimed complete."
+  ],
+  "failureModel": {
+    "wrong_order_or_customer": "exact reference/optional ID checks, customer policy test, yard and ownership adversarial integration cases",
+    "concurrent_or_stale_link": "revision locks, duplicate ownership and real database integration checks",
+    "silent_repricing_or_reuniting": "server and real-browser regression tests, generated decimal properties and manual mutants",
+    "webhook_reblocks_link": "manual-link then webhook integration case; preserve automatic-link coverage checks",
+    "production_regression": "captured deployed baseline, zero new relevant suite/type/lint failures, scoped image overlays and configuration fingerprints",
+    "host_resource_leak": "finally teardown, bounded Compose settings, Docker postcheck and production health"
+  }
+}

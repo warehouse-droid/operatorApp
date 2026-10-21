@@ -1,0 +1,160 @@
+{
+  "feature": "NetSuite customer webhook",
+  "status": "Application customer webhook deployed and verified publicly; failed NetSuite event for customer 8444 needs to be resent.",
+  "spec": "test/customer-webhook-spec.json",
+  "specApproval": "not obtained (autonomous run); NetSuite source confirmed by user",
+  "command": "bash server/tools/customer-webhook-gauntlet.sh",
+  "sourceState": "test-artifacts/customer-webhook/final/source-state.json",
+  "sourceHashesVerifiedAfterRun": true,
+  "red": {
+    "passed": 0,
+    "failed": 15,
+    "log": "test-artifacts/customer-webhook-red.log"
+  },
+  "baseline": {
+    "passed": 86,
+    "failed": 0,
+    "log": "test-artifacts/customer-webhook-baseline.log"
+  },
+  "final": {
+    "passed": 102,
+    "failed": 0,
+    "skipped": 0,
+    "newWebhookTests": 16,
+    "customerRegressionTests": 86,
+    "log": "test-artifacts/customer-webhook/final/tests-coverage.log"
+  },
+  "coverage": {
+    "scope": "src/netsuite-customer-webhook.js and src/netsuite-customer-webhook-router.js",
+    "lines": {
+      "total": 182,
+      "covered": 182,
+      "skipped": 0,
+      "pct": 100
+    },
+    "statements": {
+      "total": 182,
+      "covered": 182,
+      "skipped": 0,
+      "pct": 100
+    },
+    "functions": {
+      "total": 15,
+      "covered": 14,
+      "skipped": 0,
+      "pct": 93.33
+    },
+    "branches": {
+      "total": 82,
+      "covered": 76,
+      "skipped": 0,
+      "pct": 92.68
+    },
+    "branchesTrue": {
+      "total": 0,
+      "covered": 0,
+      "skipped": 0,
+      "pct": "Unknown"
+    }
+  },
+  "layers": {
+    "syntax": "Passed for both new application modules, NetSuite sender and server.js",
+    "types": "Passed targeted TypeScript check with JSDoc on both new application modules",
+    "lint": "Passed with zero warnings for new application modules, sender, tests and validation tools",
+    "secrets": "No high-confidence findings in the three new production files; test secrets are synthetic constants",
+    "mutations": {
+      "suiteKilled": 5,
+      "suiteTotal": 5,
+      "applicablePropertyKilled": 2,
+      "applicablePropertyTotal": 2
+    },
+    "properties": "100 reproducible generated snapshot cases; existing customer property suite also passed",
+    "adversarial": "Wrong/missing secrets, wrong accounts, malformed JSON, invalid identities/timestamps/currency, oversized bodies and persistence faults tested",
+    "concurrency": "12 simultaneous HTTP deliveries produce one canonical customer and one canonical event; existing 25-repetition customer race tests pass",
+    "runtime": "Full server starts, accepts and commits a synthetic customer over HTTP; existing order webhook still rejects missing authentication",
+    "rollback": "Injected audit insert failure rolls back canonical customer, return projection, master event, sync run and audit",
+    "complexity": "ESLint complexity maximum 12, nesting maximum 4 passed",
+    "supplyChain": "No dependencies added or changed; reused existing pinned test tooling",
+    "suiteHealth": "Single test-worker execution and seeded property tests; baseline and final customer suites passed"
+  },
+  "scenarioMapping": {
+    "createAndSearch": "authenticated create is committed and immediately visible in existing searches",
+    "duplicatesAndRaces": "retries and simultaneous requests create one customer and one event",
+    "updateOrder": "newer event wins; stale and same-time conflicting events cannot overwrite it",
+    "inactivationAndIsolation": "inactivation removes active search and return projection without hard deletion",
+    "preserveLocalProfiles": "customer-sync.test.js: P3-F02 source precedence is deterministic and local site fields survive live hydration",
+    "authorization": "configuration, header authentication, account binding and mirror restrictions fail closed",
+    "validation": "malformed, incomplete and oversized input is rejected with no writes",
+    "atomicity": "real database rollback removes all writes if audit persistence fails",
+    "retryableFailure": "HTTP persistence failures return a retryable response without exposing internals",
+    "sender": "customer-webhook-sender.test.js: create/edit/xedit, individual/inactive, unsupported stages, configuration and sanitized failure logging",
+    "regression": "86 existing customer synchronization, source, projection, mirror, property and concurrency tests",
+    "cleanup": "mbbs-customer-webhook-test-1716857-cleanup.log and running/all container inventories"
+  },
+  "cleanup": {
+    "project": "mbbs-customer-webhook-test-1716857",
+    "testContainersRemaining": 0,
+    "testProjectNetworksRemaining": 0,
+    "testProjectVolumesRemaining": 0,
+    "method": "Teardown trap before startup; compose down --volumes --remove-orphans; docker ps and docker ps -a verified",
+    "productionHealth": {
+      "ok": true,
+      "app": "MBBS Yard Server"
+    },
+    "preExistingOtherTaskStack": "mbbs-to-yard-test-1627181 was already running before this task and was left to its owning task"
+  },
+  "resolvedFailures": [
+    "Initial test launch needed explicit /app working directory and the existing development-dependency cache mount; cleanup succeeded.",
+    "Integration tests exposed reuse of one SQL parameter as both UUID and text; separate parameter fixed it.",
+    "ESLint required explicit null/undefined equality; corrected without weakening tests.",
+    "TypeScript required explicit JSDoc at untrusted payload and Express error-handler boundaries; added annotations."
+  ],
+  "skippedAndLimits": [
+    "The unrelated application-wide suites were not run; the complete affected customer regression suite was run with zero new failures.",
+    "No production data or live NetSuite records were used. NetSuite runtime is verified through a SuiteScript VM boundary harness and official API documentation, not an installed NetSuite deployment.",
+    "Coverage excludes the VM-executed sender and the one-line server registration; sender behavior and actual full-server routing are tested separately.",
+    "The default settings callback is exercised by the real application smoke test outside the measured unit/integration coverage run.",
+    "Six normalizer branches are not covered by the focused coverage run; no claim of exhaustive hostile-input coverage.",
+    "No dependency audit or migration rollback rehearsal was needed: dependency versions and database schema were unchanged.",
+    "No UI browser test was needed: the existing customer searches are used without UI changes.",
+    "Random test-file order was not added; deterministic property seeds, serial file execution and concurrency-specific tests were used.",
+    "NetSuite delivery has no durable retry queue; failed delivery is logged and the customer can be saved again.",
+    "Hard deletes and removed child-address/contact propagation are outside this change."
+  ],
+  "versions": {
+    "node": "v20.20.2",
+    "pg": "8.21.0",
+    "express": "4.22.2",
+    "fast-check": "4.9.0",
+    "c8": "12.0.0",
+    "eslint": "10.8.0",
+    "typescript": "7.0.2"
+  },
+  "deployment": {
+    "at": "2026-10-09T23:01:24.079206+00:00",
+    "image": "sha256:387c4e6fef89ad9188b00aece6d4fa87df6a5a998519a99d9c31ef374f5df583",
+    "health": "healthy",
+    "localUnauthenticatedStatus": 401,
+    "publicUnauthenticatedStatus": 401,
+    "authenticatedInvalidPayloadStatus": 400,
+    "otherServicesUnchanged": true,
+    "productionCustomerWritesDuringVerification": 0,
+    "candidateValidation": {
+      "candidateImage": "sha256:387c4e6fef89ad9188b00aece6d4fa87df6a5a998519a99d9c31ef374f5df583",
+      "passed": 102,
+      "failed": 0,
+      "fullApplicationRuntime": "passed",
+      "source": "Exact production candidate image; application source and runtime dependencies were not overlaid."
+    },
+    "rollbackVerification": {
+      "originalImageRestored": true,
+      "health": "healthy",
+      "otherServicesUnchanged": true,
+      "cause": "Public Python-urllib probe rejected by Cloudflare error 1010. Curl reached the unchanged old route and returned 404."
+    },
+    "manifest": "deployments/customer-webhook-20261009/manifest.json",
+    "scope": "Three application source files layered over the captured current production image; other services and runtime configuration unchanged.",
+    "senderStatus": "The user provided an execution log from the installed NetSuite script; its failed event was not durably accepted.",
+    "testCleanup": "Disposable Compose project removed with volumes and orphans; logs retained."
+  }
+}

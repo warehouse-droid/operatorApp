@@ -21,7 +21,7 @@ task_mounts=(-v "$task_root/public:/app/public:ro" -v "$task_root/src:/app/src:r
 docker run --rm --network none "${task_mounts[@]}" --entrypoint node mbbs-schedule-columns-test:20260910 \
   --test --test-concurrency=1 src/scm-schedule-column-filter-harness.js src/scm-schedule-row-refresh-harness.js \
   test/dispatch/frontend/scm-schedule-status-save.test.js test/dispatch/frontend/scm-schedule-remarks-ui.red.test.js \
-  test/dispatch/frontend/scm-schedule-column-preferences.test.js
+  test/dispatch/frontend/scm-schedule-column-preferences.test.js test/dispatch/frontend/scm-schedule-multi-sort.test.js
 
 docker run --rm --network none --shm-size 256m "${task_mounts[@]}" \
   -e SCHEDULE_SCREENSHOT_DIR=/app/test-artifacts/schedule-columns --entrypoint node mbbs-schedule-columns-test:20260910 \
@@ -55,6 +55,7 @@ docker run --rm --network none "${task_mounts[@]}" --entrypoint npx mbbs-schedul
   eslint --no-config-lookup --no-ignore --rule 'no-unreachable:error' --rule 'no-dupe-args:error' \
   --rule 'no-dupe-keys:error' --rule 'valid-typeof:error' public/scm-schedule.js \
   test/dispatch/frontend/scm-schedule-column-preferences.test.js \
+  test/dispatch/frontend/scm-schedule-multi-sort.test.js \
   test/dispatch/frontend/scm-schedule-columns.browser.test.mjs test/support/run-schedule-column-mutations.mjs
 git diff --check -- public/scm-schedule.js public/dispatch.css public/scm-schedule.html test/dispatch/frontend/scm-schedule-remarks-ui.red.test.js
 sha256sum public/scm-schedule.js public/dispatch.css public/scm-schedule.html

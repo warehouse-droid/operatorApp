@@ -10,6 +10,11 @@ RUN apt-get update \
 COPY package.json package-lock.json ./
 RUN npm ci --omit=dev && npm cache clean --force
 
+ENV PLAYWRIGHT_BROWSERS_PATH=/ms-playwright
+RUN node node_modules/playwright/cli.js install --with-deps chromium \
+    && chmod -R a+rX /ms-playwright \
+    && rm -rf /var/lib/apt/lists/*
+
 COPY migrations ./migrations
 COPY netsuite-smart-scm-picking-ticket-restlet.js ./
 COPY netsuite-order-webhook-user-event.js ./

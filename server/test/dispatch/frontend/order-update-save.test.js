@@ -9,6 +9,7 @@ const declarations = parse(source, { ecmaVersion: 'latest', sourceType: 'script'
 function subject(names, overrides = {}) {
   const context = vm.createContext({
     console, Date, Promise, Map, Set, URLSearchParams, setTimeout, clearTimeout,
+    dispatchEditActivity: { start() {} },
     currentPlan: { id: '1', planDate: '2028-03-01', revision: 63, digest: 'old' }, currentPlanDate: '2028-03-01',
     localPlanGeneration: 1, localPlanDirty: false, lastServerSavedAt: '2028-03-01T12:00:00Z',
     pendingPlanSaveAttempt: null, pendingDispatchPlanAction: null, blockedRemotePlanUpdate: false,

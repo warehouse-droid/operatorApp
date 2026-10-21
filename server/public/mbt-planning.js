@@ -3,7 +3,7 @@
 (() => {
   const state = { ready: false, cards: new Map(), pool: [], nextOffset: null,
     total: 0, filter: "all", request: 0, navigation: 0, loadingDate: false, truckIds: new Set(), rawPlan: null };
-  const filters = [["all", "BIN"], ["delivery", "Delivery"], ["exchange", "Exchange"], ["return_bin", "Pickup"]];
+  const filters = [["all", "BIN"], ["delivery", "Delivery"], ["exchange", "Exchange"], ["collection", "Collection"]];
   const localTime = value => value ? new Intl.DateTimeFormat("en-GB", { timeZone: "America/Toronto", hour: "2-digit", minute: "2-digit" }).format(new Date(value)) : "";
   const visitId = stop => String(stop?.mbt?.visitId || "");
   const compatibleTruck = truck => state.truckIds.has(String(truck.id));
@@ -12,9 +12,17 @@
 
   function orderForCard(card) {
     return { ...card, pallets: 0, weightLbs: 0, items: [], travelMinutes: 30,
-      pickupLocations: [...new Set(card.stops.map(stop => stop.yardCode || card.address).filter(Boolean))],
+      pickupLocations: pickupLocationsForCard(card),
       windowStart: localTime(card.scheduledWindow?.startAt), windowEnd: localTime(card.scheduledWindow?.endAt),
       localDispatchStatus: "open", planOwned: true, catalogHydrated: true };
+  }
+  function pickupLocationsForCard(card) {
+    const locations=(card.workflow ? card.stops.filter(stop=>stop.type==="pickup") : card.stops)
+      .map(stop=>(card.workflow && stop.planningAddress) || stop.yardCode || card.address).filter(Boolean);
+    if (locations.length) {return [...new Set(locations)];}
+    const source=card.workflow?.source;
+    if (source?.address) {return [`${source.planned ? "After dumping: " : ""}${source.address}`];}
+    return card.workflow?.configurationRequired ? ["Choose bin in workflow"] : [];
   }
   function adoptCards() {
     const binOrders = [...state.cards.values()].map(orderForCard);
@@ -24,7 +32,7 @@
   function visualStop(stop, loadId, card, index) {
     return { ...stop, id: stop.id || `BIN-draft-${card.mbt.visitId}-${stop.sequence || index + 1}`,
       loadId, orderId: card.id, type: ["collect_empty_bin", "pickup_bin"].includes(stop.actionCode) ? "pick" : "drop",
-      location: stop.yardCode || card.address,
+      location: (card.workflow && (stop.planningAddress || stop.location?.address)) || stop.yardCode || card.address,
       mbt: { ...stop.mbt, visitId: card.mbt.visitId, stopSequence: Number(stop.mbt?.stopSequence || stop.sequence || index + 1), mandatory: true } };
   }
   function decoratePlan() {
@@ -73,6 +81,7 @@
       state.truckIds = new Set(data.trucks.map(truck => String(truck.id)));
       mergePlanningFleet(data.trucks);
       for (const card of [...data.pool.items, ...data.assigned]) {
+        if (card.workflow?.role) {state.cards.delete(card.workflow.orderId);}
         const prior = state.cards.get(card.mbt.visitId);
         if (!prior || card.mbt.visitRevision >= prior.mbt.visitRevision) {state.cards.set(card.mbt.visitId, card);}
       }
@@ -92,7 +101,8 @@
     const placed = assigned();
     const ids = new Set([...state.pool, ...[...state.cards.values()].filter(card => card.loadId && !searchText).map(card => card.mbt.visitId)]);
     return [...ids].map(id => state.cards.get(id)).filter(card => card && !placed.has(card.mbt.visitId)
-      && !["completed", "cancelled"].includes(card.mbt.status) && (state.filter === "all" || card.serviceAction === state.filter));
+      && !["completed", "cancelled"].includes(card.mbt.status) && (state.filter === "all"
+        || (card.serviceAction==="return_bin" ? "collection" : card.serviceAction) === state.filter));
   }
   function orderList() {
     const cards = poolCards().map(card => renderOrderCard(orderForCard(card))).join("");
@@ -105,7 +115,12 @@
     if (order.type !== "BIN") {return "";}
     const card = state.cards.get(order.mbt.visitId); const choices = mbtEligibleAssetChoice(card); const selected = mbtSelectedEligibleAsset(card);
     return `<div class="bin-card-actions">${choices.length ? `<label>Bin<select data-bin-asset="${escapeHtml(card.mbt.visitId)}" aria-label="Bin for ${escapeHtml(card.id)}"><option value="">Choose bin</option>${choices.map(asset => `<option value="${escapeHtml(asset.assetId)}" ${selected?.assetId === asset.assetId ? "selected" : ""}>${escapeHtml(asset.assetCode)}</option>`).join("")}</select></label>` : `<span>${escapeHtml((card.mbt.assetRequirements || []).map(asset => asset.exactAssetCode).join(", "))}</span>`}
+      ${card.workflow?.configurationRequired ? `<button data-action="bin-workflow" data-visit="${escapeHtml(card.mbt.visitId)}" type="button">Configure ${escapeHtml(card.workflow.kind)}</button>` : ""}
       <button data-action="bin-details" data-visit="${escapeHtml(card.mbt.visitId)}" type="button">Details</button></div>
+      ${card.workflow?.role && !card.loadId ? `<button data-action="bin-workflow" data-visit="${escapeHtml(card.workflow.orderId)}" type="button">Edit workflow</button>` : ""}
+      ${card.workflow?.role ? `<p class="bin-workflow-note">${escapeHtml(card.workflow.reference)} · ${escapeHtml(card.workflow.role)}
+        ${card.workflow.dependencies.map(d=>` · after ${escapeHtml(d.display_reference)} (${escapeHtml(d.status)})`).join("")}</p>` : ""}
+      ${card.workflow?.pendingCollections.length ? `<p class="bin-workflow-note">Pending: ${card.workflow.pendingCollections.map(p=>`${escapeHtml(p.asset_code)} · ${escapeHtml(p.display_reference)}`).join("; ")}</p>` : ""}
       ${card.blockedReason ? `<span class="chip warn">${escapeHtml(card.blockedReason)}</span>` : ""}`;
   }
   function selectedActions() {
@@ -121,7 +136,8 @@
   }
   function stopPlace(stop, order) {
     const place = stop.yardCode ? placeForLocation(stop.yardCode) : null;
-    const address = place?.address || order?.address || String(stop.location || "");
+    const address = stop.reference ? stop.planningAddress || place?.address || String(stop.location || "") || order?.address
+      : place?.address || order?.address || String(stop.location || "");
     const position = placePosition(place) || fallbackPositionForAddress(address, order);
     return { kind: place?.kind || "delivery", key: stop.yardCode || address, label: stop.displayName || address,
       address, routeLocation: address || position, lat: position.lat, lng: position.lng };
@@ -234,7 +250,13 @@
     dialog.innerHTML = `<header><h2>${escapeHtml(data.visit.id)}</h2><button type="button">Close</button></header><p>${escapeHtml(data.visit.customer)} · ${escapeHtml(data.visit.address)}</p>
       <h3>Required steps</h3><ol>${data.steps.map(step => `<li>${escapeHtml(step.display_name)} · ${escapeHtml(step.status)}</li>`).join("")}</ol>
       <h3>Assignment history</h3><ul>${data.history.map(item => `<li>${escapeHtml(item.action.replaceAll("_", " "))} · ${escapeHtml(displayDateTime(item.created_at))} · ${escapeHtml(item.reason)}</li>`).join("") || "<li>No assignments yet.</li>"}</ul>
-      <p>${data.evidence.length} evidence item(s) recorded.</p>`;
+      ${data.events.some(e=>e.action==="late_same_day_completion") ? '<p class="chip warn">Same-day replacement was completed late. The actual completion and evidence have been retained.</p>' : ""}
+      <p>${data.evidence.length} evidence item(s) recorded.</p>
+      ${data.visit.workflow ? '<button type="button" data-handoff>Record physical bin handoff</button>' : ""}`;
+    const handoff=dialog.querySelector("[data-handoff]");
+    if (handoff) {handoff.onclick=()=>window.BinOrderWorkflowUI.handoff(id,{headers:dispatchAuthHeaders,onSaved:async()=>{
+      dialog.close();await refreshFeed();
+    }}).catch(error=>{routeNotice=error.message;render({save:false});});}
     dialog.querySelector("button").onclick = () => dialog.close(); dialog.onclose = () => dialog.remove(); document.body.append(dialog); dialog.showModal();
   }
   function install() {
@@ -319,6 +341,11 @@
       if (action === "bin-load-more") {void refreshFeed({ append: true });}
       if (action === "bin-assign-selected" && ensureDispatchPlanEditor()) { if (addVisit(selectedOrderId, selectedLoadId)) {commitPlanMutation("bin_visit_assigned");} else {render({ save: false });} }
       if (action === "bin-details") {details(button.dataset.visit).catch(error => { routeNotice = error.message; render({ save: false }); });}
+      if (action === "bin-workflow") {
+        window.BinOrderWorkflowUI.open(button.dataset.visit,{headers:dispatchAuthHeaders,onSaved:async()=>{
+          await refreshFeed();routeNotice="BIN workflow saved. Assign its delivery and collection parts to loads.";
+        }}).catch(error=>{routeNotice=error.message;render({save:false});});
+      }
     }, true);
   }
   globalThis.MbbsBinPlanning = { install, compatibleTruck, payload, saveRequest, acknowledgeSave, orderList, cardActions, selectedActions, physicalVisits, stopPlace, drop,

@@ -1,15 +1,16 @@
 import {
   withSpecialQuantityReviewLock, claimSpecialFulfillmentChange, saveSpecialFulfillmentPlan,
-  failSpecialFulfillmentChange, finishSpecialFulfillmentChange, getSpecialStockCase
+  failSpecialFulfillmentChange, finishSpecialFulfillmentChange, cancelSpecialFulfillmentChange, getSpecialStockCase
 } from './special-stock-request-repository.js';
 import { prepareSpecialFulfillmentInNetSuite, applySpecialFulfillmentInNetSuite } from './netsuite.js';
 import { isLocalPickupChange } from './special-stock-fulfillment-policy.js';
 
 export function createSpecialFulfillmentService(dependencies={}) {
   const deps={withLock:withSpecialQuantityReviewLock,claim:claimSpecialFulfillmentChange,savePlan:saveSpecialFulfillmentPlan,
-    fail:failSpecialFulfillmentChange,finish:finishSpecialFulfillmentChange,get:getSpecialStockCase,
+    fail:failSpecialFulfillmentChange,finish:finishSpecialFulfillmentChange,discard:cancelSpecialFulfillmentChange,get:getSpecialStockCase,
     prepare:prepareSpecialFulfillmentInNetSuite,apply:applySpecialFulfillmentInNetSuite,...dependencies};
   return async (id,input,context)=>deps.withLock(id,async()=>{
+    if(input.action==='discard') return deps.discard(id,input,context);
     let detail;
     try {
       detail=await deps.claim(id,input,context);
@@ -17,7 +18,7 @@ export function createSpecialFulfillmentService(dependencies={}) {
       const change=detail.fulfillmentChange;
       let verified={};
       if(detail.salesOrderId && !isLocalPickupChange(detail.fulfillmentMethod,change.target.fulfillmentMethod,detail.fulfillmentChangePlan)){
-        const plan=detail.fulfillmentChangePlan || await deps.prepare({salesOrderId:detail.salesOrderId,...change.target});
+        const plan=(!change.replan && detail.fulfillmentChangePlan) || await deps.prepare({salesOrderId:detail.salesOrderId,...change.target});
         await deps.savePlan(id,change.id,plan);
         verified=await deps.apply(plan);
       }

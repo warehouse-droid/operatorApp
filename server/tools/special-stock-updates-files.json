@@ -1,0 +1,22 @@
+[
+  "migrations/258_special_stock_information.sql",
+  "public/app-sidebar.js",
+  "public/regular-stock-purchase.js",
+  "public/regular-stock-ui.js",
+  "public/sales-special-alert.js",
+  "public/sales-special-stock-requests.js",
+  "public/sales-stock-requests.html",
+  "public/sales-stock-requests.js",
+  "public/scm-special-stock-requests.js",
+  "public/scm-stock-requests.html",
+  "public/scm-stock-requests.js",
+  "public/special-stock-case-status.js",
+  "public/special-stock-documents.css",
+  "public/special-stock-information.js",
+  "public/special-stock-workflow.js",
+  "src/server.js",
+  "src/special-stock-alerts.js",
+  "src/special-stock-request-domain.js",
+  "src/special-stock-request-repository.js",
+  "tools/regular-stock-resolution-globals.d.ts"
+]

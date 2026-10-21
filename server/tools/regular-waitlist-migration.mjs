@@ -1,0 +1,30 @@
+import assert from 'node:assert/strict';
+import {readFileSync,writeFileSync} from 'node:fs';
+import pg from 'pg';
+const url=new URL(process.env.DATABASE_URL);
+assert.equal(process.env.MBT_TEST_ISOLATED,'1');assert.equal(url.hostname,'db');assert.equal(url.pathname,'/mbt_verify');
+const client=new pg.Client({connectionString:url.href});await client.connect();
+const tables=['regular_waitlist_pool_reads','regular_waitlist_commands','regular_waitlist_allocation_sources','regular_waitlist_allocations','regular_waitlist_conversions','regular_waitlist_pools','regular_waitlist_requests'];
+const filename='254_regular_waitlist.sql',sql=readFileSync('migrations/'+filename,'utf8');
+const definitions=async()=> (await client.query("SELECT conname,pg_get_constraintdef(oid) AS definition FROM pg_constraint WHERE conrelid='sales_stock_request_lines'::regclass AND conname IN ('sales_stock_request_lines_route_check','sales_stock_request_lines_stocking_type_check') ORDER BY conname")).rows;
+try{
+  for(const table of tables)assert.equal(Number((await client.query('SELECT count(*) AS n FROM '+table)).rows[0].n),0,'Rehearsal requires an empty isolated waitlist ledger');
+  await client.query('BEGIN');
+  for(const table of tables)await client.query('DROP TABLE '+table);
+  await client.query('DROP INDEX sales_stock_waitlist_one_item');
+  await client.query("ALTER TABLE sales_stock_request_lines DROP CONSTRAINT sales_stock_request_lines_stocking_type_check; ALTER TABLE sales_stock_request_lines ADD CONSTRAINT sales_stock_request_lines_stocking_type_check CHECK(stocking_type IN ('transfer','purchase'));");
+  await client.query(sql.slice(sql.indexOf('ALTER TABLE sales_stock_request_lines DROP CONSTRAINT sales_stock_request_lines_route_check;'),sql.indexOf('CREATE UNIQUE INDEX')).replace("('purchase','waitlist')","('purchase')"));
+  await client.query('DELETE FROM schema_migrations WHERE filename=$1',[filename]);await client.query('COMMIT');
+  const previous=await definitions();
+  await client.query('BEGIN');
+  await client.query(sql);
+  await assert.rejects(()=>client.query('SELECT 1/0'),error=>error.code==='22012');await client.query('ROLLBACK');
+  assert.deepEqual(await definitions(),previous,'Interrupted migration restores the original regular constraints');
+  assert.equal((await client.query("SELECT to_regclass('regular_waitlist_requests') AS table_name")).rows[0].table_name,null);
+  await client.query('BEGIN');await client.query(sql);await client.query('INSERT INTO schema_migrations(filename) VALUES($1)',[filename]);await client.query('COMMIT');
+  for(const table of tables)assert((await client.query('SELECT to_regclass($1) AS name',[table])).rows[0].name);
+  assert((await definitions()).every(row=>row.definition.includes('waitlist')));
+  assert.equal((await client.query('SELECT count(*)::int AS n FROM schema_migrations WHERE filename=$1',[filename])).rows[0].n,1);
+  const result={migration:filename,interruptedMigrationRolledBack:true,previousRegularConstraintsRestored:true,successfulMigrationCommitted:true,ledgerTables:tables.length,productionDatabaseUsed:false};
+  writeFileSync('test-artifacts/regular-waitlist/migration.json',JSON.stringify(result,null,2));console.log(JSON.stringify(result));
+}finally{await client.end();}

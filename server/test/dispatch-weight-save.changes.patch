@@ -1,0 +1,78 @@
+--- a/src/dispatch-plan-repository.js
++++ b/src/dispatch-plan-repository.js
+@@ -860,7 +860,7 @@
+       toPcs: item.toPcs ?? item.to_pcs ?? inventory?.to_pcs ?? null
+     };
+   });
+-  const calculatedWeight = items.reduce((sum, item) => sum + numberValue(item.lineWeight), 0);
++  const calculatedWeight = Math.round(items.reduce((sum, item) => sum + numberValue(item.lineWeight), 0) * 1000) / 1000;
+   const childOrderDetails = (order.childOrderDetails || []).map((child) => enrichOrderWeights(child, inventoryByItemId));
+   const raw = order.raw ? {
+     ...order.raw,
+--- a/src/dispatch-load-assignment.js
++++ b/src/dispatch-load-assignment.js
+@@ -1516,6 +1516,11 @@
+   [previousPlan, nextPlan] = comparableAllocationPlans(previousPlan, nextPlan);
+   const before = new Map(flattenDispatchPlanLoads(previousPlan).map((row) => [text(row.load.id || row.load.loadId), row]));
+   const after = new Map(flattenDispatchPlanLoads(nextPlan).map((row) => [text(row.load.id || row.load.loadId), row]));
++  // Sequence numbers may have gaps; only the actual position in a driver's
++  // ordered route is execution evidence.
++  const positions = new Map([previousPlan, nextPlan].map(plan => [plan,
++    new Map(driverLoadLanes(plan).flatMap(lane => lane.loads.map((row, index) => [text(row.load.id || row.load.loadId), index])))
++  ]));
+   const allocationSignature = (plan, row) => {
+     const refs = new Set((row?.load?.stops || []).map((stop) => text(stop.orderId || stop.orderRef)).filter(Boolean));
+     return (plan.orders || [])
+@@ -1560,7 +1565,7 @@
+     truckPlate: row.truckPlate,
+     switchYard: row.switchYard,
+     parkingSpot: row.parkingSpot,
+-    driverSequence: row.driverSequence,
++    driverSequence: positions.get(plan).get(text(row.load.id || row.load.loadId)),
+     plannedStartMinute: row.plannedStartMinute,
+     plannedFinishMinute: row.plannedFinishMinute,
+     handoffTravelMinutes: row.handoffTravelMinutes,
+@@ -1650,7 +1655,7 @@
+     dropSections: stop.dropSections ?? stop.sections ?? null,
+     dropPieces: stop.dropPieces ?? stop.pieces ?? null,
+     dropSalesQty: stop.dropSalesQty ?? stop.salesQty ?? null,
+-    dropWeight: stop.dropWeight ?? stop.weight ?? null,
++    // Derived weight is informational; physical cargo quantities remain locked.
+     effectiveOrderLocation: pickup
+       ? text(stop.location || stop.yard || order.sourceYard || order.source_yard)
+       : text(
+--- a/src/dispatch-executed-order-review.js
++++ b/src/dispatch-executed-order-review.js
+@@ -297,10 +297,10 @@
+       const after = (nextPlan.orders || []).find(order => key(identity(order)) === key(ref));
+       if (!after) {changes.push({ orderRef: ref, field: "order_removed", before: ref, after: null });}
+       else if (before) {
+-        changes.push(...executedOrderChanges(before, after).map(change => ({ ...change, orderRef: ref })));
++        changes.push(...reviewableSourceChanges(executedOrderChanges(before, after)).map(change => ({ ...change, orderRef: ref })));
+         for (const child of leafOrders(before).filter(candidate => candidate !== before)) {
+           const updated = leafOrders(after).find(value => key(identity(value)) === key(identity(child)));
+-          changes.push(...(updated ? executedOrderChanges(child, updated) : [{ field: "order_removed", before: identity(child), after: null }]).map(change => ({ ...change, orderRef: identity(child) })));
++          changes.push(...reviewableSourceChanges(updated ? executedOrderChanges(child, updated) : [{ field: "order_removed", before: identity(child), after: null }]).map(change => ({ ...change, orderRef: identity(child) })));
+         }
+       }
+     }
+@@ -316,7 +316,7 @@
+         const nextStop = after.load.stops.find(stop => text(stop.id || stop.stopId) === context.stopId);
+         if (!nextStop) { changes.push({ orderRef: context.orderRef, field: "stop_removed", before: context.stopId, after: null }); continue; }
+         for (const field of ["type", "location", "address", "yard", "dropAddress", "dropLocation", "destinationYard", "destinationLocationId", "orderId", "orderRefs",
+-          "instructions", "instruction", "notes", "lineRowIds", "dropPallets", "dropLayers", "dropSections", "dropPieces", "dropSalesQty", "dropWeight",
++          "instructions", "instruction", "notes", "lineRowIds", "dropPallets", "dropLayers", "dropSections", "dropPieces", "dropSalesQty",
+           "plannedArrivalMinute", "plannedDepartureMinute"]) {
+           if (!same(oldStop[field], nextStop[field])) {changes.push({ orderRef: context.orderRef, stopId: context.stopId, field, before: oldStop[field] ?? null, after: nextStop[field] ?? null });}
+         }
+--- a/src/dispatch-planner-performance.js
++++ b/src/dispatch-planner-performance.js
+@@ -743,7 +743,7 @@
+     truckPlate: row.truckPlate,
+     switchYard: row.switchYard,
+     parkingSpot: row.parkingSpot,
+-    driverSequence: row.driverSequence,
++    // The lane-prefix identity check protects actual load order, not number gaps.
+     plannedStartMinute: row.plannedStartMinute,
+     handoffTravelMinutes: row.handoffTravelMinutes,
+     handoffTravelFrom: row.handoffTravelFrom,

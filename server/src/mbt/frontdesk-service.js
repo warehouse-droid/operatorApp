@@ -316,12 +316,16 @@ function publicContract(row) {
 }
 
 /** @param {any} row */
+function visitDisplayReference(row) {return String(row.display_reference || row.service_snapshot?.binWorkflow?.reference || row.visit_reference);}
+
+/** @param {any} row */
 function publicVisit(row) {
   return {
     visitId: String(row.service_visit_id),
     serviceLineId: row.service_line_id ? String(row.service_line_id) : null,
     visitNumber: Number(row.visit_number),
     visitReference: String(row.visit_reference),
+    displayReference: visitDisplayReference(row),
     serviceAction: String(row.service_action),
     displayName: String(row.service_snapshot?.displayName || row.service_action),
     status: String(row.status),
@@ -350,6 +354,10 @@ function publicServiceLine(row) {
   const pricing = row.pricing_snapshot || {};
   return {
     serviceLineId: String(row.service_line_id),
+    ...(row.rental_number ? {rentalReference:`BIN${String(row.rental_number).padStart(5,"0")}`,
+      binAvailableForService:Boolean(row.bin_available),currentBin:row.current_asset_code
+        ? {assetId:String(row.current_asset_id),assetCode:row.current_asset_code} : null,
+      recoveryPending:Boolean(row.recovery_pending),pendingCollections:row.pending_collections || []} : {}),
     contractId: String(row.contract_id),
     lineNumber: Number(row.line_number),
     binTypeId: String(row.bin_type_id),
@@ -2346,6 +2354,8 @@ async function insertServiceVisit(input) {
       input.actorId
     ]
   );
+  const readable=await query("SELECT display_reference FROM mbt_bin_orders WHERE order_id=$1",[input.visitId]);
+  if (readable.rows[0]) {inserted.rows[0].display_reference=readable.rows[0].display_reference;}
   return inserted.rows[0];
 }
 
@@ -3679,9 +3689,11 @@ export async function getFrontdeskContractTimeline(input) {
   }
   const [visitResult, amendmentResult, billingResult, serviceLineResult, lineEventResult] = await Promise.all([
     query(
-      `SELECT * FROM mbt_service_visits
-        WHERE contract_id = $1::uuid
-        ORDER BY visit_number, service_visit_id`,
+      `SELECT v.*,COALESCE(p.display_reference,o.display_reference) AS display_reference
+        FROM mbt_service_visits v LEFT JOIN mbt_bin_orders o ON o.order_id=v.service_visit_id
+        LEFT JOIN mbt_bin_order_parts p ON p.visit_id=v.service_visit_id
+        WHERE v.contract_id = $1::uuid
+        ORDER BY v.visit_number, v.service_visit_id`,
       [contractId]
     ),
     query(
@@ -3700,9 +3712,26 @@ export async function getFrontdeskContractTimeline(input) {
       [contractId]
     ),
     query(
-      `SELECT line.*, bin.type_code AS bin_type_code
+      `SELECT line.*, bin.type_code AS bin_type_code,r.rental_number::text,r.current_asset_id,
+          a.asset_code AS current_asset_code,r.recovery_pending,
+          (latest.status='completed' OR (delivery.status='completed' AND s.location_kind='customer_site'
+            AND s.customer_site_profile_id=line.customer_site_profile_id)) AS bin_available,
+          (SELECT COALESCE(jsonb_agg(jsonb_build_object('reference',p.display_reference,'assetCode',ba.asset_code,'status',v.status)
+            ORDER BY o.exchange_number),'[]'::jsonb)
+           FROM mbt_bin_order_parts p JOIN mbt_bin_orders o ON o.order_id=p.order_id
+           JOIN mbt_service_visits v ON v.service_visit_id=p.visit_id JOIN mbt_bin_assets ba ON ba.asset_id=p.asset_id
+           WHERE o.service_line_id=line.service_line_id AND p.part_role='collection'
+             AND v.status NOT IN ('completed','cancelled')) AS pending_collections
          FROM mbt_contract_service_lines line
          JOIN mbt_bin_types bin ON bin.bin_type_id = line.bin_type_id
+         LEFT JOIN mbt_bin_rental_numbers r ON r.service_line_id=line.service_line_id
+         LEFT JOIN mbt_bin_assets a ON a.asset_id=r.current_asset_id
+         LEFT JOIN mbt_bin_asset_state s ON s.asset_id=r.current_asset_id
+         LEFT JOIN LATERAL (SELECT v.* FROM mbt_service_visits v WHERE v.service_line_id=line.service_line_id
+           AND v.service_action IN ('delivery','exchange_bin') AND v.status<>'cancelled'
+           ORDER BY v.visit_number DESC LIMIT 1) latest ON true
+         LEFT JOIN mbt_bin_order_parts dp ON dp.order_id=latest.service_visit_id AND dp.part_role='delivery'
+         LEFT JOIN mbt_service_visits delivery ON delivery.service_visit_id=dp.visit_id
         WHERE line.contract_id = $1::uuid
         ORDER BY line.line_number, line.service_line_id`,
       [contractId]
@@ -3997,6 +4026,13 @@ async function lockReturnVisitForLine(serviceLineId) {
   }
   if (!isUnassignedReturnEditable(result.rows[0])) {
     throw failure(409, "MBT_FRONTDESK_RETURN_STARTED", "A collection visit that has started cannot be changed.");
+  }
+  const issuedPart=await query(`SELECT 1 FROM mbt_bin_order_parts p JOIN mbt_service_visits v ON v.service_visit_id=p.visit_id
+    WHERE p.order_id=$1 AND (v.dispatch_plan_id IS NOT NULL OR v.actual_started_at IS NOT NULL OR EXISTS(
+      SELECT 1 FROM mbt_bin_planning_assignments a WHERE a.service_visit_id=p.visit_id AND a.released_at IS NOT NULL)) LIMIT 1`,
+  [result.rows[0].service_visit_id]);
+  if (issuedPart.rowCount) {
+    throw failure(409,"MBT_FRONTDESK_RETURN_STARTED","The collection has assigned or issued BIN parts. Resolve those instructions in Bin Planning first.");
   }
   return result.rows[0];
 }
@@ -4376,6 +4412,11 @@ export async function exchangeFrontdeskServiceLine(input) {
         service: exchangeSnapshot, billingOwnership: String(deliveryVisit.billing_ownership),
         actorId: String(actor.operatorId)
       });
+      // Freeze the old physical bin when the exchange is requested. Later
+      // replacements must not retarget an older outstanding collection.
+      await query(`UPDATE mbt_service_visits v SET expected_asset_id=r.current_asset_id
+        FROM mbt_bin_rental_numbers r WHERE v.service_visit_id=$1 AND r.service_line_id=$2
+          AND r.current_asset_id IS NOT NULL`,[exchangeVisitId,serviceLineId]);
       await insertVisitSteps({
         visitId: exchangeVisitId,
         steps: [

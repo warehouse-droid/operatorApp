@@ -12,7 +12,7 @@ after(closeDb);
 const search = (ref) => loadDispatchOrdersForResponse({ type: "SO", search: ref, includeCompletedScmSearch: true });
 
 for (const [index, status] of ["F", "G"].entries()) {
-  test(`${status}: NetSuite fulfilled Delivery is completed and planable in explicit search without changing cargo or history`, () => scenario(async () => {
+  test(`${status}: NetSuite fulfilled Delivery is pending and planable in explicit search without changing cargo or history`, () => scenario(async () => {
     const ref = `SO-FULFILLED-${status}`;
     await seedSalesOrder(817150001 + index, ref, { status });
     const before = (await query("SELECT row_to_json(s) AS value FROM sales_orders s WHERE tranid=$1", [ref])).rows;
@@ -20,8 +20,8 @@ for (const [index, status] of ["F", "G"].entries()) {
     const order = (await search(ref)).find(row => row.id === ref);
     assert.ok(order, "Explicit search includes the fulfilled SO");
     assert.equal(order.dispatchFulfilledSalesPlanningEligible, true);
-    assert.equal(order.dispatchCompletionStatus, "completed");
-    assert.equal(order.scm.status, "Completed");
+    assert.equal(order.dispatchCompletionStatus, "");
+    assert.equal(order.scm.status, "Queued");
     assert.equal(order.dispatchPlanningRestricted, false);
     assert.equal(order.items[0].quantity, 4);
     assert.deepEqual((await query("SELECT row_to_json(s) AS value FROM sales_orders s WHERE tranid=$1", [ref])).rows, before);
@@ -153,7 +153,7 @@ test("the snapshot transaction rechecks local delivery rather than trusting an e
   assert.deepEqual((await getDispatchPlan(plan.id)).orders, []);
 }));
 
-test("saved SO group retains completion and pending delivery permission for all its fulfilled members", () => scenario(async () => {
+test("saved SO group retains pending delivery permission without Dispatch completion for all its fulfilled members", () => scenario(async () => {
   const refs = ["SO-FULFILLED-GROUP-A", "SO-FULFILLED-GROUP-B"];
   for (const [index, ref] of refs.entries()) await seedSalesOrder(817150070 + index, ref);
   const children = (await search("SO-FULFILLED-GROUP-")).filter(order => refs.includes(order.id));
@@ -164,6 +164,6 @@ test("saved SO group retains completion and pending delivery permission for all 
   await saveDispatchPlanSnapshot(plan.id, { orders: [group], trucks: [], baseRevision: plan.revision });
   const retained = (await getDispatchPlan(plan.id)).orders.find(order => order.id === group.id);
   assert.equal(retained.dispatchFulfilledSalesPlanningEligible, true);
-  assert.equal(retained.dispatchCompletionStatus, "completed");
+  assert.equal(retained.dispatchCompletionStatus, "");
   assert.deepEqual(retained.childOrders, refs);
 }));

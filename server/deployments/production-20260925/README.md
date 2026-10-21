@@ -66,3 +66,11 @@ python3 server/deployments/production-20260925/restore-worker.py /tmp/production
 This patch only reconstructs source; it does not deploy anything. Root NetSuite
 SuiteScript files are captured as shipped in the container. Their independent
 installation inside the NetSuite account was not audited by this Git snapshot.
+
+## Subsequent complete-worktree release
+
+At **20:29 UTC on 25 September 2026**, the user-authorized whole worktree release
+deployed all application changes listed above to both the app and webhook worker.
+The “implemented but not deployed” table records the earlier 19:56 snapshot; those
+features are now live. See the [new release evidence](../../test/whole-worktree-deployment-20260925-evidence.md)
+and [new image/source manifest](../whole-worktree-20260925/manifest.json).

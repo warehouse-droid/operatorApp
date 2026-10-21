@@ -1,0 +1,26 @@
+.regular-status-summary { display: inline-flex; flex-direction: column; gap: .3rem; min-width: 0; max-width: 100%; vertical-align: middle; }
+.regular-status-badges { display: flex; flex-wrap: wrap; align-items: center; gap: .35rem; }
+.regular-status-detail { color: #64748b; white-space: normal; overflow-wrap: anywhere; font-size: .75rem; font-weight: 400; }
+.regular-status-badges .stock-request-pill { white-space: normal; }
+.regular-status-badges .pending_scm { background: #fef3c7; color: #92400e; }
+.regular-status-badges .pending_sales { background: #dbeafe; color: #1e40af; }
+.regular-status-badges .waiting_stock { background: #ede9fe; color: #5b21b6; }
+.regular-status-badges .in_progress { background: #cffafe; color: #155e75; }
+.regular-status-badges .completed { background: #dcfce7; color: #166534; }
+.regular-status-badges .closed { background: #e2e8f0; color: #475569; }
+.regular-status-filter { min-width: 0; }
+.regular-status-filter select { max-width: 100%; }
+.stock-request-status-line:has(.regular-status-summary) { flex-wrap: wrap; align-items: flex-start; }
+:is(#salesStockRequestApp, #scmStockRequestApp) .stock-request-page { min-width: 0; }
+:is(#salesStockRequestApp, #scmStockRequestApp) .stock-request-toolbar { display: flex; flex-wrap: wrap; align-items: flex-end; min-width: 0; }
+:is(#salesStockRequestApp, #scmStockRequestApp) .stock-request-toolbar > .stock-request-actions { flex-wrap: wrap; }
+:is(#salesStockRequestApp, #scmStockRequestApp) .stock-request-filters { flex: 1 1 700px; flex-wrap: wrap; min-width: 0; }
+:is(#salesStockRequestApp, #scmStockRequestApp) .regular-status-filter { width: 180px; }
+:is(#salesStockRequestApp, #scmStockRequestApp) .stock-request-yard-filter:not([open]) > div { display: none; }
+@media (max-width: 600px) {
+  .regular-status-summary { flex-basis: 100%; }
+  .regular-status-filter { width: 100%; }
+  :is(#salesStockRequestApp, #scmStockRequestApp) .stock-request-yard-filter > div {
+    position: fixed; left: 70px; right: 12px; width: auto; min-width: 0; max-width: none; max-height: 50vh; overflow-y: auto;
+  }
+}

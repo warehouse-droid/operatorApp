@@ -103,12 +103,11 @@ includesAll(schedule, [
 ], "SCM/Admin local VRMA completion override");
 
 includesAll(schedule, [
-  "scmScheduleHistoryTime",
-  "completedAt",
-  "cancelledAt",
-  "statusChangedAt",
-  ".sort((left, right) => scmScheduleHistoryTime(right.row) - scmScheduleHistoryTime(left.row)"
-], "newest-first completed/cancelled history");
+  "scmScheduleSorts",
+  'key: "date", direction: "ascending"',
+  "scmScheduleSortValue",
+  "scmScheduleDisplayRows"
+], "spreadsheet sorting across schedule views");
 
 includesAll(css, [
   ".scm-review-filter",
@@ -125,8 +124,8 @@ includesAll(css, [
   ".scm-complete-vrma"
 ], "reconciliation schedule styling");
 
-assert.ok(html.includes("/dispatch.css?v=20260910-schedule-columns-v1"), "Reconciliation CSS cache bust is missing.");
-assert.ok(html.includes("/scm-schedule.js?v=20260910-search-vendor-complete-v1"), "Reconciliation client cache bust is missing.");
+assert.ok(html.includes("/dispatch.css?v=20261001-schedule-multi-sort-v1"), "Reconciliation CSS cache bust is missing.");
+assert.ok(html.includes("/scm-schedule.js?v=20261001-schedule-multi-sort-v1"), "Reconciliation client cache bust is missing.");
 
 const payloadStart = schedule.indexOf("function normalizeScmSchedulePayload");
 const payloadEnd = schedule.indexOf("function loadScmSchedulePresetsOnce", payloadStart);
@@ -143,18 +142,22 @@ const helperEnd = schedule.indexOf("function scmScheduleReconciliationQuantity",
 assert.ok(helperStart >= 0 && helperEnd > helperStart, "Reconciliation status/history helper block must remain independently testable.");
 const helperContext = {
   scmScheduleRows: [
-    { orderRef: "PO-OLD", status: "Completed", completedAt: "2026-07-01T10:00:00Z" },
+    { orderRef: "PO-OLD", status: "Completed", queuedDate: "2026-07-01" },
     {
       orderRef: "TO-REVIEW",
+      queuedDate: "2026-07-15",
       status: "Queued",
       reconciliationStatus: "review",
       reconciliationReason: "Destination receipt was deleted."
     },
-    { orderRef: "PO-NEW", status: "Completed", completedAt: "2026-07-28T10:00:00Z" }
+    { orderRef: "PO-NEW", status: "Completed", queuedDate: "2026-07-28" }
   ],
   scmScheduleMeta: {},
   scmScheduleReviewOnly: false,
   scmScheduleFilters: { view: "completed", status: [] },
+  scmScheduleSorts: [{ key: "date", direction: "ascending" }],
+  scheduleDateText: (row) => row.queuedDate,
+  scheduleRowId: (row) => row.orderRef,
   scmScheduleFilterValues: (value) => Array.isArray(value) ? value : [value].filter(Boolean)
 };
 vm.runInNewContext(
@@ -172,7 +175,7 @@ assert.equal(helperContext.result.needsReview, true);
 assert.equal(helperContext.result.reason, "Destination receipt was deleted.");
 assert.equal(helperContext.result.reviewCount, 1);
 assert.equal(helperContext.result.effectiveStatus, "Completed");
-assert.deepEqual([...helperContext.result.history], ["PO-NEW", "PO-OLD", "TO-REVIEW"]);
+assert.deepEqual([...helperContext.result.history], ["PO-OLD", "TO-REVIEW", "PO-NEW"]);
 
 const reductionStart = schedule.indexOf("function scmSchedulePoSplitRequiresBaselineReduction");
 const reductionEnd = schedule.indexOf("function scmSchedulePoSplitCandidatePreviewHtml", reductionStart);

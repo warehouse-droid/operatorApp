@@ -2,7 +2,7 @@ $ErrorActionPreference = "Stop"
 
 $Root = Split-Path -Parent $PSScriptRoot
 $EnvFile = Join-Path $PSScriptRoot "env\.env"
-$BackupDir = Join-Path $PSScriptRoot "backups"
+$BackupDir = Join-Path $Root "backups\production"
 $Stamp = Get-Date -Format "yyyy-MM-dd_HH-mm-ss"
 $ContainerPath = "/tmp/mbbs_yard_$Stamp.dump"
 $HostPath = Join-Path $BackupDir "mbbs_yard_$Stamp.dump"

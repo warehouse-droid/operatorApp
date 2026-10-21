@@ -6,7 +6,8 @@
     <title>MBBS SCM Stock Requests</title>
     <link rel="stylesheet" href="/stock-request-conversation.css?v=20261016" />
     <link rel="stylesheet" href="/dispatch.css?v=20260930-po-text-v1" />
-    <link rel="stylesheet" href="/stock-requests.css?v=20260928-enhancements-v1&regular=20260930-purchase&special=20261001-header-note-v1&auditScroll=20261006-v2&backorder=20261014-material-layout&scrollChaining=20261009-v1&filterApply=20261010-v1" />
+    <link rel="stylesheet" href="/regular-stock-status.css?v=20261019-unified" />
+    <link rel="stylesheet" href="/stock-requests.css?input=20261020-v1&v=20260928-enhancements-v1&regular=20260930-purchase&special=20261001-header-note-v1&auditScroll=20261006-v2&backorder=20261014-material-layout&scrollChaining=20261009-v1&filterApply=20261010-v1" />
     <link rel="stylesheet" href="/scm-stock-check-lines.css?v=20261015-ollama" />
     <link rel="stylesheet" href="/aggregate-requests.css?v=20260925-aggregate-alert-v1" />
     <link rel="stylesheet" href="/scm-stock-pickup.css?v=20260930-purchase" />
@@ -22,28 +23,29 @@
     <main class="dispatch-shell stock-request-shell" id="scmStockRequestApp"></main>
     <script src="/i18n.js?v=20260923-aggregate-terminology-layout-v1" defer></script>
     <script src="/app-event-stream.js?v=20261005" defer></script>
-    <script src="/regular-stock-alert.js?v=20261006-line-actions-v1&backorder=20261007-v4&stockCheck=20261009" defer></script>
-    <script src="/app-sidebar.js?conversation=20261016&v=20260928-batch-discount-v1&regular=20260930-purchase&special=20261001-header-note-v1&stockUpdates=20261002-v1&stockingReply=20261006-v1&actions=20261006-v1" defer></script>
+    <script src="/regular-stock-alert.js?arrival=20261020-v1&input=20261020-v1&v=20261006-line-actions-v1&backorder=20261007-v4&stockCheck=20261009" defer></script>
+    <script src="/app-sidebar.js?arrival=20261020-v1&input=20261020-v1&conversation=20261016&v=20260928-batch-discount-v1&regular=20260930-purchase&special=20261001-header-note-v1&stockUpdates=20261002-v1&stockingReply=20261006-v1&actions=20261006-v1" defer></script>
     <script src="/dispatch-auth.js?v=20261003-staff-reset-1" defer></script>
     <script src="/aggregate-requests-i18n.js?v=20260925-aggregate-confirmation-date-v1" defer></script>
     <script src="/scm-stock-request-tabs.js?v=20260926-special-queue-v1&waitlist=20261002-v1" defer></script>
     <script src="/aggregate-requests.js?v=20260925-aggregate-confirmation-date-v1" defer></script>
-    <script src="/regular-stock-delivery.js?v=20260930-delivery-progress" defer></script>
-    <script src="/regular-waitlist.js?v=20261002-v2" defer></script>
-    <script src="/regular-stock-ui.js?v=20260930-delivery-progress&purchase=20260930-v1&resolve=20261002-v1&waitlist=20261002-v1&stockUpdates=20261002-v1&lineActions=20261006-v1&backorder=20261007-v4" defer></script>
+    <script src="/regular-stock-status-ui.js?pendingPo=20261021-v1&arrival=20261020-v1&input=20261020-v1&v=20261019-unified" defer></script>
+    <script src="/regular-stock-delivery.js?unified=20261019&v=20260930-delivery-progress" defer></script>
+    <script src="/regular-waitlist.js?unified=20261019&v=20261002-v2" defer></script>
+    <script src="/regular-stock-ui.js?input=20261020-v1&v=20260930-delivery-progress&purchase=20260930-v1&resolve=20261002-v1&waitlist=20261002-v1&stockUpdates=20261002-v1&lineActions=20261006-v1&backorder=20261007-v4" defer></script>
     <script src="/regular-stock-waitlist-transition.js?v=20261006-v1" defer></script>
     <script src="/stock-request-conversation.js?v=20261016-followup" defer></script>
     <script src="/regular-stock-reply.js?conversation=20261016&v=20261006-stocking-replies&actions=20261006-v1&lineActions=20261006-v1" defer></script>
     <script src="/regular-stock-resolution.js?v=20261002-v1&lineActions=20261006-v1" defer></script>
-    <script src="/regular-stock-purchase.js?v=20260930-purchase&resolve=20261002-v1&stockUpdates=20261002-v1&stockingReply=20261006-v1&actions=20261006-v1&lineActions=20261006-v1" defer></script>
+    <script src="/regular-stock-purchase.js?unified=20261019&v=20260930-purchase&resolve=20261002-v1&stockUpdates=20261002-v1&stockingReply=20261006-v1&actions=20261006-v1&lineActions=20261006-v1" defer></script>
     <script src="/regular-stock-dialog.js?v=20260930-delivery-progress" defer></script>
     <script src="/scm-stock-pickup.js?v=20260930-purchase" defer></script>
     <script src="/scm-waitlist-list.js?v=20261002-v2" defer></script>
-    <script src="/scm-waitlist.js?v=20261002-v2&stableView=20261006-document-scroll-v1&actions=20261006-v1" defer></script>
+    <script src="/scm-waitlist.js?unified=20261019&v=20261002-v2&stableView=20261006-document-scroll-v1&actions=20261006-v1" defer></script>
     <script src="/stock-request-view.js?v=20261006-document-scroll-v1" defer></script>
     <script src="/scm-stock-check-lines.js?v=20261015-description" defer></script>
     <script src="/scm-request-line-visibility.js?v=20261016" defer></script>
-    <script src="/scm-stock-requests.js?transferEta=20261016&lineVisibility=20261016&conversation=20261016-followup&v=20260927-yard-layout-v1&regular=20260930-delivery-progress&purchase=20260930-v1&resolve=20261002-v1&waitlist=20261002-v1&stockUpdates=20261002-v1&stableView=20261006-document-scroll-v1&stockingReply=20261006-v1&actions=20261006-v1&lineActions=20261006-v1&backorder=20261014-material-layout&liveStock=20261014-v1&requestLoading=20261008&requestScroll=20261009-v1&filterApply=20261010-v1" defer></script>
+    <script src="/scm-stock-requests.js?arrival=20261020-v1&input=20261020-v1&unified=20261019&transferEta=20261016&lineVisibility=20261016&conversation=20261016-followup&v=20260927-yard-layout-v1&regular=20260930-delivery-progress&purchase=20260930-v1&resolve=20261002-v1&waitlist=20261002-v1&stockUpdates=20261002-v1&stableView=20261006-document-scroll-v1&stockingReply=20261006-v1&actions=20261006-v1&lineActions=20261006-v1&backorder=20261014-material-layout&liveStock=20261014-v1&requestLoading=20261008&requestScroll=20261009-v1&filterApply=20261010-v1" defer></script>
     <script src="/scm-special-stock-requests.js?transferEta=20261016&lineVisibility=20261016&conversation=20261016-followup&v=20261001-custom-po-v1&stockUpdates=20261002-v1&scmPlanning=20261002-v2&lineFields=20261003-v1&uomOne=20261003-v1&scmLines=20261003-v1&stableView=20261006-document-scroll-v1&manualLinks=20261006-request-po-v2&backorder=20261007-v4&stockCheckRevision=20261009-v1&filterApply=20261010-v1&compactStockCheck=20261013-v1&etaRow=20261013-v1&liveStock=20261014-v1" defer></script>
   </body>
 </html>

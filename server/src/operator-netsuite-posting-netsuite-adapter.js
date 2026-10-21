@@ -11,7 +11,7 @@ import {
   transformTransferOrderToItemFulfillment,
   transformTransferOrderToItemReceipt
 } from "./netsuite.js";
-import { verifyOperatorNetSuitePostingRecord } from "./operator-netsuite-posting-adapter.js";
+import { purchaseReceiptNeedsChargeSource, verifyPurchaseReceiptWithCharges } from './operator-netsuite-receipt-charges.js';
 import { operatorNetSuiteRequestPool } from "./operator-netsuite-request-pool.js";
 import { createLocationAwareIFAdapter } from './item-fulfillment-parts-service.js';
 import { itemFulfillmentPartsRepository } from './item-fulfillment-parts-repository.js';
@@ -78,6 +78,7 @@ async function recheckKitSource(step, readSource) {
  * @param {Function} dependencies.fetchItemReceipt
  * @param {Function} [dependencies.fetchKitSource]
  * @param {Function} [dependencies.fetchDirectReceiptSource]
+ * @param {Function} [dependencies.fetchPurchaseReceiptSource]
  * @param {Function} [dependencies.fetchDispatchFulfillmentSource]
  * @param {Function} [dependencies.fetchSalesOrderFulfillmentSource]
  * @param {Function} [dependencies.checkTransferPosting]
@@ -92,16 +93,30 @@ export function createOperatorNetSuitePostingAdapter({
   fetchItemReceipt,
   fetchKitSource = fetchOperatorKitSource,
   fetchDirectReceiptSource = fetchPurchaseOrderHistorySnapshotFromNetSuite,
+  fetchPurchaseReceiptSource = fetchPurchaseOrderHistorySnapshotFromNetSuite,
   fetchDispatchFulfillmentSource = (/** @type {number} */ id) => fetchSalesOrderFulfillmentStateFromNetSuite(id, { includeAllSourceLines: true }),
   fetchSalesOrderFulfillmentSource = (/** @type {number} */ id) => fetchSalesOrderFulfillmentStateFromNetSuite(id, { includeAllSourceLines: true }),
   checkTransferPosting = async () => {}
 }) {
   const endpointTypes = new WeakMap();
+  // Source proof stays out of the remote record and can only come from our read.
+  const purchaseChargeSources = new WeakMap();
+  async function readChargeSource(/** @type {any} */ step, /** @type {any} */ record) {
+    if (!purchaseReceiptNeedsChargeSource(step, record) || purchaseChargeSources.has(record)) { return; }
+    try {
+      purchaseChargeSources.set(record, await operatorNetSuiteRequestPool.run(() => fetchPurchaseReceiptSource(step.sourceNetSuiteId)));
+    } catch {
+      // Keep the readable IR so the posting service can show its identity while
+      // holding finalization until its extra charge can be verified.
+      purchaseChargeSources.set(record, null);
+    }
+  }
   async function fetchById(/** @type {Record<string, any>} */ step, /** @type {number} */ id) {
     const record = await operatorNetSuiteRequestPool.run(() => step.transactionType === "IF"
       ? fetchItemFulfillment(id)
       : fetchItemReceipt(id));
     if (record && typeof record === "object") {endpointTypes.set(record, step.transactionType);}
+    await readChargeSource(step, record);
     return record;
   }
 
@@ -122,7 +137,8 @@ export function createOperatorNetSuitePostingAdapter({
           ambiguous: true
         });
       }
-      return {
+      await readChargeSource(step, record);
+      const normalized = {
         ...record,
         id,
         tranId: record.tranId ?? record.tranid ?? found.tranid,
@@ -133,6 +149,8 @@ export function createOperatorNetSuitePostingAdapter({
           ?? found.createdfrom,
         transactionType: transactionTypeFromRecord(record, step.transactionType)
       };
+      purchaseChargeSources.set(normalized, purchaseChargeSources.get(record));
+      return normalized;
     },
     async transform(/** @type {Record<string, any>} */ step) {
       if (step.transactionType === "IF" && step.sourceOrderKind === "SO") {
@@ -170,8 +188,8 @@ export function createOperatorNetSuitePostingAdapter({
     },
     fetchById,
     verify(/** @type {Record<string, any>} */ step, /** @type {Record<string, any>} */ record) {
-      return verifyOperatorNetSuitePostingRecord(step, { ...record,
-        transactionType: transactionTypeFromRecord(record, endpointTypes.get(record)) });
+      return verifyPurchaseReceiptWithCharges(step, { ...record,
+        transactionType: transactionTypeFromRecord(record, endpointTypes.get(record)) }, purchaseChargeSources.get(record));
     }
   };
 }

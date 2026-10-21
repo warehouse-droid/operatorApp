@@ -16,7 +16,7 @@ test("selected receiving order card counts the same current remaining lines as i
     { item_type: "InvtPart", original_quantity: 100, quantity: 100, netsuite_active: true, sync_exception: "line_deleted" },
     { item_type: "NonInvtPart", sku: "DELIVERY CHARGE", quantity: 1 }
   ];
-  const context = vm.createContext({ receivingOrders: [order], receivingOrderType: "purchase_order",
+  const context = vm.createContext({ locationId: 28, receivingOrders: [order], receivingOrderType: "purchase_order",
     receivingDetailRequest: 0, receivingSelectedId: null, receivingSelectedOrder: null,
     invalidateReceivingRequests() {}, receivingRequestContext: () => ({}), receivingRequestIsCurrent: () => true,
     api: async () => ({ ...order, lines }), PICKABLE_ITEM_TYPES: new Set(["InvtPart"]), render() {} });

@@ -1,0 +1,383 @@
+--- a/src/dispatch-repository.js
++++ b/src/dispatch-repository.js
+@@ -341,6 +341,10 @@
+     netsuiteId: row.netsuite_id,
+     type: row.dispatch_type,
+     sourceTable: row.source_table,
++    firstSeenAt: row.first_seen_at instanceof Date ? row.first_seen_at.toISOString() : row.first_seen_at || null,
++    sourceOrderDate: row.source_order_date instanceof Date
++      ? row.source_order_date.toISOString().slice(0, row.dispatch_type === "CO" ? 24 : 10)
++      : row.source_order_date || null,
+     ...(row.dispatch_type === "CO" ? {
+       createdAt: row.local_order_created_at,
+       updatedAt: row.local_order_updated_at || row.local_order_created_at
+@@ -726,6 +730,7 @@
+         netsuite_id,
+         tranid,
+         trandate AS source_order_date,
++        first_seen_at,
+         'sales_order'::text AS order_type,
+         customer,
+         NULL::text AS destination_location,
+@@ -764,6 +769,7 @@
+         netsuite_id,
+         tranid,
+         trandate AS source_order_date,
++        first_seen_at,
+         'transfer_order'::text AS order_type,
+         NULL::text AS customer,
+         to_location AS destination_location,
+@@ -870,6 +876,7 @@
+         tranid,
+         dispatch_ref,
+         trandate AS source_order_date,
++        first_seen_at,
+         'purchase_order'::text AS order_type,
+         vendor,
+         source_location,
+@@ -905,6 +912,7 @@
+         tranid,
+         NULL::text AS dispatch_ref,
+         trandate AS source_order_date,
++        first_seen_at,
+         'transfer_order'::text AS order_type,
+         NULL::text AS vendor,
+         from_location AS source_location,
+@@ -1041,6 +1049,7 @@
+         o.tranid,
+         NULL::text AS dispatch_ref,
+         o.source_order_date,
++        o.first_seen_at,
+         CASE WHEN o.order_type = 'transfer_order' THEN 'TO' ELSE 'SO' END AS dispatch_type,
+         CASE WHEN o.order_type = 'transfer_order' THEN 'transfer_orders' ELSE 'sales_orders' END AS source_table,
+         COALESCE(o.customer, o.destination_location, '') AS party,
+@@ -1169,7 +1178,7 @@
+             OR o.status_text ILIKE '%Received%'
+           ))
+         )
+-      GROUP BY o.netsuite_id, o.tranid, o.source_order_date, o.order_type, o.customer, o.destination_location, o.destination_location_id,
++      GROUP BY o.netsuite_id, o.tranid, o.source_order_date, o.first_seen_at, o.order_type, o.customer, o.destination_location, o.destination_location_id,
+                o.expected_delivery_date, o.outbound_location, o.dispatch_address, o.dispatch_pickup_address,
+                o.dispatch_window_start, o.dispatch_window_end, o.dispatch_instructions,
+                o.dispatch_parse_source, o.operator_status, o.local_yard_order_status,
+@@ -1184,6 +1193,7 @@
+         o.tranid,
+         o.dispatch_ref,
+         o.source_order_date,
++        o.first_seen_at,
+         CASE WHEN o.order_type = 'transfer_order' THEN 'TO' ELSE 'PO' END AS dispatch_type,
+         CASE WHEN o.order_type = 'transfer_order' THEN 'transfer_orders' ELSE 'purchase_orders' END AS source_table,
+         COALESCE(o.vendor, o.source_location, '') AS party,
+@@ -1373,7 +1383,7 @@
+             AND d.netsuite_active = true
+             AND d.fulfillment_status <> 'fulfilled'
+         )
+-      GROUP BY o.netsuite_id, o.tranid, o.source_order_date, o.order_type, o.vendor, o.source_location,
++      GROUP BY o.netsuite_id, o.tranid, o.source_order_date, o.first_seen_at, o.order_type, o.vendor, o.source_location,
+                 o.dispatch_ref,
+                 o.destination_location, o.destination_location_id, o.expected_delivery_date, o.dispatch_vendor_yard,
+                o.dispatch_address, o.dispatch_delivery_address, o.dispatch_pickup_address, o.dispatch_window_start, o.dispatch_window_end,
+@@ -1395,6 +1405,7 @@
+         co.co_ref AS tranid,
+         NULL::text AS dispatch_ref,
+         co.created_at AS source_order_date,
++        co.created_at AS first_seen_at,
+         'CO' AS dispatch_type,
+         'local_co_orders' AS source_table,
+         COALESCE(co.details->>'customer', 'Transit Depot') AS party,
+@@ -1481,6 +1492,7 @@
+         v.vrma_ref AS tranid,
+         NULL::text AS dispatch_ref,
+         v.created_at::date AS source_order_date,
++        v.created_at AS first_seen_at,
+         'PO' AS dispatch_type,
+         'scm_vrma_orders' AS source_table,
+         COALESCE(v.local_vendor, v.vendor, 'Vendor Return') AS party,
+@@ -1614,7 +1626,7 @@
+              ROW_NUMBER() OVER (
+                PARTITION BY dispatch_type
+                ORDER BY CASE WHEN $2::boolean AND tranid LIKE 'TSTDEP-SO-%' THEN 0 ELSE 1 END,
+-                        source_order_date DESC NULLS LAST, netsuite_id DESC, tranid DESC
++                        first_seen_at DESC NULLS LAST, source_order_date DESC NULLS LAST, netsuite_id DESC, tranid DESC
+              ) AS dispatch_type_rank
+         FROM eligible_orders
+        WHERE ($5::text = '' OR dispatch_type = $5)
+@@ -1718,7 +1730,7 @@
+        OR orders.dispatch_type_rank <= $4
+        OR orders.dispatch_planned = true
+     ORDER BY CASE WHEN $2::boolean AND tranid LIKE 'TSTDEP-SO-%' THEN 0 ELSE 1 END,
+-             source_order_date DESC NULLS LAST, netsuite_id DESC, tranid DESC
++             first_seen_at DESC NULLS LAST, source_order_date DESC NULLS LAST, netsuite_id DESC, tranid DESC
+     LIMIT CASE WHEN $3::text <> '' THEN 200 ELSE NULL END
+     `,
+     params
+--- a/src/dispatch-order-recency.js
++++ b/src/dispatch-order-recency.js
+@@ -0,0 +1,51 @@
++// Arrival recency is independent of logistics update activity.
++/** @param {unknown} value */
++function validInstant(value) {
++  if (value instanceof Date) return Number.isFinite(value.getTime()) ? value.toISOString() : null;
++  if (typeof value !== "string") return null;
++  const candidate = value.trim();
++  if (!/^\d{4}-\d{2}-\d{2}(?:$|T| )/u.test(candidate)) return null;
++  const day = candidate.slice(0, 10);
++  const calendar = new Date(`${day}T00:00:00Z`);
++  if (!Number.isFinite(calendar.getTime()) || calendar.toISOString().slice(0, 10) !== day) return null;
++  const parsed = new Date(candidate);
++  return Number.isFinite(parsed.getTime()) ? parsed.toISOString() : null;
++}
++
++/** @param {Record<string, any>} order @param {Set<object>} seen @returns {string | null} */
++export function dispatchOrderSourceDate(order = {}, seen = new Set()) {
++  if (!order || seen.has(order)) return null;
++  seen.add(order);
++  const own = [order.sourceOrderDate, order.tranDate, order.raw?.source_order_date,
++    order.raw?.trandate, order.createdAt, order.created_at, order.raw?.created_at]
++    .map(validInstant).find(Boolean) || null;
++  const localCo = order.type === "CO" && order.sourceTable === "local_co_orders" && order.sourceOrderId;
++  if (localCo) return own;
++  const children = (Array.isArray(order.childOrderDetails) ? order.childOrderDetails : [])
++    .map(child => dispatchOrderSourceDate(child, seen)).filter(Boolean);
++  return children.length ? children.sort().at(-1) || null : own;
++}
++
++/** @param {Record<string, any>} order @param {Set<object>} seen @returns {string | null} */
++export function dispatchOrderFirstSeenAt(order = {}, seen = new Set()) {
++  if (!order || seen.has(order)) return null;
++  seen.add(order);
++  const own = [order.firstSeenAt, order.raw?.first_seen_at,
++    order.createdAt, order.created_at, order.raw?.created_at]
++    .map(validInstant).find(Boolean) || null;
++  const localCo = order.type === "CO" && order.sourceTable === "local_co_orders" && order.sourceOrderId;
++  if (localCo) return own;
++  const children = (Array.isArray(order.childOrderDetails) ? order.childOrderDetails : [])
++    .map(child => dispatchOrderFirstSeenAt(child, seen)).filter(Boolean);
++  return children.length ? children.sort().at(-1) || null : own;
++}
++
++/** @param {Record<string, any>} order */
++export function dispatchOrderRecency(order = {}) {
++  const arrival = dispatchOrderFirstSeenAt(order);
++  if (arrival) return arrival;
++  const original = dispatchOrderSourceDate(order);
++  if (original) return original;
++  return validInstant(order.updatedAt || order.updated_at || order.syncedAt
++    || order.synced_at || order.scm?.updatedAt) || new Date(0).toISOString();
++}
+--- a/src/dispatch-order-catalog-repository.js
++++ b/src/dispatch-order-catalog-repository.js
+@@ -1,4 +1,5 @@
+ import crypto from "node:crypto";
++import { dispatchOrderRecency } from "./dispatch-order-recency.js";
+ import { decorateSorOrders } from "./sor-rental-repository.js";
+ 
+ import { query, withTransaction } from "./db.js";
+@@ -70,7 +71,7 @@
+       full_order: { ...order, catalogHydrated: true },
+       source: text(source),
+       source_updated_at: activityAt(order),
+-      activity_at: activityAt(order)
++      activity_at: dispatchOrderRecency(order)
+     });
+   }
+   return rows;
+@@ -295,6 +296,9 @@
+       || parsed.k.length > 500
+       || parsed.r.length > 500
+     ) throw cursorError();
++    // Old cursors used update activity. Restart once with arrival-date ordering.
++    if (parsed.v === undefined) return null;
++    if (parsed.v !== 2) throw cursorError();
+     return { e: Number(parsed.e), d: parsed.d, k: parsed.k, r: parsed.r };
+   } catch (error) {
+     if (error?.code === "DISPATCH_ORDER_POOL_CURSOR_INVALID") throw error;
+@@ -355,7 +359,7 @@
+        UNION ALL
+        SELECT global_split.split_ref, global_split.order_type,
+               global_split.eligible, global_split.search_text,
+-              global_split.card, global_split.updated_at
++              global_split.card, COALESCE(NULLIF(global_split.card->>'firstSeenAt', '')::timestamptz, date_trunc('milliseconds', global_split.created_at))
+          FROM dispatch_global_order_splits global_split
+         WHERE global_split.active = true
+           AND NOT EXISTS (
+@@ -367,7 +371,7 @@
+        UNION ALL
+        SELECT global_group.group_ref, global_group.order_type,
+               global_group.eligible, global_group.search_text,
+-              global_group.card, global_group.updated_at
++              global_group.card, COALESCE(NULLIF(global_group.card->>'firstSeenAt', '')::timestamptz, date_trunc('milliseconds', global_group.created_at))
+          FROM dispatch_global_order_groups global_group
+         WHERE global_group.active = true
+           AND EXISTS (
+@@ -497,6 +501,7 @@
+   return {
+     orders: await decorateSorOrders(orders),
+     nextCursor: hasMore && last ? encodeCursor({
++      v: 2,
+       e: Number(last.exact_rank || 0),
+       d: new Date(last.activity_at).toISOString(),
+       k: text(last.order_ref).toLowerCase(),
+--- a/src/dispatch-planner-optimization.js
++++ b/src/dispatch-planner-optimization.js
+@@ -1,3 +1,5 @@
++import { dispatchOrderFirstSeenAt, dispatchOrderSourceDate } from "./dispatch-order-recency.js";
++
+ const DISPATCH_PLANNER_MODES = new Set(["off", "shadow", "on"]);
+ const CARD_ITEM_LIMIT = 8;
+ 
+@@ -98,6 +100,10 @@
+   if (transitCo) {card.transitCo = transitCo;}
+   card.id = identity(order);
+   card.type = text(order.type).toUpperCase();
++  const firstSeenAt = dispatchOrderFirstSeenAt(order);
++  if (firstSeenAt) {card.firstSeenAt = firstSeenAt;}
++  const sourceDate = dispatchOrderSourceDate(order);
++  if (sourceDate) {card.sourceOrderDate = ["SO", "PO", "TO"].includes(card.type) ? sourceDate.slice(0, 10) : sourceDate;}
+   card.items = (Array.isArray(order.items) ? order.items : [])
+     .slice(0, CARD_ITEM_LIMIT)
+     .map(compactCardItem);
+--- a/src/dispatch-delivery-group-repository.js
++++ b/src/dispatch-delivery-group-repository.js
+@@ -15,7 +15,7 @@
+ const GLOBAL_DERIVED_ORDER_TYPES = new Set(["SO", "PO", "TO", "CO", "CUSTOM"]);
+ const NETSUITE_DISPATCH_SOURCE_TABLES = new Set(["sales_orders", "purchase_orders", "transfer_orders"]);
+ const SPLIT_LIVE_SOURCE_FIELDS = Object.freeze([
+-  "sourceTable", "netsuiteId", "dispatchRef", "customer", "customerName",
++  "sourceTable", "firstSeenAt", "sourceOrderDate", "netsuiteId", "dispatchRef", "customer", "customerName",
+   "address", "pickupAddress", "pickupAddressOverride", "sourceAddress",
+   "defaultSourceAddress", "pickupLocation", "pickupLocations", "sourceYard",
+   "destinationYard", "destinationAddress", "defaultDestinationAddress",
+--- a/src/server.js
++++ b/src/server.js
+@@ -1974,8 +1974,7 @@
+     [...orders, ...snapshotOrders, ...hiddenScmOrders].filter(order => order.type === "TO")
+       .flatMap(order => [order.id, ...(order.childOrders || [])])
+   );
+-  const decorateTransfer = order => (searchTerm || exactIdentityRequest)
+-    ? annotateFulfilledTransferOrders([order], transferStates)[0] : order;
++  const decorateTransfer = order => annotateFulfilledTransferOrders([order], transferStates)[0];
+   const fulfilledSalesStates = await listFulfilledSalesDeliveryStates(
+     [...orders, ...snapshotOrders, ...hiddenScmOrders].filter(order => order.type === "SO")
+       .flatMap(order => [order.id, ...(order.childOrders || [])])
+--- a/migrations/242_dispatch_order_first_seen.sql
++++ b/migrations/242_dispatch_order_first_seen.sql
+@@ -0,0 +1,118 @@
++-- Dispatch recency follows arrival in this application, independently of the
++-- NetSuite transaction date or a later synchronization/edit. Older headers did
++-- not retain first arrival; recover the earliest available local evidence.
++SET LOCAL lock_timeout = '5s';
++SET LOCAL statement_timeout = '60s';
++
++DO $migration$
++DECLARE
++  source record;
++BEGIN
++  FOR source IN
++    SELECT * FROM (VALUES
++      ('sales_orders', 'SO', 'sales_order'),
++      ('purchase_orders', 'PO', 'purchase_order'),
++      ('transfer_orders', 'TO', 'transfer_order')
++    ) AS sources(table_name, order_type, entity_type)
++  LOOP
++    EXECUTE format(
++      'ALTER TABLE %I ADD COLUMN IF NOT EXISTS first_seen_at timestamptz',
++      source.table_name
++    );
++
++    EXECUTE format($backfill$
++      WITH discovery AS MATERIALIZED (
++        SELECT audit.details->'order'->>'netsuite_id' AS record_id,
++               min(audit.created_at) AS first_seen_at
++          FROM delivery_audit_log audit
++         WHERE audit.source = 'netsuite'
++           AND audit.action IN (
++             'netsuite.order.discover', 'netsuite.receiving_order.discover'
++           )
++           AND audit.details->'order'->>'order_type' = %L
++         GROUP BY audit.details->'order'->>'netsuite_id'
++      ), catalog_identity AS MATERIALIZED (
++        SELECT candidate.created_at, candidate.order_type,
++               lower(candidate.order_ref) AS order_ref,
++               candidate.full_order->>'sourceTable' AS source_table,
++               candidate.full_order->>'sourceRecordId' AS source_record_id,
++               candidate.full_order->>'netsuiteId' AS netsuite_id,
++               candidate.full_order->'raw'->>'netsuite_id' AS raw_netsuite_id
++          FROM dispatch_order_catalog_entries candidate
++         WHERE candidate.order_type = %L
++            OR candidate.full_order->>'sourceTable' = %L
++      ), catalog_by_id AS MATERIALIZED (
++        SELECT identity.record_id, min(candidate.created_at) AS first_seen_at
++          FROM catalog_identity candidate
++          CROSS JOIN LATERAL (VALUES
++            (candidate.source_record_id), (candidate.netsuite_id), (candidate.raw_netsuite_id)
++          ) identity(record_id)
++         WHERE candidate.source_table = %L
++           AND identity.record_id IS NOT NULL
++         GROUP BY identity.record_id
++      ), catalog_by_ref AS MATERIALIZED (
++        SELECT candidate.order_ref, min(candidate.created_at) AS first_seen_at
++          FROM catalog_identity candidate
++         WHERE candidate.order_type = %L
++         GROUP BY candidate.order_ref
++      ), arrivals AS (
++        SELECT header.netsuite_id,
++               COALESCE(LEAST(
++                 discovery.first_seen_at,
++                 catalog_by_id.first_seen_at,
++                 catalog_by_ref.first_seen_at,
++                 header.synced_at,
++                 header.status_updated_at,
++                 header.dispatch_parsed_at
++               ), '1970-01-01T00:00:00Z'::timestamptz) AS first_seen_at
++          FROM %I header
++          LEFT JOIN discovery
++            ON discovery.record_id = header.netsuite_id::text
++          LEFT JOIN catalog_by_id
++            ON catalog_by_id.record_id = header.netsuite_id::text
++          LEFT JOIN catalog_by_ref
++            ON catalog_by_ref.order_ref = lower(header.tranid)
++         WHERE header.first_seen_at IS NULL
++      )
++      UPDATE %I header
++         SET first_seen_at = arrivals.first_seen_at
++        FROM arrivals
++       WHERE header.netsuite_id = arrivals.netsuite_id
++         AND header.first_seen_at IS NULL
++    $backfill$, source.entity_type, source.order_type, source.table_name,
++       source.table_name, source.order_type, source.table_name, source.table_name);
++
++    EXECUTE format(
++      'ALTER TABLE %I ALTER COLUMN first_seen_at SET DEFAULT now(), ALTER COLUMN first_seen_at SET NOT NULL',
++      source.table_name
++    );
++  END LOOP;
++END;
++$migration$;
++
++CREATE OR REPLACE FUNCTION preserve_dispatch_order_first_seen_at()
++RETURNS trigger LANGUAGE plpgsql AS $function$
++BEGIN
++  NEW.first_seen_at := OLD.first_seen_at;
++  RETURN NEW;
++END;
++$function$;
++
++DO $migration$
++DECLARE
++  source_table text;
++BEGIN
++  FOREACH source_table IN ARRAY ARRAY['sales_orders', 'purchase_orders', 'transfer_orders']
++  LOOP
++    EXECUTE format('DROP TRIGGER IF EXISTS preserve_dispatch_order_first_seen_at ON %I', source_table);
++    EXECUTE format(
++      'CREATE TRIGGER preserve_dispatch_order_first_seen_at BEFORE UPDATE OF first_seen_at ON %I FOR EACH ROW EXECUTE FUNCTION preserve_dispatch_order_first_seen_at()',
++      source_table
++    );
++    EXECUTE format(
++      'COMMENT ON COLUMN %I.first_seen_at IS %L', source_table,
++      'Immutable local first-arrival timestamp. Historical rows use the earliest retained local evidence; epoch means arrival is unknown. Later syncs and edits preserve it.'
++    );
++  END LOOP;
++END;
++$migration$;

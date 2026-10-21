@@ -44,6 +44,8 @@ const proposalContext = vm.createContext({
   Set,
   Intl
 });
+vm.runInContext(readPublic("scm-smart-line-order-core.js"), proposalContext);
+vm.runInContext(readPublic("scm-smart-line-order.js"), proposalContext);
 vm.runInContext(readPublic("scm-smart-proposals.js"), proposalContext, { filename: "scm-smart-proposals.js" });
 vm.runInContext(readPublic("scm-smart-exclusions.js"), proposalContext, { filename: "scm-smart-exclusions.js" });
 assert.equal(proposalContext.smartState.planCompact, true, "Compact should be the default proposal view for a new browser.");
@@ -711,7 +713,9 @@ const forecastContext = vm.createContext({
 const smartCoreUiSource = readPublic("scm-smart.js");
 const smartBlanketUiSource = readPublic("scm-smart-blanket.js");
 const smartVendorUiSource = readPublic("scm-smart-vendor.js");
+vm.runInContext(readPublic("scm-smart-line-order-core.js"), forecastContext);
 vm.runInContext(smartCoreUiSource, forecastContext, { filename: "scm-smart.js" });
+vm.runInContext(readPublic("scm-smart-line-order.js"), forecastContext);
 vm.runInContext("smartState.operator = { role: 'scm' };", forecastContext);
 
 const smartNoticeDismissSource = smartCoreUiSource.slice(

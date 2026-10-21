@@ -55,7 +55,7 @@ test('L2 received CO and its proven shared pickup do not block a fresh customer-
   assert.deepEqual(await protectedCoHistory(f), before);
 }));
 
-test('L2 active CO, absent arrival evidence and real SO packing still block linking', () => isolated(async () => {
+test('L2 active CO, absent arrival evidence and real SO loading still block linking', () => isolated(async () => {
   const f = await completedSharedCo(await seedLinkGroup());
   const command = await linkCommand(f, { planDate: f.plan.planDate });
   for (const sql of ["UPDATE local_co_orders SET received_at=NULL,details=details-'driverCompletionRecordId' WHERE co_ref=$1",
@@ -66,7 +66,7 @@ test('L2 active CO, absent arrival evidence and real SO packing still block link
       assert.ok(preview.blockers.some(row => row.code === 'OPERATOR_ACTIVITY_STARTED'));
     }, { rollback: true });
   }
-  await query('UPDATE sales_order_lines SET packed_piece_qty=1 WHERE id=$1', [f.lines[0].id]);
+  await query('UPDATE sales_order_lines SET loaded_qty=1 WHERE id=$1', [f.lines[0].id]);
   assert.ok((await previewScmDependencyMutation(command)).blockers.some(row => row.code === 'OPERATOR_ACTIVITY_STARTED'));
 }));
 

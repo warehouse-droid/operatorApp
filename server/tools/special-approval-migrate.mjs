@@ -1,0 +1,13 @@
+import assert from 'node:assert/strict';
+import {readFileSync} from 'node:fs';
+import {query,withTransaction,closeDb} from '../src/db.js';
+assert.equal(process.env.MBT_TEST_ISOLATED,'1');
+assert.ok(process.env.DATABASE_URL.endsWith('/mbt_verify'));
+const sql=readFileSync('migrations/237_special_purchase_approval.sql','utf8');
+const before=(await query("SELECT pg_get_viewdef('special_stock_workflow_stages'::regclass) AS definition")).rows[0].definition;
+await withTransaction(()=>query(sql),{rollback:true});
+assert.equal((await query("SELECT pg_get_viewdef('special_stock_workflow_stages'::regclass) AS definition")).rows[0].definition,before);
+await withTransaction(()=>query(sql));
+await withTransaction(()=>query(sql));
+console.log('Isolated migration: rollback and idempotent apply verified.');
+await closeDb();

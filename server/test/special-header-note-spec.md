@@ -1,0 +1,19 @@
+Sales Special Request header Note — Tier 3
+
+Scope: one always-visible Note textarea in the existing delivery header form before Sales Order creation, and one Save header button. No Edit note button. Issued-order delivery editing retains its existing review/sync flow. Spec approval: not obtained (autonomous run); the user confirmed before-SO editing and directed the shared header save.
+
+Acceptance criteria:
+1. Saving multiline English/Chinese notes including × preserves the exact text (CRLF canonicalizes to LF), with a maximum of 8,000 characters. Empty notes can be cleared. Invalid types, control characters or oversized notes reject the whole save.
+2. The header saves Note, delivery method, address, contact name/phone, date, time window and delivery instructions together in one local transaction. A changed delivery target follows existing delivery validation. A Note-only save also works when an old preferred delivery date has elapsed.
+3. A successful save increments the request revision once and records before/after header values in an all-audience audit. Identical saves are no-ops. It preserves raw request status/stage, every material/PALLET commercial value, SCM check, customer decision, unsent order line and unrelated header field. It never restarts the enquiry.
+4. Current notes appear in quotes and copied request drafts and are safely escaped with line breaks visible in Sales and SCM. Existing NetSuite PO Note and local PO split notes are separate and untouched.
+5. Authentication, Sales role, authorized yard, workflow flag, original revision, before-SO and dispatch/closure guards apply. Concurrent edits and SO claims serialize on the request lock; a SQL/audit failure rolls back Note, delivery, revision and audit together. No external request is needed for this pre-order save.
+6. The UI has no Edit note button, keeps dirty header fields across renders and errors, fits phone and desktop widths, and cannot silently overwrite a changed revision. Conflicts retain entered values and require reloading the header. Saving other editors must not discard an unsaved header.
+
+Failure model: partial Note/address saves (SQL fault injection); status/review or price loss (SQL full-row invariants); stale write/order race (real concurrent HTTP/DB tests); hostile input/access (boundary and role/yard/flag tests); lost or executable text (properties and Chromium escaping/conflict tests); unintended NetSuite/unrelated deployment changes (outbound guards, captured live tree with task-only delta and service hashes).
+
+Setup: use existing isolated database and installed Node, TypeScript, ESLint, c8, fast-check and Playwright. Add focused acceptance tests, RED logs, five manual mutants, a reproducible check script and evidence. No dependencies, migrations, commits or installations. Capture the current deployed app before editing; deploy only this task’s delta onto that captured source with app-only rollback. Live SPREQ-000022 already contains the specified Note; do not mutate it during verification. No performance budget or new runtime capability is requested.
+
+Discovered formatting edge case: HTML textarea parsing consumes an initial newline. Add a real Chromium parser acceptance case for leading/trailing blank lines and ensure rendering preserves the stored Note exactly, including a no-edit reopen/save. This strengthens criteria 1, 4 and 6 without changing the approved product scope.
+
+Draft retention refinement: a case-line save must reject while header fields are unsaved, retaining both editors and giving explicit instructions to cancel case edits, save the header and reopen the line editor. This prevents the case editor’s existing draft cleanup from discarding a newly entered Note. Reproduce the case using a real browser and a successful case-line API boundary before the guard.

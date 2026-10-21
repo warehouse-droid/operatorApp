@@ -28,7 +28,7 @@ function commercial(snapshot) {
 }
 /** @param {number} id @param {Transport} boundary @returns {Promise<State>} */
 async function read(id,boundary) {
-  const {record,snapshot}=await readSpecialRestOrder({id,kind:'sales_order'},boundary);
+  const {record,snapshot}=await readSpecialRestOrder({id,kind:'sales_order'},boundary,{allowHeaderDiscount:true});
   return {delivery:deliveryFields(record),commercial:commercial(snapshot)};
 }
 /** @param {unknown} value */

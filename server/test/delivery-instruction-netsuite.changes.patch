@@ -1,0 +1,529 @@
+--- a/server/src/delivery-instruction-netsuite.js
++++ b/server/src/delivery-instruction-netsuite.js
+@@ -0,0 +1,78 @@
++import { isDeepStrictEqual as same } from 'node:util';
++
++/**
++ * @typedef {{memo:string,shipDate:string,deliverByDate:string}} Values
++ * @typedef {{orderId:number,orderRef:string,locationId:number,deliveryMethodId:number,status:string}} Identity
++ * @typedef {{identity:Identity,values:Values,editable:boolean,lockReason:string}} Snapshot
++ * @typedef {{rest:(path:string,options?:{method?:string,body?:Record<string,string|null>})=>Promise<{data?:Record<string,any>}>}} Boundary
++ */
++/** @param {string} message @param {number} [status] */
++function invalid(message, status = 400) {
++  return Object.assign(new Error(message), { status, code: 'DELIVERY_INSTRUCTION_NETSUITE' });
++}
++/** @param {unknown} value */
++function orderId(value) {
++  if (!Number.isSafeInteger(value) || Number(value) <= 0) throw invalid('A valid NetSuite Sales Order ID is required.');
++  return Number(value);
++}
++/** @param {unknown} value @param {string} label */
++function calendarDate(value, label) {
++  if (value === '') return '';
++  if (typeof value !== 'string' || !/^[1-9]\d{3}-\d{2}-\d{2}$/.test(value)) throw invalid(`${label} must be a date in YYYY-MM-DD format, or blank.`);
++  const date = new Date(`${value}T12:00:00Z`);
++  if (!Number.isFinite(date.getTime()) || date.toISOString().slice(0, 10) !== value) throw invalid(`${label} is not a valid calendar date.`);
++  return value;
++}
++/** @param {unknown} input @returns {Values} */
++export function normalizeDeliveryNetSuiteValues(input) {
++  if (!input || typeof input !== 'object' || Array.isArray(input)
++    || Object.keys(input).length !== 3 || !['memo', 'shipDate', 'deliverByDate'].every(key => Object.hasOwn(input, key))) {
++    throw invalid('Only the NetSuite memo instruction, Ship Date and To be delivered by fields may be updated.');
++  }
++  const value = /** @type {Record<string,unknown>} */ (input);
++  if (typeof value.memo !== 'string' || value.memo.length > 5000 || value.memo.includes('\0')) throw invalid('NetSuite memo instruction must be text of at most 5,000 characters.');
++  return { memo: value.memo.replace(/\r\n?/g, '\n'), shipDate: calendarDate(value.shipDate, 'Ship Date'),
++    deliverByDate: calendarDate(value.deliverByDate, 'To be delivered by') };
++}
++/** @param {number} id @param {Boundary} boundary @returns {Promise<Snapshot>} */
++export async function readDeliveryNetSuite(id, boundary) {
++  const { data: record } = await boundary.rest(`/record/v1/salesOrder/${orderId(id)}`);
++  if (!record || Number(record.id) !== id || !record.tranId || !record.status?.id || !record.location?.id || !record.custbody3?.id) {
++    throw invalid('NetSuite did not return the complete Sales Order identity. Reload the order before editing.', 502);
++  }
++  const identity = { orderId: id, orderRef: String(record.tranId), locationId: Number(record.location.id),
++    deliveryMethodId: Number(record.custbody3.id), status: String(record.status.id) };
++  const editable = identity.deliveryMethodId === 2 && ['A', 'B', 'D', 'E', 'F', 'G'].includes(identity.status);
++  return { identity, values: normalizeDeliveryNetSuiteValues({ memo: record.custbody7 ?? '',
++    shipDate: record.shipDate ?? '', deliverByDate: record.custbody4 ?? '' }), editable,
++  lockReason: editable ? '' : 'This NetSuite Sales Order is closed, cancelled, or no longer a Delivery order.' };
++}
++/** @param {{orderId:number,expected:Snapshot,values:Values}} input @param {Boundary} boundary @returns {Promise<Snapshot>} */
++export async function updateDeliveryNetSuite(input, boundary) {
++  const id = orderId(input.orderId), target = normalizeDeliveryNetSuiteValues(input.values);
++  const before = normalizeDeliveryNetSuiteValues(input.expected?.values);
++  const current = await readDeliveryNetSuite(id, boundary);
++  if (!current.editable || !same(current.identity, input.expected?.identity)
++    || (!same(current.values, before) && !same(current.values, target))) {
++    throw invalid('The Sales Order changed in NetSuite. Reload NetSuite values and review your changes before saving.', 409);
++  }
++  if (same(current.values, target)) return current;
++  /** @type {Record<string,string|null>} */
++  const body = {};
++  for (const [key, field] of /** @type {Array<[keyof Values,string]>} */ ([['memo', 'custbody7'], ['shipDate', 'shipDate'], ['deliverByDate', 'custbody4']])) {
++    if (current.values[key] !== target[key]) body[field] = target[key] || null;
++  }
++  let patchError;
++  try { await boundary.rest(`/record/v1/salesOrder/${id}`, { method: 'PATCH', body }); }
++  catch (error) { patchError = error; }
++  let after;
++  try { after = await readDeliveryNetSuite(id, boundary); }
++  catch {
++    throw invalid('NetSuite save could not be verified. Your input is retained. Retry the same save or reload NetSuite values to check the result.', 502);
++  }
++  if (same(after.identity, current.identity) && same(after.values, target)) return after;
++  if (patchError && same(after.values, before)) {
++    throw invalid('The changes were not saved in NetSuite. Check your access and try again; your input is retained.', 502);
++  }
++  throw invalid('NetSuite returned different values after saving. Reload NetSuite values and review the result before trying again.', 409);
++}
+--- a/server/src/delivery-instruction-repository.js
++++ b/server/src/delivery-instruction-repository.js
+@@ -11,6 +11,60 @@
+ } from "./delivery-instruction-domain.js";
+ import { salesStoreLocationIdSql } from "./sales-store.js";
+ import { netSuiteClosedOrderFamilySql } from "./netsuite-closed-order-policy.js";
++import { normalizeDeliveryNetSuiteValues } from './delivery-instruction-netsuite.js';
++import { readDeliveryInstructionFromNetSuite, updateDeliveryInstructionInNetSuite } from './netsuite.js';
++
++const deliveryNetSuite = { read: readDeliveryInstructionFromNetSuite, update: updateDeliveryInstructionInNetSuite };
++
++function assertNetSuiteSalesContext(context) {
++  if (context.source !== 'sales' || !normalizedAuthorizedYards(context.authorizedOrderingLocationIds)?.length) {
++    throw repositoryError('An authorized staff Sales account is required to edit NetSuite delivery instructions.', 403, 'DELIVERY_INSTRUCTION_FORBIDDEN');
++  }
++}
++
++function assertRemoteDeliveryIdentity(row, netSuite, context) {
++  const identity = netSuite?.identity;
++  if (!identity || !Number.isSafeInteger(identity.orderId) || typeof identity.orderRef !== 'string'
++    || !Number.isSafeInteger(identity.locationId)) {
++    throw repositoryError('A complete NetSuite snapshot is required. Reload NetSuite values before saving.', 400);
++  }
++  if (identity.orderId !== Number(row.order_id) || identity.orderRef !== row.order_ref
++    || identity.locationId !== Number(row.ordering_location_id)) {
++    throw repositoryError('The Sales Order identity or yard changed in NetSuite. Refresh the order before editing.', 409);
++  }
++  assertOrderYardAccess({ ordering_location_id: identity.locationId }, context.authorizedOrderingLocationIds);
++}
++
++export async function getDeliveryInstructionNetSuite(identifier, context = {}, remote = deliveryNetSuite) {
++  assertNetSuiteSalesContext(context);
++  const row = await findOrderRow(identifier);
++  assertOrderYardAccess(row, context.authorizedOrderingLocationIds);
++  const netSuite = await remote.read(Number(row.order_id));
++  assertRemoteDeliveryIdentity(row, netSuite, context);
++  return { ...await getDeliveryInstruction(row.order_id, context), netSuite };
++}
++
++export async function saveDeliveryInstructionNetSuite(identifier, input = {}, context = {}, remote = deliveryNetSuite) {
++  assertNetSuiteSalesContext(context);
++  const values = normalizeDeliveryNetSuiteValues(input.values);
++  normalizeDeliveryNetSuiteValues(input.expected?.values);
++  return withTransaction(async () => {
++    const row = await lockOrderState(identifier, context);
++    assertEditable(row);
++    assertDeliveryInstructionRevision(input.expectedRevision, row.revision);
++    assertRemoteDeliveryIdentity(row, input.expected, context);
++    const netSuite = await remote.update({ orderId: Number(row.order_id), expected: input.expected, values });
++    assertRemoteDeliveryIdentity(row, netSuite, context);
++    const automatic = deriveMemoDeliveryInstruction(netSuite.values.memo);
++    await query(`UPDATE sales_orders SET memo=$2, expected_delivery_date=$3::date,
++      dispatch_instructions=$4, dispatch_instruction_details=$5::jsonb,
++      dispatch_instruction_parse_version=2, dispatch_instruction_parsed_at=now()
++      WHERE netsuite_id=$1`, [row.order_id, netSuite.values.memo, netSuite.values.deliverByDate || null,
++      automatic.text, JSON.stringify(automatic)]);
++    await incrementRevision(row, { operatorId: context.operatorId, source: 'sales' });
++    return { ...await getDeliveryInstruction(row.order_id, context), netSuite };
++  });
++}
+ 
+ const EFFECTIVE_ORDERING_LOCATION_SQL = `COALESCE(
+   so.order_location_id,
+--- a/server/src/netsuite.js
++++ b/server/src/netsuite.js
+@@ -1580,6 +1580,16 @@
+ export async function readRegularStockSalesOrderFromNetSuite(reference) {
+   const { readRegularSalesOrder } = await import('./regular-stock-netsuite-adapter.js');
+   return readRegularSalesOrder(reference, { rest: netsuiteRest, queryAll: suiteqlAll, resolveYards: resolveNetSuiteYardLocations });
++}
++
++export async function readDeliveryInstructionFromNetSuite(orderId) {
++  const { readDeliveryNetSuite } = await import('./delivery-instruction-netsuite.js');
++  return readDeliveryNetSuite(orderId, { rest: netsuiteRest });
++}
++
++export async function updateDeliveryInstructionInNetSuite(input) {
++  const { updateDeliveryNetSuite } = await import('./delivery-instruction-netsuite.js');
++  return queueNetSuiteMutation(() => updateDeliveryNetSuite(input, { rest: netsuiteRest }));
+ }
+ 
+ export async function applyRegularStockSalesOrderLocationInNetSuite(input) {
+--- a/server/src/server.js
++++ b/server/src/server.js
+@@ -413,12 +413,14 @@
+ import { cachePhotoThumbnail, createPhotoThumbnail, readCachedPhotoThumbnail } from "./photo-thumbnail.js";
+ import {
+   getDeliveryInstruction,
++  getDeliveryInstructionNetSuite,
+   getDeliveryInstructionMedia,
+   issueDeliveryInstructionMediaUpload,
+   listDeliveryInstructionOrders,
+   registerDeliveryInstructionMedia,
+   removeDeliveryInstructionMedia,
+-  saveDeliveryInstructionText
++  saveDeliveryInstructionText,
++  saveDeliveryInstructionNetSuite
+ } from "./delivery-instruction-repository.js";
+ import {
+   localizeDeliveryInstructionSet,
+@@ -10570,6 +10572,22 @@
+   } catch (error) {
+     next(error);
+   }
++});
++
++app.get('/api/sales/delivery-instructions/orders/:id/netsuite', requirePrivateSalesRecordAccess, operatorNetSuitePriority, async (req, res, next) => {
++  try {
++    deliveryInstructionNoStore(res);
++    res.json(await getDeliveryInstructionNetSuite(req.params.id, deliveryInstructionContext(req, 'sales')));
++  } catch (error) { next(error); }
++});
++
++app.put('/api/sales/delivery-instructions/orders/:id/netsuite', requirePrivateSalesRecordAccess, operatorNetSuitePriority, async (req, res, next) => {
++  try {
++    deliveryInstructionNoStore(res);
++    const detail = await saveDeliveryInstructionNetSuite(req.params.id, req.body || {}, deliveryInstructionContext(req, 'sales'));
++    await auditDeliveryInstructionMutation(req, 'delivery.instructions.netsuite.updated', detail, 'sales');
++    res.json(detail);
++  } catch (error) { next(error); }
+ });
+ 
+ async function issueDeliveryInstructionUploadRoute(req, res, next, source) {
+--- a/server/public/sales-delivery-instructions.js
++++ b/server/public/sales-delivery-instructions.js
+@@ -6,6 +6,13 @@
+   orders: [],
+   selectedId: Number(localStorage.getItem("mbbs.sales.deliveryInstructions.selected")) || null,
+   detail: null,
++  netSuite: null,
++  netSuiteDraft: null,
++  additionalDraft: null,
++  netSuiteError: "",
++  loadingNetSuite: false,
++  savingNetSuite: false,
++  detailGeneration: 0,
+   search: "",
+   loadingList: true,
+   loadingDetail: false,
+@@ -50,12 +57,54 @@
+   const contentType = response.headers.get("content-type") || "";
+   const payload = contentType.includes("application/json") ? await response.json() : await response.text();
+   if (!response.ok) {
+-    const error = new Error(payload?.error || payload || `Request failed (${response.status})`);
++    const message = typeof payload === "string" ? payload : typeof payload?.error === "string" ? payload.error : payload?.error?.message || payload?.message;
++    const error = new Error(message || `Request failed (${response.status})`);
+     error.status = response.status;
+     error.code = payload?.code || "";
+     throw error;
+   }
+   return payload;
++}
++
++function salesDeliveryInstructionBusyControls() {
++  const busy = salesDeliveryInstructionState.saving || salesDeliveryInstructionState.loadingNetSuite || salesDeliveryInstructionState.loadingDetail || salesDeliveryInstructionState.loadingList;
++  salesDeliveryInstructionApp.setAttribute("aria-busy", String(busy));
++  const sidebar = document.querySelector(".app-sidebar");
++  if (sidebar) sidebar.inert = busy;
++  for (const control of document.querySelectorAll("button, input, textarea, select")) {
++    if (busy) {
++      if (control.dataset.deliveryBusy === undefined) control.dataset.deliveryBusy = String(control.disabled);
++      control.disabled = true;
++    } else if (control.dataset.deliveryBusy !== undefined) {
++      control.disabled = control.dataset.deliveryBusy === "true";
++      delete control.dataset.deliveryBusy;
++    }
++  }
++}
++
++function salesDeliveryInstructionNetSuiteHtml(detail) {
++  const state = salesDeliveryInstructionState;
++  const values = state.netSuiteDraft || { memo: "", shipDate: "", deliverByDate: "" };
++  const editable = detail.editable && state.netSuite?.editable;
++  const disabled = editable ? "" : "disabled";
++  return `<p class="delivery-instruction-muted">${deliveryInstructionEscape(deliveryInstructionT("deliveryInstruction.netsuiteHelp", "Changes here are saved to this Sales Order in NetSuite."))}</p>
++    ${state.loadingNetSuite || state.savingNetSuite ? `<div role="status" class="delivery-instruction-notice delivery-instruction-busy">${deliveryInstructionEscape(state.savingNetSuite ? deliveryInstructionT("deliveryInstruction.savingNetSuite", "Saving to NetSuite… Please wait.") : deliveryInstructionT("deliveryInstruction.loadingNetSuite", "Loading NetSuite values… Please wait."))}</div>` : ""}
++    ${state.netSuiteError ? `<div role="alert" class="delivery-instruction-notice error">${deliveryInstructionEscape(state.netSuiteError)}</div>` : ""}
++    ${state.netSuite?.lockReason ? `<div class="delivery-instruction-notice">${deliveryInstructionEscape(state.netSuite.lockReason)}</div>` : ""}
++    <label for="salesDeliveryInstructionMemo">${deliveryInstructionEscape(deliveryInstructionT("deliveryInstruction.netsuiteMemo", "NetSuite memo instruction"))}</label>
++    <textarea id="salesDeliveryInstructionMemo" maxlength="5000" ${disabled}>${deliveryInstructionEscape(values.memo)}</textarea>
++    <div class="delivery-instruction-date-fields">
++      <label for="salesDeliveryInstructionShipDate">${deliveryInstructionEscape(deliveryInstructionT("deliveryInstruction.shipDate", "Ship Date"))}
++        <input id="salesDeliveryInstructionShipDate" type="date" min="1000-01-01" max="9999-12-31" value="${deliveryInstructionEscape(values.shipDate)}" ${disabled} />
++      </label>
++      <label for="salesDeliveryInstructionDeliverByDate">${deliveryInstructionEscape(deliveryInstructionT("deliveryInstruction.deliverByDate", "To be delivered by"))}
++        <input id="salesDeliveryInstructionDeliverByDate" type="date" min="1000-01-01" max="9999-12-31" value="${deliveryInstructionEscape(values.deliverByDate)}" ${disabled} />
++      </label>
++    </div>
++    <div class="delivery-instruction-actions">
++      <button class="primary" type="button" data-delivery-instruction-action="save-netsuite" ${disabled}>${deliveryInstructionEscape(deliveryInstructionT("deliveryInstruction.saveNetSuite", "Save to NetSuite"))}</button>
++      <button type="button" data-delivery-instruction-action="reload-netsuite">${deliveryInstructionEscape(deliveryInstructionT("deliveryInstruction.reloadNetSuite", "Reload NetSuite values"))}</button>
++    </div>`;
+ }
+ 
+ function deliveryInstructionContentUrl(media) {
+@@ -95,6 +144,7 @@
+   if (!list) return;
+   if (salesDeliveryInstructionState.loadingList) {
+     list.innerHTML = `<div class="delivery-instruction-empty">${deliveryInstructionEscape(deliveryInstructionT("deliveryInstruction.loading", "Loading delivery orders…"))}</div>`;
++    salesDeliveryInstructionBusyControls();
+     return;
+   }
+   if (!salesDeliveryInstructionState.orders.length) {
+@@ -107,6 +157,7 @@
+       <span>${deliveryInstructionEscape(order.customer || deliveryInstructionT("deliveryInstruction.noCustomer", "Customer not available"))}</span>
+       <small>${deliveryInstructionEscape(deliveryInstructionDate(order.orderDate))} · ${deliveryInstructionEscape(order.status || "—")}</small>
+     </button>`).join("");
++  salesDeliveryInstructionBusyControls();
+ }
+ 
+ function deliveryInstructionMediaHtml(media, editable) {
+@@ -130,6 +181,7 @@
+   if (!editor) return;
+   if (salesDeliveryInstructionState.loadingDetail) {
+     editor.innerHTML = `<div class="delivery-instruction-empty">${deliveryInstructionEscape(deliveryInstructionT("deliveryInstruction.loadingDetail", "Loading instructions…"))}</div>`;
++    salesDeliveryInstructionBusyControls();
+     return;
+   }
+   const detail = salesDeliveryInstructionState.detail;
+@@ -140,7 +192,7 @@
+   const automaticText = detail.automatic?.text || "";
+   const phones = Array.isArray(detail.automatic?.phones) ? detail.automatic.phones : [];
+   const media = Array.isArray(detail.media) ? detail.media : [];
+-  const busy = salesDeliveryInstructionState.saving;
++  const busy = salesDeliveryInstructionState.saving || salesDeliveryInstructionState.loadingNetSuite;
+   const mediaUploadEnabled = detail.editable && !busy && media.length < 5;
+   editor.innerHTML = `<div class="delivery-instruction-editor-grid">
+     <div class="delivery-instruction-heading-line">
+@@ -153,13 +205,16 @@
+     ${detail.editable ? "" : `<div class="delivery-instruction-notice">${deliveryInstructionEscape(detail.lockReason || deliveryInstructionT("deliveryInstruction.completedLock", "This completed order is retained for reference and cannot be edited."))}</div>`}
+     <section class="delivery-instruction-section">
+       <h3>${deliveryInstructionEscape(deliveryInstructionT("deliveryInstruction.netsuiteMemo", "NetSuite memo instruction"))}</h3>
++      ${salesDeliveryInstructionNetSuiteHtml(detail)}
++      <h4>${deliveryInstructionEscape(deliveryInstructionT("deliveryInstruction.driverPreview", "Driver instruction preview"))}</h4>
+       <p class="delivery-instruction-muted">${deliveryInstructionEscape(deliveryInstructionT("deliveryInstruction.automaticHelp", "Address and planned date/time are omitted when confidently recognized. Ambiguous notes remain complete."))}</p>
+       <p class="delivery-instruction-automatic">${deliveryInstructionEscape(automaticText || deliveryInstructionT("deliveryInstruction.noAutomatic", "No memo delivery instruction."))}</p>
+       ${phones.length ? `<div class="delivery-instruction-phone-list">${phones.map((phone) => `<a href="tel:${deliveryInstructionEscape(phone.href)}">☎ ${deliveryInstructionEscape(phone.display)}</a>`).join("")}</div>` : ""}
+     </section>
+     <section class="delivery-instruction-section">
+       <h3>${deliveryInstructionEscape(deliveryInstructionT("deliveryInstruction.additionalText", "Additional delivery text"))}</h3>
+-      <textarea id="salesDeliveryInstructionText" maxlength="5000" ${detail.editable && !busy ? "" : "disabled"} placeholder="${deliveryInstructionEscape(deliveryInstructionT("deliveryInstruction.additionalPlaceholder", "Add call-ahead, gate, placement, access, or other driver instructions"))}">${deliveryInstructionEscape(detail.additionalText || "")}</textarea>
++      <p class="delivery-instruction-muted">${deliveryInstructionEscape(deliveryInstructionT("deliveryInstruction.appTextHelp", "Additional text and media are shared with Dispatch and drivers in this app."))}</p>
++      <textarea id="salesDeliveryInstructionText" maxlength="5000" ${detail.editable && !busy ? "" : "disabled"} placeholder="${deliveryInstructionEscape(deliveryInstructionT("deliveryInstruction.additionalPlaceholder", "Add call-ahead, gate, placement, access, or other driver instructions"))}">${deliveryInstructionEscape(salesDeliveryInstructionState.additionalDraft ?? detail.additionalText ?? "")}</textarea>
+       <div class="delivery-instruction-actions">
+         <button class="primary" type="button" data-delivery-instruction-action="save-text" ${detail.editable && !busy ? "" : "disabled"}>${deliveryInstructionEscape(busy ? deliveryInstructionT("deliveryInstruction.saving", "Saving…") : deliveryInstructionT("deliveryInstruction.saveText", "Save text"))}</button>
+       </div>
+@@ -177,9 +232,11 @@
+       </div>
+     </section>
+   </div>`;
++  salesDeliveryInstructionBusyControls();
+ }
+ 
+ async function salesDeliveryInstructionLoadList({ preserveSelection = true } = {}) {
++  if (salesDeliveryInstructionState.saving || salesDeliveryInstructionState.loadingNetSuite) return;
+   const generation = ++salesDeliveryInstructionState.listGeneration;
+   salesDeliveryInstructionState.loadingList = true;
+   salesDeliveryInstructionRenderList();
+@@ -199,19 +256,61 @@
+ }
+ 
+ async function salesDeliveryInstructionLoadDetail(orderId) {
++  if (salesDeliveryInstructionState.saving || salesDeliveryInstructionState.loadingNetSuite) return;
++  const generation = ++salesDeliveryInstructionState.detailGeneration;
++  salesDeliveryInstructionState.netSuite = null;
++  salesDeliveryInstructionState.netSuiteDraft = null;
++  salesDeliveryInstructionState.additionalDraft = null;
++  salesDeliveryInstructionState.netSuiteError = "";
+   salesDeliveryInstructionState.loadingDetail = true;
+   salesDeliveryInstructionState.error = "";
+   salesDeliveryInstructionState.notice = "";
+   salesDeliveryInstructionRenderDetail();
+   try {
+-    salesDeliveryInstructionState.detail = await salesDeliveryInstructionApi(`/api/sales/delivery-instructions/orders/${encodeURIComponent(orderId)}`);
++    const detail = await salesDeliveryInstructionApi(`/api/sales/delivery-instructions/orders/${encodeURIComponent(orderId)}`);
++    if (generation !== salesDeliveryInstructionState.detailGeneration) return;
++    salesDeliveryInstructionState.detail = detail;
+     salesDeliveryInstructionState.selectedId = Number(salesDeliveryInstructionState.detail.orderId);
+     localStorage.setItem("mbbs.sales.deliveryInstructions.selected", String(salesDeliveryInstructionState.selectedId));
+   } finally {
+-    salesDeliveryInstructionState.loadingDetail = false;
+-    salesDeliveryInstructionRenderList();
+-    salesDeliveryInstructionRenderDetail();
+-  }
++    if (generation === salesDeliveryInstructionState.detailGeneration) {
++      salesDeliveryInstructionState.loadingDetail = false;
++      salesDeliveryInstructionRenderList();
++      salesDeliveryInstructionRenderDetail();
++    }
++  }
++  await salesDeliveryInstructionLoadNetSuite();
++}
++
++async function salesDeliveryInstructionLoadNetSuite() {
++  const state = salesDeliveryInstructionState, detail = state.detail;
++  if (!detail || state.saving || state.loadingNetSuite) return;
++  const generation = state.detailGeneration;
++  state.loadingNetSuite = true; state.netSuiteError = ""; state.notice = "";
++  salesDeliveryInstructionRenderDetail();
++  try {
++    const loaded = await salesDeliveryInstructionApi(`/api/sales/delivery-instructions/orders/${detail.orderId}/netsuite`);
++    if (generation !== state.detailGeneration) return;
++    state.detail = loaded; state.netSuite = loaded.netSuite; state.netSuiteDraft = { ...loaded.netSuite.values };
++  } catch (error) { state.netSuiteError = error.message; }
++  finally { state.loadingNetSuite = false; salesDeliveryInstructionRenderDetail(); }
++}
++
++async function salesDeliveryInstructionSaveNetSuite() {
++  const state = salesDeliveryInstructionState, detail = state.detail;
++  if (!detail?.editable || !state.netSuite?.editable || state.saving || state.loadingNetSuite || state.loadingList) return;
++  if (!["salesDeliveryInstructionShipDate", "salesDeliveryInstructionDeliverByDate"].every(id => document.getElementById(id).reportValidity())) return;
++  window.clearTimeout(state.searchTimer); state.listGeneration += 1;
++  state.saving = true; state.savingNetSuite = true; state.netSuiteError = ""; state.notice = "";
++  salesDeliveryInstructionRenderDetail();
++  try {
++    const saved = await salesDeliveryInstructionApi(`/api/sales/delivery-instructions/orders/${detail.orderId}/netsuite`, {
++      method: "PUT", body: JSON.stringify({ expectedRevision: detail.revision, expected: state.netSuite, values: state.netSuiteDraft })
++    });
++    state.detail = saved; state.netSuite = saved.netSuite; state.netSuiteDraft = { ...saved.netSuite.values };
++    state.notice = deliveryInstructionT("deliveryInstruction.savedNetSuite", "Saved to NetSuite.");
++  } catch (error) { state.netSuiteError = error.message; }
++  finally { state.saving = false; state.savingNetSuite = false; salesDeliveryInstructionRenderDetail(); }
+ }
+ 
+ async function salesDeliveryInstructionSaveText() {
+@@ -340,6 +439,15 @@
+ }
+ 
+ salesDeliveryInstructionApp.addEventListener("input", (event) => {
++  const fields = { salesDeliveryInstructionMemo: "memo", salesDeliveryInstructionShipDate: "shipDate", salesDeliveryInstructionDeliverByDate: "deliverByDate" };
++  if (fields[event.target.id] && salesDeliveryInstructionState.netSuiteDraft) {
++    salesDeliveryInstructionState.netSuiteDraft[fields[event.target.id]] = event.target.value;
++    return;
++  }
++  if (event.target.id === "salesDeliveryInstructionText") {
++    salesDeliveryInstructionState.additionalDraft = event.target.value;
++    return;
++  }
+   if (event.target.id !== "salesDeliveryInstructionSearch") return;
+   salesDeliveryInstructionState.search = event.target.value;
+   window.clearTimeout(salesDeliveryInstructionState.searchTimer);
+@@ -385,8 +493,10 @@
+ 
+ salesDeliveryInstructionApp.addEventListener("click", async (event) => {
+   const button = event.target.closest("[data-delivery-instruction-action]");
+-  if (!button) return;
+-  try {
++  if (!button || button.disabled || salesDeliveryInstructionState.saving || salesDeliveryInstructionState.loadingNetSuite) return;
++  try {
++    if (button.dataset.deliveryInstructionAction === "save-netsuite") return salesDeliveryInstructionSaveNetSuite();
++    if (button.dataset.deliveryInstructionAction === "reload-netsuite") return salesDeliveryInstructionLoadNetSuite();
+     if (button.dataset.deliveryInstructionAction === "refresh") return salesDeliveryInstructionLoadList({ preserveSelection: true });
+     if (button.dataset.deliveryInstructionAction === "select") return salesDeliveryInstructionLoadDetail(button.dataset.id);
+     if (button.dataset.deliveryInstructionAction === "save-text") return salesDeliveryInstructionSaveText();
+--- a/server/public/sales-delivery-instructions.html
++++ b/server/public/sales-delivery-instructions.html
+@@ -5,15 +5,15 @@
+     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+     <title>MBBS Sales Delivery Instructions</title>
+     <link rel="stylesheet" href="/dispatch.css?v=20260811-delivery-instructions-v1" />
+-    <link rel="stylesheet" href="/delivery-instructions.css?v=20260812-delivery-image-720p-v1" />
++    <link rel="stylesheet" href="/delivery-instructions.css?v=20260929-netsuite-edit-v1" />
+     <link rel="stylesheet" href="/i18n.css?v=20260701-i18n-v2" />
+   </head>
+   <body class="delivery-instruction-page">
+     <main class="dispatch-shell delivery-instruction-shell" id="salesDeliveryInstructionApp"></main>
+-    <script src="/i18n.js?v=20260811-delivery-instructions-v1"></script>
++    <script src="/i18n.js?v=20260929-netsuite-edit-v1"></script>
+     <script src="/app-sidebar.js?v=20260811-delivery-instructions-v1"></script>
+     <script src="/dispatch-auth.js?v=20260811-delivery-instructions-v1"></script>
+     <script src="/delivery-instruction-upload.js?v=20260812-delivery-image-720p-v1"></script>
+-    <script src="/sales-delivery-instructions.js?v=20260812-delivery-image-720p-v1"></script>
++    <script src="/sales-delivery-instructions.js?v=20260929-netsuite-edit-v1"></script>
+   </body>
+ </html>
+--- a/server/public/delivery-instructions.css
++++ b/server/public/delivery-instructions.css
+@@ -2,6 +2,29 @@
+   min-height: 100vh;
+   background: #edf3f5;
+ }
++
++.delivery-instruction-date-fields {
++  display: grid;
++  grid-template-columns: repeat(auto-fit, minmax(min(220px, 100%), 1fr));
++  gap: 14px;
++  margin: 14px 0;
++}
++
++.delivery-instruction-date-fields label { display: grid; gap: 7px; min-width: 0; }
++.delivery-instruction-date-fields input {
++  box-sizing: border-box;
++  min-width: 0;
++  width: 100%;
++  padding: 10px;
++  border: 1px solid #aebfc7;
++  border-radius: 9px;
++  color: #142f3a;
++  background: white;
++  font: inherit;
++}
++
++.delivery-instruction-busy { font-weight: 600; border-left: 4px solid #186680; }
++.delivery-instruction-page button:disabled { cursor: wait; opacity: .55; }
+ 
+ .delivery-instruction-workspace {
+   display: grid;
+@@ -348,3 +371,21 @@
+     text-align: center;
+   }
+ }
++
++@media (max-width: 760px) {
++  body.delivery-instruction-page.has-app-sidebar { padding-left: 0; overflow: auto; }
++  body.delivery-instruction-page .app-sidebar { display: none; }
++  body.delivery-instruction-page.has-app-sidebar .delivery-instruction-shell {
++    width: 100%;
++    height: auto;
++    min-width: 0;
++    grid-template-rows: auto auto;
++  }
++  body.delivery-instruction-page.has-app-sidebar .dispatch-topbar {
++    grid-template-columns: minmax(0, 1fr) auto;
++  }
++  .delivery-instruction-page .topbar-actions { grid-column: 1 / -1; flex-wrap: wrap; }
++  .delivery-instruction-workspace { padding: 10px; grid-template-columns: minmax(0, 1fr); }
++  .delivery-instruction-editor { padding: 12px; overflow: visible; }
++  .delivery-instruction-editor-grid { min-width: 0; }
++}
+--- a/server/public/i18n.js
++++ b/server/public/i18n.js
+@@ -1596,6 +1596,16 @@
+     "deliveryInstruction.revision": "版本",
+     "deliveryInstruction.completedLock": "此已完成订单会永久保留以供查阅，但不能再编辑。",
+     "deliveryInstruction.netsuiteMemo": "NetSuite 备注指示",
++    "deliveryInstruction.netsuiteHelp": "此处的更改会直接保存至 NetSuite 中的这张销售订单。",
++    "deliveryInstruction.shipDate": "发货日期（Ship Date）",
++    "deliveryInstruction.deliverByDate": "最迟送达日期（To be delivered by）",
++    "deliveryInstruction.saveNetSuite": "保存至 NetSuite",
++    "deliveryInstruction.reloadNetSuite": "重新载入 NetSuite 数据",
++    "deliveryInstruction.loadingNetSuite": "正在载入 NetSuite 数据…请稍候。",
++    "deliveryInstruction.savingNetSuite": "正在保存至 NetSuite…请稍候。",
++    "deliveryInstruction.savedNetSuite": "已保存至 NetSuite。",
++    "deliveryInstruction.driverPreview": "司机指示预览",
++    "deliveryInstruction.appTextHelp": "附加文字和媒体在本应用内与调度员和司机共享。",
+     "deliveryInstruction.automaticHelp": "若能准确识别，地址和计划日期／时间会被省略；有歧义的备注会完整保留。",
+     "deliveryInstruction.noAutomatic": "没有备注送货指示。",
+     "deliveryInstruction.additionalText": "附加送货文字",

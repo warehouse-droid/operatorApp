@@ -1,0 +1,14 @@
+ARG STOCK_CHECK_BASE_IMAGE
+FROM ${STOCK_CHECK_BASE_IMAGE}
+USER root
+WORKDIR /app
+COPY package.json package-lock.json ./
+RUN npm ci --omit=dev && npm cache clean --force
+ENV PLAYWRIGHT_BROWSERS_PATH=/ms-playwright
+RUN node node_modules/playwright/cli.js install --with-deps chromium \
+    && chmod -R a+rX /ms-playwright \
+    && rm -rf /var/lib/apt/lists/*
+COPY --chown=node:node src ./src
+COPY --chown=node:node public ./public
+COPY --chown=node:node migrations ./migrations
+USER node

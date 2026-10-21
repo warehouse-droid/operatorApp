@@ -386,7 +386,7 @@ async function login(baseUrl, account) {
   return result.payload.token;
 }
 
-async function assertRestrictedScheduleHidden(baseUrl, token, label, endpoint = "/api/scm/schedule") {
+async function assertScheduleSearchVisibility(baseUrl, token, label, endpoint = "/api/scm/schedule", searchAcrossOrders = false) {
   const queries = [
     `view=completed&search=${encodeURIComponent(prefix)}`,
     `view=blanket&search=${encodeURIComponent(prefix)}`,
@@ -395,7 +395,23 @@ async function assertRestrictedScheduleHidden(baseUrl, token, label, endpoint = 
   for (const queryString of queries) {
     const result = await requestJson(baseUrl, `${endpoint}?${queryString}`, { token });
     assert.equal(result.response.status, 200, `${label} schedule request should succeed: ${queryString}`);
-    assertNoRestricted(result.payload, `${label} schedule ${queryString}`);
+    if (!searchAcrossOrders) {
+      assertNoRestricted(result.payload, `${label} schedule ${queryString}`);
+      continue;
+    }
+    const returned = new Set(fixtureRefs(result.payload));
+    for (const ref of ["PO-BLANKET", "PO-COMPLETED", "PO-CANCELLED", "TO-COMPLETED", "TO-CANCELLED"]) {
+      assert(returned.has(`${prefix}-${ref}`), `${label} search must include ${ref} across views and statuses.`);
+    }
+    for (const ref of ["PO-HOLD", "TO-HOLD", "PO-STALE-RECON-HOLD"]) {
+      assert(!returned.has(`${prefix}-${ref}`), `${label} search must exclude Hold ${ref}.`);
+    }
+    assertHasNormalControls(result.payload, `${label} schedule search ${queryString}`);
+  }
+  for (const queryString of ["view=completed", "view=blanket", "status=Hold&includeRestricted=true"]) {
+    const result = await requestJson(baseUrl, `${endpoint}?${queryString}`, { token });
+    assert.equal(result.response.status, 200);
+    assertNoRestricted(result.payload, `${label} ordinary browsing ${queryString}`);
   }
 }
 
@@ -585,7 +601,7 @@ try {
   assert.equal(targetedReconciliationPending.payload?.order?.dispatchReconciliationPlanningEligible, true);
   assert.notEqual(targetedReconciliationPending.payload?.order?.dispatchPlanningRestricted, true);
 
-  await assertRestrictedScheduleHidden(baseUrl, tokens.dispatcher, "Dispatcher");
+  await assertScheduleSearchVisibility(baseUrl, tokens.dispatcher, "Dispatcher", "/api/scm/schedule", true);
   const dispatcherNormal = await requestJson(
     baseUrl,
     `/api/scm/schedule?view=dispatch&search=${encodeURIComponent(prefix)}`,
@@ -594,7 +610,7 @@ try {
   assert.equal(dispatcherNormal.response.status, 200);
   assertHasNormalControls(dispatcherNormal.payload, "Dispatcher normal schedule");
 
-  await assertRestrictedScheduleHidden(baseUrl, tokens.sales, "Sales", "/api/sales/schedule");
+  await assertScheduleSearchVisibility(baseUrl, tokens.sales, "Sales", "/api/sales/schedule", true);
   const salesNormal = await requestJson(
     baseUrl,
     `/api/sales/schedule?view=yard%20manager&search=${encodeURIComponent(prefix)}`,
@@ -603,7 +619,7 @@ try {
   assert.equal(salesNormal.response.status, 200);
   assertHasNormalControls(salesNormal.payload, "Sales normal schedule");
 
-  await assertRestrictedScheduleHidden(baseUrl, tokens.yardManager, "Yard Manager");
+  await assertScheduleSearchVisibility(baseUrl, tokens.yardManager, "Yard Manager");
   const yardManagerNormal = await requestJson(
     baseUrl,
     `/api/scm/schedule?view=yard%20manager&search=${encodeURIComponent(prefix)}`,

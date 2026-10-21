@@ -1,0 +1,9 @@
+{
+  "all": true,
+  "include": ["src/delivery-request*.js"],
+  "exclude": ["test/**"],
+  "check-coverage": false,
+  "report-dir": "test-artifacts/delivery-requests/coverage",
+  "temp-directory": "test-artifacts/delivery-requests/.c8",
+  "reporter": ["text", "json", "json-summary", "lcov"]
+}

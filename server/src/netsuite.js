@@ -1,5 +1,6 @@
 import { normalizeNetSuiteTransactionUnits } from './netsuite-transaction-units.js';
 import { salesOrderBillingExclusions } from './netsuite-fulfillment-exclusions.js';
+import { normalizeSalesOrderPackPayload } from '../public/order-pack-quantities.js';
 import { createBossNetSuiteAdapter } from './boss-approval-netsuite.js';
 
 export function createBossApprovalNetSuite() {
@@ -835,24 +836,26 @@ export async function createPurchaseOrderInNetSuite(payload) {
   return queueNetSuiteMutation(run);
 }
 
-export async function createSalesOrderInNetSuite(payload) {
-  const run = () => netsuiteRest("/record/v1/salesOrder", {
+export async function createSalesOrderInNetSuite(payload, { rest = netsuiteRest, mutate = queueNetSuiteMutation } = {}) {
+  const body = normalizeSalesOrderPackPayload(payload);
+  const run = () => rest("/record/v1/salesOrder", {
     method: "POST",
-    body: payload
+    body
   });
-  return queueNetSuiteMutation(run);
+  return mutate(run);
 }
 
-export async function transformEstimateToSalesOrderInNetSuite(estimateId, payload) {
+export async function transformEstimateToSalesOrderInNetSuite(estimateId, payload, { rest = netsuiteRest, mutate = queueNetSuiteMutation } = {}) {
   const id = Number(estimateId);
   if (!Number.isSafeInteger(id) || id <= 0) {
     throw new Error("A valid numeric NetSuite estimate ID is required.");
   }
-  const run = () => netsuiteRest(`/record/v1/estimate/${id}/!transform/salesOrder?replace=item`, {
+  const body = normalizeSalesOrderPackPayload(payload);
+  const run = () => rest(`/record/v1/estimate/${id}/!transform/salesOrder?replace=item`, {
     method: "POST",
-    body: payload
+    body
   });
-  return queueNetSuiteMutation(run);
+  return mutate(run);
 }
 
 export async function createOrUpdateReturnAuthorizationInNetSuite({
@@ -1044,6 +1047,43 @@ function restletErrorDetail(payload, text) {
   return combined || String(text || "").trim().slice(0, 2000) || "Unknown RESTlet error";
 }
 
+/** @param {string} url */
+function restletReadTarget(url) {
+  const target = new URL(url);
+  const account = String(config.netsuite.accountId || "").toLowerCase().replaceAll("_", "-");
+  if (target.protocol !== "https:" || target.hostname !== `${account}.restlets.api.netsuite.com`
+      || target.pathname !== "/app/site/hosting/restlet.nl"
+      || target.username || target.password || target.hash || target.port) {
+    throw Object.assign(new Error("The RESTlet URL must belong to the configured NetSuite account."),
+      { status: 503, code: "INVALID_NETSUITE_RESTLET_URL" });
+  }
+  return target;
+}
+
+/** Read a RESTlet using the existing backend credentials and shared request queue.
+ * @param {string} url
+ */
+export async function readNetSuiteRestlet(url) {
+  assertNetSuiteDirectAccessEnabled();
+  const target = restletReadTarget(url);
+  const accessToken = await getAccessToken();
+  const { response, text } = await timedNetSuiteTextRequest(target.toString(), {
+    method: "GET",
+    redirect: "error",
+    headers: {
+      Authorization: `Bearer ${accessToken}`,
+      Accept: "application/json",
+      "Content-Type": "application/json"
+    }
+  });
+  const payload = parsedRestletPayload(text);
+  if (!response.ok || !payload || payload.ok === false || payload.error) {
+    throw Object.assign(new Error(`NetSuite balance lookup failed: ${response.status} ${restletErrorDetail(payload, text)}`),
+      { status: 503, code: "NETSUITE_RESTLET_FAILED", netsuiteStatus: response.status });
+  }
+  return payload;
+}
+
 export async function callFieldSalesRestlet(action, payload = {}) {
   const target = new URL(String(process.env.FIELD_SALES_RESTLET_URL || 'https://invalid.invalid'));
   if (target.protocol !== 'https:' || !target.hostname.endsWith('.restlets.api.netsuite.com') || target.pathname !== '/app/site/hosting/restlet.nl') {
@@ -1186,6 +1226,10 @@ export async function fetchPurchaseOrderPdfFromNetSuite(orderId, { filenamePrefi
 
 export async function fetchSalesOrderPdfFromNetSuite(orderId, { filenamePrefix = "SO" } = {}) {
   return fetchNetSuiteOrderPdf('sales_order', orderId, { filenamePrefix, restlet: configuredRestletJson });
+}
+
+export async function fetchEstimatePdfFromNetSuite(estimateId, { filenamePrefix = "EST", restlet = configuredRestletJson } = {}) {
+  return fetchNetSuiteOrderPdf('estimate', estimateId, { filenamePrefix, restlet });
 }
 
 export async function fetchEstimateRecordFromNetSuite(estimateId, { rest = netsuiteRest } = {}) {
@@ -3991,7 +4035,8 @@ export async function createSpecialDiscountSalesOrderInNetSuite(payload,{estimat
   assertSpecialRestSalesPayload(payload);
   if(estimateId!==null && (!Number.isSafeInteger(Number(estimateId)) || Number(estimateId)<=0))throw new Error('A valid estimate ID is required.');
   const path=estimateId===null ? '/record/v1/salesOrder' : `/record/v1/estimate/${Number(estimateId)}/!transform/salesOrder?replace=item`;
-  return mutate(()=>rest(path,{method:'POST',body:payload}));
+  const body = normalizeSalesOrderPackPayload(payload);
+  return mutate(()=>rest(path,{method:'POST',body}));
 }
 export async function prepareSpecialAdjustmentPlanInNetSuite(input,{rest=netsuiteRest,queryAll=suiteqlAll}={}) {
   await assertSpecialDiscountRestReady({queryAll});

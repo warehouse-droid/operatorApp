@@ -1,0 +1,34 @@
+import assert from 'node:assert/strict';
+import crypto from 'node:crypto';
+import {readFileSync} from 'node:fs';
+import {query,withTransaction,closeDb} from '../../src/db.js';
+import {createOperator} from '../../src/auth-repository.js';
+import {createSpecialStockCase} from '../../src/special-stock-request-repository.js';
+import {createSpecialStockCase as legacyCreate} from './baseline/src/special-stock-request-repository.js';
+import {withBackorderWorkflow} from './baseline/src/stock-case-workflow.js';
+import {closeDb as closeBaselineDb} from './baseline/src/db.js';
+const filename='269_backorder_line_routing.sql',upgrade=readFileSync('migrations/'+filename,'utf8'),rollback=readFileSync('tools/backorder-enhancements-20261007/rollback.sql','utf8');
+assert.equal(process.env.MBT_TEST_ISOLATED,'1');assert.equal(new URL(process.env.DATABASE_URL).hostname,'db');
+try{
+  const user=await createOperator({username:'route-migration-'+crypto.randomUUID(),password:crypto.randomUUID(),displayName:'TEST migration',role:'sales',roles:['sales'],yardLocationIds:[1,28]});
+  const context={operatorId:user.id,authorizedStoreLocationIds:[1,28]},draft={storeLocationId:1,inquiryDate:'2099-01-01',customerName:'TEST customer',vendorName:'TEST Vendor',vendorId:331,fulfillmentMethod:'yard_pickup',lines:[{productName:'TEST material',quantity:2,uom:'EA',rate:10,requiredDate:'2099-02-01'}]};
+  const special=await createSpecialStockCase({...draft,lines:[{...draft.lines[0],uom:'PCS'}]},context);
+  const snapshot=async id=>(await query("SELECT to_jsonb(line)-ARRAY['backorder_vendor_id','backorder_destination_location_id'] AS value FROM sales_special_stock_lines line WHERE request_id=$1 ORDER BY id",[id])).rows.map(r=>r.value);
+  const specialBefore=await snapshot(special.id);
+  await withTransaction(async()=>{await query(rollback);await query('DELETE FROM schema_migrations WHERE filename=$1',[filename]);});
+  await query("INSERT INTO inventory_items(item_id,item_name,display_name,stock_unit,vendor,vendor_id) VALUES(88999601,'TEST-MIGRATION','Migration material','EA','TEST Vendor',332)");
+  const back=await withBackorderWorkflow(()=>legacyCreate({...draft,customerName:'',lines:[{...draft.lines[0],regularItemId:88999601,regularItemCode:'TEST-MIGRATION'}]},context));
+  const before=await snapshot(back.id);
+  await assert.rejects(withTransaction(async()=>{await query(upgrade);throw Error('Interrupted migration');}),/Interrupted migration/);
+  assert.equal((await query("SELECT count(*)::int AS n FROM information_schema.columns WHERE table_name='sales_special_stock_lines' AND column_name='backorder_vendor_id'")).rows[0].n,0);
+  await withTransaction(async()=>{await query(upgrade);await query('INSERT INTO schema_migrations(filename) VALUES($1)',[filename]);});
+  assert.deepEqual(await snapshot(back.id),before);assert.deepEqual(await snapshot(special.id),specialBefore);
+  const route=()=>query('SELECT backorder_vendor_id,backorder_destination_location_id FROM sales_special_stock_lines WHERE request_id=$1',[back.id]);assert.deepEqual((await route()).rows,[{backorder_vendor_id:'332',backorder_destination_location_id:'1'}]);
+  const duringRelease=await withBackorderWorkflow(()=>legacyCreate({...draft,customerName:'',lines:[{...draft.lines[0],regularItemId:88999601,regularItemCode:'TEST-MIGRATION'}]},context));
+  assert.deepEqual((await query('SELECT backorder_vendor_id,backorder_destination_location_id FROM sales_special_stock_lines WHERE request_id=$1',[duringRelease.id])).rows,[{backorder_vendor_id:'332',backorder_destination_location_id:'1'}]);
+  await query('UPDATE sales_special_stock_lines SET backorder_destination_location_id=28 WHERE request_id=$1',[back.id]);
+  await assert.rejects(withTransaction(()=>query(rollback)),/Rollback refused/);assert.equal((await route()).rows[0].backorder_destination_location_id,'28');
+  await query('UPDATE sales_special_stock_lines SET backorder_destination_location_id=1 WHERE request_id=$1',[back.id]);
+  await withTransaction(async()=>{await query(rollback);await query(upgrade);});assert.deepEqual((await route()).rows,[{backorder_vendor_id:'332',backorder_destination_location_id:'1'}]);assert.deepEqual(await snapshot(back.id),before);
+  console.log(JSON.stringify({upgrade:true,backfill:true,rollback:true,reupgrade:true,legacyFieldsPreserved:true,interruptedDdlAtomic:true,independentRouteDowngradeRefused:true,oldVersionWritesDuringRelease:true}));
+}finally{await closeBaselineDb();await closeDb();}

@@ -396,9 +396,9 @@ function orderFamily(order) {
   return "sales_order";
 }
 
-function operatorLoadLineSnapshot(lines = []) {
+function operatorLoadLineSnapshot(lines = [], { includeEmpty = false } = {}) {
   return lines
-    .filter((line) => positiveQuantity(line.loaded_qty) > 0 || positiveQuantity(line.packed_pallet_qty) > 0 || positiveQuantity(line.packed_layer_qty) > 0 || positiveQuantity(line.packed_section_qty) > 0 || positiveQuantity(line.packed_piece_qty) > 0 || positiveQuantity(line.packed_sales_qty) > 0)
+    .filter((line) => includeEmpty || positiveQuantity(line.loaded_qty) > 0 || positiveQuantity(line.packed_pallet_qty) > 0 || positiveQuantity(line.packed_layer_qty) > 0 || positiveQuantity(line.packed_section_qty) > 0 || positiveQuantity(line.packed_piece_qty) > 0 || positiveQuantity(line.packed_sales_qty) > 0)
     .map((line) => ({
       lineId: line.line_id,
       itemId: line.item_id,
@@ -642,6 +642,10 @@ function formatLoadUnits(units, field) {
   return visible.map((unit) => `${roundQuantity(unit[field])} ${unit.label}`).join(" / ");
 }
 
+function deliveryLoadOverpackTolerance(order) {
+  return isVrmaDeliveryOrder(order) ? 0.000001 : LOAD_SALES_QTY_TOLERANCE;
+}
+
 function buildDeliveryLoadValidation(order, { allowNetSuiteCompleted = false } = {}) {
   const issues = [];
   for (const line of order.lines || []) {
@@ -690,7 +694,8 @@ function buildDeliveryLoadValidation(order, { allowNetSuiteCompleted = false } =
       continue;
     }
 
-    if (roundQuantity(packedSalesQty - remainingSalesQty) > LOAD_SALES_QTY_TOLERANCE) {
+    const overpackTolerance = deliveryLoadOverpackTolerance(order);
+    if (roundQuantity(packedSalesQty - remainingSalesQty) > overpackTolerance) {
       issues.push({
         ...issue,
         code: line.sync_exception || "overpacked",
@@ -3939,9 +3944,144 @@ async function recordLocalCoDeliveryLoad(order, operatorId, { photoDataUrls }) {
   };
 }
 
+async function finalizeVrmaLoadedLines(order, { dryRun = false } = {}) {
+  const finalizedLines = [];
+  for (const line of order.lines || []) {
+    const estimatedQty = roundQuantity(lineRequiredSalesQuantity(line));
+    const packedQty = roundQuantity(linePackedSalesQuantity(line));
+    // Local VRMA estimates are ceilings, not a target to round actual loading up to.
+    const finalQty = roundQuantity(Math.min(estimatedQty, lineLoadedSalesQuantity(line) + packedQty));
+    const consumed = loadedUnitConsumption(line);
+    if (!dryRun) await query(
+      `UPDATE scm_vrma_order_lines
+          SET quantity = $3,
+              loaded_qty = $3,
+              loaded_uom = COALESCE(NULLIF(unit, ''), loaded_uom),
+              weight_lbs = $4,
+              pallet_qty = $5,
+              layer_qty = $6,
+              section_qty = $7,
+              piece_qty = $8,
+              packed_pallet_qty = 0,
+              packed_layer_qty = 0,
+              packed_piece_qty = 0,
+              packed_section_qty = 0,
+              packed_sales_qty = 0,
+              confirmed = false,
+              confirmed_at = null
+        WHERE vrma_order_id = $1 AND id = $2`,
+      [order.vrma_order_id, line.line_id, finalQty, roundQuantity(positiveQuantity(line.item_weight) * finalQty),
+        !hasConversion(line) && String(line.unit).toUpperCase() === "PLT"
+          ? finalQty : consumed.pallet + positiveQuantity(line.packed_pallet_qty),
+        consumed.layer + positiveQuantity(line.packed_layer_qty),
+        consumed.section + positiveQuantity(line.packed_section_qty),
+        consumed.piece + positiveQuantity(line.packed_piece_qty)]
+    );
+    finalizedLines.push({
+      lineId: line.line_id,
+      itemId: line.item_id,
+      itemName: line.item_name,
+      unit: line.unit,
+      estimatedQty,
+      previouslyLoadedQty: lineLoadedSalesQuantity(line),
+      finalQty,
+      abandonedQty: roundQuantity(Math.max(0, estimatedQty - finalQty))
+    });
+  }
+  return finalizedLines;
+}
+
+async function finalizeVrmaLoadStatus(order, operatorId, loadedAt = null) {
+  await query(
+    `UPDATE scm_vrma_orders
+        SET operator_status = 'loaded', local_yard_order_status = 'Loaded',
+            preparing_operator_id = null, preparing_started_at = null,
+            loaded_at = COALESCE($2::timestamptz, now()),
+            status_updated_at = now(), updated_at = now()
+      WHERE id = $1`,
+    [order.vrma_order_id, loadedAt]
+  );
+  await query(
+    `UPDATE scm_transport_schedule
+        SET content = summary.content, weight_lbs = summary.weight_lbs,
+            updated_by = COALESCE($3, updated_by), updated_at = now()
+       FROM (
+         SELECT string_agg(concat_ws(' ', COALESCE(NULLIF(sku, ''), item_name),
+                  trim(to_char(quantity, 'FM999999999990.######')), NULLIF(unit, '')), '; ' ORDER BY id)
+                  FILTER (WHERE quantity > 0) AS content,
+                COALESCE(SUM(weight_lbs), 0) AS weight_lbs
+           FROM scm_vrma_order_lines WHERE vrma_order_id = $1
+       ) summary
+      WHERE order_kind = 'VRMA' AND LOWER(order_ref) = LOWER($2)`,
+    [order.vrma_order_id, order.tranid, operatorId]
+  );
+}
+
+/** Audited maintenance for explicitly selected, inactive historical short loads. */
+export async function finalizeLegacyVrmaShortLoads({ orderRefs, dryRun = true } = {}) {
+  if (!Array.isArray(orderRefs) || !orderRefs.length || orderRefs.length > 500) {
+    throw new Error("Select the local VRMA references to finalize.");
+  }
+  return withTransaction(async () => {
+    const candidates = await query(
+      `SELECT vrma_ref FROM scm_vrma_orders
+        WHERE LOWER(vrma_ref) = ANY($1::text[]) AND operator_status = 'partial_loaded'
+        ORDER BY vrma_ref`,
+      [orderRefs.map(ref => String(ref).trim().toLowerCase())]
+    );
+    const results = [];
+    for (const candidate of candidates.rows) {
+      await withDeliveryPackingMutation(`VRMA:${candidate.vrma_ref}`, async () => {
+        const header = (await query("SELECT * FROM scm_vrma_orders WHERE vrma_ref=$1 FOR UPDATE", [candidate.vrma_ref])).rows[0];
+        const order = await getDeliveryOrder(`VRMA:${candidate.vrma_ref}`);
+        if (!order || header.operator_status !== "partial_loaded" || header.preparing_operator_id) return;
+        if (order.lines.some(line => ["packed_pallet_qty", "packed_layer_qty", "packed_section_qty", "packed_piece_qty", "packed_sales_qty"]
+          .some(field => positiveQuantity(line[field]) > 0))) return;
+        if (!order.lines.some(line => lineLoadedSalesQuantity(line) > 0)
+          || !order.lines.some(line => lineRequiredSalesQuantity(line) > lineLoadedSalesQuantity(line))) return;
+        const proofs = (await query(
+          `SELECT id, created_at FROM operator_load_records
+            WHERE order_family='vrma_order' AND order_id=$1 AND load_type='vrma_local_load'
+            ORDER BY created_at DESC, id DESC`, [order.vrma_order_id]
+        )).rows;
+        if (!proofs.length) return;
+        const before = {
+          header,
+          lines: (await query("SELECT * FROM scm_vrma_order_lines WHERE vrma_order_id=$1 ORDER BY id", [order.vrma_order_id])).rows,
+          schedule: (await query("SELECT * FROM scm_transport_schedule WHERE order_kind='VRMA' AND LOWER(order_ref)=LOWER($1)", [order.tranid])).rows
+        };
+        const finalizedLines = await finalizeVrmaLoadedLines(order, { dryRun });
+        const result = { orderRef: order.tranid, orderId: order.vrma_order_id, finalizedLines, loadRecordIds: proofs.map(proof => proof.id) };
+        if (!dryRun) {
+          await finalizeVrmaLoadStatus(order, null, header.loaded_at || proofs[0].created_at);
+          await writeAudit({ actorType: "system", action: "delivery.vrma.finalize_legacy_short_load",
+            orderId: order.vrma_order_id, details: { ...result, before, localOnly: true, netSuiteUpdated: false, inventoryUpdated: false } });
+        }
+        results.push(result);
+      });
+    }
+    return results;
+  });
+}
+
 async function recordVrmaDeliveryLoad(order, operatorId, { photoDataUrls }) {
   if (!["packed", "loaded"].includes(order.operator_status)) {
     throw new Error("VRMA order must be packed before loading.");
+  }
+  if (!orderHasPackedQuantity(order)) {
+    if (order.operator_status === "loaded") {
+      const previous = await query(
+        `SELECT id, response FROM operator_load_records
+          WHERE order_family = 'vrma_order' AND order_id = $1
+            AND load_type = 'vrma_local_load' AND response->>'quantitiesFinalized' = 'true'
+          ORDER BY id DESC LIMIT 1`,
+        [order.vrma_order_id]
+      );
+      if (previous.rows[0]) return { ...previous.rows[0].response, id: previous.rows[0].id };
+    }
+    throw Object.assign(new Error("Confirm a packed quantity before loading this local VRMA."), {
+      code: "VRMA_LOAD_EMPTY", status: 409
+    });
   }
   const validation = buildDeliveryLoadValidation(order);
   if (!validation.ok) {
@@ -3952,33 +4092,21 @@ async function recordVrmaDeliveryLoad(order, operatorId, { photoDataUrls }) {
     throw error;
   }
 
-  for (const line of order.lines || []) {
-    const packedSalesQty = roundQuantity(linePackedSalesQuantity(line));
-    if (packedSalesQty <= 0) continue;
-    const loadSalesQty = lineLoadSalesQuantity(line);
-    await query(
-      `UPDATE scm_vrma_order_lines
-          SET loaded_qty = LEAST(quantity, COALESCE(loaded_qty, 0) + $3),
-              loaded_uom = COALESCE(NULLIF(unit, ''), loaded_uom),
-              packed_pallet_qty = 0,
-              packed_layer_qty = 0,
-              packed_piece_qty = 0,
-              packed_section_qty = 0,
-              packed_sales_qty = 0,
-              confirmed = false,
-              confirmed_at = null
-        WHERE vrma_order_id = $1
-          AND id = $2`,
-      [order.vrma_order_id, line.line_id, loadSalesQty]
-    );
-  }
-
-  const loadedSnapshotOrder = await getDeliveryOrder(order.netsuite_id);
-  const remainingLines = (loadedSnapshotOrder.lines || []).filter((line) => {
-    if (!line.netsuite_active || !isDeliveryPickableLine(line)) return false;
-    return lineRequiredSalesQuantity(line) > lineLoadedSalesQuantity(line) + linePackedSalesQuantity(line) + 0.000001;
-  });
-  const nextStatus = remainingLines.length ? "partial_loaded" : "loaded";
+  const finalizedLines = await finalizeVrmaLoadedLines(order);
+  const response = {
+    localOnly: true,
+    netSuiteUpdated: false,
+    inventoryUpdated: false,
+    quantitiesFinalized: true,
+    finalizedLines,
+    localYardOrderStatus: "Loaded",
+    dispatchPlanDate: order.dispatch_plan_date,
+    dispatchTruckPlate: order.dispatch_truck_plate,
+    dispatchLoadName: order.dispatch_load_name,
+    dispatchParkingSpot: order.dispatch_parking_spot,
+    activatedCo: [],
+    remainingLines: 0
+  };
   const loadRecord = await insertOperatorLoadRecord({
     loadType: "vrma_local_load",
     order,
@@ -3986,35 +4114,13 @@ async function recordVrmaDeliveryLoad(order, operatorId, { photoDataUrls }) {
     photoDataUrls,
     sourceTable: null,
     sourceRecordId: null,
-    lineSnapshot: operatorLoadLineSnapshot(loadedSnapshotOrder.lines || order.lines || []),
-    response: {
-      localOnly: true,
-      netSuiteUpdated: false,
-      inventoryUpdated: false,
-      localYardOrderStatus: nextStatus === "loaded" ? "Loaded" : "Partial Loaded",
-      dispatchPlanDate: order.dispatch_plan_date,
-      dispatchTruckPlate: order.dispatch_truck_plate,
-      dispatchLoadName: order.dispatch_load_name,
-      dispatchParkingSpot: order.dispatch_parking_spot,
-      remainingLines: remainingLines.length
-    }
+    // Keep every original estimate, including wholly abandoned lines, with the proof.
+    lineSnapshot: operatorLoadLineSnapshot(order.lines.map((line, index) => ({
+      ...line, loaded_qty: finalizedLines[index].finalQty
+    })), { includeEmpty: true }),
+    response
   });
-  await query(
-    `UPDATE scm_vrma_orders
-        SET operator_status = $2,
-            local_yard_order_status = $3,
-            preparing_operator_id = null,
-            preparing_started_at = null,
-            loaded_at = CASE WHEN $2 = 'loaded' THEN now() ELSE loaded_at END,
-            status_updated_at = now(),
-            updated_at = now()
-      WHERE id = $1`,
-    [
-      order.vrma_order_id,
-      nextStatus,
-      nextStatus === "loaded" ? "Loaded" : "Partial Loaded"
-    ]
-  );
+  await finalizeVrmaLoadStatus(order, operatorId);
   await writeAudit({
     actorOperatorId: operatorId,
     action: "delivery.vrma.load",
@@ -4022,25 +4128,15 @@ async function recordVrmaDeliveryLoad(order, operatorId, { photoDataUrls }) {
     details: {
       vrmaRef: order.tranid,
       loadRecordId: loadRecord?.id || null,
-      remainingLines: remainingLines.length,
+      remainingLines: 0,
+      quantitiesFinalized: true,
+      finalizedLines,
       localOnly: true,
       netSuiteUpdated: false,
       inventoryUpdated: false
     }
   });
-  return {
-    id: loadRecord?.id || null,
-    localOnly: true,
-    netSuiteUpdated: false,
-    inventoryUpdated: false,
-    localYardOrderStatus: nextStatus === "loaded" ? "Loaded" : "Partial Loaded",
-    dispatchPlanDate: order.dispatch_plan_date,
-    dispatchTruckPlate: order.dispatch_truck_plate,
-    dispatchLoadName: order.dispatch_load_name,
-    dispatchParkingSpot: order.dispatch_parking_spot,
-    activatedCo: [],
-    remainingLines: remainingLines.length
-  };
+  return { ...response, id: loadRecord?.id || null };
 }
 
 /**

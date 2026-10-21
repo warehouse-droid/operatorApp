@@ -1,0 +1,18 @@
+# Completion-driven direct PO IR and special-order SO IF (Tier 3)
+
+User authorization: fix the posting behavior, include MBBS-Special Order in fulfillment and receipt, and retry all local completed orders previously classified gate_disabled. Deployment and the requested historical NetSuite retries are in scope. Spec approval: not obtained (autonomous run); these criteria make the user's requested behavior concrete.
+
+Acceptance scenarios:
+
+1. SOM06662's 270.78 MBBS-Special Order quantity is fulfillable. A completed, fully PO-supplied special line builds a 270.78 SO IF snapshot without a yard load. Live item eligibility is authoritative; delivery charges, discounts, credits, and nonfulfillable service items are excluded.
+2. A fully delivered direct PO queues one IR job using its existing completion evidence. Pickup alone does not queue an IR. Repeated Driver completion, duplicate discovery, and worker restart retain the same posting identity.
+3. For LOINC-036776 / POB03915, the IR selects its exact NetSuite lines (270.78 special-order units and 2 pallets). Split POs resolve to a positive parent ID and exact parent line identities. An unknown parent, changed item, excessive quantity, or ambiguous mapping blocks posting.
+4. IR jobs use the existing receiving gates and durable posting worker, including external-ID recovery, verified transactions, receiving finalization, and source claims. Automation records a system action with immutable Driver provenance rather than impersonating an Operator. Ordinary Operator commands still require a real Operator.
+5. Existing live IR/IF progress reconciles without a duplicate transaction. A partial existing receipt posts only the live remaining completed quantity. An ambiguous prior post is recovered and verified; it cannot authorize a new transform.
+6. All completed gate_disabled SO candidates are audited against effective completion evidence, current enabled gates, positive parent IDs, live source status, line quantities, and existing transaction progress. The user's explicit retry uses historical_backfill eligibility while preserving the default activation watermark for other historical orders.
+7. Each backlog row ends with a transaction reference, reconciled/closed disposition, or a specific persisted blocker. Uncertain candidates outside the user's requested backlog are not reset. Existing quantity conservation, split/group isolation, bounds, and gate-off behavior remain enforced.
+8. Release only the scoped change over the current production image, verify startup and health, preserve unrelated deployed code/configuration, and keep a rollback image. Validate the final image and migration before production backfill.
+
+Failure model: wrong-parent posting (exact ID/line mapping tests); duplicate posting (idempotency, recovery, and concurrency tests); excessive IR/IF (live bounds and generated quantity properties); missing special item (NetSuite reader and repository regressions); disabled gates bypassed (negative gate tests); worker crash (existing durable lease/recovery tests); silent retry failure (persisted jobs and per-order result audit); schema incompatibility (migration repeat and rollback-image import rehearsal).
+
+Setup: reuse Node's test runner, existing PostgreSQL Docker test tooling, fast-check, c8, TypeScript, ESLint and the secret scanner. No packages, credentials, or new external services. Add focused tests, a migration, persisted verification/retry/release tools, and evidence. Preserve the existing dirty worktree; no commits are required. Tests and simulated transactions run on disposable internal-only databases. Only the explicitly requested production backfill may issue live IR/IF transforms.

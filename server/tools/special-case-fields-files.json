@@ -1,0 +1,14 @@
+[
+  "public/special-stock-case-edits.js",
+  "public/special-stock-line-fields.js",
+  "public/sales-special-stock-requests.js",
+  "public/scm-special-stock-requests.js",
+  "public/sales-stock-requests.html",
+  "public/scm-stock-requests.html",
+  "src/special-stock-request-repository.js",
+  "src/special-stock-request-domain.js",
+  "src/special-stock-quantity-service.js",
+  "src/special-stock-adjustment-adapter.js",
+  "src/special-stock-rest-orders.js",
+  "migrations/264_special_case_field_edits.sql"
+]

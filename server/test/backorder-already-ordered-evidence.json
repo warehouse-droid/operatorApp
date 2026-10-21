@@ -1,0 +1,316 @@
+{
+  "feature": "Regular Backorder Already Ordered status",
+  "spec approval": "not obtained (autonomous run)",
+  "spec": "server/test/backorder-already-ordered-spec.json",
+  "sourceTreeHash": "feac7414a940327e3d693e0fc0e146419f1f4f1b9a3f86117826ef4daa5065e9",
+  "changedFiles": [
+    "src/backorder-request-service.js",
+    "src/special-stock-request-repository.js",
+    "public/backorder-stock-requests.js",
+    "public/backorder-workflow.js",
+    "public/sales-stock-requests.html",
+    "public/sales-stock-requests.js",
+    "public/scm-stock-requests.html",
+    "public/scm-stock-requests.js",
+    "migrations/274_backorder_already_ordered.sql"
+  ],
+  "tests": [
+    {
+      "name": "focused",
+      "exitCode": 0,
+      "tests": 12,
+      "passed": 12,
+      "failed": 0,
+      "failures": []
+    },
+    {
+      "name": "browser",
+      "exitCode": 0,
+      "tests": 4,
+      "passed": 4,
+      "failed": 0,
+      "failures": []
+    },
+    {
+      "name": "regressions",
+      "exitCode": 1,
+      "tests": 388,
+      "passed": 357,
+      "failed": 31,
+      "failures": [
+        "multi-line case transitions atomically from Sales to SCM and back to an exact SO draft",
+        "discount and pallet adjustment survives an early webhook and lost SO response before committing locally",
+        "issued quantity confirmation tolerates exact SO/PO webhook transitions",
+        "issued quantity confirmation tolerates exact SO/PO webhook transitions across recovery",
+        "SCM PO creation survives SO webhooks after PATCH, before submission and before final linking",
+        "webhook revision changes do not grant another operation ownership or allow a future revision",
+        "loss of SO approval during the claimed operation blocks PO submission",
+        "owned PO submission still blocks when case closes",
+        "owned PO submission still blocks when SO becomes planned",
+        "owned PO submission still blocks when SO quantity changes",
+        "owned PO submission still blocks when SO UOM changes",
+        "owned PO submission still blocks when SO description is unreviewed",
+        "a stopped owner cannot finalize, and description recording cannot conceal a changed commercial line",
+        "real SCM workflow corrects SO quantity/UOM before creating a standalone PO despite webhooks",
+        "real SCM workflow corrects SO quantity/UOM before updating the existing native PO despite webhooks",
+        "real SCM workflow corrects SO quantity/UOM before creating a standalone PO despite webhooks and a lost creation response",
+        "a confirmed quantity change preserves gross PO costs, updates the vendor summary and private review, and accepts its webhook",
+        "directory customer identity persists from enquiry through SO draft without creating canonical data",
+        "skip HTTP routes require authentication, correct role, gate and Sales yard access",
+        "duplicate concurrent SO and PO skips each commit once and preserve role-owned order kind",
+        "gate disable wins before a waiting skip transaction without advancing the request",
+        "real creation claim and test skip cannot both acquire the same request revision",
+        "closure and planning serialize on the case lock so a Dispatch save cannot overtake Sales cancellation",
+        "discount-only and PALLET adjustments wait for SCM and persist together on approval",
+        "issued test orders hold proposals until SCM approves both local quantities without changing rates",
+        "real pair retains a partial update, recovers exact lines and invalidates the old Dispatch quantities",
+        "real order service persists submission and recovers after SO patch success before PO creation",
+        "Sales and SCM Special tabs are real feature-gated interfaces",
+        "the filter exposes seven labelled choices, retains multiple selections and allows clearing",
+        "native PO recovery before a durable submission updates the existing PO without creating",
+        "native PO recovery after a durable submission updates the existing PO without creating"
+      ]
+    },
+    {
+      "name": "types",
+      "exitCode": 1,
+      "tests": 0,
+      "passed": 0,
+      "failed": 0,
+      "failures": []
+    },
+    {
+      "name": "coverage",
+      "exitCode": 0,
+      "tests": 12,
+      "passed": 12,
+      "failed": 0,
+      "failures": []
+    }
+  ],
+  "regressionBaseline": {
+    "failures": [
+      "multi-line case transitions atomically from Sales to SCM and back to an exact SO draft",
+      "discount and pallet adjustment survives an early webhook and lost SO response before committing locally",
+      "issued quantity confirmation tolerates exact SO/PO webhook transitions",
+      "issued quantity confirmation tolerates exact SO/PO webhook transitions across recovery",
+      "SCM PO creation survives SO webhooks after PATCH, before submission and before final linking",
+      "webhook revision changes do not grant another operation ownership or allow a future revision",
+      "loss of SO approval during the claimed operation blocks PO submission",
+      "owned PO submission still blocks when case closes",
+      "owned PO submission still blocks when SO becomes planned",
+      "owned PO submission still blocks when SO quantity changes",
+      "owned PO submission still blocks when SO UOM changes",
+      "owned PO submission still blocks when SO description is unreviewed",
+      "a stopped owner cannot finalize, and description recording cannot conceal a changed commercial line",
+      "real SCM workflow corrects SO quantity/UOM before creating a standalone PO despite webhooks",
+      "real SCM workflow corrects SO quantity/UOM before updating the existing native PO despite webhooks",
+      "real SCM workflow corrects SO quantity/UOM before creating a standalone PO despite webhooks and a lost creation response",
+      "a confirmed quantity change preserves gross PO costs, updates the vendor summary and private review, and accepts its webhook",
+      "directory customer identity persists from enquiry through SO draft without creating canonical data",
+      "skip HTTP routes require authentication, correct role, gate and Sales yard access",
+      "duplicate concurrent SO and PO skips each commit once and preserve role-owned order kind",
+      "gate disable wins before a waiting skip transaction without advancing the request",
+      "real creation claim and test skip cannot both acquire the same request revision",
+      "closure and planning serialize on the case lock so a Dispatch save cannot overtake Sales cancellation",
+      "discount-only and PALLET adjustments wait for SCM and persist together on approval",
+      "issued test orders hold proposals until SCM approves both local quantities without changing rates",
+      "real pair retains a partial update, recovers exact lines and invalidates the old Dispatch quantities",
+      "real order service persists submission and recovers after SO patch success before PO creation",
+      "Sales and SCM Special tabs are real feature-gated interfaces",
+      "the filter exposes seven labelled choices, retains multiple selections and allows clearing",
+      "native PO recovery before a durable submission updates the existing PO without creating",
+      "native PO recovery after a durable submission updates the existing PO without creating"
+    ],
+    "newFailures": [],
+    "note": "31 failures also occur on captured production code; all are retained in the reports."
+  },
+  "types": {
+    "baselineDiagnostics": 7911,
+    "finalDiagnostics": 7911,
+    "newDiagnostics": []
+  },
+  "lint": {
+    "runtimeMessages": [],
+    "testAndToolMessages": []
+  },
+  "coverage": {
+    "changedExecutableLines": 64,
+    "uncoveredLines": [],
+    "coveredBranchArmsOnChangedLines": 83,
+    "branchArmsOnChangedLines": 87,
+    "note": "Includes existing branches on edited lines; backend c8 and actual Chromium V8 coverage are merged."
+  },
+  "mutations": [
+    {
+      "name": "completed lines block PO readiness",
+      "killed": true,
+      "failures": [
+        "Mixed Backorder skips completed materials in PO readiness and finishes remaining normal workflow",
+        "property: completed materials never hold up PO readiness for the remaining accepted materials"
+      ],
+      "propertyResult": {
+        "exitCode": 1,
+        "failures": [
+          "property: completed materials never hold up PO readiness for the remaining accepted materials"
+        ]
+      }
+    },
+    {
+      "name": "all ordered cases incorrectly close",
+      "killed": true,
+      "failures": [
+        "Already Ordered completes without synced orders, vendor, ETA or Sales acceptance and persists both references",
+        "Completed lines cannot be reopened by responses, Sales decisions, edits or readiness while other lines stay active",
+        "Already Ordered plus declined or closed materials completes in either action order",
+        "Concurrent SCM completions commit exactly once and another line can finish with the fresh revision",
+        "property: arbitrary safe PO references round trip without external orders and always complete the only line",
+        "property: all resolved Already Ordered cases complete before information and linking stages, with explicit closure respected"
+      ],
+      "propertyResult": {
+        "exitCode": 1,
+        "failures": [
+          "property: arbitrary safe PO references round trip without external orders and always complete the only line",
+          "property: all resolved Already Ordered cases complete before information and linking stages, with explicit closure respected"
+        ]
+      }
+    },
+    {
+      "name": "PO number becomes optional",
+      "killed": true,
+      "failures": [
+        "PO number and optional reference reject invalid text atomically and accept their exact length limits"
+      ]
+    },
+    {
+      "name": "references stored without trimming",
+      "killed": true,
+      "failures": [
+        "Already Ordered completes without synced orders, vendor, ETA or Sales acceptance and persists both references",
+        "property: arbitrary safe PO references round trip without external orders and always complete the only line"
+      ],
+      "propertyResult": {
+        "exitCode": 1,
+        "failures": [
+          "property: arbitrary safe PO references round trip without external orders and always complete the only line"
+        ]
+      }
+    },
+    {
+      "name": "completed lines can be reopened",
+      "killed": true,
+      "failures": [
+        "Completed lines cannot be reopened by responses, Sales decisions, edits or readiness while other lines stay active"
+      ]
+    },
+    {
+      "name": "missing completion audit",
+      "killed": true,
+      "failures": [
+        "Already Ordered completes without synced orders, vendor, ETA or Sales acceptance and persists both references",
+        "Concurrent SCM completions commit exactly once and another line can finish with the fresh revision"
+      ]
+    },
+    {
+      "name": "ordered line still triggers SCM review",
+      "killed": true,
+      "failures": [
+        "Already Ordered clears an outstanding SCM review alert while the remaining material awaits PO linkage"
+      ]
+    }
+  ],
+  "properties": {
+    "seeds": [
+      105080,
+      8102026,
+      8102027
+    ],
+    "roundTripCases": 24,
+    "readinessCases": 200,
+    "stageCases": 100
+  },
+  "failureModelChecks": {
+    "httpConcurrencyAndAtomicValidation": true,
+    "terminalWriteProtection": true,
+    "browserInformationAndPlanningPrompts": true,
+    "hostileReferenceEscaping": true,
+    "migrationReplayPreservedRows": true,
+    "transactionalSchemaRollback": true,
+    "databaseConstraints": 4,
+    "restoredAndReordered": true
+  },
+  "toolchain": {
+    "node": "v20.20.2",
+    "fast-check": "4.9.0",
+    "c8": "12.0.0",
+    "eslint": "10.8.0",
+    "typescript": "7.0.2",
+    "playwright": "1.62.1"
+  },
+  "deployment": {
+    "deployed": true,
+    "at": "2026-10-08T18:27:23.563100+00:00",
+    "imageId": "sha256:4e0e83d704e112870f7da1256274ce2decf0868e71166185accf140b72f1c9d2",
+    "files": [
+      "src/backorder-request-service.js",
+      "src/special-stock-request-repository.js",
+      "public/backorder-stock-requests.js",
+      "public/backorder-workflow.js",
+      "public/sales-stock-requests.html",
+      "public/sales-stock-requests.js",
+      "public/scm-stock-requests.html",
+      "public/scm-stock-requests.js",
+      "migrations/274_backorder_already_ordered.sql"
+    ],
+    "configurationPreserved": true,
+    "dependenciesPreserved": true,
+    "productionHealthy": true
+  },
+  "live": {
+    "passed": true,
+    "checks": [
+      {
+        "base": "http://127.0.0.1:3000",
+        "healthy": true,
+        "exactPublicAssets": 4,
+        "entryPagesUpdated": 2,
+        "anonymousApisDenied": 2
+      },
+      {
+        "base": "https://test.mbbsoperation.com",
+        "healthy": true,
+        "exactPublicAssets": 4,
+        "entryPagesUpdated": 2,
+        "anonymousApisDenied": 2
+      }
+    ]
+  },
+  "cleanup": {
+    "registeredBeforeStartup": true,
+    "testProjectsRemovedIncludingVolumesAndNetworks": true,
+    "evidence": "server/deployments/backorder-already-ordered-20261008/final-cleanup.json"
+  },
+  "reproduce": [
+    "python3 server/tools/backorder-already-ordered-check.py red",
+    "python3 server/tools/backorder-already-ordered-check.py final",
+    "python3 server/tools/backorder-already-ordered-check.py proofs"
+  ],
+  "resolvedDuringValidation": [
+    "Corrected the SCM completed-queue fixture and compared unchanged lines within the same audience.",
+    "Removed outstanding information and planning prompts after explicit browser failures.",
+    "Added two callback type annotations to keep the diagnostic count unchanged.",
+    "Explicitly enabled/restored the Special workflow flag in the negative routing test to remove a test-order dependency.",
+    "Corrected a syntax error in the mutation runner before executing its checks.",
+    "Captured browser coverage before reload and added a meaningful SCM alert scenario after coverage identified those gaps; the alert-removal mutant is killed."
+  ],
+  "skipped": {
+    "repositoryWideSuite": "Shared Backorder/Special suites were compared against captured production; unrelated dirty workspace work is outside this feature.",
+    "supplyChainAudit": "No dependency or package changes.",
+    "productionBusinessMutation": "Live verification reads health, assets and schema; all business-action tests use disposable data."
+  },
+  "limits": [
+    "Autonomous specification was not independently approved.",
+    "Existing repository test/type failures remain; zero new failures are enforced.",
+    "Rollback retains additive schema and saved references; old code rollback is allowed only before new statuses are saved."
+  ]
+}

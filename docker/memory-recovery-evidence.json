@@ -1,0 +1,172 @@
+{
+  "spec": {
+    "date": "2026-10-05",
+    "tier": "3: production operations and explicitly authorized disposable data deletion",
+    "specApproval": "not obtained (autonomous hotfix); user explicitly requested immediate removal without test database preservation",
+    "acceptance": [
+      "Only the four mbbs-operator-app production containers remain; all test containers and their attached disposable database storage are removed.",
+      "Production container IDs and start times are unchanged, and local/public health endpoints return HTTP 200.",
+      "AI memory is capped at 6 GiB live and in Compose, with a 4 GiB reservation and no additional swap allowance.",
+      "All services in the standard isolated test Compose configuration share mbbs-tests.slice, with 4 GiB aggregate memory and 3 GiB memory high watermark.",
+      "Test services have individual limits, an init process, bounded PID counts, and explicitly sized tmpfs mounts.",
+      "Repository instructions require removing test containers, databases, volumes, and networks on success, failure, and interruption."
+    ],
+    "failureModel": {
+      "production selected for cleanup": "Production allowlist and shared-volume exclusion checked before deletion; verify production IDs and start times afterward.",
+      "test RAM grows without bounds": "Validate Compose limits and effective systemd cgroup budget; use a disposable probe that removes itself.",
+      "limits vanish after recreation": "Persist limits in the base Compose files used by deployments.",
+      "orphan test processes accumulate": "Set init and PID limits and make teardown mandatory in repository instructions.",
+      "unrequested data removal": "Remove identified test storage only; retain production and former-production rollback volumes."
+    },
+    "setup": "Use Python standard library, installed Docker/Compose, systemd, and existing Node isolation validation. No new packages or application code changes.",
+    "rollback": "Restore the resource configuration files and previous AI Docker limits if needed; test database deletion is intentional and irreversible per the user's hotfix instruction.",
+    "scope": "Cleanup, resource configuration, repository instructions, focused verification, and evidence."
+  },
+  "checks": [
+    {
+      "command": [
+        "/usr/bin/python3",
+        "docker/verify-memory-limits.py"
+      ],
+      "exitCode": 0,
+      "stdout": "",
+      "stderr": "test_aggregate_unit_limits_host_exposure (__main__.MemoryLimits.test_aggregate_unit_limits_host_exposure) ... ok\ntest_ai_budget_is_persistent (__main__.MemoryLimits.test_ai_budget_is_persistent) ... ok\ntest_every_test_service_has_a_memory_budget (__main__.MemoryLimits.test_every_test_service_has_a_memory_budget) ... ok\ntest_every_test_service_shares_the_aggregate_budget (__main__.MemoryLimits.test_every_test_service_shares_the_aggregate_budget) ... ok\ntest_every_test_tmpfs_is_sized (__main__.MemoryLimits.test_every_test_tmpfs_is_sized) ... ok\ntest_test_processes_are_reaped_and_bounded (__main__.MemoryLimits.test_test_processes_are_reaped_and_bounded) ... ok\n\n----------------------------------------------------------------------\nRan 6 tests in 0.288s\n\nOK\n"
+    },
+    {
+      "command": [
+        "/usr/bin/python3",
+        "docker/check-memory-limit-mutations.py"
+      ],
+      "exitCode": 0,
+      "stdout": "{\n  \"killed\": 5,\n  \"total\": 5,\n  \"results\": [\n    {\n      \"mutation\": \"AI budget raised above 6 GiB\",\n      \"killed\": true\n    },\n    {\n      \"mutation\": \"Test memory budget removed\",\n      \"killed\": true\n    },\n    {\n      \"mutation\": \"Aggregate test budget bypassed\",\n      \"killed\": true\n    },\n    {\n      \"mutation\": \"Process reaping disabled\",\n      \"killed\": true\n    },\n    {\n      \"mutation\": \"Test tmpfs unbounded\",\n      \"killed\": true\n    }\n  ]\n}\n",
+      "stderr": ""
+    },
+    {
+      "command": [
+        "sudo",
+        "-n",
+        "systemd-analyze",
+        "verify",
+        "docker/mbbs-tests.slice"
+      ],
+      "exitCode": 0,
+      "stdout": "",
+      "stderr": ""
+    },
+    {
+      "command": [
+        "git",
+        "diff",
+        "--check",
+        "--",
+        "docker-compose.yml",
+        "docker-compose.mbt-test.yml"
+      ],
+      "exitCode": 0,
+      "stdout": "",
+      "stderr": ""
+    },
+    {
+      "command": [
+        "sudo",
+        "-n",
+        "docker",
+        "exec",
+        "-i",
+        "mbbs-operator-app-app-1",
+        "node",
+        "--input-type=module"
+      ],
+      "exitCode": 0,
+      "stdout": "Isolated Compose safety checks passed\n",
+      "stderr": ""
+    }
+  ],
+  "pythonSyntaxChecked": [
+    "docker/verify-memory-limits.py",
+    "docker/check-memory-limit-mutations.py",
+    "docker/verify-memory-recovery-live.py",
+    "docker/check-memory-recovery.py"
+  ],
+  "live": {
+    "verifiedAt": "2026-10-05T14:40:53.303048+00:00",
+    "remainingContainers": [
+      "mbbs-operator-app-app-1",
+      "mbbs-operator-app-db-1",
+      "mbbs-operator-app-ollama-1",
+      "mbbs-operator-app-webhook-worker-1"
+    ],
+    "remainingTestContainers": 0,
+    "productionRestarted": false,
+    "health": {
+      "http://127.0.0.1:3000/health": {
+        "status": 200,
+        "seconds": 0.002385
+      },
+      "https://test.mbbsoperation.com/health": {
+        "status": 200,
+        "seconds": 0.176919
+      }
+    },
+    "availableMemoryGiB": 17.31,
+    "aiMemoryLimitGiB": 6,
+    "testAggregateLimitGiB": 4,
+    "sliceProperties": {
+      "ActiveState": "active",
+      "CPUQuotaPerSecUSec": "2s",
+      "MemoryHigh": "3221225472",
+      "MemoryMax": "4294967296",
+      "MemorySwapMax": "0",
+      "TasksMax": "2048"
+    },
+    "probePassedAndRemoved": true,
+    "newOOMSince": "2026-10-05 14:27:10 UTC",
+    "newOOMCount": 0,
+    "sourceSha256": {
+      "AGENTS.md": "dfb5688def4787c2d00cf02b7bfa9b4c51d6ac6477c702a820846679337d18ba",
+      "docker-compose.yml": "c5dca272bc19064e19e9ffa5547c91071e38b4390f6d2d644024eb8d15dac574",
+      "docker-compose.mbt-test.yml": "64f240b8369f317c1153d8e04a053b6116fca004d0f0d9985148c16a2c896829",
+      "docker/mbbs-tests.slice": "ef10d63d424970f6fc49c68ecb30377f163530ae7442c07d1f6056d790366580",
+      "docker/verify-memory-limits.py": "c37a8fbe003607e12591add30863691f34a37d39d182ccdaba232b24b24e8661",
+      "docker/check-memory-limit-mutations.py": "879ad4a2b38fefa6ae1795499c5bfe1f01763bb01a7c73c0eb9c23ba5399d04d",
+      "docker/verify-memory-recovery-live.py": "4ba2099e2abbdb3a7e6513afc131c71cf1c2bf7b2d7b6c006356ecf0f32efbce"
+    }
+  },
+  "cleanup": {
+    "initialTestContainersRemoved": 57,
+    "initialRunningTestsStopped": 49,
+    "additionalTestContainersRemoved": [
+      "fe56ee89c6c2b91848cb5bb55dc7909155dbce06f7196269012e314c7d61d8ad",
+      "blissful_fermat",
+      "distracted_einstein",
+      "mbbs-sales150-test-390124-db"
+    ],
+    "unusedTestNetworksRemoved": 32,
+    "namedTestVolumesRemoved": [
+      "mbbs-special-review-db"
+    ],
+    "testDatabaseBackupsCreated": 0,
+    "anonymousAttachedVolumes": "removed with docker rm --volumes",
+    "tmpfsDatabases": "discarded when test containers stopped"
+  },
+  "toolVersions": {
+    "python": "3.14.4 (main, Aug 20 2026, 10:41:58) [GCC 15.2.0]",
+    "compose": "Docker Compose version v5.3.1",
+    "docker": "29.6.1",
+    "node": "v20.20.2"
+  },
+  "issuesResolved": [
+    "Before persistent configuration changes, acceptance checks reported 45 failing assertions and one missing-unit error.",
+    "The host has no Node binary; the existing pure isolation validator ran using the production container's Node runtime without changing application files.",
+    "The installed systemd ignores CPUAccounting; that obsolete option was removed and unit validation now emits no warnings.",
+    "Concurrent test jobs created containers during verification; newly discovered isolated tests were also removed and the final check requires zero test containers."
+  ],
+  "skippedLayers": {
+    "applicationFullSuite": "No application code changed; use focused Compose isolation and resource checks plus real production health/database verification instead of creating another database-heavy test stack.",
+    "applicationTypesAndCoverage": "No application executable lines changed; Python verification scripts were syntax checked. Configuration assertions cover all nine isolated services.",
+    "dependencyAudit": "No dependencies added or updated.",
+    "propertyTests": "No parsing or domain implementation changed; bounded-resource assertions inspect every resolved service, and five concrete configuration mutations are rejected.",
+    "testDatabaseRollback": "User explicitly requested immediate deletion without preserving test databases; deletion is intentional and irreversible."
+  },
+  "repeatCommand": "python3 docker/check-memory-recovery.py"
+}

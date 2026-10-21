@@ -415,11 +415,35 @@ async function returnPolicies(itemIds = []) {
   return new Map(result.rows.map((row) => [String(row.item_id), row]));
 }
 
+/** @param {number} customerId */
+async function customerHasLocalPalletReturns(customerId) {
+  const result = await query(`SELECT EXISTS (
+    SELECT 1 FROM return_records
+      WHERE customer_id=$1 AND record_type='pallet' AND status NOT IN ('rejected','voided')
+    UNION ALL
+    SELECT 1 FROM return_batch_authorizations a
+      WHERE a.draft_id IS NOT NULL AND a.intent_snapshot->>'customerId'=$1::text
+        AND a.sync_status <> 'cancelled'
+        AND EXISTS (SELECT 1 FROM jsonb_array_elements(a.intent_snapshot->'lines') line
+                    WHERE line->>'kind'='pallet')
+  ) AS has_returns`, [customerId]);
+  return result.rows[0].has_returns;
+}
+
+/** @param {any} remote */
+function palletBalanceSource(remote) {
+  return remote.savedSearchId ? {
+    source: remote.source,
+    savedSearchId: remote.savedSearchId,
+    balanceFound: remote.balanceFound
+  } : {};
+}
+
 async function customerPalletBalance(customer, remoteBalance = null, { force = true } = {}) {
   const customerId = customer.id || customer.internalId;
   const remote = remoteBalance || await fetchPalletBalanceFromNetSuite(
     customerId,
-    { force }
+    { force, includeCreditIdentity: await customerHasLocalPalletReturns(customerId) }
   );
   await reconcileMissingPalletCreditMemos(customerId, remote);
   const authorizations = await query(
@@ -449,8 +473,10 @@ async function customerPalletBalance(customer, remoteBalance = null, { force = t
     ...returnBalance({
       fulfilled: remote.fulfilled,
       netsuiteReturned: remote.netsuiteReturned,
+      netBalance: remote.netBalance,
       localReserved
     }),
+    ...palletBalanceSource(remote),
     lookedUpAt: remote.lookedUpAt || new Date().toISOString()
   };
 }
@@ -1707,7 +1733,7 @@ export async function submitReturnBatch({
         palletBalance.transactionIds || [],
         palletBalance.linkedCredits || []
       );
-      const currentAvailable = Math.max(palletBalance.fulfilled - palletBalance.netsuiteReturned - currentLocal, 0);
+      const currentAvailable = returnBalance({ ...palletBalance, localReserved: currentLocal }).available;
       if (palletQuantity - currentAvailable > QUANTITY_EPSILON) {
         throw httpError(409, `Maximum returnable PALLET quantity is now ${currentAvailable}.`, {
           code: "PALLET_QUOTA_CHANGED",

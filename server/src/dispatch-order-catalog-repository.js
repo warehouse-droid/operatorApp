@@ -61,6 +61,7 @@ function catalogRows(orders = [], source = "") {
     const key = ref.toLowerCase();
     if (!ref || seen.has(key)) continue;
     seen.add(key);
+    const card = compactDispatchOrderCard(order);
     rows.push({
       order_ref: ref,
       order_type: orderType(order),
@@ -68,8 +69,8 @@ function catalogRows(orders = [], source = "") {
       sort_date: sortDate(order),
       sort_key: `${sortDate(order) || "9999-12-31"}|${ref.toLowerCase()}`,
       search_text: dispatchOrderSearchText(order),
-      card: compactDispatchOrderCard(order),
-      full_order: { ...order, catalogHydrated: true },
+      card,
+      full_order: { ...order, catalogHydrated: true, catalogDetailSignature: card.catalogDetailSignature },
       source: text(source),
       source_updated_at: activityAt(order),
       activity_at: dispatchOrderRecency(order)
@@ -250,7 +251,8 @@ export async function getDispatchOrderCatalogOrder(ref) {
   const canonical = order.type === "CO"
     ? (await reconcileDispatchPlanLocalCos({ orders: [order], trucks: [] })).orders
     : [order];
-  return (await overlayFulfilledSalesDeliveryPlanning(await overlayDispatchOrderCompletionStatuses(canonical)))[0] || null;
+  const full = (await overlayFulfilledSalesDeliveryPlanning(await overlayDispatchOrderCompletionStatuses(canonical)))[0];
+  return full ? { ...full, catalogHydrated: true, catalogDetailSignature: compactDispatchOrderCard(full).catalogDetailSignature } : null;
 }
 
 export async function removeDispatchOrderCatalogOrder(ref) {

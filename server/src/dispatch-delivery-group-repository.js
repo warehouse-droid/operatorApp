@@ -224,6 +224,8 @@ function findGroupAssignment(plan, groupRef) {
 function globalGroupSnapshot(order = {}, { sourcePlanId, sourcePlanDate, orderType } = {}) {
   const snapshot = JSON.parse(JSON.stringify(order));
   for (const field of [
+    "originalOrderId", "parentOrderRef", "resplitSourceOrderId", "originalPallets",
+    "globalOrderDefinition", "globalOrderDefinitionKind", "globalOrderSourcePlanId", "globalOrderSourcePlanDate",
     "dispatchSnapshotSourcePlanId",
     "dispatchSnapshotSourcePlanDate",
     "dispatchPlanned",
@@ -241,6 +243,7 @@ function globalGroupSnapshot(order = {}, { sourcePlanId, sourcePlanDate, orderTy
   return {
     ...snapshot,
     type: orderType || canonicalGroupedOrderType(order) || snapshot.type,
+    isSplit: false,
     globalGroupDefinition: true,
     globalGroupSourcePlanId: sourcePlanId === null || sourcePlanId === undefined ? "" : String(sourcePlanId),
     globalGroupSourcePlanDate: sourcePlanDate,
@@ -458,6 +461,7 @@ function canonicalDerivedOrderType(order = {}) {
 
 function derivedDefinitionKind(order = {}) {
   if (!canonicalDerivedOrderType(order)) return "";
+  if (isGroupedDispatchOrder(order)) return "";
   if (order.orderKind === "sor_rental_return") { return "derived"; }
   if (splitParentRef(order)) return "split";
   const declared = text(order.globalOrderDefinitionKind).toLowerCase();

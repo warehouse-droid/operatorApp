@@ -3,6 +3,7 @@ import { preserveOrdinaryDispatchBins } from "./mbt/bin-planning-domain.js";
 import { applyPendingDispatchPlanMaintenance } from "./dispatch-plan-maintenance.js";
 
 import { query, withTransaction } from "./db.js";
+import { assertDispatchSplitQuantityChanges } from './dispatch-split-quantity-repository.js';
 import { persistedDispatchPlan } from './dispatch-plan-fence.js';
 import { lockDispatchPlanEditLease, assertDispatchPlanEditLease } from './dispatch-plan-lease-repository.js';
 import { assertSalesDeliveryPlanningAllowed, fulfilledSalesDeliveryPlanningRefs } from "./dispatch-fulfilled-so-repository.js";
@@ -533,7 +534,8 @@ export function dispatchPlanAssignmentRows(plan = {}) {
 export async function listDispatchPlanOrderAssignmentsProjection({
   orderRefs = [],
   excludePlanId = "",
-  excludePlanDate = ""
+  excludePlanDate = "",
+  includeSnapshots = true
 } = {}) {
   const refs = [...new Set(
     (orderRefs || []).map((ref) => text(ref).toLowerCase()).filter(Boolean)
@@ -547,7 +549,7 @@ export async function listDispatchPlanOrderAssignmentsProjection({
             assignment.assignment_kind,
             assignment.load_id,
             assignment.stop_id,
-            assignment.assignment
+            ${includeSnapshots ? "assignment.assignment" : "(assignment.assignment - 'plannedOrderSnapshot')"} AS assignment
        FROM dispatch_plan_order_assignments assignment
        JOIN dispatch_plans plan ON plan.id = assignment.plan_id
       WHERE plan.status <> 'cancelled'
@@ -975,6 +977,7 @@ export async function applyDispatchV2Command({ planId, command = {}, actorId = n
       plan,
       command: { ...command, type: commandType }
     });
+    await assertDispatchSplitQuantityChanges(result.plan, { previousPlan: persistedPlan });
     if (retainedHistory && historicalOrders.reconstructed.length) {
       const known = new Set((result.plan.orders || []).map(order => text(order.id).toLowerCase()));
       result.plan.orders.push(...plan.orders.filter(order => !known.has(text(order.id).toLowerCase())));

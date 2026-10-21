@@ -1,0 +1,528 @@
+--- a/src/receiving-yard-scope.js
++++ b/src/receiving-yard-scope.js
+@@ -0,0 +1,46 @@
++// @ts-check
++import { normalizeOperatorNetSuiteLocationId } from './operator-netsuite-posting-policy.js';
++import { operatorYardForbidden } from './operator-yard-access.js';
++
++/** @param {Record<string, any>} order @param {Record<string, any>} line */
++function lineYard(order, line) {
++  return normalizeOperatorNetSuiteLocationId(order.destination_override)
++    ?? normalizeOperatorNetSuiteLocationId(line.location_id ?? order.destination_location_id);
++}
++
++/** @param {Record<string, any>} line */
++function visibleLine(line) {
++  return line.netsuite_active !== false || Boolean(line.sync_exception);
++}
++
++/** @param {Record<string, any>} order @returns {number[]} */
++export function receivingOrderYards(order) {
++  if (order.order_type === 'purchase_order' && Array.isArray(order.receiving_yard_location_ids)) {
++    return order.receiving_yard_location_ids;
++  }
++  const lines = (order.lines || []).filter(visibleLine);
++  const locations = order.order_type === 'purchase_order' && lines.length
++    ? lines.map((/** @type {Record<string, any>} */ line) => lineYard(order, line))
++    : [normalizeOperatorNetSuiteLocationId(order.destination_override)
++      ?? normalizeOperatorNetSuiteLocationId(order.destination_location_id)];
++  return [...new Set(locations)].filter((/** @type {number|null} */ yard) => yard !== null);
++}
++
++/** @param {Record<string, any>} order @param {unknown} locationId
++ * @param {{keepAllLines?: boolean}} [options] */
++export function scopeReceivingOrderYard(order, locationId, { keepAllLines = false } = {}) {
++  const yard = normalizeOperatorNetSuiteLocationId(locationId);
++  if (yard === null || !receivingOrderYards(order).includes(yard)) {
++    throw operatorYardForbidden();
++  }
++  if (order.order_type !== 'purchase_order') {return order;}
++  const selected = (/** @type {Record<string, any>} */ line) => visibleLine(line) && lineYard(order, line) === yard;
++  return {
++    ...order,
++    destination_location_id: yard,
++    destination_location: /** @type {Record<number, string>} */ ({ 1: '3445', 28: '2967', 15: '12441', 26: '150' })[yard],
++    lines: keepAllLines ? (order.lines || []).map((/** @type {Record<string, any>} */ line) => line.location_id === null || line.location_id === undefined
++      ? { ...line, location_id: lineYard(order, line) } : line) : (order.lines || []).filter(selected),
++    ...(order.receivableLines ? { receivableLines: order.receivableLines.filter(selected) } : {})
++  };
++}
+--- a/src/receiving-repository.js
++++ b/src/receiving-repository.js
+@@ -5,6 +5,7 @@
+ import { writeAudit } from "./auth-repository.js";
+ import { netSuiteClosedOrderFamilySql } from "./netsuite-closed-order-policy.js";
+ import { assertNoClosedNetSuiteOrders, listClosedNetSuiteOrders } from "./netsuite-closed-order-repository.js";
++import { receivingOrderYards, scopeReceivingOrderYard } from "./receiving-yard-scope.js";
+ 
+ function normalizeNumber(value) {
+   if (value === null || value === undefined || value === "") return null;
+@@ -60,6 +61,16 @@
+     WHEN '150' THEN 26
+     ELSE NULL
+   END`;
++}
++
++function receivingLineYardSql(line = 'rol', order = 'ro') {
++  return `COALESCE(${scheduleDestinationLocationIdSql(`${order}.destination_override`)}, ${line}.location_id, ${order}.destination_location_id)`;
++}
++
++function receivingLineScopeSql(destinationLocationId, parameter, line = 'rol', order = 'ro') {
++  return destinationLocationId
++    ? `AND (${order}.order_type <> 'purchase_order' OR ${receivingLineYardSql(line, order)} = ${parameter})`
++    : '';
+ }
+ 
+ function hasConversion(line) {
+@@ -277,10 +288,12 @@
+   let destinationClause = "";
+   if (destinationLocationId) {
+     params.push(destinationLocationId);
+-    destinationClause = `AND COALESCE(
+-      ${scheduleDestinationLocationIdSql("schedule.dropoff_point")},
+-      po.destination_location_id
+-    ) = $${params.length}`;
++    destinationClause = `AND EXISTS (
++      SELECT 1 FROM purchase_order_lines line
++      WHERE line.purchase_order_id = po.netsuite_id AND line.netsuite_active = true
++        AND COALESCE(${scheduleDestinationLocationIdSql("schedule.dropoff_point")},
++          line.location_id, po.destination_location_id) = $${params.length}
++    )`;
+   }
+   const result = await query(
+     `SELECT vendor_id, vendor, COUNT(*)::int AS order_count
+@@ -339,6 +352,7 @@
+ 
+ export async function listReceivingOrders({ orderType, vendor = null, sourceLocationId = null, destinationLocationId = null, search = null, itemSearch = null } = {}) {
+   const params = [orderType];
++  let destinationParameter = null;
+   const clauses = ["ro.order_type = $1", "ro.netsuite_active = true", "ro.receipt_status IS DISTINCT FROM 'received'", "(ro.status_text ILIKE '%Pending Receipt%' OR ro.status_text ILIKE '%Partially Received%')"];
+   if (vendor) {
+     params.push(vendor);
+@@ -350,7 +364,12 @@
+   }
+   if (destinationLocationId) {
+     params.push(destinationLocationId);
+-    clauses.push(`ro.destination_location_id = $${params.length}`);
++    destinationParameter = `$${params.length}`;
++    clauses.push(`((ro.order_type = 'purchase_order' AND EXISTS (
++      SELECT 1 FROM receiving_line_source rol WHERE rol.order_id = ro.netsuite_id
++        AND rol.order_type = ro.order_type AND rol.netsuite_active = true
++        AND ${receivingLineYardSql()} = ${destinationParameter}
++    )) OR (ro.order_type = 'transfer_order' AND ro.destination_location_id = ${destinationParameter}))`);
+   }
+   if (search) {
+     params.push(`%${String(search).trim()}%`);
+@@ -361,7 +380,9 @@
+     clauses.push(`EXISTS (
+       SELECT 1 FROM receiving_line_source rol
+       WHERE rol.order_id = ro.netsuite_id
++        AND rol.order_type = ro.order_type
+         AND rol.netsuite_active = true
++        ${receivingLineScopeSql(destinationLocationId, destinationParameter)}
+         AND (rol.item_name ILIKE $${params.length} OR rol.item_description ILIKE $${params.length})
+     )`);
+   }
+@@ -410,15 +431,17 @@
+          )
+      ),
+      receiving_line_source AS (
+-       SELECT purchase_order_id AS order_id, item_name, item_description, netsuite_active
++       SELECT purchase_order_id AS order_id, 'purchase_order'::text AS order_type, location_id, item_name, item_description, netsuite_active
+        FROM purchase_order_lines
+        UNION ALL
+-       SELECT transfer_order_id AS order_id, item_name, item_description, netsuite_active
++       SELECT transfer_order_id AS order_id, 'transfer_order'::text AS order_type, location_id, item_name, item_description, netsuite_active
+        FROM transfer_order_lines
+        WHERE line_stage = 'receiving'
+      )
+      SELECT ro.*,
+-            (SELECT COUNT(*)::int FROM receiving_line_source rol WHERE rol.order_id = ro.netsuite_id AND rol.netsuite_active = true) AS line_count
++            (SELECT COUNT(*)::int FROM receiving_line_source rol WHERE rol.order_id = ro.netsuite_id
++              AND rol.order_type = ro.order_type AND rol.netsuite_active = true
++              ${receivingLineScopeSql(destinationLocationId, destinationParameter)}) AS line_count
+      FROM receiving_order_source ro
+      WHERE ${clauses.join(" AND ")}
+      ORDER BY ro.trandate DESC, ro.tranid DESC
+@@ -428,7 +451,7 @@
+   return result.rows;
+ }
+ 
+-export async function getReceivingOrder(orderId, { includeNetSuiteClosed = false } = {}) {
++export async function getReceivingOrder(orderId, { includeNetSuiteClosed = false, destinationLocationId = null } = {}) {
+   const purchaseVisibilitySql = includeNetSuiteClosed
+     ? "true"
+     : `NOT ${netSuiteClosedOrderFamilySql("po", "PO")}`;
+@@ -545,12 +568,16 @@
+         location: overrideLocation
+       }
+     : line);
+-  return {
++  const result = {
+     ...receivingOrder,
++    ...(receivingOrder.order_type === 'purchase_order' ? {
++      receiving_yard_location_ids: receivingOrderYards({ ...receivingOrder, lines: projectedLines })
++    } : {}),
+     lines: projectedLines.map((/** @type {Record<string,any>} */ line) => applyPoAllocationFields(receipts
+       ? applyReceivingPoSplitReservations(applyReceivingReceiptProgress(line, receipts), splitReservations) : line))
+       .filter(hasReceivingDisplayQuantity)
+   };
++  return destinationLocationId === null ? result : scopeReceivingOrderYard(result, destinationLocationId);
+ }
+ 
+ export async function confirmReceivingLine(orderId, lineRowId, values, operatorId) {
+@@ -779,7 +806,7 @@
+   return getReceivingOrder(orderId);
+ }
+ 
+-export async function getReceivableReceivingOrder(orderId, { includeNetSuiteClosed = false } = {}) {
++export async function getReceivableReceivingOrder(orderId, { includeNetSuiteClosed = false, destinationLocationId = null } = {}) {
+   const order = await getReceivingOrder(orderId, { includeNetSuiteClosed });
+   if (!order) throw new Error("Receiving order not found.");
+   if (order.receipt_status === "received") {
+@@ -801,8 +828,10 @@
+       && ["InvtPart", "NonInvtPart"].includes(line.item_type || "")
+       && (physicalTotal > 0 || confirmedSalesQuantity > 0);
+   });
+-  if (!receivableLines.length) throw new Error("No confirmed lines to receive.");
+-  return { ...order, receivableLines };
++  const result = destinationLocationId === null ? { ...order, receivableLines }
++    : scopeReceivingOrderYard({ ...order, receivableLines }, destinationLocationId, { keepAllLines: true });
++  if (!result.receivableLines.length) throw new Error("No confirmed lines to receive.");
++  return result;
+ }
+ 
+ export function buildItemReceiptPayload(order, lines) {
+@@ -1667,13 +1696,15 @@
+   }
+   if (destinationLocationId) {
+     params.push(destinationLocationId);
+-    clauses.push(`ro.destination_location_id = $${params.length}`);
++    clauses.push(`((ro.order_type = 'purchase_order' AND ${receivingLineYardSql()} = $${params.length})
++      OR (ro.order_type = 'transfer_order' AND ro.destination_location_id = $${params.length}))`);
+   }
+   const result = await query(
+     `WITH receiving_order_source AS (
+        SELECT po.netsuite_id, 'purchase_order'::text AS order_type, po.vendor,
+               NULL::bigint AS source_location_id,
+               COALESCE(${scheduleDestinationLocationIdSql("schedule.dropoff_point")}, po.destination_location_id) AS destination_location_id,
++              NULLIF(BTRIM(schedule.dropoff_point), '') AS destination_override,
+               po.status_text, po.netsuite_active
+ 	       FROM purchase_orders po
+          LEFT JOIN scm_transport_schedule schedule
+@@ -1684,6 +1715,7 @@
+ 	       UNION ALL
+        SELECT netsuite_id, 'transfer_order'::text AS order_type, NULL::text AS vendor,
+               from_location_id AS source_location_id, to_location_id AS destination_location_id,
++              NULL::text AS destination_override,
+               status_text, netsuite_active
+ 	       FROM transfer_orders t
+ 	       WHERE t.to_location_id IS NOT NULL
+@@ -1697,10 +1729,10 @@
+          )
+      ),
+      receiving_line_source AS (
+-       SELECT purchase_order_id AS order_id, item_id, item_name, item_description, netsuite_active
++       SELECT purchase_order_id AS order_id, 'purchase_order'::text AS order_type, location_id, item_id, item_name, item_description, netsuite_active
+        FROM purchase_order_lines
+        UNION ALL
+-       SELECT transfer_order_id AS order_id, item_id, item_name, item_description, netsuite_active
++       SELECT transfer_order_id AS order_id, 'transfer_order'::text AS order_type, location_id, item_id, item_name, item_description, netsuite_active
+        FROM transfer_order_lines
+        WHERE line_stage = 'receiving'
+      )
+@@ -1709,7 +1741,7 @@
+             MIN(rol.item_description) AS item_description,
+             COUNT(DISTINCT ro.netsuite_id)::int AS order_count
+      FROM receiving_line_source rol
+-     INNER JOIN receiving_order_source ro ON ro.netsuite_id = rol.order_id
++     INNER JOIN receiving_order_source ro ON ro.netsuite_id = rol.order_id AND ro.order_type = rol.order_type
+      WHERE ${clauses.join(" AND ")}
+      GROUP BY rol.item_id, rol.item_name
+      ORDER BY order_count DESC, rol.item_name
+--- a/src/operator-yard-authorization.js
++++ b/src/operator-yard-authorization.js
+@@ -8,6 +8,7 @@
+ import { operatorRequestPath, operatorRouteId } from "./operator-yard-route.js";
+ import { outboundOrderYards, outboundYardLocationId } from './outbound-location-domain.js';
+ import { ensureOutboundLocationDirectory } from './outbound-location-runtime.js';
++import { receivingOrderYards, scopeReceivingOrderYard } from './receiving-yard-scope.js';
+ 
+ /** @param {any} row */
+ function found(row) {
+@@ -15,30 +16,44 @@
+   return row;
+ }
+ 
+-/** @param {import("./operator-yard-access.js").OperatorYardAccount} operator @param {any} id */
+-export async function assertOperatorOrderYard(operator, id, { receiving = false, orderType = "" } = {}) {
++/** @param {import("./operator-yard-access.js").OperatorYardAccount} operator @param {any} id
++ * @param {{receiving?: boolean, orderType?: string, destinationLocationId?: unknown}} [options] */
++export async function assertOperatorOrderYard(operator, id, { receiving = false, orderType = "", destinationLocationId = null } = {}) {
+   let order;
+   if (receiving) {
+-    const local = orderType === "co_order" || String(id).startsWith("CO-");
+-    order = local ? await getLocalCoReceivingOrder(id) : await getReceivingOrder(id, { includeNetSuiteClosed: true });
+-    // SCM split POs and TOs also use negative IDs. Resolve those before the
+-    // legacy local CO fallback, matching the receiving detail route.
+-    if (!order && !local && Number(id) < 0) {
+-      order = await getLocalCoReceivingOrder(id);
+-    }
++    order = await readReceivingIdentity(id, orderType);
+   } else {
+     await ensureOutboundLocationDirectory();
+     order = await getDeliveryOrder(id, { includeNetSuiteClosed: true });
+   }
+   found(order);
+   if (receiving) {
+-    assertOperatorYard(operator, order.destination_location_id);
++    order = receivingOrderForOperator(operator, order, destinationLocationId);
+     assertOperatorChildOrderYards(operator, order);
+   } else {
+     if (!deliveryOrderWithinYards(order, operatorYardLocationIds(operator))) throw operatorYardForbidden();
+     for (const yard of outboundOrderYards(order)) assertOperatorYard(operator, yard);
+   }
+   return order;
++}
++
++/** @param {any} id @param {string} orderType */
++async function readReceivingIdentity(id, orderType) {
++  const local = orderType === 'co_order' || String(id).startsWith('CO-');
++  const order = local ? await getLocalCoReceivingOrder(id) : await getReceivingOrder(id, { includeNetSuiteClosed: true });
++  // Resolve canonical split POs and TOs before the legacy negative CO fallback.
++  return !order && !local && Number(id) < 0 ? getLocalCoReceivingOrder(id) : order;
++}
++
++/** @param {import("./operator-yard-access.js").OperatorYardAccount} operator
++ * @param {any} order @param {unknown} destinationLocationId */
++function receivingOrderForOperator(operator, order, destinationLocationId) {
++  const allowed = operatorYardLocationIds(operator);
++  const candidates = receivingOrderYards(order).filter(yard => allowed.includes(yard));
++  const yard = destinationLocationId ?? (candidates.includes(Number(order.destination_location_id))
++    ? Number(order.destination_location_id) : candidates.length === 1 ? candidates[0] : null);
++  assertOperatorYard(operator, yard);
++  return scopeReceivingOrderYard(order, yard);
+ }
+ 
+ /** @param {import("./operator-yard-access.js").OperatorYardAccount} operator @param {any} order */
+@@ -60,7 +75,8 @@
+   if (body.recordType === "operator-return-photo" || body.recordType === "operator-damage-photo") return assertOperatorYard(operator, body.locationId);
+   if (!body.orderId) throw Object.assign(new Error("An order is required for this photo."), { status: 400 });
+   const order = await assertOperatorOrderYard(operator, body.orderId, {
+-    receiving: String(body.recordType).includes("receiving"), orderType: body.orderType
++    receiving: String(body.recordType).includes("receiving"), orderType: body.orderType,
++    destinationLocationId: body.destinationLocationId ?? body.locationId ?? null
+   });
+   return String(body.recordType).includes('receiving') ? Number(order.destination_location_id)
+     : outboundYardLocationId(order.outbound_location_id ?? order.source_location_id);
+@@ -235,13 +251,34 @@
+   if (pathname.startsWith("/api/returns/")) return authorizeReturnRequest(req, pathname);
+   const order = pathname.match(/^\/api\/(delivery|receiving|customer-pickup)\/orders\/([^/]+)/);
+   if (order) {
+-    return assertOperatorOrderYard(req.operator, operatorRouteId(order[2]), { receiving: order[1] === "receiving", orderType: req.body?.orderType || req.query.orderType });
++    return authorizeOrderRequest(req, pathname, order);
+   }
+   const consolidation = pathname.match(/^\/api\/delivery\/consolidation\/(orders|batches)\/([^/]+)/);
+   if (consolidation) return assertConsolidationYard(req, consolidation[1] || "", operatorRouteId(consolidation[2]));
+   const job = pathname.match(/^\/api\/(delivery\/fulfillment-jobs|receiving\/receipt-jobs|operator\/netsuite-posting-jobs)\/([^/]+)/);
+   if (job) return authorizeJobRequest(req, job, jobs);
+   return authorizeListRequest(req, pathname);
++}
++
++/** @param {any} req @param {string} pathname @param {RegExpMatchArray} match */
++async function authorizeOrderRequest(req, pathname, match) {
++  const authorized = await assertOperatorOrderYard(req.operator, operatorRouteId(match[2]), {
++    receiving: match[1] === 'receiving', orderType: req.body?.orderType || req.query.orderType,
++    destinationLocationId: req.body?.destinationLocationId ?? req.body?.locationId
++      ?? req.query?.destinationLocationId ?? req.query?.locationId ?? null
++  });
++  if (match[1] === 'receiving') {assertReceivingRequestLines(req, pathname, authorized);}
++  return authorized;
++}
++
++/** @param {any} req @param {string} pathname @param {any} order */
++function assertReceivingRequestLines(req, pathname, order) {
++  if (order.order_type !== 'purchase_order') {return;}
++  const single = pathname.match(/\/lines\/([^/]+)\/(?:confirm|unconfirm)$/);
++  const ids = single ? [operatorRouteId(single[1])]
++    : pathname.endsWith('/lines/confirm-page') ? (req.body?.lines || []).map((/** @type {any} */ line) => line.lineId || line.id) : [];
++  const own = new Set((order.lines || []).map((/** @type {any} */ line) => String(line.id)));
++  if (ids.some((/** @type {any} */ id) => !own.has(String(id)))) {throw operatorYardForbidden();}
+ }
+ 
+ export function createOperatorYardGuard({ receivingJobs = new Map(), fulfillmentJobs = new Map() } = {}) {
+--- a/src/operator-netsuite-posting-targets.js
++++ b/src/operator-netsuite-posting-targets.js
+@@ -7,6 +7,7 @@
+ import { fetchOperatorKitSource } from './operator-netsuite-posting-kit-source.js';
+ import { applyVerifiedPoReceiptProgress } from "./receiving-receipt-progress.js";
+ import { refreshPoReceiptAvailability } from "./operator-po-receipt-availability.js";
++import { receivingOrderYards, scopeReceivingOrderYard } from './receiving-yard-scope.js';
+ import { fetchPickupExistingFulfillment } from './operator-pickup-existing-if-source.js';
+ import { outboundOrderYards } from './outbound-location-domain.js';
+ import { operatorPostingTelemetry as telemetry } from "./operator-netsuite-posting-telemetry.js";
+@@ -476,7 +477,7 @@
+         400
+       );
+     }
+-    const root = functionKey === "receiving"
++    let root = functionKey === "receiving"
+       ? await getReceivingOrderById(orderId, orderType)
+       : await readDeliveryOrder(orderId);
+     if (!root) {
+@@ -485,6 +486,14 @@
+         "The current Operator order was not found.",
+         404
+       );
++    }
++    if (functionKey === 'receiving' && root.order_type === 'purchase_order'
++        && clientLocationId !== null && clientLocationId !== undefined && clientLocationId !== '') {
++      if (!receivingOrderYards(root).includes(normalizeOperatorNetSuiteLocationId(clientLocationId))) {
++        throw resolutionError('OPERATOR_NETSUITE_POSTING_LOCATION_MISMATCH',
++          'The selected yard does not match the server-owned order yard. Refresh before confirming.');
++      }
++      root = scopeReceivingOrderYard(root, clientLocationId, { keepAllLines: true });
+     }
+     if (functionKey === "customer_pickup"
+         && (root.order_type !== "sales_order" || !isPickupDeliveryMethod(root.delivery_method))) {
+--- a/src/server.js
++++ b/src/server.js
+@@ -204,6 +204,7 @@
+ import { createOperator, getOperatorByToken, hasOperators, listAudit, listAuditOptions, listOperators, loginOperator, logoutToken, operatorHomeRoute, setOperatorActive, updateOperatorPassword, updateOperatorRoles, writeAudit } from "./auth-repository.js";
+ import { applyInventoryClassificationRules, confirmCycleCountLine, getCycleCountDraft, listCycleCountRecords, listInventoryClassifications, listInventoryFacets, listInventoryItems, submitCycleCount, updateInventoryClassification, upsertInventoryBalances } from "./inventory-repository.js";
+ import { listReceivingVendors, listReceivingSources, listReceivingOrders, getReceivingOrder, searchReceivingItems, confirmReceivingLine, confirmPurchaseOrderReceivingLines, unconfirmReceivingLine, getReceivableReceivingOrder, buildItemReceiptPayload, recordReceivingReceipt, recordReceivingReceiptFailure, listReceivingReceipts, listLocalCoSources, listLocalCoReceivingOrders, searchLocalCoItems, getLocalCoReceivingOrder, confirmLocalCoReceivingLine, unconfirmLocalCoReceivingLine, receiveLocalCoOrder } from "./receiving-repository.js";
++import { scopeReceivingOrderYard } from './receiving-yard-scope.js';
+ import { listExistingInboundOrderIds, listExistingOutboundOrderIds, markMissingInboundOrderLines, markMissingInboundOrders, markMissingOutboundOrderLines, markOutboundOrderMissing, updatePurchaseOrderNetSuiteStatus, updateSalesOrderNetSuiteStatus, updateTransferOrderNetSuiteStatus, upsertInboundTransferOrderLines, upsertInboundTransferOrders, upsertOutboundTransferOrderLines, upsertOutboundTransferOrders, upsertPurchaseOrderLines, upsertPurchaseOrders, upsertSalesOrderLines, upsertSalesOrders } from "./order-sync-repository.js";
+ import { acceptNetSuiteMirrorEvents, enqueueNetSuiteMirrorOrderEvent, getNetSuiteMirrorStatus, isNetSuiteMirrorConsumer, isNetSuiteMirrorSource, listNetSuiteMirrorManifest, retryNetSuiteMirrorFailures } from "./netsuite-mirror-repository.js";
+ import { kickNetSuiteMirrorConsumer, localNetSuiteMirrorEventPage, localNetSuiteMirrorInventorySnapshot, localNetSuiteMirrorOrderSnapshot, relayPendingNetSuiteMirrorEvents, requireNetSuiteMirrorSignature, runNetSuiteMirrorConsumerTick, runNetSuiteMirrorReconciliation, startNetSuiteMirrorWorkers } from "./netsuite-mirror-service.js";
+@@ -23904,7 +23905,7 @@
+     if (req.body?.orderType === "co_order" || req.query.orderType === "co_order" || String(req.params.id).startsWith("CO-")) {
+       return res.json({ localOnly: true, synced: { order: true, orderType: "co_order", lines: 0 } });
+     }
+-    const order = await getReceivingOrder(req.params.id);
++    const order = await getReceivingOrder(req.params.id, { destinationLocationId: req.operatorYardOrder.destination_location_id });
+     await writeAudit({
+       actorOperatorId: req.operator.id,
+       source: "receiving",
+@@ -23921,7 +23922,9 @@
+   try {
+     const requestedType = req.query.orderType || "";
+     if (requestedType !== "co_order") {
+-      const order = await getReceivingOrder(req.params.id);
++      const order = await getReceivingOrder(req.params.id, {
++        destinationLocationId: req.operatorYardOrder?.destination_location_id ?? null
++      });
+       if (order) return res.json(order);
+     }
+     if (requestedType === "co_order" || String(req.params.id).startsWith("CO-") || Number(req.params.id) < 0) {
+@@ -23945,7 +23948,7 @@
+     }
+     const result = await confirmReceivingLine(req.params.id, req.params.lineId, req.body || {}, operatorId(req));
+     emitAppEvent("receiving.line.confirmed", { orderId: req.params.id, lineId: req.params.lineId, orderType: req.body?.orderType || null, operatorId: operatorId(req) });
+-    res.json(result);
++    res.json(scopeReceivingOrderYard(result, req.operatorYardOrder.destination_location_id));
+   } catch (error) {
+     next(error);
+   }
+@@ -23955,7 +23958,7 @@
+   try {
+     await assertOperatorNetSuitePostingOrderMutable({ functionKey: "receiving", orderId: req.params.id, orderType: "purchase_order" });
+     const result = await confirmPurchaseOrderReceivingLines(req.params.id, req.body?.lines || [], operatorId(req));
+-    const order = await getReceivingOrder(req.params.id);
++    const order = await getReceivingOrder(req.params.id, { destinationLocationId: req.operatorYardOrder.destination_location_id });
+     emitAppEvent("receiving.line.confirmed", {
+       orderId: req.params.id,
+       count: result.confirmed,
+@@ -23979,7 +23982,7 @@
+     }
+     const result = await unconfirmReceivingLine(req.params.id, req.params.lineId, operatorId(req));
+     emitAppEvent("receiving.line.unconfirmed", { orderId: req.params.id, lineId: req.params.lineId, orderType: req.body?.orderType || null, operatorId: operatorId(req) });
+-    res.json(result);
++    res.json(scopeReceivingOrderYard(result, req.operatorYardOrder.destination_location_id));
+   } catch (error) {
+     next(error);
+   }
+@@ -23988,7 +23991,7 @@
+ app.post("/api/receiving/orders/:id/receive", async (req, res, next) => {
+   try {
+     const saved = await operatorPhotoAction(req, "receiving", async photos => {
+-    req.body = { ...(req.body || {}), photoDataUrls: photos };
++    req.body = { ...(req.body || {}), photoDataUrls: photos, destinationLocationId: req.operatorYardOrder.destination_location_id };
+     const admission = await submitOperatorNetSuitePostingAction({
+       requestId: req.body?.requestId,
+       actorOperatorId: operatorId(req),
+@@ -24268,7 +24271,9 @@
+ 
+ async function runReceivingReceipt(orderId, body, currentOperatorId, jobId) {
+   updateReceivingJob(jobId, { stage: "validating", message: "Checking confirmed receiving lines." });
+-  const order = await getReceivableReceivingOrder(orderId);
++  const order = await getReceivableReceivingOrder(orderId, {
++    destinationLocationId: body?.destinationLocationId ?? body?.locationId ?? null
++  });
+   updateReceivingJob(jobId, {
+     stage: "payload",
+     message: `Recording ${order.receivableLines.length} confirmed line(s) locally.`
+--- a/public/operator.js
++++ b/public/operator.js
+@@ -6325,7 +6325,7 @@
+   const listOrder = receivingOrders.find((order) => String(order.netsuite_id) === String(id));
+   const orderType = listOrder?.order_type || receivingOrderType;
+   try {
+-    const order = await api(`/api/receiving/orders/${encodeURIComponent(id)}?orderType=${encodeURIComponent(orderType)}`);
++    const order = await api(`/api/receiving/orders/${encodeURIComponent(id)}?orderType=${encodeURIComponent(orderType)}&locationId=${encodeURIComponent(locationId)}`);
+     if (!receivingRequestIsCurrent(context) || request !== receivingDetailRequest || String(receivingSelectedId) !== String(id)) return null;
+     receivingSelectedOrder = order;
+     if (listOrder) listOrder.line_count = (order.lines || []).filter((line) => isPickableLine(line) && hasReceivingRemainingQty(line)).length;
+@@ -7683,7 +7683,7 @@
+   try {
+     const result = await api(`/api/receiving/orders/${encodeURIComponent(receivingSelectedId)}/lines/confirm-page`, {
+       method: "POST",
+-      body: JSON.stringify({ orderType: "purchase_order", lines: requests })
++      body: JSON.stringify({ orderType: "purchase_order", locationId, lines: requests })
+     });
+     receivingSelectedOrder = result.order || receivingSelectedOrder;
+     const failures = result.failures || [];
+@@ -7711,6 +7711,7 @@
+     pieces: isIndependentManualLine(line) ? row.querySelector('[data-pack="pieces"]')?.value || 0 : salesQty || row.querySelector('[data-pack="pieces"]')?.value || 0,
+     salesQty,
+     sections: row.querySelector('[data-pack="sections"]')?.value || 0,
++    locationId,
+     orderType: receivingSelectedOrder?.order_type || receivingOrderType
+   };
+   receivingSelectedOrder = await api(`/api/receiving/orders/${receivingSelectedId}/lines/${lineId}/confirm`, {
+@@ -7726,6 +7727,7 @@
+   receivingSelectedOrder = await api(`/api/receiving/orders/${receivingSelectedId}/lines/${lineId}/unconfirm`, {
+     method: "POST",
+     body: JSON.stringify({
++      locationId,
+       orderType: receivingSelectedOrder?.order_type || receivingOrderType
+     })
+   });
+--- a/public/operator.html
++++ b/public/operator.html
+@@ -31,7 +31,7 @@
+     <script src="/operator-delivery-refresh.js?v=20260924-operator-responsiveness-v1"></script>
+     <script src="/counting-calculator.js?v=20260923-operator-inventory-v1"></script>
+     <script src="/operator-inventory.js?v=20260930-android-native-camera-v2"></script>
+-    <script src="/operator.js?v=20260930-return-ra-draft-v1"></script>
++    <script src="/operator.js?v=20260930-receiving-multi-yard-v1"></script>
+     <script src="/scm-aggregate-alert.js?v=20260925-aggregate-alert-v1"></script>
+     <script src="/scm-special-alert.js?v=20260928-special-alert-v1"></script>
+   </body>
+--- a/public/service-worker.js
++++ b/public/service-worker.js
+@@ -1,4 +1,4 @@
+-const CACHE_NAME = "mbbs-yard-operator-20260930-return-ra-draft-v1";
++const CACHE_NAME = "mbbs-yard-operator-20260930-receiving-multi-yard-v1";
+ const OPERATOR_CACHE_PREFIX = "mbbs-yard-operator-";
+ const APP_SHELL = [
+   "/operator",
+@@ -18,7 +18,7 @@
+   "/operator-load-summary.js?v=20260918-operator-display-settings-v1",
+   "/operator-photo-outbox.js?v=20260917-background-photos-v1",
+   "/operator-delivery-refresh.js?v=20260924-operator-responsiveness-v1",
+-  "/operator.js?v=20260930-return-ra-draft-v1",
++  "/operator.js?v=20260930-receiving-multi-yard-v1",
+   "/manifest.webmanifest",
+   "/icons/mbbs-yard-192.png",
+   "/icons/mbbs-yard-512.png",

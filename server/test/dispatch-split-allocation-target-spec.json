@@ -1,0 +1,20 @@
+{
+  "task": "Allow an unallocated unfinished split to be split again while retaining completed sibling group PO allocations",
+  "tier": 3,
+  "specApproval": "not obtained (autonomous run); user reported S4 blocked by allocations belonging to S1/S3",
+  "acceptance": [
+    "A PO allocation linked to a completed sibling delivery group, even when sales_order_ref identifies the root SO, must not block resplitting the selected unallocated child.",
+    "The source child remains subject to its own PO/TO allocation, packing, execution, plan and lease checks; initial root splitting still rejects root allocations.",
+    "Split numbering uses the original family and includes existing/retired/native-only siblings.",
+    "An authenticated HTTP resplit request succeeds and preserves sibling allocations, history, quantities and photos.",
+    "Rejected requests do not retire the source or create children; retry remains idempotent.",
+    "SOA09140 S1 and S3 PO allocations and S4's 4588 SQFT remain unchanged during deployment."
+  ],
+  "setup": {
+    "dependencies": "No new dependencies; reuse existing isolated Compose, Node tests, fast-check, c8, TypeScript and ESLint.",
+    "tests": "Disposable bounded containers in mbbs-tests.slice; teardown registered before starting; verify docker ps and ps -a plus task networks/volumes.",
+    "release": "Capture live source, patch only the selected-source argument in resplit numbering, test, deploy over the current image, retain rollback.",
+    "git": "Preserve unrelated workspace changes; no commit or reset.",
+    "liveVerification": "Read-only checks of allocation targets, split preview, numbering and unchanged quantities; do not execute an actual S4 split without quantities supplied by the user."
+  }
+}

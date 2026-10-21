@@ -4705,6 +4705,7 @@ function renderDetailPanel(order) {
           from: escapeHtml(order.outbound_location || t("operator.ourYard", "our yard")),
           to: escapeHtml(order.destination_location || t("operator.vendorYardGeneric", "the vendor yard"))
         })}</span>
+        <span>${t("operator.localVrmaFinalQuantity", "The estimate is the maximum. Confirming the load makes the loaded quantity final; any remaining quantity is abandoned.")}</span>
       </div>
     ` : ""}
     ${exceptions.length ? `
@@ -7589,18 +7590,20 @@ async function refreshLoadPostingStatus() {
 
 let loadPartialConfirmation = null;
 function confirmMissingLoadLines(summaries) {
-  const missing = (summaries || []).filter(summary => summary?.missing?.length);
+  const missing = (summaries || []).filter(summary => summary?.missing?.length || summary?.finalizesEstimatedQuantity);
   if (!missing.length) return Promise.resolve(true);
   if (loadPartialConfirmation) return Promise.resolve(false);
   const dialog = document.createElement("dialog");
   dialog.className = "receiving-confirmation-dialog";
   dialog.dataset.loadPartialConfirmation = "true";
   dialog.setAttribute("aria-labelledby", "load-confirmation-title");
-  dialog.innerHTML = `<form method="dialog"><h2 id="load-confirmation-title">Unconfirmed load lines</h2>
+  dialog.innerHTML = `<form method="dialog"><h2 id="load-confirmation-title">${missing.some(summary => summary.finalizesEstimatedQuantity) ? "Confirm load quantities" : "Unconfirmed load lines"}</h2>
     ${missing.map(summary => `<p><strong>${escapeHtml(summary.orderRef)}</strong></p>
       <p>${summary.confirmed} of ${summary.total} lines confirmed; ${summary.missing.length} still unconfirmed.</p>
-      <ul>${summary.missing.map(line => `<li>${escapeHtml(line.sku)}</li>`).join("")}</ul>`).join("")}
-    <p>Only confirmed lines will be loaded. Remaining lines stay open and will appear when you scan the order again.</p>
+      <ul>${summary.missing.map(line => `<li>${escapeHtml(line.sku)}</li>`).join("")}</ul>
+      <p>${summary.finalizesEstimatedQuantity
+        ? "Local VRMA: the loaded quantity becomes final. Any remaining estimated quantity, including unconfirmed lines, will be abandoned. The estimate remains the maximum."
+        : "Only confirmed lines will be loaded. Remaining lines stay open and will appear when you scan the order again."}</p>`).join("")}
     <div class="receiving-confirmation-actions"><button class="secondary-button" value="back" autofocus>Go back</button>
       <button class="primary-button" value="load">Load confirmed lines</button></div></form>`;
   loadPartialConfirmation = dialog;

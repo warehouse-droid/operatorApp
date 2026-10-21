@@ -7,7 +7,7 @@ export function createConsolidationPostingPreparation({ assertClaims, resolveTar
     await assertClaims({ functionKey: "delivery_prep", localOrderKeys });
     const resolutions = await Promise.all(orders.map((order) => resolveTargets({ functionKey: "delivery_prep",
       orderId: order.netsuite_id, orderType: order.order_type, clientLocationId: batch.locationId, deferTargets: true })));
-    const native = resolutions.filter((resolution) => resolution.netSuitePostingOwner !== "driver_completion" && !resolution.localOnly);
+    const native = resolutions.filter((resolution) => !["driver_completion", "transfer_background"].includes(resolution.netSuitePostingOwner) && !resolution.localOnly);
     if (!native.length) return null;
     const policy = await getPolicy({ functionKey: "delivery_prep", locationId: batch.locationId, lock: true });
     if (!policy.effective) return null;

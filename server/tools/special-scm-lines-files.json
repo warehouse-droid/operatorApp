@@ -1,0 +1,9 @@
+[
+  "public/special-stock-line-fields.js",
+  "public/sales-special-stock-requests.js",
+  "public/scm-special-stock-requests.js",
+  "public/sales-stock-requests.html",
+  "public/scm-stock-requests.html",
+  "public/special-stock-scm-line.css",
+  "src/special-stock-request-domain.js"
+]

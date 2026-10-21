@@ -1,3 +1,4 @@
+import { dispatchLinkPhysicalQuantities } from "./dispatch-po-route-projection.js";
 import crypto from "node:crypto";
 import { config, isNetSuiteSandboxEnvironment } from "./config.js";
 import { query, withTransaction } from "./db.js";
@@ -285,7 +286,21 @@ export function preferredFullCoverageSourceYards(lines = [], matrixItems = [], r
   return preferredByItem;
 }
 
+function transferLinkItemKey(itemId, unit) {
+  return JSON.stringify([String(itemId), text(unit).replace(/\s+/gu, " ").toUpperCase()]);
+}
+
 function allocationSalesQuantity(allocation = {}, targetLine = {}) {
+  if (allocation.quantities && Object.hasOwn(allocation.quantities, "salesQty")
+    && !["pallets", "layers", "sections", "pieces"].some(field => Number(allocation.quantities[field] || 0) !== 0)) {
+    const quantity = Number(allocation.quantities.salesQty);
+    if (!Number.isFinite(quantity) || quantity <= 0) throw new Error("Enter a positive, finite base quantity.");
+    const physical = dispatchLinkPhysicalQuantities(quantity, targetLine);
+    return { quantity: Number(quantity.toFixed(6)), display: {
+      palletQty: physical.pallets, layerQty: physical.layers,
+      sectionQty: physical.sections, pieceQty: physical.pieces
+    } };
+  }
   if (!allocation.quantities || typeof allocation.quantities !== "object") {
     const quantity = number(allocation.quantity);
     return {
@@ -1257,24 +1272,33 @@ export async function getOrderDependencyOptions({ dispatchTargetRef = "", salesO
   if (transferOrderRef && !transfer && !requestedTerminalStatus) matchError = `Transfer Order ${text(transferOrderRef)} was not found.`;
   if (resolved && transfer) {
     const transferLines = await query(
-      `SELECT item_id, MAX(COALESCE(sku, item_name, item_id::text)) AS item_label,
+      `SELECT item_id, unit, MAX(COALESCE(sku, item_name, item_id::text)) AS item_label,
               SUM(quantity) AS transfer_quantity
          FROM transfer_order_lines
         WHERE transfer_order_id = $1
           AND line_stage = 'outbound'
           AND COALESCE(netsuite_active, true)
-        GROUP BY item_id`,
+        GROUP BY item_id, unit`,
       [transfer.netsuite_id]
     );
-    const remainingByItem = new Map(transferLines.rows.map((row) => [String(row.item_id), number(row.transfer_quantity)]));
+    const remainingByItem = new Map();
+    for (const row of transferLines.rows) {
+      const key = transferLinkItemKey(row.item_id, row.unit);
+      remainingByItem.set(key, number(remainingByItem.get(key)) + number(row.transfer_quantity));
+    }
+    for (const link of existingLinks.filter(link => text(link.transferOrderRef).toUpperCase() === transferOrderRef)) {
+      for (const line of (link.lines || []).filter(line => (line.lineRole || "sales_allocation") === "sales_allocation")) {
+        const key = transferLinkItemKey(line.itemId, line.unit);
+        remainingByItem.set(key, Math.max(0, number(remainingByItem.get(key)) - number(line.allocatedQuantity)));
+      }
+    }
     matchingLines = resolved.lines.map((line) => {
-      const itemKey = String(line.itemId);
+      const itemKey = transferLinkItemKey(line.itemId, line.unit);
       const transferQuantity = number(remainingByItem.get(itemKey));
       const availableShortage = Math.max(0, number(line.shortageQuantity) - number(line.dependencyAllocatedQuantity));
       const suggestedQuantity = Math.min(availableShortage, transferQuantity);
       remainingByItem.set(itemKey, Math.max(0, transferQuantity - suggestedQuantity));
       const availableSelection = conversionSelection(availableShortage, line);
-      const suggestedSelection = conversionSelection(suggestedQuantity, line);
       const transferSelection = conversionSelection(transferQuantity, line);
       return {
         targetLineKey: line.targetLineKey,
@@ -1290,8 +1314,8 @@ export async function getOrderDependencyOptions({ dispatchTargetRef = "", salesO
         suggestedQuantity,
         hasConversion: availableSelection.hasConversion,
         conversions: availableSelection.conversions,
-        available: availableSelection.available,
-        suggestedQuantities: suggestedSelection.quantities,
+        available: { ...availableSelection.available, salesQty: suggestedQuantity },
+        suggestedQuantities: { salesQty: suggestedQuantity },
         transferDisplay: transferSelection.quantities,
         ...conversionDisplay(suggestedQuantity, {
           to_plt: line.toPlt,
@@ -1315,7 +1339,7 @@ export async function getOrderDependencyOptions({ dispatchTargetRef = "", salesO
         const soLabels = targetItems.slice(0, 6).map((line) => line.sku || line.itemName).filter(Boolean).join(", ");
         matchError = `No matching item lines. ${transfer.tranid}: ${toLabels || "no items"}. ${resolved.target.ref}: ${soLabels || "no items"}.`;
       } else {
-        matchError = `Matching items were found, but no quantity remains available on both ${resolved.target.ref} and ${transfer.tranid}.`;
+        matchError = `No quantity with a matching item and base UOM remains available on both ${resolved.target.ref} and ${transfer.tranid}.`;
       }
     }
   }
@@ -4168,7 +4192,7 @@ export async function createOrderDependency({
     const targetLinesByKey = new Map(resolved.lines.map((line) => [line.targetLineKey, line]));
     const outboundByItem = new Map();
     for (const line of outboundLines) {
-      const key = String(line.item_id);
+      const key = transferLinkItemKey(line.item_id, line.unit);
       const entry = outboundByItem.get(key) || { quantity: 0, first: line };
       entry.quantity += number(line.quantity);
       outboundByItem.set(key, entry);
@@ -4181,10 +4205,11 @@ export async function createOrderDependency({
       const targetLine = targetLinesByKey.get(text(allocation.targetLineKey))
         || resolved.lines.find((line) => Number(line.salesLineId) === requestedSalesLineId);
       const itemId = Number(targetLine?.itemId || allocation.itemId);
-      const outboundEntry = outboundByItem.get(String(itemId));
+      const itemKey = transferLinkItemKey(itemId, targetLine?.unit);
+      const outboundEntry = outboundByItem.get(itemKey);
       const outbound = outboundEntry?.first;
-      const receiving = receivingLines.find((line) => Number(line.item_id) === itemId);
-      if (!targetLine || !outbound) throw new Error(`Item ${itemId} is not available on both ${targetRef} and ${transferOrderRef}.`);
+      const receiving = receivingLines.find((line) => transferLinkItemKey(line.item_id, line.unit) === itemKey);
+      if (!targetLine || !outbound) throw new Error(`Item ${itemId} with matching base UOM is not available on both ${targetRef} and ${transferOrderRef}.`);
       const availableShortage = Math.max(0, number(targetLine.shortageQuantity) - number(targetLine.dependencyAllocatedQuantity));
       const requestedQuantity = allocationSalesQuantity(allocation, targetLine);
       const qty = requestedQuantity.quantity;
@@ -4194,7 +4219,7 @@ export async function createOrderDependency({
         throw new Error(`${targetLine.itemName || itemId} allocation ${requestedForTargetLine} exceeds ${targetRef} remaining quantity ${availableShortage}.`);
       }
       requestedByTargetLine.set(targetLine.targetLineKey, requestedForTargetLine);
-      requestedByItem.set(String(itemId), number(requestedByItem.get(String(itemId))) + qty);
+      requestedByItem.set(itemKey, number(requestedByItem.get(itemKey)) + qty);
       normalized.push({
         targetLine,
         outbound,
@@ -4205,7 +4230,7 @@ export async function createOrderDependency({
     }
     const existingAllocatedByItem = new Map();
     for (const line of existingLines.rows.filter((entry) => entry.line_role === "sales_allocation")) {
-      const key = String(line.item_id);
+      const key = transferLinkItemKey(line.item_id, line.unit);
       existingAllocatedByItem.set(key, number(existingAllocatedByItem.get(key)) + number(line.allocated_quantity));
     }
     for (const [itemId, requestedQuantity] of requestedByItem) {
@@ -4214,7 +4239,7 @@ export async function createOrderDependency({
         number(outboundByItem.get(itemId)?.quantity) - number(existingAllocatedByItem.get(itemId))
       );
       if (requestedQuantity > available + EPSILON) {
-        const itemName = normalized.find((entry) => String(entry.targetLine.itemId) === itemId)?.targetLine.itemName || itemId;
+        const itemName = normalized.find((entry) => transferLinkItemKey(entry.targetLine.itemId, entry.targetLine.unit) === itemId)?.targetLine.itemName || itemId;
         throw new Error(`${itemName} allocation ${requestedQuantity} exceeds ${transferOrderRef} quantity ${available}.`);
       }
     }

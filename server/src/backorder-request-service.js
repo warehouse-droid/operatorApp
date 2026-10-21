@@ -7,6 +7,7 @@ import {torontoDate} from '../public/special-stock-workflow.js';
 import {normalizeSpecialRate,normalizeSpecialDiscount,specialDiscountLineSubtotal} from '../public/special-stock-pricing.js';
 import {normalizeSpecialSalesInternalRemark} from '../public/special-stock-internal-remark.js';
 import * as cases from './special-stock-request-repository.js';
+import {backorderArrivalAlerts} from './backorder-arrival.js';
 
 /** @typedef {import('../public/backorder-workflow.js').BackorderRequest} BackorderRequest */
 /** @typedef {{operatorId:string,audience:string,authorizedStoreLocationIds?:number[]}} ActionContext */
@@ -51,17 +52,26 @@ export async function backorderAlerts({scm=false,operatorId,authorizedDestinatio
       AND stage.stage NOT IN ('closed','completed') AND (special.purchase_order_netsuite_id IS NOT NULL OR stage.stage IN ('await_customer_confirmation','pending_update','wait_for_production','dispatch_arrangement')
         OR review.needs_reply)
       AND notice.revision>COALESCE(seen.event_id,0) ORDER BY request.updated_at DESC LIMIT 200`,[operatorId,authorizedDestinationLocationIds])).rows;
-  return {manualReview:0,requests:rows.map(/** @param {Record<string,any>} row */ row=>({id:Number(row.id),requestRef:row.request_ref,eventId:Number(row.revision),action:'backorder',purchaseOrderRef:row.purchase_order_ref || null,
-    message:['confirmed','dispatch_arrangement'].includes(row.stage) && row.purchase_order_ref && !row.needs_reply ? 'Backorder · PO linked: '+row.purchase_order_ref : 'Backorder · '+row.stage.replaceAll('_',' ')}))};
+  const arrivals=await backorderArrivalAlerts(operatorId,authorizedDestinationLocationIds);
+  return {manualReview:0,requests:[...arrivals,...rows.map(/** @param {Record<string,any>} row */ row=>({id:Number(row.id),requestRef:row.request_ref,eventId:Number(row.revision),action:'backorder',purchaseOrderRef:row.purchase_order_ref || null,
+    message:['confirmed','dispatch_arrangement'].includes(row.stage) && row.purchase_order_ref && !row.needs_reply ? 'Backorder · PO linked: '+row.purchase_order_ref : 'Backorder · '+row.stage.replaceAll('_',' ')}))]};
 }
-/** @param {number|string} id @param {unknown} eventId @param {SalesContext} context */
-export async function acknowledgeBackorderAlert(id,eventId,context) {
-  const d=await getBackorderRequest(id,{audience:'sales',authorizedStoreLocationIds:context.authorizedDestinationLocationIds});
-  if (d.requestedBy!==context.operatorId) throw invalid('Only the requester can acknowledge this update.','BACKORDER_ALERT_FORBIDDEN',403);
-  if (!Number.isSafeInteger(Number(eventId)) || Number(eventId)<=0 || Number(eventId)>d.revision) throw invalid('That revision was not displayed for this request.');
-  await query(`INSERT INTO regular_stock_decision_reads(request_id,operator_id,event_id) VALUES($1,$2,$3)
-    ON CONFLICT(request_id,operator_id) DO UPDATE SET event_id=GREATEST(regular_stock_decision_reads.event_id,EXCLUDED.event_id),read_at=now()`,[id,context.operatorId,eventId]);
-  return {acknowledged:true,eventId:Number(eventId)};
+/** @param {number|string} id @param {unknown} eventId @param {SalesContext} context @param {unknown} [arrivalKey] */
+export async function acknowledgeBackorderAlert(id,eventId,context,arrivalKey) {
+  return withTransaction(async()=>{
+    await query('SELECT id FROM sales_stock_requests WHERE id=$1 FOR UPDATE',[id]);
+    const d=await getBackorderRequest(id,{audience:'sales',authorizedStoreLocationIds:context.authorizedDestinationLocationIds});
+    if (d.requestedBy!==context.operatorId) throw invalid('Only the requester can acknowledge this update.','BACKORDER_ALERT_FORBIDDEN',403);
+    if (!Number.isSafeInteger(Number(eventId)) || Number(eventId)<=0 || Number(eventId)>d.revision) throw invalid('That revision was not displayed for this request.');
+    if (arrivalKey!==undefined) {
+      if (typeof arrivalKey!=='string' || !/^[a-f0-9]{64}$/.test(arrivalKey)) throw invalid('That receipt was not displayed for this request.');
+      if (arrivalKey!==d.alreadyOrderedArrival?.key) throw invalid('Receipt progress changed. Refresh the request.','BACKORDER_ARRIVAL_CHANGED',409);
+    }
+    await query(`INSERT INTO regular_stock_decision_reads(request_id,operator_id,event_id,backorder_arrival_key) VALUES($1,$2,$3,COALESCE($4,''))
+      ON CONFLICT(request_id,operator_id) DO UPDATE SET event_id=GREATEST(regular_stock_decision_reads.event_id,EXCLUDED.event_id),read_at=now(),
+      backorder_arrival_key=CASE WHEN $4::text IS NULL THEN regular_stock_decision_reads.backorder_arrival_key ELSE EXCLUDED.backorder_arrival_key END`,[id,context.operatorId,eventId,arrivalKey ?? null]);
+    return {acknowledged:true,eventId:Number(eventId)};
+  });
 }
 
 /** @param {Record<string,any>} input @param {{vendorName:string,vendorId?:unknown,destinationLocationId:unknown}} defaults @param {number[]} yards */
@@ -134,6 +144,19 @@ async function linkQuotation(id,input,context) {
       estimate_netsuite_id=CASE WHEN estimate_ref IS NOT DISTINCT FROM $2 THEN estimate_netsuite_id ELSE NULL END,
       estimate_ref=$2,updated_at=now() WHERE request_id=$1`,[id,number]);
     await localEvent(id,'backorder_quotation_linked',{quotationNumber:number},context);
+  });
+}
+/** @param {number|string} id @param {Record<string,any>} input @param {ActionContext} context */
+async function attachAlreadyOrderedSalesOrder(id,input,context) {
+  const salesOrderRef=orderedReference(input.salesOrderRef,'sales order number',120,true);
+  await withTransaction(async()=>{
+    const row=await lockLocalCase(id,input,context,{allowTerminal:true});
+    if (row.close_status!=='active' || row.status==='cancelled') throw invalid('This Backorder is closed.','BACKORDER_CLOSED',409);
+    const ordered=await query("SELECT id FROM sales_special_stock_lines WHERE request_id=$1 AND supply_status='already_ordered' AND removed_at IS NULL",[id]);
+    if (!ordered.rowCount) throw invalid('This request has no Already Ordered materials.','BACKORDER_ALREADY_ORDERED_REQUIRED',409);
+    if (row.sales_order_netsuite_id && String(row.sales_order_ref || '').trim().toUpperCase()!==salesOrderRef.toUpperCase()) throw invalid('This request already has a different linked sales order.','BACKORDER_SO_CONFLICT',409);
+    await query(`UPDATE sales_stock_requests SET regular_details=jsonb_set(regular_details,'{alreadyOrderedSalesOrderRef}',to_jsonb($2::text)) WHERE id=$1`,[id,salesOrderRef]);
+    await localEvent(id,'backorder_already_ordered_so_attached',{salesOrderRef},context);
   });
 }
 /** @param {number|string} id @param {Record<string,any>} input @param {ActionContext} context */
@@ -237,6 +260,11 @@ export async function runBackorderAction(id,action,input,context) {
   return withBackorderWorkflow(async()=>{
     // Resolve persisted identity and scope before selecting a capability.
     const detail = await cases.getSpecialStockCase(id,{audience:context.audience,authorizedStoreLocationIds:context.authorizedStoreLocationIds});
+    if (action==='already-ordered/sales-order') {
+      if (context.audience!=='sales') throw invalid('Sales must attach the sales order number.','BACKORDER_ROLE_FORBIDDEN',403);
+      await attachAlreadyOrderedSalesOrder(id,input,context);
+      return cases.getSpecialStockCase(id,{audience:context.audience,authorizedStoreLocationIds:context.authorizedStoreLocationIds});
+    }
     if (context.audience==='sales' && action==='quotation/link') {
       await linkQuotation(id,input,context);
       return cases.getSpecialStockCase(id,{audience:context.audience,authorizedStoreLocationIds:context.authorizedStoreLocationIds});

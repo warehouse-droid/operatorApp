@@ -1,0 +1,35 @@
+services:
+  test:
+    image: ${STOCK_CHECK_TEST_IMAGE:-mbbs-operator-app:mbr-nullable-browser-test-20261013}
+    build: !reset null
+    working_dir: /app
+    user: '1000:1000'
+    environment:
+      PLAYWRIGHT_BROWSERS_PATH: /ms-playwright
+      XDG_CONFIG_HOME: /tmp/stock-check-config
+      XDG_CACHE_HOME: /tmp/stock-check-cache
+    labels:
+      com.mbbs.lifecycle: disposable-test
+    volumes:
+      - ${STOCK_CHECK_SOURCE_ROOT:-./server}/src:/app/src:ro
+      - ${STOCK_CHECK_SOURCE_ROOT:-./server}/public:/app/public:ro
+      - ${STOCK_CHECK_SOURCE_ROOT:-./server}/migrations:/app/migrations:ro
+      - ./server/test/mbt:/app/test/mbt:ro
+      - ./server/test/support:/app/test/support:ro
+      - ./server/tools:/app/tools:ro
+      - ./server/eslint.stock-check.config.js:/app/eslint.stock-check.config.js:ro
+      - ./server/tsconfig.stock-check.json:/app/tsconfig.stock-check.json:ro
+      - ./server/test-artifacts/mbr-contract/toolchain/node_modules:/app/node_modules:ro
+      - ./server/test-artifacts/mbr-contract/playwright-browsers:/ms-playwright:ro
+  db:
+    labels:
+      com.mbbs.lifecycle: disposable-test
+  app:
+    image: ${STOCK_CHECK_RUNTIME_IMAGE:-mbbs-operator-app:stock-check-20261014}
+    build: !reset null
+    labels:
+      com.mbbs.lifecycle: disposable-test
+    environment:
+      PLAYWRIGHT_BROWSERS_PATH: /ms-playwright
+      XDG_CONFIG_HOME: /tmp/stock-check-config
+      XDG_CACHE_HOME: /tmp/stock-check-cache

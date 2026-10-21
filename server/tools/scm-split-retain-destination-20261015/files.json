@@ -1,0 +1,6 @@
+[
+  "src/dispatch-repository.js",
+  "src/server.js",
+  "public/dispatch-scm.js",
+  "public/dispatch-scm.html"
+]

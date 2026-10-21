@@ -1,0 +1,40 @@
+{
+  "task": "Operator returns use the saved REST orderLine mapping",
+  "tier": 3,
+  "specApproval": "not obtained (autonomous run)",
+  "authorization": "User asked to continue fixing SOM06642 and identified the existing saved REST orderLine IDs used by IF.",
+  "setup": {
+    "dependencies": "No new dependencies; use existing Docker Node, PostgreSQL, node:test, fast-check, c8, TypeScript and ESLint.",
+    "git": "Preserve the dirty workspace; no commits or wholesale deployment.",
+    "artifacts": "Persist tests, source snapshots, one gauntlet entry point, scoped deployment tooling and JSON evidence."
+  },
+  "scenarios": [
+    "A complete stored mapping resolves by Sales Order ID, stable line key and item ID, preserving the exact saved positive REST ID rather than the stable key or row position.",
+    "A workflow-locked Sales Order with a complete mapping submits one correctly linked RA without a REST source-order GET.",
+    "Live fulfilled quantities, UOM, rates, item return policies, receiving-yard rules and return reservations retain their existing validation.",
+    "Missing stored mappings retain the existing authoritative REST lookup for historical orders; no mapping is guessed or written to the database.",
+    "Wrong order/item identities, duplicate source keys, duplicate REST IDs and invalid populated REST IDs fail before local return admission or NetSuite creation.",
+    "Unrelated stored rows and inactive rows cannot supply another live line's mapping; repeated SKUs are mapped by stable key.",
+    "Concurrent identical confirmations and uncertain responses retain the existing one-RA/recovery protection.",
+    "SOM06642 is verified read-only against deployed source at yard 150; actual RA creation and physical-return confirmation remain with the Operator."
+  ],
+  "failureModel": {
+    "wrongSourceOrLine": "Pure unit/property tests, hostile identities, real database integration and mutation of order/item/duplicate guards.",
+    "cachedBusinessData": "Integration verifies live quantity, UOM and rate despite stale stored order status/quantity.",
+    "lockStillTriggers": "Transport rejects every source SO GET while a complete stored mapping must succeed.",
+    "doubleRA": "Existing return concurrency/uncertain-response regressions plus a mapped-source concurrency case.",
+    "unrelatedDeployment": "Overlay only the return mapping module and its caller on exact current images, compare full trees, preserve runtime configuration and keep rollback images.",
+    "regressions": "Fresh baseline versus final full suite, scoped types/lint/coverage, independently exercised property mutations and shuffled focused tests."
+  },
+  "revisions": [
+    {
+      "reason": "The initial concurrency test incorrectly required every simultaneous confirmation reply to be succeeded; existing idempotent replays may return pending while the first request posts.",
+      "criterion": "Eight concurrent identical confirmations create exactly one RA, share the same batch, expose only pending or verified success, and a final replay plus saved record show the same succeeded RA. No unrelated response-contract change."
+    }
+  ],
+  "invariants": [
+    "No production NetSuite transaction is created for testing.",
+    "No workflow, feature gate, credential, mapping row, return quantity or order status is changed by the fix.",
+    "No public API, schema or UI change. Existing historical REST mapping remains available."
+  ]
+}

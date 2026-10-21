@@ -619,7 +619,8 @@ export function buildOperatorNetSuitePostingDraft(input = {}) {
     ...(localOperation.kind === 'transfer_background_posting' ? {transferEvidence: {
       jobId: requiredText(input.transferEvidence?.jobId, 'Transfer posting job'),
       operatorRecordId: positiveInteger(input.transferEvidence?.operatorRecordId, 'Operator completion record'),
-      completionEventId: positiveInteger(input.transferEvidence?.completionEventId, 'Driver completion event')
+      completionEventId: input.transferEvidence?.completionEventId === null
+        ? null : positiveInteger(input.transferEvidence?.completionEventId, 'Driver completion event')
     }} : {}),
     ...(directDeliveryEvidence ? {directDeliveryEvidence} : {}),
     ...(directTransferEvidence ? {directTransferEvidence} : {}),

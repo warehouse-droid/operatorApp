@@ -1,0 +1,22 @@
+# Isolated extension of docker-compose.mbt-test.yml. No production services or credentials.
+x-regular-code: &regular-code
+  - ./server/src:/app/src:ro
+  - ./server/public:/app/public:ro
+  - ./server/test:/app/test:ro
+  - ./server/tools:/app/tools:ro
+  - ./server/migrations:/app/migrations:ro
+  - ./server/test-artifacts:/app/test-artifacts
+services:
+  test:
+    image: mbbs-regular-v2:test
+    volumes: *regular-code
+  migrate:
+    image: mbbs-regular-v2:test
+    volumes: *regular-code
+  e2e:
+    image: mbbs-regular-v2:e2e
+    volumes: *regular-code
+  app:
+    image: mbbs-regular-v2:app
+  mutation:
+    image: mbbs-regular-v2:mutation

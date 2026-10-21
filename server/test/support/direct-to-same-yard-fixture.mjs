@@ -4,8 +4,8 @@ export function pickupUi() {
   return productionFunctions(process.env.DIRECT_TO_PUBLIC_SOURCE || "../../public/dispatch.js", [
     "poRouteProjectionForOrder", "routeItemsForOrder", "routeDropoffsForOrder", "orderWeightLbs",
     "dropoffForStop", "dropItemsForStop", "positiveBalance", "isOwnYardCode",
-    "directPickupEntriesForLocation", "directPickupItemsForLocation", "poPickupEntriesForLocation",
-    "poPickupItemsForLocation", "directPickupAllocatedForItem", "itemForPickupLocation",
+    "retainedDirectPickupManifest", "groupPickupSourceItems", "directPickupEntriesForLocation", "directPickupItemsForLocation", "poPickupEntriesForLocation",
+    "poPickupItemsForLocation", "directPickupAllocatedForItem", "spreadDirectPickupAllocation", "itemForPickupLocation",
     "dispatchLocationHierarchyRoot", "normalizedPickupLocation", "sameDispatchLocation",
     "uniqueDispatchLocationLabels", "isMbbsSpecialLinkLine", "isOperationalDispatchItem",
     "itemHasQuantity", "tooltipItemsForOrder", "tooltipItemRowsForOrder", "qtyText", "itemQtyText",

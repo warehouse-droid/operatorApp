@@ -1,0 +1,24 @@
+--- a/src/field-sales/company-pdf.js
++++ b/src/field-sales/company-pdf.js
+@@ -67,17 +67,18 @@
+   const newPage=()=>{doc.addPage();y=58;tableHeader();};
+   tableHeader();
+   for(const line of s.lines){
++   const hasSku=String(line.sku??'').trim().length>0,descriptionOffset=hasSku?14:0;
+    const cells=[line.quantity,line.unit,line.description,rate(line.unitRate),money(line.amountMinor),
+     ...(packing?['palletQty','sectionQty','layerQty','pieceQty'].map(field=>String(line.packQuantities?.[field]??'')):[])];
+    doc.font('regular').fontSize(9);
+    const height=packing?Math.max(30,...cells.map((value,i)=>{
+     doc.font('regular').fontSize(i===2?9:8);
+-    return doc.heightOfString(String(value??''),{width:columns[i][2]-2,lineGap:1})+(i===2?24:8);
+-   })):Math.max(30,doc.heightOfString(line.description,{width:254})+24);
++    return doc.heightOfString(String(value??''),{width:columns[i][2]-2,lineGap:1})+(i===2?descriptionOffset+10:8);
++   })):Math.max(30,doc.heightOfString(line.description,{width:254})+descriptionOffset+10);
+    if(y+height>675){newPage();}
+    for(const [i,value] of cells.entries()){
+     const [,x,width,align]=columns[i];
+-    if(i===2){text(line.sku,x,y,width-2,9,true);text(value,x,y+14,width-2,9);}
++    if(i===2){if(hasSku){text(line.sku,x,y,width-2,9,true);}text(value,x,y+descriptionOffset,width-2,9);}
+     else text(value,x,y,width,packing||i===1?8:9,false,align);
+    }
+    y+=height;

@@ -560,7 +560,7 @@ test("R1 live linked IF evidence closes the remaining quantity without losing th
   assert.equal(live.lines[0].sourceLineKey, "4866005");
 });
 
-test("M3 live TO receipt evidence inherits the visible outbound REST transform line", async () => {
+test("M3 live TO fulfillment and receipt use distinct physical transform legs", async () => {
   const fetchLiveSource = createOperatorNetSuitePostingLiveSourceFetcher({
     fetchReconciliationOrders: async () => [{
       id: 972958,
@@ -576,7 +576,10 @@ test("M3 live TO receipt evidence inherits the visible outbound REST transform l
         itemId: 501,
         quantity: 10,
         cumulativeProgressQuantity: 10,
-        identityStatus: "exact"
+        identityStatus: "exact",
+        raw: {identityStatus:'exact',physicalRows:[
+          {id:'972958',item_id:'501',source_line_key:'4868177',order_line_number:'1',signed_quantity:'-10',do_not_print_line:'F'},
+          {id:'972958',item_id:'501',source_line_key:'4868178',order_line_number:'2',signed_quantity:'-10',do_not_print_line:'T'}]}
       }, {
         sourceLineKey: "4868179",
         sourceLineAliases: ["4868179"],
@@ -587,7 +590,9 @@ test("M3 live TO receipt evidence inherits the visible outbound REST transform l
         itemId: 501,
         quantity: 10,
         cumulativeProgressQuantity: 4,
-        identityStatus: "exact"
+        identityStatus: "exact",
+        raw: {identityStatus:'exact',physicalRows:[
+          {id:'972958',item_id:'501',source_line_key:'4868179',order_line_number:'3',signed_quantity:'10',do_not_print_line:'T'}]}
       }]
     }],
     fetchSourceItemLines: async () => [{ orderLine: 1, item: { id: 501 } }],
@@ -596,8 +601,8 @@ test("M3 live TO receipt evidence inherits the visible outbound REST transform l
 
   const live = await fetchLiveSource({ sourceOrderKind: "TO", sourceNetSuiteId: 972958 });
   assert.deepEqual(live.lines.map((entry) => [entry.stage, entry.restOrderLine, entry.remainingQuantity]), [
-    ["outbound", 1, 0],
-    ["receiving", 1, 6]
+    ["outbound", 2, 0],
+    ["receiving", 3, 6]
   ]);
 });
 

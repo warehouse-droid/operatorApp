@@ -1,0 +1,16 @@
+{
+  "task": "Use the regular-stock description for Unilock matching",
+  "tier": 2,
+  "specApproval": "not obtained (autonomous correction requested by user)",
+  "behaviors": [
+    "Regular backorders match using the saved item description in the request specifications; missing descriptions fall back to the inventory description or a descriptive request name.",
+    "The NetSuite item code remains available as a reference but is excluded from catalogue ranking and Ollama input.",
+    "Descriptions specifying Rdm or Random only consider Random catalogue products, including when another reference contains an XL SKU.",
+    "Missing descriptions require manual catalogue selection and do not trigger a model guess based on an internal code.",
+    "Special-order names, specifications, matching and stock-check evidence retain their existing behavior.",
+    "Effective description changes invalidate old selections and results without modifying historical jobs or request data.",
+    "The current Ollama model, prompt and inference settings remain unchanged.",
+    "Historical verification is read-only; no live request, stock job, catalogue or cart changes."
+  ],
+  "setup": "Existing bounded disposable Compose and toolchain; no dependencies or schema changes."
+}

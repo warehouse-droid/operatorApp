@@ -963,7 +963,7 @@ test("active planned manual split does not inherit its reconciliation Partially 
   });
 });
 
-test("PO Split new display alias inherits a linked source's initial Hold when the alias is only Queued", async () => {
+test("PO Split uses the exact Queued schedule instead of a linked source's initial Hold", async () => {
   await inRollback(async () => {
     const nonce = `${Date.now()}${Math.floor(Math.random() * 1_000_000)}`;
     const sourceRef = `PO-STATUS-LINKED-SOURCE-INITIAL-HOLD-${nonce}`;
@@ -1000,9 +1000,11 @@ test("PO Split new display alias inherits a linked source's initial Hold when th
 
     const listed = await listScmPurchaseOrderCatalog({ search: sourceRef });
     const detail = await getScmPurchaseOrderCatalogOrder(displayRef);
+    const [schedule] = await listScmSchedule({ kind: "PO", exactRef: displayRef });
 
-    assert.equal(listed.orders[0]?.scm?.status, "Hold");
-    assert.equal(detail?.scm?.status, "Hold");
+    assert.equal(schedule?.calculatedStatus, "Queued");
+    assert.equal(listed.orders[0]?.scm?.status, schedule?.calculatedStatus);
+    assert.equal(detail?.scm?.status, schedule?.calculatedStatus);
   });
 });
 

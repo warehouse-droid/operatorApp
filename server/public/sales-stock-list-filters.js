@@ -1,5 +1,6 @@
 import {SPECIAL_STAGES} from './special-stock-workflow.js';
 import {parseVendorNames} from './stock-request-vendor-filter.js';
+import {REGULAR_STATUSES} from './regular-stock-status.js';
 
 export const SALES_REQUEST_TYPES = Object.freeze({
   stocking: ['Stocking', '备货'], backorder: ['Backorder', '欠货'],
@@ -28,8 +29,12 @@ export const parseSalesCaseStages = value => parseChoices(value, SALES_CASE_STAG
 export function restoreSalesStockFilters(saved) {
   try {
     const value = JSON.parse(saved || '{}');
+    const stages = parseSalesCaseStages(value.backorderStageFilter);
+    const stageStatus = {new_enquiry:'pending_scm',pending_update:'pending_sales',await_customer_confirmation:'pending_sales',
+      confirmed:'in_progress',dispatch_arrangement:'in_progress',wait_for_production:'waiting_stock',closed:'closed',completed:'completed'};
+    const migrated = stages.length ? {unifiedStatus:Object.keys(REGULAR_STATUSES).filter(status=>stages.some(stage=>stageStatus[stage]===status)).join(',')} : {};
     return {requestTypeFilter:parseSalesRequestTypes(value.requestTypeFilter),
-      backorderStageFilter:parseSalesCaseStages(value.backorderStageFilter), vendorFilter:parseVendorNames(value.vendorFilter)};
+      backorderStageFilter:[], vendorFilter:parseVendorNames(value.vendorFilter),...migrated};
   } catch { return {requestTypeFilter:[],backorderStageFilter:[],vendorFilter:[]}; }
 }
 
@@ -47,7 +52,6 @@ export function salesStockListFiltersHtml({requestTypeFilter,backorderStageFilte
       <div class="stock-request-filter-actions"><button type="button" data-sales-filter-clear="${name}" ${disabled?'disabled':''}>${column?'清除选择':'Clear selection'}</button><button class="primary" type="button" data-sales-filter-apply="${name}" ${disabled?'disabled':''}>${column?'应用':'Apply'}</button></div></div></details>`;
   };
   const vendors = Object.fromEntries([...new Set([...availableVendors,...vendorFilter])].sort((a,b)=>a.localeCompare(b)).map(name=>[name,[name,name]]));
-  return menu('backorderStageFilter',['Case stage','申请阶段'],SALES_CASE_STAGES,backorderStageFilter)
-    + menu('requestTypeFilter',['Request type','申请类型'],SALES_REQUEST_TYPES,requestTypeFilter)
+  return menu('requestTypeFilter',['Request type','申请类型'],SALES_REQUEST_TYPES,requestTypeFilter)
     + menu('vendorFilter',['Item vendor','商品供应商'],vendors,vendorFilter);
 }

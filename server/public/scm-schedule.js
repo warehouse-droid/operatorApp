@@ -1326,7 +1326,8 @@ function scmScheduleSortValue(row, key, rowElement = null) {
     case "dropoff": value = draft?.value || row.dropoffPoint; break;
     case "brand": value = row.orderKind === "TO" ? "Transfer Order" : row.brand || row.party; break;
     case "content": value = row.content; break;
-    case "remark": value = draft ? draft.value || row.netSuiteMemo : row.remark; break;
+    case "remark": value = draft
+      ? [row.remarkPrefix, draft.value || row.netSuiteMemo].filter(Boolean).join(" ") : row.remark; break;
     case "order": value = row.orderKind === "PO" && !scmScheduleSalesHost
       ? row.sourceRef || row.orderRef || row.displayRef : row.displayRef || row.orderRef; break;
     case "weight": value = row.weightLbs; break;
@@ -1943,22 +1944,34 @@ function contentCell(row = {}) {
   `;
 }
 
+function scmScheduleAutoRemarkPrefixHtml(prefix) {
+  return `<span class="scm-remark-auto-prefix" title="Automatically added from linked request">${scmScheduleEscape(prefix)}</span>`;
+}
+
 function remarkCell(row = {}, { rowId = "", editable = false } = {}) {
   const local = String(row.remarkOverride || "");
   const netSuiteMemo = String(row.netSuiteMemo || "");
+  const prefix = String(row.remarkPrefix || "");
   if (!editable) {
+    const remark = String(row.remark || "");
+    const hasPrefix = prefix && remark.toLowerCase().startsWith(prefix.toLowerCase())
+      && (remark.length === prefix.length || /^[\s:;,.-]/.test(remark.slice(prefix.length)));
+    const value = hasPrefix
+      ? `<span class="scm-readonly-value">${scmScheduleAutoRemarkPrefixHtml(remark.slice(0, prefix.length))}${scmScheduleEscape(remark.slice(prefix.length))}</span>`
+      : readOnlyCell(row.remark);
     return `<div class="scm-remark-layout">
-      ${readOnlyCell(row.remark)}
+      ${value}
       ${row.remarkSource === "netsuite" ? `<small>NetSuite Memo</small>` : row.remarkSource === "local" ? `<small>Local override</small>` : ""}
     </div>`;
   }
-  const placeholder = row.orderKind === "TO" && netSuiteMemo
+  const placeholder = ["PO", "TO"].includes(row.orderKind) && netSuiteMemo
     ? netSuiteMemo
     : "Add remark";
   return `<div class="scm-remark-layout">
+    ${prefix ? `<span class="scm-readonly-value" title="${scmScheduleEscape(prefix)}">${scmScheduleAutoRemarkPrefixHtml(prefix)}</span>` : ""}
     <textarea data-row="${scmScheduleEscape(rowId)}" data-field="remarkOverride" rows="2" maxlength="2000"
       placeholder="${scmScheduleEscape(placeholder)}">${scmScheduleEscape(local)}</textarea>
-    ${row.orderKind === "TO" && netSuiteMemo
+    ${row.remarkPrefix ? "" : ["PO", "TO"].includes(row.orderKind) && netSuiteMemo
       ? `<small title="${scmScheduleEscape(netSuiteMemo)}">${local ? "Local override · clear to use NetSuite Memo" : "NetSuite Memo"}</small>`
       : `<small>${local ? "Local remark" : "Blank"}</small>`}
   </div>`;
@@ -1990,8 +2003,8 @@ function scheduleDateText(row = {}) {
   return row.queuedDate || "";
 }
 
-function scmScheduleDisplayType(row = {}, { scmWorkingView = canEditScmSchedule() } = {}) {
-  return row.isSpecialOrder && !scmWorkingView ? "Sp.O" : row.orderKind;
+function scmScheduleDisplayType(row = {}) {
+  return row.orderKind === "PO" && row.isSpecialOrder ? "Sp.O" : row.orderKind;
 }
 
 function scmScheduleTimingCell(row) {
@@ -2023,7 +2036,7 @@ function scmScheduleTableRowHtml(row, { pickupOptions = [], dropoffOptions = OWN
     const remarkEditable = editable && !reconciliationReview;
     const statusEditable = rowEditable && !SCM_SYSTEM_STATUSES.has(displayStatus);
     const selectable = rowEditable && row.orderKind === "PO" && !row.groupRef && !String(row.orderRef || "").toUpperCase().startsWith("PGOB-");
-    const displayType = scmScheduleDisplayType(row, { scmWorkingView });
+    const displayType = scmScheduleDisplayType(row);
     const isGroupOrder = Boolean(row.groupRef) || String(row.orderRef || "").toUpperCase().startsWith("PGOB-");
     const blanketView = scmScheduleFilters.view === "blanket";
     const canManageBlankets = scmScheduleCanManageBlankets();
@@ -2050,7 +2063,7 @@ function scmScheduleTableRowHtml(row, { pickupOptions = [], dropoffOptions = OWN
         <div class="scm-sheet-cell readonly" ${scmScheduleColumnAttributes("date")}>${readOnlyCell(scheduleDateText(row))}</div>
         <div class="scm-sheet-cell readonly scm-type-cell${typeFormatting.className}"${typeFormatting.style} ${scmScheduleColumnAttributes("type")}>
           <strong>${scmScheduleEscape(displayType)}</strong>
-          ${scmWorkingView && row.orderKind === "PO" ? `<label class="scm-sheet-check"><input data-row="${scmScheduleEscape(rowId)}" data-field="isSpecialOrder" type="checkbox" ${row.isSpecialOrder ? "checked" : ""} ${rowEditable ? "" : "disabled"} /><span>Sp.O</span></label>` : ""}
+          ${scmWorkingView && row.orderKind === "PO" ? `<label class="scm-sheet-check"><input data-row="${scmScheduleEscape(rowId)}" data-field="isSpecialOrder" type="checkbox" ${row.isSpecialOrder ? "checked" : ""} ${rowEditable && !row.isAutomaticSpecialOrder ? "" : "disabled"} /><span>Sp.O</span></label>` : ""}
           ${blanketView && row.orderKind === "PO" ? `<label class="scm-blanket-flag ${row.isBlanket ? "active" : ""}" title="${row.isBlanket ? "Flagged blanket parent: hidden from normal schedules and dispatch planning" : "Flag this large parent PO as a blanket order"}">
             <input data-action="toggle-blanket" data-ref="${scmScheduleEscape(row.orderRef)}" type="checkbox" ${row.isBlanket ? "checked" : ""}
               ${canManageBlankets && scmScheduleBlanketSavingRef !== rowId ? "" : "disabled"} />
@@ -2284,6 +2297,7 @@ function collectRowPatch(rowId) {
     expectedSplitRevision: row?.isScmSplit ? row?.scmSplitRevision : undefined
   };
   scmScheduleApp.querySelectorAll(`[data-row="${CSS.escape(rowId)}"][data-field]`).forEach((field) => {
+    if (field.dataset.field === "isSpecialOrder" && row?.isAutomaticSpecialOrder) return;
     const value = field.type === "checkbox" ? field.checked : field.value;
     const unchangedPoPickup = row?.orderKind === "PO"
       && field.dataset.field === "pickupPoint"
@@ -2306,9 +2320,12 @@ function collectRowRemarkPatch(rowId) {
 }
 
 function setScmScheduleRowControlsDisabled(rowId, disabled) {
+  const row = scmScheduleRows.find((item) => scheduleRowId(item) === rowId);
   scmScheduleApp.querySelectorAll(
     `[data-row="${CSS.escape(rowId)}"][data-field], button[data-action="save-row"][data-row="${CSS.escape(rowId)}"], button[data-action="save-remark-row"][data-row="${CSS.escape(rowId)}"]`
-  ).forEach((field) => { field.disabled = disabled; });
+  ).forEach((field) => {
+    field.disabled = disabled || (field.dataset.field === "isSpecialOrder" && row?.isAutomaticSpecialOrder === true);
+  });
 }
 
 function collectScmScheduleReconciliationAllocations(rowId) {

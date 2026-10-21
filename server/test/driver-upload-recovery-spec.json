@@ -1,0 +1,30 @@
+{
+  "tier": 3,
+  "spec approval": "not obtained (autonomous run)",
+  "setup": "Use existing Node, Playwright, ESLint, TypeScript, c8 and fast-check in bounded disposable containers. No dependencies, schema changes, git commits or production test data. Preserve scoped source snapshots, logs, screenshots, traces and release rollback image.",
+  "behaviors": [
+    "A lost, invalid, timed-out or 5xx save response automatically checks saved state and returns success only for the confirmed matching stop or DVIR.",
+    "A 409 after a completed stop may recover by reading saved state; an uncompleted conflicting stop must remain an error.",
+    "Automatic recovery never sends a second completion POST. Failed or hanging confirmation preserves photos and pending reconciliation for explicit retry.",
+    "The entire status check is bounded to 15 seconds, including manual reconciliation; an unconfirmed stop never advances.",
+    "Confirmed photo-reference bookkeeping and post-save local draft deletion each have a 5-second budget. A local-storage hang must not prevent the durable server save or advancement.",
+    "Cancelling or switching driver sessions stops recovery and prevents further uploads or clearing a new driver's photos.",
+    "Draft photos are only deleted after confirmed server completion, and local-storage failures emit safe diagnostics.",
+    "Driver GPS arrival radius is 1000 metres, with warnings outside that boundary and unavailable GPS remaining unavailable.",
+    "HTML, service-worker cache and upload-module version advance together without changing the offline protocol or deleting offline events."
+  ],
+  "failureModel": {
+    "duplicate completion": "Unit and real-browser request counts, no automatic POST retry; manual retry gated by saved-state check",
+    "false advancement": "Wrong-job/incomplete history and missing DVIR confirmation retain evidence",
+    "lost evidence": "Confirmed R2 references kept in memory despite local cache failure; draft cleanup only after confirmed save",
+    "hung storage or network": "Controllable clocks, never-resolving boundary promises and actual-browser fault injection",
+    "cross-session race": "Abort during cache/reconciliation and late responses cannot complete the old session",
+    "stale installed PWA": "Version consistency and service-worker regression checks",
+    "production regression": "Scope release to exact live image, preserve all unrelated source hashes, test candidate and retain rollback"
+  },
+  "knownLimits": [
+    "Synthetic Android Chromium and iPhone WebKit tests do not reproduce the drivers' physical networks or prove Cloudflare caused HTTP 0.",
+    "Browser timers cannot run while the operating system suspends the PWA. Recovery proceeds when execution resumes.",
+    "No automatic submission replay when read-only confirmation remains unavailable."
+  ]
+}

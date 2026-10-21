@@ -1,0 +1,37 @@
+import assert from 'node:assert/strict';
+import crypto from 'node:crypto';
+import {readFileSync} from 'node:fs';
+import {query,withTransaction,closeDb} from '../../src/db.js';
+import {createOperator} from '../../src/auth-repository.js';
+import {createSpecialStockCase as legacyCreate} from './baseline/src/special-stock-request-repository.js';
+import {withBackorderWorkflow} from './baseline/src/stock-case-workflow.js';
+import {closeDb as closeBaselineDb} from './baseline/src/db.js';
+const filename='270_backorder_order_completion.sql',upgrade=readFileSync('migrations/'+filename,'utf8'),rollback=readFileSync('tools/backorder-review-flow-20261007/rollback-stage-view.sql','utf8');
+assert.equal(process.env.MBT_TEST_ISOLATED,'1');assert.equal(new URL(process.env.DATABASE_URL).hostname,'db');
+try{
+  await withTransaction(async()=>{await query(rollback);await query('DELETE FROM schema_migrations WHERE filename=$1',[filename]);});
+  const user=await createOperator({username:'stage-migration-'+crypto.randomUUID(),password:crypto.randomUUID(),displayName:'TEST migration',role:'sales',roles:['sales'],yardLocationIds:[1]});
+  const context={operatorId:user.id,authorizedStoreLocationIds:[1]},draft={storeLocationId:1,inquiryDate:'2099-01-01',customerName:'TEST customer',vendorName:'TEST Vendor',vendorId:331,fulfillmentMethod:'yard_pickup',lines:[{productName:'TEST material',quantity:2,uom:'EA',rate:10,requiredDate:'2099-02-01'}]};
+  await query("INSERT INTO inventory_items(item_id,item_name,stock_unit,vendor,vendor_id) VALUES(88999701,'TEST-STAGE-MIGRATION','EA','TEST Vendor',331)");
+  await query("INSERT INTO sales_orders(netsuite_id,tranid,netsuite_active,status_text) VALUES(88999702,'TEST-MIGRATION-SO',false,'Closed')");
+  await query("INSERT INTO purchase_orders(netsuite_id,tranid,netsuite_active,status_text) VALUES(88999703,'TEST-MIGRATION-PO',false,'Pending Approval')");
+  const backs=[];
+  for(let index=0;index<6;index++)backs.push(await withBackorderWorkflow(()=>legacyCreate({...draft,customerName:'',lines:[{...draft.lines[0],regularItemId:88999701,regularItemCode:'TEST-STAGE-MIGRATION'}]},context)));
+  for(const index of [1,2,3,4])await query("UPDATE sales_special_stock_lines SET supply_status='production',stock_checked_at=now(),sales_decision=$2 WHERE request_id=$1",[backs[index].id,index===2?'declined':'accepted']);
+  for(const index of [3,4])await query("UPDATE sales_special_stock_cases SET purchase_order_netsuite_id=88999703,purchase_order_ref='TEST-MIGRATION-PO',purchase_order_custom_linkage=true WHERE request_id=$1",[backs[index].id]);
+  for(const index of [4,5])await query("UPDATE sales_special_stock_cases SET sales_order_netsuite_id=88999702,sales_order_ref='TEST-MIGRATION-SO',sales_order_source='manual_link' WHERE request_id=$1",[backs[index].id]);
+  const special=await legacyCreate({...draft,lines:[{...draft.lines[0],uom:'PCS'}]},context);
+  const snapshot=async()=>{const result={};for(const table of ['sales_stock_requests','sales_special_stock_cases','sales_special_stock_lines'])result[table]=(await query(`SELECT to_jsonb(row) AS value FROM ${table} row ORDER BY ${table==='sales_special_stock_cases'?'request_id':'id'}`)).rows;return result;};
+  const specialStages=async()=>(await query("SELECT stage FROM special_stock_workflow_stages WHERE request_id=$1",[special.id])).rows;
+  const definition=async()=>(await query("SELECT pg_get_viewdef('special_stock_workflow_stages'::regclass,true) AS definition")).rows[0].definition;
+  const before=await snapshot(),beforeSpecial=await specialStages(),oldDefinition=await definition();
+  await assert.rejects(withTransaction(async()=>{await query(upgrade);throw Error('Interrupted view migration');}),/Interrupted view migration/);
+  assert.equal(await definition(),oldDefinition);assert.deepEqual(await snapshot(),before);
+  await withTransaction(async()=>{await query(upgrade);await query('INSERT INTO schema_migrations(filename) VALUES($1)',[filename]);});
+  const expected=['new_enquiry','confirmed','closed','dispatch_arrangement','completed','completed'];
+  for(const [index,back] of backs.entries())assert.equal((await query('SELECT stage FROM special_stock_workflow_stages WHERE request_id=$1',[back.id])).rows[0].stage,expected[index]);
+  assert.deepEqual(await snapshot(),before);assert.deepEqual(await specialStages(),beforeSpecial);
+  await withTransaction(()=>query(rollback));assert.equal(await definition(),oldDefinition);assert.deepEqual(await snapshot(),before);assert.deepEqual(await specialStages(),beforeSpecial);
+  await withTransaction(()=>query(upgrade));assert.deepEqual(await snapshot(),before);
+  console.log(JSON.stringify({upgrade:true,rollback:true,reupgrade:true,interruptedDdlAtomic:true,storedDataPreserved:true,SpecialStagesPreserved:true,legacyBackorderStates:expected}));
+}finally{await closeBaselineDb();await closeDb();}

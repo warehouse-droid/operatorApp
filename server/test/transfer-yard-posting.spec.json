@@ -1,0 +1,66 @@
+{
+  "feature": "Transfer Order yard milestone posting without Driver completion",
+  "tier": 3,
+  "specApproval": "not obtained (autonomous run)",
+  "scenarios": [
+    {
+      "id": "if-on-load",
+      "behavior": "Ordinary yard-to-yard IF is admitted from a valid saved loading record without receiving or Driver completion; no source read if that loading record is missing."
+    },
+    {
+      "id": "ir-on-receipt",
+      "behavior": "A saved full or partial receipt admits IR after matching IF is verified, without Driver completion. IR waits for IF if queued, failed, uncertain or absent."
+    },
+    {
+      "id": "local-receiving",
+      "behavior": "IF failure cannot block receiving list, detail, confirmation or receipt submission. Local receipt quantities remain saved and cannot be received twice."
+    },
+    {
+      "id": "recovery",
+      "behavior": "Retries and concurrent workers preserve immutable quantities, command ID and external ID. Previously waiting jobs advance under the new rule; completed and attention jobs retain their recovery contracts."
+    },
+    {
+      "id": "boundary",
+      "behavior": "Posting rechecks durable local records and fulfillment evidence. Wrong order/scope/quantity, over-receipt and missing records cannot authorize IR."
+    },
+    {
+      "id": "history",
+      "behavior": "Ordinary TO load history does not say waiting for driver completion. Sales/CO/VRMA and linked direct-to-customer SO evidence remain protected."
+    },
+    {
+      "id": "compatibility",
+      "behavior": "Existing yard authorization, photos, closed order protections, NetSuite source validation, sync preservation and direct-to-customer behavior remain intact."
+    }
+  ],
+  "failureModel": [
+    "Early or duplicate IF/IR: real database admission, worker retries and concurrency tests",
+    "Lost receipt after remote failure: HTTP and repository local receiving regression",
+    "Over-receipt or unrelated evidence: quantity properties and adversarial scope cases",
+    "Direct-to-customer regression: existing linked SO suites",
+    "Misleading UI history: history evidence integration"
+  ],
+  "setup": {
+    "newDependencies": [],
+    "gitCommits": false,
+    "productionDeployment": false,
+    "tooling": "Existing Node, fast-check, c8, TypeScript, ESLint; standard disposable Compose under mbbs-tests.slice with teardown trap before startup",
+    "evidence": "server/test-artifacts/transfer-yard-posting-20261021",
+    "sourceFiles": [
+      "src/transfer-order-posting-domain.js",
+      "src/transfer-order-posting-repository.js",
+      "src/transfer-order-posting-service.js",
+      "src/operator-netsuite-posting-targets.js",
+      "src/operator-netsuite-posting-admission.js",
+      "src/movement-record-evidence.js",
+      "test/mbt/unit/transfer-order-background-posting.test.js",
+      "test/mbt/unit/operator-linked-fulfillment.red.test.js",
+      "test/mbt/property/operator-to-yard-flow.property.test.js",
+      "test/mbt/integration/operator-to-yard-flow.test.js",
+      "test/mbt/integration/transfer-order-background-posting.test.js"
+    ]
+  },
+  "additionalCriteria": [
+    "Consolidated TO loading must also remain local and use the background queue, without synchronous NetSuite source lookup.",
+    "Ordinary transfer posting commands record a null Driver completion identity; linked SO commands retain their completion identity and checks."
+  ]
+}

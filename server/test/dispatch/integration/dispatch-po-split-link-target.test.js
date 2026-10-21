@@ -852,7 +852,7 @@ test("a fully linked PO inherits planned and completed lifecycle from its Driver
         exactRef: currentPoRef,
         audience: "operations"
       })).find((row) => row.orderRef === currentPoRef);
-      assert.equal(planned?.calculatedStatus, "Planned");
+      assert.equal(planned?.calculatedStatus, "Direct ship");
       assert.equal(planned?.driver, "Linked Driver");
       assert.match(planned?.notes || "", /LINK-PO-12 Load 12/u);
 

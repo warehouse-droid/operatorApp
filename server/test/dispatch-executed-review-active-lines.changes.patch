@@ -1,0 +1,153 @@
+--- a/src/dispatch-repository.js
++++ b/src/dispatch-repository.js
+@@ -501,6 +501,7 @@
+   unboundedPerType = false,
+   includeInactiveSalesOrderSearchCandidates = false,
+   includeFulfilledSalesDeliveries = false,
++  includeInactiveSalesOrderLines = true,
+   includeScmLinkedSearchRefs = false,
+   search = "",
+   perTypeLimit = DEFAULT_DISPATCH_ORDERS_PER_TYPE,
+@@ -524,7 +525,8 @@
+     normalizedExactOrderRefs,
+     Boolean(includeAllDiscoverableScmPurchaseOrders),
+     Boolean(unboundedPerType),
+-    Boolean(includeFulfilledSalesDeliveries && (searchTerm || normalizedExactOrderRefs.length))
++    Boolean(includeFulfilledSalesDeliveries && (searchTerm || normalizedExactOrderRefs.length)),
++    Boolean(includeInactiveSalesOrderLines)
+   ];
+   const result = await query(
+     `
+@@ -821,7 +823,7 @@
+         to_sec,
+         to_pcs,
+         CASE
+-          WHEN ($2::boolean AND COALESCE(o.is_test_fixture, false)) OR $6::boolean THEN true
++          WHEN $12::boolean AND (($2::boolean AND COALESCE(o.is_test_fixture, false)) OR $6::boolean) THEN true
+           ELSE l.netsuite_active
+         END AS netsuite_active
+       FROM sales_order_lines l
+@@ -1131,7 +1133,7 @@
+         ) ORDER BY l.line_id NULLS LAST, l.id) FILTER (WHERE l.id IS NOT NULL) AS items
+       FROM delivery_order_source o
+       LEFT JOIN delivery_line_source l ON l.order_id = o.netsuite_id
+-        AND (l.netsuite_active = true OR ($11::boolean AND o.order_type = 'sales_order'))
++        AND (l.netsuite_active = true OR ($11::boolean AND $12::boolean AND o.order_type = 'sales_order'))
+       LEFT JOIN so_alloc sa ON sa.sales_line_id = l.id
+       LEFT JOIN LATERAL (
+         SELECT co_ref, from_location, to_location, status
+--- a/src/dispatch-executed-order-review-repository.js
++++ b/src/dispatch-executed-order-review-repository.js
+@@ -2,7 +2,7 @@
+ import { DISPATCH_FLEET_PLANNING_LOCK } from "./dispatch-fleet-status.js";
+ import { lockDispatchPlanEditLease } from "./dispatch-plan-lease-repository.js";
+ import { persistedDispatchPlan } from "./dispatch-plan-fence.js";
+-import { buildExecutedOrderReviews, executedOrderContexts, executedSourceDigest, executedChangeMessage, reconcileExecutedSourcePlan } from "./dispatch-executed-order-review.js";
++import { buildExecutedOrderReviews, buildPlannedOrderReviews, plannedOrderContexts, executedSourceDigest, executedChangeMessage, reconcileExecutedSourcePlan } from "./dispatch-executed-order-review.js";
+ import { evaluateExecutedPrefixPolicy } from "./dispatch-planner-performance.js";
+ import { preserveDispatchOrderAddress } from "./dispatch-address-guard.js";
+ import { writeDispatchAudit } from "./dispatch-audit-repository.js";
+@@ -29,7 +29,7 @@
+ async function reviewState(plan, suppliedActivity) {
+   const activity = suppliedActivity || (await query(`SELECT status,load_id,stop_id,stop_type,order_refs,job_details
+     FROM driver_job_records WHERE plan_id=$1 AND status IN ('in_progress', 'complete') ORDER BY id`, [plan.id])).rows;
+-  const contexts = executedOrderContexts(plan, activity);
++  const contexts = plannedOrderContexts(plan);
+   const protectedRefs = new Set(contexts.map(context => key(context.orderRef)));
+   const orders = (plan.orders || []).filter(order => protectedRefs.has(key(order.id))).flatMap(nestedOrders);
+   const stored = (await query("SELECT * FROM dispatch_executed_order_reviews WHERE plan_id=$1 ORDER BY observed_at,token", [plan.id])).rows;
+@@ -39,24 +39,27 @@
+   const sourceOrders = [];
+   for (let offset = 0; offset < refs.length; offset += 200) {
+     sourceOrders.push(...await listDispatchOrders({ exactOrderRefs: refs.slice(offset, offset + 200), includeHiddenScm: true,
+-      includeFulfilledSalesDeliveries: true, includeAllDiscoverableScmPurchaseOrders: true, unboundedPerType: true }));
++      includeFulfilledSalesDeliveries: true, includeInactiveSalesOrderLines: false,
++      includeAllDiscoverableScmPurchaseOrders: true, unboundedPerType: true }));
+   }
+   // Empty refresh values cannot erase a known delivery address, including inside groups.
+   const previousByRef = new Map(orders.map(order => [key(order.id), order]));
+   const protectedSources = sourceOrders.map(order => preserveDispatchOrderAddress(previousByRef.get(key(order.id)) || {}, order).order);
+   const freshByRef = new Map(protectedSources.map(order => [key(order.id), order]));
+   const reviews = buildExecutedOrderReviews({ previousPlan: plan, activity, sourceOrders: protectedSources });
+-  for (const review of reviews) {
++  const notices = buildPlannedOrderReviews({ previousPlan: plan, activity, sourceOrders: protectedSources });
++  for (const review of notices) {
+     const publicReview = publicExecutedOrderReview(review);
+     await query(`INSERT INTO dispatch_executed_order_reviews (plan_id,token,order_ref,source_digest,review,changes)
+       VALUES ($1,$2,$3,$4,$5::jsonb,$6::jsonb) ON CONFLICT DO NOTHING`,
+     [plan.id, review.token, key(review.orderRef), executedSourceDigest(review.sourceOrder), JSON.stringify(publicReview), JSON.stringify(publicReview.changes)]);
+   }
+-  const records = reviews.length ? (await query("SELECT * FROM dispatch_executed_order_reviews WHERE plan_id=$1 ORDER BY observed_at,token", [plan.id])).rows : stored;
++  const records = notices.length ? (await query("SELECT * FROM dispatch_executed_order_reviews WHERE plan_id=$1 ORDER BY observed_at,token", [plan.id])).rows : stored;
+   const publicReviews = records.filter(row => {
+     const source = freshByRef.get(key(row.order_ref));
+     return source ? row.source_digest === executedSourceDigest(source) : !row.acknowledged_at;
+   }).map(row => ({ ...row.review, token: row.token, acknowledged: Boolean(row.acknowledged_at),
++    replanRequested: notices.some(notice => notice.token === row.token && notice.replanRequested),
+     observedAt: row.observed_at, acknowledgedAt: row.acknowledged_at, acknowledgedBy: row.actor_name,
+     sourceAvailable: freshByRef.has(key(row.order_ref)) }));
+   return { plan, activity, reviews, publicReviews };
+--- a/src/dispatch-executed-order-review.js
++++ b/src/dispatch-executed-order-review.js
+@@ -111,8 +111,17 @@
+   return order.childOrderDetails?.length ? order.childOrderDetails.flatMap(leafOrders) : [order];
+ }
+ 
+-export function buildExecutedOrderReviews({ previousPlan = {}, activity = [], sourceOrders = [] } = {}) {
+-  const contexts = executedOrderContexts(previousPlan, activity);
++export function plannedOrderContexts(plan = {}) {
++  return (plan.trucks || []).flatMap(truck => (truck.loads || []).flatMap(load =>
++    (load.stops || []).filter(physical).flatMap(stop => refs(stop).map(orderRef => ({
++      orderRef, loadId: loadRef(load), loadName: text(load.name || load.loadName || load.id),
++      driverLogin: text(load.driverLogin || truck.driverLogin), driverName: text(load.driverName || truck.driverName || load.driverLogin || truck.driverLogin),
++      truckPlate: text(load.truckPlate || truck.plate || truck.id), stopId: text(stop.id || stop.stopId), stopType: text(stop.type || stop.stopType)
++    })))
++  ));
++}
++
++function buildOrderSourceReviews(previousPlan, contexts, sourceOrders) {
+   const sources = new Map(sourceOrders.map(order => [key(identity(order)), order]));
+   const reviews = new Map();
+   for (const order of previousPlan.orders || []) {
+@@ -135,6 +144,20 @@
+     }
+   }
+   return [...reviews.values()];
++}
++
++export function buildExecutedOrderReviews({ previousPlan = {}, activity = [], sourceOrders = [] } = {}) {
++  return buildOrderSourceReviews(previousPlan, executedOrderContexts(previousPlan, activity), sourceOrders);
++}
++
++export function buildPlannedOrderReviews({ previousPlan = {}, activity = [], sourceOrders = [] } = {}) {
++  const executed = executedOrderContexts(previousPlan, activity);
++  return buildOrderSourceReviews(previousPlan, plannedOrderContexts(previousPlan), sourceOrders).map(review => ({
++    ...review,
++    message: `${review.orderRef}: source information differs from the saved plan. Review the changes and re-plan remaining work where needed. Source updates and planning saves continue.`,
++    replanRequested: review.contexts.some(context => !executed.some(recorded => recorded.loadId === context.loadId
++      && recorded.stopId === context.stopId && key(recorded.orderRef) === key(context.orderRef)))
++  }));
+ }
+ 
+ function compareOrder(before, next, reviews) {
+--- a/public/dispatch.js
++++ b/public/dispatch.js
+@@ -7954,6 +7954,7 @@
+   const reason = orderPoolRefreshReason;
+   const splitOrderTarget = modalType === "split" ? orderById(modalOrderId) : null;
+   try {
++    void loadExecutedOrderReviews({ force: true });
+     if (!await loadDispatchOrders()) throw new Error("the order feed request failed");
+     if (splitOrderTarget) {
+       await refreshDispatchSplitOrder(splitOrderTarget);
+@@ -11481,7 +11482,9 @@
+   const pending = executedOrderReviews.filter(review => !review.acknowledged);
+   const warnings = pending.map(review => {
+     const context = [...new Set((review.contexts || []).map(item => `${item.driverName || item.driverLogin}, ${item.truckPlate}, ${item.loadName}, ${item.stopType || "stop"} ${item.stopId}`))].join("; ");
+-    return `<details data-executed-source-review data-review-token="${escapeHtml(review.token)}" ${executedOrderReviewExpanded.has(review.token) ? "open" : ""}><summary><strong>${escapeHtml(review.orderRef)}${review.groupRef ? ` (${escapeHtml(review.groupRef)})` : ""}: source update — review needed</strong></summary><p>${escapeHtml(context)}</p><ul>${(review.changes || []).map(change => `<li>${escapeHtml(change.message || "Source details updated")}</li>`).join("")}</ul><p>The source order has updated information. Planning saves remain available. Confirm that you have reviewed these changes. Recorded driver work and photos are retained.</p><button type="button" data-action="confirm-executed-source-update" data-review-token="${escapeHtml(review.token)}" ${!dispatchEditLeaseIsLocallyActive() || executedOrderReviewConfirming || review.sourceAvailable === false ? "disabled" : ""}>${executedOrderReviewConfirming === review.token ? "Confirming…" : "Confirm updated information"}</button>${!dispatchEditLeaseIsLocallyActive() ? "<span> Enter Edit Mode to confirm.</span>" : ""}${review.sourceAvailable === false ? "<p>The current source record is unavailable. Refresh source data to review its latest information.</p>" : ""}</details>`;
++    const request = review.replanRequested ? "re-plan requested" : "review needed";
++    const guidance = review.replanRequested ? " Review the affected remaining work and re-plan where needed." : "";
++    return `<details data-executed-source-review data-review-token="${escapeHtml(review.token)}" ${executedOrderReviewExpanded.has(review.token) ? "open" : ""}><summary><strong>${escapeHtml(review.orderRef)}${review.groupRef ? ` (${escapeHtml(review.groupRef)})` : ""}: source update — ${request}</strong></summary><p>${escapeHtml(context)}</p><ul>${(review.changes || []).map(change => `<li>${escapeHtml(change.message || "Source details updated")}</li>`).join("")}</ul><p>Source updates and planning saves continue.${guidance} Confirm that you have reviewed these changes. Recorded driver work and photos are retained.</p><button type="button" data-action="confirm-executed-source-update" data-review-token="${escapeHtml(review.token)}" ${!dispatchEditLeaseIsLocallyActive() || executedOrderReviewConfirming || review.sourceAvailable === false ? "disabled" : ""}>${executedOrderReviewConfirming === review.token ? "Confirming…" : "Confirm updated information"}</button>${!dispatchEditLeaseIsLocallyActive() ? "<span> Enter Edit Mode to confirm.</span>" : ""}${review.sourceAvailable === false ? "<p>The current source record is unavailable. Refresh source data to review its latest information.</p>" : ""}</details>`;
+   }).join("");
+   const confirmed = visibleExecutedOrderReviewHistory();
+   const history = confirmed.length ? `<details><summary>${confirmed.length} source update${confirmed.length === 1 ? "" : "s"} reviewed</summary>${confirmed.map(review => `<p><strong>${escapeHtml(review.orderRef)}</strong> — ${escapeHtml(review.acknowledgedBy || "Dispatcher")}: ${(review.changes || []).map(change => escapeHtml(change.message || "")).join("; ")}</p>`).join("")}</details>` : "";

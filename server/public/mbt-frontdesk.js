@@ -466,6 +466,7 @@ function contractLineContent(line) {
 }
 
 function binAvailableForService(line) {
+  if (typeof line.binAvailableForService==="boolean") return line.binAvailableForService;
   const latest = state.visits.filter((visit) => visit.serviceLineId === line.serviceLineId
     && ["delivery", "exchange_bin"].includes(visit.serviceAction) && visit.status !== "cancelled")
     .sort((left, right) => right.visitNumber - left.visitNumber)[0];
@@ -492,12 +493,17 @@ function renderContract() {
     if (line.status === "cancelled") continue;
     const card = element("section", "", "mbt-service-line-card");
     card.append(
-      element("h3", `Line ${line.lineNumber} · ${line.binTypeCode || "Bin"}`),
+      element("h3", `${line.rentalReference || `Line ${line.lineNumber}`} · ${line.binTypeCode || "Bin"}`),
       element("p", `Status: ${String(line.status || "unknown").replaceAll("_", " ")}`),
       element("p", `Contents: ${contractLineContent(line)}`),
       element("p", `Site: ${fullAddress(line.site) || "Service site snapshot unavailable"}`),
       element("p", `Delivery: ${displayDate(line.plannedDeliveryAt)} · Return: ${displayDate(line.plannedReturnAt)}`)
     );
+    if (line.currentBin) card.append(element("p",`Current physical bin: ${line.currentBin.assetCode}`));
+    if (line.recoveryPending) card.append(element("p","Recovery pending · remaining collections or onward deliveries must finish."));
+    for (const pending of line.pendingCollections || []) {
+      card.append(element("p",`Pending collection: ${pending.assetCode} · ${pending.reference} · ${pending.status}`));
+    }
     if (!["closed", "cancelled"].includes(line.status)) {
       const actions = element("div", "", "mbt-quote-actions");
       const exchange = button("Exchange bin", () => openCustomerChargeDialog(line, "exchange_bin"), "mbt-button-secondary");
@@ -538,7 +544,7 @@ function renderContract() {
   for (const visit of state.visits) {
     const item = element("li", "", "mbt-visit-card");
     item.append(
-      element("h3", visit.displayName || visit.serviceAction),
+      element("h3", `${visit.displayReference || visit.visitReference || ""} · ${visit.displayName || visit.serviceAction}`),
       element("p", String(visit.status || "unknown").replaceAll("_", " "), "mbt-visit-status"),
       element("p", `${displayDate(visit.scheduledStartAt)} – ${displayDate(visit.scheduledEndAt)}`)
     );

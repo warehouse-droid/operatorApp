@@ -36,6 +36,8 @@
 .special-planning-order.is-planned .special-planning-eta { color: #fff; font-size: 14px; }
 .special-planning-order.is-planned button { color: #fff; border-color: #fff; background: transparent; }
 .special-planning-order.is-planned button:hover { background: #006d22; }
+.special-planning-order [data-special-po-sent-form] button { color: #fff; border-color: #c2410c; background: #c2410c; }
+.special-planning-order [data-special-po-sent-form] button:hover { border-color: #9a3412; background: #9a3412; }
 
 .special-sales-order-summary { grid-template-columns: repeat(auto-fit, minmax(min(100%, 230px), 1fr)); }
 .special-sales-order-reference { display: flex; align-items: center; gap: 10px; }

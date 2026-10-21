@@ -60,6 +60,7 @@ test("Admin catalog exposes four default-off completion-owned SO IF gates", () =
     "driver_offline_mode",
     "driver_yard_dependency_soft_mode",
     "operator_customer_pickup_photo_required",
+    "operator_phone_layout",
     "sales_stock_request_over_availability",
     "special_stock_request_workflow",
     "special_stock_request_test_skip_orders",
@@ -84,6 +85,14 @@ test("Admin catalog exposes four default-off completion-owned SO IF gates", () =
     "operator_netsuite_pallet_return_ra_12441",
     "operator_netsuite_stock_return_ra_150",
     "operator_netsuite_pallet_return_ra_150",
+    "operator_netsuite_stock_return_cm_3445",
+    "operator_netsuite_pallet_return_cm_3445",
+    "operator_netsuite_stock_return_cm_2967",
+    "operator_netsuite_pallet_return_cm_2967",
+    "operator_netsuite_stock_return_cm_12441",
+    "operator_netsuite_pallet_return_cm_12441",
+    "operator_netsuite_stock_return_cm_150",
+    "operator_netsuite_pallet_return_cm_150",
     "dispatch_netsuite_sales_order_if_3445",
     "dispatch_netsuite_sales_order_if_2967",
     "dispatch_netsuite_sales_order_if_12441",
@@ -98,7 +107,7 @@ test("Admin catalog exposes four default-off completion-owned SO IF gates", () =
     "mbt_customer_sync",
     "mbt_netsuite_writes"
   ]);
-  assert.deepEqual(MBT_ADMIN_WRITABLE_GATE_KEYS, MBT_ADMIN_GATE_KEYS.slice(0, 39));
+  assert.deepEqual(MBT_ADMIN_WRITABLE_GATE_KEYS, MBT_ADMIN_GATE_KEYS.slice(0, -2));
   for (const flagKey of MBT_ADMIN_GATE_KEYS.filter((key) => key.startsWith("dispatch_netsuite_sales_order_if_"))) {
     const selected = gate(materializeMbtAdminGates({ flags: flags([]), environment: environmentOpen }), flagKey);
     assert.equal(selected.gateGroup, "dispatch_sales_order_fulfillment");

@@ -1,4 +1,23 @@
+import { dependencyQuantityConversionDisplay } from "./order-dependency-quantity.js";
+
 const QUANTITY_FIELDS = ["pallets", "layers", "sections", "pieces"];
+
+// Packing is a projection of linked base quantity. Each order retains its own
+// packing ratio, including manually entered packing without item conversions.
+export function dispatchLinkPhysicalQuantities(quantity, item = {}) {
+  const total = number(item.quantity ?? item.salesQty);
+  const physical = Object.fromEntries(QUANTITY_FIELDS.map(field => [field,
+    Math.max(0, number(item[field] ?? item[`${field.slice(0, -1)}_qty`]))]));
+  if (total > 0 && Object.values(physical).some(value => value > 0)) {
+    const coverage = Math.min(Math.max(number(quantity), 0) / total, 1);
+    return Object.fromEntries(QUANTITY_FIELDS.map(field => [field, rounded(physical[field] * coverage)]));
+  }
+  const hasConversion = [item.toPlt ?? item.to_plt, item.toLyr ?? item.to_lyr,
+    item.toSec ?? item.to_sec, item.toPcs ?? item.to_pcs].some(value => number(value) > 0);
+  if (!hasConversion && !/^(EACH|EA|PCS|PC|PIECES?)$/u.test(text(item.unit).toUpperCase())) return physical;
+  const converted = dependencyQuantityConversionDisplay(quantity, item);
+  return Object.fromEntries(QUANTITY_FIELDS.map(field => [field, converted[`${field.slice(0, -1)}Qty`]]));
+}
 
 function text(value) {
   return String(value ?? "").trim();
@@ -114,6 +133,10 @@ function residualItem(item = {}, allocations = []) {
   const matches = allocations.filter((allocation) => allocationMatchesItem(allocation, item));
   const totalSales = number(item.quantity ?? item.salesQty ?? item.sales_qty);
   const allocatedSales = matches.reduce((sum, allocation) => sum + allocatedQuantity(allocation, "salesQty"), 0);
+  const baseMatches = matches.filter(allocation => allocationDetails(allocation).quantityBasis === "base");
+  const baseCoverage = totalSales > 0
+    ? Math.min(baseMatches.reduce((sum, allocation) => sum + allocatedQuantity(allocation, "salesQty"), 0) / totalSales, 1)
+    : 0;
   // MBBS-Special links use Sales Qty. Their physical counts are display cargo,
   // so reduce them by the same coverage used on the linked SO's pickup.
   const specialCoverage = Number(item.itemId ?? item.item_id) === 2055 && totalSales > 0
@@ -124,7 +147,9 @@ function residualItem(item = {}, allocations = []) {
     positiveDifference(
       item[field] ?? item[`${field.slice(0, -1)}_qty`],
       Math.max(
-        matches.reduce((sum, allocation) => sum + allocatedQuantity(allocation, field), 0),
+        matches.filter(allocation => allocationDetails(allocation).quantityBasis !== "base")
+          .reduce((sum, allocation) => sum + allocatedQuantity(allocation, field), 0)
+          + number(item[field] ?? item[`${field.slice(0, -1)}_qty`]) * baseCoverage,
         number(item[field] ?? item[`${field.slice(0, -1)}_qty`]) * specialCoverage
       )
     )

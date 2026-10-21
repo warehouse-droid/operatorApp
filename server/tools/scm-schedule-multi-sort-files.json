@@ -1,0 +1,8 @@
+[
+  "public/scm-schedule.js",
+  "public/scm-schedule.html",
+  "public/dispatch.css",
+  "src/dispatch-repository.js",
+  "src/scm-schedule-preference-repository.js",
+  "migrations/248_scm_schedule_multi_filters.sql"
+]

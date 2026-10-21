@@ -1,0 +1,34 @@
+{
+  "feature": "Refresh pallet balance and retire confirmed deleted or cancelled reservations",
+  "tier": 3,
+  "specApproval": "not obtained (autonomous run)",
+  "setup": {
+    "dependencies": "Existing test image and Node/fast-check/c8/TypeScript/ESLint only; no new dependencies.",
+    "git": "Preserve workspace edits; no commits or resets.",
+    "tests": "Standard bounded isolated Compose; teardown registered before startup.",
+    "deployment": "Carry the correction through the existing authorized feature rollout, preserve gate values, use app-only image overlay and rollback. NetSuite writes prohibited in diagnostics."
+  },
+  "scenarios": [
+    "F1 Every customer or Sales Order pallet enquiry reads fresh NetSuite activity; submission rechecks the latest balance.",
+    "D1 A previously verified direct CM absent from fresh activity is read by its exact internal ID. Only HTTP 404 with NONEXISTENT_ID confirms deletion. Mark the linked batch and records cancelled/Deleted, preserve intent and remote identity, and audit the finding.",
+    "D2 A deleted CM is never recreated by retry, repeated lookup, concurrent lookup, or background reconciliation.",
+    "S1 Permission failures, generic 404s, malformed success bodies and transport errors do not confirm deletion, do not release reservations, and fail the enquiry.",
+    "S2 Pending, unverified, local-only and uncertain creation records remain reserved; a CM still present but not yet indexed stays reserved.",
+    "C1 Confirmed cancelled/voided transactions release pallet and stock reservations; live RA reservations remain intact. Combined CM deletion releases both components.",
+    "R1 Existing return/gate tests remain green; API privacy, yard restrictions, idempotency and proof requirements remain unchanged.",
+    "E1 The sample customer balance refresh reconciles through ordinary application code without editing business records manually or creating any NetSuite transaction."
+  ],
+  "failureModel": {
+    "falseDeletion": "Strict NetSuite error code tests plus generated error cases; never infer deletion solely from SuiteQL absence.",
+    "duplicateCredit": "Identity preservation, concurrent lookup/retry tests and mutation.",
+    "overReturn": "Unverified and local-only reservations; before-submit fresh balance and existing concurrency regression.",
+    "staleBalance": "Immediate consecutive customer/order enquiries after remote changes, cache regression test.",
+    "partialLocalState": "Atomic durable cancelled state for batch/records with audit; existing intent preserved.",
+    "hostImpact": "mbbs-tests.slice standard resource budgets, cleanup logs, production health checks."
+  },
+  "knownLimits": [
+    "NetSuite cannot provide a transaction spanning its balance read and a later Operator action; the app rechecks before admission and retains local concurrency protection.",
+    "Error handling uses Oracle documented NONEXISTENT_ID; no financial transactions will be created in live verification."
+  ],
+  "reference": "https://docs.oracle.com/en/cloud/saas/netsuite/ns-online-help/section_156570709583.html"
+}

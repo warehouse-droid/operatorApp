@@ -128,11 +128,26 @@ export function assertCrossYardReturn({
   });
 }
 
+/** @param {{fulfilled?: any, netsuiteReturned?: any, localReserved?: any, netBalance?: number}} [options] */
 export function returnBalance({
   fulfilled = 0,
   netsuiteReturned = 0,
-  localReserved = 0
+  localReserved = 0,
+  netBalance
 } = {}) {
+  if (netBalance !== undefined) {
+    if (typeof netBalance !== "number" || !Number.isFinite(netBalance)) {
+      throw Object.assign(new Error("NetSuite net balance must be a finite number."), { status: 400 });
+    }
+    const reserved = finiteNonNegativeNumber(localReserved, "Local reserved quantity");
+    return {
+      netBalance,
+      fulfilled: null,
+      netsuiteReturned: null,
+      localReserved: reserved,
+      available: Math.max(Math.round((netBalance - reserved) * 1e8) / 1e8, 0)
+    };
+  }
   const values = {
     fulfilled: finiteNonNegativeNumber(fulfilled, "Fulfilled quantity"),
     netsuiteReturned: finiteNonNegativeNumber(netsuiteReturned, "NetSuite returned quantity"),

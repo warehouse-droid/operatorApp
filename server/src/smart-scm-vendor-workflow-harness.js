@@ -132,6 +132,9 @@ const context = vm.createContext({
   setTimeout,
   clearTimeout
 });
+for (const name of ["scm-smart-line-order-core.js", "scm-smart-line-order.js"]) {
+  vm.runInContext(fs.readFileSync(new URL(`../public/${name}`, import.meta.url), "utf8"), context);
+}
 vm.runInContext(`${ui}\nglobalThis.__openSmartVendorEmail = (workflowId) => { smartVendorEmailModalWorkflowId = workflowId; };`, context, { filename: "scm-smart-vendor.js" });
 
 const base = {

@@ -507,6 +507,11 @@ const dispatchSessionPoolOrders = new Map();
 const dispatchOrderSearchCache = new Map();
 const dispatchOrderBrowseCursors = new Map();
 const dispatchOrderHydrationPromises = new Map();
+/** @type {Promise<any[]> | null} */
+let dispatchGroupHydrationPromise = null;
+let dispatchGroupHydrationRefs = new Set();
+let dispatchGroupHydrationInvalidated = false;
+let dispatchGroupRefreshPending = false;
 let modalType = "";
 let modalOrderId = "";
 let modalLoadId = "";
@@ -616,10 +621,17 @@ let lastAcknowledgedPlanState = null;
 let planPollInFlight = false;
 let eventSource = null;
 let remoteRefreshTimer = null;
+/** @type {number | null} */
 let orderPoolRefreshTimer = null;
 let orderPoolRefreshInFlight = false;
 let orderPoolRefreshTrailing = false;
 let orderPoolRefreshReason = "";
+let dispatchOrderRefreshEpoch = 0;
+let dispatchOrderReadSequence = 0;
+const dispatchOrderReadRequests = new Map();
+const dispatchOrderAppliedReads = new Map();
+const pendingDispatchOrderRefreshRefs = new Set();
+const pendingDispatchRequiredRefreshRefs = new Set();
 let orderClickTimer = null;
 let undoStack = [];
 let redoStack = [];
@@ -649,6 +661,7 @@ let currentPlanDate = /^\d{4}-\d{2}-\d{2}$/.test(sharedPlanningDate)
 let currentPlan = null;
 let dispatchPlannerSnapshotState = "loading";
 let dispatchPlannerSnapshotError = "";
+let dispatchPlanLoadSequence = 0;
 let planHistory = [];
 let planEditLease = null;
 let planEditLeaseToken = "";
@@ -809,6 +822,7 @@ function applyAtomicDependencyMutationPayload(payload, context = {}) {
     renderDispatchNoticePatch();
     return false;
   }
+  dispatchOrderRefreshEpoch += 1;
   if (payload?.plan) {
     lastAcknowledgedPlanState = dispatchPlanWireState(payload.plan);
     if (context.generation !== undefined && context.generation !== localPlanGeneration) {
@@ -1046,7 +1060,7 @@ async function enterDispatchEditMode() {
   }
   const requestedDate = currentPlanDate;
   const requestedGeneration = localPlanGeneration;
-  await refreshPlannedAssignments();
+  await refreshPlannedAssignments({ includeSnapshots: false });
   const response = await fetch("/api/dispatch/plan-edit-lease/acquire", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
@@ -2106,7 +2120,7 @@ function itemFootprint(item) {
 }
 
 function splitItemKey(item = {}, index = 0) {
-  return String(item.lineRowId || item.id || item.lineId || item.line_id || item.sku || item.itemName || `item-${index}`);
+  return String(item.lineId || item.line_id || item.lineRowId || item.id || item.sku || item.itemName || `item-${index}`);
 }
 
 function conversionNumber(item = {}, key) {
@@ -2561,24 +2575,9 @@ function tooltipItemRowsForOrder(order, { pickupLocation = "", stop = null, incl
 }
 
 function availableUnitsForLine(line = {}) {
-  const available = line.available || {};
-  if (isMbbsSpecialLinkLine(line)) {
-    const salesQty = Number(available.salesQty || 0);
-    const salesUom = String(line.required?.unit || "").trim();
-    return salesQty > 0 ? [["salesQty", `Sales Qty${salesUom ? ` (${salesUom})` : ""}`, salesQty]] : [];
-  }
-  const units = [
-    ["pallets", "PLT", available.pallets],
-    ["layers", "LYR", available.layers],
-    ["sections", "SEC", available.sections],
-    ["pieces", "PCS", available.pieces]
-  ].filter(([, , value]) => Number(value || 0) > 0);
-  if (line.independentSalesQty && Number(available.salesQty || 0) > 0) {
-    units.push(["salesQty", line.required?.unit || "Sales Qty", available.salesQty]);
-  }
-  if (units.length) return units;
-  if (Number(available.salesQty || 0) > 0) return [["salesQty", line.required?.unit || "Qty", available.salesQty]];
-  return [];
+  const quantity = Number(line.available?.salesQty || 0);
+  const unit = String(line.required?.unit || line.unit || "Qty").trim();
+  return quantity > 0 ? [["salesQty", `Base qty (${unit})`, quantity]] : [];
 }
 
 function linkQuantityInputStep() {
@@ -2586,13 +2585,11 @@ function linkQuantityInputStep() {
 }
 
 function availableQtyTextForLine(line = {}) {
-  if (isMbbsSpecialLinkLine(line)) {
-    return `${qtyText(line.available?.salesQty || 0)} ${line.required?.unit || "Qty"}`;
-  }
-  return itemQtyText({ ...(line.available || {}), unit: line.required?.unit || "Qty" });
+  return `${qtyText(line.available?.salesQty || 0)} ${line.required?.unit || line.unit || "Qty"}`;
 }
 
 function linkSalesQuantityFromValues(values = {}, conversions = {}) {
+  if (Object.hasOwn(values, "salesQty")) return Number(Number(values.salesQty || 0).toFixed(6));
   const converted = ["pallets", "layers", "sections", "pieces"].reduce(
     (sum, unit) => sum + (Number(values[unit] || 0) * Number(conversions[unit] || 0)),
     0
@@ -4259,6 +4256,10 @@ function setAuthoritativeOrderRetirement(ref, retired = true) {
   if (retired) {
     authoritativeRetiredOrderRefs.add(key);
     for (const retained of dispatchSessionPoolOrders.values()) retained.delete(key);
+    orderCatalog = orderCatalog.filter(order => dispatchOrderRefKey(order.id) !== key);
+    for (const evidenceRef of assignedOrderEvidenceById.keys()) {
+      if (dispatchOrderRefKey(evidenceRef) === key) assignedOrderEvidenceById.delete(evidenceRef);
+    }
   }
   else authoritativeRetiredOrderRefs.delete(key);
 }
@@ -4489,9 +4490,7 @@ function applyDispatchOrderFeed(feed) {
   orders = [
     ...orderCatalog.map((order) => {
       const previous = byId.get(order.id) || {};
-      const refreshed = order.type === "CO"
-        ? preserveDispatchPlanningFields(previous, order)
-        : { ...previous, ...order };
+      const refreshed = preserveDispatchPlanningFields(previous, order);
       return normalizeOrder(preserveActiveOrderEvidence(previous, refreshed, activityEvidence));
     }),
     ...localOrders.filter((order) => !nextIds.has(order.id)).map(normalizeOrder)
@@ -4506,7 +4505,13 @@ function applyDispatchOrderFeed(feed) {
 }
 
 function preserveDispatchPlanningFields(existing = {}, fresh = {}) {
+  if (fresh.catalogHydrated === false && existing.catalogHydrated === true
+    && fresh.catalogDetailSignature && fresh.catalogDetailSignature === existing.catalogDetailSignature) {
+    return { ...existing, ...fresh, items: existing.items, childOrderDetails: existing.childOrderDetails,
+      catalogHydrated: true };
+  }
   if (fresh.type === "CO" && fresh.catalogHydrated === false && existing.catalogHydrated === true
+    && (!fresh.catalogDetailSignature || !existing.catalogDetailSignature)
     && existing.sourceTable === "local_co_orders" && existing.sourceOrderId) {
     const cargoFields = ["items", "pallets", "layers", "sections", "pieces", "salesQty", "weight",
       "childOrders", "childOrderDetails", "globalGroupDefinition", "isGrouped", "catalogHydrated"];
@@ -4545,6 +4550,16 @@ function preserveDispatchPlanningFields(existing = {}, fresh = {}) {
     .filter((key) => existing[key] !== undefined)
     .map((key) => [key, existing[key]]));
   const merged = { ...fresh, ...planning, ...(authoritativeLocalCo ? { globalGroupDefinition: false, isGrouped: false } : {}) };
+  if (!authoritativeLocalCo && fresh.catalogHydrated !== false && Array.isArray(fresh.childOrderDetails)
+    && Array.isArray(merged.childOrders) && merged.childOrders.length) {
+    const freshChildren = new Map(fresh.childOrderDetails.map((child) => [String(child.id), child]));
+    const previousChildren = new Map((existing.childOrderDetails || []).map((child) => [String(child.id), child]));
+    merged.childOrderDetails = merged.childOrders.map((ref) => {
+      const previous = previousChildren.get(String(ref));
+      const next = freshChildren.get(String(ref));
+      return next ? preserveDispatchPlanningFields(previous || {}, next) : previous;
+    }).filter(Boolean);
+  }
   const guarded = globalThis.DispatchAddressGuard?.preserve(existing, merged);
   if (guarded?.warnings.length && typeof routeNotice !== "undefined") {routeNotice = guarded.warnings.map(warning => warning.message).join(" ");}
   return guarded?.order || { ...merged, address: String(merged.address || "").trim() ? merged.address : existing.address || "" };
@@ -4584,6 +4599,7 @@ function mergeDispatchOrderSearchFeed(feed) {
 }
 
 function mergeTargetedDispatchMutationOrders(payload) {
+  dispatchOrderRefreshEpoch += 1;
   const responsePayload = payload || {};
   const candidates = [
     responsePayload.order,
@@ -4675,16 +4691,57 @@ function renderDispatchOrderPoolPatch() {
   }
 }
 
-async function applyTargetedDispatchOrderUpdate(orderId) {
-  const response = await fetch(`/api/dispatch/v2/order-feed/${encodeURIComponent(orderId)}`, {
-    headers: { "Cache-Control": "no-cache" }
+function dispatchOrderReadToken() {
+  return { sequence: ++dispatchOrderReadSequence, epoch: dispatchOrderRefreshEpoch, generation: localPlanGeneration,
+    planId: String(currentPlan?.id || ""), planDate: currentPlanDate };
+}
+
+function dispatchOrderReadIsCurrent(token) {
+  return token.epoch === dispatchOrderRefreshEpoch && token.generation === localPlanGeneration
+    && token.planId === String(currentPlan?.id || "") && token.planDate === currentPlanDate;
+}
+
+async function dispatchOrderFeedForRead(feed, token) {
+  const candidates = (feed || []).map((order) => {
+    const newerRead = dispatchOrderAppliedReads.get(dispatchOrderRefKey(order.id));
+    return newerRead > token.sequence ? orderById(order.id) || order : order;
   });
-  if (!response.ok) throw new Error(await dispatchErrorMessage(response));
-  const payload = await response.json();
-  if (!payload?.order) throw new Error("The refreshed Dispatch order was not returned.");
-  mergeDispatchOrderSearchFeed([payload.order]);
-  renderDispatchOrderPoolPatch();
-  return payload.order;
+  const verify = candidates.filter((order) => {
+    const existing = orderById(order.id);
+    return order.catalogHydrated === false && existing?.catalogHydrated === true
+      && (!order.catalogDetailSignature || order.catalogDetailSignature !== existing.catalogDetailSignature);
+  }).map((order) => order.id);
+  if (!verify.length) return candidates;
+  // A content hash detects a difference, not which read is newer. Keep the
+  // complete details until a direct read verifies a changed compact card.
+  for (const ref of verify) orderById(ref).catalogHydrated = false;
+  await refreshDispatchOrderRefs(verify);
+  const verified = new Set(verify);
+  return candidates.map((order) => verified.has(order.id) ? orderById(order.id) || order : order);
+}
+
+async function applyTargetedDispatchOrderUpdate(orderId, { grouping = false } = {}) {
+  if (!grouping && dispatchGroupHydrationPromise) {
+    await dispatchGroupHydrationPromise.catch(() => null);
+  }
+  const token = dispatchOrderReadToken();
+  const key = dispatchOrderRefKey(orderId);
+  dispatchOrderReadRequests.set(key, token);
+  try {
+    const response = await fetch(`/api/dispatch/v2/order-feed/${encodeURIComponent(orderId)}?fresh=true`, {
+      headers: { "Cache-Control": "no-cache" }
+    });
+    if (!response.ok) throw new Error(await dispatchErrorMessage(response));
+    const payload = await response.json();
+    if (!dispatchOrderReadIsCurrent(token) || dispatchOrderReadRequests.get(key) !== token) return orderById(orderId);
+    if (!payload?.order) throw new Error("The refreshed Dispatch order was not returned.");
+    mergeDispatchOrderSearchFeed([payload.order]);
+    dispatchOrderAppliedReads.set(key, token.sequence);
+    renderDispatchOrderPoolPatch();
+    return payload.order;
+  } finally {
+    if (dispatchOrderReadRequests.get(key) === token) dispatchOrderReadRequests.delete(key);
+  }
 }
 
 function cancelDispatchOrderSearch() {
@@ -4698,7 +4755,9 @@ function cancelDispatchOrderSearch() {
 }
 
 async function loadDispatchOrderSearch(term, sequence) {
+  if (dispatchGroupHydrationPromise) await dispatchGroupHydrationPromise.catch(() => null);
   const scope = dispatchOrderPoolScope();
+  const readToken = dispatchOrderReadToken();
   try {
     orderSearchAbortController?.abort();
     orderSearchAbortController = new AbortController();
@@ -4709,9 +4768,12 @@ async function loadDispatchOrderSearch(term, sequence) {
     if (!response.ok) throw new Error(await response.text());
     const payload = await response.json();
     const feed = versionedPool ? payload.orders : payload;
-    if (sequence !== orderSearchSequence || term !== searchText.trim() || scope !== dispatchOrderPoolScope()) return;
+    if (sequence !== orderSearchSequence || term !== searchText.trim() || scope !== dispatchOrderPoolScope()
+      || !dispatchOrderReadIsCurrent(readToken)) return;
     dispatchOrderPoolNextCursor = versionedPool ? payload.nextCursor || "" : "";
-    mergeDispatchOrderSearchFeed(feed);
+    const freshFeed = await dispatchOrderFeedForRead(feed, readToken);
+    if (!dispatchOrderReadIsCurrent(readToken) || sequence !== orderSearchSequence) return;
+    mergeDispatchOrderSearchFeed(freshFeed);
     if (feed?.length) dispatchOrderSearchCache.set(`${scope}:${term.toLowerCase()}`, {
       refs: feed.map((order) => dispatchOrderRefKey(order.id)),
       nextCursor: dispatchOrderPoolNextCursor
@@ -4808,14 +4870,16 @@ function dispatchPlannedAssignment(orderRef) {
   return plannedAssignmentsByRef.get(String(orderRef || "").trim().toUpperCase()) || null;
 }
 
-async function refreshPlannedAssignments() {
-  const response = await fetch("/api/dispatch/planned-assignments");
+async function refreshPlannedAssignments({ includeSnapshots = true } = {}) {
+  const response = await fetch(`/api/dispatch/planned-assignments${includeSnapshots ? "" : "?includeSnapshots=false"}`);
   if (!response.ok) throw new Error(await response.text());
   applyPlannedAssignments(await response.json());
 }
 
 async function loadDispatchOrders({ sync = false, append = false } = {}) {
+  if (dispatchGroupHydrationPromise) await dispatchGroupHydrationPromise.catch(() => null);
   const scope = dispatchOrderPoolScope();
+  const readToken = dispatchOrderReadToken();
   const requestedType = activeOrderType === "BIN" ? "SO" : activeOrderType;
   const browseKey = `${scope}:${requestedType}`;
   if (!sync && !append && dispatchOrderPoolLoadPromise && dispatchOrderPoolLoadKey === browseKey) return dispatchOrderPoolLoadPromise;
@@ -4834,23 +4898,24 @@ async function loadDispatchOrders({ sync = false, append = false } = {}) {
       });
       if (!response.ok) throw new Error(await response.text());
       const payload = await response.json();
-      if (scope !== dispatchOrderPoolScope()) return false;
+      if (scope !== dispatchOrderPoolScope() || !dispatchOrderReadIsCurrent(readToken)) return true;
+      const freshFeed = await dispatchOrderFeedForRead(versionedPool ? payload.orders : sync ? payload.orders : payload, readToken);
+      if (!dispatchOrderReadIsCurrent(readToken)) return true;
       if (versionedPool) {
         dispatchOrderBrowseCursors.set(browseKey, payload.nextCursor || "");
         if (!searchText.trim() && requestedType === activeOrderType) dispatchOrderPoolNextCursor = payload.nextCursor || "";
-        if (append || requestedType !== activeOrderType) mergeDispatchOrderSearchFeed(payload.orders || []);
-        else applyDispatchOrderFeed(payload.orders || []);
+        if (append || requestedType !== activeOrderType) mergeDispatchOrderSearchFeed(freshFeed);
+        else applyDispatchOrderFeed(freshFeed);
       } else {
         dispatchOrderBrowseCursors.set(browseKey, "");
         if (!searchText.trim()) dispatchOrderPoolNextCursor = "";
-        applyDispatchOrderFeed(sync ? payload.orders : payload);
+        applyDispatchOrderFeed(freshFeed);
       }
       dispatchOrderPoolLoaded = true;
       routeNotice = sync ? "Orders refreshed from local DB." : routeNotice;
       return true;
     } catch (error) {
       routeNotice = sync ? `Order refresh failed: ${error.message}` : routeNotice;
-      applyDispatchOrderFeed(orderCatalog);
       return false;
     }
   })();
@@ -4871,6 +4936,7 @@ async function loadDispatchOrderPoolForPlanSwitch() {
 
 async function loadMoreDispatchOrders() {
   if (!dispatchOrderPoolNextCursor || dispatchOrderPoolLoadingMore) return;
+  const readToken = dispatchOrderReadToken();
   dispatchOrderPoolLoadingMore = true;
   renderDispatchOrderPoolPatch();
   try {
@@ -4880,7 +4946,10 @@ async function loadMoreDispatchOrders() {
       const response = await fetch(request.url, { headers: request.headers });
       if (!response.ok) throw new Error(await dispatchErrorMessage(response));
       const payload = await response.json();
-      mergeDispatchOrderSearchFeed(payload.orders || []);
+      if (!dispatchOrderReadIsCurrent(readToken)) return;
+      const freshFeed = await dispatchOrderFeedForRead(payload.orders, readToken);
+      if (!dispatchOrderReadIsCurrent(readToken)) return;
+      mergeDispatchOrderSearchFeed(freshFeed);
       dispatchOrderPoolNextCursor = payload.nextCursor || "";
     } else {
       await loadDispatchOrders({ append: true });
@@ -4915,18 +4984,49 @@ function dispatchGroupOrderNeedsHydration(order) {
 }
 
 async function hydrateDispatchGroupSelection() {
+  if (dispatchGroupHydrationPromise) return dispatchGroupHydrationPromise;
   const selected = selectedOrders();
   const ids = selected.map((order) => order.id).sort();
-  await Promise.all(selected.filter(dispatchGroupOrderNeedsHydration)
-    .map((order) => hydrateDispatchOrder(order.id, { force: true })));
-  const current = selectedOrders();
-  if (JSON.stringify(current.map((order) => order.id).sort()) !== JSON.stringify(ids)) {
-    throw new Error("The order selection changed while details loaded. Review the selection and group again.");
+  const token = dispatchOrderReadToken();
+  dispatchGroupHydrationRefs = new Set(ids.map(dispatchOrderRefKey));
+  // Invalidate older pool reads and coalesce background work until this action
+  // has complete details. Events for selected sources still require a new read.
+  dispatchOrderRefreshEpoch += 1;
+  dispatchGroupRefreshPending ||= Boolean(orderPoolRefreshTimer);
+  window.clearTimeout(orderPoolRefreshTimer ?? undefined);
+  orderPoolRefreshTimer = null;
+  dispatchGroupHydrationPromise = (async () => {
+    for (let attempt = 0; attempt < 3; attempt += 1) {
+      dispatchGroupHydrationInvalidated = false;
+      await Promise.all(selectedOrders().filter(order => attempt > 0 || dispatchGroupOrderNeedsHydration(order))
+        .map(order => applyTargetedDispatchOrderUpdate(order.id, { grouping: true })));
+      const current = selectedOrders();
+      if (JSON.stringify(current.map(order => order.id).sort()) !== JSON.stringify(ids)) {
+        throw new Error("The order selection changed while details loaded. Review the selection and group again.");
+      }
+      if (token.generation !== localPlanGeneration || token.planId !== String(currentPlan?.id || "")
+        || token.planDate !== currentPlanDate) {
+        throw new Error("The plan changed while details loaded. Review the selection and group again.");
+      }
+      if (dispatchGroupHydrationInvalidated) continue;
+      if (current.some(dispatchGroupOrderNeedsHydration)) {
+        if (attempt < 2) continue;
+        throw new Error("Complete item details could not be loaded for every selected order.");
+      }
+      return current;
+    }
+    throw new Error("Selected orders changed while details loaded. Please group again.");
+  })();
+  try {
+    return await dispatchGroupHydrationPromise;
+  } finally {
+    dispatchGroupHydrationPromise = null;
+    dispatchGroupHydrationRefs.clear();
+    if (dispatchGroupRefreshPending) {
+      dispatchGroupRefreshPending = false;
+      queueDispatchOrderPoolRefresh(orderPoolRefreshReason);
+    }
   }
-  if (current.some(dispatchGroupOrderNeedsHydration)) {
-    throw new Error("Complete item details could not be loaded for every selected order.");
-  }
-  return current;
 }
 
 async function loadMbtBinDispatchCapability() {
@@ -7894,9 +7994,14 @@ function resetPlanningBoard() {
 }
 
 async function resetDispatchAfterOrderDataClear() {
+  dispatchOrderRefreshEpoch += 1;
+  pendingDispatchOrderRefreshRefs.clear();
+  pendingDispatchRequiredRefreshRefs.clear();
+  dispatchOrderReadRequests.clear();
+  dispatchOrderAppliedReads.clear();
   clearTimeout(saveTimer);
   clearTimeout(remoteRefreshTimer);
-  clearTimeout(orderPoolRefreshTimer);
+  clearTimeout(orderPoolRefreshTimer ?? undefined);
   orderPoolRefreshTimer = null;
   orderPoolRefreshTrailing = false;
   orderPoolRefreshReason = "";
@@ -7926,7 +8031,10 @@ async function resetDispatchAfterOrderDataClear() {
 
 async function loadPlanForDate(planDate = currentPlanDate, { createIfMissing = true, setupReady = null } = {}) {
   const binNavigation = globalThis.MbbsBinPlanning?.navigation();
-  const currentNavigation = () => binNavigation === globalThis.MbbsBinPlanning?.navigation();
+  const loadSequence = ++dispatchPlanLoadSequence;
+  const generation = localPlanGeneration;
+  const currentNavigation = () => loadSequence === dispatchPlanLoadSequence && generation === localPlanGeneration
+    && binNavigation === globalThis.MbbsBinPlanning?.navigation();
   if (String(planDate || "") !== String(currentPlanDate || "")) {
     driverNewTruckSelections.clear();
     resetActiveLinkModalState();
@@ -8078,8 +8186,20 @@ async function restoreServerPlan() {
   }
 }
 
-async function pollServerPlan() {
-  if (!currentPlan?.id || planPollInFlight || saveInFlight || saveQueued || confirmInFlight) return;
+async function pollServerPlan({ discoverPlan = false } = {}) {
+  if (planPollInFlight || saveInFlight || saveQueued || confirmInFlight) return;
+  if (["stale", "failed"].includes(dispatchPlannerSnapshotState) || (discoverPlan && !currentPlan?.id)) {
+    if (localPlanDirty || pendingPlanSaveAttempt || pendingDispatchPlanAction) return;
+    planPollInFlight = true;
+    try {
+      await loadPlanForDate(currentPlanDate, { createIfMissing: false });
+      render({ save: false });
+    } catch {
+      // Keep editing locked until a later poll can verify the complete snapshot.
+    } finally { planPollInFlight = false; }
+    return;
+  }
+  if (!currentPlan?.id) return;
   planPollInFlight = true;
   try {
     const response = await fetch(`/api/dispatch/plans/${encodeURIComponent(currentPlan.id)}/revision`);
@@ -8110,16 +8230,86 @@ async function pollServerPlan() {
   }
 }
 
+function dispatchRelatedRefreshRefs(payload = {}) {
+  const list = (values) => Array.isArray(values) ? values : [];
+  const refs = new Set([
+    payload.orderId, payload.orderRef, payload.tranid, payload.coRef, payload.coOrderId,
+    payload.sourceOrderRef, ...list(payload.orderRefs), ...list(payload.affectedOrderRefs), ...list(payload.reactivatedGlobalOrderRefs)
+  ].map(dispatchOrderRefKey).filter(Boolean));
+  const visit = (order, seen = new Set()) => {
+    if (!order || seen.has(order)) return [];
+    seen.add(order);
+    return [order.id, order.netsuiteId, order.originalOrderId, order.sourceOrderId, order.relatedSoId, order.relatedToId,
+      order.transitCo?.id, ...(order.childOrders || []), ...(order.groupAliases || []),
+      ...(order.correspondingPoRefs || []),
+      ...(order.orderDependencies || []).flatMap((link) => [link.salesOrderRef, link.transferOrderRef, link.dispatchTargetRef]),
+      ...(order.childOrderDetails || []).flatMap((child) => visit(child, seen))].map(dispatchOrderRefKey).filter(Boolean);
+  };
+  // Expand only through cards already present, so a source event also updates
+  // searched groups, further splits and their CO without loading the whole DB.
+  const candidates = [...orders, ...orderCatalog].map((order) => ({ order, refs: visit(order) }));
+  let changed = true;
+  while (changed) {
+    changed = false;
+    for (const candidate of candidates) {
+      if (!candidate.refs.some((ref) => refs.has(ref))) continue;
+      const key = dispatchOrderRefKey(candidate.order.id);
+      if (!refs.has(key)) { refs.add(key); changed = true; }
+    }
+  }
+  return [...refs].filter((ref) => !isAuthoritativelyRetiredOrderRef(ref));
+}
+
+async function refreshDispatchOrderRefs(refs) {
+  const remaining = [...new Set(refs)];
+  const failures = [];
+  const worker = async () => {
+    while (remaining.length) {
+      const ref = remaining.shift();
+      try { await applyTargetedDispatchOrderUpdate(ref); }
+      catch (error) {
+        if (!isAuthoritativelyRetiredOrderRef(ref)) failures.push(`${ref}: ${error.message}`);
+      }
+    }
+  };
+  await Promise.all(Array.from({ length: Math.min(4, remaining.length) }, worker));
+  if (failures.length) throw new Error(failures.join("; "));
+}
+
+function dispatchRefreshableOrderRefs(refs = [], requiredRefs = []) {
+  const requested = new Set(refs.map(dispatchOrderRefKey).filter(Boolean));
+  const targets = new Map();
+  for (const ref of requiredRefs) {
+    const key = dispatchOrderRefKey(ref);
+    if (key && !isAuthoritativelyRetiredOrderRef(key)) targets.set(key, ref);
+  }
+  // General order events also name pickup-only orders and source aliases.
+  // The refreshed pool determines eligibility; fetch each actual card once.
+  for (const order of [...orders, ...orderCatalog, ...assignedOrderEvidenceById.values()]) {
+    const key = dispatchOrderRefKey(order?.id);
+    if (!key || isAuthoritativelyRetiredOrderRef(key)) continue;
+    if (requested.has(key) || requested.has(dispatchOrderRefKey(order.netsuiteId))) targets.set(key, order.id);
+  }
+  return [...targets.values()];
+}
+
 async function runQueuedDispatchOrderPoolRefresh() {
   if (orderPoolRefreshInFlight) {
     orderPoolRefreshTrailing = true;
     return;
   }
   orderPoolRefreshInFlight = true;
+  const previousFailure = routeNotice.startsWith("Order-pool refresh failed:") ? routeNotice : "";
+  const refs = [...pendingDispatchOrderRefreshRefs];
+  pendingDispatchOrderRefreshRefs.clear();
+  const requiredRefs = [...pendingDispatchRequiredRefreshRefs];
+  pendingDispatchRequiredRefreshRefs.clear();
   const splitOrderTarget = modalType === "split" ? orderById(modalOrderId) : null;
   try {
     void loadExecutedOrderReviews({ force: true });
     if (!await loadDispatchOrders()) throw new Error("the order feed request failed");
+    const targets = dispatchRefreshableOrderRefs(refs, requiredRefs);
+    if (targets.length) await refreshDispatchOrderRefs(targets);
     if (splitOrderTarget) {
       const fresh = await refreshDispatchSplitOrder(splitOrderTarget);
       if (modalType === "split" && modalOrderId === splitOrderTarget.id && !splitStatusLoading) {
@@ -8127,13 +8317,12 @@ async function runQueuedDispatchOrderPoolRefresh() {
         renderDispatchModalInPlace();
       }
     }
+    if (previousFailure && routeNotice === previousFailure) routeNotice = "";
     renderDispatchNoticePatch();
     renderDispatchOrderPoolPatch();
-    if (modalType === "to-link") {
-      loadOrderDependencyOptions(orderById(modalOrderId)).catch(() => null);
-    } else if (modalType === "po-link") {
-      loadPoAllocationOptions(modalOrderId).catch(() => null);
-    }
+    // Background feeds update the board, not an in-progress linking form.
+    // Explicit refresh/match actions reload options; submission validates the
+    // retained target signature and current available quantities on the server.
   } catch (error) {
     routeNotice = `Order-pool refresh failed: ${error.message}`;
     renderDispatchNoticePatch();
@@ -8146,13 +8335,34 @@ async function runQueuedDispatchOrderPoolRefresh() {
   }
 }
 
-function queueDispatchOrderPoolRefresh(reason = "Order data updated.") {
+function queueDispatchOrderPoolRefresh(reason = "Order data updated.", payload = {}) {
   orderPoolRefreshReason = reason || orderPoolRefreshReason;
+  dispatchOrderSearchCache.clear();
+  const relatedRefs = dispatchRelatedRefreshRefs(payload);
+  for (const ref of relatedRefs) pendingDispatchOrderRefreshRefs.add(ref);
+  // Explicit structural results can introduce cards beyond the current page.
+  for (const values of [payload.reactivatedGlobalOrderRefs, payload.affectedOrderRefs,
+    payload.change === "order_resplit" ? payload.orderRefs : [],
+    payload.coRef && payload.cancelled !== true ? [payload.coRef] : []]) {
+    for (const ref of Array.isArray(values) ? values : []) {
+      const key = dispatchOrderRefKey(ref);
+      if (key) pendingDispatchRequiredRefreshRefs.add(key);
+    }
+  }
+  if (dispatchGroupHydrationPromise) {
+    dispatchGroupRefreshPending = true;
+    if (!relatedRefs.length || relatedRefs.some(ref => dispatchGroupHydrationRefs.has(ref))) {
+      dispatchGroupHydrationInvalidated = true;
+      dispatchOrderRefreshEpoch += 1;
+    }
+    return;
+  }
+  dispatchOrderRefreshEpoch += 1;
   if (orderPoolRefreshInFlight) {
     orderPoolRefreshTrailing = true;
     return;
   }
-  window.clearTimeout(orderPoolRefreshTimer);
+  window.clearTimeout(orderPoolRefreshTimer ?? undefined);
   orderPoolRefreshTimer = window.setTimeout(() => {
     orderPoolRefreshTimer = null;
     void runQueuedDispatchOrderPoolRefresh();
@@ -8214,6 +8424,13 @@ function connectEvents() {
     }
 
     if (["dispatch.plan.saved", "dispatch.plan.confirmed", "dispatch.plan.reopened"].includes(event.type)) {
+      if (payload.planDate && payload.planDate !== currentPlanDate && payload.retiredGlobalOrderRefs?.length) {
+        applyRetiredStructuralLiveEvent(payload.retiredGlobalOrderRefs);
+      }
+      if (payload.refreshOrderPool || payload.affectedOrderRefs?.length || payload.reactivatedGlobalOrderRefs?.length) {
+        for (const ref of payload.reactivatedGlobalOrderRefs || []) setAuthoritativeOrderRetirement(ref, false);
+        queueDispatchOrderPoolRefresh("Order structure updated.", payload);
+      }
       if (payload.planDate && payload.planDate !== currentPlanDate) {
         refreshPlannedAssignments()
           .then(() => renderDispatchOrderPoolPatch())
@@ -8230,7 +8447,7 @@ function connectEvents() {
       // Some legacy server events omit sourceSessionId. Verify that the server
       // revision is actually newer before warning about a remote editor.
       if (saveInFlight || saveQueued || confirmInFlight) return;
-      pollServerPlan();
+      pollServerPlan({ discoverPlan: Boolean(payload.planId) });
       return;
     }
 
@@ -8273,7 +8490,7 @@ function connectEvents() {
           applyTargetedDispatchOrderUpdate(payload.coRef).catch(() => null);
         }
       }
-      queueDispatchOrderPoolRefresh("Order data updated.");
+      queueDispatchOrderPoolRefresh("Order data updated.", payload);
       return;
     }
 
@@ -8308,7 +8525,8 @@ function connectEvents() {
       queueDispatchOrderPoolRefresh(
         event.type === "delivery.order.unpacked"
           ? "Operator unpacked an order. Split can continue."
-          : "Order data updated."
+          : "Order data updated.",
+        payload
       );
     }
   });
@@ -8995,13 +9213,19 @@ function loadStats(parentTruck, load) {
   const truck = effectiveTruckForLoad(parentTruck, load);
   const startInfo = loadStartInfo(parentTruck, load);
   const start = startInfo.start;
+  // The counterpart planner owns the entire saved interval, including stops.
+  // Combining its fixed start with fresh estimates can invent an overlap.
+  const preserveTiming = isPlanningLoadReadOnly(load);
+  const savedFinish = preserveTiming ? load.plannedFinishMinute ?? load.timing?.finish : null;
   const startWarnings = [];
   if (startInfo.startClamped) {
     startWarnings.push(`Load start ${timeText(startInfo.scheduledStart)} does not leave enough time after the previous load. Start was moved to ${timeText(start)}.`);
   }
   if (load.returnOnly) {
     const estimate = estimateForLoad(load);
-    const totalMinutes = Number(estimate?.totalMinutes || adjustedTravelMinutesForTruck(truck, load.returnMinutes || 30));
+    const totalMinutes = Number.isFinite(savedFinish) && savedFinish >= start
+      ? savedFinish - start
+      : Number(estimate?.totalMinutes || adjustedTravelMinutesForTruck(truck, load.returnMinutes || 30));
     return {
       rows: [],
       palletTotal: 0,
@@ -9100,6 +9324,7 @@ function loadStats(parentTruck, load) {
       travelTotal += travelMinutes;
       routeLegIndex += 1;
     }
+    if (preserveTiming && Number.isFinite(stop.timing?.arrival)) current = stop.timing.arrival;
     if (visit.type === "pick") {
       let pickedFootprint = 0;
       for (const pickupOrder of pickupOrdersForStop(load, stop)) {
@@ -9113,6 +9338,7 @@ function loadStats(parentTruck, load) {
       }
       const arrival = current;
       current += physicalVisitStayMinutes(visit, truck);
+      if (preserveTiming && Number.isFinite(stop.timing?.depart)) current = stop.timing.depart;
       let warningReason = "";
       const window = stopTimeWindow(stop, order);
       const hasTimeWindow = Boolean(window.start && window.end);
@@ -9130,6 +9356,7 @@ function loadStats(parentTruck, load) {
     }
     const arrival = current;
     current += physicalVisitStayMinutes(visit, truck);
+    if (preserveTiming && Number.isFinite(stop.timing?.depart)) current = stop.timing.depart;
     for (const entry of visit.entries) {
       const entryStop = entry.stop;
       const entryOrder = entry.order;
@@ -9191,7 +9418,7 @@ function loadStats(parentTruck, load) {
     processedWeightLbs,
     capacityLbs,
     start,
-    finish: current,
+    finish: Number.isFinite(savedFinish) && savedFinish >= start ? savedFinish : current,
     returnTrip,
     warningCount,
     warnings,
@@ -11616,8 +11843,12 @@ function ensureDispatchRenderLayers() {
   return { plannerRoot, modalLayer };
 }
 
-function renderDispatchModalInPlace() {
+function renderDispatchModalInPlace({ preserveActiveLink = false } = {}) {
   const { modalLayer } = ensureDispatchRenderLayers();
+  const activeLink = modalLayer.querySelector('[data-link-modal="true"]');
+  if (preserveActiveLink && ["po-link", "to-link"].includes(modalType)
+      && activeLink?.dataset.linkModalType === modalType
+      && activeLink.dataset.linkOrderRef === String(modalOrderId)) return;
   modalLayer.innerHTML = renderModal();
   if (dispatchPersistentFocusSelector) {
     const input = app.querySelector(dispatchPersistentFocusSelector);
@@ -11953,7 +12184,7 @@ function render(options = {}) {
       <div id="orderTooltip"></div>
     </section>
   `;
-  renderDispatchModalInPlace();
+  renderDispatchModalInPlace({ preserveActiveLink: options.refreshLinkModal !== true });
   applyReadOnlyPlanningControls();
   const orderList = app.querySelector(".order-list");
   if (orderList) orderList.scrollTop = orderListScrollTop;
@@ -13509,7 +13740,7 @@ function renderTransitCoEditor(order, { creationChecked = false } = {}) {
   `;
 }
 
-async function loadOrderDependencyOptions(order, { transferOrderRef = "" } = {}) {
+async function loadOrderDependencyOptions(order, { transferOrderRef = null } = {}) {
   if (!order?.id) return;
   const targetRef = order.id;
   const draft = getLinkModalDraft("to", targetRef);
@@ -13593,13 +13824,14 @@ function renderToLinkModal(order) {
   const matchingLines = options.matchingLines || [];
   const matchError = options.matchError || "";
   return `
-    <div class="modal-backdrop show" data-link-modal="true">
+    <div class="modal-backdrop show" data-link-modal="true" data-link-modal-type="to-link" data-link-order-ref="${escapeHtml(order.id)}">
       <section class="dispatch-modal wide-modal">
         <div class="modal-header">
           <div>
             <h2>Link TO</h2>
             <p>${escapeHtml(order.id)}${options.dispatchTargetKind && options.dispatchTargetKind !== "normal" ? ` | ${escapeHtml(options.dispatchTargetKind)}` : ""}</p>
           </div>
+          <button data-action="refresh-to-link-match" type="button">Refresh match</button>
           <button data-action="close-modal" type="button">Close</button>
         </div>
         <div class="modal-body">
@@ -13618,7 +13850,7 @@ function renderToLinkModal(order) {
             <datalist id="toLinkOptions">${transferOrders.filter((entry) => !entry.linkedSalesOrderRef || entry.linkedSalesOrderRef === order.id).map((entry) => `<option value="${escapeHtml(entry.ref)}">${escapeHtml(entry.fromLocation || "")} to ${escapeHtml(entry.toLocation || "")}</option>`).join("")}</datalist>
             ${orderDependencyLoading ? `<div class="empty-drop">Matching Transfer Order lines...</div>` : ""}
             ${orderDependencyError ? `<div class="warning-detail">Link TO options failed: ${escapeHtml(orderDependencyError)}</div>` : ""}
-            ${draft.structureWarning ? `<div class="warning-detail">${escapeHtml(draft.structureWarning)} <button data-action="refresh-to-link-match" type="button">Refresh Match</button></div>` : ""}
+            ${draft.structureWarning ? `<div class="warning-detail">${escapeHtml(draft.structureWarning)}</div>` : ""}
             <div class="order-dependency-match-lines">
               ${matchingLines.map((line, index) => {
                 const units = availableUnitsForLine({ available: line.available, required: { unit: line.unit } });
@@ -13626,7 +13858,7 @@ function renderToLinkModal(order) {
                 const values = { ...(line.suggestedQuantities || {}), ...saved };
                 const equivalent = linkSalesQuantityFromValues(values, line.conversions || {});
                 return `<section class="link-quantity-line to-link-line" data-target-line-key="${escapeHtml(line.targetLineKey)}" data-dependency-item="${line.itemId}" data-to-plt="${Number(line.conversions?.pallets || 0)}" data-to-lyr="${Number(line.conversions?.layers || 0)}" data-to-sec="${Number(line.conversions?.sections || 0)}" data-to-pcs="${Number(line.conversions?.pieces || 0)}" data-sales-unit="${escapeHtml(line.unit || "Qty")}">
-                  <div class="link-quantity-info"><strong>${escapeHtml(line.sku || line.itemName)}</strong>${line.sourceOrderRef && line.sourceOrderRef !== order.id ? `<span>${escapeHtml(line.sourceOrderRef)}</span>` : ""}<em>SO open ${escapeHtml(availableQtyTextForLine({ available: line.available, required: { unit: line.unit } }))} | TO ${escapeHtml(itemQtyText({ ...(line.transferDisplay || {}), salesQty: line.transferDisplay?.salesQty, unit: line.unit }))}</em><em class="link-sales-equivalent" data-link-sales-equivalent>Selected ${escapeHtml(qtyText(equivalent))} ${escapeHtml(line.unit || "Qty")}</em></div>
+                  <div class="link-quantity-info"><strong>${escapeHtml(line.sku || line.itemName)}</strong>${line.sourceOrderRef && line.sourceOrderRef !== order.id ? `<span>${escapeHtml(line.sourceOrderRef)}</span>` : ""}<em>SO open ${escapeHtml(availableQtyTextForLine({ available: line.available, required: { unit: line.unit } }))} | TO ${escapeHtml(qtyText(line.transferQuantity))} ${escapeHtml(line.unit || "Qty")}</em><em class="link-sales-equivalent" data-link-sales-equivalent>Selected ${escapeHtml(qtyText(equivalent))} ${escapeHtml(line.unit || "Qty")}</em></div>
                   <div class="link-quantity-units">${units.map(([field, label, max]) => `<label><span>${escapeHtml(label)}</span><input id="toLinkQty-${index}-${field}" data-to-link-qty="${field}" data-target-line-key="${escapeHtml(line.targetLineKey)}" type="number" inputmode="decimal" min="0" max="${Number(max || 0)}" step="${linkQuantityInputStep()}" value="${escapeHtml(values[field] ?? 0)}" /></label>`).join("")}</div>
                 </section>`;
               }).join("") || (!orderDependencyLoading ? (matchError ? `<div class="warning-detail">${escapeHtml(matchError)}</div>` : `<span class="muted">Type a Transfer Order number, then press Match Lines.</span>`) : "")}
@@ -13805,19 +14037,20 @@ function renderPoLinkModal(order) {
   );
   const matchableSalesLines = materialSalesLines;
   return `
-    <div class="modal-backdrop show" data-link-modal="true">
+    <div class="modal-backdrop show" data-link-modal="true" data-link-modal-type="po-link" data-link-order-ref="${escapeHtml(order.id)}">
       <section class="dispatch-modal wide-modal">
         <div class="modal-header">
           <div>
             <h2>Link PO Pickup</h2>
             <p>${order.id} | vendor pickup quantity will be removed from yard packing</p>
           </div>
+          <button data-action="refresh-po-link-options" type="button">Refresh options</button>
           <button data-action="close-modal" type="button">Close</button>
         </div>
         <div class="modal-body">
           ${poAllocationLoading ? `<div class="empty-drop">Loading matching PO lines...</div>` : ""}
           ${poAllocationError ? `<div class="warning-detail">Link PO options failed: ${escapeHtml(poAllocationError)}</div>` : ""}
-          ${draft.structureWarning ? `<div class="warning-detail">${escapeHtml(draft.structureWarning)} <button data-action="refresh-po-link-options" type="button">Refresh Match</button></div>` : ""}
+          ${draft.structureWarning ? `<div class="warning-detail">${escapeHtml(draft.structureWarning)}</div>` : ""}
           ${allocations.length ? `
             <div class="allocation-list">
               <strong>Active linked PO quantity</strong>
@@ -13843,7 +14076,7 @@ function renderPoLinkModal(order) {
             ${renderPoLinkMatchBoard(order, salesLines, selectedPoLines, draft)}
             <div class="po-link-quantity-heading">
               <strong>Connected quantities</strong>
-              <span>Only connected SO lines can be entered below.</span>
+              <span>Enter the base quantity in the order UOM for each connected line.</span>
             </div>
             <div class="po-link-lines">
               ${matchableSalesLines.map((line, index) => {
@@ -13873,7 +14106,7 @@ function renderPoLinkModal(order) {
               `; }).join("")}
             </div>
             <div class="warning-detail">
-              Item code and UOM together control which cards can connect; a UOM mismatch is a different item. MBBS-Special always links by Sales Qty. Manual PLT/LYR/SEC/PCS remain operational display quantities and follow the linked Sales Qty coverage.
+              Item code and UOM together control which cards can connect; a UOM mismatch is a different item. All links use the base quantity and order UOM. Pallet, layer, section and piece counts are derived for dispatch display.
             </div>
             <div class="modal-status" data-modal-status></div>
             <div class="modal-footer">
@@ -14505,6 +14738,7 @@ function renderModal() {
       `;
     }
     ensureSplitDraft(order);
+    const splitQuantityMessage = splitQuantityValidationMessage(order);
     return `
       <div class="modal-backdrop show">
         <section class="dispatch-modal wide-modal">
@@ -14564,10 +14798,11 @@ function renderModal() {
                 `;
               }).join("")}
             </div>
+            <div class="warning-detail" role="alert" data-split-quantity-validation ${splitQuantityMessage ? "" : "hidden"}>${escapeHtml(splitQuantityMessage)}</div>
           </div>
           <div class="modal-footer">
             <button data-action="close-modal" type="button">Cancel</button>
-            <button class="primary" data-action="confirm-split" data-order="${order.id}" type="button">Create Split Orders</button>
+            <button class="primary" data-action="confirm-split" data-order="${order.id}" type="button" ${splitQuantityMessage ? "disabled" : ""}>Create Split Orders</button>
           </div>
         </section>
       </div>
@@ -15066,14 +15301,57 @@ function splitTotalsForPart(order, partIndex) {
   return { items, pallets, salesQty, weight };
 }
 
+/** @param {any} order @param {number} [parts] */
+function splitQuantityValidationMessage(order, parts = splitParts) {
+  if (!order?.items?.length) return "Refresh Orders before splitting; source item quantities are missing.";
+  /** @param {number} value */
+  const format = value => Number(value).toLocaleString("en-US", { maximumFractionDigits: 6 });
+  const draftItems = /** @type {Record<string, Array<Record<string, number>>>} */ (splitDraft.items);
+  for (const [itemIndex, item] of order.items.entries()) {
+    const values = draftItems[splitItemKey(item, itemIndex)] || [];
+    for (const unit of splitUnitDefinitions(item)) {
+      const quantities = Array.from({ length: parts }, (_value, index) => Number(values[index]?.[unit.key]));
+      if (quantities.some(value => !Number.isFinite(value) || value < 0)) {
+        return `${item.sku || item.itemName || "Item"}: enter a nonnegative quantity for every split.`;
+      }
+      const allocated = quantities.reduce((sum, value) => sum + value, 0);
+      const difference = allocated - Number(unit.total);
+      if (!Number.isFinite(difference) || Math.abs(difference) > 0.000001) {
+        return `Cannot split ${order.id}: ${item.sku || item.itemName || "Item"} totals ${format(allocated)} ${unit.label}; expected ${format(unit.total)} ${unit.label} (${format(Math.abs(difference))} ${unit.label} ${difference < 0 ? "short" : "over"}).`;
+      }
+    }
+  }
+  if (Array.from({ length: parts }, (_value, index) => splitTotalsForPart(order, index).salesQty).some(value => !(value > 0))) {
+    return "Each split must contain a positive quantity. Reduce the number of splits or adjust the quantities.";
+  }
+  return "";
+}
+
+/** @param {any} order */
+function refreshSplitQuantityValidation(order) {
+  const message = splitQuantityValidationMessage(order);
+  const warning = /** @type {HTMLElement | null} */ (app?.querySelector("[data-split-quantity-validation]"));
+  if (warning) {
+    warning.textContent = message;
+    warning.hidden = !message;
+  }
+  const confirm = /** @type {HTMLButtonElement | null} */ (app?.querySelector('[data-action="confirm-split"]'));
+  if (confirm) confirm.disabled = Boolean(message);
+}
+
 function splitOrder(orderId, parts = 2, startSuffix = 1) {
   const order = orderById(orderId);
-  if (!order || order.type === "CUSTOM") return;
+  if (!order || order.type === "CUSTOM") return false;
   if (order.childOrders?.length) {
     routeNotice = "Ungroup first, then split the child order.";
-    return;
+    return false;
   }
   const cleanParts = Math.min(Math.max(Number(parts) || 2, 2), 10);
+  const validationMessage = splitQuantityValidationMessage(order, cleanParts);
+  if (validationMessage) {
+    routeNotice = validationMessage;
+    return false;
+  }
   const cleanStartSuffix = Math.max(Number(startSuffix) || 1, 1);
   const originalPallets = order.pallets;
   const insertAt = orders.findIndex((item) => item.id === order.id) + 1;
@@ -15101,6 +15379,7 @@ function splitOrder(orderId, parts = 2, startSuffix = 1) {
   selectedOrderId = splits[0]?.id || "";
   selectedOrderIds = new Set(selectedOrderId ? [selectedOrderId] : []);
   if (splits[0]?.type) activeOrderType = splits[0].type;
+  return true;
 }
 
 function prepareUnsplitOrder(splitOrderId) {
@@ -15416,6 +15695,15 @@ function groupOrder(orderId) {
   const grouped = normalizeOrder({
     ...groupItems[0],
     id: uniqueGroupedDispatchOrderId(leafItems),
+    originalOrderId: "",
+    parentOrderRef: "",
+    resplitSourceOrderId: "",
+    originalPallets: null,
+    isSplit: false,
+    globalOrderDefinition: false,
+    globalOrderDefinitionKind: "",
+    globalOrderSourcePlanId: "",
+    globalOrderSourcePlanDate: "",
     groupPlanId: currentPlan?.id || "",
     groupPlanDate: currentPlanDate,
     planOwned: true,
@@ -15930,6 +16218,8 @@ app.addEventListener("dragstart", (event) => {
     event.preventDefault();
     return;
   }
+  clearTimeout(orderClickTimer);
+  orderClickTimer = null;
   const driverLaneHandle = event.target.closest("[data-driver-lane-handle]");
   if (driverLaneHandle) {
     const driverLane = driverLaneHandle.closest("[data-driver-lane]");
@@ -16115,6 +16405,15 @@ app.addEventListener("pointerdown", (event) => {
   if (!event.target.closest(".load-preview-resize")) return;
   startPreviewResize(event);
 });
+
+for (const eventName of ["pointerover", "focusin"]) {
+  app.addEventListener(eventName, (event) => {
+    const card = event.target.closest("[data-order]");
+    if (!card || (event.relatedTarget && card.contains(event.relatedTarget))) return;
+    const order = orderById(card.dataset.order);
+    if (order?.catalogHydrated === false && dispatchOrderHydrationPromises.size < 4) void hydrateDispatchOrder(order.id).catch(() => null);
+  });
+}
 
 app.addEventListener("mousedown", (event) => {
   if (beginWholeLoadPointerDrag(event)) return;
@@ -16492,8 +16791,14 @@ app.addEventListener("click", async (event) => {
       } else {
         selectedOrderIds = new Set([orderCard.dataset.order]);
       }
+      const actions = app.querySelector("[data-dispatch-order-actions]");
+      if (actions) actions.innerHTML = renderSelectedOrderActions();
+      for (const card of app.querySelectorAll(".order-card[data-order]")) {
+        card.classList.toggle("selected", selectedOrderIds.has(card.dataset.order));
+      }
       clearTimeout(orderClickTimer);
-      orderClickTimer = setTimeout(() => render({ save: false }), 180);
+      // Keep an unassigned card mounted between pointer press and native dragstart.
+      orderClickTimer = setTimeout(() => assignment.load ? render({ save: false }) : renderDispatchOrderPoolPatch(), 180);
       return;
     }
   }
@@ -17110,6 +17415,12 @@ app.addEventListener("click", async (event) => {
   if (action === "confirm-split") {
     if (splitStatusLoading || splitStatusError) return;
     const order = orderById(button.dataset.order);
+    const validationMessage = splitQuantityValidationMessage(order);
+    if (validationMessage) {
+      routeNotice = validationMessage;
+      refreshSplitQuantityValidation(order);
+      return;
+    }
     if (order?.type === "SO" && splitParentOrderId(order)) {
       button.disabled = true;
       try {
@@ -17126,6 +17437,7 @@ app.addEventListener("click", async (event) => {
         result.retiredGlobalOrderRefs.forEach(queueGlobalOrderRetirement);
         requestTargetedOrderPoolRefresh([order.id, ...result.orders.map((/** @type {any} */ candidate) => candidate.id)]);
         currentPlan.revision = result.planRevision ?? currentPlan.revision;
+        currentPlan.digest = result.planDigest || currentPlan.digest;
         selectedOrderId = result.orders[0].id;
         selectedOrderIds = new Set([selectedOrderId]);
         modalType = ""; modalOrderId = "";
@@ -17146,7 +17458,11 @@ app.addEventListener("click", async (event) => {
         return response.json();
       })
       .then((seed) => {
-        splitOrder(button.dataset.order, splitParts, seed.nextSuffix);
+        if (!splitOrder(button.dataset.order, splitParts, seed.nextSuffix)) {
+          refreshSplitQuantityValidation(order);
+          renderDispatchNoticePatch();
+          return;
+        }
         const created = orders.filter((item) => item.originalOrderId === button.dataset.order).map(summarizeOrder);
         created.forEach((item) => {
           const ref = String(item?.id || "").trim();
@@ -17221,7 +17537,7 @@ app.addEventListener("click", async (event) => {
       if (!applied) return;
       poAllocationOptions = payload.options;
       routeNotice = "PO link cancelled.";
-      render({ save: false });
+      render({ save: false, refreshLinkModal: true });
     }).catch((error) => {
       routeNotice = `Cancel PO link failed: ${error.message}`;
       render({ save: false });
@@ -17582,6 +17898,7 @@ app.addEventListener("input", (event) => {
       after: { sku, index, unit, value: splitDraft.items[key][index][unit] },
       details: { splitParts }
     });
+    refreshSplitQuantityValidation(order);
     return;
   }
   if (event.target?.id !== "orderSearch") return;
@@ -18273,11 +18590,7 @@ app.addEventListener("submit", async (event) => {
       targetLineKey: row.dataset.targetLineKey,
       poLineId: String(draft.poLineIds[row.dataset.targetLineKey] || ""),
       quantities: {
-        pallets: row.querySelector('[data-po-link-qty="pallets"]')?.value || 0,
-        layers: row.querySelector('[data-po-link-qty="layers"]')?.value || 0,
-        sections: row.querySelector('[data-po-link-qty="sections"]')?.value || 0,
-        pieces: row.querySelector('[data-po-link-qty="pieces"]')?.value || 0,
-        salesQty: row.querySelector('[data-po-link-qty="salesQty"]')?.value || 0
+        salesQty: Number(row.querySelector('[data-po-link-qty="salesQty"]')?.value || 0)
       }
     })).filter((line) => Object.values(line.quantities).some((value) => Number(value || 0) > 0));
     if (!poRef) {
@@ -18330,7 +18643,7 @@ app.addEventListener("submit", async (event) => {
       const nextDraft = getLinkModalDraft("po", order.id);
       nextDraft.targetSignature = payload.options?.order?.targetSignature || "";
       routeNotice = `${payload.allocations?.length || 0} PO item line(s) connected to sales order.`;
-      render({ save: false });
+      render({ save: false, refreshLinkModal: true });
     }).catch((error) => {
       setModalFormStatus(form, `PO link failed: ${error.message}`, "error");
       if (submitButton) {

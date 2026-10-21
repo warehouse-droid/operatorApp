@@ -1,0 +1,27 @@
+{
+  "task": "Hide cancelled SCM split lifecycles from PO/TO Schedule, including reused references such as SN1400761",
+  "tier": "2: read-only query bug fix",
+  "spec approval": "not obtained (autonomous run)",
+  "behaviors": [
+    "Search returns only the active replacement when an unsplit reference is reused; its content and pallet quantity remain correct.",
+    "Cancelled splits are absent from global search, completed search, explicit completed filters, exact-reference batches and status projections, including when no replacement exists.",
+    "The split ledger status is authoritative even if the retired child header or lines have stale active flags.",
+    "Active source POs, active splits, legitimate empty POs, ordinary completed/inactive POs and transfer orders retain existing visibility.",
+    "Authenticated schedule HTTP responses contain one active replacement; anonymous requests remain denied.",
+    "Reading the schedule leaves purchase orders, item lines, split history and schedule records unchanged."
+  ],
+  "setup": {
+    "dependencies": "No new dependencies; use existing Node, PostgreSQL, fast-check, c8, ESLint and TypeScript test image.",
+    "isolation": "Standard disposable Compose stack, mbbs-tests.slice, resource limits, teardown registered before startup; no production data in tests.",
+    "git": "Preserve unrelated workspace edits; no commits or resets.",
+    "artifacts": "Regression test, reproducible validation/release scripts, red and final logs, mutation evidence, source manifests and deployment verification.",
+    "release": "Capture the live runtime and apply only the schedule query change. No migration or business-data repair. App-only restart with rollback image."
+  },
+  "failureModel": {
+    "hide_replacement_by_shared_ref": "Assert active internal ID and quantity for reused references and mutate identity matching.",
+    "hide_completed_history": "Keep ordinary completed/inactive purchase and transfer orders visible in explicit history searches.",
+    "retired_record_reappears": "Exercise every include-completed path, stale flags and multiple cancelled lifecycles.",
+    "data_changed_by_filter": "Compare saved records before and after schedule reads.",
+    "unrelated_release_changes": "Source hashes restrict the release to one file; verify production configuration and dependencies."
+  }
+}

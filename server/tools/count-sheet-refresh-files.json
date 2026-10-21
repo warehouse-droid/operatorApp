@@ -1,0 +1,21 @@
+[
+  "src/count-sheet-stock-refresh.js",
+  "src/inventory-packed-stock.js",
+  "src/cycle-count-stock-refresh.js",
+  "src/count-sheet-reconstruction.js",
+  "src/count-sheet-repository.js",
+  "src/inventory-repository.js",
+  "src/history-repository.js",
+  "src/operator-inventory-router.js",
+  "src/server.js",
+  "public/operator-inventory.js",
+  "public/operator.js",
+  "public/control-count-sheets.js",
+  "public/control.js",
+  "public/i18n.js",
+  "public/operator.html",
+  "public/control.html",
+  "public/admin.html",
+  "public/service-worker.js",
+  "migrations/260_inventory_count_packed_snapshot.sql"
+]

@@ -2625,6 +2625,38 @@ export function createMbtRouter(dependencies = {}) {
   });
   router.post("/planning/commands", requireMbtSurface("dispatcher", "Dispatcher"), binDispatchMutation(""));
 
+  router.get("/planning/workflows/:visitId", requireMbtSurface("dispatcher", "Dispatcher"), async (req,res,next) => {
+    try {
+      await binDispatchCapability(req);
+      const service=await import("./bin-order-workflow-service.js");
+      noStore(res); res.json(await service.getBinOrderWorkflowOptions(requiredRequestText(req.params.visitId,
+        "MBT_BIN_VISIT_REQUIRED","A BIN visit ID is required.")));
+    } catch (error) {next(error);}
+  });
+  router.post("/planning/workflows/:visitId", requireMbtSurface("dispatcher", "Dispatcher"), async (req,res,next) => {
+    try {
+      await binDispatchCapability(req);
+      const service=await import("./bin-order-workflow-service.js");
+      const result=await service.configureBinOrderWorkflow({...requestObject(req.body),visitId:req.params.visitId,
+        actor:commandActor(req),idempotencyKey:requiredRequestText(req.get("idempotency-key"),
+          "MBT_IDEMPOTENCY_KEY_REQUIRED","An Idempotency-Key header is required."),
+        correlationId:correlationId(req),requestId:requestId(req)});
+      noStore(res); res.setHeader("x-mbt-idempotent-replay",String(result.replayed));
+      res.status(result.status).json(result.body);
+    } catch (error) {next(error);}
+  });
+  router.post("/planning/workflows/:visitId/handoffs", requireMbtSurface("dispatcher", "Dispatcher"), async (req,res,next) => {
+    try {
+      await binDispatchCapability(req);
+      const service=await import("./bin-order-workflow-handoff.js");
+      const result=await service.recordBinWorkflowHandoff({...requestObject(req.body),visitId:req.params.visitId,
+        actor:commandActor(req),idempotencyKey:requiredRequestText(req.get("idempotency-key"),
+          "MBT_IDEMPOTENCY_KEY_REQUIRED","An Idempotency-Key header is required."),
+        correlationId:correlationId(req),requestId:requestId(req)});
+      noStore(res);res.status(result.status).json(result.body);
+    } catch(error) {next(error);}
+  });
+
   router.get(
     "/dispatch/front-legs",
     requireMbtSurface("dispatcher", "Dispatcher"),

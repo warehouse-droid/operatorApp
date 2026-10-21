@@ -15,6 +15,11 @@ define(['N/record','N/search','N/runtime','N/crypto','N/encode'],(record,search,
   const F={revision:'custbody_fs_quote_revision',hash:'custbody_fs_quote_hash',state:'custbody_fs_state_hash',closed:'custbody_fs_quote_closed'};
   function failure(message){throw Object.assign(new Error(message),{permanent:true});}
   function positive(v,label){if(!/^\d+$/.test(String(v||''))||Number(v)<1){failure(`Invalid ${label}.`);}return Number(v);}
+  function packQuantity(value) {
+    if (value == null || (typeof value === 'string' && value.trim() === '')) return null;
+    if (!['number','string'].includes(typeof value) || !Number.isFinite(Number(value)) || Number(value) < 0 || Number(value) > 1e9) failure('Invalid PLT, LYR, SEC or PCS quantity.');
+    return Number(value) === 0 ? null : Number(value);
+  }
   function find(externalId) {
     if(!/^field-sales-[0-9a-f-]{36}-(mbbs|mbt)$/.test(String(externalId))){failure('Invalid Field Sales external ID.');}
     const rows=search.create({type:search.Type.ESTIMATE,filters:[['externalidstring','is',externalId],'AND',['mainline','is','T']],columns:['internalid']}).run().getRange({start:0,end:2});
@@ -209,7 +214,9 @@ define(['N/record','N/search','N/runtime','N/crypto','N/encode'],(record,search,
     for(const [field,body] of [...(!p.useCustomerBilling?[['billingaddress',p.billToAddress]]:[]),['shippingaddress',p.shipToAddress]]){const address=rec.getSubrecord({fieldId:field});address.setValue({fieldId:'override',value:true});address.setValue({fieldId:'addrtext',value:String(body||'')});}
     if(p.shippingMethod==='Delivery'){set('custbody3',Number(p.config.deliveryMethodId));}else if(p.shippingMethod==='Pick-Up'){set('custbody3',Number(p.config.pickupMethodId));}
     if(p.config.termsId){set('terms',Number(p.config.termsId));}
-    p.lines.forEach((l,i)=>{const line=(fieldId,value)=>rec.setSublistValue({sublistId:'item',fieldId,line:i,value});line('item',Number(l.itemId));if(l.unitId){line('units',Number(l.unitId));}line('quantity',Number(l.quantity));line('price',-1);line('rate',Number(l.unitRate));line('description',String(l.description));if(!suiteTax()){line('taxcode',Number(p.config.taxCodeId));}});
+    p.lines.forEach((l,i)=>{const line=(fieldId,value)=>rec.setSublistValue({sublistId:'item',fieldId,line:i,value});line('item',Number(l.itemId));if(l.unitId){line('units',Number(l.unitId));}line('quantity',Number(l.quantity));line('price',-1);line('rate',Number(l.unitRate));line('description',String(l.description));if(!suiteTax()){line('taxcode',Number(p.config.taxCodeId));}
+      for (const field of ['custcol_plt','custcol_lyr','custcol_sec','custcol_pcs']) line(field,packQuantity(l[field]));
+    });
     set(SO.revision,p.revision);set(SO.hash,p.payloadHash);set(SO.company,p.company);set(SO.state,`pending:${p.payloadHash}`);
     let id;try{id=rec.save({enableSourcing:true,ignoreMandatoryFields:false});}catch(error){const found=externalRecord(record.Type.SALES_ORDER,p.externalId);if(found){return sealOrder(found,p);}throw error;}
     return sealOrder(record.load({type:record.Type.SALES_ORDER,id,isDynamic:false}),p);

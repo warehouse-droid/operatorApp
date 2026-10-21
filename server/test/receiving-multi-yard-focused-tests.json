@@ -1,0 +1,16 @@
+[
+  "test/mbt/unit/receiving-yard-scope.test.js",
+  "test/mbt/unit/receiving-multi-yard-ui.test.js",
+  "test/mbt/unit/receiving-split-balance-ui.test.js",
+  "test/mbt/integration/receiving-multi-yard.test.js",
+  "test/mbt/integration/operator-receiving-identity.test.js",
+  "test/mbt/integration/operator-receiving-allocations.test.js",
+  "test/mbt/integration/operator-receiving-completed.test.js",
+  "test/mbt/integration/receiving-followup.test.js",
+  "test/mbt/integration/receiving-split-balance.test.js",
+  "test/mbt/integration/operator-yard-access.test.js",
+  "test/mbt/concurrency/receiving-followup.test.js",
+  "test/mbt/concurrency/operator-netsuite-posting-concurrency.test.js",
+  "test/mbt/unit/operator-netsuite-posting-targets.red.test.js",
+  "test/mbt/unit/operator-netsuite-posting-admission.red.test.js"
+]

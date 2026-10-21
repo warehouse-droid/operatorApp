@@ -1,0 +1,6 @@
+import fs from 'node:fs';import assert from 'node:assert/strict';import {spawnSync} from 'node:child_process';
+const source=fs.readFileSync('src/netsuite-transaction-units.js','utf8');
+const mutations=[['wrong_direction','value / factor','value * factor'],['omit_progress',"'netsuite_received_qty',",''],['ignore_missing',"throw unresolved(`NetSuite unit ${row.unit_id} has no valid conversion rate. Refresh the Units access before syncing.`);",'return row;'],['wrong_price','value * factor','value / factor']];
+const results=[];
+for(const [name,oldText,replacement] of mutations){assert(source.includes(oldText));const file='/tmp/uom-'+name+'.mjs';fs.writeFileSync(file,source.replace(oldText,replacement));for(const propertyOnly of [false,true]){const r=spawnSync(process.execPath,['--test',...(propertyOnly?['--test-name-pattern=conversion property']:[]),'tools/incident/units.test.mjs'],{encoding:'utf8',env:{...process.env,UNITS_SOURCE:file}});fs.writeFileSync(`test-artifacts/uom-${name}-${propertyOnly}.log`,r.stdout+r.stderr);assert.equal(r.status,1,name+' survived');assert.match(r.stdout,/ERR_ASSERTION|ERR_TEST_FAILURE/);assert.doesNotMatch(r.stdout+r.stderr,/SyntaxError|ReferenceError|ERR_MODULE_NOT_FOUND/);results.push({name,propertyOnly,killed:true});}}
+console.log(JSON.stringify({mutants:results}));

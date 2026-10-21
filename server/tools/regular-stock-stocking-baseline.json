@@ -1,0 +1,18 @@
+{
+  "files": {
+    "src/regular-stock-domain.js": "7c27886e9d41ae313c0c60776ef0c69a7bbc28c2807018dc4ea42ed35c4f09f3",
+    "src/regular-stock-request-service.js": "3ef702287c93c231009dfd0f03fe55202d230eab362668213589c9aecfae12de",
+    "src/regular-stock-handoff.js": "243486c80fac9ee4952279f8edb7b77b6f057a64192a7c22a25d6d3a29278c72",
+    "src/stock-request-repository.js": "262f4f6d87d1e2cf8eabffa04d4e6f18aec23eb9d77d537d33e5b07c664b6669",
+    "public/regular-stock-ui.js": "48defc72bfcdd566d19b4a4af523d88d31df9347a33e5eb446b2ab353d6ea9c6",
+    "public/scm-stock-requests.js": "672d24f877db114eba019f30901ede3a8d445265616a72244263958506fc8472",
+    "public/scm-smart.js": "3e2252e8baac35be6859eae653b64e7ed004fde0b587d2a1221a7418f0e80f77",
+    "public/sales-stock-requests.html": "50e15aeb461be97faf06bf39cbe548adf97323df2f905b33dc7e8f6f8bc5c203",
+    "public/scm-stock-requests.html": "b4fcfaf00e3ed24f44fc50f041146b388b0d12e77f77a258e4da12e75752242c",
+    "public/scm-smart.html": "7593a27c8065cb79fcbbd342e00664968502bb0774638d4f4ae61c613f60c7f2",
+    "src/regular-stock-pickup.js": "a251d9a30c845dd659d77cdaf1dc3de33f257fcd0a761b1693ba7383e21a8fab",
+    "public/scm-stock-pickup.js": "2d2822bcb81361acd7e2da3b1b841fd8342daa43cd485615e0255e761057b4c2",
+    "public/sales-stock-requests.js": "53979b8c510d348b3f0bf4d357231cbb180bf487238ea8f0b93d6afaf2c644a9"
+  },
+  "packageSha256": "192d82c4ff0808e9d93cc924916041caf02d0c0e50398446f5206f804a05e3df"
+}

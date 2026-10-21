@@ -37,6 +37,8 @@ function sortedCounts(map) {
   return Object.fromEntries([...map.entries()].sort(([left], [right]) => left.localeCompare(right)));
 }
 
+check(process.env.MBT_TEST_ISOLATED === "1" && /\/mbt_test(?:_file_[a-f0-9]{12}_[a-z0-9]+)?(?:[?#]|$)/u.test(String(process.env.DATABASE_URL || "")),
+  "Driver history replay requires the isolated test database.");
 const corpus = await readCorpus();
 const expectedCount = integer(process.env.DRIVER_REPLAY_EXPECTED_COUNT, corpus.length);
 const fromDate = String(process.env.DRIVER_REPLAY_FROM_DATE || "").trim();
@@ -57,7 +59,7 @@ for (const [index, entry] of corpus.entries()) {
   check(/^[a-f0-9]{32}$/.test(sourceKey), "A replay row has an invalid anonymized source key.", { index });
   check(/^[a-f0-9]{32}$/.test(visitKey), "A replay row has an invalid anonymized visit key.", { index });
   check(!sourceKeys.has(sourceKey), "The replay corpus contains a duplicate Driver job.", { sourceKey });
-  check(["pickup", "dropoff", "travel"].includes(entry.stopType), "The replay corpus contains an unsupported stop type.", {
+  check(["pickup", "dropoff", "travel", "truck_switch"].includes(entry.stopType), "The replay corpus contains an unsupported stop type.", {
     sourceKey,
     stopType: entry.stopType
   });

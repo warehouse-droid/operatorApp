@@ -1,0 +1,74 @@
+--- a/server/src/stock-request-repository.js
++++ b/server/src/stock-request-repository.js
+@@ -203,6 +203,7 @@
+ function mapTransfer(row = {}) {
+   return {
+     workflowVersion:Number(row.request_workflow_version||1),
++    deliverySalesOrderRef: row.delivery_sales_order_ref || null,
+     id: Number(row.id),
+     transferRef: row.transfer_ref || "",
+     requestId: Number(row.request_id),
+@@ -1374,6 +1375,8 @@
+   const result = await query(
+     `SELECT transfer.*,
+             (SELECT workflow_version FROM sales_stock_requests WHERE id=transfer.request_id) AS request_workflow_version,
++            (SELECT CASE WHEN regular_details->>'deliveryVersion'='1' THEN regular_details->>'salesOrderRef' END
++               FROM sales_stock_requests WHERE id=transfer.request_id) AS delivery_sales_order_ref,
+             print_job.status AS print_status,
+             canonical.dispatch_planned,
+             canonical.dispatch_plan_date,
+--- a/server/src/stock-request-service.js
++++ b/server/src/stock-request-service.js
+@@ -130,7 +130,7 @@
+     ...(transfer.workflowVersion===2?{externalId:`MBBS_REGULAR_STOCK_${transfer.requestId}_${transfer.id}`}:{ }),
+     location: { id: String(locations.source.netsuiteLocationId) },
+     transferLocation: { id: String(locations.destination.netsuiteLocationId) },
+-    memo: `Sales stock request ${transfer.transferRef || transfer.id} | ${stockRequestMemoMarker(transfer.id)}`,
++    memo: transfer.deliverySalesOrderRef || `Sales stock request ${transfer.transferRef || transfer.id} | ${stockRequestMemoMarker(transfer.id)}`,
+     item: {
+       items: [
+         ...materialItems,
+@@ -161,6 +161,7 @@
+   for (let attempt = 1; attempt <= attempts; attempt += 1) {
+     const rows = await findRemoteByMarker({
+       transferId: transfer.id,
++      ...(transfer.deliverySalesOrderRef ? { requestId: transfer.requestId } : {}),
+       sourceLocationId: locations.source.netsuiteLocationId,
+       destinationLocationId: locations.destination.netsuiteLocationId
+     });
+--- a/server/src/netsuite.js
++++ b/server/src/netsuite.js
+@@ -3627,10 +3627,12 @@
+ 
+ export async function findTransferOrdersByStockRequestMarkerFromNetSuite({
+   transferId,
++  requestId = null,
+   sourceLocationId,
+   destinationLocationId
+ } = {}) {
+   const transfer = Number(transferId);
++  const request = Number(requestId);
+   const source = Number(sourceLocationId);
+   const destination = Number(destinationLocationId);
+   if (!Number.isInteger(transfer) || transfer <= 0) {
+@@ -3639,7 +3641,12 @@
+   if (!Number.isInteger(source) || source <= 0 || !Number.isInteger(destination) || destination <= 0) {
+     throw new Error("Valid NetSuite transfer locations are required to recover a Sales stock-request TO.");
+   }
++  if (requestId !== null && (!Number.isSafeInteger(request) || request <= 0)) {
++    throw new Error("A valid local stock request ID is required.");
++  }
+   const marker = `MBBS-STOCK-REQUEST-TO:${transfer}`.toUpperCase();
++  // Delivery memos show the SO number; retain marker recovery for older TOs.
++  const externalIdFilter = requestId === null ? '' : `UPPER(t.externalid) = 'MBBS_REGULAR_STOCK_${request}_${transfer}' OR`;
+   const result = await suiteql(`
+     SELECT DISTINCT
+       t.id,
+@@ -3663,6 +3670,7 @@
+     WHERE t.type = 'TrnfrOrd'
+       AND t.transferlocation = ${destination}
+       AND (
++        ${externalIdFilter}
+         UPPER(COALESCE(t.memo, '')) LIKE '%${marker} |%'
+         OR UPPER(COALESCE(t.memo, '')) LIKE '%${marker}'
+       )

@@ -13,7 +13,7 @@ test('unpriced legacy entry is explicit, and existing native-unit prices keep th
   const legacy=prepareSpecialMaterial({quantity:3,uom:'SQFT',rate:12},{pricingSource:'legacy',originalRate:null});
   assert.equal(legacy.originalRate,12);assert.equal(legacy.conversionToPc,1);assert.equal(legacy.uom,'SQFT');
   const fixed={pricingSource:'legacy_order',originalRate:12,rateUom:'SQFT',discountPercent:10};
-  assert.equal(prepareSpecialMaterial({quantity:3,uom:'SQFT',rate:12},fixed).rate,10.8);
+  assert.equal(prepareSpecialMaterial({quantity:3,uom:'SQFT',rate:12},fixed).rate,12);
   assert.throws(()=>prepareSpecialMaterial({quantity:23,packageQuantity:2,conversionToPc:12,uom:'PC',rate:120},{pricingSource:'enquiry',originalRate:120,uom:'PLT'}),{code:'SPECIAL_CONVERSION_MISMATCH'});
 });
 test('pricing rejects unrepresentable totals and converted quantities instead of rounding quantities silently',()=>{

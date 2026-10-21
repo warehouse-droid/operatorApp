@@ -1,0 +1,93 @@
+{
+  "assuranceTier": 3,
+  "specApproval": "not obtained (autonomous run); user authorized isolated historical replay, fixes, focused reruns, continuation and complete second replay",
+  "setup": {
+    "database": "Full consistent read-only pg_dump of the existing database, restored into an isolated mbt_test_history database",
+    "runtime": "Existing mbbs-regular-v2:test image; current source mounted read-only",
+    "network": "New Docker internal network, no production network or credential mounts",
+    "dependencies": [],
+    "commitsOrDeployment": "none"
+  },
+  "scenarios": [
+    "Enumerate every retained plan snapshot, archived snapshot and command result with a retained plan; order them chronologically and report missing request/source history explicitly.",
+    "Replay each retained board through the actual Dispatch V2 save path, with rollback after each case; separately run current TO dependency and packing regression matrices.",
+    "Every rejection fails the replay and stops at the failing case; no business rejection is silently classified as success.",
+    "Fix each proven logic defect, reproduce its failure in a focused regression, rerun the regression and resume at the failing case.",
+    "After the first pass completes, replay all retained states again from the original database copy using the final fixes.",
+    "TO dependency planning is independent of Operator packing status on the transfer and dependent order; route precedence and physical execution rules still apply.",
+    "Compare assigned order identities and cargo before/after replay so silently dropping historical orders cannot count as success."
+  ],
+  "addenda": [
+    {
+      "reason": "The captured database includes future-dated synthetic CO regression boards whose definitions were retired by later fixture cleanup.",
+      "behavior": "Only inside the isolated rollback transaction, reconstruct derived definitions for a verified fixture note plus testOnly orders and record every reconstructed definition. Execute every fixture through the normal write path; do not relax production retirement guards or classify rejection as success.",
+      "superseded": "Investigation found directly seeded, intentionally invalid synthetic ITEM-0 cargo. Reconstructing current source rows cannot faithfully recreate those inputs. See the following addendum."
+    },
+    {
+      "reason": "Retained regression fixtures are not business planning history; they include deliberately invalid boards and bypassed writes.",
+      "behavior": "Inventory every retained state. Identify fixtures only through corroborating generator notes, future fixture dates and test-only markers or synthetic references. Report them as fixture controls, never replay successes. Replay every operational state strictly, and execute the full Dispatch regression suite for fixture behavior."
+    },
+    {
+      "reason": "A retained grouped SO has child-specific transit CO pickups omitted from the parent's pickupLocations.",
+      "behavior": "Pickup validation must include each grouped SO/TO child's effective pickup location while retaining the manifest authority of a standalone CO or whole-group CO. Missing or unrelated pickups remain rejected."
+    },
+    {
+      "reason": "A retained history board routes an unsplit parent but contains only later split cards. An earlier retained full card exists in the same plan's history.",
+      "behavior": "For historical plans, restore missing routed order cards from the latest retained version at or before the original save time. Preserve that version's cargo and report its provenance; reject if evidence is missing, and never substitute later or live cargo."
+    },
+    {
+      "reason": "User narrowed the replay to August and September and requested newer evidence to override conflicting July snapshots.",
+      "behavior": "Replay every retained state belonging to plan dates 2026-08-01 through 2026-09-30. Keep all other states and prior exploratory failures auditable as outside scope or fixture controls; never count them as passes. For missing-card recovery, the newest retained version at or before the original save takes precedence over older July data."
+    },
+    {
+      "reason": "Legacy boards may retain a routed CO or grouped source only in a same-plan local CO manifest.",
+      "behavior": "Use a CO manifest only when its plan ID and plan date match and creation/update timestamps precede the saved board. Recover a group source only when retained source metadata proves a whole-group manifest without child-specific filtering; reject partial manifests and missing evidence."
+    },
+    {
+      "reason": "An August 5 board routes two historical PO references whose saved cards were removed, but dated drop audits preserve their original cards and exact route stop IDs.",
+      "behavior": "Retained Dispatch drop-audit cards can restore a missing routed card only when the audit predates the saved board, belongs to this plan or has legacy-null plan ID, and proves the same load ID, stop ID and order reference. Combine dated card sources by newest evidence at or before the save; reject future or unrelated route evidence."
+    },
+    {
+      "reason": "The historical archive includes intentionally rejected edits saved for recovery. A September 18 recovery entry delivers a CO before pickup; its accepted command receipt has a valid route.",
+      "behavior": "Classify a recovery draft only with archive_reason=save_recovery, checkpoint_kind=recovery and saveRecovery.applied=false. Inventory it separately, never count it as an accepted-plan success, and exclude all recovery rows from cargo reconstruction evidence. Replay every accepted August/September snapshot and full command receipt strictly."
+    },
+    {
+      "reason": "The full regression suite exposed a completed CO arrival incorrectly treated as execution of the later customer leg.",
+      "behavior": "A proven completed CO arrival may precede a new TO customer-leg link. Require status completed and retained arrival evidence; incomplete arrivals, active CO loads and actual SO loading remain blockers."
+    },
+    {
+      "reason": "Adding grouped child pickups revived a stale vendor pickup after the parent PO allocation was cancelled.",
+      "behavior": "Retain child physical source and transit-arrival yards, but extra vendor pickups must be supported by the parent current manifest. Current PO allocation cancellation must still remove the vendor requirement."
+    },
+    {
+      "reason": "Existing regression tests explicitly required confirmation, preparation and packing to block TO links, extensions and unlinking; the user replaced this business rule.",
+      "behavior": "Update those tests to require planning independence from packing and to prove packing data is preserved. Preserve their execution, driver, receipt, signature, lock and rollback assertions, and use actual loading as the negative execution case."
+    },
+    {
+      "reason": "The final complexity check found 13 branches in the historical group-source card helper against a budget of 12.",
+      "behavior": "Replace duplicate optional address access with an equivalent explicit missing-stop branch. Keep all assertions unchanged; rerun focused tests and restart the second replay from the captured database. Preserve the superseded replay attempt for audit."
+    },
+    {
+      "reason": "User requested independent pickup/delivery content checks and route/stop checks, especially TO and PO links.",
+      "behavior": "Audit every accepted August/September retained board twice. Independently derive cargo per pickup yard and delivery stop from dated retained material lines, linked TO/PO manifests, route projections and CO child/source evidence; compare Dispatch tooltip cargo and driver plan projections, detect duplicate or missing cargo, and verify pickup before delivery and linked replenishment precedence. Stop on a proven logic error, reproduce in focused tests, fix and resume. Keep unavailable historical allocation or cargo evidence explicit and never count an unverifiable stop as verified. Preserve previous replay evidence and do not deploy."
+    },
+    {
+      "reason": "Accepted history contains intermediate edits whose route is incomplete, and retained cards can omit original cargo. August 14 17:54 receipt for SN1398351 lacks pickup; later driver records show pickup before delivery.",
+      "behavior": "Keep strict stop/fix/resume for reproducible current projection defects. Inventory incomplete retained routes and missing dated cargo as explicit unresolved evidence, do not fabricate stops or quantities and do not count these as fully verified routes. Independently inspect final snapshots and recorded execution. Driver orderRefs preserve delivery order; the shared PO test expects SO then PO because the customer drop precedes the yard drop."
+    },
+    {
+      "reason": "User explicitly authorized deployment before resuming cargo checks and clarified packing independence also covers PO links and replenishment-to-direct-pickup changes.",
+      "behavior": "Deploy a scoped patch over the latest captured live runtime, preserve its Direct ship schedule behavior, retain a rollback image, and verify the exact candidate in isolated databases and the live runtime/HTTP asset hashes. Remove remaining packing-only blockers from PO dependency previews and CO TO-cargo reconciliation while preserving every recorded packing quantity and protecting loading, receiving and Driver execution. Exercise actual PO link and reverse mode-change commands and concurrent CO packing under the existing locks. The old PO lifecycle test expected Planned; paired captured-live reproduction proves Direct ship already replaced that behavior. Update that exact status expectation, retaining driver, route and completion assertions. Finish two complete cargo audits and repeat the historical replay with the deployed candidate after this additional fix."
+    }
+  ],
+  "failureModel": {
+    "productionMutation": "Only pg_dump reads production; all execution uses an isolated database and internal network",
+    "packingFalseBlock": "Regression matrices cover Operator open/confirmed/packed statuses and dependency statuses",
+    "silentlyIgnoredRejection": "Strict stop-on-error replay with retained checkpoint and nonzero exit status",
+    "historyContamination": "Per-case rollback, second pass from the preserved original database copy",
+    "historySourceDrift": "Retained order snapshots are the baseline; distinguish missing historical authoritative source versions in evidence",
+    "silentCargoLoss": "Assigned identity and material assertions compare retained and saved plans",
+    "stopCargoMismatch": "Per-stop item and unit comparisons against independent retained line and allocation evidence, quantity conservation, focused multi-yard and linked-order fixtures",
+    "linkedRouteMismatch": "Per-load pickup-before-drop checks; linked TO replenishment and PO residual/drop scopes exercised through real save and driver job generation"
+  }
+}

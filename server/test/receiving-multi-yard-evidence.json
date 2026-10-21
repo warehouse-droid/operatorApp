@@ -1,0 +1,324 @@
+{
+  "task": "SN1401728 / POB03969 receiving at the yard assigned to each PO line",
+  "tier": 3,
+  "specApproval": "not obtained (autonomous run)",
+  "spec": "test/receiving-multi-yard-spec.md",
+  "sourceFiles": {
+    "src/receiving-yard-scope.js": "fdf958341f6bcab4c354c4283c716f22914478d1efa08f7b0c63c098bde2d34b",
+    "src/receiving-repository.js": "562f84d43d4cee9759fb2989fb3cf5f8275065437e3a24dc2f2f9bd5bed32b1f",
+    "src/operator-yard-authorization.js": "6a1ca75b98d89974284ee52075ac0ea082a1e6159eb7ff2071a9331f3348e09c",
+    "src/operator-netsuite-posting-targets.js": "163ba2c32144cf9fffdefd39f62ac3044eaf52a8ed0225379fde353705486630",
+    "src/server.js": "5fd8f11f07366ca26dc94fefb41e127d36514469034580f14ad0e925059a13da",
+    "public/operator.js": "8872d05d8f91cc9e835f9d1934b8ee6af4aa67ae77a1af48d667bb4fd1a538ca",
+    "public/operator.html": "cfbb9182b3639d35c5a4ce9163c34eab25e38b2587a2ac5a8bf12474d1f228e7",
+    "public/service-worker.js": "ba1efe2a4f318892fa6e42cc508ebf676a3db4c28b585ea0f373c167a80fb177"
+  },
+  "releaseTreeHash": "14ea6ff14002d5b7dd459c659dba30345a9e2a3bc084fb437ea231e9b259675d",
+  "candidateImageId": "sha256:98cc201acbd1edbd9865f914a33b3d83d9eb13cde777d07b579dc2a520da7e5d",
+  "rebaseProof": {
+    "oldServerHash": "58baee286b80a7fa77e7b51aed8ca4bf061f06229a9d184486fa0ed908e262e0",
+    "newServerHash": "5fd8f11f07366ca26dc94fefb41e127d36514469034580f14ad0e925059a13da",
+    "existingBaselineAddition": "      if (order) {\n        await upsertScmPurchaseOrderCatalog({ orders: [order], source: \"detail-first-load\" });\n        order = await getScmPurchaseOrderCatalogOrder(req.params.ref, { includeRestricted });\n      }\n",
+    "scope": "Existing SCM catalog first-load fallback; outside all receiving routes and receipt code.",
+    "workspaceMatch": true
+  },
+  "tools": {
+    "node": "v20.20.2",
+    "tools": {
+      "c8": "12.0.0",
+      "eslint": "10.8.0",
+      "typescript": "7.0.2",
+      "fast-check": "4.9.0",
+      "playwright": "1.62.1"
+    },
+    "image": "mbbs-regular-v2:e2e",
+    "imageId": "sha256:b36611e8d01bdd5cef6e030735a25fe0f8bc0ac2fa4d02de331fb66946029242",
+    "databaseImage": "postgres:18-alpine",
+    "databaseImageId": "sha256:9a8afca54e7861fd90fab5fdf4c42477a6b1cb7d293595148e674e0a3181de15"
+  },
+  "reproduce": "RECEIVING_MULTIYARD_SOURCE_ROOT=deployments/receiving-multi-yard-20260930/candidate bash tools/receiving-multi-yard-gauntlet.sh",
+  "acceptance": [
+    {
+      "criterion": "List, vendor and item search find the PO at both line yards with scoped counts",
+      "test": "receiving-multi-yard.test.js: SN1401728 shape is discoverable by order vendor and own-yard item with scoped counts"
+    },
+    {
+      "criterion": "Detail shows four lines at 3445 and three at 2967; legacy requests, overrides and missing locations remain supported",
+      "tests": [
+        "receiving-multi-yard.test.js: detail and legacy one-yard requests expose only the selected yard lines",
+        "receiving-yard-scope.test.js: missing locations inherit the header and overrides retain their authority"
+      ]
+    },
+    {
+      "criterion": "Foreign yards and line IDs cannot change drafts, including mixed-yard bulk requests; photos and recovery enforce grants",
+      "tests": [
+        "receiving-multi-yard.test.js: foreign lines and bulk requests are denied before draft changes",
+        "receiving-multi-yard.test.js: confirm unconfirm page confirmation and recovery retain the selected receiving yard"
+      ]
+    },
+    {
+      "criterion": "3445 receives four lines/five pallets; the payload explicitly skips 2967; its balances remain open and replay adds no quantities",
+      "tests": [
+        "receiving-multi-yard.test.js: receipt and posting target select five pallets at 3445 and explicitly skip 2967",
+        "receiving-multi-yard.test.js: a skipped line without a location retains its original header yard",
+        "receiving-multi-yard.test.js: the real receive route records only the selected yard and keeps the receipt job accessible",
+        "receiving-multi-yard.test.js: a completed yard receipt leaves the other yard open and prevents duplicate quantities"
+      ]
+    },
+    {
+      "criterion": "TO/CO identity, allocations, completed order rules, split balances, receipt progress and order-wide concurrency retain their contracts",
+      "testList": "test/receiving-multi-yard-focused-tests.json"
+    },
+    {
+      "criterion": "Tablet requests include the chosen yard and the updated cache installs the matching client",
+      "test": "receiving-multi-yard-ui.test.js"
+    },
+    {
+      "criterion": "No dependencies, migrations, PO edits or actual receipts are required for this fix",
+      "evidence": [
+        "Eight runtime files in the scoped manifest",
+        "Read-only live preview and post-deployment checks",
+        "Release preserves application configuration and worker/database containers"
+      ]
+    }
+  ],
+  "results": {
+    "focused": {
+      "tests": 111,
+      "pass": 111,
+      "fail": 0
+    },
+    "changedLines": {
+      "covered": 172,
+      "total": 172
+    },
+    "yardModuleBranches": {
+      "total": 35,
+      "covered": 32,
+      "skipped": 0,
+      "pct": 91.42
+    },
+    "mutantsKilled": 6,
+    "propertyMutantsKilled": 3,
+    "properties": {
+      "seed": 20260930,
+      "examples": 120
+    },
+    "static": {
+      "lintBaseline": 1835,
+      "lintCurrent": 1834,
+      "newLint": 0,
+      "typeBaseline": 0,
+      "typeCurrent": 0,
+      "newTypes": 0
+    },
+    "full": {
+      "files": 737,
+      "passed": 3913,
+      "failed": 90,
+      "cancelled": 0,
+      "skipped": 1,
+      "baseline": {
+        "files": 737,
+        "passed": 3873,
+        "failed": 97
+      },
+      "failures": [
+        "P3 gauntlet artifacts: CI always uploads the bounded artifact directory with a pinned action",
+        "P3.12: browser specs share one worker-owned database-pool lifecycle",
+        "P3.11: the extended mutation manifest owns every dedicated runner and the P3 gauntlet executes it",
+        "F01 legacy seam: MBT environment gates default false when absent",
+        "F01 legacy seam: MBT environment gates parse only explicit truthy values",
+        "F01 legacy seam: applyEnvFile replaces the live MBT config without process pollution",
+        "P2-R7 env replacement clears omitted file-owned NetSuite runtime keys only",
+        "Control and Admin request the cache-busted thumbnail hydration client",
+        "a fresh Driver shell version evicts older copy-enabled cached assets",
+        "S11: the guarded client ships in a new atomic Driver shell generation",
+        "a fresh Driver worker reloads every v41 shell asset and initializes only its scoped sentinel",
+        "a successful repair replaces only the complete Driver shell and preserves offline data sentinels",
+        "a failed staging download leaves the active and non-Driver caches byte-for-byte unchanged",
+        "the reset ships as a new atomic shell generation without forcing a protocol-version cutover",
+        "the updated override policy is atomically included in the Driver PWA shell",
+        "the production MBT router is wired to the server-owned pricing adapter",
+        "operator cache assets advance with the cycle-count pagination release",
+        "S7: Operator cache revision ships the live-policy client once; later toggles are server-only",
+        "P2 the installed operator shell precaches the versioned refresh guard and client together",
+        "page confirmation has a duplicate-click guard and ships in a fresh Operator cache",
+        "selected receiving order card counts the same current remaining lines as its detail",
+        "F15: all MBT routes render one accessible controlled shell with an explicit controller",
+        "/app/test/mbt/integration/local-load-performance.test.js",
+        "F06/F16: schema-101 upgrade preserves representative legacy records and is migration-runner idempotent",
+        "saved IFs display for pickups in both lists and details without a driver wait",
+        "waiting ends on the drop, not the pickup, prior delivery, or IF availability",
+        "driver-created IF follows its saved load snapshot and completion outside the selected date",
+        "receipt IR number appears from both legacy and posting evidence and keeps yard scope",
+        "transfer load keeps waiting after IF posting until its driver drop",
+        "multipart IF numbers show individually even while another part is pending",
+        "/app/test/mbt/integration/operator-background-photos.test.js",
+        "/app/test/mbt/integration/operator-display-settings.test.js",
+        "P3-F29: all seven Phase 3 environment gates default false when absent",
+        "P3-F29: all seven Phase 3 environment gates parse only explicit truthy values",
+        "P3-F29: env reload clears omitted Phase 3 gates instead of retaining prior activation",
+        "P3.11 E2E-A: imported customer -> Front Desk -> BIN Dispatch -> offline Driver -> reconciliation -> next leg -> local billing",
+        "P3.11: the deployment inventory exactly covers every on-disk MBT-era migration",
+        "delivery and PO reference endpoints enforce roles, yard and revision; SCM sees saved Sales delivery details",
+        "a planning transaction holding the case share lock wins against delivery claim and prevents any journal",
+        "SCM requires a percentage per material, retains distinct failed inputs, and sends gross costs",
+        "one SCM save records all responses, and one Sales save records selected decisions",
+        "a later invalid SCM line rolls back earlier responses, events and case revision",
+        "a later invalid Sales decision rolls back earlier decisions and rejects wrong scope",
+        "batch input rejects empty, oversized, duplicate, foreign and stale writes without partial changes",
+        "SCM saves readiness and pending responses together while retaining transfer status",
+        "SCM item-name correction uses the authenticated stock-check endpoint while awaiting confirmation",
+        "HTTP requires active Sales Rep and restricts Sales alerts and own queue to authenticated identity",
+        "expiry skips an order claim lock, observes committed state and concurrent sweepers close once",
+        "Special counts include every new and confirmed case across yards, beyond the 60-case queue page",
+        "alert counts use the existing SCM read permissions and return only uncached counts",
+        "Sales Rep directory route requires Sales access and returns live directory choices without caching",
+        "new submissions update counts and saved PDFs credit the selected Sales Rep through Sales and SCM routes",
+        "batch routes enforce roles, save once, and reject one of two concurrent writes",
+        "Dispatch save and restore require a route and Via Yard receipt without weakening snapshots",
+        "multi-line case transitions atomically from Sales to SCM and back to an exact SO draft",
+        "transfer status and ETA survive reload and not-ready updates until SCM confirms readiness",
+        "discount and pallet adjustment survives an early webhook and lost SO response before committing locally",
+        "issued quantity confirmation tolerates exact SO/PO webhook transitions",
+        "issued quantity confirmation tolerates exact SO/PO webhook transitions across recovery",
+        "SCM PO creation survives SO webhooks after PATCH, before submission and before final linking",
+        "webhook revision changes do not grant another operation ownership or allow a future revision",
+        "loss of SO approval during the claimed operation blocks PO submission",
+        "owned PO submission still blocks when case closes",
+        "owned PO submission still blocks when SO becomes planned",
+        "owned PO submission still blocks when SO quantity changes",
+        "owned PO submission still blocks when SO UOM changes",
+        "owned PO submission still blocks when SO description is unreviewed",
+        "a stopped owner cannot finalize, and description recording cannot conceal a changed commercial line",
+        "real SCM workflow corrects SO quantity/UOM before creating a standalone PO despite webhooks",
+        "real SCM workflow corrects SO quantity/UOM before updating the existing native PO despite webhooks",
+        "real SCM workflow corrects SO quantity/UOM before creating a standalone PO despite webhooks and a lost creation response",
+        "a confirmed quantity change preserves gross PO costs, updates the vendor summary and private review, and accepts its webhook",
+        "directory customer identity persists from enquiry through SO draft without creating canonical data",
+        "skip HTTP routes require authentication, correct role, gate and Sales yard access",
+        "duplicate concurrent SO and PO skips each commit once and preserve role-owned order kind",
+        "gate disable wins before a waiting skip transaction without advancing the request",
+        "real creation claim and test skip cannot both acquire the same request revision",
+        "saved quotes enforce login, role, yard and workflow scope and end only when a real SO is linked",
+        "native SO/PO PDFs persist exact bytes, enforce Sales/SCM roles, and refresh after local changes",
+        "native PDF fetch does not lock order edits and rejects a file fetched for a changed snapshot",
+        "issued PO closure HTTP requires Sales scope and SCM confirmation, and permits SCM rejection",
+        "closure and planning serialize on the case lock so a Dispatch save cannot overtake Sales cancellation",
+        "local MBBS quote is available before SO creation without writing a case or requiring NetSuite",
+        "quantity endpoints enforce login, SCM-only approval, Sales role, yard scope and workflow gate",
+        "simultaneous SCM approvals commit once and Sales cannot bypass the review through test skips",
+        "new enquiry rejects a missing line rate and calculates each line discount independently",
+        "yard queue HTTP access cannot be widened by query parameters; SCM gets all-yard filters",
+        "discount-only and PALLET adjustments wait for SCM and persist together on approval",
+        "real order service persists submission and recovers after SO patch success before PO creation",
+        "normal stock draft preserves every line field and consumes the draft only on success"
+      ],
+      "deadlines": [
+        "/app/test/mbt/integration/aggregate-request-browser.test.js"
+      ],
+      "fixtureRechecks": [
+        {
+          "file": "test/mbt/unit/receiving-split-balance-ui.test.js",
+          "test": "selected receiving order card counts the same current remaining lines as its detail",
+          "beforeHash": "1add34d3c378628cab0d502f925c09b2df2d8698b6cd927f4bbeae986900f0f2",
+          "afterHash": "cd5926a87dfddd6771c0c97435e06f7c1016f854bb82a9a86ec17661261d867c",
+          "assertionsUnchanged": true,
+          "source": {
+            "src/receiving-yard-scope.js": "fdf958341f6bcab4c354c4283c716f22914478d1efa08f7b0c63c098bde2d34b",
+            "src/receiving-repository.js": "562f84d43d4cee9759fb2989fb3cf5f8275065437e3a24dc2f2f9bd5bed32b1f",
+            "src/operator-yard-authorization.js": "6a1ca75b98d89974284ee52075ac0ea082a1e6159eb7ff2071a9331f3348e09c",
+            "src/operator-netsuite-posting-targets.js": "163ba2c32144cf9fffdefd39f62ac3044eaf52a8ed0225379fde353705486630",
+            "src/server.js": "5fd8f11f07366ca26dc94fefb41e127d36514469034580f14ad0e925059a13da",
+            "public/operator.js": "8872d05d8f91cc9e835f9d1934b8ee6af4aa67ae77a1af48d667bb4fd1a538ca",
+            "public/operator.html": "cfbb9182b3639d35c5a4ce9163c34eab25e38b2587a2ac5a8bf12474d1f228e7",
+            "public/service-worker.js": "ba1efe2a4f318892fa6e42cc508ebf676a3db4c28b585ea0f373c167a80fb177"
+          },
+          "exit": 0,
+          "passed": 1,
+          "failed": 0,
+          "logHash": "51cb83a900811b8ad61baa2d04da61176e335fd27f07dc334519de40554b122c"
+        }
+      ],
+      "method": "Full suite on unchanged production source plus fresh recheck after supplying a missing browser global to an extracted-function fixture; assertions unchanged.",
+      "newFailures": [],
+      "newDeadlines": []
+    },
+    "deployment": {
+      "deployed": true,
+      "image": "mbbs-operator-app:receiving-multi-yard-20260930",
+      "at": "2026-09-30T23:47:27.316271+00:00",
+      "configurationPreserved": true,
+      "dependenciesUnchanged": true,
+      "runtimeFilesVerified": 1168,
+      "publicAssetsVerified": 3,
+      "receiving": {
+        "readOnly": true,
+        "ref": "SN1401728",
+        "po": "POB03969",
+        "yards": [
+          {
+            "yard": "3445",
+            "lines": 4,
+            "pallets": 5
+          },
+          {
+            "yard": "2967",
+            "lines": 3,
+            "pallets": 4
+          }
+        ],
+        "receiptPreview": {
+          "receiveLines": 4,
+          "skipLines": 3
+        },
+        "poWrites": 0,
+        "receiptWrites": 0,
+        "netSuitePosts": 0
+      }
+    },
+    "externalPublicAssets": {
+      "origin": "https://test.mbbsoperation.com",
+      "verified": [],
+      "blocked": {
+        "path": "/operator",
+        "status": 403
+      },
+      "passed": false
+    }
+  },
+  "knownLimits": [
+    "The full suite retains baseline failures and one browser test deadline; it is not globally green.",
+    "Production validation is read-only; an actual NetSuite Item Receipt was not posted.",
+    "Type checking covers the existing @ts-check authorization/posting modules and the new yard module; the entire legacy JavaScript application is not statically checked.",
+    "The full suite ran on the receiving implementation before the test-only additions and the inherited SCM catalog change. Its missing browser-global fixture was rechecked with unchanged assertions; additional refresh/error-contract checks ran in the final focused suites and mutation layer. All 737 files were not repeated after these additions.",
+    "A later unrelated SCM catalog first-load change was inherited from the live baseline. Removing those exact four baseline lines restores the previously tested server byte for byte; all receiving code is unchanged. The final receiving gauntlet was repeated on the current parent image.",
+    "The unauthenticated external tablet-page probe returned HTTP 403. All three assets were verified by HTTP directly against the live application, but the public front door was not verified from this environment.",
+    "Spec approval was autonomous; the user did not independently review the acceptance criteria."
+  ],
+  "skipped": [
+    {
+      "layer": "Dependency audit/license recheck",
+      "reason": "No dependencies or lockfiles changed."
+    },
+    {
+      "layer": "Migration rollback rehearsal",
+      "reason": "No migration added; the application image has a retained rollback image."
+    },
+    {
+      "layer": "Checkpoint commits",
+      "reason": "The shared workspace contains unrelated ongoing edits; source hashes identify the release."
+    }
+  ],
+  "verificationRepairs": [
+    "Used the existing browser-enabled test image after the first baseline image lacked Chromium.",
+    "Recorded and bounded an unrelated hanging browser test, then completed the baseline remainder.",
+    "Used the project per-file database isolation for the reverse-order suite to eliminate fixture collisions without changing assertions.",
+    "Added an actual cache-install regression test and confirmed it fails against the old deployed assets.",
+    "Copied the cache baseline fixture into mutation sandboxes so mutation failures cannot be attributed to a missing fixture.",
+    "Supplied the selected-yard browser global to an extracted-function fixture, preserving every assertion and independently rechecking it against the same production source.",
+    "Coverage identified missing authorized-refresh and invalid-PO-yard error-contract scenarios; added behavioral assertions and a specific error-contract mutant.",
+    "Rebased the scoped patch onto the latest live stock-purchase release and repeated verification against that source."
+  ]
+}

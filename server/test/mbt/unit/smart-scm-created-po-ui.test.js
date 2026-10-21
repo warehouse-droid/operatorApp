@@ -17,7 +17,9 @@ function vendorUi() {
     smartPill:(_value,label)=>label||'',smartDate:()=>'',
     smartProposalRoute:(proposal)=>proposal.destinationName,
   });
-  vm.runInContext(fs.readFileSync(new URL('../../../public/scm-smart-vendor.js',import.meta.url),'utf8'),context);
+  for (const name of ['scm-smart-line-order-core.js', 'scm-smart-line-order.js', 'scm-smart-vendor.js']) {
+    vm.runInContext(fs.readFileSync(new URL(`../../../public/${name}`,import.meta.url),'utf8'),context);
+  }
   return {context,calls,listeners};
 }
 

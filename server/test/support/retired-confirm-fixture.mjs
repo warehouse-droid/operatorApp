@@ -2,11 +2,12 @@ import { cargoFunctions } from "./sales-order-cargo-fixture.mjs";
 
 export function retiredConfirmBrowser(plan, extra = {}) {
   return cargoFunctions("../../public/dispatch.js", [
+    "preserveMbtReadOnlyLoads", "isMbtPlanningLoad",
     "planPayload", "isDispatchPlanOwnedOrder", "dispatchOrderRefKey",
     "assignedOrderIdsForTrucks", "groupedChildOrderIds", "splitParentOrderIds", "splitParentOrderId",
     "canonicalDispatchOrderType", "isAggregateDispatchCoGroup"
   ], {
-    currentPlan: plan, currentPlanDate: plan.planDate, orders: plan.orders,
+    currentPlan: plan, currentPlanDate: plan.planDate, orders: plan.orders, lastAcknowledgedPlanState: plan,
     normalizePlanBeforeSave() {}, trucksWithTimingMetadata: () => plan.trucks,
     withoutAuthoritativelyRetiredStops: value => value,
     withoutAuthoritativelyRetiredOrders: value => value,

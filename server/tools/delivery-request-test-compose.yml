@@ -1,0 +1,28 @@
+services:
+  test:
+    image: mbbs-delivery-requests:${DELIVERY_TEST_PHASE:-final}
+    build:
+      context: ${DELIVERY_TEST_STAGE}
+      dockerfile: Dockerfile.test
+      target: test-e2e
+    labels:
+      com.mbbs.lifecycle: disposable-test
+  migrate:
+    image: mbbs-delivery-requests:${DELIVERY_TEST_PHASE:-final}
+    build:
+      context: ${DELIVERY_TEST_STAGE}
+      dockerfile: Dockerfile.test
+      target: test-e2e
+    labels:
+      com.mbbs.lifecycle: disposable-test
+  mutation:
+    image: mbbs-delivery-requests:${DELIVERY_TEST_PHASE:-final}
+    build:
+      context: ${DELIVERY_TEST_STAGE}
+      dockerfile: Dockerfile.test
+      target: test-e2e
+    labels:
+      com.mbbs.lifecycle: disposable-test
+  db:
+    labels:
+      com.mbbs.lifecycle: disposable-test

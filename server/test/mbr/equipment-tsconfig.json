@@ -1,0 +1,1 @@
+{"compilerOptions":{"allowJs":true,"checkJs":true,"strict":true,"noEmit":true,"target":"ES2023","module":"NodeNext","moduleResolution":"NodeNext","skipLibCheck":true},"include":["../../public/mbr/domain.js","../../public/mbr/equipment.js"]}

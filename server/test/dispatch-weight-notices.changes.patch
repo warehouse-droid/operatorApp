@@ -1,0 +1,82 @@
+--- a/src/dispatch-executed-order-review.js
++++ b/src/dispatch-executed-order-review.js
+@@ -150,14 +150,24 @@
+   return buildOrderSourceReviews(previousPlan, executedOrderContexts(previousPlan, activity), sourceOrders);
+ }
+ 
++export function reviewableSourceChanges(changes = []) {
++  return changes.filter(change => change.field !== "weight");
++}
++
++export function sourceReviewChangesDigest(changes = []) {
++  return createHash("sha256").update(stable(reviewableSourceChanges(changes)
++    .map(({ message: _message, ...change }) => change))).digest("hex");
++}
++
+ export function buildPlannedOrderReviews({ previousPlan = {}, activity = [], sourceOrders = [] } = {}) {
+   const executed = executedOrderContexts(previousPlan, activity);
+   return buildOrderSourceReviews(previousPlan, plannedOrderContexts(previousPlan), sourceOrders).map(review => ({
+     ...review,
++    changes: reviewableSourceChanges(review.changes),
+     message: `${review.orderRef}: source information differs from the saved plan. Review the changes and re-plan remaining work where needed. Source updates and planning saves continue.`,
+     replanRequested: review.contexts.some(context => !executed.some(recorded => recorded.loadId === context.loadId
+       && recorded.stopId === context.stopId && key(recorded.orderRef) === key(context.orderRef)))
+-  }));
++  })).filter(review => review.changes.length);
+ }
+ 
+ function compareOrder(before, next, reviews) {
+--- a/src/dispatch-executed-order-review-repository.js
++++ b/src/dispatch-executed-order-review-repository.js
+@@ -2,7 +2,7 @@
+ import { DISPATCH_FLEET_PLANNING_LOCK } from "./dispatch-fleet-status.js";
+ import { lockDispatchPlanEditLease } from "./dispatch-plan-lease-repository.js";
+ import { persistedDispatchPlan } from "./dispatch-plan-fence.js";
+-import { buildExecutedOrderReviews, buildPlannedOrderReviews, plannedOrderContexts, executedSourceDigest, executedChangeMessage, reconcileExecutedSourcePlan } from "./dispatch-executed-order-review.js";
++import { buildExecutedOrderReviews, buildPlannedOrderReviews, plannedOrderContexts, executedSourceDigest, executedChangeMessage, reconcileExecutedSourcePlan, reviewableSourceChanges, sourceReviewChangesDigest } from "./dispatch-executed-order-review.js";
+ import { evaluateExecutedPrefixPolicy } from "./dispatch-planner-performance.js";
+ import { preserveDispatchOrderAddress } from "./dispatch-address-guard.js";
+ import { writeDispatchAudit } from "./dispatch-audit-repository.js";
+@@ -24,6 +24,11 @@
+ export function publicExecutedOrderReview(review) {
+   const { beforeOrder: _before, sourceOrder: _source, ...result } = review;
+   return { ...result, changes: result.changes.map(change => ({ ...change, message: executedChangeMessage(change) })) };
++}
++
++function matchesSourceNotice(row, notice) {
++  return key(row.order_ref) === key(notice.orderRef)
++    && sourceReviewChangesDigest(row.changes) === sourceReviewChangesDigest(notice.changes);
+ }
+ 
+ async function reviewState(plan, suppliedActivity) {
+@@ -49,17 +54,28 @@
+   const reviews = buildExecutedOrderReviews({ previousPlan: plan, activity, sourceOrders: protectedSources });
+   const notices = buildPlannedOrderReviews({ previousPlan: plan, activity, sourceOrders: protectedSources });
+   for (const review of notices) {
++    if (stored.some(row => matchesSourceNotice(row, review))) {continue;}
+     const publicReview = publicExecutedOrderReview(review);
+     await query(`INSERT INTO dispatch_executed_order_reviews (plan_id,token,order_ref,source_digest,review,changes)
+       VALUES ($1,$2,$3,$4,$5::jsonb,$6::jsonb) ON CONFLICT DO NOTHING`,
+     [plan.id, review.token, key(review.orderRef), executedSourceDigest(review.sourceOrder), JSON.stringify(publicReview), JSON.stringify(publicReview.changes)]);
+   }
+   const records = notices.length ? (await query("SELECT * FROM dispatch_executed_order_reviews WHERE plan_id=$1 ORDER BY observed_at,token", [plan.id])).rows : stored;
++  // Weight changes do not replace an existing notice or undo its acknowledgement.
++  const currentNotices = new Map(notices.flatMap(notice => {
++    const matching = records.filter(row => matchesSourceNotice(row, notice));
++    const row = matching.find(record => record.acknowledged_at) || matching[0];
++    return row ? [[row.token, notice]] : [];
++  }));
+   const publicReviews = records.filter(row => {
++    if (!reviewableSourceChanges(row.changes).length) {return false;}
+     const source = freshByRef.get(key(row.order_ref));
+-    return source ? row.source_digest === executedSourceDigest(source) : !row.acknowledged_at;
++    if (!source) {return !row.acknowledged_at;}
++    return notices.some(notice => matchesSourceNotice(row, notice))
++      ? currentNotices.has(row.token) : row.source_digest === executedSourceDigest(source);
+   }).map(row => ({ ...row.review, token: row.token, acknowledged: Boolean(row.acknowledged_at),
+-    replanRequested: notices.some(notice => notice.token === row.token && notice.replanRequested),
++    changes: reviewableSourceChanges(row.changes),
++    replanRequested: Boolean(currentNotices.get(row.token)?.replanRequested),
+     observedAt: row.observed_at, acknowledgedAt: row.acknowledged_at, acknowledgedBy: row.actor_name,
+     sourceAvailable: freshByRef.has(key(row.order_ref)) }));
+   return { plan, activity, reviews, publicReviews };

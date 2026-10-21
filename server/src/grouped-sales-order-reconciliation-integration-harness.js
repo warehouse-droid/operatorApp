@@ -171,8 +171,8 @@ try {
       "SELECT orders, trucks FROM dispatch_plan_snapshots WHERE plan_id = $1",
       [plan.rows[0].id]
     )).rows[0];
-    assert.equal(snapshot.orders[0].reconciliationApplicationStatus, "Reconcile Review",
-      "A grouped SO child in Review must elevate the parent before any completion rollup.");
+    assert.equal(snapshot.orders[0].reconciliationApplicationStatus, "Partially Done",
+      "A packing-only Review must not prevent the Dispatch completion rollup.");
     const reviewHiddenFromSnapshot = structuredClone(snapshot.orders);
     reviewHiddenFromSnapshot[0].reconciliationApplicationStatus = "Queued";
     reviewHiddenFromSnapshot[0].reconciliationStatus = "current";
@@ -193,8 +193,8 @@ try {
     );
     assert.equal(
       (await getDispatchPlan(plan.rows[0].id)).orders[0].reconciliationApplicationStatus,
-      "Reconcile Review",
-      "A plan reload must derive Review from an active child packing draft even when its old snapshot is stale."
+      "Partially Done",
+      "A plan reload must allow packing status while retaining current child completion evidence."
     );
     await query(
       `UPDATE sales_orders

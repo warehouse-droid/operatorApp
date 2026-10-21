@@ -1,0 +1,8 @@
+[
+  "src/regular-stock-delivery-access.js",
+  "src/regular-stock-delivery.js",
+  "src/regular-stock-delivery-operations.js",
+  "src/stock-request-repository.js",
+  "public/sales-stock-requests.js",
+  "public/sales-stock-requests.html"
+]

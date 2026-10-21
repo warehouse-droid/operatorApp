@@ -6,9 +6,11 @@ import { compileFunction } from "node:vm";
 // Execute the real browser functions, substituting only their environment.
 // Preserve source offsets so V8 coverage refers to application lines.
 export function mapFrontend(names, dependencies = {}) {
+  // Match the browser's per-page in-flight map without sharing state between fixtures.
+  dependencies = { backgroundRouteRequests: new Map(), ...dependencies };
   const file = new URL("../../public/dispatch.js", import.meta.url);
   const source = fs.readFileSync(file, "utf8");
-  const optional = ["validRouteMapCoordinate", "normalizedRouteMapGeometry", "routeMapPreviewData", "updateGoogleMapPreviewGeometry"];
+  const optional = ["isMbtPlanningLoad", "isPlanningLoadReadOnly", "validRouteMapCoordinate", "normalizedRouteMapGeometry", "routeMapPreviewData", "updateGoogleMapPreviewGeometry"];
   const selected = [...new Set([...names, ...optional.filter((name) => source.includes(`function ${name}(`))])];
   let body = source.replace(/[^\n\r]/gu, " ");
   for (const name of selected) {

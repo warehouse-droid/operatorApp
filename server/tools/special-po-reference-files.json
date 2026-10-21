@@ -1,0 +1,11 @@
+[
+  "public/special-stock-po-reference.js",
+  "public/special-po-reference-alert.js",
+  "public/sales-special-alert.js",
+  "public/sales-special-stock-requests.js",
+  "public/sales-stock-requests.html",
+  "src/special-po-reference-alerts.js",
+  "src/server.js",
+  "migrations/250_special_po_reference_alerts.sql",
+  "public/special-stock-queue.js"
+]

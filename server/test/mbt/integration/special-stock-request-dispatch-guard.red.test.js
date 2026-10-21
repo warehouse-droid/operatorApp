@@ -4,6 +4,7 @@ import test, { after } from "node:test";
 
 import { beginRollbackContext, closeDb, query } from "../../../src/db.js";
 import {
+  assertSpecialStockHandoffPlanning,
   createDispatchPlan,
   restoreDispatchPlanSnapshot,
   saveDispatchPlanSnapshot
@@ -31,7 +32,7 @@ function candidatePlan({ planId, planDate, soRef, driverLogin, truckPlate }) {
   };
 }
 
-test("Dispatch save and restore require a route and Via Yard receipt without weakening snapshots", async () => {
+test("Dispatch save and restore allow notice-only handoffs during production without route selection or receipt", async () => {
   const rollback = await beginRollbackContext();
   try {
     await rollback.run(async () => {
@@ -88,35 +89,20 @@ test("Dispatch save and restore require a route and Via Yard receipt without wea
       const planDate = "2099-11-03";
       const plan = await createDispatchPlan({ planDate });
       const candidate = candidatePlan({ planId: plan.id, planDate, soRef, driverLogin, truckPlate });
-      await assert.rejects(
-        () => saveDispatchPlanSnapshot(plan.id, { ...candidate, baseRevision: plan.revision }),
-        (error) => error?.code === "SPECIAL_PLAN_ROUTE_REQUIRED"
-      );
-      await query(
-        "UPDATE sales_special_stock_handoffs SET route = 'via_yard', status = 'ready' WHERE request_id = $1",
-        [special.id]
-      );
+      await assert.doesNotReject(() => assertSpecialStockHandoffPlanning(candidate));
       await query("UPDATE sales_special_stock_lines SET sales_decision='accepted', supply_status='production' WHERE request_id=$1", [special.id]);
       for (const waitingRef of [soRef, poRef]) {
         const waiting = candidatePlan({ planId:plan.id, planDate, soRef:waitingRef, driverLogin, truckPlate });
-        await assert.rejects(() => saveDispatchPlanSnapshot(plan.id, { ...waiting, baseRevision:plan.revision }), error => error?.code === 'SPECIAL_STOCK_NOT_READY');
+        await assert.doesNotReject(() => assertSpecialStockHandoffPlanning(waiting));
       }
-      await query("UPDATE sales_special_stock_lines SET supply_status='in_stock' WHERE request_id=$1", [special.id]);
-      await assert.rejects(
-        () => saveDispatchPlanSnapshot(plan.id, { ...candidate, baseRevision: plan.revision }),
-        (error) => error?.code === "SPECIAL_PLAN_PO_RECEIPT_REQUIRED"
-      );
-      await query(
-        `UPDATE purchase_orders
-            SET status = 'H', status_text = 'Fully Received', receipt_status = 'received', received_at = now()
-          WHERE netsuite_id = $1`,
-        [purchaseOrderId]
-      );
       await query("UPDATE sales_special_stock_cases SET quantity_review='{\"status\":\"pending\"}'::jsonb WHERE request_id=$1",[special.id]);
-      await assert.rejects(() => saveDispatchPlanSnapshot(plan.id, { ...candidate, baseRevision: plan.revision }), error => error?.code === 'SPECIAL_QUANTITY_REVIEW_REQUIRED');
-      await query("UPDATE sales_special_stock_cases SET quantity_review='{}'::jsonb WHERE request_id=$1",[special.id]);
+
       const assigned = await saveDispatchPlanSnapshot(plan.id, { ...candidate, baseRevision: plan.revision });
       assert.equal(assigned.trucks[0].loads[0].stops[0].orderId, soRef);
+      assert.equal((await query('SELECT quantity_review FROM sales_special_stock_cases WHERE request_id=$1', [special.id])).rows[0].quantity_review.status, 'pending');
+      const purchase = (await query("SELECT receipt_status, received_at FROM purchase_orders WHERE netsuite_id = $1", [purchaseOrderId])).rows[0];
+      assert.equal(purchase.receipt_status, 'not_received');
+      assert.equal(purchase.received_at, null);
 
       const emptied = await saveDispatchPlanSnapshot(plan.id, {
         planDate,

@@ -180,25 +180,34 @@ const ORDER_SELECT = `
   COALESCE(instruction.revision, 0) AS revision,
   instruction.updated_at AS instruction_updated_at,
   instruction.updated_by AS instruction_updated_by,
-  EXISTS (
-    SELECT 1
-      FROM driver_job_records job
-      CROSS JOIN LATERAL jsonb_array_elements_text(
-        CASE WHEN jsonb_typeof(COALESCE(job.order_refs, '[]'::jsonb)) = 'array'
-             THEN COALESCE(job.order_refs, '[]'::jsonb)
-             ELSE '[]'::jsonb END
-      ) completed_ref(value)
-     WHERE lower(COALESCE(job.status, '')) = 'complete'
-       AND lower(COALESCE(job.stop_type, '')) = 'dropoff'
-       AND (
-         upper(btrim(completed_ref.value)) = upper(btrim(COALESCE(so.tranid, '')))
-         OR EXISTS (
-           SELECT 1
-             FROM dispatch_scm_so_splits family_split
+  (
+    -- Instructions are shared by the whole SO. Each active split needs its own
+    -- completed dropoff; the parent is the delivery target only when unsplit.
+    SELECT bool_and(EXISTS (
+      SELECT 1
+        FROM driver_job_records job
+        CROSS JOIN LATERAL jsonb_array_elements_text(
+          CASE WHEN jsonb_typeof(COALESCE(job.order_refs, '[]'::jsonb)) = 'array'
+               THEN COALESCE(job.order_refs, '[]'::jsonb)
+               ELSE '[]'::jsonb END
+        ) completed_ref(value)
+       WHERE lower(COALESCE(job.status, '')) = 'complete'
+         AND lower(COALESCE(job.stop_type, '')) = 'dropoff'
+         AND upper(btrim(completed_ref.value)) = upper(btrim(delivery_target.order_ref))
+    ))
+      FROM (
+        SELECT family_split.split_so_ref AS order_ref
+          FROM dispatch_scm_so_splits family_split
+         WHERE family_split.source_so_id = so.netsuite_id
+           AND family_split.status = 'active'
+        UNION ALL
+        SELECT so.tranid
+         WHERE NOT EXISTS (
+           SELECT 1 FROM dispatch_scm_so_splits family_split
             WHERE family_split.source_so_id = so.netsuite_id
-              AND upper(btrim(completed_ref.value)) = upper(btrim(family_split.split_so_ref))
+              AND family_split.status = 'active'
          )
-       )
+      ) delivery_target
   ) AS dropoff_completed`;
 
 async function mediaForOrderIds(orderIds = []) {

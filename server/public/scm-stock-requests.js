@@ -5,13 +5,11 @@ const scmStockQueueFilterUrl = '/stock-request-queue-filter.js?v=20261007-v3&fil
 const scmStockQueueFilterReady = import(scmStockQueueFilterUrl);
 /** @type {(selected?:unknown)=>string} */
 let scmStockQueueFilterHtml = () => '';
-/** @param {string} value */
-const scmStockQueueIncludes = value => !scmStockState.queue || scmStockState.queue.split(',').includes(value);
 function scmStockShowsTransfers() {
   const request=scmStockState.detail;
   if (!request) return false;
-  return Boolean(request?.transfers?.length) && (scmStockQueueIncludes('pending_to') || scmStockQueueIncludes('closed'))
-    && (!scmStockState.queue.includes(',') && scmStockState.queue!=='' || !request.lines.some(/** @param {{status:string}} line */ line=>['submitted','changes_requested'].includes(line.status)));
+  return Boolean(request?.transfers?.length)
+    && !request.lines.some(/** @param {{status:string}} line */ line=>['submitted','changes_requested'].includes(line.status));
 }
 const scmStockRequestApp = /** @type {HTMLElement} */ (document.getElementById("scmStockRequestApp"));
 const scmStockUpdates = window.StockRequestView?.create({mount:scmStockRequestApp,active:()=>!window.MBBSStockRequestTabs || window.MBBSStockRequestTabs.isActive('regular')});
@@ -20,6 +18,7 @@ const scmStockState = {
   operator: null,
   queue: new URLSearchParams(location.search).get("review") === "1" ? "request" : (localStorage.getItem("mbbs.scm.stockRequests.queue") ?? "request"),
   search: "",
+  unifiedStatus: "active", outcome: "", waitingReason: "",
   requestTypeFilter:"",
   backorderStageFilter:"",
   vendorFilter: "",
@@ -117,7 +116,7 @@ function scmStockList() {
           ? `${rejectedLines} rejected line(s)`
           : scmStockState.queue === "closed" ? `${closedTransfers} closed TO(s)` : `${pendingLines} actionable line(s) · ${pendingTransfers} pending TO(s) · ${rejectedLines} rejected line(s) · ${closedTransfers} closed TO(s)`;
     return `<button class="stock-request-card ${Number(request.id) === Number(scmStockState.selectedId) ? "selected" : ""}" data-scm-stock-action="select" data-id="${Number(request.id)}" type="button">
-      <span class="stock-request-status-line"><strong>${scmStockEscape(request.requestRef)}</strong>${scmStockPill(window.RegularStockReply?.status(request)||request.bucket||request.status)}</span>
+      <span class="stock-request-status-line"><strong>${scmStockEscape(request.requestRef)}</strong>${window.RegularStockStatus?.render(request) || (scmStockPill(window.RegularStockReply?.status(request)||request.bucket||request.status)+(scmBackorderUI?.isBackorder(request) ? scmBackorderUI.waitingStatus(request) : ''))}</span>
       <span>To ${scmStockEscape(request.destinationName)} · ${countLabel}</span>
       ${window.RegularStockUI.customer(request)}
       <small>${scmStockEscape(request.requestedByName || request.requestedBy || "")} · ${scmStockDate(request.updatedAt)}</small>
@@ -253,7 +252,7 @@ function scmStockPickupButton(request) {
 let scmBackorderUI;
 /** @type {ReturnType<typeof import('./stocking-backorder-conversion-ui.js').createStockingBackorderUI>|undefined} */
 let scmStockingBackorderUI;
-const scmBackorderReady=()=>Promise.all([import(new URL('/backorder-stock-requests.js?transferEta=20261016&lineVisibility=20261016&conversation=20261016&v=20261014-live-stock',location.href).href),import(new URL('/stocking-backorder-conversion-ui.js?v=20261007-v1',location.href).href)]).then(([{createBackorderUI},{createStockingBackorderUI}])=>{
+const scmBackorderReady=()=>Promise.all([import(new URL('/backorder-stock-requests.js?arrival=20261020-v1&unified=20261019&waitingLabels=20261016&transferEta=20261016&lineVisibility=20261016&conversation=20261016&v=20261014-live-stock',location.href).href),import(new URL('/stocking-backorder-conversion-ui.js?v=20261007-v1',location.href).href)]).then(([{createBackorderUI},{createStockingBackorderUI}])=>{
   scmBackorderUI=createBackorderUI({mount:scmStockRequestApp,audience:'scm',api:scmStockApi,getDetail:()=>/** @type {import('./backorder-workflow.js').BackorderRequest|null} */ (scmStockState.detail),
     setDetail:(/** @type {import('./backorder-workflow.js').BackorderRequest} */ request)=>{scmStockState.detail=request;scmStockState.requests=scmStockState.requests.map(row=>row.id===request.id?request:row);},render:renderScmStockRequests});
   scmStockingBackorderUI=createStockingBackorderUI({api:scmStockApi,onConverted:(/** @type {any} */ request)=>{
@@ -276,7 +275,7 @@ function scmStockRequestDetail() {
   const snapshot=request.workflowVersion===2 && (!!request.regular?.pickupTransfer || request.regular?.handoffStatus==='complete' || request.status==='completed');
   return `<div class="stock-request-heading">
       <div><h2>${scmStockEscape(request.requestRef)}</h2><p>${scmStockEscape(request.requestedByName || request.requestedBy || "")} · destination ${scmStockEscape(request.destinationName)}</p></div>
-      ${scmStockPill(window.RegularStockReply?.status(request)||request.bucket||request.status)}
+      ${window.RegularStockStatus?.render(request) || scmStockPill(window.RegularStockReply?.status(request)||request.bucket||request.status)}
     </div>
     <div class="stock-request-summary">
       <span><small>Destination</small><strong>${scmStockEscape(request.destinationName)}</strong></span>
@@ -358,7 +357,7 @@ function scmStockPendingToDetail() {
   return `<div class="stock-request-heading">
       <div><h2>${scmStockEscape(request.requestRef)} · ${scmStockEscape(transfer.transferRef)}</h2><p>${scmStockEscape(transfer.sourceName)} → ${scmStockEscape(transfer.destinationName)}</p></div>
       ${scmStockPill(transfer.status)}
-      ${window.RegularStockReply?.label(request.displayStatus)?scmStockPill(request.displayStatus):''}
+      ${window.RegularStockStatus?.render(request) || (window.RegularStockReply?.label(request.displayStatus)?scmStockPill(request.displayStatus):'')}
     </div>
     ${scmStockTransferList(request)}
     ${window.RegularStockUI.customer(request)}
@@ -391,7 +390,7 @@ function scmStockPendingToDetail() {
       <button data-scm-stock-action="save-transfer" type="button" ${canEdit ? "" : "disabled"}>Save TO changes</button>
       <button class="primary" data-scm-stock-action="confirm-print" type="button" ${canConfirm ? "" : "disabled"}>Confirm TO + Print</button>
       ${hasPrinted || transfer.netsuiteTransferOrderId ? `<button data-scm-stock-action="reprint" type="button" ${transfer.netsuiteTransferOrderId ? "" : "disabled"}>Re-print</button>` : ""}
-      ${scmStockQueueIncludes("pending_to") ? `<button class="danger" data-scm-stock-action="reject-pending-to" title="${canRejectPending ? "Reject this local Pending TO" : "Only available before Confirm TO + Print"}" type="button" ${canRejectPending ? "" : "disabled"}>Reject Pending TO</button>` : ""}
+      ${!['closed','cancelled','received'].includes(transfer.status) ? `<button class="danger" data-scm-stock-action="reject-pending-to" title="${canRejectPending ? "Reject this local Pending TO" : "Only available before Confirm TO + Print"}" type="button" ${canRejectPending ? "" : "disabled"}>Reject Pending TO</button>` : ""}
     </div>`;
 }
 
@@ -427,6 +426,7 @@ function renderScmStockRequests({detailOnly=false} = {}) {
   const restoreScroll = window.StockRequestView?.preserveScroll(scmStockRequestApp);
   const restoreTabFocus = window.MBBSStockRequestTabs?.preserveFocus();
   const focusSnapshot = scmStockFocusSnapshot();
+  const openFilters=[...scmStockRequestApp.querySelectorAll('[data-yard-filter][open]')].map(filter=>filter.dataset.yardFilter);
   if (!detailOnly || !window.StockRequestView?.renderDetail(scmStockRequestApp, scmStockShowsTransfers() ? scmStockPendingToDetail() : scmStockRequestDetail(), scmStockState.selectedId)) {
   scmStockRequestApp.innerHTML = `${scmStockHeader()}
     <section class="stock-request-page">
@@ -436,7 +436,7 @@ function renderScmStockRequests({detailOnly=false} = {}) {
       </div>`}
       <div class="stock-request-toolbar">
         <div class="stock-request-actions"><input class="stock-request-search" data-scm-stock-search type="search" value="${scmStockEscape(scmStockState.search)}" placeholder="Search request or item" /><button data-scm-stock-action="refresh" type="button">Refresh</button></div>
-        <div class="stock-request-filters">${scmStockQueueFilterHtml(scmStockState.queue)}${scmBackorderUI?.filter(scmStockState.requestTypeFilter || "",scmStockState.backorderStageFilter || "",'data-scm-stock-filter') || ""}
+        <div class="stock-request-filters">${window.RegularStockStatus?.filters(scmStockState,"scm",{disabled:scmStockState.busy}) || scmStockQueueFilterHtml(scmStockState.queue)}${window.RegularStockStatus?.typeFilter(scmStockState.requestTypeFilter) || scmBackorderUI?.filter(scmStockState.requestTypeFilter || "",scmStockState.backorderStageFilter || "",'data-scm-stock-filter') || ""}
           <label><span>Item vendor</span><select name="vendor" data-scm-stock-filter="vendorFilter"><option value="">All vendors</option>${scmStockFilterOptions("vendors", scmStockState.vendorFilter)}</select></label>
           <label><span>Request date</span><input name="requestDate" data-scm-stock-filter="requestDateFilter" type="date" value="${scmStockEscape(scmStockState.requestDateFilter)}" /></label>
           ${scmStockYardFilterHtml(scmStockState.filterOptions.sourceYards || [], scmStockState.sourceLocationFilter, {label: "From yard", name: "sourceLocationId", attribute: 'data-scm-stock-filter="sourceLocationFilter"'})}
@@ -455,6 +455,7 @@ function renderScmStockRequests({detailOnly=false} = {}) {
       </div>
     </section>`;
   }
+  for(const name of openFilters){const filter=scmStockRequestApp.querySelector(`[data-yard-filter="${name}"]`);if(filter)filter.open=true;}
   window.StockRequestConversation?.watchQueue(scmStockRequestApp, {url:scmStockState.conversationQueueUrl, requests:scmStockState.requests,
     active:()=>(!window.MBBSStockRequestTabs || window.MBBSStockRequestTabs.isActive('regular')), read:scmStockApi, error:()=>scmStockUpdates?.changed(),
     accept:requests=>{scmStockState.requests=requests; const list=scmStockRequestApp.querySelector('.stock-request-list'); if(list)list.innerHTML=scmStockList();}});
@@ -501,7 +502,8 @@ async function scmStockLoad({ preserveSelection = true } = {}) {
   const version = scmStockUpdates?.version;
   scmStockState.loading = true;
   renderScmStockRequests();
-  const params = new URLSearchParams({ queue: scmStockState.queue, limit: "100" });
+  const params = new URLSearchParams({ queue: window.RegularStockStatus ? "" : scmStockState.queue, limit: "100" });
+  window.RegularStockStatus?.params(scmStockState,params);
   if(scmStockState.requestTypeFilter)params.set("type",scmStockState.requestTypeFilter);
   if(scmStockState.backorderStageFilter)params.set("stage",scmStockState.backorderStageFilter);
   if (scmStockState.search.trim()) params.set("search", scmStockState.search.trim());
@@ -695,19 +697,23 @@ scmStockRequestApp.addEventListener("change", (event) => {
     return;
   }
   if (event.target.matches("[data-scm-stock-filter]")) {
-    const filterName = /** @type {"requestTypeFilter"|"backorderStageFilter"|"vendorFilter"|"requestDateFilter"|"sourceLocationFilter"|"destinationLocationFilter"|"queue"|"search"} */ (event.target.dataset.scmStockFilter);
+    const filterName = /** @type {"requestTypeFilter"|"backorderStageFilter"|"vendorFilter"|"requestDateFilter"|"sourceLocationFilter"|"destinationLocationFilter"|"queue"|"unifiedStatus"|"outcome"|"waitingReason"|"search"} */ (event.target.dataset.scmStockFilter);
     if(filterName==='requestTypeFilter'||filterName==='backorderStageFilter'){scmStockState.queue=['closed','completed'].includes(event.target.value)?'closed':'request';if(filterName==='requestTypeFilter')scmStockState.backorderStageFilter='';}
     const yardName = event.target.type === 'checkbox' ? event.target.name : null;
     scmStockState[filterName] = yardName
       ? [...scmStockRequestApp.querySelectorAll(`[name="${yardName}"]:checked`)].map(input => input.value).join(',')
       : event.target.value;
-    if(filterName==='queue'){
+    if(['unifiedStatus','outcome','waitingReason'].includes(filterName)){
+      window.RegularStockStatus?.changed(scmStockState,filterName,'scm');
+      scmStockState.queue=scmStockState.unifiedStatus==='closed'?'closed':'';
+    }
+    if(['queue','unifiedStatus','outcome','waitingReason'].includes(filterName)){
       localStorage.setItem('mbbs.scm.stockRequests.queue',scmStockState.queue);
       scmStockState.replyDraft=null;scmStockState.resolveDraft=null;scmStockState.pendingDecision=null;
       scmStockState.selectedLineIds.clear();scmStockState.selectedTransferId=null;
     }
     scmStockLoad({ preserveSelection: false }).then(() => {
-      const filter = yardName && scmStockRequestApp.querySelector(`[data-yard-filter="${yardName}"]`);
+      const filter = yardName && filterName!=='unifiedStatus' && scmStockRequestApp.querySelector(`[data-yard-filter="${yardName}"]`);
       if (filter) filter.open = true;
     }).catch((error) => {
       scmStockState.loading = false;
@@ -756,7 +762,7 @@ async function scmStockSendReply(form) {
 }
 
 scmStockRequestApp.addEventListener("click", async (event) => {
-  const button = event.target.closest('[data-scm-stock-action], [data-yard-filter-clear], [data-yard-filter-apply="queue"], [data-yard-filter-apply="sourceLocationId"], [data-yard-filter-apply="destinationLocationId"]');
+  const button = event.target.closest('[data-scm-stock-action], [data-yard-filter-clear], [data-yard-filter-apply]');
   if (!button || scmStockState.busy || window.RegularStockDialog.isBusy()) return;
   const action = button.dataset.scmStockAction;
   let operation;
@@ -777,12 +783,20 @@ scmStockRequestApp.addEventListener("click", async (event) => {
       return scmStockLoad({preserveSelection:false});
     }
     if (button.dataset.yardFilterClear) {
+      if(button.dataset.yardFilterClear==='unifiedStatus'){
+        scmStockState.unifiedStatus='all';scmStockState.queue='';window.RegularStockStatus?.save('scm',scmStockState);
+        scmStockState.replyDraft=null;scmStockState.resolveDraft=null;scmStockState.pendingDecision=null;
+        scmStockState.selectedLineIds.clear();scmStockState.selectedTransferId=null;
+        return scmStockLoad({preserveSelection:false});
+      }
       scmStockState[button.dataset.yardFilterClear === 'sourceLocationId' ? 'sourceLocationFilter' : 'destinationLocationFilter'] = '';
       return scmStockLoad({preserveSelection: false});
     }
     if (action === "special") return window.MBBSSCMSpecialStock?.open({ operator: scmStockState.operator });
     if (action === "refresh") return scmStockLoad({ preserveSelection: true });
     if (action === "clear-filters") {
+      Object.assign(scmStockState,window.RegularStockStatus?.defaults());
+      window.RegularStockStatus?.save("scm",scmStockState);
       scmStockState.queue="";localStorage.setItem("mbbs.scm.stockRequests.queue","");
       scmStockState.replyDraft=null;scmStockState.resolveDraft=null;scmStockState.pendingDecision=null;
       scmStockState.selectedLineIds.clear();scmStockState.selectedTransferId=null;
@@ -1024,10 +1038,13 @@ requireDispatchLogin({
     await scmBackorderReady();
     window.RegularStockDelivery.configure(operator.id);
     try {
+      await window.RegularStockStatus?.ready;
+      Object.assign(scmStockState,window.RegularStockStatus?.restore("scm"));
+      if(new URLSearchParams(location.search).get("review")==="1")scmStockState.unifiedStatus="pending_scm";
       ({yardFilterHtml: scmStockYardFilterHtml} = await scmStockYardFilterReady);
       ({scmQueueFilterHtml: scmStockQueueFilterHtml} = await scmStockQueueFilterReady);
       const linkedId=Number(new URLSearchParams(location.search).get('requestId'));
-      if(linkedId>0 && new URLSearchParams(location.search).get('tab')==='regular'){scmStockState.queue='request';scmStockState.selectedId=linkedId;scmStockState.requestTypeFilter='';scmStockState.backorderStageFilter='';scmStockState.search=new URLSearchParams(location.search).get('requestRef') || '';}
+      if(linkedId>0 && new URLSearchParams(location.search).get('tab')==='regular'){const linked=await scmStockApi(`/api/scm/stock-requests/${linkedId}`);Object.assign(scmStockState,{unifiedStatus:'all',outcome:'',waitingReason:''});scmStockState.queue='request';scmStockState.selectedId=linkedId;scmStockState.requestTypeFilter='';scmStockState.backorderStageFilter='';scmStockState.search=linked.requestRef;}
       if (window.MBBSStockRequestTabs) {
         window.MBBSStockRequestTabs.onOpen = async (type) => {
           if (type === 'waitlist') return window.SCMWaitlist.open({mount:scmStockRequestApp,operator,api:scmStockApi});

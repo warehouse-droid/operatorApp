@@ -234,7 +234,7 @@ test("V1/R1/R2 combined confirmation immediately creates one verified RA without
   assert.equal(remote.created.size, 1);
   assert.ok(result.records.every(r => r.workflowVersion === 3 && r.status === "accepted" && r.netSuiteSyncStatus === "succeeded"));
   assert.ok(result.stockReturn.lines.every(l => l.approvalStatus === "not_required"));
-  assert.equal([...remote.created.values()].find(s => s.createdFrom).item.items[0].units.id, "3");
+  assert.equal([...remote.created.values()].find(s => s.createdFrom).item.items[0].units, "3");
   assert.equal((await submitReturnBatch({ operatorId: actor, input })).idempotentReplay, true);
   assert.equal(remote.created.size, 1);
   await assert.rejects(decideReturnLine({ recordId: result.stockReturn.id, lineId: result.stockReturn.lines[0].id,
@@ -356,6 +356,19 @@ test("HTTP confirmed stock return exposes verified RA references, rejects anothe
   assert.equal(submitted.body.stockReturn.netSuiteSnapshot, undefined);
   assert.equal((await call("/api/returns/submit", input)).status, 200);
   assert.equal(remote.created.size, 1);
+  remote.control.rejectCreate = true;
+  const retryInput = { ...input, idempotencyKey: input.idempotencyKey + "-rejection" };
+  const rejected = await call("/api/returns/submit", retryInput);
+  assert.equal(rejected.status, 409);
+  assert.equal(rejected.body.code, "RETURN_SUBMISSION_DRAFT");
+  assert.ok(rejected.body.draftId);
+  assert.equal(rejected.body.draftSaved, true);
+  assert.equal((await query("SELECT count(*) AS n FROM return_records WHERE operator_id=$1", [operator.id])).rows[0].n, "1");
+  remote.control.rejectCreate = false;
+  const retried = await call("/api/returns/submit", { ...retryInput, draftId: rejected.body.draftId });
+  assert.equal(retried.status, 201, JSON.stringify(retried.body));
+  assert.equal(retried.body.stockReturn.netSuiteSyncStatus, "succeeded");
+  assert.equal(remote.created.size, 2);
 });
 
 test("G1 Admin RA gates use the existing revision, replay and audit path", async t => {

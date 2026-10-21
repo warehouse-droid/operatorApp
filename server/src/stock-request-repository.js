@@ -11,6 +11,8 @@ import {parseSalesStockStatus} from '../public/sales-stock-status-filter.js';
 import {parseSalesRequestTypes,parseSalesCaseStages} from '../public/sales-stock-list-filters.js';
 import {parseVendorNames} from '../public/stock-request-vendor-filter.js';
 import {salesStockRowsByStatus} from './sales-stock-status-query.js';
+import {regularStockStatusSummary,parseRegularStatusFilters} from '../public/regular-stock-status.js';
+import {regularStockRowsBySummary} from './regular-stock-status-query.js';
 import {conversationQueueActivitySql} from './stock-request-conversation-queue.js';
 import {
   STOCK_REQUEST_YARDS,
@@ -625,6 +627,7 @@ async function requestDetailRows(requestId, {audience='scm',authorizedStoreLocat
     const {decorateWaitlistRequest}=await import('./regular-waitlist-repository.js');
     await decorateWaitlistRequest(request);
   }
+  request.statusSummary = regularStockStatusSummary(request);
   return request;
 }
 
@@ -806,7 +809,7 @@ export async function getSalesStockRequest(requestId, { authorizedDestinationLoc
 
 // A queue can contain several Backorders. Read their shared completion and
 // planning data once, retaining the existing detail hydration for other types.
-async function requestDetailsForQueue(rows, options = {}) {
+export async function requestDetailsForQueue(rows, options = {}) {
   const backorderIds = rows.filter(row => row.regular_details?.deliveryMethod === 'backorder').map(row => Number(row.id));
   const {getSpecialStockCasesByIds} = await import('./special-stock-request-repository.js');
   const backorders = backorderIds.length
@@ -831,11 +834,12 @@ function addBackorderListScope(clauses,params,normalStart,bucket,type,stage) {
   }
 }
 
-/** @param {{authorizedDestinationLocationIds?:number[],bucket?:string,status?:unknown,type?:unknown,stage?:unknown,search?:string,allStatuses?:boolean,vendor?:string,vendors?:unknown,requestDate?:string,sourceLocationId?:string,sourceLocationIds?:unknown,limit?:number,offset?:number}} [options] */
+/** @param {{authorizedDestinationLocationIds?:number[],bucket?:string,status?:unknown,unifiedStatus?:unknown,outcome?:unknown,waitingReason?:unknown,type?:unknown,stage?:unknown,search?:string,allStatuses?:boolean,vendor?:string,vendors?:unknown,requestDate?:string,sourceLocationId?:string,sourceLocationIds?:unknown,limit?:number,offset?:number}} [options] */
 export async function listSalesStockRequests({
   authorizedDestinationLocationIds,
   bucket = "",
   status = "",
+  unifiedStatus, outcome, waitingReason,
   type = "",
   stage = "",
   search = "",
@@ -848,6 +852,7 @@ export async function listSalesStockRequests({
   limit = 40,
   offset = 0
 } = {}) {
+  const statusFilters = parseRegularStatusFilters({unifiedStatus,outcome,waitingReason});
   const yards = [...new Set((authorizedDestinationLocationIds || []).map(Number).filter((id) => YARD_BY_LOCATION_ID.has(id)))];
   const normalizedSearch = cleanSearch(search);
   const acrossStatuses = allStatuses && Boolean(normalizedSearch);
@@ -924,6 +929,8 @@ export async function listSalesStockRequests({
     destinationLocationId: null,
     destinationLocationIds: undefined
   });
+  if (statusFilters.enabled) return regularStockRowsBySummary({clauses,params,filters:statusFilters,limit:boundedLimit,offset:boundedOffset,
+    legacyStatus:requestedStatus,hydrate:rows=>requestDetailsForQueue(rows,{audience:'sales',authorizedStoreLocationIds:yards})});
   if (requestedStatus) {
     const ownTransaction = !hasActiveTransaction();
     return withTransaction(async () => {
@@ -1401,9 +1408,10 @@ export async function convertSalesStockRequestLines(requestId, input = {}, { ope
   });
 }
 
-/** @param {{queue?:unknown,type?:unknown,stage?:unknown,search?:string,allStatuses?:boolean,vendor?:string,requestDate?:string,sourceLocationId?:string,sourceLocationIds?:unknown,destinationLocationId?:string,destinationLocationIds?:unknown,limit?:number,offset?:number}} [options] */
+/** @param {{queue?:unknown,unifiedStatus?:unknown,outcome?:unknown,waitingReason?:unknown,type?:unknown,stage?:unknown,search?:string,allStatuses?:boolean,vendor?:string,requestDate?:string,sourceLocationId?:string,sourceLocationIds?:unknown,destinationLocationId?:string,destinationLocationIds?:unknown,limit?:number,offset?:number}} [options] */
 export async function listScmStockRequests({
-  queue = "request",
+  queue,
+  unifiedStatus, outcome, waitingReason,
   type = "",
   stage = "",
   search = "",
@@ -1417,7 +1425,8 @@ export async function listScmStockRequests({
   limit = 40,
   offset = 0
 } = {}) {
-  const normalizedQueues = parseScmStockQueues(queue);
+  const statusFilters = parseRegularStatusFilters({unifiedStatus,outcome,waitingReason});
+  const normalizedQueues = statusFilters.enabled && (queue == null || queue === '') ? [] : parseScmStockQueues(queue);
   const boundedLimit = normalizeStockRequestListLimit(limit);
   const boundedOffset = Math.min(Math.max(Math.trunc(Number(offset)) || 0, 0), 10_000);
   const normalizedSearch = cleanSearch(search);
@@ -1483,6 +1492,21 @@ export async function listScmStockRequests({
     sourceLocationIds,
     destinationLocationIds
   });
+  if (statusFilters.enabled) {
+    const types = parseSalesRequestTypes(type);
+    if (types.length) {
+      params.push(types);
+      clauses.push(`(CASE WHEN request.regular_details->>'deliveryMethod' IN ('stocking','backorder','delivery','pickup','waitlist')
+        THEN request.regular_details->>'deliveryMethod' ELSE 'other' END)=ANY($${params.length}::text[])`);
+    }
+    const stages = parseSalesCaseStages(allStatuses && normalizedSearch ? '' : stage);
+    if (stages.length) {
+      params.push(stages);
+      clauses.push(`request.regular_details->>'deliveryMethod'='backorder' AND EXISTS(
+        SELECT 1 FROM special_stock_workflow_stages WHERE request_id=request.id AND stage=ANY($${params.length}::text[]))`);
+    }
+    return regularStockRowsBySummary({clauses,params,filters:statusFilters,limit:boundedLimit,offset:boundedOffset,hydrate:requestDetailsForQueue});
+  }
   params.push(boundedLimit, boundedOffset);
   const result = await query(
     `SELECT request.id, request.regular_details, ${conversationQueueActivitySql}

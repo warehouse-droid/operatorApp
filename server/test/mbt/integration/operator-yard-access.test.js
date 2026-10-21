@@ -295,10 +295,12 @@ test("counting authorized inventory returns only authorized draft lines", async 
   const item = 9_910_000_010;
   await query("UPDATE inventory_items SET to_pcs=1 WHERE item_id=$1", [item]);
   await query("INSERT INTO inventory_balances(item_id,location_id,quantity_on_hand,quantity_available) VALUES($1,1,10,10)", [item]);
-  const result = await request(assigned, "/api/cycle-count/lines", "POST", { locationId: 1, itemId: item, pieces: 7 });
-  assert.equal(result.status, 200);
-  assert.deepEqual(result.data.lines.map((line) => Number(line.location_id)), [1]);
-  assert.equal(Number(result.data.lines[0].counted_piece_qty), 7);
+  await withNetSuiteReadStub(() => ({items:[{item_id:item,location_id:1,quantity_on_hand:10,quantity_available:10,to_pcs:1}]}), async () => {
+    const result = await request(assigned, "/api/cycle-count/lines", "POST", { locationId: 1, itemId: item, pieces: 7 });
+    assert.equal(result.status, 200);
+    assert.deepEqual(result.data.lines.map((line) => Number(line.location_id)), [1]);
+    assert.equal(Number(result.data.lines[0].counted_piece_qty), 7);
+  });
 });
 
 test("authorized photo tickets bind unsaved returns to a yard and order previews follow the current stored yard", async () => {

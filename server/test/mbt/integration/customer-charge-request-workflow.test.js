@@ -805,12 +805,26 @@ test("cash initial then card add rolls both confirmed amounts into the next cust
   assert.equal(outboxAfter.rows[0].count, outboxBefore.rows[0].count);
 });
 
+test("aggregate add-bin pricing persists independently of the 150 origin choice", async () => {
+  const { fixture, converted } = await convertedContract("aggregate-standard-origin");
+  const draft = await requiredOperation("previewFrontdeskChargeRequest")(command("aggregate-standard", initialBinFields(fixture, {
+    kind: "add_bin", contractId: converted.body.contract.contractId,
+    expectedContractRevision: converted.body.contract.revision, orderFrom150: false,
+    aggregateLines: [{ itemCode: "AGG_HPB", quantityYards: "1.000" }]
+  })));
+  assert.equal(draft.body.request.orderFrom150, false);
+  assert.equal(draft.body.request.lines.filter((line) => line.itemCode === "AGG_HPB").length, 1);
+  assert.equal(draft.body.request.lines.filter((line) => line.lineCode === "aggregate_loading_fee").length, 1);
+});
+
 test("confirmed soil-to-garbage exchange collects the garbage deposit and carries aggregate on one exchange visit", async () => {
   const preview = requiredOperation("previewFrontdeskChargeRequest");
   const confirm = requiredOperation("confirmFrontdeskChargeRequest");
   const { fixture, converted } = await convertedContract("exchange-confirm");
   const contract = converted.body.contract;
   const line = converted.body.serviceLines[0];
+  await query("UPDATE mbt_service_visits SET status='completed', actual_completed_at=now() WHERE service_line_id=$1 AND service_action='delivery'", [line.serviceLineId]);
+  line.revision = Number((await query("SELECT revision FROM mbt_contract_service_lines WHERE service_line_id=$1", [line.serviceLineId])).rows[0].revision);
   const draft = await preview(command("exchange-preview", {
     kind: "exchange_bin",
     contractId: contract.contractId,

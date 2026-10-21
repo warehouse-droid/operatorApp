@@ -27,7 +27,8 @@
     const name = String(request?.regular?.customerName || '').trim();
     return name ? `<span class="regular-stock-customer"><small>${t('Customer','客户')}</small> <strong>${esc(name)}</strong></span>` : '';
   }
-  const approvalExpired=request=>!stocking(request) && !request?.regular?.handoffStatus && !!request?.regular?.approvalExpiresAt && Date.now()>=new Date(request.regular.approvalExpiresAt).getTime();
+  const approvalExpired=request=>!['completed','closed','cancelled'].includes(request?.status) && !['waitlist','backorder'].includes(request?.regular?.deliveryMethod)
+    && request?.regular?.deliveryVersion!==1 && !stocking(request) && !request?.regular?.handoffStatus && !!request?.regular?.approvalExpiresAt && Date.now()>=new Date(request.regular.approvalExpiresAt).getTime();
   function reviewReasons(request) {
     const approval=request.regular?.approval || {},reasons=[];
     if(stocking(request))reasons.push(t('Stocking always requires SCM review and direct TO creation.','备货申请始终须 SCM 审核并直接建立调货单。'));
@@ -56,7 +57,7 @@
       ${r.approvalExpiresAt&&!r.handoffStatus&&!stocking(request)?`<span><small>${t('Approval valid until','批准有效期至')}</small><strong>${esc(window.MBBS_I18N?.displayDateTime?.(r.approvalExpiresAt)||r.approvalExpiresAt)}</strong></span>`:''}
       ${r.salesOrderRef?`<span><small>SO</small><strong>${esc(r.salesOrderRef)}</strong></span>`:''}
     </div>${(!a.automatic||stocking(request))&&reasons.length?`<section class="stock-request-notice regular-stock-review-reasons"><strong>${t('Why SCM review is required','需要 SCM 审核的原因')}</strong><ul>${reasons.map(reason=>`<li>${esc(reason)}</li>`).join('')}</ul></section>`:''}
-    ${approvalExpired(request)?`<p class="stock-request-notice stock-request-error">${t('Approval expired. Sales can re-raise this request for a fresh review.','批准已过期，销售可重新提交申请以重新审核。')}</p>`:''}
+    ${approvalExpired(request)?`<p class="stock-request-notice stock-request-error">${t('Approval expired. Re-raise for a fresh review or close the request.','批准已过期。请重新提交以重新审核，或关闭申请。')}</p>`:''}
     ${r.handoffError?`<p class="stock-request-notice stock-request-error">${esc(r.handoffError)}</p>`:''}`;
   }
   function safety(request,line) {
@@ -96,7 +97,8 @@
     const r=request.regular||{};
     if(r.handoffStatus==='complete')return completedAction(request);
     if(stocking(request))return stockingResult(request);
-    if(approvalExpired(request))return `<section class="stock-request-section regular-stock-expired"><h3>${t('Approval expired','批准已过期')}</h3><p>${t(`The ${r.approvalValidityMinutes || 15}-minute approval window has ended. Re-raise the approved items to check current stock and approval rules.`,`批准的 ${r.approvalValidityMinutes || 15} 分钟有效期已结束。请重新提交已批准的商品，以检查最新库存和审核规则。`)}</p><button class="primary" data-sales-stock-action="re-raise" type="button" ${saving?'disabled':''}>${t('Re-raise request','重新提交申请')}</button></section>`;
+    if(['completed','closed','cancelled'].includes(request.status))return '';
+    if(approvalExpired(request))return `<section class="stock-request-section regular-stock-expired"><h3>${t('Approval expired','批准已过期')}</h3><p>${t(`The ${r.approvalValidityMinutes || 15}-minute approval window has ended. Re-raise to check current stock and approval rules, or close this request if it is no longer needed.`,`批准的 ${r.approvalValidityMinutes || 15} 分钟有效期已结束。请重新提交以检查最新库存和审核规则，或关闭不再需要的申请。`)}</p><div class="stock-request-actions"><button class="primary" data-sales-stock-action="re-raise" type="button" ${saving?'disabled':''}>${t('Re-raise request','重新提交申请')}</button><button data-sales-stock-action="close-expired" type="button" ${saving?'disabled':''}>${t('Close request','关闭申请')}</button></div></section>`;
     if(request.lines.some(line=>line.status==='submitted'))return `<p class="stock-request-notice">${t('Waiting for SCM to finish reviewing all lines before entering the SO number.','待 SCM 审核所有商品行后，请输入销售订单号。')}</p>`;
     if(!request.lines.some(line=>['stock','po'].includes(line.decision)))return '';
     return `<section class="stock-request-section regular-stock-so"><h3>${t('Sales Order','销售订单')}</h3><p>${t('Create the SO at your own sales yard, then enter its number. Review and confirm the planned action before it is processed.','请在您的销售货场建立销售订单，再输入订单号，请先查看并确认将执行的操作。')}</p><label><span>${t('SO number','销售订单号')}</span><input data-regular-so maxlength="80" value="${esc(r.salesOrderRef||r.soInput)}" ${r.salesOrderRef?'readonly':''} /></label>${(r.soChoices||[]).map(choice=>`<label><span>${esc(choice.itemName||choice.itemId)} · ${t("Select SO line","选择销售订单行")}</span><select data-regular-so-line="${choice.itemId}">${choice.lines.map(line=>`<option value="${line.id}">${line.id} · ${number(line.quantity)} ${esc(line.uom)}</option>`).join('')}</select></label>`).join('')}<button class="primary" data-sales-stock-action="link-so" type="button" ${saving?'disabled':''}>${saving?t('Processing…','处理中…'):r.salesOrderRef?t('Retry / check progress','重试 / 查看进度'):t('Review SO routing','查看订单安排')}</button></section>`;

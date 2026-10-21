@@ -4,7 +4,7 @@ import { createSpecialQuantityService } from '../../../src/special-stock-quantit
 
 function fixture({issued=true,po=true,skipped=false}={}) {
   const events=[];
-  const review={id:'review-1',mode:issued?'issued':'draft',status:'pending',lines:[{caseLineId:1,fromQuantity:24,toQuantity:36,fromPurchaseQuantity:2,toPurchaseQuantity:3}]};
+  const review={id:'review-1',mode:issued?'issued':'draft',status:'pending',...(issued&&!skipped?{remoteStarted:true}:{}),lines:[{caseLineId:1,fromQuantity:24,toQuantity:36,fromPurchaseQuantity:2,toPurchaseQuantity:3}]};
   const detail={id:7,revision:3,salesOrderId:issued&&!skipped?901:null,purchaseOrderId:issued&&po&&!skipped?902:null,
     salesOrderSkipped:skipped,quantityReview:review,quantityReviewPlan:null,
     salesOrderLines:[{caseLineId:1,remoteLineId:90101,itemId:2055,quantity:24,rate:9,uom:'PC',description:'Product'}],
@@ -23,7 +23,7 @@ function fixture({issued=true,po=true,skipped=false}={}) {
   return {events,review,detail,deps,service:createSpecialQuantityService(deps)};
 }
 const input={reviewId:'review-1',expectedRevision:3,decision:'approve'};
-test('SCM saves exact SO and proportional PO targets before remote writes and completes with verified receipts',async()=>{
+test('historic started review saves exact SO and proportional PO targets before remote writes and completes with verified receipts',async()=>{
   const f=fixture();await f.service.reviewQuantityChange(7,input,{operatorId:2});
   assert.deepEqual(f.events.map(e=>e[0]),['lock','claim','prepare','save','apply','finish']);
   assert.equal(f.events[2][1][0].lines[0].toQuantity,36);assert.equal(f.events[2][1][1].lines[0].toQuantity,3);
@@ -40,7 +40,7 @@ for(const [label,options]of [['pre-SO',{issued:false}],['test-skipped',{skipped:
   const f=fixture(options);await f.service.reviewQuantityChange(7,input);
   assert.deepEqual(f.events.map(e=>e[0]),['lock','claim','finish']);assert.deepEqual(f.events[2][1],[]);
 });
-test('SO without issued PO updates SO and lets the repository update the PO draft',async()=>{
+test('historic started review without issued PO updates SO and lets the repository update the PO draft',async()=>{
   const f=fixture({po:false});await f.service.reviewQuantityChange(7,input);
   assert.deepEqual(f.events.at(-1),['finish',[901]]);
 });
@@ -54,4 +54,18 @@ test('invalid decisions and mixed simulated/live orders fail closed',async()=>{
   f.detail.salesOrderSkipped=true;
   await assert.rejects(()=>f.service.reviewQuantityChange(7,input),{code:'SPECIAL_TEST_ORDER_REMOTE_BLOCKED'});
   assert.ok(!f.events.some(e=>e[0]==='apply'));
+});
+
+
+test('quantity targets recompute independent vendor percentages for the entire PO and choose the durable adjustment path', async () => {
+  const f=fixture();
+  f.detail.vendorDiscountReview={mode:'per_line',lines:[{caseLineId:1,vendorDiscountPercent:10}]};
+  f.detail.purchaseOrderLines[0].unitPurchaseCost=4;
+  let captured;
+  const service=createSpecialQuantityService({...f.deps,
+    prepareAdjustmentPlan:async input=>{captured=input;return {version:2,orders:input.orders};},
+    applyAdjustmentPlan:async plan=>({verifiedOrderIds:plan.orders.map(o=>o.id)})});
+  await service.reviewQuantityChange(7,input);
+  assert.deepEqual(captured?.orders.find(o=>o.kind==='purchase_order').vendorDiscountTotal,{before:0.8,after:1.2});
+  assert.equal(captured.orders.find(o=>o.kind==='purchase_order').lines[0].rate,4);
 });

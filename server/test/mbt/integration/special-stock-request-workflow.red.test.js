@@ -31,7 +31,7 @@ function response(overrides = {}) {
     vendorReference: "VENDOR-READY",
     salesVisibleNote: "Ready for pickup.",
     scmInternalNote: "SCM-only note.",
-    unitPurchaseCost: 2.1,
+    vendorDiscountPercent:0,unitPurchaseCost: 2.1,
     currency: "CAD",
     itemResolution: null,
     ...overrides
@@ -129,7 +129,7 @@ test("multi-line case transitions atomically from Sales to SCM and back to an ex
         decision: "declined",
         reason: "Customer declined line B."
       }, { operatorId: salesId, authorizedStoreLocationIds: [15] });
-      assert.equal(detail.stage, "await_customer_confirmation");
+      assert.equal(detail.stage, "confirmed");
 
       detail = await saveSpecialSalesOrderDraft(detail.id, {
         expectedRevision: detail.revision,
@@ -171,7 +171,7 @@ test("multi-line case transitions atomically from Sales to SCM and back to an ex
         expectedRevision: detail.revision,
         salesOrderId,
         salesOrderRef: `SO-SPECIAL-${suffix}`,
-        source: "manual_link"
+        source: "standalone"
       }, { operatorId: salesId, authorizedStoreLocationIds: [15] });
       assert.equal(detail.salesOrderApproved, true);
       assert.equal(detail.stage, "confirmed");
@@ -184,9 +184,9 @@ test("multi-line case transitions atomically from Sales to SCM and back to an ex
         }, { operatorId: scmId }),
         (error) => error?.code === "SPECIAL_PO_SECOND_RESPONSE_REQUIRED"
       );
-      detail = await prepareSpecialPurchaseOrder(detail.id, {
+      detail = await prepareSpecialPurchaseOrder(detail.id, { vendorDiscountAmount: 0,
         expectedRevision: detail.revision,
-        lines: [{ caseLineId: detail.lines[0].id, description: 'Special test item', quantity: 20, uom: 'PC', unitPurchaseCost: 2.1 }]
+        lines: [{ caseLineId: detail.lines[0].id, description: 'Special test item', quantity: 20, uom: 'PC', vendorDiscountPercent:0,unitPurchaseCost: 2.1 }]
       }, { operatorId: scmId });
       const storedReadiness = await query(
         `SELECT po_ready, po_ready_response_revision
@@ -241,6 +241,11 @@ test("multi-line case transitions atomically from Sales to SCM and back to an ex
          ) VALUES ('SO',$1,now(),'reconciliation',$2,'system','','{}'::jsonb)`,
         [`SO-SPECIAL-${suffix}`, `special-test:${suffix}`]
       );
+      detail = await getSpecialStockCase(detail.id, { audience: "scm" });
+      assert.equal(detail.operationallyComplete, false);
+      await query(`INSERT INTO dispatch_order_completion_events (
+        order_kind,order_ref,dispatch_completed_at,completion_evidence_type,completion_evidence_id,actor_type,actor_id,metadata)
+        VALUES('PO',$1,now(),'reconciliation',$2,'system','','{}')`, [`PO-SPECIAL-${suffix}`, `special-po-test:${suffix}`]);
       detail = await getSpecialStockCase(detail.id, { audience: "scm" });
       assert.equal(detail.operationallyComplete, true);
       assert.equal(detail.stage, "completed");
@@ -306,11 +311,11 @@ test("multi-line case transitions atomically from Sales to SCM and back to an ex
         expectedRevision: pickup.revision,
         salesOrderId: pickupSalesOrderId,
         salesOrderRef: `SO-PICKUP-${suffix}`,
-        source: "manual_link"
+        source: "standalone"
       }, { operatorId: salesId, authorizedStoreLocationIds: [15] });
-      pickup = await prepareSpecialPurchaseOrder(pickup.id, {
+      pickup = await prepareSpecialPurchaseOrder(pickup.id, { vendorDiscountAmount: 0,
         expectedRevision: pickup.revision,
-        lines: [{ caseLineId: pickup.lines[0].id, description: 'Special test item', quantity: 20, uom: 'PC', unitPurchaseCost: 2.1 }]
+        lines: [{ caseLineId: pickup.lines[0].id, description: 'Special test item', quantity: 20, uom: 'PC', vendorDiscountPercent:0,unitPurchaseCost: 2.1 }]
       }, { operatorId: scmId });
       await query(
         `INSERT INTO purchase_orders (
@@ -574,13 +579,13 @@ test("a PO claim racing the SCM purchase review can never bypass PO readiness", 
     expectedRevision: detail.revision,
     salesOrderId,
     salesOrderRef: `SO-PO-RACE-${suffix}`,
-    source: "manual_link"
+    source: "standalone"
   }, { operatorId: salesId, authorizedStoreLocationIds: [15] });
 
   const attempts = await Promise.allSettled([
-    prepareSpecialPurchaseOrder(detail.id, {
+    prepareSpecialPurchaseOrder(detail.id, { vendorDiscountAmount: 0,
       expectedRevision: detail.revision,
-      lines: [{ caseLineId: detail.lines[0].id, description:'PO race special item', quantity:20, uom:'PC', unitPurchaseCost:2.1 }]
+      lines: [{ caseLineId: detail.lines[0].id, description:'PO race special item', quantity:20, uom:'PC', vendorDiscountPercent:0,unitPurchaseCost:2.1 }]
     }, { operatorId: scmId }),
     claimSpecialOrderOperation(detail.id, {
       expectedRevision: detail.revision,

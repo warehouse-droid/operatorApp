@@ -42,9 +42,9 @@ export async function captureTransferPosting({order,operatorId,recordId,transact
     locationId:transactionType==='IF'?order.source_location_id || order.outbound_location_id:order.destination_location_id,
     ...(linked || {})};
   if (linked && conflictingLinkedScope(scope,linked)) {snapshot.linkError='The linked SO dispatch assignment conflicts with the saved TO plan and load.';}
-  return (await query(`INSERT INTO transfer_order_posting_jobs(transaction_type,local_to_id,order_ref,operator_id,operator_record_id,snapshot)
-    VALUES($1,$2,$3,$4,$5,$6::jsonb) ON CONFLICT(transaction_type,operator_record_id) DO NOTHING RETURNING *`,
-  [transactionType,order.netsuite_id,order.tranid,operatorId,recordId,JSON.stringify(snapshot)])).rows[0];
+  return (await query(`INSERT INTO transfer_order_posting_jobs(transaction_type,local_to_id,order_ref,operator_id,operator_record_id,snapshot,status)
+    VALUES($1,$2,$3,$4,$5,$6::jsonb,$7) ON CONFLICT(transaction_type,operator_record_id) DO NOTHING RETURNING *`,
+  [transactionType,order.netsuite_id,order.tranid,operatorId,recordId,JSON.stringify(snapshot),linked?'waiting_driver':'waiting_posting'])).rows[0];
 }
 
 /** @param {Record<string,any>} job */
@@ -57,7 +57,8 @@ export async function readTransferCompletionEvents(job) {
         {code:'TRANSFER_POSTING_EVIDENCE_INVALID',postingNotAttempted:true});
     }
   }
-  const refs=job.snapshot.driverTarget?.orderRefs || [job.order_ref];
+  if (!job.snapshot.driverTarget) {return [];}
+  const refs=job.snapshot.driverTarget.orderRefs;
   return (await query(`SELECT e.*,e.plan_date::text AS plan_date,d.status AS driver_status,d.stop_type,d.completed_at
     FROM dispatch_effective_order_completion_events e
     JOIN driver_job_records d ON d.job_id=e.completion_evidence_id
@@ -65,7 +66,7 @@ export async function readTransferCompletionEvents(job) {
       AND d.plan_date IS NOT DISTINCT FROM e.plan_date AND d.order_refs ? e.order_ref
     WHERE e.order_kind=$1 AND upper(e.order_ref)=ANY($2::text[]) AND e.completion_evidence_type='driver_job'
       AND d.mbt_assignment_withdrawn_at IS NULL ORDER BY e.dispatch_completed_at DESC,e.id DESC`,
-    [linked?'SO':'TO',refs.map((/** @type {unknown} */ ref)=>String(ref).toUpperCase())])).rows;
+    ['SO',refs.map((/** @type {unknown} */ ref)=>String(ref).toUpperCase())])).rows;
 }
 
 /** @param {Record<string,any>} job @returns {Promise<Record<string,any>[]>} */
@@ -107,12 +108,17 @@ export async function assertTransferPostingStepReady(step) {
   }
   const event=transferPostingCompletion(job,await readTransferCompletionEvents(job));
   const linkedIds=event?.linkedEvents?.map((/** @type {Record<string,any>} */ e)=>String(e.id)).sort();
-  if(!event || String(event.id)!==String(job.completion_event_id)
-    || (job.snapshot.driverTarget && JSON.stringify(linkedIds)!==JSON.stringify(job.snapshot.completionEventIds))) {
+  if(!event || (job.snapshot.driverTarget && (String(event.id)!==String(job.completion_event_id)
+    || JSON.stringify(linkedIds)!==JSON.stringify(job.snapshot.completionEventIds)))) {
     throw Object.assign(new Error('The matching Driver drop-off completion is no longer effective.'),
       {code:'TRANSFER_POSTING_EVIDENCE_INVALID',postingNotAttempted:true});
   }
   return job;
+}
+
+/** @param {unknown} saved @param {unknown} submitted */
+function sameTransferCompletionId(saved,submitted) {
+  return saved===null ? submitted===null : String(saved)===String(submitted);
 }
 
 /** @param {Record<string,any>} command */
@@ -121,7 +127,7 @@ export async function finalizeTransferPosting(command) {
     const job=(await query('SELECT * FROM transfer_order_posting_jobs WHERE command_id=$1 FOR UPDATE',[command.id])).rows[0];
     const evidence=command.inputSnapshot?.transferEvidence;
     if(!job || job.id!==evidence?.jobId || Number(job.operator_record_id)!==Number(evidence.operatorRecordId)
-      || Number(job.completion_event_id)!==Number(evidence.completionEventId)) {throw new Error('Transfer posting completion evidence does not match its saved Operator record.');}
+      || !sameTransferCompletionId(job.completion_event_id,evidence.completionEventId)) {throw new Error('Transfer posting completion evidence does not match its saved Operator record.');}
     if(job.status==='completed'){return job.result;}
     if(!command.steps.length || command.steps.some((/** @type {Record<string,any>} */ step)=>step.status!=='posted')) {
       throw new Error('Every transfer posting transaction must be verified before attaching evidence.');

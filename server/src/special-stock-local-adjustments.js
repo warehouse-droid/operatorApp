@@ -72,6 +72,13 @@ export function specialAdjustmentIsLocal(review) {
   return review.mode === 'issued' && review.remoteStarted !== true;
 }
 
+/** A saved delivery plan may already have reached NetSuite and must finish recovery.
+ * @param {Record<string,any>|null|undefined} change */
+export function specialFulfillmentBlocksAdjustment(change, { localOnly = false } = {}) {
+  return change?.status === 'applying'
+    || (change?.status === 'attention' && (!localOnly || Boolean(change.plan)));
+}
+
 /** Keep an unissued PO draft aligned with the active local request.
  * @param {Record<string,any>} detail @returns {Array<Record<string,any>>} */
 export function specialLocalPurchaseDraft(detail) {

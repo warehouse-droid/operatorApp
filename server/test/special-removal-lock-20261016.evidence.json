@@ -1,0 +1,214 @@
+{
+  "task": "SPREQ-000063 local line removal blocker",
+  "tier": 3,
+  "specApproval": "not obtained (autonomous run)",
+  "userScopeConfirmation": "Keep the current request-only removal behavior; no NetSuite synchronization",
+  "spec": "test/special-removal-lock-20261016.spec.json",
+  "entryPoint": "python3 server/tools/special-removal-lock-20261016/run.py final",
+  "evidenceCommand": "python3 server/tools/special-removal-lock-20261016/evidence.py",
+  "sourceHashes": {
+    "src/special-stock-local-adjustments.js": "b26515883a6e63a24f1f7b7d8444aac9dd508a1f6913346e2178a84ed8fe9606",
+    "src/special-stock-request-repository.js": "cc02715e02d1ea95055ea5dc0b3f6bdd9f158e7101a963f61c93a799ecfad0a2"
+  },
+  "runtimeTreeHash": "db984c4df2ca296e6f59cde8b5a291eab5ff025ff883c5e79f51fbd9d30a79de",
+  "tools": {
+    "node": "v20.20.2",
+    "fast-check": "4.9.0",
+    "c8": "12.0.0",
+    "typescript": "7.0.2",
+    "eslint": "10.8.0"
+  },
+  "acceptance": [
+    {
+      "scenario": 1,
+      "status": "pass",
+      "tests": [
+        "unprepared delivery failure permits local removal through SCM while preserving the failed journal and issued orders",
+        "unprepared delivery failure allows request removal over HTTP without remote writes"
+      ]
+    },
+    {
+      "scenario": 2,
+      "status": "pass",
+      "tests": [
+        "applying deliveries and failed saved plans keep their adjustment locks",
+        "delivery locks remain enforced at proposal, SCM claim and completion when remote work can be active"
+      ]
+    },
+    {
+      "scenario": 3,
+      "status": "pass",
+      "tests": [
+        "applying deliveries and failed saved plans keep their adjustment locks"
+      ]
+    },
+    {
+      "scenario": 4,
+      "status": "pass",
+      "tests": [
+        "delivery failures before remote preparation permit only local adjustments",
+        "unprepared delivery failure permits local removal through SCM while preserving the failed journal and issued orders",
+        "delivery locks remain enforced at proposal, SCM claim and completion when remote work can be active"
+      ]
+    },
+    {
+      "scenario": 5,
+      "status": "pass",
+      "tests": [
+        "delivery locks remain enforced at proposal, SCM claim and completion when remote work can be active"
+      ],
+      "limit": "Deterministic operation interleavings and existing row/advisory locks; no additional multi-process stress run"
+    },
+    {
+      "scenario": 6,
+      "status": "partial",
+      "tests": [
+        "local issued request removal enforces Sales and SCM roles and never accesses NetSuite",
+        "SCM rejection preserves removed lines and all records; stale and foreign removals do not write",
+        "a failed local approval rolls back every removal and audit row, then retries once after the fault is resolved"
+      ],
+      "limit": "Two pre-existing status expectations fail on captured production source and candidate; one prevents the later completed-request assertion in that legacy test. Closed/completed guards are unchanged."
+    }
+  ],
+  "red": {
+    "unitFailures": 3,
+    "integrationFailure": "SPECIAL_OPERATION_BUSY",
+    "httpFailure": "409 instead of 200",
+    "preExistingLockTest": "Passed on baseline; killed by both allow-applying and allow-saved-plan mutants"
+  },
+  "finalRun": {
+    "affectedSuite": {
+      "tests": 75,
+      "pass": 73,
+      "fail": 2,
+      "skipped": 0
+    },
+    "http": {
+      "tests": 12,
+      "pass": 2,
+      "fail": 0,
+      "skipped": 10
+    },
+    "shuffledSuite": {
+      "tests": 75,
+      "pass": 73,
+      "fail": 2,
+      "skipped": 0
+    },
+    "newFailures": [],
+    "knownFailures": [
+      "all-line removal remains local and completed requests stay locked",
+      "property: a real unapproved PO remains Confirmed until approval, except terminal stages"
+    ],
+    "types": "PASS: changed policy module",
+    "syntax": "PASS: both runtime files",
+    "lint": "PASS: both runtime files and new unit/database regression tests",
+    "changedCoverage": {
+      "covered": [
+        "src/special-stock-local-adjustments.js:77",
+        "src/special-stock-local-adjustments.js:78",
+        "src/special-stock-local-adjustments.js:79",
+        "src/special-stock-local-adjustments.js:80",
+        "src/special-stock-request-repository.js:24",
+        "src/special-stock-request-repository.js:60",
+        "src/special-stock-request-repository.js:67",
+        "src/special-stock-request-repository.js:3150",
+        "src/special-stock-request-repository.js:3179"
+      ],
+      "uncovered": [],
+      "changedBranches": {
+        "covered": 8,
+        "total": 8,
+        "uncovered": []
+      }
+    },
+    "mutations": [
+      {
+        "name": "block-unprepared",
+        "killed": true,
+        "propertyKilled": true
+      },
+      {
+        "name": "allow-saved-plan",
+        "killed": true,
+        "propertyKilled": true
+      },
+      {
+        "name": "allow-applying",
+        "killed": true,
+        "propertyKilled": true
+      },
+      {
+        "name": "unlock-remote",
+        "killed": true,
+        "propertyKilled": true
+      }
+    ],
+    "newPropertyExamples": 150,
+    "propertySeed": 631016,
+    "realExecution": "Actual Express Sales proposal and SCM approval endpoints against isolated PostgreSQL; external transport counted at the network boundary",
+    "cleanup": {
+      "containers": "",
+      "networks": "",
+      "volumes": "",
+      "productionHealth": "healthy"
+    }
+  },
+  "supplyChain": {
+    "newDependencies": 0,
+    "runtimeCapabilityChanges": [],
+    "scopedDiffReview": "Only the delivery guard and its local-only call sites changed; no credentials added"
+  },
+  "skipped": {
+    "repositoryWideTests": "Ran the directly affected local adjustment, quantity, fulfillment, database and HTTP suites; unrelated application modules were outside this fix.",
+    "repositoryWideTypes": "Type-checked the changed policy module and checked repository syntax and lint; did not run a whole-application type check.",
+    "browser": "No UI code changed; actual HTTP routes were exercised.",
+    "dependencyAudit": "No package or lockfile changes.",
+    "liveOrderMutation": "User confirmed request-only removal. Production verification is read-only."
+  },
+  "honestNotes": [
+    "The first runner used a Node flag unavailable in the installed Node 20 image; corrected the runner.",
+    "The ordinary-edit rejection test initially omitted required vendor-response fields and hit validation first; supplied valid fixture fields without changing its assertion.",
+    "Two unrelated status expectations already fail on production baseline; preserved those assertions and required zero additional failures.",
+    "A concurrent release changed only src/sor-return-readiness.js. Rebased onto that image and reran final verification; the two target source files were unchanged by that release.",
+    "No test databases retained; logs, source snapshots and rollback image are retained."
+  ],
+  "deployment": {
+    "deployed": true,
+    "at": "2026-10-16T19:19:56.201295+00:00",
+    "imageId": "sha256:c62fa93aa6499efe9ecf8468cc79d20d34d5890069e925593701c6b0375b738a",
+    "files": [
+      "src/special-stock-local-adjustments.js",
+      "src/special-stock-request-repository.js"
+    ],
+    "runtimeFilesVerified": 1412,
+    "configurationPreserved": true,
+    "dependenciesUnchanged": true,
+    "schemaChanged": false,
+    "productionRequestWrites": 0,
+    "netSuiteWrites": 0,
+    "http": {
+      "http://127.0.0.1:3000": {
+        "health": 200,
+        "publicAssetsVerified": 0,
+        "anonymousApisDenied": 2
+      },
+      "https://test.mbbsoperation.com": {
+        "health": 200,
+        "publicAssetsVerified": 0,
+        "anonymousApisDenied": 2
+      }
+    },
+    "request": {
+      "requestRef": "SPREQ-000063",
+      "revision": 34,
+      "activeLines": 11,
+      "salesOrder": "SOB122477",
+      "purchaseOrder": "POB04029",
+      "deliveryStatus": "attention",
+      "savedDeliveryPlan": false,
+      "localAdjustmentBlockedByDelivery": false,
+      "quantityReviewStatus": null
+    }
+  }
+}

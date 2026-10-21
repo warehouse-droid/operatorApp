@@ -1,0 +1,330 @@
+{
+  "task": "Special request delivery recovery and remaining-order closure",
+  "specApproval": "not obtained (autonomous run)",
+  "spec": "test/special-delivery-recovery-20261016.spec.json",
+  "sourceHashes": {
+    "src/special-stock-rest-orders.js": "7c660505866148a9a4bfd2edab5eab9ddb4bdbf09ba18f91023879b41c23c099",
+    "src/special-stock-fulfillment-adapter.js": "5bd64ecbd03aacf7dd2d0831f1dbb4631a52fe57865679ef18aa47985253434c",
+    "src/special-stock-fulfillment.js": "e5a9378d8bc843cd03aaa430c81573a2e3572d796f1093e4d092389b4094f193",
+    "src/special-stock-request-repository.js": "98be5c6a5f5459fd0093e056fd22859ac50b2a27c44afe83e1a6b72c4447901d",
+    "public/special-stock-fulfillment.js": "027cb89e37eedb07d07e2ab4c92590b972c8bc55aec14a4a73ebfa11ccf625f5",
+    "public/sales-special-stock-requests.js": "7df96dc5b3aab4a1aed5c47233b72c0bdcf10311acb0d0317aeb92ef5e502d35",
+    "src/special-stock-closure-adapter.js": "10540c488788a4a44feab76f8fd4e92bc405b831d8206dd16693329115dda7fc",
+    "src/special-stock-closure-service.js": "de0e353a80ad4e09f82a590b69aa9169466bb3c63c5280fc780f02dbb38fdf17",
+    "public/special-stock-case-status.js": "e73ad1e3a5cef4170e2a50039d24c7d1d0bc75222e6be3590d5b36afc4736b8e"
+  },
+  "runtimeFiles": 1412,
+  "commands": {
+    "tests": "python3 server/tools/special-delivery-recovery-20261016/run.py final",
+    "stage": "python3 server/tools/special-delivery-recovery-20261016/run.py stage",
+    "release": "python3 server/tools/special-delivery-recovery-20261016/release.py prepare / apply",
+    "liveRecovery": "docker exec -i mbbs-operator-app-app-1 node --input-type=module - --apply < server/tools/special-delivery-recovery-20261016/recover.mjs"
+  },
+  "tests": {
+    "suite": {
+      "tests": 106,
+      "pass": 105,
+      "fail": 1,
+      "skipped": 0,
+      "failures": [
+        "all-line removal remains local and completed requests stay locked"
+      ]
+    },
+    "browser": {
+      "tests": 10,
+      "pass": 9,
+      "fail": 1,
+      "skipped": 0,
+      "failures": [
+        "approved PO exposes shared reference form and preserves failed edits"
+      ]
+    },
+    "http": {
+      "tests": 13,
+      "pass": 3,
+      "fail": 0,
+      "skipped": 10,
+      "failures": []
+    },
+    "suite-order": {
+      "tests": 106,
+      "pass": 105,
+      "fail": 1,
+      "skipped": 0,
+      "failures": [
+        "all-line removal remains local and completed requests stay locked"
+      ]
+    }
+  },
+  "baselineFailures": {
+    "all-line removal remains local and completed requests stay locked": "Existing confirmed-vs-dispatch_arrangement expectation, reproduced before this task in the removal-fix baseline.",
+    "approved PO exposes shared reference form and preserves failed edits": "The previous shared reference form is absent; reproduced on captured production source in closure-red/baseline-browser.log."
+  },
+  "gauntlet": {
+    "checks": {
+      "resource-policy": 0,
+      "db": 0,
+      "migrate": 0,
+      "suite": 1,
+      "browser": 1,
+      "http": 0,
+      "syntax-0": 0,
+      "syntax-1": 0,
+      "syntax-2": 0,
+      "syntax-3": 0,
+      "syntax-4": 0,
+      "syntax-5": 0,
+      "syntax-6": 0,
+      "syntax-7": 0,
+      "syntax-8": 0,
+      "types": 0,
+      "lint": 0,
+      "merge-coverage": 0,
+      "property-mutant-reject-native-discount": 1,
+      "property-mutant-accept-foreign-row": 1,
+      "property-mutant-relax-financial-reader": 1,
+      "property-mutant-keep-failed-lock": 1,
+      "property-mutant-discard-saved-plan": 1,
+      "property-mutant-ignore-closure-activity": 1,
+      "suite-order": 1,
+      "versions": 0
+    },
+    "changedLineCoverage": {
+      "covered": 97,
+      "uncovered": []
+    },
+    "changedBranchCoverage": {
+      "covered": 116,
+      "total": 124,
+      "details": "test-artifacts/special-delivery-recovery-20261016/final/changed-coverage.json"
+    },
+    "mutations": [
+      {
+        "name": "reject-native-discount",
+        "killed": true,
+        "propertyKilled": true
+      },
+      {
+        "name": "accept-foreign-row",
+        "killed": true,
+        "propertyKilled": true
+      },
+      {
+        "name": "relax-financial-reader",
+        "killed": true,
+        "propertyKilled": true
+      },
+      {
+        "name": "keep-failed-lock",
+        "killed": true,
+        "propertyKilled": true
+      },
+      {
+        "name": "discard-saved-plan",
+        "killed": true,
+        "propertyKilled": true
+      },
+      {
+        "name": "ignore-closure-activity",
+        "killed": true,
+        "propertyKilled": true
+      }
+    ],
+    "testHashes": {
+      "test/mbt/unit/special-fulfillment-adapter.test.js": "3d2f665f936e34a9cf5d988fcdecedbf9f644d39862b28fcf64878e1c262502a",
+      "test/mbt/integration/special-approval-fulfillment.test.js": "dedbe3283d93895e8e0cc2f6e6528c5d525e1e4a07ad420e6a3be2eccbc10c8a",
+      "test/mbt/unit/special-workflow-rest-orders.test.js": "57afe79a73b5d50a9001eb227938c014e7e0f0e0c03c544c91c025ce6bb5ab96",
+      "test/mbt/integration/special-local-adjustments.test.js": "2affd0d1ad619143a49fd8a7c2c0206b72e42356dc74a76b3dbbed23533c16ef",
+      "test/mbt/unit/special-workflow-closure.test.js": "0b307614e0b681a6302a9e57a71ec256cff46d63a6d906957fa0358e51a25fb1",
+      "test/mbt/unit/special-workflow-closure-lock.test.js": "1e73639630a807cf8306523f8e87eab0f7bd9d88be3fc23224db638085b64bea",
+      "test/mbt/unit/special-linked-closure.test.js": "683bf88d3fa22a74f928b72a348ba8cab6cebad4d205b0c2da1e5dd2b9874d8a",
+      "test/mbt/integration/special-workflow-closure.test.js": "6040021362cf6c1edbc95e26e011709de8d7eed21a5634e0d781aa06d695944d",
+      "test/mbt/integration/special-local-closure.test.js": "6a50f0538df18fa284afd05fa054ecb3740e5bb2b66c23993f65865b59defcc8",
+      "test/mbt/integration/special-approval-browser.test.js": "3b278efc12cfccf33c8da0f856dc15412c36e4d1fd06750e8139014245afb524",
+      "test/mbt/integration/special-workflow-pricing-http.test.js": "bff01478bdc2c72424ecc9005fffc0d75c0b9e8eb4ec6cb5a47ae5960d917593"
+    },
+    "shuffleSeed": 631020,
+    "versions": {
+      "node": "v20.20.2",
+      "fast-check": "4.9.0",
+      "c8": "12.0.0",
+      "typescript": "7.0.2",
+      "eslint": "10.8.0",
+      "@playwright/test": "1.62.1",
+      "v8-to-istanbul": "9.3.0"
+    },
+    "typescript": "Checked REST, fulfillment adapter, closure adapter and fulfillment editor with checkJs, NodeNext and explicit Node types. Larger legacy repository/service scripts have syntax, lint, database and integration checks.",
+    "supplyChain": "No dependencies, permissions, environment settings or schema changes. Existing pinned test toolchain reused. Dependency audit skipped because dependency manifests are unchanged.",
+    "suiteScope": "Full affected adapter, repository, closure and browser suites; focused authenticated HTTP regressions. Entire unrelated application suite not run.",
+    "realExecution": "Production preflight and recovery logs use the deployed modules and normal service journals; only authorized NetSuite closed flags may be written.",
+    "red": "Delivery unit, database, browser and HTTP regressions, plus closure adapter and readiness/closure integration, failed on captured production source before their fixes. Additional adversarial/property checks were added during the gauntlet.",
+    "issuesResolved": [
+      "Type-check command needed the installed Node definitions enabled explicitly.",
+      "Coverage needed public helper modules included alongside browser execution.",
+      "Added an adversarial regression for inconsistent order identities/status before any close write."
+    ],
+    "limits": [
+      "Specification was not independently reviewed. Tests cannot eliminate every undiscovered NetSuite workflow or concurrency behavior.",
+      "8 of 124 changed branch paths were not exercised; all 97 changed executable lines were exercised."
+    ]
+  },
+  "behaviorTests": {
+    "nativeHeaderDiscount": "delivery header accepts the separate native order discount row without changing commercial data; property: only one matching header discount may be outside the material sublist",
+    "preparationUnlock": "delivery preparation failure releases editing and Sales can replace the failed target; property: failed delivery attempts release editing exactly when no remote plan exists",
+    "safeDiscard": "discarding an unapplied delivery attempt releases a stale lock without remote calls and preserves history; delivery recovery HTTP keeps Sales authorization, scope, revisions and operation ownership while releasing an unapplied lock",
+    "savedPlanRecovery": "saved remote delivery plans cannot be discarded but can be explicitly replaced under the operation lock; replacement pickup after an uncertain remote change must reverify NetSuite and cannot discard failed re-preparation",
+    "editableHeader": "failed delivery recovery keeps header editable and saves the edited target explicitly; delivery recovery distinguishes retry from discard and hides discard after a saved remote plan",
+    "remainingClosure": "explicit remaining-order closure preserves fulfilled and billed quantities and retries without duplicate writes; remaining-order closure recovers a workflow-locked closed record with unchanged posted quantities",
+    "closureConcurrency": "remaining-order closure freezes fulfillment and billing evidence before any writes; property: remaining-order closure refuses any new execution or billing before writing",
+    "readiness": "readiness reminder stays informational while SCM closes remaining fulfilled SO and untouched PO lines",
+    "legacyInvariants": "Existing financial-adjustment, closure-lock, linked-closure, local-closure, local-removal and lost-acknowledgement suites retained."
+  },
+  "cleanup": {
+    "containers": "",
+    "networks": "",
+    "volumes": "",
+    "productionHealth": "healthy"
+  },
+  "deployment-result.json": {
+    "deployed": true,
+    "at": "2026-10-16T19:55:38.380460+00:00",
+    "imageId": "sha256:908870cf1e82a26fb31c827b937bffef31fefcbb5f4a979b07b6a7d3f6f22985",
+    "files": [
+      "src/special-stock-rest-orders.js",
+      "src/special-stock-fulfillment-adapter.js",
+      "src/special-stock-fulfillment.js",
+      "src/special-stock-request-repository.js",
+      "public/special-stock-fulfillment.js",
+      "public/sales-special-stock-requests.js",
+      "src/special-stock-closure-adapter.js",
+      "src/special-stock-closure-service.js",
+      "public/special-stock-case-status.js"
+    ],
+    "runtimeFilesVerified": 1412,
+    "configurationPreserved": true,
+    "dependenciesUnchanged": true,
+    "schemaChanged": false,
+    "http": {
+      "http://127.0.0.1:3000": {
+        "health": 200,
+        "publicAssetsVerified": 3,
+        "anonymousApisDenied": 2
+      },
+      "https://test.mbbsoperation.com": {
+        "health": 200,
+        "publicAssetsVerified": 3,
+        "anonymousApisDenied": 2
+      }
+    },
+    "request": {
+      "requestRef": "SPREQ-000063",
+      "revision": 39,
+      "activeLines": 8,
+      "salesOrder": "SOB122477",
+      "purchaseOrder": "POB04029",
+      "deliveryStatus": "cancelled",
+      "savedDeliveryPlan": false,
+      "localAdjustmentBlockedByDelivery": false,
+      "quantityReviewStatus": "approved"
+    },
+    "deploymentDataWrites": 0,
+    "netSuiteDeploymentWrites": 0,
+    "authorizedRecoveryLog": "server/deployments/special-delivery-recovery-20261016/recovery.log"
+  },
+  "image-check.json": {
+    "passed": true,
+    "imageId": "sha256:908870cf1e82a26fb31c827b937bffef31fefcbb5f4a979b07b6a7d3f6f22985",
+    "runtimeFiles": 1412
+  },
+  "recovery-preflight.log": [
+    {
+      "event": "delivery-preflight",
+      "passed": true,
+      "materialLines": 8,
+      "headerDiscount": "10716"
+    },
+    {
+      "event": "result",
+      "preflight": true,
+      "recordWrites": 0
+    }
+  ],
+  "recovery.log": [
+    {
+      "event": "delivery-preflight",
+      "passed": true,
+      "materialLines": 8,
+      "headerDiscount": "10716"
+    },
+    {
+      "event": "delivery-recovered",
+      "requestRef": "SPREQ-000063",
+      "revision": 39,
+      "status": "cancelled",
+      "headerPreserved": true
+    },
+    {
+      "event": "posted-history-verification",
+      "posted": [
+        {
+          "id": 1055764,
+          "lines": 2,
+          "postedQuantitiesPreserved": true
+        },
+        {
+          "id": 1052059,
+          "lines": 5,
+          "postedQuantitiesPreserved": true
+        }
+      ]
+    },
+    {
+      "event": "result",
+      "closed": true,
+      "requestRef": "SPREQ-000021",
+      "revision": 50,
+      "readinessAlerts": [],
+      "remote": {
+        "orders": [
+          {
+            "id": 1052059,
+            "kind": "sales_order",
+            "reference": "SOB122473",
+            "type": "SalesOrd",
+            "status": "H",
+            "statusText": "Sales Order : Closed"
+          },
+          {
+            "id": 1055764,
+            "kind": "purchase_order",
+            "reference": "POB04030",
+            "type": "PurchOrd",
+            "status": "H",
+            "statusText": "Purchase Order : Closed"
+          }
+        ]
+      },
+      "recordWrites": 2,
+      "delivery": {
+        "id": "71f05e95-1a39-4f93-a505-1f38e757e920",
+        "error": "A complete, distinct NetSuite order is required.",
+        "status": "cancelled",
+        "target": {
+          "windowEnd": null,
+          "windowStart": null,
+          "deliveryDate": null,
+          "deliveryAddress": "/",
+          "fulfillmentMethod": "mbt_delivery",
+          "deliveryContactName": "",
+          "deliveryContactPhone": "(647) 679-9666",
+          "deliveryInstructions": "ADD: \nDATE: \nTEL: (647) 679-9666\nLOC:"
+        },
+        "cancelledAt": "2026-10-16T19:54:17.872Z",
+        "cancelledBy": null,
+        "requestedAt": "2026-10-16T13:57:04.311Z",
+        "requestedBy": "1dfc1d5f-de65-4e5f-b17e-4be2c32b1583",
+        "hasPlan": false
+      }
+    }
+  ]
+}

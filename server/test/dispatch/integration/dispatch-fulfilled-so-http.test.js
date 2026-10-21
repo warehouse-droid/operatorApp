@@ -29,7 +29,10 @@ async function board(index, ref) {
     orders: [ref], stops: [{ id: `pickup-${index}`, type: "pickup", orderId: ref, yard: "3445" },
       { id: `drop-${index}`, type: "drop", orderId: ref, address: "Test Road" }]
   }] }];
-  return { plan, lease, sessionId, body: { planDate: date, baseRevision: plan.revision, orders: [order], trucks, sessionId } };
+  const current = await fixture.request(`/api/dispatch/plans/${plan.id}`);
+  assert.equal(current.response.status, 200, JSON.stringify(current.payload));
+  return { plan: current.payload, lease, sessionId, body: { planDate: date, baseRevision: current.payload.revision,
+    baseDigest: current.payload.digest, orders: [order], trucks, sessionId } };
 }
 
 test("HTTP billed SO can be saved and confirmed with completion retained", async () => {
@@ -40,8 +43,10 @@ test("HTTP billed SO can be saved and confirmed with completion retained", async
     method: "PUT", headers: { "x-dispatch-edit-lease": lease }, body
   });
   assert.equal(saved.response.status, 200, JSON.stringify(saved.payload));
+  const savedPlan = saved.payload.plan || saved.payload;
   const confirmed = await fixture.request(`/api/dispatch/plans/${plan.id}/confirm`, {
-    method: "POST", headers: { "x-dispatch-edit-lease": lease }, body: { sessionId: body.sessionId }
+    method: "POST", headers: { "x-dispatch-edit-lease": lease }, body: { sessionId: body.sessionId,
+      baseRevision: savedPlan.revision, baseDigest: savedPlan.digest }
   });
   assert.equal(confirmed.response.status, 200, JSON.stringify(confirmed.payload));
   const retained = await getDispatchPlan(plan.id);

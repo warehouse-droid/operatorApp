@@ -36,7 +36,7 @@ async function fixture() {
   return { children, groupId };
 }
 
-test("L1/L2 planned fully linked group remains discoverable with two reference lines", () => scenario(async () => {
+test("L1/L2 fully linked group detail retains references while completed yard work leaves the operator list", () => scenario(async () => {
   const f = await fixture();
   const group = await getDeliveryOrder(f.groupId);
   assert.equal(group.lines.length, 2);
@@ -44,8 +44,7 @@ test("L1/L2 planned fully linked group remains discoverable with two reference l
   assert.deepEqual(group.lines.map((line) => line.original_quantity), [2332, 20]);
   const active = await listDeliveryOrders({ locationId: 1 });
   const card = active.find((order) => order.netsuite_id === f.groupId);
-  assert.ok(card, "reference group must remain under Planned");
-  assert.equal(card.has_open_qty, false, "references are not outstanding packing work");
+  assert.equal(card, undefined, "direct-supply references alone are not outstanding yard work");
   assert.ok(!(await listDeliveryOrders({ locationId: 1, status: "packed" })).some((order) => order.netsuite_id === f.groupId));
   await query("UPDATE sales_orders SET local_yard_order_status='Loaded',fulfillment_status='fulfilled' WHERE netsuite_id=ANY($1::bigint[])", [f.children.map((child) => child.id)]);
   assert.ok(!(await listDeliveryOrders({ locationId: 1 })).some((order) => order.netsuite_id === f.groupId));

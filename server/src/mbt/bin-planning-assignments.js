@@ -2,6 +2,7 @@
 import crypto from "node:crypto";
 import { query } from "../db.js";
 import { canonicalSha256 } from "./canonical-json.js";
+import { validateBinWorkflowClaims, updateBinWorkflowClaim } from "./bin-order-workflow-planning.js";
 import { lockPlanningVisit, planningLoad, planningError, planningEvent, samePlanningValue, readPlanningPlan }
   from "./bin-planning-repository.js";
 
@@ -22,6 +23,7 @@ export async function stagePlanningAssignment(visitId, plan, input, bumpVisit = 
   }
   await withdrawPlanningAssignment(visit, input);
   const { truck, load } = planningLoad(plan, String(visit.dispatch_load_id));
+  await updateBinWorkflowClaim(visit,load,String(truck.id),plan.planDate);
   const generation = Number(visit.planning_generation) + 1;
   const revision = Number(visit.revision) + (bumpVisit ? 1 : 0);
   const steps = await query("SELECT action_code,status FROM mbt_visit_steps WHERE service_visit_id=$1 ORDER BY sequence_number", [visitId]);
@@ -94,6 +96,10 @@ function matchesAssignmentEvidence(current, visit, group) {
 }
 /** @param {any} visit @param {any} current @param {any} snapshot */
 async function validateAssignmentReservations(visit, current, snapshot) {
+  if (visit.service_snapshot?.binWorkflow && visit.status !== "completed") {
+    await validateBinWorkflowClaims(visit,snapshot);
+    return;
+  }
   if (visit.status !== "completed") {
     const active = await query("SELECT reservation_id::text,asset_id::text,reservation_slot FROM mbt_bin_asset_reservations WHERE visit_id=$1 AND released_at IS NULL ORDER BY reservation_slot", [visit.service_visit_id]);
     const expected = [...snapshot.assetReservations].sort((a, b) => a.reservationSlot.localeCompare(b.reservationSlot));

@@ -1,0 +1,262 @@
+--- a/public/dispatch.js
++++ b/public/dispatch.js
+@@ -579,6 +579,7 @@
+ let backgroundRouteRunPromise = null;
+ let backgroundRouteRenderQueued = false;
+ let backgroundRouteInFlight = new Set();
++const backgroundRouteRequests = new Map();
+ let orderListScrollTop = 0;
+ let loadPreviewWidth = Number(dispatchStorageGet("mbbs.dispatch.previewWidth", "520"));
+ let isResizingPreview = false;
+@@ -7551,10 +7552,18 @@
+   if (!ensureDispatchPlanEditor()) throw new Error(dispatchEditModeMessage());
+   if (!currentPlan?.id) throw new Error("Dispatch plan is not loaded.");
+   const retry = pendingDispatchPlanAction?.kind === "confirm" ? pendingDispatchPlanAction : null;
++  const confirmationPlanKey = `${currentPlanDate}:${currentPlan.id}`;
++  let googleRouteRefresh = retry?.payload?.audit?.details?.googleRouteRefresh || { attempted: 0, failed: [] };
+   clearTimeout(saveTimer);
+   if (!retry) {
+-  await refreshGoogleRouteEstimatesForConfirmation();
++  googleRouteRefresh = await refreshGoogleRouteEstimatesForConfirmation();
++  if (confirmationPlanKey !== `${currentPlanDate}:${currentPlan?.id}`) {
++    throw new Error("The date plan changed while Google routes were refreshing. Confirm the selected plan again.");
++  }
+   const saveResult = await saveCurrentPlanNow();
++  if (confirmationPlanKey !== `${currentPlanDate}:${currentPlan?.id}`) {
++    throw new Error("The date plan changed while saving. Confirm the selected plan again.");
++  }
+   if (saveResult?.recoverySaved) {
+     const error = new Error(routeNotice || "The latest draft was backed up but not applied. Fix it before confirming.");
+     error.code = "DISPATCH_PLAN_RECOVERY_PENDING";
+@@ -7582,6 +7591,7 @@
+             planDate: payload.planDate,
+             status: currentPlan?.status,
+             operatorAlertRefs,
++            googleRouteRefresh,
+             refreshOrderPool: Boolean(payload.refreshOrderPool),
+             saveMode: "confirm"
+           }
+@@ -7589,6 +7599,8 @@
+       }, confirmGeneration);
+     try {
+       const plan = acknowledged.result;
++      plan.googleRouteWarnings = googleRouteRefresh?.failed || [];
++      routeNotice = confirmedPlanNotice(plan);
+       if (String(currentPlan?.id) !== String(plan.id) || currentPlanDate !== plan.planDate) {return plan;}
+       lastAcknowledgedPlanState = dispatchPlanWireState(plan);
+       if (confirmGeneration !== localPlanGeneration) {
+@@ -7625,6 +7637,35 @@
+   }
+ }
+ 
++/**
++ * @param {{ planDate: string, followupWarnings?: Array<{ label?: string, step?: string }>,
++ *   googleRouteWarnings?: Array<{ truckPlate?: string, loadName?: string, loadId: string, status: string }> }} plan
++ */
++function confirmedPlanNotice(plan) {
++  const notices = [`Plan ${displayDate(plan.planDate)} confirmed.`];
++  if (plan.followupWarnings?.length) {
++    notices.push(`${plan.followupWarnings.map((item) => item.label || item.step).join(", ")} needs attention. Details are in the browser console.`);
++  }
++  if (plan.googleRouteWarnings?.length) {
++    const routes = plan.googleRouteWarnings.map((item) => `${item.truckPlate || "Truck"} ${item.loadName || item.loadId} (${googleRouteRefreshStatusText(item.status)})`);
++    notices.push(`Google route refresh needs attention: ${routes.join("; ")}. Available estimates were retained. Refresh these routes to update their Google estimates and mapping.`);
++  }
++  return notices.join(" ");
++}
++
++/** @param {string} status */
++function googleRouteRefreshStatusText(status) {
++  /** @type {Record<string, string>} */
++  const labels = {
++    MAP_GEOMETRY_UNAVAILABLE: "Google mapping unavailable",
++    INCOMPLETE_GOOGLE_LEGS: "Google returned incomplete travel times",
++    ROUTE_CHANGED: "route changed during refresh",
++    waypoint_cost_guard: "manual refresh required for routes with more than 12 stops",
++    LOCAL_FALLBACK: "Google estimate unavailable"
++  };
++  return labels[status] || String(status || "Google unavailable").replaceAll("_", " ").toLowerCase();
++}
++
+ function commitPlanMutation(actionName = "dispatch_plan_mutation", mutator = null, options = {}) {
+   if (!ensureDispatchPlanEditor()) return false;
+   const rollbackPacked = historyReady ? historyCurrentSnapshot : null;
+@@ -8623,6 +8664,7 @@
+     legMinutes: Array.isArray(estimate.legMinutes) ? estimate.legMinutes.map(Number) : [],
+     rawLegMinutes: Array.isArray(estimate.rawLegMinutes) ? estimate.rawLegMinutes.map(Number) : [],
+     ...normalizedRouteMapGeometry(estimate, stops.length),
++    ...(Number.isFinite(Date.parse(estimate.asOf)) ? { asOf: new Date(estimate.asOf).toISOString() } : {}),
+     allowTolls: Boolean(estimate.allowTolls),
+     travelTimePercent: Number(estimate.travelTimePercent || 0),
+     routeEstimateId: meta.id,
+@@ -10758,6 +10800,7 @@
+       legMinutes: Array.isArray(estimate.legMinutes) ? estimate.legMinutes.map(Number) : [],
+       rawLegMinutes: Array.isArray(estimate.rawLegMinutes) ? estimate.rawLegMinutes.map(Number) : [],
+       ...normalizedRouteMapGeometry(estimate, stops.length),
++      ...(Number.isFinite(Date.parse(estimate.asOf)) ? { asOf: new Date(estimate.asOf).toISOString() } : {}),
+       allowTolls: Boolean(estimate.allowTolls),
+       travelTimePercent: Number(estimate.travelTimePercent || 0),
+       routeEstimateId: meta.id,
+@@ -11004,9 +11047,17 @@
+ function applyServerRouteEstimate(truck, load, stops, response = {}) {
+   if (!routeEstimateHasCompleteGoogleLegs(stops, response)) return null;
+   const meta = routeEstimateMeta(truck, load, stops);
++  const geometry = normalizedRouteMapGeometry(response, stops.length);
++  if (!geometry.routePath.length || !geometry.stopCoordinates.length) {
++    const previous = estimateForLoad(load);
++    const previousGeometry = normalizedRouteMapGeometry(previous, stops.length);
++    if (["google", "google_routes_v2"].includes(previous?.source)
++      && routeEstimateMatchesMeta(previous, meta) && routeEstimateHasCompleteGoogleLegs(stops, previous)
++      && previousGeometry.routePath.length && previousGeometry.stopCoordinates.length) return previous;
++  }
+   const estimate = {
+     ...response,
+-    ...normalizedRouteMapGeometry(response, stops.length),
++    ...geometry,
+     routeEstimateId: meta.id,
+     routeSignature: meta.signature,
+     allowTolls: Boolean(load?.allowTolls),
+@@ -11017,20 +11068,22 @@
+   return estimate;
+ }
+ 
+-async function googleRouteForLoad(truck, load, { reason = "confirm" } = {}) {
++async function googleRouteForLoad(truck, load, { reason = "confirm", forceRefresh = false } = {}) {
+   if (!load?.id) return null;
+   if (isPlanningLoadReadOnly(load)) return null;
+   truck = effectiveTruckForLoad(findLoad(load.id).truck || truck, load);
+   const stops = mapStopsForLoad(load, truck);
+   if (stops.length <= 1) return null;
+-  if (reason !== "manual_refresh" && applyCachedRouteEstimate(truck, load, stops)) {
++  if (!forceRefresh && reason !== "manual_refresh" && applyCachedRouteEstimate(truck, load, stops)) {
+     return { source: "persistent-cache", stops, estimate: estimateForLoad(load) };
+   }
+   const meta = routeEstimateMeta(truck, load, stops);
+   const requestPlanKey = `${currentPlanDate}:${currentPlan?.id || ""}`;
+-  if (backgroundRouteInFlight.has(meta.id)) return null;
++  const requestKey = `${requestPlanKey}:${load.id}:${meta.signature}`;
++  if (backgroundRouteRequests.has(requestKey)) return backgroundRouteRequests.get(requestKey);
+   backgroundRouteInFlight.add(meta.id);
+-  try {
++  const request = (async () => {
++   try {
+     const response = await fetch("/api/dispatch/maps/route-estimate", {
+       method: "POST",
+       headers: { "Content-Type": "application/json" },
+@@ -11060,15 +11113,25 @@
+       || routeEstimateMeta(latestTruck, latest.load, latestStops).signature !== meta.signature) {
+       return { source: "fallback", status: "ROUTE_CHANGED", stops, estimate: null };
+     }
++    const geometry = normalizedRouteMapGeometry(result, stops.length);
+     return {
+       source: result.source || "fallback",
+-      status: result.fallbackReason || "OK",
++      status: result.fallbackReason || (result.source === "google_routes_v2"
++        && (!geometry.routePath.length || !geometry.stopCoordinates.length) ? "MAP_GEOMETRY_UNAVAILABLE" : "OK"),
+       stops,
+-      estimate: applyServerRouteEstimate(latestTruck, latest.load, latestStops, result)
++      estimate: result.source === "google_routes_v2"
++        ? applyServerRouteEstimate(latestTruck, latest.load, latestStops, result)
++        : null
+     };
+   } catch (error) {
+     return { source: "fallback", status: error?.message || "ERROR", stops, estimate: null };
++   }
++  })();
++  backgroundRouteRequests.set(requestKey, request);
++  try {
++    return await request;
+   } finally {
++    if (backgroundRouteRequests.get(requestKey) === request) backgroundRouteRequests.delete(requestKey);
+     backgroundRouteInFlight.delete(meta.id);
+   }
+ }
+@@ -11199,25 +11262,35 @@
+   updateGoogleMapPreviewGeometry(canvas);
+ }
+ 
+-function routeLoadsNeedingEstimate() {
++function routeLoadsNeedingEstimate({ refreshAll = false } = {}) {
++  if (refreshAll) {
++    normalizePlanBeforeSave();
++  }
+   const candidates = [];
+-  for (const truck of trucks) {
+-    for (const load of truck.loads || []) {
++  const driverOriented = driverOrientedPlanningEnabled();
++  /** @type {Array<Pick<ReturnType<typeof driverLoadEntries>[number], "truck" | "load">>} */
++  const entries = driverOriented ? driverLoadEntries() : [];
++  if (!driverOriented) {
++    for (const truck of trucks) {
++      for (const load of truck.loads || []) entries.push({ truck, load });
++    }
++  }
++  for (const { truck, load } of entries) {
+       if (isPlanningLoadReadOnly(load)) continue;
+-      const stops = mapStopsForLoad(load, truck);
++      const stops = mapStopsForLoad(load, effectiveTruckForLoad(truck, load));
+       if (stops.length <= 1) continue;
+-      if (applyCachedRouteEstimate(truck, load, stops)) continue;
+-      if (!routeNeedsGoogleEstimateForLoad(truck, load)) continue;
++      if (!stops.slice(1).some((stop, index) => !samePhysicalRouteStop(stops[index], stop))) continue;
++      if (!refreshAll && applyCachedRouteEstimate(truck, load, stops)) continue;
++      if (!refreshAll && !routeNeedsGoogleEstimateForLoad(truck, load)) continue;
+       const meta = routeEstimateMeta(truck, load, stops);
+-      candidates.push({ truck, load, meta });
+-    }
++      candidates.push({ truck, load, meta, refreshAll });
+   }
+   return candidates;
+ }
+ 
+ async function refreshGoogleRouteEstimatesForConfirmation() {
+   if (backgroundRoutesRunning) return backgroundRouteRunPromise;
+-  const candidates = routeLoadsNeedingEstimate();
++  const candidates = routeLoadsNeedingEstimate({ refreshAll: true });
+   if (!candidates.length) return { attempted: 0, failed: [] };
+   backgroundRoutesRunning = true;
+   backgroundRouteRunPromise = (async () => {
+@@ -11226,14 +11299,25 @@
+       for (const candidate of candidates) {
+         const latest = findLoad(candidate.load.id);
+         if (!latest.truck || !latest.load) continue;
+-        // An earlier load can change this load's inherited departure while the
+-        // queue is running. Re-check the exact route identity before calling
+-        // Google so a now-valid downstream estimate is not replaced needlessly.
+-        if (!routeNeedsGoogleEstimateForLoad(latest.truck, latest.load)) continue;
++        // Earlier loads change inherited departures, including truck switches.
++        // Resolve the latest load before each sequential request.
++        if (!candidate.refreshAll && !routeNeedsGoogleEstimateForLoad(latest.truck, latest.load)) continue;
+         const previousEstimate = estimateForLoad(latest.load);
+-        const result = await googleRouteForLoad(latest.truck, latest.load, { reason: "confirm" });
++        const result = await googleRouteForLoad(latest.truck, latest.load, { reason: "confirm", forceRefresh: true });
++        let warningStatus = "";
+         if (!result?.estimate || result.source !== "google_routes_v2") {
+-          failed.push({ loadId: latest.load.id, status: result?.status || "LOCAL_FALLBACK" });
++          warningStatus = result?.source === "google_routes_v2" && !result.estimate
++            ? "INCOMPLETE_GOOGLE_LEGS" : result?.status || "LOCAL_FALLBACK";
++        } else {
++          const geometry = normalizedRouteMapGeometry(result.estimate, result.stops.length);
++          if (result.status === "MAP_GEOMETRY_UNAVAILABLE" || !geometry.stopCoordinates.length || !geometry.routePath.length) {
++            warningStatus = "MAP_GEOMETRY_UNAVAILABLE";
++          }
++        }
++        if (warningStatus) {
++          failed.push({ loadId: latest.load.id, loadName: latest.load.name || latest.load.id,
++            truckPlate: effectiveTruckForLoad(latest.truck, latest.load)?.plate || latest.truck.plate,
++            status: warningStatus });
+         }
+         if (routeEstimateChangesVisibleTiming(previousEstimate, result?.estimate)) {
+           backgroundRouteRenderQueued = true;
+@@ -16652,10 +16736,8 @@
+       if (Array.isArray(plan.followupWarnings) && plan.followupWarnings.length) {
+         const warning = new Error(plan.followupWarnings.map((item) => `${item.step}: ${item.message}`).join("; "));
+         reportDispatchSaveError("confirmed-with-followup-warning", warning, { followupWarnings: plan.followupWarnings });
+-        routeNotice = `Plan ${displayDate(plan.planDate)} confirmed, but ${plan.followupWarnings.map((item) => item.label || item.step).join(", ")} needs attention. Details are in the browser console.`;
+-      } else {
+-        routeNotice = `Plan ${displayDate(plan.planDate)} confirmed.`;
+       }
++      routeNotice = confirmedPlanNotice(plan);
+       render({ save: false });
+     }).catch((error) => {
+       reportDispatchSaveError("confirm", error, { code: error.code || "" });

@@ -34,16 +34,19 @@ test("a TO falls back to the latest NetSuite Memo and blank local input resets i
   assert.equal(normalizeScmScheduleRemarkOverride(" \n "), null);
 });
 
-test("PO never inherits its source memo implicitly", () => {
+test("PO maps its source memo as the remark and clearing a local remark restores it", () => {
   assert.deepEqual(resolveScmScheduleRemark({
     orderKind: "PO",
-    netSuiteMemo: "Do not expose this PO memo"
+    remarkOverride: " \n ",
+    netSuiteMemo: "PO pickup instructions"
   }), {
-    remark: "",
-    remarkSource: "none",
+    remark: "PO pickup instructions",
+    remarkSource: "netsuite",
     remarkOverride: "",
-    netSuiteMemo: "Do not expose this PO memo"
+    netSuiteMemo: "PO pickup instructions"
   });
+  assert.equal(resolveScmScheduleRemark({orderKind:"PO",remarkOverride:"Local PO remark",netSuiteMemo:"Memo"}).remark,"Local PO remark");
+  assert.equal(resolveScmScheduleRemark({orderKind:"CO",netSuiteMemo:"Other memo"}).remark,"");
 });
 
 test("normalization preserves internal newlines and enforces the 2,000 character boundary", () => {
@@ -65,4 +68,30 @@ test("remark-only patch classification permits concurrency/audit metadata only",
   assert.equal(isRemarkOnlyScmSchedulePatch({ remark_override: "snake case" }), true);
   assert.equal(isRemarkOnlyScmSchedulePatch({ remarkOverride: "", status: "Hold" }), false);
   assert.equal(isRemarkOnlyScmSchedulePatch({ status: "Hold" }), false);
+});
+
+test("a linked SO prefix preserves the local edit and underlying PO memo", () => {
+  assert.deepEqual(resolveScmScheduleRemark({
+    orderKind: "PO", remarkOverride: "Call vendor", netSuiteMemo: "Pickup at gate 2", remarkPrefix: "For SOB12345"
+  }), {
+    remark: "For SOB12345 Call vendor", remarkSource: "local", remarkOverride: "Call vendor",
+    remarkPrefix: "For SOB12345", netSuiteMemo: "Pickup at gate 2"
+  });
+  assert.equal(resolveScmScheduleRemark({
+    orderKind: "PO", remarkOverride: "", netSuiteMemo: "Pickup at gate 2", remarkPrefix: "For SOB12345"
+  }).remark, "For SOB12345 Pickup at gate 2");
+  assert.equal(resolveScmScheduleRemark({ orderKind: "PO", remarkPrefix: "For SOB12345" }).remark, "For SOB12345");
+});
+
+test("SO prefixes are idempotent and do not match longer SO numbers or transfer orders", () => {
+  for (const base of ["For SOB12345", "for sob12345 Call vendor", "For SOB12345: call vendor"]) {
+    const result = resolveScmScheduleRemark({ orderKind: "PO", remarkOverride: base, remarkPrefix: "For SOB12345" });
+    assert.equal(result.remark, base);
+  }
+  assert.equal(resolveScmScheduleRemark({
+    orderKind: "PO", remarkOverride: "For SOB123456 Call vendor", remarkPrefix: "For SOB12345"
+  }).remark, "For SOB12345 For SOB123456 Call vendor");
+  assert.equal(resolveScmScheduleRemark({
+    orderKind: "TO", netSuiteMemo: "Transfer", remarkPrefix: "For SOB12345"
+  }).remark, "Transfer");
 });

@@ -76,7 +76,10 @@ export async function movementRecordEvidence({ loadIds = [], receiptIds = [], co
               JOIN completions e ON e.id=c.completion_event_id AND e.load_record_id=l.id
               WHERE EXISTS (SELECT 1 FROM jsonb_array_elements(c.line_snapshot) line
                              WHERE line->>'operatorLoadRecordId'=l.id::text)), '[]'::jsonb) AS documents,
-            l.load_type IN ('sales_order_delivery_load','transfer_order_load','local_co_load','vrma_local_load')
+            (l.load_type IN ('sales_order_delivery_load','local_co_load','vrma_local_load')
+              OR (l.load_type='transfer_order_load' AND EXISTS (
+                SELECT 1 FROM order_dependencies dependency WHERE dependency.transfer_order_id=l.order_id
+                  AND dependency.dependency_mode='direct_to_customer' AND dependency.status<>'cancelled')))
               AND lower(l.current_status) NOT IN ('closed','cancelled','canceled')
               AND NOT EXISTS (SELECT 1 FROM completions e WHERE e.load_record_id=l.id)
               AND NOT EXISTS (SELECT 1 FROM driver_job_records d

@@ -7,6 +7,14 @@ body.delivery-request-page { overflow-y:auto; }
 .delivery-request-page button,.delivery-request-page input,.delivery-request-page select,.delivery-request-page textarea { font:inherit; }
 .delivery-request-page button { min-height:38px; border:1px solid #cbd5e1; border-radius:7px; padding:8px 12px; background:#fff; color:#0f172a; cursor:pointer; }
 .delivery-request-page button.primary { background:#0f766e; border-color:#0f766e; color:white; }
+.delivery-request-page button.danger { background:#b91c1c; border-color:#b91c1c; color:white; }
+.delivery-request-page button.danger:hover { background:#991b1b; border-color:#991b1b; }
+.dr-approval-actions { align-items:end; }
+.dr-expiry-field { width:210px; max-width:100%; }
+.dr-expiry-dialog { width:min(460px,calc(100vw - 32px)); box-sizing:border-box; padding:22px; border:1px solid #fca5a5; border-radius:12px; color:#0f172a; background:white; font:16px/1.5 system-ui; }
+.dr-expiry-dialog::backdrop { background:#0f172a80; }
+.dr-expiry-dialog h2 { margin:0; font-size:22px; }
+.dr-expiry-dialog p { margin:14px 0 20px; }
 .delivery-request-page button:disabled { opacity:.5; cursor:default; }
 .delivery-request-page :focus-visible { outline:3px solid #0f766e; outline-offset:2px; }
 .dr-workspace { display:grid; grid-template-columns:minmax(260px,340px) minmax(0,1fr); gap:20px; padding:20px; align-items:start; }

@@ -1,0 +1,17 @@
+[
+  "public/backorder-stock-requests.js",
+  "public/regular-stock-status.js",
+  "public/regular-stock-status-ui.js",
+  "public/regular-stock-alert.js",
+  "public/sales-stock-requests.js",
+  "public/scm-stock-requests.js",
+  "public/sales-stock-requests.html",
+  "public/scm-stock-requests.html",
+  "public/app-sidebar.js",
+  "src/backorder-request-service.js",
+  "src/regular-stock-request-service.js",
+  "src/special-stock-request-repository.js",
+  "src/backorder-arrival-status.js",
+  "src/backorder-arrival.js",
+  "migrations/299_backorder_arrival_reads.sql"
+]

@@ -216,5 +216,5 @@ test("Sales delivery-order cards retain their own height and wrap long content w
     deliveryInstructionCss,
     /\.delivery-instruction-order-card\s*>\s*span[\s\S]*?overflow-wrap:\s*anywhere;/
   );
-  assert.match(salesDeliveryInstructionHtml, /delivery-instructions\.css\?v=20260812-delivery-image-720p-v1/);
+  assert.match(salesDeliveryInstructionHtml, /delivery-instructions\.css\?v=20260929-netsuite-edit-v1/);
 });

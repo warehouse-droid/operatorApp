@@ -23,6 +23,7 @@ export function rentalItemDecision(item = {}, policy = {}) {
   };
 }
 
+/** @param {Record<string, any>} order @returns {Record<string, any>} */
 export function projectSorOrder(order = {}, policies = new Map()) {
   // A CO owns its route and cargo; source children describe the later delivery.
   if (clean(order.type).toUpperCase() === 'CO' || /^CO-/iu.test(clean(order.id))) {return order;}
@@ -34,13 +35,15 @@ export function projectSorOrder(order = {}, policies = new Map()) {
         sorAutoReturn: byLine.get(String(item.lineRowId)).sorAutoReturn} : item);
     const rentalPickupChanged = children.some((child,index) => child.sourceYard === RENTAL_YARD.code
       && order.childOrderDetails[index].sourceYard !== RENTAL_YARD.code);
-    const pickupLocations = [...new Set(children.flatMap(child => child.pickupLocations?.length
-      ? child.pickupLocations : [child.sourceYard]).filter(Boolean))];
-    const allRentalYard = children.every(child => child.sourceYard === RENTAL_YARD.code);
+    const pickupLocations = [...new Set([
+      ...children.flatMap(child => child.pickupLocations?.length ? child.pickupLocations : [child.sourceYard]),
+      ...[...(order.poPickupManifest || []), ...(order.directPickupManifest || [])].map(entry => entry.location)
+    ].filter(Boolean))];
+    const allRentalYard = children.every(child => child.sorOrder === true && child.sourceYard === RENTAL_YARD.code);
     return {...order, childOrderDetails:children, items, ...(rentalPickupChanged ? {
       pickupLocations, sourceYard:children[0].sourceYard,sourceAddress:children[0].sourceAddress
     } : {}), ...(allRentalYard ? {
-      sourceYard:RENTAL_YARD.code,sourceAddress:RENTAL_YARD.address,pickupLocations:[RENTAL_YARD.code]
+      sourceYard:RENTAL_YARD.code,sourceAddress:RENTAL_YARD.address,pickupLocations
     } : {})};
   }
   if (!isSorDeliveryRef(order.id) || order.type !== 'SO') {return order;}

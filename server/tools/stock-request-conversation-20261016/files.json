@@ -1,0 +1,20 @@
+[
+  "src/server.js",
+  "public/sales-stock-requests.html",
+  "public/scm-stock-requests.html",
+  "public/sales-stock-requests.js",
+  "public/scm-stock-requests.js",
+  "public/sales-special-stock-requests.js",
+  "public/scm-special-stock-requests.js",
+  "public/special-stock-information.js",
+  "public/backorder-stock-requests.js",
+  "public/regular-stock-reply.js",
+  "src/stock-request-conversation.js",
+  "src/stock-request-conversation-router.js",
+  "src/stock-request-conversation-domain.js",
+  "public/stock-request-conversation.js",
+  "public/stock-request-conversation.css",
+  "public/app-sidebar.js",
+  "public/stock-request-conversation-alert.js",
+  "migrations/293_stock_request_conversation_reads.sql"
+]

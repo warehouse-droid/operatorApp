@@ -1,0 +1,11 @@
+import { spawnSync } from 'node:child_process';
+import { readFile } from 'node:fs/promises';
+import { runNodeTestFilesIsolated } from '../test/support/test-database-isolation.mjs';
+const mode = process.argv[2] || 'final';
+const all = JSON.parse(await readFile('tools/transfer-yard-posting-suites.json', 'utf8'));
+const history = 'test/mbt/integration/movement-document-history.test.js';
+const files = all.filter(file => file !== history);
+const historyResult = spawnSync(process.execPath, ['--test', '--test-reporter=spec', history], { stdio: 'inherit' });
+if (mode !== 'baseline') files.push('test/mbt/integration/transfer-yard-posting.test.js');
+if (mode === 'reverse') files.reverse();
+process.exitCode = (await runNodeTestFilesIsolated(files, { label: `transfer-yard-${mode}` })) || historyResult.status || 0;

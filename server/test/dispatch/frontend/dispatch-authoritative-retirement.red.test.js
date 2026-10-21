@@ -63,6 +63,9 @@ const extractedFunctions = [
   "mergeFreshDispatchOperationalOrder",
   "mergeDispatchOrderSearchFeed",
   "applyPlannedAssignments",
+  "isMbtPlanningLoad",
+  "preserveMbtReadOnlyLoads",
+  "findLoad",
   "planPayload",
   "applySavedPlan",
   "resetPlanningBoard",
@@ -617,7 +620,12 @@ test("group then ungroup before autosave leaves one retirement intent and no rea
     dispatchSource.indexOf('if (action === "ungroup-order")'),
     dispatchSource.indexOf('if (action === "unsplit-order")')
   );
-  assert.match(ungroupBranch, /queueGlobalOrderRetirement\(actionOrderId\)/u);
+  if (ungroupBranch.includes("ungroupOrderWithPoCheck")) {
+    assert.match(ungroupBranch, /await ungroupOrderWithPoCheck\(actionOrderId\)/u);
+    assert.match(functionBody("ungroupOrderWithPoCheck"), /queueGlobalOrderRetirement\(orderId\)/u);
+  } else {
+    assert.match(ungroupBranch, /queueGlobalOrderRetirement\(actionOrderId\)/u);
+  }
 
   const groupBranch = dispatchSource.slice(
     dispatchSource.indexOf('if (action === "confirm-group")'),

@@ -1,0 +1,12 @@
+{
+  "reason": "These failures were reproduced with the saved original popup and sidebar UI; they precede the delivery changes.",
+  "failedTests": [
+    "Wait for Transfer requires ETA, sends the date, and keeps the selection after saving",
+    "changing queues discards an unfinished Resolve reply without submitting or closing the case"
+  ],
+  "testSourceHashes": {
+    "test/mbt/integration/regular-stock-resolution-browser.test.js": "d731ce64696269382c2484f9b24da83bef1237784ffe0d398a87f717354eaf2a",
+    "test/mbt/integration/special-stock-alert-browser.test.js": "bd51f6fa7a7ea4b4ea036b113dcf3977a199fe518a7893562348ad4ef0be2cbc"
+  },
+  "evidence": "test-artifacts/delivery-timeslot-notifications-20261014/baseline-alerts/run.log"
+}

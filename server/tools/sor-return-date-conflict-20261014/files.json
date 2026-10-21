@@ -1,0 +1,32 @@
+{
+  "runtime": [
+    "src/server.js",
+    "src/dispatch-planner-v2-repository.js"
+  ],
+  "primary": [
+    "test/dispatch/unit/dispatch-sor-return-date-conflict.test.js",
+    "test/dispatch/integration/dispatch-sor-return-date-conflict.test.js"
+  ],
+  "regressions": [
+    "test/dispatch/unit/dispatch-split-date-conflict.test.js",
+    "test/dispatch/integration/dispatch-split-date-conflict.test.js",
+    "test/dispatch/integration/dispatch-v2-command-flow.red.test.js",
+    "test/dispatch/integration/dispatch-save-reliability.test.js",
+    "test/dispatch/integration/sor-return-definition.test.js",
+    "test/dispatch/integration/sor-return-lifecycle.test.js",
+    "test/dispatch/integration/sor-rental-concurrency.test.js",
+    "test/dispatch/integration/dispatch-assignment-readiness-invariant.red.test.js"
+  ],
+  "support": [
+    "test/support/dispatch-split-date-conflict-harness.mjs",
+    "test/dispatch-sor-return-date-conflict-spec.md",
+    "tools/sor-return-date-conflict-20261014/run.py",
+    "tools/sor-return-date-conflict-20261014/check.mjs",
+    "tools/sor-return-date-conflict-20261014/coverage.py",
+    "tools/sor-return-date-conflict-20261014/mutations.mjs",
+    "tools/sor-return-date-conflict-20261014/deploy.py",
+    "tools/sor-return-date-conflict-20261014/full-suite-evidence.py",
+    "tools/sor-return-date-conflict-20261014/watchdog.mjs",
+    "tools/sor-return-date-conflict-20261014/files.json"
+  ]
+}

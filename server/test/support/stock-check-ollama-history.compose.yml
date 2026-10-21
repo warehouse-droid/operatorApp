@@ -1,0 +1,12 @@
+services:
+  test:
+    environment:
+      OLLAMA_BASE_URL: http://ollama:11434
+      OLLAMA_MODEL: qwen3:4b-instruct
+    networks:
+      - mbt_test_internal
+      - ollama_existing
+networks:
+  ollama_existing:
+    external: true
+    name: mbbs-operator-app_mbbs

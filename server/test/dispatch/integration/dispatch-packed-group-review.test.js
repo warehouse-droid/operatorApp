@@ -94,13 +94,13 @@ for (const [name, options] of [
   ["unfinished progress on open order", { status: "open", progress: true }],
   ["active preparation lock on packed order", { locked: true }]
 ]) {
-  test(`${name} keeps draft protection`, async () => {
+  test(`${name} permits dispatch planning and retains reconciliation draft protection`, async () => {
     await withTransaction(async () => {
       const f = await fixture(options);
       const group = (await getDispatchPlan(f.planId)).orders[0];
-      assert.equal(group.reconciliationApplicationStatus, "Reconcile Review");
-      assert.equal(group.reconciliationBlocked, true);
-      assert.match(group.reconciliationReason, /active operator packing draft/);
+      assert.equal(group.reconciliationApplicationStatus, "Queued");
+      assert.equal(group.reconciliationBlocked, false);
+      assert.equal((await activeSalesOrderFamilyDraft({ familyIds: f.ids, familyRefs: f.refs })).blocked, true);
     }, { rollback: true });
   });
 }
@@ -155,5 +155,25 @@ test("refreshing old group cards changes only review fields and preserves real r
     assert.equal(cachedAfter.card.reconciliationBlocked, false);
     assert.deepEqual(await sourceState(f), before);
     assert.deepEqual((await refreshPackedGroupReviews({ apply: true })).cleared, [], "refresh must be idempotent");
+  }, { rollback: true });
+});
+
+test('cached packing-only group cards use current authority before a plan has been reopened', async () => {
+  await withTransaction(async () => {
+    const f = await fixture({ status: 'preparing', stale: true });
+    const before = await sourceState(f);
+    await syncDispatchDeliveryGroupsFromPlan({ id: f.planId, planDate: '2099-11-27',
+      orders: before.snapshot[0].orders, trucks: [] });
+    const cached = await getDispatchOrderCatalogOrder(f.groupRef);
+    assert.equal(cached.dispatchPlanningRestricted, false);
+    assert.equal(cached.reconciliationBlocked, false);
+    assert.notEqual(cached.reconciliationStatus, 'review');
+    assert.deepEqual(await sourceState(f), before);
+    await query(`INSERT INTO scm_reconciliation_order_state(order_kind,source_order_netsuite_id,source_order_ref,
+      application_status,reconciliation_status,reconciliation_reason)
+      VALUES('SO',$1,$2,'Reconcile Review','review','Genuine source mismatch')`, [f.ids[0], f.refs[0]]);
+    const restricted = await getDispatchOrderCatalogOrder(f.groupRef);
+    assert.equal(restricted.dispatchPlanningRestricted, true);
+    assert.equal(restricted.reconciliationBlocked, true);
   }, { rollback: true });
 });

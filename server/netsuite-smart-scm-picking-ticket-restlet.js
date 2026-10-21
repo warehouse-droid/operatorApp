@@ -9,15 +9,15 @@
  *   Renders a transaction picking ticket. For backward compatibility, omitting
  *   action while supplying entityId also renders a picking ticket.
  *
- * POST action=salesOrderPdf or purchaseOrderPdf renders the native order PDF.
+ * GET/POST action=salesOrderPdf, purchaseOrderPdf or estimatePdf renders the native PDF.
  * POST action=updatePurchaseOrder applies narrowly scoped, version-checked PO edits.
  *
  * @NApiVersion 2.1
  * @NScriptType Restlet
  * @NModuleScope SameAccount
  */
-define(["N/error", "N/log", "N/record", "N/render", "N/runtime"], (error, log, record, render, runtime) => {
-  const VERSION = "3.2.0";
+define(["N/error", "N/log", "N/record", "N/render", "N/runtime", "N/search"], (error, log, record, render, runtime, search) => {
+  const VERSION = "3.4.0";
   const MAX_BASE64_CHARS = 9 * 1024 * 1024;
 
   function booleanValue(value, fallback = false) {
@@ -91,8 +91,10 @@ define(["N/error", "N/log", "N/record", "N/render", "N/runtime"], (error, log, r
         pickingTicket: true,
         purchaseOrderPdf: true,
         salesOrderPdf: true,
+        estimatePdf: true,
         updatePurchaseOrder: true,
         createSpecialSalesOrder: true,
+        createSpecialPurchaseOrder: true,
         specialOrderAdjustment: true,
         locationFilter: true,
         metadataOnly: true,
@@ -169,14 +171,26 @@ define(["N/error", "N/log", "N/record", "N/render", "N/runtime"], (error, log, r
     };
   }
 
-  function orderPdf(request, id, salesOrder) {
+  function orderPdf(request, id, kind) {
     const details = runtimeDetails();
     assertRequestedEnvironment(request, details);
     const entityId = positiveInteger(request.entityId, "entityId");
     const includeContent = booleanValue(request.includeContent, true);
-    const prefix = salesOrder ? 'SO' : 'PO';
-    // Verify the requested record type before printing its configured form.
-    record.load({ type: salesOrder ? record.Type.SALES_ORDER : record.Type.PURCHASE_ORDER, id: entityId, isDynamic: false });
+    const {type,prefix,action} = {
+      sales_order: {type:search.Type.SALES_ORDER,prefix:'SO',action:'salesOrderPdf'},
+      purchase_order: {type:search.Type.PURCHASE_ORDER,prefix:'PO',action:'purchaseOrderPdf'},
+      estimate: {type:search.Type.ESTIMATE,prefix:'EST',action:'estimatePdf'}
+    }[kind];
+    // A workflow-locked order cannot be loaded. Search checks the requested
+    // type and the integration role's visibility without opening it for editing.
+    const visible = search.create({
+      type,
+      filters: [['internalid', 'anyof', entityId], 'and', ['mainline', 'is', 'T']],
+      columns: ['internalid']
+    }).run().getRange({ start: 0, end: 1 });
+    if (visible.length !== 1 || Number(visible[0].id) !== entityId) {
+      throw error.create({ name: 'MBBS_ORDER_NOT_ACCESSIBLE', message: `The requested ${prefix} is unavailable to this role.`, notifyOff: true });
+    }
     const pdf = render.transaction({ entityId, printMode: render.PrintMode.PDF });
     const contentBase64 = includeContent ? String(pdf.getContents() || "") : "";
     if (includeContent && !contentBase64) {
@@ -187,7 +201,7 @@ define(["N/error", "N/log", "N/record", "N/render", "N/runtime"], (error, log, r
     }
     return {
       ok: true,
-      action: salesOrder ? "salesOrderPdf" : "purchaseOrderPdf",
+      action,
       version: VERSION,
       requestId: id,
       generatedAt: new Date().toISOString(),
@@ -242,8 +256,8 @@ define(["N/error", "N/log", "N/record", "N/render", "N/runtime"], (error, log, r
     for(const field of ['entity','location','subsidiary','currency','exchangerate','shipaddress','discountitem','discountrate','memo']) {
       header[field]=String(order.getValue({fieldId:field}) ?? '');
     }
-    const status=String(order.getText({fieldId:'orderstatus'}) || '').replace(/^(?:Sales Order|Purchase Order)\s*:\s*/i,'');
-    if(!/^(Pending Approval|Pending Submission|Pending Fulfillment|Pending Receipt)$/.test(status)) adjustmentError('Only pending, unexecuted orders can be adjusted.');
+    const status=String(order.getValue({fieldId:'orderstatus'}) ?? '').trim();
+    if(!['A','B'].includes(status)) adjustmentError(`Only pending, unexecuted orders can be adjusted (orderstatus=${status || 'unavailable'}).`);
     const lines=[];
     for(let index=0;index<order.getLineCount({sublistId:'item'});index++){
       const value=fieldId=>order.getSublistValue({sublistId:'item',fieldId,line:index});
@@ -312,6 +326,68 @@ define(["N/error", "N/log", "N/record", "N/render", "N/runtime"], (error, log, r
     }
   }
 
+  function nativePoConflict(message) {
+    throw error.create({name:'MBBS_SPECIAL_NATIVE_PO_CONFLICT',message,notifyOff:true});
+  }
+
+  function nativeSoSnapshot(order) {
+    const header={};
+    for(const field of ['entity','location','subsidiary','currency','exchangerate','discountitem','discountrate','memo']) header[field]=String(order.getValue({fieldId:field}) ?? '');
+    const lines=[];
+    for(let index=0;index<order.getLineCount({sublistId:'item'});index++){
+      const values={};
+      for(const field of ['lineuniquekey','item','quantity','units','rate','amount','description','taxcode','location','isclosed']) values[field]=String(order.getSublistValue({sublistId:'item',fieldId:field,line:index}) ?? '');
+      lines.push(values);
+    }
+    return JSON.stringify({header,lines});
+  }
+
+  function nativePoSelection(order,request) {
+    if(String(order.getValue({fieldId:'orderstatus'}))!=='B' || Number(order.getValue({fieldId:'location'}))!==request.locationId) nativePoConflict('The SO must be approved in the reviewed yard.');
+    const count=order.getLineCount({sublistId:'item'}),selected=[];
+    if(!Array.isArray(request.lines) || !request.lines.length || request.lines.length>200) nativePoConflict('Every reviewed material is required.');
+    for(const line of request.lines){
+      const key=positiveInteger(line.remoteLineId,'remoteLineId');
+      const indexes=[];
+      for(let i=0;i<count;i++)if(Number(order.getSublistValue({sublistId:'item',fieldId:'lineuniquekey',line:i}))===key)indexes.push(i);
+      if(indexes.length!==1 || selected.some(previous=>previous.index===indexes[0])) nativePoConflict('The exact SO material identities must be distinct.');
+      const index=indexes[0],value=fieldId=>order.getSublistValue({sublistId:'item',fieldId,line:index});
+      if(Number(value('item'))!==2055 || Number(value('quantity'))!==numericValue(line.quantity,'quantity',{positive:true})
+        || Number(value('units'))!==positiveInteger(line.unitId,'unitId') || Number(value('rate'))!==numericValue(line.salesRate,'salesRate')
+        || String(value('description')||'')!==String(line.description) || booleanValue(value('isclosed'))
+        || Number(value('quantityfulfilled')||0)!==0 || Number(value('quantitybilled')||0)!==0
+        || (value('createpo') && value('createpo')!=='SpecOrd')) nativePoConflict('The SO material changed after SCM review.');
+      numericValue(line.purchaseRate,'purchaseRate');
+      selected.push({index,line,poId:Number(value('createdpo')||0)});
+    }
+    const linked=selected.filter(line=>line.poId);
+    if(linked.length && (linked.length!==selected.length || new Set(linked.map(line=>line.poId)).size!==1)) nativePoConflict('The SO has partial or different PO links. Resolve them before continuing.');
+    for(let index=0;index<count;index++)if(order.getSublistValue({sublistId:'item',fieldId:'createpo',line:index}) && !order.getSublistValue({sublistId:'item',fieldId:'createdpo',line:index})) nativePoConflict('A native PO is already pending. Recover its link before saving again.');
+    return {selected,poId:linked[0]?.poId || null};
+  }
+
+  function createSpecialPurchaseOrder(request,id) {
+    assertRequestedEnvironment(request,runtimeDetails());
+    const entityId=positiveInteger(request.entityId,'entityId');
+    request={...request,locationId:positiveInteger(request.locationId,'locationId'),vendorId:positiveInteger(request.vendorId,'vendorId')};
+    positiveInteger(request.caseId,'caseId');
+    const load=()=>record.load({type:record.Type.SALES_ORDER,id:entityId,isDynamic:true});
+    const order=load(),before=nativeSoSnapshot(order),plan=nativePoSelection(order,request);
+    if(plan.poId)return {ok:true,action:'createSpecialPurchaseOrder',version:VERSION,entityId,purchaseOrderId:plan.poId,alreadyLinked:true};
+    for(const {index,line} of plan.selected){
+      order.selectLine({sublistId:'item',line:index});
+      for(const [fieldId,value] of [['povendor',request.vendorId],['porate',Number(line.purchaseRate)],['createpo','SpecOrd']]) order.setCurrentSublistValue({sublistId:'item',fieldId,value,forceSyncSourcing:true});
+      order.commitLine({sublistId:'item'});
+    }
+    if(nativeSoSnapshot(order)!==before) nativePoConflict('Setting the purchase fields changed SO commercial values. Nothing was saved.');
+    order.save({enableSourcing:true,ignoreMandatoryFields:false});
+    const after=load();
+    if(nativeSoSnapshot(after)!==before) nativePoConflict('SO commercial values changed during native PO creation. Reconcile the order before continuing.');
+    const verified=nativePoSelection(after,request);
+    if(!verified.poId) nativePoConflict('NetSuite has not generated the native PO link. Recover this operation; do not create a separate PO.');
+    return {ok:true,action:'createSpecialPurchaseOrder',version:VERSION,requestId:id,entityId,purchaseOrderId:verified.poId};
+  }
+
   function specialOrderAdjustment(request,id) {
     assertRequestedEnvironment(request,runtimeDetails());
     const sales=request.kind==='sales_order';
@@ -334,6 +410,12 @@ define(["N/error", "N/log", "N/record", "N/render", "N/runtime"], (error, log, r
     const after=adjustmentSnapshot(record.load({type,id:entityId,isDynamic:false}),sales);
     if(!adjustmentMatches(request.target,after))adjustmentError('The saved order needs reconciliation; retry SCM confirmation.');
     return {ok:true,action:'specialOrderAdjustment',version:VERSION,requestId:id,entityId,snapshot:after};
+  }
+
+  function salesOrderPackQuantity(value) {
+    if (value == null || (typeof value === 'string' && value.trim() === '')) return null;
+    if (!['number','string'].includes(typeof value) || !Number.isFinite(Number(value)) || Number(value) < 0 || Number(value) > 1e9) adjustmentError('Invalid PLT, LYR, SEC or PCS quantity.');
+    return Number(value) === 0 ? null : Number(value);
   }
 
   function createSpecialSalesOrder(request,id) {
@@ -369,6 +451,7 @@ define(["N/error", "N/log", "N/record", "N/render", "N/runtime"], (error, log, r
         if(line.location)set('location',positiveInteger(line.location.id,'location'));
         set('description',String(line.description||''));set('price',-1);set('rate',numericValue(line.rate,'rate'));
       }
+      for (const field of ['custcol_plt','custcol_lyr','custcol_sec','custcol_pcs']) set(field,salesOrderPackQuantity(line[field]));
       order.commitLine({sublistId:'item'});
     }
     const entityId=Number(order.save({enableSourcing:true,ignoreMandatoryFields:false}));
@@ -502,14 +585,16 @@ define(["N/error", "N/log", "N/record", "N/render", "N/runtime"], (error, log, r
       });
       if (action === "health") return health(request, id);
       if (action === "pickingticket") return pickingTicket(request, id);
-      if (action === "purchaseorderpdf") return orderPdf(request, id, false);
-      if (action === "salesorderpdf") return orderPdf(request, id, true);
+      if (action === "purchaseorderpdf") return orderPdf(request, id, 'purchase_order');
+      if (action === "salesorderpdf") return orderPdf(request, id, 'sales_order');
+      if (action === "estimatepdf") return orderPdf(request, id, 'estimate');
       if (action === "updatepurchaseorder") return updatePurchaseOrder(request, id);
+      if (action === 'createspecialpurchaseorder') return createSpecialPurchaseOrder(request,id);
       if (action === 'specialorderadjustment') return specialOrderAdjustment(request,id);
       if (action === 'createspecialsalesorder') return createSpecialSalesOrder(request,id);
       throw error.create({
         name: "MBBS_UNSUPPORTED_ACTION",
-        message: `Unsupported action "${String(request.action || "")}". Use health, pickingTicket, salesOrderPdf, purchaseOrderPdf, or updatePurchaseOrder.`,
+        message: `Unsupported action "${String(request.action || "")}". Use health, pickingTicket, salesOrderPdf, purchaseOrderPdf, estimatePdf, or updatePurchaseOrder.`,
         notifyOff: true
       });
     } catch (caught) {

@@ -1,0 +1,29 @@
+{
+  "tier": 3,
+  "specApproval": "not obtained (autonomous run)",
+  "scope": "Audit all locally known aggregate sales, purchase and transfer order lines without a date cutoff; compare with read-only authoritative NetSuite records, and audit related native-unit quantity, progress, price and weight calculations.",
+  "acceptance": [
+    "Discover aggregate items from the local and NetSuite item catalogs, including Screening and both yard-specific item families; do not reuse an incomplete hard-coded repair list.",
+    "Read each transaction line's configured unit conversion rate. Base 5.2 with rate 1.3 must become 4 Yard; base 6.75 with rate 1.35 must become 5 Yard. Ton lines with rate 1 remain unchanged.",
+    "Ordered, committed, backordered and received quantities use the transaction unit; native price times native quantity preserves the NetSuite line amount. Native webhook/REST quantities are not divided twice.",
+    "Compare every local aggregate source line to the exact NetSuite order, unique line key, item and UOM. Account explicitly for deleted lines, local splits, historical execution, and absent NetSuite evidence.",
+    "A data repair requires an exact current NetSuite match and an identified old-base-to-native discrepancy. Audit each changed line, preserve unrelated fields, and refresh affected display projections.",
+    "Check historical packing, loading, receiving and posting evidence before changing any execution quantity or completed record; source quantity corrections must not invent or repeat fulfillment.",
+    "Any runtime calculation defect receives a reproducing test, isolated verification and bounded regression testing before a narrow deployment; keep existing unrelated workspace changes intact.",
+    "Keep operational audit evidence; remove all disposable test containers, volumes and unused networks, then verify production health."
+  ],
+  "failureModel": {
+    "wrong conversion or double conversion": "configured UOM identity, concrete cases, round-trip properties, existing reader regression tests and deliberate mutants",
+    "partial or stale data repair": "bounded transactions, order and row locks, source-state checks, audit records, idempotence and disposable-database rollback/concurrency tests if a reusable repair runner is implemented",
+    "historical fulfillment corruption": "separate current source quantities from immutable operational evidence; exact remote fulfillment evidence before any progress correction",
+    "weight basis ambiguity": "inspect configured item weight unit and transaction/stock unit basis; do not infer density from material names",
+    "resource pressure": "read-only paginated source queries; tests use the existing shared 4 GiB/two-core slice; no production data or credentials in tests"
+  },
+  "setup": {
+    "newDependencies": [],
+    "commits": false,
+    "tools": "Existing Node, PostgreSQL client, Docker test images, node:test, fast-check, c8, ESLint and TypeScript where applicable",
+    "artifacts": "server/test-artifacts/aggregate-uom-audit-20261008",
+    "scripts": "server/tools/aggregate-uom-audit-20261008"
+  }
+}

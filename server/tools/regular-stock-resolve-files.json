@@ -1,0 +1,10 @@
+[
+  "src/regular-stock-resolution.js",
+  "public/regular-stock-resolution.js",
+  "src/server.js",
+  "public/scm-stock-requests.js",
+  "public/regular-stock-ui.js",
+  "public/regular-stock-purchase.js",
+  "public/scm-stock-requests.html",
+  "public/sales-stock-requests.html"
+]

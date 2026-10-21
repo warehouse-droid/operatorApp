@@ -1,0 +1,24 @@
+{
+  "specApproval": "not obtained (autonomous run)",
+  "tier": 3,
+  "setup": "Reuse installed Node, PostgreSQL, Playwright, c8, ESLint and fast-check in the bounded disposable Compose runner. No new dependencies or commits. Separate fenced app-only release; no production order mutation for this follow-up.",
+  "behaviors": [
+    "Both link dialogs expose one editable base quantity per item, labelled with its order UOM. Pallet, layer, section and piece quantities are display only.",
+    "PO base allocation 1673.6 SQFT against 2301.2 SQFT preserves 16 customer pallets and 6 residual pallets. Count allocation 16 EACH consumes all 16 target pieces.",
+    "Partial PO links derive physical coverage separately from each order line, including differing manual packing counts; full coverage leaves no phantom yard cargo.",
+    "TO options, suggestions, persisted allocations and remaining capacity use exact base quantities, including fractional values below one pallet or layer. Physical display is derived without rounding the base quantity.",
+    "TO matching and capacity group by item plus order UOM, and reject incompatible UOMs before writing. Existing allocations reduce remaining source capacity.",
+    "Negative, non-finite, excessive and stale requests fail atomically; legacy converted-only requests remain supported.",
+    "Background notices and order updates preserve PO/TO popup DOM, draft, focus and scroll; explicit refresh remains available.",
+    "Sety original route identity, photos, completed travel and 22/16/6 quantities survive. Dao completed driver evidence is unchanged."
+  ],
+  "failureModel": {
+    "quantity loss or duplicate cargo": "integration conservation and randomized proportional coverage",
+    "rounding base quantity": "fractional TO and PO persistence assertions",
+    "cross UOM capacity": "mixed-unit TO negative and remaining capacity scenarios",
+    "partial writes and stale UI": "transaction rollback and signature rejection regressions",
+    "driver evidence loss": "previous verified repair and driver save/reload regressions",
+    "popup reset": "real browser regression",
+    "deployment drift": "live capture, exact file hashes, image-only configuration, rollback and health checks"
+  }
+}

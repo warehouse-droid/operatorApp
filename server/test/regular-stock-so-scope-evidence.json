@@ -1,0 +1,203 @@
+{
+  "result": "Deployed; selected-line validation passes for the live request",
+  "spec": "test/regular-stock-so-scope-spec.json",
+  "specApproval": "not obtained (autonomous run); explicit user authorization to implement the fix",
+  "sourceHash": "7637fa56847e8e41c1827ff7b0c0a62ea9bac4d23cc5a6529baece3be1f98a70",
+  "deployment": {
+    "deployed": true,
+    "at": "2026-10-08T17:36:26.426114+00:00",
+    "imageId": "sha256:2bde2f54e306b9a7dbf41c22b03d416793bfc5c5a077b6d2e3a5131b739f7155",
+    "files": [
+      "src/regular-stock-handoff.js"
+    ],
+    "configurationPreserved": true,
+    "dependenciesPreserved": true,
+    "productionHealthy": true
+  },
+  "liveReadOnlyCheck": {
+    "checkedAt": "2026-10-08T17:36:50.993Z",
+    "request": "STREQ-000105",
+    "salesOrder": "SOA09945",
+    "requestStatus": "completed",
+    "storedHandoffStatus": "attention",
+    "selectedLines": [
+      {
+        "item": "BWS-PW-REG-BM",
+        "quantity": 24,
+        "unit": "PC"
+      }
+    ],
+    "originalLineCount": 8,
+    "currentLineCount": 9,
+    "relevantDifferences": [],
+    "selectedLineValidationPasses": true,
+    "businessRecordsModified": false
+  },
+  "acceptanceMapping": {
+    "unrelated additions removals edits and ordering": "regular-stock-so-scope.test.js: unselected cases and generated property",
+    "selected identity quantity unit yard backorder fulfillment": "regular-stock-so-scope.test.js: selected changes, removed selected identity, generated negative property",
+    "order identity customer header yard": "regular-stock-so-scope.test.js: SO header cases",
+    "preserved selection and no duplicate transfer": "regular-stock-so-scope.test.js: saved owners/mappings assertions and committed-transfer retry case",
+    "manual approvals": "regular-stock-so-scope.test.js: manual approval case",
+    "unselected kit changes": "regular-stock-kit.test.js: changed components and generated property",
+    "non-Delivery workflow": "regular-stock-so-scope.test.js: whole-order validation case; existing handoff regression suite"
+  },
+  "verification": {
+    "red": {
+      "newBehaviorFailures": 9,
+      "log": "test-artifacts/regular-stock-so-scope-20261008/red/focused.log"
+    },
+    "targeted": {
+      "name": "focused",
+      "exitCode": 0,
+      "tests": 27,
+      "passed": 27,
+      "failed": 0,
+      "skipped": 0,
+      "failures": []
+    },
+    "regressions": {
+      "name": "regressions",
+      "exitCode": 1,
+      "tests": 384,
+      "passed": 377,
+      "failed": 7,
+      "skipped": 0,
+      "failures": [
+        "browser can uncheck either backordered line, recalculate and submit only the checked line on desktop and mobile",
+        "desktop and phone Resolve require PO and ETA, retain the reply through refresh, and close both Stocking types",
+        "unknown PO errors retain entered PO/ETA, and Cancel does not close the case",
+        "changing queues discards an unfinished Resolve reply without submitting or closing the case",
+        "Sales notification opens the resolved case and its PO/ETA once, and remains dismissed after refresh",
+        "Sales and SCM list filters are combined server-side and returned requests sort first",
+        "stock-request feedback is content-sized and availability shows Sales plus conversion equivalents"
+      ]
+    },
+    "newRegressionFailures": [],
+    "coverageRun": {
+      "name": "coverage",
+      "exitCode": 0,
+      "tests": 53,
+      "passed": 53,
+      "failed": 0,
+      "skipped": 0,
+      "failures": []
+    },
+    "changedLines": {
+      "covered": 4,
+      "total": 4
+    },
+    "changedBranches": {
+      "covered": 9,
+      "total": 9
+    },
+    "mutations": {
+      "killed": 7,
+      "total": 7,
+      "alsoKilledByPropertySuite": 7
+    },
+    "newOrChangedTestsIndividuallyObservedFailing": 24,
+    "generatedCasesPerFocusedRun": 80,
+    "propertySeeds": [
+      1052026,
+      1052027,
+      121865
+    ],
+    "types": {
+      "newDiagnostics": 0,
+      "existingDiagnostics": 10529
+    },
+    "lint": {
+      "errors": 0
+    },
+    "syntax": "passed",
+    "sourceOrderChecks": [
+      {
+        "name": "reordered-0",
+        "exitCode": 0,
+        "tests": 5,
+        "passed": 5,
+        "failed": 0,
+        "skipped": 0,
+        "failures": []
+      },
+      {
+        "name": "reordered-1",
+        "exitCode": 0,
+        "tests": 19,
+        "passed": 19,
+        "failed": 0,
+        "skipped": 0,
+        "failures": []
+      },
+      {
+        "name": "reordered-2",
+        "exitCode": 0,
+        "tests": 22,
+        "passed": 22,
+        "failed": 0,
+        "skipped": 0,
+        "failures": []
+      },
+      {
+        "name": "reordered-3",
+        "exitCode": 0,
+        "tests": 7,
+        "passed": 7,
+        "failed": 0,
+        "skipped": 0,
+        "failures": []
+      }
+    ],
+    "runtime": "Built image hash matches the exact tested candidate; app import and live health passed",
+    "toolchain": {
+      "node": "v20.20.2",
+      "fast-check": "4.9.0",
+      "c8": "12.0.0",
+      "eslint": "10.8.0",
+      "typescript": "7.0.2"
+    }
+  },
+  "iterations": [
+    "Nine intended behavior failures reproduced before implementation",
+    "Fixed one new implicit-any diagnostic and strengthened type comparison to count repeated messages; reran the final checks",
+    "First deployment attempt waited for an active database transaction; subsequent attempt passed all activity and health checks"
+  ],
+  "knownLimits": {
+    "baselineFailures": [
+      "browser can uncheck either backordered line, recalculate and submit only the checked line on desktop and mobile",
+      "desktop and phone Resolve require PO and ETA, retain the reply through refresh, and close both Stocking types",
+      "unknown PO errors retain entered PO/ETA, and Cancel does not close the case",
+      "changing queues discards an unfinished Resolve reply without submitting or closing the case",
+      "Sales notification opens the resolved case and its PO/ETA once, and remains dismissed after refresh",
+      "Sales and SCM list filters are combined server-side and returned requests sort first",
+      "stock-request feedback is content-sized and availability shows Sales plus conversion equivalents"
+    ],
+    "baselineFailureReasons": [
+      "Five browser cases fail to launch Chromium under the existing read-only image setup",
+      "One shared test-database filtering assertion",
+      "One pre-existing UI layout contract mismatch"
+    ],
+    "existingTypeDebt": 10529,
+    "remoteRaceWindow": "Unchanged; no atomic NetSuite snapshot/write guarantee added",
+    "liveRequest": "Read-only verification. The saved warning is re-evaluated on Retry / check progress. The earlier transfer synchronization issue and Completed label are separate."
+  },
+  "skipped": {
+    "repositoryWideSuite": "Unrelated dirty workspace; full regular-stock and legacy stock-request suites compared against captured production",
+    "browserVisuals": "No UI change; existing browser tests included in the regression comparison",
+    "supplyChainAudit": "No dependency changes"
+  },
+  "reproduceFromRepositoryRoot": [
+    "python3 server/tools/regular-stock-so-scope-check.py final",
+    "python3 server/tools/regular-stock-so-scope-check.py proofs"
+  ],
+  "environment": "Existing captured production code baseline and installed mbbs-delivery-requests:static image; Docker access required; standard isolated Compose configuration, synthetic data and bounded mbbs-tests.slice",
+  "cleanup": "All task Compose environments were removed with down --volumes --remove-orphans. Image check containers used --rm; docker ps and docker ps -a were checked. Production data and rollback image retained.",
+  "cleanupConcurrentWorkload": {
+    "name": "mbbs-dispatch-open-gauntlet-234696",
+    "createdAt": "2026-10-08T17:38:33.907007033Z",
+    "lifecycle": "disposable-test",
+    "cgroup": "mbbs-tests.slice",
+    "disposition": "Separate active task started during final verification; preserved to avoid interrupting concurrent work. No containers, volumes or networks from this fix remain."
+  }
+}

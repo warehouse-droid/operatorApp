@@ -39,11 +39,11 @@ test('directory customer identity persists from enquiry through SO draft without
  d=await repo.respondSpecialStockLine(d.id,d.lines[0].id,{expectedRevision:d.revision,supplyStatus:'in_stock',availabilityMode:'no_projection',vendorId:8899200,vendorName:'TEST vendor brand',vendorYard:'TEST yard'},context);
  d=await repo.decideSpecialStockLine(d.id,d.lines[0].id,{expectedRevision:d.revision,decision:'accepted'},context);
  const draft={expectedRevision:d.revision,customerId:id,operationalYardLocationId:1,fulfillmentMethod:'yard_pickup',palletTotal:0,materialLines:[{caseLineId:d.lines[0].id,itemId:2055,description:'TEST product',packageQuantity:2,conversionToPc:1,quantity:2,uom:'PC',rate:120,discountPercent:10}]};
- d=await repo.saveSpecialSalesOrderDraft(d.id,draft,context);assert.equal(d.customerId,id);assert.equal(d.salesOrderLines[0].quantity,2);assert.equal(d.salesOrderLines[0].rate,108);
+ d=await repo.saveSpecialSalesOrderDraft(d.id,draft,context);assert.equal(d.customerId,id);assert.equal(d.salesOrderLines[0].quantity,2);assert.equal(d.salesOrderLines[0].rate,120);
  const payload=buildSpecialSalesOrderPayload({caseId:d.id,netsuiteLocationId:1,pickupMethodId:1,deliveryMethodId:2,draft:{customerId:d.customerId,fulfillmentMethod:'yard_pickup',materialLines:d.salesOrderLines}});
  assert.equal(Number(payload.entity.id),id);
  await query("INSERT INTO sales_orders(netsuite_id,tranid,customer_id,status_text,netsuite_active) VALUES(8899570,'TEST-WRONG-CUSTOMER',8899502,'Pending Fulfillment',true)");
- await assert.rejects(()=>repo.linkSpecialSalesOrder(d.id,{expectedRevision:d.revision,salesOrderId:8899570,salesOrderRef:'TEST-WRONG-CUSTOMER'},context),{code:'SPECIAL_SO_CUSTOMER_MISMATCH'});
+ await assert.rejects(()=>repo.linkSpecialSalesOrder(d.id,{expectedRevision:d.revision,source:'standalone',salesOrderId:8899570,salesOrderRef:'TEST-WRONG-CUSTOMER'},context),{code:'SPECIAL_SO_CUSTOMER_MISMATCH'});
  await canonical(id+2);
  d=await repo.saveSpecialSalesOrderDraft(d.id,{...draft,expectedRevision:d.revision,customerId:id+2},context);assert.equal(d.customerId,id+2);
  const stored=(await query('SELECT canonical_customer_id,directory_customer_id FROM sales_special_stock_cases WHERE request_id=$1',[d.id])).rows[0];

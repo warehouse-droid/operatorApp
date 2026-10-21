@@ -3,13 +3,13 @@ import { SPECIAL_LINE_PACK_FIELDS } from '../public/special-stock-line-fields.js
 import { sumSpecialAmounts } from './special-stock-discount-total.js';
 import { normalizeSpecialDiscount, normalizeSpecialRate, specialPalletQuantity, specialQuantity, specialDiscountLineAmount } from '../public/special-stock-pricing.js';
 /**
- * @typedef {{remoteLineId:number|null,itemId:number,quantity:number|null,unitId:number|null,rate:string,description:string,locationId:number|null,taxCode:string,createdPoId:number|null,createPo:string,pack?:Record<string,number>}} SnapshotLine
+ * @typedef {{remoteLineId:number|null,itemId:number,quantity:number|null,unitId:number|null,rate:string,description:string,locationId:number|null,taxCode:string,createdPoId:number|null,createPo:string,pack?:Record<string,number|null>}} SnapshotLine
  * @typedef {{header:Record<string,string|number>,lines:SnapshotLine[]}} Snapshot
  * @typedef {{id:number,kind:string}} Identity
- * @typedef {{remoteLineId:number,itemId:number,quantity:number,rate:number,unitId:number,description:string,toQuantity:number,toRate?:number,nativeDiscountPercent?:number|null,toNativeDiscountPercent?:number|null,toDescription?:string,fromPack?:Record<string,number>,toPack?:Record<string,number>}} Change
+ * @typedef {{remoteLineId:number,itemId:number,quantity:number,rate:number,unitId:number,description:string,toQuantity:number,toRate?:number,nativeDiscountPercent?:number|null,toNativeDiscountPercent?:number|null,toDescription?:string,fromPack?:Record<string,number>,toPack?:Record<string,number|null>}} Change
  * @typedef {{fromQuantity:number,toQuantity:number,rate:number,unitId?:number}} Pallets
  * @typedef {Identity & {lines:Change[],pallets?:Pallets,discountMode?:string,vendorDiscountTotal?:{before:number,after:number}}} InputOrder
- * @typedef {Identity & {baseline:Snapshot,target:Snapshot,reviewedFields?:Array<{remoteLineId:number,description?:string,pack?:Record<string,number>}>}} PreparedOrder
+ * @typedef {Identity & {baseline:Snapshot,target:Snapshot,reviewedFields?:Array<{remoteLineId:number,description?:string,pack?:Record<string,number|null>}>}} PreparedOrder
  * @typedef {{version:number,orders:PreparedOrder[]}} Plan
  * @typedef {{snapshot:(order:Identity)=>Promise<Snapshot>,apply:(order:PreparedOrder)=>Promise<unknown>,validate?:(plan:Plan)=>unknown}} Boundary
  */
@@ -57,7 +57,7 @@ function materialTarget(order,baseline) {
       before.description = change.toDescription;
     }
     for (const [field, value] of Object.entries(change.toPack || {})) {
-      if (!SPECIAL_LINE_PACK_FIELDS.includes(field) || typeof value !== 'number' || !Number.isFinite(value) || value < 0 || value > 1e9
+      if (!SPECIAL_LINE_PACK_FIELDS.includes(field) || (value !== null && (typeof value !== 'number' || !Number.isFinite(value) || value < 0 || value > 1e9))
         || Number(before.pack?.[field] ?? 0) !== change.fromPack?.[field]) throw conflict('The issued packing no longer matches its review.');
       before.pack = { ...before.pack, [field]: value };
     }

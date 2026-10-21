@@ -6,6 +6,7 @@ import {
   fetchCreditMemoMetadataFromNetSuite,
   fetchReturnAuthorizationFromNetSuite,
   fetchSalesOrderReturnLinesFromNetSuite,
+  readNetSuiteRestlet,
   resolvePalletItemFromNetSuite,
   suiteql,
   suiteqlAll
@@ -13,6 +14,8 @@ import {
 import { buildPalletReturnAuthorizationPayload, verifyReturnAuthorizationSnapshot } from "./return-ra-workflow.js";
 import { query } from "./db.js";
 import { mapStoredReturnSalesOrderLines } from "./return-stored-orderline.js";
+import { config } from "./config.js";
+import { parsePalletSavedSearch } from "./return-pallet-saved-search.js";
 
 export const CONFIRMED_RETURN_REASONS = Object.freeze([
   { id: 5, code: "R1", label: "R1 - Color Variation", kind: "quality" },
@@ -448,6 +451,8 @@ export function summarizePalletActivityRows(rows = []) {
 export function palletActivityQuery(customerId, palletItemId) {
   const id = positiveId(customerId, "NetSuite customer ID");
   const itemId = positiveId(palletItemId, "NetSuite PALLET item ID");
+  // Actual fulfillment item rows can be mainline=T. Exclude their COGS/asset
+  // mirrors with iscogs=F instead of discarding those real item rows.
   return `
     SELECT
       0 AS transaction_id,
@@ -467,7 +472,7 @@ export function palletActivityQuery(customerId, palletItemId) {
       ON tl.transaction = t.id
     WHERE t.type = 'ItemShip'
       AND tl.item = ${itemId}
-      AND tl.mainline = 'F'
+      AND tl.iscogs = 'F'
       AND (tl.taxline = 'F' OR tl.taxline IS NULL)
       AND UPPER(NVL(BUILTIN.DF(t.status), '')) NOT LIKE '%VOID%'
       AND UPPER(NVL(BUILTIN.DF(t.status), '')) NOT LIKE '%CANCEL%'
@@ -493,6 +498,7 @@ export function palletActivityQuery(customerId, palletItemId) {
       ON tl.transaction = t.id
     WHERE t.type = 'CustCred'
       AND tl.item = ${itemId}
+      AND tl.iscogs = 'F'
       AND tl.mainline = 'F'
       AND (tl.taxline = 'F' OR tl.taxline IS NULL)
       AND UPPER(NVL(BUILTIN.DF(t.status), '')) NOT LIKE '%VOID%'
@@ -509,9 +515,56 @@ export function palletActivityQuery(customerId, palletItemId) {
   `;
 }
 
-export async function fetchPalletBalanceFromNetSuite(customerId, { force = false } = {}) {
+/** @param {number} customerId
+ * @param {number} palletItemId
+ */
+export function palletCreditIdentityQuery(customerId, palletItemId) {
   const id = positiveId(customerId, "NetSuite customer ID");
-  const cacheKey = String(id);
+  const itemId = positiveId(palletItemId, "NetSuite PALLET item ID");
+  return `
+    SELECT DISTINCT t.id AS transaction_id, t.externalid
+    FROM transaction t /* return_pallet_credit_identity */
+    INNER JOIN transactionline tl ON tl.transaction = t.id
+    WHERE t.entity = ${id} AND t.type = 'CustCred'
+      AND tl.item = ${itemId} AND tl.iscogs = 'F' AND tl.mainline = 'F'
+      AND (tl.taxline = 'F' OR tl.taxline IS NULL)
+      AND UPPER(NVL(BUILTIN.DF(t.status), '')) NOT LIKE '%VOID%'
+      AND UPPER(NVL(BUILTIN.DF(t.status), '')) NOT LIKE '%CANCEL%'
+      AND UPPER(NVL(BUILTIN.DF(t.status), '')) NOT LIKE '%REJECT%'
+    ORDER BY transaction_id
+  `;
+}
+
+/** @param {number} customerId
+ * @param {{id: number}} pallet
+ * @param {string} endpoint
+ * @param {boolean} includeCreditIdentity
+ */
+async function savedPalletBalance(customerId, pallet, endpoint, includeCreditIdentity) {
+  // Observe credits before the net balance. A credit posted afterwards stays
+  // reserved locally until the next lookup, instead of releasing quota against
+  // a report snapshot taken before that credit existed.
+  /** @type {{externalid: string, transaction_id: number | string}[]} */
+  const credits = includeCreditIdentity
+    ? await suiteqlAll(palletCreditIdentityQuery(customerId, pallet.id)) : [];
+  const target = new URL(endpoint);
+  target.searchParams.set("customerId", String(customerId));
+  const report = parsePalletSavedSearch(await readNetSuiteRestlet(target.toString()), customerId);
+  return {
+    item: pallet,
+    ...report,
+    fulfilled: null,
+    netsuiteReturned: null,
+    externalIds: credits.map(row => row.externalid).filter(Boolean),
+    transactionIds: credits.map(row => Number(row.transaction_id))
+      .filter(id => Number.isSafeInteger(id) && id > 0)
+  };
+}
+
+export async function fetchPalletBalanceFromNetSuite(customerId, { force = false, includeCreditIdentity = true } = {}) {
+  const id = positiveId(customerId, "NetSuite customer ID");
+  const endpoint = config.netsuite.palletBalanceRestletUrl;
+  const cacheKey = `${id}|${endpoint || "transactions"}|${includeCreditIdentity}`;
   if (!force) {
     const cached = cachedValue(palletBalanceCache, cacheKey);
     if (cached) return cached;
@@ -520,6 +573,11 @@ export async function fetchPalletBalanceFromNetSuite(customerId, { force = false
   }
   const lookup = (async () => {
     const pallet = await resolvePalletItemFromNetSuite();
+    if (endpoint) {
+      const balance = await savedPalletBalance(id, pallet, endpoint, includeCreditIdentity);
+      storeCachedValue(palletBalanceCache, cacheKey, balance, PALLET_BALANCE_CACHE_TTL_MS);
+      return balance;
+    }
     const rows = await suiteqlAll(palletActivityQuery(id, pallet.id));
     const summary = summarizePalletActivityRows(rows);
     const balance = {

@@ -1,0 +1,45 @@
+{
+  "runtime": [
+    "src/operator-order-progress-repository.js",
+    "src/operator-order-reopen-repository.js",
+    "src/operator-load-state-repository.js",
+    "src/scm-dependency-preview-service.js",
+    "src/scm-dependency-management-policy.js",
+    "src/server.js",
+    "src/delivery-repository.js",
+    "src/operator-netsuite-posting-controller.js",
+    "src/driver-repository.js",
+    "public/control-order-reopen.js",
+    "public/control.js",
+    "public/control.html",
+    "public/app-sidebar.js",
+    "public/operator.js",
+    "public/operator.html",
+    "migrations/281_operator_order_reopens.sql"
+  ],
+  "primary": [
+    "test/dispatch/unit/operator-progress-message.test.js",
+    "test/dispatch/integration/control-order-reopen.test.js",
+    "test/dispatch/integration/control-order-reopen-local.test.js",
+    "test/dispatch/integration/control-order-reopen-http.test.js",
+    "test/dispatch/integration/operator-attribution-ownership.test.js"
+  ],
+  "regressions": [
+    "test/mbt/unit/scm-dependency-management-policy.red.test.js",
+    "test/dispatch/integration/to-dependency-packing-independent.test.js",
+    "test/dispatch/integration/scm-dependency-preview-blockers.red.test.js",
+    "test/dispatch/integration/scm-to-untouched-lines.test.js",
+    "test/dispatch/integration/co-source-packing-handoff.test.js",
+    "test/dispatch/integration/dispatch-po-split-link-target.test.js",
+    "test/mbt/integration/operator-yard-access.test.js",
+    "test/mbt/integration/customer-pickup-yard-scope.test.js",
+    "test/mbt/integration/operator-customer-pickup-photo-gate.red.test.js",
+    "test/mbt/integration/operator-netsuite-posting-repository.red.test.js",
+    "test/mbt/integration/operator-posting-http-timing.test.js",
+    "test/mbt/integration/consolidation-load.test.js",
+    "test/mbt/integration/driver-reopen-replan.test.js",
+    "test/dispatch/frontend/dispatch-packing-planning.test.js",
+    "test/mbt/unit/sales-order-reload-photo-entry.test.js",
+    "test/mbt/unit/consolidation-load.test.js"
+  ]
+}

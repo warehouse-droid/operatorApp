@@ -1,0 +1,16 @@
+[
+  "src/inventory-damage-service.js",
+  "src/inventory-damage-posting-proof.js",
+  "src/inventory-damage-netsuite.js",
+  "src/operator-inventory-router.js",
+  "public/damage-draft-cache.js",
+  "public/operator-inventory.js",
+  "public/operator.html",
+  "public/service-worker.js",
+  "public/i18n.js",
+  "src/inventory-damage-repository.js",
+  "src/control-damage-service.js",
+  "public/control-damage.js",
+  "public/control.html",
+  "src/control-damage-domain.js"
+]

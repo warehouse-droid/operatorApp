@@ -1,0 +1,12 @@
+[
+  "src/inventory-damage-photo-links.js",
+  "src/inventory-damage-service.js",
+  "src/inventory-damage-netsuite.js",
+  "public/control.js",
+  "public/control-damage.js",
+  "public/damage-photo-download.js",
+  "public/control-damage.css",
+  "public/control.html",
+  "public/i18n.js",
+  "src/control-damage-router.js"
+]

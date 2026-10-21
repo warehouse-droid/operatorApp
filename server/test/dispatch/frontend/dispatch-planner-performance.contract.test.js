@@ -263,7 +263,10 @@ test("DP-05/DP-16 frontend: normal autosave uses guarded semantic deltas with a 
 });
 
 test("DPO-10 frontend: indexed search is bounded, cancellable, paged, and hydrated before mutation", () => {
-  const search = functionBody("loadDispatchOrderSearch");
+  const requestBuilder = functionBody("dispatchOrderFeedRequest");
+  const searchCaller = functionBody("loadDispatchOrderSearch");
+  assert.match(searchCaller, /dispatchOrderFeedRequest/u);
+  const search = searchCaller + requestBuilder;
   assert.match(search, /plannerOrderPoolMode\s*===\s*["']on["']/u);
   assert.match(search, /plannerOrderPoolMode\s*===\s*["']shadow["']/u);
   assert.match(search, /versionedPool/u);
@@ -271,7 +274,9 @@ test("DPO-10 frontend: indexed search is bounded, cancellable, paged, and hydrat
   assert.match(search, /\/api\/dispatch\/v2\/order-pool/u);
   const schedule = functionBody("scheduleDispatchOrderSearch");
   assert.match(schedule, /225/u);
-  const load = functionBody("loadDispatchOrders");
+  const loadCaller = functionBody("loadDispatchOrders");
+  assert.match(loadCaller, /dispatchOrderFeedRequest/u);
+  const load = loadCaller + requestBuilder;
   assert.match(load, /plannerOrderPoolMode\s*===\s*["']shadow["']/u,
     "Shadow mode must exercise the versioned endpoint while the server still returns the legacy result.");
   assert.match(load, /versionedPool/u);
@@ -407,6 +412,7 @@ test("history edit mode scopes reconciliation-complete feeds to a leased past da
     let historyEditMode = false;
     let currentPlanDate = "2026-08-09";
     let planEditLeaseToken = "test-history-lease";
+    const dispatchSessionId = "test-history-session";
     function isDispatchHistoryEditMode() { return historyEditMode; }
     ${requestSource}
     return {
@@ -852,7 +858,7 @@ test("cached order pools refresh global assignment ownership before edit, plan r
   const jump = functionBody("jumpToPlannedOrder");
   const events = functionBody("connectEvents");
 
-  assert.match(enterEdit, /await\s+refreshPlannedAssignments\(\)/u,
+  assert.match(enterEdit, /await\s+refreshPlannedAssignments\(\{ includeSnapshots: false \}\)/u,
     "Entering Edit Mode must clear assignment flags left by an earlier plan revision.");
   assert.match(loadPlan, /await\s+refreshPlannedAssignments\(\)/u,
     "A date switch must not reuse stale cross-date assignment flags from the cached pool.");

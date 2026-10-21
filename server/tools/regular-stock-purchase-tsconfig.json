@@ -1,0 +1,4 @@
+{
+  "compilerOptions": {"allowJs":true,"checkJs":true,"strict":true,"noEmit":true,"skipLibCheck":true,"module":"NodeNext","target":"ES2023"},
+  "files": ["../src/regular-stock-purchase-domain.js"]
+}

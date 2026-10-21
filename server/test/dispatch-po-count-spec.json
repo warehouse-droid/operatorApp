@@ -1,0 +1,15 @@
+{
+  "tier": 3,
+  "specApproval": "not obtained (autonomous run)",
+  "scope": "CE94489 Sety Load 1, 2026-10-19, linked PO #3022301585 and group GOB-122755-122934",
+  "acceptance": [
+    "PO remains 22 pallets. Vendor pickup carries 22 exactly once when the residual PO and linked group share a load: 16 to linked customers and 6 to 2967.",
+    "A fully linked 16 EACH pallet line displayed as 16 PCS has no residual pickup at 2967. Partial count allocations conserve quantities. Do not equate arbitrary sales units or infer pack conversions.",
+    "Grouped member driver pickups retain only each member's allocated PO lines, including when no standalone PO is planned. Cancelled links disappear; unrelated siblings gain no cargo.",
+    "Sety's route starts at the original 3445 to PERMACON travel, preserving its job identity, status and timestamps. Retain five original pickup photos and reopened pending state; never mark a pickup or delivery complete.",
+    "Correct only the latest target load and order projections, with revision and fleet locks, archive and audit; preserve unrelated dispatch work and all driver job rows.",
+    "Full and incremental saves and reloads retain the corrected allocation and route. Real executed cargo edits remain protected.",
+    "PO and TO link dialogs preserve their DOM, draft, focus, cursor and scroll during notices, alerts, execution updates and order-feed refreshes. Explicit refresh, matching, successful linking, unlinking, closing and switching targets still update the dialog. Submission retains server signature/quantity validation."
+  ],
+  "validation": "RED before implementation, isolated database regression plus deterministic quantity properties and targeted mutants, syntax/lint checks, exact candidate image hashes, read-only production verification and mandatory disposable test cleanup."
+}

@@ -1,0 +1,25 @@
+services:
+  db:
+    labels:
+      com.mbbs.lifecycle: disposable-test
+  test:
+    image: ${CUSTOMER_WEBHOOK_TEST_IMAGE:-mbbs-to-yard-test-browser:20261009}
+    working_dir: /app
+    user: "1000:1000"
+    labels:
+      com.mbbs.lifecycle: disposable-test
+    environment:
+      NETSUITE_ACCOUNT_ID: CUSTOMER_WEBHOOK_TEST
+    volumes:
+      - ./server/package.json:/app/package.json:ro
+      - ${CUSTOMER_WEBHOOK_NODE_MODULES:-./server/test-artifacts/operator-to-yard-flow-tooling/node_modules}:/app/node_modules:ro
+      - ./server/contracts:/app/contracts:ro
+      - ./server/tsconfig.mbt.json:/app/tsconfig.mbt.json:ro
+      - ./server/.c8rc.json:/app/.c8rc.json:ro
+      - ./server/src:/app/src:ro
+      - ./server/test:/app/test:ro
+      - ./server/tools:/app/tools:ro
+      - ./server/migrations:/app/migrations:ro
+      - ./server/public:/app/public:ro
+      - ./server/netsuite-customer-webhook-user-event.js:/app/netsuite-customer-webhook-user-event.js:ro
+      - ./server/eslint.mbt.config.js:/app/eslint.mbt.config.js:ro

@@ -1,0 +1,4 @@
+services:
+  test:
+    volumes:
+      - /home/ubuntu/apps/operatorApp/server/src/sor-return-readiness.js:/app/src/sor-return-readiness.js:ro

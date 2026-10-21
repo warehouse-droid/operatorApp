@@ -45,7 +45,9 @@ test("D1 twelve simultaneous stock/pallet retries share one RA without exhaustin
 test("D1 a lost creation response recovers the same RA from the other member record", async t => {
   const remote = await fixture(t);
   remote.control.failAfterCreate = true;
-  const result = await submit(await submitInput({ pallet: true }));
+  const result = await submitReturnBatch({ operatorId: actor, input: await submitInput({ pallet: true }), autoSync: false });
+  await assert.rejects(syncReturnRecord({ recordId: result.stockReturn.id }), /connection lost/);
+  result.records = await Promise.all(result.records.map(record => getReturnRecordDetail(record.id)));
   assert.ok(result.records.every(record => record.netSuiteSyncStatus === "failed"));
   assert.equal(creates(remote).length, 1);
   const recovered = await syncReturnRecord({ recordId: result.palletReturn.id });
@@ -58,7 +60,8 @@ test("D1 an unfindable uncertain RA never creates a replacement and cannot be vo
   const remote = await fixture(t);
   remote.control.failAfterCreate = true;
   remote.control.hideExternalId = true;
-  const result = await submit(await submitInput({ pallet: true }));
+  const result = await submitReturnBatch({ operatorId: actor, input: await submitInput({ pallet: true }), autoSync: false });
+  await assert.rejects(syncReturnRecord({ recordId: result.stockReturn.id }), /connection lost/);
   await assert.rejects(syncReturnRecord({ recordId: result.palletReturn.id }), { code: "RETURN_RA_CREATION_UNCERTAIN" });
   await assert.rejects(voidReturnRecord({ recordId: result.stockReturn.id, actorOperatorId: actor, reason: "Do not lose uncertain RA" }), /unconfirmed|uncertain/i);
   assert.equal(creates(remote).length, 1);
@@ -67,7 +70,9 @@ test("D1 an unfindable uncertain RA never creates a replacement and cannot be vo
 test("D2 a bad PALLET readback fails the whole batch and retains its ID for recovery", async t => {
   const remote = await fixture(t);
   remote.control.alter = snapshot => { snapshot.item.items.at(-1).quantity += 1; };
-  const result = await submit(await submitInput({ pallet: true }));
+  const result = await submitReturnBatch({ operatorId: actor, input: await submitInput({ pallet: true }), autoSync: false });
+  await assert.rejects(syncReturnRecord({ recordId: result.stockReturn.id }), { code: "RETURN_RA_VERIFICATION_FAILED" });
+  result.records = await Promise.all(result.records.map(record => getReturnRecordDetail(record.id)));
   assert.ok(result.records.every(record => record.netSuiteSyncStatus === "failed"));
   assert.ok(result.records.every(record => record.netSuiteTransactionId > 0));
   await assert.rejects(syncReturnRecord({ recordId: result.palletReturn.id }), { code: "RETURN_RA_VERIFICATION_FAILED" });
@@ -151,7 +156,9 @@ test("D2 a rejected manual link leaves the original batch recoverable", async t 
 test("B1 standalone PALLET and definite rejection retry use one RA and no Credit Memo", async t => {
   const remote = await fixture(t);
   remote.control.rejectCreate = true;
-  const result = await submit(await submitInput({ stock: false, pallet: true }));
+  const result = await submitReturnBatch({ operatorId: actor, input: await submitInput({ stock: false, pallet: true }), autoSync: false });
+  await assert.rejects(syncReturnRecord({ recordId: result.palletReturn.id }), /NetSuite.*400/i);
+  result.palletReturn = await getReturnRecordDetail(result.palletReturn.id);
   assert.equal(result.palletReturn.netSuiteSyncStatus, "failed");
   assert.equal(result.palletReturn.netSuiteRaAttemptedAt, null);
   remote.control.rejectCreate = false;

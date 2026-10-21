@@ -19,7 +19,7 @@
   let syncSpecialFulfillmentForm=()=>{};
   /** @type {typeof import('./special-stock-internal-remark.js').syncSpecialInternalRemarkForm} */
   let syncSpecialInternalRemarkForm=()=>{};
-  import(new URL('/special-stock-fulfillment.js?v=20261006-confirmed-note-v1', location.href).href).then(module=>{
+  import(new URL('/special-stock-fulfillment.js?v=20261016-delivery-recovery-v1', location.href).href).then(module=>{
     specialFulfillmentEditor=module.specialFulfillmentEditor;syncSpecialFulfillmentForm=module.syncSpecialFulfillmentForm;
     syncSpecialInternalRemarkForm=module.syncSpecialInternalRemarkForm;
     if(state.enabled)render();
@@ -81,8 +81,11 @@
   let specialDocumentActions = () => '';
   /** @type {typeof import('./special-stock-case-status.js').specialPlanningStatus} */
   let specialPlanningStatus = () => '';
+  /** @type {typeof import('./special-stock-case-status.js').specialSupplyWaitingStatus} */
+  let specialSupplyWaitingStatus = () => '';
   let specialClosureStatus = () => '', canRequestSpecialClosure = () => false;
-  import(new URL('/special-stock-case-status.js?v=20261005-status-following-v1', location.href).href).then(status => {
+  import(new URL('/special-stock-case-status.js?v=20261005-status-following-v1&waitingLabels=20261016', location.href).href).then(status => {
+    specialSupplyWaitingStatus = status.specialSupplyWaitingStatus;
     specialPlanningStatus = (detail, compact = false) => status.specialPlanningStatus(detail, compact, { audience: 'sales', showOrderPreviews: !compact }); specialClosureStatus = status.specialClosureStatus;
     canRequestSpecialClosure = status.canRequestSpecialClosure;
     if (state.enabled) render();
@@ -305,7 +308,7 @@
     if (!state.requests.length) return `<div class="stock-request-empty"><strong>No matching Special Item cases</strong><span>Create a multi-line case for one vendor.</span></div>`;
     return state.requests.map((request) => `
       <button class="stock-request-card ${state.detail?.id === request.id ? "selected" : ""}" data-special-sales-action="select" data-id="${request.id}" type="button">
-        <span class="stock-request-status-line"><strong>${escapeHtml(request.requestRef)}</strong>${pill(request.stage)}</span>${specialPlanningStatus(request, true)}
+        <span class="stock-request-status-line"><strong>${escapeHtml(request.requestRef)}</strong>${pill(request.stage)}${specialSupplyWaitingStatus(request)}</span>${specialPlanningStatus(request, true)}
         <span>${escapeHtml(request.customerName)} · ${escapeHtml(request.vendorName)}</span>
         <small>${escapeHtml(request.storeName || request.storeLocationId)} · ${request.lines.length} line(s) · ${displayDate(request.updatedAt)}</small>${request.informationRequest?.status === 'pending' ? '<strong class="stock-request-error">SCM needs more information · Update required</strong>' : ''}${request.quantityReviewPending ? '<strong class="stock-request-error">Order adjustment · SCM review required</strong>' : ''}
       </button>`).join("");
@@ -1070,7 +1073,7 @@
         const changed = Object.entries(values).some(([field,value]) => field !== 'expectedRevision' && String(value) !== String(detail[field] ?? ''));
         if (header && !changed) { state.notice = noteOnly ? 'Note is already saved.' : 'Header is already saved.'; state.formDrafts.delete(specialFormKey(form)); return; }
         state.detail=await api(`/api/sales/special-stock-requests/${detail.id}/${header ? 'header' : 'fulfillment'}`,{method:header ? 'PUT' : 'POST',body:JSON.stringify({
-          ...values,expectedRevision:expected,...(!header && ['applying','attention'].includes(change?.status)?{changeId:change.id}:{})
+          ...values,expectedRevision:expected,...(!header && ['applying','attention','failed'].includes(change?.status)?{replaceChangeId:change.id}:{})
         })});
         if (!noteOnly) {
           if(state.soDraft) for(const field of ['fulfillmentMethod','deliveryAddress','deliveryContactName','deliveryContactPhone','deliveryDate','windowStart','windowEnd','deliveryInstructions','deliveryFeeRate']) state.soDraft[field]=state.detail[field];
@@ -1257,7 +1260,15 @@
       state.busy = true;
       state.error = "";
       syncSoActionAvailability();
-      if (action === "create-so") {
+      if (action === 'retry-delivery' || action === 'discard-delivery') {
+        const detail=state.detail;
+        state.detail=await api(`/api/sales/special-stock-requests/${detail.id}/fulfillment`, {
+          method:'POST',body:JSON.stringify({expectedRevision:detail.revision,changeId:detail.fulfillmentChange.id,
+            ...(action==='discard-delivery'?{action:'discard'}:{})})
+        });
+        state.formDrafts.delete('data-special-fulfillment-form:');
+        state.notice=action==='discard-delivery'?'Unapplied delivery change discarded. The saved header is unchanged.':'Delivery update completed.';
+      } else if (action === "create-so") {
         const source = mount.querySelector("[data-special-so-source]")?.value || "standalone";
         state.detail = await api(`/api/sales/special-stock-requests/${state.detail.id}/sales-order/create`, {
           method: "POST", body: JSON.stringify({ expectedRevision: state.detail.revision, operationId: state.detail.salesOrderOperationId || crypto.randomUUID(), source, salesRepId: state.soDraft?.salesRepId || state.detail.netsuiteSalesRepId })

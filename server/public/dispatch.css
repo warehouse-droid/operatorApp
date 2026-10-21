@@ -2718,6 +2718,10 @@ button[data-action="enter-edit-mode"]:disabled:hover {
   min-width: 0;
 }
 
+.scm-remark-auto-prefix {
+  color: #c2410c;
+}
+
 .scm-remark-layout small {
   overflow: hidden;
   color: #61737d;
@@ -3381,10 +3385,7 @@ button[data-action="enter-edit-mode"]:disabled:hover {
 }
 
 .scm-content-layout {
-  display: grid;
-  grid-template-columns: minmax(0, 1fr) 96px;
-  gap: 8px;
-  align-items: center;
+  position: relative;
   width: 100%;
   min-height: 0;
 }
@@ -3399,8 +3400,11 @@ button[data-action="enter-edit-mode"]:disabled:hover {
 }
 
 .scm-content-total {
-  justify-self: end;
-  align-self: center;
+  position: absolute;
+  right: 0;
+  top: 50%;
+  transform: translateY(-50%);
+  pointer-events: none;
   border: 1px solid #cbd8e1;
   border-radius: 999px;
   background: #f8fbfc;

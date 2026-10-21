@@ -1,0 +1,7 @@
+[
+  "src/dispatch-fulfilled-so-policy.js",
+  "src/scm-dependency-preview-service.js",
+  "public/dispatch.js",
+  "public/dispatch.html",
+  "migrations/292_sales_order_line_sync_holds.sql"
+]

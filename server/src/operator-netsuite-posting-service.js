@@ -207,7 +207,8 @@ export function createOperatorNetSuitePostingProcessor({ repository, adapter, fi
       transactionId: verified.id,
       transactionRef: verified.transactionRef,
       response: { ...safeRemoteEvidence(record),
-        ...(verified.quantityAdjustments?.length ? { quantityAdjustments: verified.quantityAdjustments } : {}) },
+        ...(verified.quantityAdjustments?.length ? { quantityAdjustments: verified.quantityAdjustments } : {}),
+        ...(verified.additionalPurchaseCharges?.length ? { additionalPurchaseCharges: verified.additionalPurchaseCharges } : {}) },
       recovered
     });
     replaceStep(command, updated);

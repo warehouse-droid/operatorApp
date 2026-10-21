@@ -1,0 +1,30 @@
+import assert from 'node:assert/strict';
+import test,{after} from 'node:test';
+import {readFile} from 'node:fs/promises';
+import {randomUUID} from 'node:crypto';
+import {query,withTransaction,closeDb} from '../../../src/db.js';
+after(closeDb);
+test('approval controls migration backfills unused approvals, enforces unique SOs, and rolls back atomically',async()=>{
+ assert.equal(process.env.MBT_TEST_ISOLATED,'1');
+ const schema=`regular_controls_${randomUUID().replaceAll('-','')}`;
+ const sql=await readFile(new URL('../../../migrations/240_regular_stock_approval_controls.sql',import.meta.url),'utf8');
+ await withTransaction(async()=>{
+  await query(`CREATE SCHEMA "${schema}";SET LOCAL search_path TO "${schema}",pg_catalog;
+   CREATE TABLE scm_smart_settings(id integer PRIMARY KEY);
+   CREATE TABLE sales_stock_requests(id bigint PRIMARY KEY,workflow_version integer,regular_details jsonb,updated_at timestamptz);
+   CREATE TABLE sales_stock_request_lines(id bigint,request_id bigint,status text,decided_at timestamptz);
+   CREATE TABLE regular_stock_handoffs(request_id bigint,sales_order_id bigint,sales_order_ref text);
+   INSERT INTO scm_smart_settings VALUES(1);
+   INSERT INTO sales_stock_requests VALUES(1,2,'{}','2026-09-29T01:00:00Z'),(2,2,'{}','2026-09-29T01:00:00Z'),(3,1,'{}','2026-09-29T01:00:00Z');
+   INSERT INTO sales_stock_request_lines VALUES(1,1,'approved','2026-09-29T01:00:00Z'),(2,2,'approved','2026-09-29T01:00:00Z'),(3,3,'submitted',null);
+   INSERT INTO regular_stock_handoffs VALUES(2,121631,'SOB121631');`);
+  await query(sql);
+  const setting=(await query('SELECT * FROM scm_smart_settings')).rows[0];assert.equal(setting.regular_stock_auto_approval_enabled,true);assert.equal(setting.regular_stock_approval_minutes,15);
+  const rows=(await query('SELECT * FROM sales_stock_requests ORDER BY id')).rows;
+  assert.equal(new Date(rows[0].regular_details.approvalExpiresAt).toISOString(),'2026-09-29T01:15:00.000Z');
+  assert.deepEqual(rows[1].regular_details,{});assert.deepEqual(rows[2].regular_details,{});
+  for(const [id,ref] of [[121631,'OTHER'],[121632,' sob121631 ']])await assert.rejects(()=>withTransaction(()=>query('INSERT INTO regular_stock_handoffs VALUES(1,$1,$2)',[id,ref])),{code:'23505'});
+  await assert.rejects(()=>withTransaction(()=>query('UPDATE scm_smart_settings SET regular_stock_approval_minutes=0')),{code:'23514'});
+ },{rollback:true});
+ assert.equal((await query('SELECT 1 FROM pg_namespace WHERE nspname=$1',[schema])).rowCount,0);
+});

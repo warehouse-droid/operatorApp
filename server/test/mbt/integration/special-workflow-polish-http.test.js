@@ -29,7 +29,7 @@ async function draft() {
     materialLines: [{ caseLineId: detail.lines[0].id, itemId: 2055, description: 'TEST product', quantity: 20, packageQuantity: 2, conversionToPc: 10, uom: 'PC', rate: 50 }] }, context);
 }
 const endpoint = (detail, order = 'sales') => `/api/${order === 'sales' ? 'sales' : 'scm'}/special-stock-requests/${detail.id}/${order}-order/skip`;
-const poLines = detail => detail.purchaseOrderLines.map(line => ({ caseLineId: line.caseLineId, description: 'TEST PO', quantity: 2, uom: 'PC', unitPurchaseCost: 4 }));
+const poLines = detail => detail.purchaseOrderLines.map(line => ({ caseLineId: line.caseLineId, description: 'TEST PO', quantity: 2, uom: 'PC', vendorDiscountPercent:0,unitPurchaseCost: 4 }));
 
 before(async () => {
   assert.equal(process.env.MBT_TEST_ISOLATED, '1');
@@ -87,7 +87,7 @@ test('duplicate concurrent SO and PO skips each commit once and preserve role-ow
   assert.equal(detail.salesOrderId, null);
   assert.equal(detail.events.filter(event => event.eventType === 'special_sales_order_creation_skipped').length, 1);
   const full = await repository.getSpecialStockCase(detail.id);
-  const po = await Promise.all([1, 2].map(() => request(endpoint(detail, 'purchase'), { role: 'scm', body: { expectedRevision: detail.revision, lines: poLines(full) } })));
+  const po = await Promise.all([1, 2].map(() => request(endpoint(detail, 'purchase'), { role: 'scm', body: { expectedRevision: detail.revision, vendorDiscountAmount: 0, lines: poLines(full) } })));
   assert.deepEqual(po.map(row => row.status).sort(), [200,409]);
   const result = po.find(row => row.status === 200).payload;
   assert.equal(result.stage, 'dispatch_arrangement');

@@ -268,7 +268,7 @@ async function operatorLoadedEvidence(source, lines) {
 
 /** @param {LooseRecord} source @param {LooseRecord[]} lines @returns {Promise<Map<string, LooseRecord[]>>} */
 async function poExecutionEvidence(source, lines) {
-  const lineIds = lines.map((line) => Number(line.source_line_id));
+  const lineIds = lines.map((line) => Number(line.local_line_id));
   if (!lineIds.length) {return new Map();}
   const result = await query(
     `SELECT DISTINCT ON (pickup.allocation_id)
@@ -327,7 +327,7 @@ async function poExecutionEvidence(source, lines) {
 
 /** @param {LooseRecord} source @param {LooseRecord[]} lines @returns {Promise<Map<string, LooseRecord[]>>} */
 async function directToExecutionEvidence(source, lines) {
-  const lineIds = lines.map((line) => Number(line.source_line_id));
+  const lineIds = lines.map((line) => Number(line.local_line_id));
   if (!lineIds.length) {return new Map();}
   const result = await query(
     `SELECT dependency.id, dependency.transfer_order_ref,
@@ -411,8 +411,8 @@ async function materializeCandidate(row, source, decision) {
     if (!operator?.immutable) {
       throw failure("SALES_ORDER_IF_DIRECT_EVIDENCE_INCOMPLETE", `Operator load evidence is unavailable for ${line.sku || line.item_name || line.local_order_line}.`);
     }
-    const poRows = poEvidence.get(text(line.source_line_id)) || [];
-    const toRows = toEvidence.get(text(line.source_line_id)) || [];
+    const poRows = poEvidence.get(text(line.local_line_id)) || [];
+    const toRows = toEvidence.get(text(line.local_line_id)) || [];
     return {
       localLineId: text(line.local_line_id),
       sourceLineId: text(line.source_line_id),

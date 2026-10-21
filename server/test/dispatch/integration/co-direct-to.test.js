@@ -137,7 +137,24 @@ test("yard replenishment leaves CO cargo unchanged", () => rollback(async () => 
   assert.deepEqual(await getLocalCoOrder(co.co_ref), before);
 }));
 
-test("reconciliation refuses a legacy direct allocation on packed cargo and rolls back other changes", () => rollback(async () => {
+test("replenishment changes to direct pickup when the affected CO cargo is packed", () => rollback(async () => {
+  const f = await seed();
+  const co = await sourceCo(f);
+  const linked = await executeScmDependencyCommand(await command(f, {mode: "yard_replenishment",quantity: 26.125}));
+  await query("UPDATE local_co_orders SET status='packed' WHERE id=$1",[co.id]);
+  await query(`UPDATE local_co_order_lines SET packed_sales_qty=52.25,packed_layer_qty=5,confirmed_at=now()
+    WHERE co_id=$1 AND item_id=1356`,[co.id]);
+  const before = (await getLocalCoOrder(co.co_ref)).lines.find(line=>Number(line.item_id)===1356);
+  const changed = await change(f,"change_mode",{dependencyId: linked.dependencyId,mode: "direct_to_customer"});
+  assert.equal(changed.dependency.mode,"direct_to_customer");
+  const updated = (await getLocalCoOrder(co.co_ref)).lines.find(line=>Number(line.item_id)===1356);
+  assert.equal(Number(updated.quantity),26.125);
+  for(const field of ["packed_sales_qty","packed_layer_qty","confirmed_at"]) {assert.deepEqual(updated[field],before[field],field);}
+  await change(f,"change_mode",{dependencyId: linked.dependencyId,mode: "yard_replenishment"});
+  assert.equal(Number((await getLocalCoOrder(co.co_ref)).lines.find(line=>Number(line.item_id)===1356).quantity),52.25);
+}));
+
+test("reconciliation updates a legacy direct allocation and preserves packed cargo", () => rollback(async () => {
   const f = await packedCo();
   await linkBoth(f);
   await query(`UPDATE local_co_order_lines SET quantity=52.25,layer_qty=5,raw=raw-'coDirectToRequirement'
@@ -145,8 +162,15 @@ test("reconciliation refuses a legacy direct allocation on packed cargo and roll
   await query(`UPDATE local_co_order_lines SET quantity=7,raw=raw-'coDirectToRequirement',packed_sales_qty=1,confirmed_at=now()
     WHERE co_id=$1 AND item_id=1784`, [f.co.id]);
   const before = await getLocalCoOrder(f.co.co_ref);
-  await assert.rejects(reconcileCoDirectToCargo({ coRefs: [f.co.co_ref] }), error => error.code === "CO_DIRECT_TO_CARGO_CONFLICT");
-  assert.deepEqual(await getLocalCoOrder(f.co.co_ref), before);
+  await reconcileCoDirectToCargo({ coRefs: [f.co.co_ref] });
+  const updated = await getLocalCoOrder(f.co.co_ref);
+  assert.equal(Number(updated.lines.find(line=>Number(line.item_id)===1356).quantity),0);
+  assert.equal(Number(updated.lines.find(line=>Number(line.item_id)===1784).quantity),6);
+  const prior = before.lines.find(line=>Number(line.item_id)===1784);
+  const current = updated.lines.find(line=>Number(line.item_id)===1784);
+  assert.equal(current.packed_sales_qty,prior.packed_sales_qty);
+  assert.deepEqual(current.confirmed_at,prior.confirmed_at);
+  assert.deepEqual(updated.lines.filter(line=>Number(line.item_id)<1356),before.lines.filter(line=>Number(line.item_id)<1356));
 }));
 
 for (const state of ["loaded", "received", "completed", "cancelled"]) {
@@ -233,8 +257,11 @@ test("concurrent CO packing is observed after the shared operator lock", async (
     await client.query("COMMIT");
     const result = await checking;
     assert.equal(waiting, true);
-    assert.equal(result.error?.code, "CO_DIRECT_TO_CARGO_CONFLICT");
-    assert.equal(Number((await getLocalCoOrder(co.co_ref)).lines.find(line => Number(line.item_id) === 1356).quantity), 52.25);
+    assert.equal(result.error,undefined);
+    const material = (await getLocalCoOrder(co.co_ref)).lines.find(line=>Number(line.item_id)===1356);
+    assert.equal(Number(material.quantity),0);
+    assert.equal(Number(material.packed_layer_qty),1);
+    assert.ok(material.confirmed_at);
   } finally {
     await client.query("ROLLBACK");
     client.release();

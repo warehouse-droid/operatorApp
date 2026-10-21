@@ -8,6 +8,8 @@ import { parseVendorNames } from '../public/stock-request-vendor-filter.js';
 import crypto from "node:crypto";
 import {stockCaseWorkflow} from './stock-case-workflow.js';
 import {backorderStage,backorderBucket,assertBackorderOrderLink,assertBackorderLineOpen} from '../public/backorder-workflow.js';
+import {regularStockStatusSummary} from '../public/regular-stock-status.js';
+import {backorderArrivals} from './backorder-arrival.js';
 import { specialVendorLineDiscountReview, refreshSpecialVendorDiscountReview, specialPurchasePalletLine } from "../public/special-stock-purchase-pricing.js";
 import {findSpecialCustomer,searchSpecialCustomerDirectory} from "./special-stock-customer-directory.js";
 import { SPECIAL_STAGES, nextReminderDate, parseStages, torontoDate, specialStockAvailable } from "../public/special-stock-workflow.js";
@@ -21,7 +23,7 @@ import { parseYardIds } from '../public/stock-request-yard-filter.js';
 import { assertSpecialDeliveryDate, specialDiscountLineSubtotal as specialLineSubtotal, specialNativePricing, specialNativeLinePricing } from '../public/special-stock-pricing.js';
 import { prepareSpecialMaterial, draftQuantityChanges, quantityReviewPending, assertNoSpecialQuantityReview } from './special-stock-pricing-domain.js';
 import { reviewedQuantityTransitions } from './special-stock-quantity-reconciliation.js';
-import { planSpecialLocalAdjustment, specialAdjustmentIsLocal, specialLocalPurchaseDraft } from './special-stock-local-adjustments.js';
+import { planSpecialLocalAdjustment, specialAdjustmentIsLocal, specialFulfillmentBlocksAdjustment, specialLocalPurchaseDraft } from './special-stock-local-adjustments.js';
 import { readSpecialDispatchPlans, specialDispatchPlanning } from './special-stock-planning.js';
 import { isLocalPickupChange } from './special-stock-fulfillment-policy.js';
 import { specialOrderStatusFields } from './special-stock-status-refresh.js';
@@ -57,14 +59,14 @@ function workflowError(message, status = 400, code = "SPECIAL_STOCK_INVALID") {
 }
 
 /** @param {Record<string,any>} special */
-function assertCaseEditable(special, { allowPendingUpdate = false } = {}) {
+function assertCaseEditable(special, { allowPendingUpdate = false, localAdjustment = false } = {}) {
   if (special.workflow_kind === 'backorder' && (special.close_status !== 'active' || mapCase(special).operationallyComplete)) {
     throw workflowError('This Backorder is closed or completed.',409,'BACKORDER_CLOSED');
   }
   if (!allowPendingUpdate && special.information_request?.status === 'pending') {
     throw workflowError('Sales must submit the requested information before stock checking or order actions.', 409, 'SPECIAL_UPDATE_PENDING');
   }
-  if (['applying','attention'].includes(special.fulfillment_change?.status)
+  if (specialFulfillmentBlocksAdjustment(special.fulfillment_change, { localOnly: localAdjustment })
       || ['applying','attention'].includes(special.quantity_review?.status)
       || [special.sales_order_operation_status, special.purchase_order_operation_status].some(status => ['creating', 'attention'].includes(status))) {
     throw workflowError('Resolve the current NetSuite operation before changing this request.', 409, 'SPECIAL_OPERATION_BUSY');
@@ -252,7 +254,8 @@ function mapCase(row = {}) {
     requestType: backorder ? 'regular' : 'special',
     workflowKind: row.workflow_kind || 'special',
     ...(backorder ? {workflowVersion:2,destinationLocationId:Number(row.destination_location_id),destinationName:row.destination_name || '',
-      regular:{deliveryMethod:'backorder',customerName:row.customer_name || ''},transfers:[]} : {}),
+      regular:{deliveryMethod:'backorder',customerName:row.customer_name || ''},transfers:[],
+      alreadyOrderedSalesOrderRef:row.regular_details?.alreadyOrderedSalesOrderRef || null} : {}),
     status: row.request_status || "submitted",
     revision: Number(row.revision) || 1,
     storeLocationId: Number(row.destination_location_id),
@@ -311,8 +314,10 @@ function mapCase(row = {}) {
     purchaseOrderApproved: row.purchase_order_approved === true,
     purchaseOrderPendingApproval: row.purchase_order_pending_approval === true,
     purchaseOrderReference: row.purchase_order_reference || '',
+    purchaseOrderSentToVendorAt: row.purchase_order_sent_to_vendor_at || null,
+    purchaseOrderSentToVendorBy: row.purchase_order_sent_to_vendor_by || null,
     purchaseOrderDispatchStatus: row.purchase_order_dispatch_status || null,
-    fulfillmentChange: row.fulfillment_change?.id ? { ...row.fulfillment_change, plan: undefined } : null,
+    fulfillmentChange: row.fulfillment_change?.id ? { ...row.fulfillment_change, hasPlan: Boolean(row.fulfillment_change.plan), plan: undefined } : null,
     fulfillmentChangePlan: row.fulfillment_change?.plan || null,
     purchaseOrderOperationStatus: row.purchase_order_operation_status || "idle",
     purchaseOrderOperationId: row.purchase_order_operation_id || null,
@@ -330,7 +335,7 @@ function mapCase(row = {}) {
     vendorPickupReference: row.vendor_pickup_reference || "",
     remotelyReconciled,
     attention: row.attention === true || postPoChangePending || needsQuantityReview || ['applying','attention'].includes(row.fulfillment_change?.status),
-    attentionReason: (['applying','attention'].includes(row.fulfillment_change?.status) ? 'Delivery update pending — Sales must finish or retry the saved change.' : '') || row.attention_reason || (needsQuantityReview ? 'Quantity changed — SCM review required.' : postPoChangePending ? "Vendor availability changed after Purchase Order creation; customer acknowledgement is required." : ""),
+    attentionReason: (['applying','attention'].includes(row.fulfillment_change?.status) ? 'Delivery update incomplete — Sales can retry or edit and save the header.' : '') || row.attention_reason || (needsQuantityReview ? 'Quantity changed — SCM review required.' : postPoChangePending ? "Vendor availability changed after Purchase Order creation; customer acknowledgement is required." : ""),
     quantityReview, quantityReviewPlan, quantityReviewPending: needsQuantityReview,
     localAdjustedAt: row.local_adjusted_at || null,
     postPoChangePending,
@@ -359,7 +364,7 @@ function stageFor(detail) {
   const hasPendingSalesDecision = !hasPendingPurchaseResponse
     && lines.some((line) => !TERMINAL_DECISIONS.has(line.salesDecision));
   const linesResolved = allLines.length > 0 && lines.every((line) => TERMINAL_DECISIONS.has(line.salesDecision));
-  return specialCaseStageAfterEdits(detail, (detail.workflowKind === 'backorder' ? backorderStage : deriveSpecialCaseStage)({
+  const derivedStage = (detail.workflowKind === 'backorder' ? backorderStage : deriveSpecialCaseStage)({
     submitted: detail.status !== "draft",
     pendingUpdate: detail.informationRequest?.status === 'pending',
     hasPendingPurchaseResponse,
@@ -376,13 +381,16 @@ function stageFor(detail) {
     purchaseOrderSkipped: detail.purchaseOrderSkipped,
     purchaseOrderApproved: detail.purchaseOrderApproved,
     purchaseOrderReference: detail.purchaseOrderReference,
+    purchaseOrderSentToVendorAt: detail.purchaseOrderSentToVendorAt,
     purchaseOrderDispatchStatus: detail.purchaseOrderDispatchStatus,
     needsDispatchRoute: detail.handoff?.status === "waiting_route",
     operationallyComplete: detail.operationallyComplete,
     remotelyReconciled: detail.remotelyReconciled,
     attention: detail.attention,
     closed: detail.closeStatus === "closed" || detail.status === "cancelled"
-  }));
+  });
+  if (detail.workflowKind !== 'backorder' && derivedStage === 'await_customer_confirmation') return derivedStage;
+  return specialCaseStageAfterEdits(detail, derivedStage);
 }
 
 function assertScope(detail, authorizedStoreLocationIds) {
@@ -547,6 +555,11 @@ async function lineRows(requestId, { forUpdate = false } = {}) {
 }
 
 async function reconcileCanonicalOrderLines(requestId, orderKind, remoteOrderId, { required = false, reviewedDescriptionChanges = [], quantityReview = {} } = {}) {
+  // Approved local adjustments preserve the issued SO snapshot. Its historical
+  // content is no longer the contract for creating the reviewed standalone PO.
+  if (orderKind === 'sales_order' && (await query(
+    'SELECT local_adjusted_at FROM sales_special_stock_cases WHERE request_id=$1', [requestId]
+  )).rows[0]?.local_adjusted_at) return false;
   if (orderKind === 'sales_order' && !required) {
     const owner = await query(`SELECT sales_order_source,purchase_order_netsuite_id,purchase_order_operation_status,quantity_review
       FROM sales_special_stock_cases WHERE request_id=$1`, [requestId]);
@@ -728,6 +741,7 @@ async function hydrateSpecialStockCases(rows, {
   // transaction, and node-postgres does not support concurrent queries on one
   // transaction client.
   const linesResult = await query("SELECT * FROM sales_special_stock_lines WHERE request_id = ANY($1::bigint[]) AND removed_at IS NULL ORDER BY line_number", [ids]);
+  const arrivals = await backorderArrivals(details,linesResult.rows);
   const backorderIds = new Set(rows.filter(row => row.workflow_kind === 'backorder').map(row => Number(row.request_id)));
   const regularLines = linesResult.rows.filter(line => backorderIds.has(Number(line.request_id)) && line.regular_item_id);
   const stockEvidence = regularLines.length
@@ -840,10 +854,15 @@ async function hydrateSpecialStockCases(rows, {
   detail.dispatchPlanning = specialDispatchPlanning(detail, plans);
   detail.stage = stageFor(detail);
   if (detail.workflowKind === 'backorder') {
+    detail.alreadyOrderedArrival = arrivals.get(detail.id) || null;
+    for (const order of detail.alreadyOrderedArrival?.orders || []) {
+      for (const line of detail.lines) if (order.lineIds.includes(line.id)) line.arrivalStatus = order.arrived ? 'arrived' : 'arrival';
+    }
     detail.bucket = backorderBucket(detail.stage);
     detail.displayStatus = detail.stage;
     detail.regular.salesOrderRef = detail.salesOrderRef;
     detail.manualDecisionEventId = detail.revision;
+    detail.statusSummary = regularStockStatusSummary(detail);
   }
   detail.stageLabel = SPECIAL_STAGES[/** @type {keyof typeof SPECIAL_STAGES} */ (detail.stage)];
   detail.readinessAlerts = ['closed', 'completed'].includes(detail.stage) ? [] : detail.lines
@@ -1854,11 +1873,9 @@ export async function linkSpecialSalesOrder(requestId, {
     assertScope(mapCase(special), authorizedStoreLocationIds);
     assertSpecialStockRemoteOrderAllowed(mapCase(special), {manualReference:manual});
     if (!verifiedRemote) assertCaseEditable(special, { allowPendingUpdate: manual });
-    if (special.workflow_kind === 'backorder') {
-      const detail = /** @type {Record<string,any>} */ (mapCase(special));
-      detail.dispatchPlanning = specialDispatchPlanning(detail, await readSpecialDispatchPlans({forShare:true}));
-      assertBackorderOrderLink(detail, 'sales_order');
-    }
+    if (special.workflow_kind === 'backorder') assertBackorderOrderLink({
+      ...mapCase(special), lines:(await lineRows(id, {forUpdate:true})).map(mapLine)
+    }, 'sales_order');
     if (!manual && special.sales_order_netsuite_id && Number(special.sales_order_netsuite_id) !== remoteId) throw workflowError('This request already owns an SO.', 409, 'SPECIAL_SO_ALREADY_LINKED');
     if (!manual) assertSpecialOrderRelease((await lineRows(id)).map(mapLine));
     if (!manual && special.pallet_total == null) throw workflowError('Save the SO draft including pallet count before linking.', 409, 'SPECIAL_SO_DRAFT_REQUIRED');
@@ -2106,6 +2123,35 @@ async function reconcileSpecialOrderCase(requestId, normalizedKind, remoteId) {
   });
 }
 
+/** Record SCM's acknowledgement; sending the vendor communication happens outside this action.
+ * @param {number|string} requestId @param {{expectedRevision?:number}} input
+ * @param {{operatorId?:string}} context */
+export async function markSpecialPurchaseOrderSentToVendor(requestId, input = {}, { operatorId } = {}) {
+  const id = positiveId(requestId, 'Special Item case');
+  await withTransaction(async () => {
+    const special = await lockCase(id, input.expectedRevision);
+    const detail = mapCase(special);
+    if (special.workflow_kind !== 'special') throw workflowError('Special Item case was not found.', 404, 'SPECIAL_CASE_NOT_FOUND');
+    if (special.close_status !== 'active' || special.request_status === 'cancelled' || detail.operationallyComplete) {
+      throw workflowError('This request is closed or completed.', 409, 'SPECIAL_CASE_CLOSED');
+    }
+    assertNoSpecialQuantityReview(special);
+    assertCaseEditable(special);
+    if (!special.purchase_order_netsuite_id) throw workflowError('Link a Purchase Order before marking it sent to the vendor.', 409, 'SPECIAL_PO_LINK_REQUIRED');
+    if (special.purchase_order_sent_to_vendor_at) return;
+    if (deriveSpecialCaseStage(detail) === 'dispatch_arrangement') {
+      throw workflowError('This Purchase Order has already moved to Dispatch Arrangement.', 409, 'SPECIAL_PO_ALREADY_DISPATCHED');
+    }
+    await query(`UPDATE sales_special_stock_cases SET purchase_order_sent_to_vendor_at=now(),
+      purchase_order_sent_to_vendor_by=$2,updated_at=now() WHERE request_id=$1`, [id, operatorId]);
+    await bumpCase(id);
+    await appendEvent(id, 'special_purchase_order_sent_to_vendor', operatorId, {
+      purchaseOrderId: detail.purchaseOrderId, purchaseOrderRef: detail.purchaseOrderRef
+    });
+  });
+  return getSpecialStockCase(id, { audience: 'scm' });
+}
+
 /** @param {number|string} requestId @param {Record<string,any>} [input] @param {{operatorId?:string}} [context] */
 export async function linkSpecialPurchaseOrder(requestId, {
   expectedRevision: revision,
@@ -2141,7 +2187,7 @@ export async function linkSpecialPurchaseOrder(requestId, {
       && special.attention_reason === special.purchase_order_operation_error;
     if (!custom && special.purchase_order_netsuite_id && Number(special.purchase_order_netsuite_id) !== remoteId) throw workflowError('This request already owns a PO.', 409, 'SPECIAL_PO_ALREADY_LINKED');
     const independentPurchase = special.sales_order_source === 'manual_link' && special.purchase_order_custom_linkage;
-    const unsynced = !custom && !independentPurchase && await query(`SELECT 1 FROM sales_special_stock_order_lines so
+    const unsynced = !custom && !independentPurchase && !special.local_adjusted_at && await query(`SELECT 1 FROM sales_special_stock_order_lines so
       JOIN sales_special_stock_order_lines po ON po.request_id=so.request_id AND po.case_line_id=so.case_line_id AND po.order_kind='purchase_order'
       WHERE so.request_id=$1 AND so.order_kind='sales_order' AND so.description IS DISTINCT FROM po.description LIMIT 1`, [id]);
     if (unsynced && unsynced.rowCount) throw workflowError('Synchronize the SO descriptions before linking a PO.', 409, 'SPECIAL_SO_DESCRIPTION_NOT_SYNCED');
@@ -3147,7 +3193,7 @@ export async function markSpecialOrderSubmitted(requestId, { expectedRevision: r
 }
 
 async function assertQuantityActionAllowed(special, { localOnly = false } = {}) {
-  if (['applying','attention'].includes(special.fulfillment_change?.status)) throw workflowError('Finish the saved delivery update first.',409,'SPECIAL_FULFILLMENT_PENDING');
+  if (specialFulfillmentBlocksAdjustment(special.fulfillment_change, { localOnly })) throw workflowError('Finish the saved delivery update first.',409,'SPECIAL_FULFILLMENT_PENDING');
   const detail = mapCase(special);
   const planning = specialDispatchPlanning(detail, await readSpecialDispatchPlans());
   if (special.close_status !== 'active' || detail.operationallyComplete || detail.remotelyReconciled
@@ -3176,7 +3222,7 @@ export async function requestSpecialQuantityChange(requestId, input, context = {
   await withTransaction(async () => {
     const special = await lockCase(id,input.expectedRevision);
     assertScope(mapCase(special),context.authorizedStoreLocationIds);
-    assertCaseEditable(special);
+    assertCaseEditable(special, { localAdjustment: true });
     await assertQuantityActionAllowed(await selectCaseRow(id),{localOnly:true});
     if (!special.sales_order_netsuite_id && !special.sales_order_skipped) throw workflowError('Edit and save the SO draft before SO issuance.',409,'SPECIAL_SO_NOT_LINKED');
     const detail = await getSpecialStockCase(id,{audience:'scm'});
@@ -3527,16 +3573,49 @@ export async function claimSpecialFulfillmentChange(requestId,input={},context={
     assertScope(mapCase(special),context.authorizedStoreLocationIds);
     await assertFulfillmentUnplanned(special);
     const previous=special.fulfillment_change;
-    if (input.changeId && previous?.id===input.changeId && ['applying','attention','complete'].includes(previous.status)) return;
-    assertCaseEditable(special); assertNoSpecialQuantityReview(special);
-    if (special.attention || special.post_po_change_pending) throw workflowError('Resolve this request’s Attention state first.',409,'SPECIAL_FULFILLMENT_ATTENTION');
+    if (input.changeId) {
+      if (input.replaceChangeId || previous?.id!==input.changeId || !['applying','attention','failed','complete'].includes(previous.status)) {
+        throw workflowError('This delivery update changed. Refresh before retrying.',409,'SPECIAL_FULFILLMENT_STALE');
+      }
+      if(previous.status==='complete') return;
+      assertCaseEditable({...special,fulfillment_change:null}); assertNoSpecialQuantityReview(special);
+      await query('UPDATE sales_special_stock_cases SET fulfillment_change=$2::jsonb WHERE request_id=$1',
+        [id,JSON.stringify({...previous,status:'applying',error:null})]);
+      await bumpCase(id);
+      return;
+    }
+    const replacing=Boolean(input.replaceChangeId);
+    if (replacing && (previous?.id!==input.replaceChangeId || !['applying','attention','failed'].includes(previous.status))) {
+      throw workflowError('This delivery update changed. Refresh before replacing it.',409,'SPECIAL_FULFILLMENT_STALE');
+    }
+    assertCaseEditable(replacing?{...special,fulfillment_change:null}:special); assertNoSpecialQuantityReview(special);
     const target=normalizeSpecialFulfillment(input);
     if (target.fulfillmentMethod==='mbt_delivery' && !special.sales_order_netsuite_id) assertSpecialDeliveryDate(target.deliveryDate);
-    const journal={id:crypto.randomUUID(),status:'applying',target,requestedBy:context.operatorId,requestedAt:new Date().toISOString()};
+    const journal={id:crypto.randomUUID(),status:'applying',target,requestedBy:context.operatorId,requestedAt:new Date().toISOString(),
+      ...(replacing && previous.plan ? {plan:previous.plan,replan:true} : {})};
+    if(replacing || previous?.status==='failed') await appendEvent(id,'special_delivery_change_replaced',context.operatorId,{previous,changeId:journal.id});
     await query('UPDATE sales_special_stock_cases SET fulfillment_change=$2::jsonb,updated_at=now() WHERE request_id=$1',[id,JSON.stringify(journal)]);
     await appendEvent(id,'special_delivery_change_started',context.operatorId,{changeId:journal.id,target});await bumpCase(id);
   });
   return getSpecialStockCase(id,{audience:'scm'});
+}
+
+export async function cancelSpecialFulfillmentChange(requestId,input={},context={}) {
+  const id=positiveId(requestId,'Special Item case');
+  await withTransaction(async()=>{
+    const special=await lockCase(id,input.expectedRevision),change=special.fulfillment_change;
+    assertScope(mapCase(special),context.authorizedStoreLocationIds);
+    if(!input.changeId || change?.id!==input.changeId) throw workflowError('This delivery update is no longer active.',409,'SPECIAL_FULFILLMENT_STALE');
+    if(change.status==='cancelled') return;
+    if(change.plan || !['applying','attention','failed'].includes(change.status)) {
+      throw workflowError('This update may already be in NetSuite. Retry it or edit and save the header.',409,'SPECIAL_FULFILLMENT_CANCEL_UNSAFE');
+    }
+    await query('UPDATE sales_special_stock_cases SET fulfillment_change=$2::jsonb,updated_at=now() WHERE request_id=$1',
+      [id,JSON.stringify({...change,status:'cancelled',cancelledBy:context.operatorId,cancelledAt:new Date().toISOString()})]);
+    await appendEvent(id,'special_delivery_change_cancelled',context.operatorId,{changeId:change.id,target:change.target,error:change.error});
+    await bumpCase(id);
+  });
+  return getSpecialStockCase(id,{audience:'sales',authorizedStoreLocationIds:context.authorizedStoreLocationIds});
 }
 
 async function ownedFulfillmentChange(requestId,changeId) {
@@ -3551,7 +3630,7 @@ export async function saveSpecialFulfillmentPlan(requestId,changeId,plan) {
   await withTransaction(async()=>{
     const special=await ownedFulfillmentChange(requestId,changeId);
     await query('UPDATE sales_special_stock_cases SET fulfillment_change=$2::jsonb WHERE request_id=$1',
-      [requestId,JSON.stringify({...special.fulfillment_change,plan,status:'applying',error:null})]);
+      [requestId,JSON.stringify({...special.fulfillment_change,plan,replan:false,status:'applying',error:null})]);
   });
 }
 
@@ -3559,7 +3638,7 @@ export async function failSpecialFulfillmentChange(requestId,changeId,message,co
   await withTransaction(async()=>{
     const special=await ownedFulfillmentChange(requestId,changeId);
     await query('UPDATE sales_special_stock_cases SET fulfillment_change=$2::jsonb WHERE request_id=$1',
-      [requestId,JSON.stringify({...special.fulfillment_change,status:'attention',error:cleanSearch(message,2000)})]);
+      [requestId,JSON.stringify({...special.fulfillment_change,status:special.fulfillment_change.plan?'attention':'failed',error:cleanSearch(message,2000)})]);
     await appendEvent(requestId,'special_delivery_change_attention',context.operatorId,{changeId,error:cleanSearch(message,2000)});await bumpCase(requestId);
   });
 }

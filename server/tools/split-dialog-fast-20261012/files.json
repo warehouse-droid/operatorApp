@@ -1,0 +1,23 @@
+{
+  "runtime": [
+    "src/dispatch-split-preview-repository.js",
+    "src/server.js",
+    "public/dispatch.js",
+    "public/dispatch.html"
+  ],
+  "primary": [
+    "test/dispatch/integration/split-dialog-fast.test.js",
+    "test/dispatch/frontend/split-dialog-fast.browser.test.mjs"
+  ],
+  "regressions": [
+    "test/dispatch/unit/unfinished-sales-resplit.test.js",
+    "test/dispatch/integration/unfinished-sales-resplit.test.js",
+    "test/dispatch/integration/unfinished-sales-resplit-http.test.js",
+    "test/dispatch/frontend/unfinished-sales-resplit.browser.test.mjs",
+    "test/dispatch/frontend/dispatch-split-target.browser.test.mjs",
+    "test/dispatch/frontend/dispatch-packing-planning.test.js"
+  ],
+  "support": [
+    "test/split-dialog-fast-spec.md"
+  ]
+}

@@ -146,7 +146,10 @@ export const REQUIRED_MBT_P3_MIGRATIONS = Object.freeze([
   "199_operator_yard_access.sql",
   "200_operator_consolidated_loads.sql",
   "201_operator_posting_photo_uploads.sql",
-  "202_netsuite_order_line.sql"
+  "202_netsuite_order_line.sql",
+  "203_operator_return_authorizations.sql",
+  "204_operator_background_photos.sql",
+  "205_dispatch_plan_maintenance.sql"
 ]);
 
 export const REQUIRED_MBT_P3_FLAGS = Object.freeze([

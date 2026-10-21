@@ -1,0 +1,6 @@
+[
+  "src/special-stock-request-repository.js",
+  "public/scm-special-stock-requests.js",
+  "public/scm-stock-requests.html",
+  "migrations/276_special_stock_check_revisions.sql"
+]

@@ -1,0 +1,27 @@
+{
+  "task": "Reconcile the blocked TOB01183 load and SOA09472 pickup to verified existing NetSuite fulfillments",
+  "specApproval": "not obtained (autonomous run); user authorized investigation and resolution of both incidents",
+  "tier": 3,
+  "scope": "Scoped operational repair using existing application finalizers; no deployed application policy changes",
+  "setup": {"dependencies": [], "gitCommits": false, "tools": ["Node built-in test runner", "existing application database repositories", "Docker exec", "Python standard library"]},
+  "acceptance": [
+    "TOB01183 must match source 1032550, IF156408 (1036362), item 1189 quantity 160 at yard 1 on fulfillment line 2 and item 1784 quantity 3 at yard 1 on fulfillment line 5; source aliases must prove their relationship to submitted lines 1 and 4.",
+    "SOA09472 must match source 1023363, IF156345 (1035754), original external ID MBBS-OP-300a2177-ca79-4246-a1a2-b118715da5fd-1, item 5175 quantity 209.82 and confirmed noninventory item 2055 quantity 58.59 at yard 1.",
+    "Each source has exactly one shipped fulfillment and authoritative quantities agree with all confirmed local outbound lines.",
+    "Record one local completed load per order, clear packed quantities, complete the recovered latest command, and release its active claims.",
+    "Preserve immutable submitted payloads, input hashes, original operator IDs and original photographs; preserve the earlier failed TO attempt as history.",
+    "Update local source status and fulfillment reference from verified NetSuite evidence; do not change transfer receiving progress or fabricate delivery completion.",
+    "No NetSuite record writes or new fulfillment documents; all repairs are local and audited.",
+    "Rollback rehearsal leaves scoped business rows unchanged; repeated execution is idempotent.",
+    "Reject wrong source, reference, external ID, item, location, quantity, unconfirmed extra line, duplicate document, changed local state or competing command. Reject before durable mutation."
+  ],
+  "clarifications": ["Rollback rehearsal showed the existing database fulfillment-status trigger creates a source-derived dispatch completion event. Permit only a netsuite_fulfillment event for the exact verified source and original remote fulfillment timestamp; preserve all existing events and forbid invented driver completion or transfer receipt."],
+  "failureModel": {
+    "duplicate fulfillment": "No transform capability; remote record HTTP restricted to GET; exact existing document verification",
+    "wrong completion": "Fixed identities, complete source/transaction/local line comparison, adversarial tests",
+    "partial local write": "Both incidents in one database transaction with rollback rehearsal",
+    "concurrent operator change": "Advisory order locks, command/order/line row locks, active-claim checks, state assertions, short lock timeout",
+    "lost history": "Immutable before/after comparisons, audit events and private snapshots",
+    "accidental receiving or delivery completion": "Transfer receiving rows/header progress and dispatch completion events compared before and after"
+  }
+}

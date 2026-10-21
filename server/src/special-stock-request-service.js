@@ -270,7 +270,7 @@ export function createSpecialStockRequestService(dependencies = {}) {
       assertSpecialStockRemoteOrderAllowed(before);
       const prepared = Array.isArray(input.lines) && !before.purchaseOrderSubmissionStartedAt
         ? await deps.preparePurchaseOrder(caseId, input, context) : before;
-      const independentPurchase = prepared.salesOrderSource === 'manual_link';
+      const independentPurchase = prepared.salesOrderSource === 'manual_link' || Boolean(prepared.localAdjustedAt);
       if (!prepared.purchaseOrderSubmissionStartedAt && prepared.vendorDiscountReview?.mode !== 'per_line') {
         throw serviceError('SCM must confirm a vendor discount percentage for every material, including 0, before PO creation.', 'SPECIAL_VENDOR_DISCOUNT_REQUIRED', 400);
       }

@@ -767,7 +767,7 @@
     document.head.appendChild(appEventStream);
     const regularAlert = document.createElement("script");
     regularAlert.async = false;
-    regularAlert.src = "/regular-stock-alert.js?v=20261014-os-notifications&stockingReply=20261006-v1&backorder=20261007-v1&stockCheck=20261009";
+    regularAlert.src = "/regular-stock-alert.js?arrival=20261020-v1&input=20261020-v1&v=20261014-os-notifications&stockingReply=20261006-v1&backorder=20261007-v1&stockCheck=20261009";
     document.head.appendChild(regularAlert);
     const aggregateAlert = document.createElement("script");
     aggregateAlert.async = false;

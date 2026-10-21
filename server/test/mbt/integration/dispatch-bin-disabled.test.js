@@ -83,6 +83,10 @@ async function persistedState() {
 }
 
 function isDisabledOperation(operation) {
+  if (operation !== "confirm") {
+    return error => error?.status === 409 && error?.code === "MBT_BIN_PLANNING_REQUIRED"
+      && error?.message === "Change BIN assignments in MBT Planning.";
+  }
   return (error) => error?.status === 409
     && error?.code === "MBT_CAPABILITY_DISABLED"
     && error?.message === "BIN dispatch is disabled."

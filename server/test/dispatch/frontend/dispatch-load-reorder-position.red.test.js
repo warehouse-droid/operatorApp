@@ -44,6 +44,7 @@ function functionBody(name) {
 }
 
 const plannerFunctions = [
+  "isMbtPlanningLoad", "isPlanningLoadReadOnly",
   "timeText",
   "normalizeTypedDispatchTime",
   "resolvedLoadStartMode",
@@ -341,7 +342,7 @@ test("DLR-05: the save path serializes the corrected positional fields", () => {
   const payloadBody = functionBody("planPayload");
   assert.match(
     payloadBody,
-    /const payloadTrucks\s*=\s*withoutAuthoritativelyRetiredStops\(trucksWithTimingMetadata\(\)\)/u
+    /const payloadTrucks\s*=\s*preserveMbtReadOnlyLoads\(withoutAuthoritativelyRetiredStops\(draftOnly \? trucks : trucksWithTimingMetadata\(\)\)\)/u
   );
   assert.match(payloadBody, /trucks:\s*payloadTrucks/u);
   assert.match(functionBody("assignLoadFields"), /load\.switchYard\s*=\s*loadSwitchYard/u);

@@ -1,0 +1,13 @@
+[
+  "src/local-sales-order-reopen.js",
+  "src/operator-order-reopen-repository.js",
+  "src/delivery-repository.js",
+  "src/sales-order-reconciliation-repository.js",
+  "src/dispatch-repository.js",
+  "src/dispatch-fulfilled-so-repository.js",
+  "src/dispatch-fulfilled-so-policy.js",
+  "public/dispatch.js",
+  "public/dispatch.html",
+  "public/control-order-reopen.js",
+  "public/control.html"
+]

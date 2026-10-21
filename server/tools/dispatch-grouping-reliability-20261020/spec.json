@@ -1,0 +1,31 @@
+{
+  "task": "Prioritize Edit Mode entry delay and grouping failures",
+  "tier": 3,
+  "specApproval": "not obtained (autonomous run)",
+  "behaviors": [
+    "Entering Edit Mode does not wait for a duplicate full assignment download; server lease acquisition and snapshot verification remain mandatory.",
+    "Grouping SOA09143-S5 and SOA09140-S5 uses complete item details despite unrelated background order refresh events.",
+    "A selected order becoming incomplete during hydration is revalidated before grouping.",
+    "Changed selection, plan, or local draft during hydration cannot be silently overwritten or grouped.",
+    "Grouping existing split orders without changing their quantities preserves PO allocations and does not request a new split.",
+    "Real split quantity changes with active allocations remain rejected and failed saves roll back.",
+    "Existing Oct-20 route repairs, order quantities, historical evidence, and concurrent edits are preserved."
+  ],
+  "failureModel": {
+    "staleReadOverwritesDraft": "Concurrency tests for selection, date, generation, and refresh ordering",
+    "incompleteGroupCargo": "Complete nested item validation and failed request tests",
+    "allocationGuardBypass": "Database integration tests for unchanged versus changed quantities and PO links",
+    "partialSave": "Transactional integration regression checks",
+    "editLeaseBypass": "Entry tests for lease conflicts and post-acquisition snapshot verification",
+    "latencyRegression": "Playwright request timing and pending-request tests",
+    "deploymentDrift": "Immutable live capture and guarded deployment with rollback"
+  },
+  "setup": {
+    "dependencies": [],
+    "tooling": "Existing Node, Playwright, test fixtures, lint/type tools; bounded isolated disposable containers",
+    "git": "Preserve dirty workspace; use source hashes and isolated baseline/candidate copies; no commits",
+    "artifacts": "Task source capture, executable tests, test runner, timing traces, mutation checks, evidence JSON",
+    "cleanup": "Register teardown before test startup; remove test containers, volumes and networks; verify docker ps and ps -a and production health"
+  },
+  "outOfScope": ["Broader initial loading-plan optimization"]
+}

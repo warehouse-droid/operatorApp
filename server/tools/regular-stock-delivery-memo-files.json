@@ -1,0 +1,5 @@
+[
+  "src/stock-request-repository.js",
+  "src/stock-request-service.js",
+  "src/netsuite.js"
+]

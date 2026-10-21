@@ -3,12 +3,12 @@ import test from 'node:test';
 import { deriveSpecialCaseStage, normalizeSpecialSalesDecision, normalizeSpecialCaseDraft,
   normalizeSpecialSalesOrderDraft } from '../../../src/special-stock-request-domain.js';
 
-test('seven stages keep production waiting above order milestones and completion above attention', () => {
+test('accepted production ETAs keep requests Confirmed and completion stays above attention', () => {
   assert.equal(deriveSpecialCaseStage({ submitted: true }), 'new_enquiry');
   assert.equal(deriveSpecialCaseStage({ submitted: true, hasPendingSalesDecision: true }), 'await_customer_confirmation');
-  assert.equal(deriveSpecialCaseStage({ waitingForProduction: true, salesOrderId: 1, purchaseOrderId: 2 }), 'wait_for_production');
+  assert.equal(deriveSpecialCaseStage({ waitingForProduction: true, salesOrderId: 1, purchaseOrderId: 2 }), 'confirmed');
   assert.equal(deriveSpecialCaseStage({ salesOrderId: 1 }), 'confirmed');
-  assert.equal(deriveSpecialCaseStage({ salesOrderId: 1, purchaseOrderId: 2, fulfillmentMethod: 'yard_pickup' }), 'dispatch_arrangement');
+  assert.equal(deriveSpecialCaseStage({ salesOrderId: 1, purchaseOrderId: 2, fulfillmentMethod: 'yard_pickup' }), 'confirmed');
   assert.equal(deriveSpecialCaseStage({ salesOrderId: 1, purchaseOrderId: 2, fulfillmentMethod: 'vendor_pickup' }), 'confirmed');
   assert.equal(deriveSpecialCaseStage({ operationallyComplete: true, attention: true }), 'completed');
   assert.equal(deriveSpecialCaseStage({ closed: true, attention: true }), 'closed');

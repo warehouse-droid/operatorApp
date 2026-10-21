@@ -1,0 +1,4 @@
+{
+  "compilerOptions": {"allowJs":true,"checkJs":true,"strict":true,"noEmit":true,"skipLibCheck":true,"target":"ES2022","module":"NodeNext","types":["node"]},
+  "include": ["../public/special-stock-po-reference.js"]
+}

@@ -20,6 +20,21 @@ function client(overrides = {}) {
   return context;
 }
 
+test("F1 a failed RA keeps the draft ID and retry form instead of showing Return recorded", async () => {
+  const c = vm.createContext({ returnBusy: false, returnDirty: true, returnDraftId: "", returnStage: "review",
+    returnPostingReady: () => true, validateReturnForReview: () => null, render: () => {},
+    uploadReturnEvidence: async () => {}, buildReturnPayload: () => ({}),
+    api: async () => { throw Object.assign(new Error("Return remains a draft"), {
+      payload: { code: "RETURN_SUBMISSION_DRAFT", draftId: "draft-123", draftSaved: true }
+    }); }, showToast: () => {}, t: (_, fallback) => fallback });
+  vm.runInContext(functionSource("submitReturn"), c);
+  await c.submitReturn();
+  assert.equal(c.returnStage, "form");
+  assert.equal(c.returnDraftId, "draft-123");
+  assert.equal(c.returnDirty, false);
+  assert.equal(c.returnValidationMessage, "Return remains a draft");
+});
+
 test("U1 combined review waits for both yard policies and enables confirmation only when loaded", async () => {
   const pending = [];
   const c = client({ loadOperatorNetSuitePostingPolicy: key => new Promise(resolve => pending.push({ key, resolve })) });

@@ -1,0 +1,37 @@
+{
+  "feature": "Count customer pallet movements once",
+  "tier": 3,
+  "specApproval": "not obtained (autonomous run); user authorized fixing the investigated bug",
+  "setup": {
+    "dependencies": "No new dependencies; use existing Node, PostgreSQL, fast-check, c8, ESLint and TypeScript.",
+    "isolation": "Standard docker-compose.mbt-test.yml, unique project, mbbs-tests.slice, existing bounded settings, teardown registered before startup.",
+    "git": "Preserve unrelated work; no commits or branch changes.",
+    "deployment": "One-file overlay on the captured live app image, exact candidate verification, app-only restart with automatic rollback, no database migrations or NetSuite writes.",
+    "artifacts": "Persist regression tests, runner, mutation script, source hashes, logs and evidence; remove all disposable test resources.",
+    "savedSearch": "After the correction, provide a read-only SuiteScript method for customsearch503. Do not switch the production balance source."
+  },
+  "acceptance": [
+    "P1 A synthetic customer with 194 fulfilled and credited at one yard and 12 fulfilled at another has fulfilled=206, returned=194 and available=12, despite accounting mirror rows and one actual 7-pallet main line.",
+    "P2 A 7-pallet fulfillment whose actual item row has mainline=T still contributes exactly 7.",
+    "P3 A 5-pallet fulfillment and 2-pallet credit memo, each accompanied by accounting rows, yield fulfilled=5 and returned=2.",
+    "P4 Generated positive and fractional movements across yards conserve actual fulfilled/credited quantities regardless of accounting rows, fulfillment mainline flag or input order.",
+    "P5 Other customers, other items, tax lines and void/cancel/reject statuses do not contribute; customer-wide scope and credit memo identity remain intact.",
+    "P6 Invalid customer/item identifiers fail before a query can execute.",
+    "R1 Existing return, credit memo, authorization, pending reservation, duplicate-credit, freshness, authorization and concurrency regressions have zero new failures.",
+    "R2 The endpoint and balance response shape stay compatible, including available=max(fulfilled-returned-localReserved,0).",
+    "L1 The deployed production function independently returns fulfilled=206, netsuiteReturned=194 and available=12 for customer 5240 when the source transactions remain unchanged."
+  ],
+  "failureModel": [
+    {"risk": "Counting accounting mirrors overstates return entitlement", "check": "Execute generated production SQL against synthetic transaction tables; targeted mutations and generated conservation cases."},
+    {"risk": "Discarding real main lines understates entitlement", "check": "Mainline=T regression, generated mainline choices, and live REST-verified historical fulfillment."},
+    {"risk": "Changing customer, item, status or yard scope", "check": "Adversarial decoy records and all affected return regressions."},
+    {"risk": "Releasing a pending return or accepting a duplicate concurrent return", "check": "Existing return reservation, freshness and concurrency tests; repository code unchanged."},
+    {"risk": "Deploying unrelated workspace changes or interrupting an active posting", "check": "Captured live image, one-file hash comparison, active-operation preflight, rollback and health checks."}
+  ],
+  "validationLimits": [
+    "PostgreSQL executes the same generated SQL with only NVL translated to COALESCE and BUILTIN.DF(status) mapped to fixture status text; a live read-only SuiteQL query verifies the NetSuite dialect.",
+    "Run the complete affected return-domain suite rather than the unrelated whole-application suite; record all selected files and any baseline failures.",
+    "Existing module-wide type/lint findings must be compared against the captured baseline. No new findings are allowed.",
+    "No performance SLA is introduced; record live lookup duration without imposing an arbitrary budget."
+  ]
+}

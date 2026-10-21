@@ -1,0 +1,40 @@
+--- a/server/src/stock-request-repository.js
++++ b/server/src/stock-request-repository.js
+@@ -1,5 +1,6 @@
+ import { query, withTransaction } from "./db.js";
+ import { parseYardIds } from '../public/stock-request-yard-filter.js';
++import { dependencyQuantityConversionDisplay } from './order-dependency-quantity.js';
+ import {
+   STOCK_REQUEST_YARDS,
+   assertStockRequestDestinationAccess,
+@@ -697,7 +698,11 @@
+       }
+       const line = normalizeLineInput({itemId:material.itemId,sourceLocationId:route.sourceLocationId,salesQty:material.quantity},
+         {...item,to_plt:null,to_lyr:null,to_sec:null,to_pcs:null}, route.destinationLocationId);
+-      return {...line,remoteLineId:material.remoteLineId,soQuantity:material.soQuantity,backorderedQuantity:material.backorderedQuantity,
++      const packing = dependencyQuantityConversionDisplay(line.salesQty, Object.fromEntries(
++        ['to_plt','to_lyr','to_sec','to_pcs'].map(key => [key, Math.max(0,numeric(item[key]))])
++      ));
++      return {...line,pallets:packing.palletQty,layers:packing.layerQty,sections:packing.sectionQty,pieces:packing.pieceQty,
++        remoteLineId:material.remoteLineId,soQuantity:material.soQuantity,backorderedQuantity:material.backorderedQuantity,
+         quantityBasis:material.quantityBasis,toPlt:nullableNumeric(item.to_plt),toLyr:nullableNumeric(item.to_lyr),toSec:nullableNumeric(item.to_sec),toPcs:nullableNumeric(item.to_pcs)};
+     });
+     const pallet = stockRequestPalletQuantity(lines);
+@@ -1155,11 +1160,13 @@
+         const mapping = plan.mappings.find(entry=>entry.remoteLineId===line.remoteLineId);
+         const row = locked.rows.find(entry=>Number(entry.id)===mapping.requestLineId);
+         row.sales_qty = line.salesQty;
+-        // Keep the conversion snapshot used to calculate PALLET with its units.
+-        for (const [key,value] of Object.entries({to_plt:line.toPlt,to_lyr:line.toLyr,to_sec:line.toSec,to_pcs:line.toPcs})) row[key]=value;
++        // Keep the selected quantity, packing counts and conversion snapshot together.
++        for (const [key,value] of Object.entries({pallet_qty:line.pallets,layer_qty:line.layers,section_qty:line.sections,piece_qty:line.pieces,
++          to_plt:line.toPlt,to_lyr:line.toLyr,to_sec:line.toSec,to_pcs:line.toPcs})) row[key]=value;
+         mapping.quantity = line.salesQty;
+-        await query('UPDATE sales_stock_request_lines SET sales_qty=$2,to_plt=$3,to_lyr=$4,to_sec=$5,to_pcs=$6 WHERE id=$1',
+-          [row.id,line.salesQty,line.toPlt,line.toLyr,line.toSec,line.toPcs]);
++        await query(`UPDATE sales_stock_request_lines SET sales_qty=$2,to_plt=$3,to_lyr=$4,to_sec=$5,to_pcs=$6,
++          pallet_qty=$7,layer_qty=$8,section_qty=$9,piece_qty=$10,updated_at=now() WHERE id=$1`,
++          [row.id,line.salesQty,line.toPlt,line.toLyr,line.toSec,line.toPcs,line.pallets,line.layers,line.sections,line.pieces]);
+       }
+       plan.groups = groupStockRequestLinesForTransfer(locked.rows);
+       await query('UPDATE regular_stock_handoffs SET plan=$2::jsonb WHERE request_id=$1',[request.id,JSON.stringify(plan)]);

@@ -3913,17 +3913,21 @@ function renderDriverBinEvidence(job) {
 }
 
 function renderDriverBinSummary(job) {
-  const assets = Object.entries(job.mbt?.exactAssets || {}).filter(([, asset]) => asset?.assetId);
+  const seen=new Set();
+  const assets = Object.entries(job.mbt?.exactAssets || {}).filter(([, asset]) => {
+    if (!asset?.assetId || seen.has(asset.assetId)) return false;
+    seen.add(asset.assetId);return true;
+  });
   const requirements = window.DriverBinUI.requirements(job);
   return `
     <section class="driver-bin-work-order" data-driver-bin-job>
       <div class="driver-bin-work-head">
-        <div><span>${t("driver.binWorkOrder", "BIN work order")}</span><h3>${escapeHtml(job.mbt?.visitReference || job.mbt?.contractNumber || job.jobId)}</h3></div>
+        <div><span>${t("driver.binWorkOrder", "BIN work order")}</span><h3>${escapeHtml(job.mbt?.displayReference || job.mbt?.visitReference || job.mbt?.contractNumber || job.jobId)}</h3></div>
         <span class="driver-bin-type-badge">${escapeHtml(job.mbt?.binTypeCode || "BIN")}</span>
       </div>
       <div class="driver-bin-frozen-grid">
         <div><span>${t("driver.binAction", "Action")}</span><strong>${escapeHtml(driverBinActionLabel(job))}</strong></div>
-        <div><span>${t("driver.binVisit", "Visit")}</span><strong>${escapeHtml(job.mbt?.visitReference || "-")}</strong></div>
+        <div><span>${t("driver.binVisit", "Visit")}</span><strong>${escapeHtml(job.mbt?.displayReference || job.mbt?.visitReference || "-")}</strong></div>
       </div>
       ${assets.length ? `<div class="driver-bin-assets">${assets.map(([role, asset]) => `
         <div data-bin-asset-role="${escapeHtml(role)}">
@@ -7293,7 +7297,7 @@ if ("serviceWorker" in navigator) {
     window.setTimeout(requestDriverWorkerVersion, 0);
     window.setTimeout(publishDriverOfflineMode, 0);
   });
-  navigator.serviceWorker.register("/driver-service-worker.js?v=20261016-driver-reconnect-v1", {
+  navigator.serviceWorker.register("/driver-service-worker.js?v=20261020-bin-workflows", {
     scope: "/driver",
     updateViaCache: "none"
   })

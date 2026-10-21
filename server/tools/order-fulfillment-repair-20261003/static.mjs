@@ -1,0 +1,18 @@
+import fs from 'node:fs';
+import {spawnSync} from 'node:child_process';
+import {ESLint} from 'eslint';
+const file='public/operator.js';
+const globals=Object.fromEntries(['window','document','navigator','self','caches','fetch','localStorage','sessionStorage','setTimeout','clearTimeout','setInterval','clearInterval','setImmediate','AbortController','AbortSignal','URL','URLSearchParams','Blob','File','FileReader','FormData','Request','Image','ImageCapture','EventSource','HTMLElement','Element','HTMLInputElement','HTMLImageElement','ResizeObserver','IntersectionObserver','MutationObserver','CustomEvent','Event','performance','location','atob','btoa','crypto','process','console','Buffer','structuredClone'].map(n=>[n,'readonly']));
+const lint=new ESLint({overrideConfigFile:true,overrideConfig:[{files:['**/*.js'],languageOptions:{ecmaVersion:'latest',sourceType:'script',globals},rules:{'no-undef':'error','no-unused-vars':'error','no-unreachable':'error',eqeqeq:'error'}}]});
+const messages=(await lint.lintText(fs.readFileSync(file,'utf8'),{filePath:file})).flatMap(r=>r.messages.map(m=>`${m.ruleId}: ${m.message}`)).sort();
+const types=spawnSync(process.execPath,['node_modules/typescript/bin/tsc','--allowJs','--checkJs','--noEmit','--skipLibCheck','--module','nodenext','--target','ES2022',file],{encoding:'utf8',maxBuffer:16*1024*1024});
+const diagnostics=(types.stdout+types.stderr).split('\n').filter(l=>/error TS\d+/.test(l)).map(l=>l.replace(/\(\d+,\d+\)/g,'(line,column)')).sort();
+fs.writeFileSync('test-artifacts/types-full.txt',types.stdout+types.stderr);
+if(types.status&&!diagnostics.length)throw new Error(types.stderr||types.stdout);
+const backendFiles=['src/operator-netsuite-posting-adapter.js','src/operator-netsuite-posting-domain.js','src/operator-netsuite-posting-targets.js','src/netsuite.js',...(fs.existsSync('src/netsuite-transaction-units.js')?['src/netsuite-transaction-units.js']:[])];
+const backendLint=new ESLint({overrideConfigFile:true,overrideConfig:[{files:['**/*.js'],languageOptions:{ecmaVersion:'latest',sourceType:'module',globals},rules:{'no-undef':'error','no-unused-vars':'error','no-unreachable':'error',eqeqeq:'error'}}]});
+const backendMessages=(await backendLint.lintFiles(backendFiles)).flatMap(r=>r.messages.map(m=>`${r.filePath.split('/').pop()}: ${m.ruleId}: ${m.message}`)).sort();
+const backendTypes=spawnSync(process.execPath,['node_modules/typescript/bin/tsc','--allowJs','--checkJs','--noEmit','--skipLibCheck','--module','nodenext','--target','ES2022',...backendFiles],{encoding:'utf8',maxBuffer:32*1024*1024});
+const backendDiagnostics=(backendTypes.stdout+backendTypes.stderr).split('\n').filter(l=>/error TS\d+/.test(l)).map(l=>l.replace(/\(\d+,\d+\)/g,'(line,column)')).sort();
+if(backendTypes.status&&!backendDiagnostics.length)throw Error(backendTypes.stdout+backendTypes.stderr);
+console.log(JSON.stringify({lint:messages,types:diagnostics,backendLint:backendMessages,backendTypes:backendDiagnostics,node:process.version}));

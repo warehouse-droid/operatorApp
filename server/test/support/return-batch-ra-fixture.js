@@ -12,7 +12,10 @@ function fixtureRows(sql, remoteLines, created, control) {
       else if (sql.includes("AS sales_quantity")) {items = remoteLines;}
       else if (sql.includes("t.externalid =")) {
         const match = sql.match(/t.externalid = '([^']+)'/);
-        items = control.hideExternalId ? [] : [...created.values()].filter(s => s.externalId === match?.[1]).map(s => ({ id: s.id, tranid: s.tranId }));
+        const type = sql.includes("t.type = 'CustCred'") ? "creditMemo" : "returnAuthorization";
+        items = control.hideExternalId ? [] : [...created.values()]
+          .filter(s => s.externalId === match?.[1] && (!s.recordType || s.recordType === type))
+          .map(s => ({ id: s.id, tranid: s.tranId }));
       } else if (sql.includes("return_ra_credit_lines")) {items = control.credits;}
       else if (sql.includes("'ItemShip' AS transaction_type")) {
         items = [{ transaction_type: "ItemShip", quantity: 20, transaction_count: 1 },
@@ -23,6 +26,9 @@ function fixtureRows(sql, remoteLines, created, control) {
 }
 
 async function fixtureCreate(address, body, created, control) {
+      if (body.item.items.some(line => line.units && typeof line.units === "object")) {
+        return Response.json({ "o:errorDetails": [{ "o:errorCode": "INVALID_VALUE", detail: "Invalid units: REST expects a scalar ID" }] }, { status: 400 });
+      }
       const keys = body.item.items.map(line => line.orderLine).filter(value => value !== undefined);
       if (new Set(keys).size !== keys.length) {
         return Response.json({ "o:errorDetails": [{ "o:errorCode": "DUPLICATE_KEYS", "o:errorPath": "item.items", detail: "There are multiple sublist lines with the same identifier." }] }, { status: 400 });
@@ -30,13 +36,16 @@ async function fixtureCreate(address, body, created, control) {
       if (control.onCreate) {await control.onCreate();}
       if (control.rejectCreate) {return Response.json({ "o:errorDetails": [{ "o:errorCode": "INVALID_QUANTITY", detail: "Invalid quantity" }] }, { status: 400 });}
       const id = String(99092000 + ++sequence);
-      const data = { ...body, id, tranId: `RA${id}`, entity: { id: "99091702" }, status: { refName: "Pending Receipt" },
+      const creditMemo = /\/creditMemo(?:\?|$)/i.test(address);
+      const recordType = creditMemo ? "creditMemo" : "returnAuthorization";
+      const data = { ...body, id, recordType, tranId: `${creditMemo ? "CM" : "RA"}${id}`, entity: { id: "99091702" },
+        status: { refName: creditMemo ? "Open" : "Pending Receipt" },
         ...(address.includes("!transform") ? { createdFrom: { id: "99091700" } } : {}) };
       data.item.items = data.item.items.map((line, index) => ({ ...line, line: index + 1 }));
       created.set(id, data);
       if (control.alter) {control.alter(data);}
       if (control.failAfterCreate) {throw new Error("connection lost after create");}
-      return new Response(null, { status: 204, headers: control.omitLocation ? {} : { location: `https://return-ra.invalid/record/v1/returnAuthorization/${id}` } });
+      return new Response(null, { status: 204, headers: control.omitLocation ? {} : { location: `https://return-ra.invalid/record/v1/${recordType}/${id}` } });
 }
 
 export async function fixture(t, { enabled = true } = {}) {
@@ -57,6 +66,7 @@ export async function fixture(t, { enabled = true } = {}) {
   await query("DELETE FROM return_batch_authorizations WHERE intent_snapshot->>'customerId'='99091702'");
   await query("DELETE FROM return_records WHERE operator_id=$1 OR customer_id=99091702", [actor]);
   await query("DELETE FROM return_batches WHERE operator_id=$1", [actor]);
+  await query("DELETE FROM return_drafts WHERE operator_id=$1", [actor]);
   await query(`INSERT INTO operators(id,username,display_name,password_hash,password_salt,role,roles,yard_location_ids)
     VALUES($1,$1,'RA test','test','test','admin',ARRAY['admin'],ARRAY[1,28]) ON CONFLICT(id) DO NOTHING`, [actor]);
   await query(`INSERT INTO netsuite_tokens(id,access_token,expires_at) VALUES(1,'fixture',now()+interval '1 hour')
@@ -109,4 +119,3 @@ export async function submitInput({ pallet = false, stock = true, quantity = 1 }
     vehiclePlate: "TEST", palletQuantity: pallet ? quantity : 0, palletPhotos: pallet ? reasonPhotos : [],
     expectedPostingPolicies: policies };
 }
-

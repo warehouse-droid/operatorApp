@@ -1,0 +1,16 @@
+[
+  "src/regular-stock-delivery-operations.js",
+  "src/regular-stock-delivery-progress.js",
+  "src/regular-stock-delivery.js",
+  "src/regular-stock-handoff.js",
+  "src/stock-request-service.js",
+  "src/server.js",
+  "public/regular-stock-delivery.js",
+  "public/regular-stock-dialog.js",
+  "public/sales-stock-requests.js",
+  "public/scm-stock-requests.js",
+  "migrations/241_regular_stock_delivery_operations.sql",
+  "public/sales-stock-requests.html",
+  "public/scm-stock-requests.html",
+  "public/scm-smart.html"
+]

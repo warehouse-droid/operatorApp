@@ -1,0 +1,6 @@
+{
+  "source": "Preserved original files, complete test environment, regression-baseline run",
+  "failureNames": [
+    "\u2716 all staff module entry points share the login page while Driver remains separate"
+  ]
+}

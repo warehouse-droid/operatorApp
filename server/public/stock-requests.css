@@ -190,6 +190,7 @@ body.scm-stock-requests-page { overflow: auto; }
 .stock-request-pill.pending_fulfillment,
 .stock-request-pill.accepted { background: #dfeaff; color: #234f9e; }
 .stock-request-pill.changes_requested { background: #fff0c8; color: #795100; }
+.stock-request-pill.stock-request-waiting { background: #fff0c8; color: #795100; text-transform: none; }
 
 .stock-request-heading {
   display: flex;
@@ -790,6 +791,7 @@ body.scm-stock-requests-page { overflow: auto; }
 .stock-request-yard-filter summary { cursor: pointer; white-space: nowrap; padding: .7rem; border: 1px solid #ccd4dc; border-radius: 8px; background: #fff; }
 .special-stage-filter > div,
 .stock-request-yard-filter > div { position: absolute; z-index: 30; right: 0; width: max-content; max-width: calc(100vw - 60px); padding: .8rem; background: #fff; border: 1px solid #ccd4dc; box-shadow: 0 8px 24px #0002; border-radius: 8px; }
+.stock-request-yard-filter[data-yard-filter="unifiedStatus"] > div { left: 0; right: auto; }
 .special-stage-filter label,
 .stock-request-yard-filter label { display: flex; gap: .5rem; align-items: center; padding: .35rem; }
 .special-stage-filter input,

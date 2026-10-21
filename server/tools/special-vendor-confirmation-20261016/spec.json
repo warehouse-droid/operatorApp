@@ -1,0 +1,43 @@
+{
+  "request": "Special Order remains Await Customer Confirmation without linked SO; SCM can mark linked PO as sent to vendor, showing Waiting Vendor Confirmation.",
+  "tier": 3,
+  "specApproval": "not obtained (autonomous run)",
+  "scenarios": [
+    "Reviewed accepted materials without SO stay Await Customer Confirmation, including accepted ETAs and a manually linked PO. New unchecked enquiries retain New enquiry.",
+    "A linked SO advances to Confirmed. Explicit test-only SO skips retain the existing testing path.",
+    "SCM can mark an active linked PO as sent once. Server stores time and actor and an audit event atomically with the revision. No vendor message is sent.",
+    "The new waiting status appears consistently in Sales, SCM, queue filters and database projections. Missing SO, terminal and pending-information states retain precedence.",
+    "Existing vendor reference plus queued PO continues the dispatch handoff; already-dispatched requests cannot be sent again. Vendor pickup retains Waiting Vendor Confirmation until completion. This proposed handoff is pending optional user clarification.",
+    "Sales, anonymous and backorder requests cannot use the SCM-only action. Missing PO, stale revisions, closed/completed requests and active operations are rejected. Duplicate current-revision retries are idempotent; racing clicks save once.",
+    "A changed linked PO clears the sent acknowledgement; the audit record retains the old order.",
+    "Regular backorder Confirmed SO/PO linkage remains unchanged.",
+    "Migration preserves request/order data and can be reapplied safely; rollback restores the old view without discarding new audit metadata."
+  ],
+  "failureModel": {
+    "incorrectStage": "property tests plus SQL/HTTP/filter assertions",
+    "unauthorizedOrForgedAction": "role tests and server-loaded PO/revision",
+    "duplicateOrLostAction": "parallel HTTP requests and exact event/revision counts",
+    "browserMismatch": "real authenticated Playwright clicks",
+    "migrationOrRollback": "isolated database rehearsal, source/config checks before deployment"
+  },
+  "setup": {
+    "dependencies": [],
+    "git": "Preserve dirty workspace; scoped patch over captured live image. No commit/reset.",
+    "tests": "Standard bounded isolated Compose, mbbs-tests.slice, cleanup registered before startup, remove volumes/network/containers after every run.",
+    "artifacts": "tools, deployments and test-artifacts/special-vendor-confirmation-20261016"
+  },
+  "amendments": [
+    {
+      "reason": "Repository rejects replacing a linked PO. Do not introduce an unrelated capability. Supersedes the different-PO scenario.",
+      "scenario": "Relinking the same PO preserves its sent acknowledgement; attempting another PO returns the existing conflict and preserves both original link and sent metadata."
+    },
+    {
+      "reason": "No optional user clarification received.",
+      "scenario": "Use the existing vendor-reference and queued PO handoff for Dispatch Arrangement. Vendor pickup remains in vendor waiting until existing completion evidence."
+    },
+    {
+      "reason": "Expanded regression review found that skipped test orders with accepted ETAs have an earlier Confirmed rule and Backorder shares the stage catalog.",
+      "scenario": "Preserve the test-only accepted-ETA milestone and exclude the Special-only vendor-waiting option from Backorder filters."
+    }
+  ]
+}

@@ -34,6 +34,8 @@ try {
     window.smartWork=async (_label,fn)=>fn();
     window.smartRender=()=>{window.smartScmApp.innerHTML=window.smartVendorLoadCard(record);};
   },proposal);
+  await page.addScriptTag({path:'public/scm-smart-line-order-core.js'});
+  await page.addScriptTag({path:'public/scm-smart-line-order.js'});
   await page.addScriptTag({path:'public/scm-smart-vendor.js'});
   await page.evaluate(()=>window.smartRender());
   assert.equal(await page.getByRole('link',{name:'View / Edit PO'}).getAttribute('href'),'/scm/netsuite-po?historyId=55');

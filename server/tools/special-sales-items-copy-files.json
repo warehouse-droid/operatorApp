@@ -1,0 +1,9 @@
+[
+  "src/special-stock-request-domain.js",
+  "src/special-stock-request-repository.js",
+  "src/server.js",
+  "public/special-stock-request-actions.js",
+  "public/special-stock-request-actions.css",
+  "public/sales-special-stock-requests.js",
+  "public/sales-stock-requests.html"
+]

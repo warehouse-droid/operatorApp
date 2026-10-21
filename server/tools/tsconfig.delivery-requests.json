@@ -1,0 +1,5 @@
+{
+  "extends": "../tsconfig.mbt.json",
+  "compilerOptions": {"checkJs": true},
+  "include": ["../src/delivery-request-domain.js", "../src/delivery-request-expiry.js"]
+}

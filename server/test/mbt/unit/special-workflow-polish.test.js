@@ -42,7 +42,7 @@ for (const step of ['salesOrderSkipped', 'purchaseOrderSkipped']) {
     test(`${method} rejects ${step} before preparation or any external call`, async () => {
       const calls = [];
       const boundary = name => async () => { calls.push(name); throw new Error(`Unexpected ${name}`); };
-      const service = createSpecialStockRequestService({
+      const service = createSpecialStockRequestService({ assertPurchaseOrderReady: async () => {}, selectSalesRep: async () => ({ id: 123, name: 'TEST NetSuite Rep' }),
         getCase: async () => ({ id: 1, revision: 2, [step]: true, salesOrderId: 91 }),
         claimOperation: boundary('claim'), preparePurchaseOrder: boundary('prepare'),
         fetchSalesOrderReference: boundary('fetch'), resolveLocations: boundary('location'),

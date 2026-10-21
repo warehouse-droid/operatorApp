@@ -1,0 +1,4 @@
+{
+  "extends": "./regular-stock-v2-tsconfig.json",
+  "files": ["../src/regular-stock-delivery-access.js", "../src/regular-stock-delivery-domain.js"]
+}

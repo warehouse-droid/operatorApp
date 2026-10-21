@@ -30,32 +30,37 @@ export function normalizeScmScheduleRemarkOverride(value) {
 export function resolveScmScheduleRemark({
   orderKind = "",
   remarkOverride = null,
-  netSuiteMemo = ""
+  netSuiteMemo = "",
+  remarkPrefix = ""
 } = {}) {
   const local = normalizeScmScheduleRemarkOverride(remarkOverride) || "";
   const memo = cleanRemarkText(netSuiteMemo);
-  if (local) {
-    return {
-      remark: local,
-      remarkSource: "local",
-      remarkOverride: local,
-      netSuiteMemo: memo
-    };
-  }
-  if (["PO", "TO"].includes(String(orderKind || "").trim().toUpperCase()) && memo) {
-    return {
-      remark: memo,
-      remarkSource: "netsuite",
-      remarkOverride: "",
-      netSuiteMemo: memo
-    };
-  }
+  const kind = String(orderKind || "").trim().toUpperCase();
+  const inherited = ["PO", "TO"].includes(kind) ? memo : "";
+  const base = local || inherited;
+  const prefix = kind === "PO" ? cleanRemarkText(remarkPrefix) : "";
+  const alreadyPrefixed = base.toLowerCase().startsWith(prefix.toLowerCase())
+    && (base.length === prefix.length || /^[\s:;,.-]/.test(base.slice(prefix.length)));
   return {
-    remark: "",
-    remarkSource: "none",
-    remarkOverride: "",
+    remark: prefix && !alreadyPrefixed ? [prefix, base].filter(Boolean).join(" ") : base,
+    remarkSource: local ? "local" : inherited ? "netsuite" : prefix ? "local" : "none",
+    remarkOverride: local,
+    ...(prefix ? { remarkPrefix: prefix } : {}),
     netSuiteMemo: memo
   };
+}
+
+// SQL equivalent for server-side search: use the same displayed remark before
+// filtering and limiting rows. Arguments are internal SQL expressions only.
+export function scmScheduleRemarkSql({ orderKind, remarkOverride, netSuiteMemo, remarkPrefix }) {
+  const base = `COALESCE(NULLIF(BTRIM(${remarkOverride}), ''),
+    CASE WHEN ${orderKind} IN ('PO', 'TO') THEN NULLIF(BTRIM(${netSuiteMemo}), '') END, '')`;
+  const prefix = `COALESCE(CASE WHEN ${orderKind} = 'PO' THEN NULLIF(BTRIM(${remarkPrefix}), '') END, '')`;
+  return `CASE WHEN ${prefix} = '' OR (
+    lower(left(${base}, length(${prefix}))) = lower(${prefix})
+    AND (length(${base}) = length(${prefix})
+      OR substring(${base} FROM length(${prefix}) + 1 FOR 1) ~ '^[[:space:]:;,.-]')
+  ) THEN ${base} ELSE concat_ws(' ', ${prefix}, NULLIF(${base}, '')) END`;
 }
 
 export function isRemarkOnlyScmSchedulePatch(patch = {}) {

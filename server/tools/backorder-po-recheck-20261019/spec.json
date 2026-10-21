@@ -1,0 +1,29 @@
+{
+  "request": "Restore SCM PO link controls for STREQ-000133 after an SCM stock update on an SO-linked Backorder.",
+  "tier": 3,
+  "specApproval": "not obtained (autonomous run)",
+  "scenarios": [
+    "An active Backorder with a linked SO and reviewed open materials permits SCM to link an existing PO when stock updates reset Sales decisions to pending.",
+    "Without a linked SO, every open material still requires Sales acceptance before either order may be linked.",
+    "A linked SO never bypasses missing stock checks, explicit request_update decisions, or all-resolved material protection.",
+    "The SO link rule is unchanged; invalid order kinds are rejected.",
+    "The real SCM page shows a visible PO field and button after a stock update; submitting the form successfully links the canonical PO.",
+    "Linking preserves pending Sales decisions, existing SO, native orders, revision protection, role access, and audit records.",
+    "Closed/completed cases and already linked POs never expose a new PO link form.",
+    "Other Backorder, stocking conversion and Special manual linking behavior remains covered by its existing suites."
+  ],
+  "failureModel": {
+    "prematureLink": "Negative property and HTTP tests for missing SO, missing checks and request_update; persisted identity used by server.",
+    "uiServerMismatch": "Real browser submit and authenticated HTTP regression.",
+    "lostWrites": "Existing concurrent revision tests plus stale-revision regression.",
+    "remoteWrites": "Existing integration fetch trap and native order snapshot comparison.",
+    "deploymentDrift": "One runtime file over captured live image, all runtime hashes and config checked before and after; automatic rollback on failure."
+  },
+  "setup": {
+    "dependencies": [],
+    "git": "Preserve existing changes; no commits or reset.",
+    "testEnvironment": "Existing Node, fast-check, Playwright, c8, ESLint and TypeScript; standard isolated Compose, mbbs-tests.slice, bounded services; teardown registered before startup.",
+    "artifacts": "tools/backorder-po-recheck-20261019; test-artifacts/backorder-po-recheck-20261019; deployments/backorder-po-recheck-20261019",
+    "database": "Synthetic disposable test DB; no production data edits or migration."
+  }
+}

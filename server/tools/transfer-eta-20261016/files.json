@@ -1,0 +1,13 @@
+[
+  "public/special-stock-transfer-eta.js",
+  "src/special-stock-request-domain.js",
+  "src/special-stock-request-repository.js",
+  "public/scm-special-stock-requests.js",
+  "public/sales-special-stock-requests.js",
+  "public/backorder-stock-requests.js",
+  "public/scm-stock-requests.js",
+  "public/sales-stock-requests.js",
+  "public/scm-stock-requests.html",
+  "public/sales-stock-requests.html",
+  "migrations/294_special_transfer_eta.sql"
+]

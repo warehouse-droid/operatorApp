@@ -1,7 +1,8 @@
 import { query, withTransaction } from './db.js';
 import {salesStockCheckNotices} from './sales-stock-check-notices.js';
 import {submitBackorderRequest,assertRegularNotBackorder,backorderAlerts,acknowledgeBackorderAlert} from './backorder-request-service.js';
-import { createSalesStockRequest, updateSalesStockRequest, getScmStockRequest, getSalesStockRequest, recordStockRequestEvent, decideSalesStockRequestLines } from './stock-request-repository.js';
+import { createSalesStockRequest, updateSalesStockRequest, getScmStockRequest, getSalesStockRequest, recordStockRequestEvent, decideSalesStockRequestLines, requestDetailsForQueue } from './stock-request-repository.js';
+import {regularStockSalesAction} from '../public/regular-stock-status.js';
 import { refreshStockRequestItemsAvailability, refreshPurchaseStockAvailability } from './stock-request-service.js';
 import { normalizeRegularArrival, normalizeRegularLeadHours, normalizeRegularApprovalMinutes } from '../public/regular-stock-input.js';
 import { evaluateRegularStockApproval, regularError, regularApprovalExpired, isRegularStockingRequest } from './regular-stock-domain.js';
@@ -226,6 +227,26 @@ export async function decideRegularStockRequest(id, input, context, dependencies
   });
 }
 
+async function regularSalesInputAlerts(operatorId,authorizedDestinationLocationIds) {
+  const requests=[],now=Date.now();let cursor=0;
+  // Hydrate bounded batches of the requester's active work, using the same
+  // workflow evidence as the list. Do not stop at the visible list's first page.
+  for (;;) {
+    const {rows}=await query(`SELECT request.id,request.regular_details FROM sales_stock_requests request
+      WHERE request.request_type='regular' AND request.requested_by=$1 AND ${stockRequestSalesScopeSql('$2')}
+        AND request.status NOT IN ('completed','cancelled') AND request.id>$3 ORDER BY request.id LIMIT 100`,
+    [operatorId,authorizedDestinationLocationIds,cursor]);
+    const details=await requestDetailsForQueue(rows,{audience:'sales',authorizedStoreLocationIds:authorizedDestinationLocationIds});
+    for(const request of details){
+      const action=regularStockSalesAction(request,now);
+      if(action)requests.push({id:request.id,requestRef:request.requestRef,eventId:request.revision,action:'input_required',...action});
+    }
+    if(rows.length<100)break;
+    cursor=Number(rows.at(-1).id);
+  }
+  return requests;
+}
+
 export async function regularStockAlerts({ scm = false, operatorId, authorizedDestinationLocationIds = [] } = {}) {
   const backorder=await backorderAlerts({scm,operatorId,authorizedDestinationLocationIds});
   if (scm) {
@@ -242,22 +263,27 @@ export async function regularStockAlerts({ scm = false, operatorId, authorizedDe
       WHERE p.last_return_event_id>COALESCE(seen.event_id,0) ORDER BY p.last_return_event_id DESC LIMIT 200`,[operatorId||null])).rows;
     return { manualReview: rows[0].count+backorder.manualReview, returnedPools:returned.map(p=>({id:Number(p.id),purchaseOrderRef:p.po_ref,itemCode:p.item_name})),total:rows[0].count+backorder.manualReview+returned.length };
   }
-  if (!operatorId || !authorizedDestinationLocationIds.length) return { unread: 0, total: 0, requests: [] };
+  if (!operatorId || !authorizedDestinationLocationIds.length) return { unread: 0, actionRequired:0, total: 0, requests: [] };
   const { rows } = await query(`SELECT request.id,request.request_ref,request.manual_decision_event_id,event.event_type,event.details FROM sales_stock_requests request
     LEFT JOIN regular_stock_decision_reads seen ON seen.request_id=request.id AND seen.operator_id=$1
     JOIN sales_stock_request_events event ON event.id=request.manual_decision_event_id AND event.request_id=request.id
     WHERE request.workflow_version=2 AND request.request_type='regular' AND request.requested_by=$1 AND ${stockRequestSalesScopeSql('$2')}
+      AND NOT request.regular_details ? 'expiredClosedAt'
       AND request.manual_decision_event_id>COALESCE(seen.event_id,0) ORDER BY request.manual_decision_event_id DESC`,[operatorId,authorizedDestinationLocationIds]);
   const stockChecks=await salesStockCheckNotices({operatorId,authorizedDestinationLocationIds});
-  return { stockChecks, unread: rows.length+backorder.requests.length, total: rows.length+backorder.requests.length, requests: [...backorder.requests,...rows.map(row => ({ id: Number(row.id), requestRef: row.request_ref, eventId: Number(row.manual_decision_event_id),
+  const inputRequired=await regularSalesInputAlerts(operatorId,authorizedDestinationLocationIds);
+  const updates=[...backorder.requests,...rows.map(row => ({ id: Number(row.id), requestRef: row.request_ref, eventId: Number(row.manual_decision_event_id),
     action:row.event_type==='regular_scm_reply'?'reply':row.details.decision||'update',message:['regular_scm_reply','stocking_line_waitlisted'].includes(row.event_type)?row.details.message:null,
     lineId:row.details.lineId||null,itemName:row.details.itemName||null,
-    eta:row.details.eta||null,purchaseOrderRef:row.details.purchaseOrderRef||null,waitlistRequestId:row.details.waitlistRequestId||null,waitlistRequestRef:row.details.waitlistRequestRef||null }))] };
+    eta:row.details.eta||null,purchaseOrderRef:row.details.purchaseOrderRef||null,waitlistRequestId:row.details.waitlistRequestId||null,waitlistRequestRef:row.details.waitlistRequestRef||null }))];
+  const activeIds=new Set(inputRequired.map(row=>row.id));
+  const requests=[...inputRequired,...updates.filter(row=>row.action==='arrival' || !activeIds.has(row.id))];
+  return {stockChecks,unread:updates.length,actionRequired:inputRequired.length,total:requests.length,requests};
 }
 
-export async function acknowledgeRegularStockDecisions(id, { eventId }, context) {
+export async function acknowledgeRegularStockDecisions(id, { eventId, arrivalKey }, context) {
   const detail=await getSalesStockRequest(id,context);
-  if (detail.regular?.deliveryMethod==='backorder') return acknowledgeBackorderAlert(id,eventId,context);
+  if (detail.regular?.deliveryMethod==='backorder') return acknowledgeBackorderAlert(id,eventId,context,arrivalKey);
   return withTransaction(async () => {
     const request = await lockRequest(id);
     await getSalesStockRequest(id, context);

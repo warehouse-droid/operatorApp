@@ -1,0 +1,10 @@
+[
+  "public/special-stock-fulfillment.js",
+  "src/special-stock-request-repository.js",
+  "src/server.js",
+  "public/sales-special-stock-requests.js",
+  "public/sales-stock-requests.html",
+  "public/scm-special-stock-requests.js",
+  "public/scm-stock-requests.html",
+  "public/stock-requests.css"
+]

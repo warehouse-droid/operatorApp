@@ -448,7 +448,8 @@ test("MBT Front Desk BIN order: an inline local address is created atomically an
 test("MBT Front Desk multi-bin: amendment, exchange, customer confirmation, and collection stay line-scoped", async () => {
   const { converted } = await convertedMultiBinContract("line-actions");
   const contractId = converted.body.contract.contractId;
-  const [firstLine, secondLine] = converted.body.serviceLines;
+  await query("UPDATE mbt_service_visits SET status='completed', actual_completed_at=now() WHERE contract_id=$1 AND service_action='delivery'", [contractId]);
+  const [firstLine, secondLine] = (await getFrontdeskContractTimeline({ actor: ACTOR, contractId })).serviceLines;
   const extension = await extendFrontdeskServiceLine(frontdeskCommand("line-extension", ACTOR, {
     contractId,
     serviceLineId: secondLine.serviceLineId,

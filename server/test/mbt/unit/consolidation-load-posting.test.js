@@ -3,13 +3,13 @@ import test from "node:test";
 import fc from "fast-check";
 import { createConsolidationPostingPreparation } from "../../../src/consolidation-load-posting.js";
 
-function fixture({ enabled = true } = {}) {
+function fixture({ enabled = true, backgroundTransfers = false } = {}) {
   const materialized = [], drafts = [], checks = [], preflights = [];
   const prepare = createConsolidationPostingPreparation({
     assertClaims: async (input) => checks.push(input),
     resolveTargets: async ({ orderId, orderType, deferTargets }) => {
       assert.equal(deferTargets, true);
-      return { netSuitePostingOwner: orderType === "sales_order" ? "driver_completion" : "operator",
+      return { netSuitePostingOwner: orderType === "sales_order" ? "driver_completion" : backgroundTransfers && orderType === "transfer_order" ? "transfer_background" : "operator",
         localOnly: orderType === "co_order", materializeTargets: async () => {
           materialized.push(orderId); return { targets: [{ sourceOrderKind: "TO", sourceNetSuiteId: orderId }] };
         } };
@@ -50,4 +50,12 @@ test("properties: any mix of SO, TO and CO can materialize only gated native TOs
     assert.deepEqual(f.materialized, enabled ? orders.filter((order) => order.order_type === "transfer_order").map((order) => order.netsuite_id) : []);
     assert.equal(f.drafts.length, enabled && types.includes("transfer_order") ? 1 : 0);
   }), { seed: 20260915, numRuns: 150 });
+});
+
+test("background TO posting never becomes synchronous in a consolidated load", async () => {
+  const f = fixture({ backgroundTransfers: true });
+  assert.equal(await f.prepare({ id: "operator" }, batch, [{ netsuite_id: "1", order_type: "sales_order" }, { netsuite_id: "2", order_type: "transfer_order" }]), null);
+  assert.deepEqual(f.materialized, []);
+  assert.deepEqual(f.drafts, []);
+  assert.deepEqual(f.checks[0].localOrderKeys, ["delivery_prep:sales_order:1", "delivery_prep:transfer_order:2"]);
 });

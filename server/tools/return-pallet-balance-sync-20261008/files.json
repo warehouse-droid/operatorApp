@@ -1,0 +1,5 @@
+[
+  "src/netsuite.js",
+  "src/return-repository.js",
+  "src/return-batch-ra-service.js"
+]

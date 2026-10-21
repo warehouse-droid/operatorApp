@@ -1,0 +1,23 @@
+{
+  "date": "2026-10-05",
+  "tier": "3: production operations and explicitly authorized disposable data deletion",
+  "specApproval": "not obtained (autonomous hotfix); user explicitly requested immediate removal without test database preservation",
+  "acceptance": [
+    "Only the four mbbs-operator-app production containers remain; all test containers and their attached disposable database storage are removed.",
+    "Production container IDs and start times are unchanged, and local/public health endpoints return HTTP 200.",
+    "AI memory is capped at 6 GiB live and in Compose, with a 4 GiB reservation and no additional swap allowance.",
+    "All services in the standard isolated test Compose configuration share mbbs-tests.slice, with 4 GiB aggregate memory and 3 GiB memory high watermark.",
+    "Test services have individual limits, an init process, bounded PID counts, and explicitly sized tmpfs mounts.",
+    "Repository instructions require removing test containers, databases, volumes, and networks on success, failure, and interruption."
+  ],
+  "failureModel": {
+    "production selected for cleanup": "Production allowlist and shared-volume exclusion checked before deletion; verify production IDs and start times afterward.",
+    "test RAM grows without bounds": "Validate Compose limits and effective systemd cgroup budget; use a disposable probe that removes itself.",
+    "limits vanish after recreation": "Persist limits in the base Compose files used by deployments.",
+    "orphan test processes accumulate": "Set init and PID limits and make teardown mandatory in repository instructions.",
+    "unrequested data removal": "Remove identified test storage only; retain production and former-production rollback volumes."
+  },
+  "setup": "Use Python standard library, installed Docker/Compose, systemd, and existing Node isolation validation. No new packages or application code changes.",
+  "rollback": "Restore the resource configuration files and previous AI Docker limits if needed; test database deletion is intentional and irreversible per the user's hotfix instruction.",
+  "scope": "Cleanup, resource configuration, repository instructions, focused verification, and evidence."
+}

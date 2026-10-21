@@ -204,29 +204,40 @@ for (const [index, [label, mutate]] of changedCases.entries()) {
       body: confirmBody(plan, lease, sessionId, trucks)
     });
     assert.equal(result.response.status, 409, JSON.stringify(result.payload));
-    assert.equal(result.payload.code, "MBT_CAPABILITY_DISABLED");
+    assert.equal(result.payload.code, "MBT_BIN_PLANNING_REQUIRED");
     assert.deepEqual(await durableState(fixture.planId), stateBefore);
   });
 }
 
-test("P3.11 HTTP Confirm: an ordinary order change cannot piggyback on an unchanged BIN group", async () => {
+test("HTTP Confirm: ordinary order changes save alongside an unchanged BIN group", async () => {
   const { fixture, plan } = await assignedFixture("http-ordinary-change", 1905);
   const sessionId = `${sessionPrefix}-ordinary-change`;
   const lease = await acquireLease(fixture.planDate, sessionId);
   const stateBefore = await durableState(fixture.planId);
+  // The ordinary snapshot must have an actual local source authority; unknown
+  // synthetic order references are correctly removed by Dispatch sanitization.
+  await query(`INSERT INTO sales_orders (netsuite_id,tranid,customer,status,status_text,sales_order_type,netsuite_active)
+    VALUES ($1,$2,'Synthetic ordinary customer','B','Pending Fulfillment','Delivery',true)`,
+  [String(BigInt(`0x${crypto.randomUUID().replaceAll("-", "").slice(0, 12)}`)), `P311-SO-${suffix}`]);
   const orders = [...plan.orders, {
     id: `P311-SO-${suffix}`,
     type: "SO",
-    customer: "Synthetic unpersisted ordinary order",
+    customer: "Synthetic ordinary customer",
     address: "1 Example Road",
     localDispatchStatus: "open",
     items: []
   }];
+  const trucks = uiShapedTrucks(plan);
+  trucks[1].loads[0].allowTolls = true;
   const result = await request(`/api/dispatch/plans/${fixture.planId}/confirm`, {
     method: "POST",
-    body: confirmBody(plan, lease, sessionId, uiShapedTrucks(plan), orders)
+    body: confirmBody(plan, lease, sessionId, trucks, orders)
   });
-  assert.equal(result.response.status, 409, JSON.stringify(result.payload));
-  assert.equal(result.payload.code, "MBT_CAPABILITY_DISABLED");
-  assert.deepEqual(await durableState(fixture.planId), stateBefore);
+  assert.equal(result.response.status, 200, JSON.stringify(result.payload));
+  const saved = await durableState(fixture.planId);
+  assert.equal(saved.status, "confirmed");
+  assert.ok(saved.revision > stateBefore.revision);
+  // Dispatch retains placed orders only; its ordinary load edit must persist.
+  assert.equal(saved.trucks[1].loads[0].allowTolls, true);
+  assert.deepEqual(saved.trucks[0].loads[0].stops, stateBefore.trucks[0].loads[0].stops);
 });

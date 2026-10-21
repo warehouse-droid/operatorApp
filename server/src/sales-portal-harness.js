@@ -351,7 +351,7 @@ try {
   assert.equal(orders.response.status, 200);
   assert.ok(orders.payload.every((order) => Number(order.orderingLocationId) === 1));
   assert.ok(orders.payload.every((order) => /^SOB/i.test(String(order.orderRef || ""))));
-  assert.ok(orders.payload.every((order) => String(order.salesOrderType).toLowerCase() === "delivery"));
+  assert.ok(orders.payload.every((order) => ["delivery", "pick-up", "pickup", "pick up"].includes(String(order.salesOrderType).trim().toLowerCase())));
   assert.ok(orders.payload.every((order) => order.lineYards.length > 0));
   assert.ok(orders.payload.every((order) => order.lineYards.every((yard) => [1, 28, 15, 26].includes(Number(yard.printerLocationId)))));
   assert.ok(orders.payload.every((order) => Array.isArray(order.itemLines) && order.itemLines.length === order.lineCount));
@@ -462,17 +462,24 @@ try {
   }
 
   const pickupOrder = await query(
-    `SELECT netsuite_id
-       FROM sales_orders
-      WHERE netsuite_active = true
-        AND lower(trim(COALESCE(sales_order_type, ''))) = 'pick-up'
-        AND COALESCE(order_location_id, CASE LEFT(UPPER(COALESCE(tranid, '')), 3) WHEN 'SOB' THEN 1 END) = 1
-      ORDER BY trandate DESC NULLS LAST
+    `SELECT so.netsuite_id, so.tranid
+       FROM sales_orders so
+       JOIN sales_order_lines line ON line.sales_order_id = so.netsuite_id
+      WHERE so.netsuite_active = true
+        AND lower(trim(COALESCE(so.sales_order_type, ''))) IN ('pick-up', 'pickup', 'pick up')
+        AND COALESCE(so.order_location_id, CASE LEFT(UPPER(COALESCE(so.tranid, '')), 3) WHEN 'SOB' THEN 1 END) = 1
+        AND line.netsuite_active = true
+        AND upper(trim(COALESCE(line.item_type, ''))) = 'INVTPART'
+      ORDER BY so.trandate DESC NULLS LAST
       LIMIT 1`
   );
   if (pickupOrder.rowCount) {
     const pickupHistory = await requestJson(baseUrl, `/api/sales/sales-orders/${pickupOrder.rows[0].netsuite_id}/print-history`, { token });
-    assert.equal(pickupHistory.response.status, 404, "Pickup orders must not enter Sales printing or history");
+    assert.equal(pickupHistory.response.status, 200, "Pickup orders must have Sales printing history");
+    const pickupSearch = await requestJson(baseUrl, `/api/sales/sales-orders?search=${encodeURIComponent(pickupOrder.rows[0].tranid)}`, { token });
+    assert.equal(pickupSearch.response.status, 200);
+    assert.ok(pickupSearch.payload.some((order) => order.orderId === Number(pickupOrder.rows[0].netsuite_id)),
+      "Pickup orders must be searchable for printing");
   }
 
   const jobs = await requestJson(baseUrl, "/api/sales/print-jobs?limit=10", { token });

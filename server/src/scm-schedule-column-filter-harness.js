@@ -66,8 +66,8 @@ includesAll(columnFilterRenderer, [
 ], "Spreadsheet column-filter mapping");
 assert(columnFilterRenderer.includes('column.key === "type" && showTypeFilter'),
   "Dispatch does not expose its Type column filter.");
-assert(columnFilterRenderer.includes('column.key === "method" && showScmWorkingControls'),
-  "Method is not limited to SCM Working.");
+assert(columnFilterRenderer.includes('column.key === "method" && showMethodFilter'),
+  "Method does not honor its view visibility.");
 assert(!columnFilterRenderer.includes('column.key === "select"')
   && !columnFilterRenderer.includes('column.key === "action"'),
 "Utility checkbox and Save columns must remain non-filterable.");
@@ -85,13 +85,13 @@ assert(
 );
 includesAll(client, [
   'rawKind === "SP.O" ? "Sp.O" : rawKind',
-  'scmScheduleFilters.kind === "Sp.O"',
+  'kinds.some((kind) => kind === "Sp.O"',
   'row.orderKind === "PO" && row.isSpecialOrder'
 ], "Special Order client filtering");
 includesAll(repository, [
-  'cleanKind = rawKind === "SP.O" ? "Sp.O" : rawKind',
-  "$4 = 'Sp.O' AND b.order_kind = 'PO' AND COALESCE(s.is_special_order, false)",
-  "$4 <> 'Sp.O' AND b.order_kind = $4"
+  'rawKind === "SP.O" ? "Sp.O" : rawKind',
+  "'Sp.O' = ANY($4::text[]) AND b.order_kind = 'PO' AND special_order.is_special_order",
+  "b.order_kind = ANY($4::text[])"
 ], "Special Order schedule query");
 includesAll(preferenceRepository, [
   '"Sp.O"',
@@ -229,7 +229,7 @@ assert(client.includes("<span>Sp.O</span>"),
   "The Special Order checkbox label must expose a distinct Sp.O text element.");
 includesAll(client, [
   "function scmScheduleDisplayType",
-  'row.isSpecialOrder && !scmWorkingView ? "Sp.O" : row.orderKind',
+  'row.orderKind === "PO" && row.isSpecialOrder ? "Sp.O" : row.orderKind',
   "const scmWorkingView = editable",
   'scmWorkingView && row.orderKind === "PO"'
 ], "Special Order display by schedule view");

@@ -1,0 +1,10 @@
+[
+  "public/special-stock-purchase-pricing.js",
+  "public/scm-special-stock-requests.js",
+  "public/scm-stock-requests.html",
+  "src/special-stock-request-repository.js",
+  "src/special-stock-request-netsuite.js",
+  "public/special-stock-po-routing.js",
+  "public/special-stock-po-routing.css",
+  "migrations/246_special_po_pallet.sql"
+]

@@ -40,11 +40,11 @@ test('accepted ETA needs no mapping and survives a revised SCM ETA', () => fixtu
   let detail = await repository.createSpecialStockCase(input, context);
   detail = await respond(detail, { supplyStatus: 'production' });
   detail = await repository.decideSpecialStockLine(detail.id, detail.lines[0].id, { expectedRevision: detail.revision, decision: 'accepted' }, context);
-  assert.equal(detail.stage, 'wait_for_production');
+  assert.equal(detail.stage, 'confirmed');
   assert.equal(detail.lines[0].itemResolution, null);
   detail = await respond(detail, { supplyStatus: 'production', availableDate: '2099-01-27' });
   assert.equal(detail.lines[0].salesDecision, 'accepted');
-  assert.equal(detail.stage, 'wait_for_production');
+  assert.equal(detail.stage, 'confirmed');
 }));
 
 test('SO draft resolves fixed product once and retains one pallet line across saves', () => fixture(async () => {
@@ -94,10 +94,11 @@ test('stage OR filter is applied before the requested page limit', () => fixture
 }));
 
 
-test('yard completion requires final customer collection evidence, independent of NetSuite fulfillment', () => fixture(async () => {
+test('yard completion requires local PO arrival and complete customer collection', () => fixture(async () => {
   let detail = await repository.createSpecialStockCase(input, context);
   const orderId = 8899800;
   await query("UPDATE sales_special_stock_cases SET sales_order_netsuite_id=$2, sales_order_ref='TEST-YARD-PHYSICAL', sales_order_status='Fully Fulfilled', purchase_order_netsuite_id=$3, purchase_order_ref='TEST-YARD-PO' WHERE request_id=$1", [detail.id, orderId, orderId+1]);
+  await query("INSERT INTO purchase_orders(netsuite_id,tranid,status,status_text,receipt_status,netsuite_active) VALUES($1,'TEST-YARD-PO','B','Pending Receipt','received',true)", [orderId+1]);
   detail = await repository.getSpecialStockCase(detail.id);
   assert.notEqual(detail.stage, 'completed');
   await query("INSERT INTO operator_load_records(load_type,order_family,order_id,response) VALUES('sales_order_load','SO',$1,'{}'),('customer_pickup_load','SO',$1,'{\"pickupStatus\":\"partial_loaded\"}')", [orderId]);
@@ -129,7 +130,8 @@ test('real order service persists submission and recovers after SO patch success
       VALUES($1,$2,2055,'MBBS-Special Order',$3,$4,'PC',true)`,[id,line.uniqueKey,line.description,line.quantity]);
     return {id};
   }
-  const service=createSpecialStockRequestService({
+  const service=createSpecialStockRequestService({ assertPurchaseOrderReady: async () => {}, selectSalesRep: async () => ({ id: 123, name: 'TEST NetSuite Rep' }),
+    findLinkedPurchaseOrder: async () => null,
     resolveLocations:async()=>[{netsuiteLocationId:1}],resolveOrderUnits:async lines=>lines.map(line=>({...line,unitId:1})),
     config:{pickupMethodId:1,deliveryMethodId:2},createSalesOrder:payload=>create('sales_order',payload),createPurchaseOrder:payload=>create('purchase_order',payload),
     findMarkerOrders:async({orderKind})=>orders.has(orderKind)?[{id:orders.get(orderKind).id,entity_id:orderKind==='sales_order'?8899100:8899200,location_id:1}]:[],
@@ -137,8 +139,8 @@ test('real order service persists submission and recovers after SO patch success
     fetchPurchaseOrderReference:async()=>({tranid:orders.get('purchase_order').ref,status_text:'Pending Receipt'}),
     synchronizeSalesDescriptions:async change=>{
       const payload=orders.get('sales_order').payload;
-      await synchronizeSpecialDescriptions(change,{queryAll:async()=>payload.item.items.map(line=>({uniquekey:line.uniqueKey,rest_line_id:line.line,item:2055})),rest:async(_path,options={})=>{
-        if(options.method==='PATCH'){patches++;for(const edit of options.body.item.items)payload.item.items.find(line=>line.line===edit.line).description=edit.description;}
+      await synchronizeSpecialDescriptions(change,{queryAll:async()=>payload.item.items.map(line=>({uniquekey:line.uniqueKey,rest_line_id:line.line,item:2055,execution_quantity:0,billed_quantity:0,line_closed:'F'})),rest:async(_path,options={})=>{
+        if(options.method==='PATCH'){patches++;for(const edit of options.body.item.items)Object.assign(payload.item.items.find(line=>line.line===edit.line),edit);}
         return {data:structuredClone(payload)};
       }});
       if(failSync){failSync=false;throw new Error('Lost acknowledgement after verified SO patch');}
@@ -147,20 +149,62 @@ test('real order service persists submission and recovers after SO patch success
   detail=await service.createSalesOrder(detail.id,{expectedRevision:detail.revision,operationId:'01911111-1111-7111-8111-111111111121'},context);
   assert.ok(detail.salesOrderSubmissionStartedAt);
   const operationId='01911111-1111-7111-8111-111111111122';
-  await assert.rejects(()=>service.createPurchaseOrder(detail.id,{expectedRevision:detail.revision,operationId,lines:[{caseLineId:detail.lines[0].id,description:'SCM reviewed description',quantity:20,uom:'PC',unitPurchaseCost:3}]},context),/Lost acknowledgement/);
+  await assert.rejects(()=>service.createPurchaseOrder(detail.id,{ vendorDiscountAmount: 0,expectedRevision:detail.revision,operationId,lines:[{caseLineId:detail.lines[0].id,description:'SCM reviewed description',quantity:20,uom:'PC',vendorDiscountPercent:0,unitPurchaseCost:3}]},context),/Lost acknowledgement/);
   detail=await repository.getSpecialStockCase(detail.id);
   assert.equal(detail.purchaseOrderOperationStatus,'attention');assert.equal(posts,1);
   detail=await service.createPurchaseOrder(detail.id,{expectedRevision:detail.revision,operationId},context);
   assert.equal(detail.stage,'dispatch_arrangement'); assert.equal(detail.attention,false); assert.equal(patches,1);assert.equal(posts,2);
   assert.ok(detail.purchaseOrderSubmissionStartedAt);
-  assert.equal(detail.salesOrderLines[0].quantity,1200);assert.equal(detail.salesOrderLines[0].rate,8);
+  assert.equal(detail.salesOrderLines[0].quantity,20);assert.equal(detail.salesOrderLines[0].rate,8);
   assert.equal(detail.salesOrderLines[0].description,'SCM reviewed description');assert.equal(detail.purchaseOrderLines[0].quantity,20);
   const canonical=await query('SELECT item_description,quantity FROM sales_order_lines WHERE sales_order_id=$1',[detail.salesOrderId]);
-  assert.equal(canonical.rows[0].item_description,'SCM reviewed description');assert.equal(Number(canonical.rows[0].quantity),1200);
+  assert.equal(canonical.rows[0].item_description,'SCM reviewed description');assert.equal(Number(canonical.rows[0].quantity),20);
   const { listDispatchOrders } = await import('../../../src/dispatch-repository.js');
   const dispatchOrders = await listDispatchOrders({exactOrderRefs:[detail.salesOrderRef],type:'SO'});
   const dispatchOrder = dispatchOrders.find(order=>order.id===detail.salesOrderRef);
   assert.ok(dispatchOrder, 'Special SO is visible in the real Dispatch query');
   assert.equal(dispatchOrder.specialPalletTotal,0); assert.equal(dispatchOrder.pallets,0);
   await assert.rejects(()=>service.createPurchaseOrder(detail.id,{expectedRevision:detail.revision,operationId},context));assert.equal(posts,2);
+}));
+
+
+test('SCM vendor discount confirmation persists gross and net costs privately and leaves the Sales discount intact', () => fixture(async () => {
+  let d=await repository.createSpecialStockCase({...input,lines:[{...input.lines[0],discountPercent:10}]},context);
+  d=await respond(d);
+  d=await repository.decideSpecialStockLine(d.id,d.lines[0].id,{expectedRevision:d.revision,decision:'accepted'},context);
+  d=await repository.saveSpecialSalesOrderDraft(d.id,{expectedRevision:d.revision,customerId:8899100,operationalYardLocationId:1,fulfillmentMethod:'yard_pickup',palletTotal:0,
+    netsuiteSalesRep:{id:123,name:'TEST NetSuite Rep'},materialLines:[{caseLineId:d.lines[0].id,itemId:2055,quantity:24,packageQuantity:2,conversionToPc:12,uom:'PC',rate:144,description:'TEST product in pieces',discountPercent:10}]},context);
+  await query('UPDATE sales_special_stock_cases SET sales_order_skipped=true,sales_order_approved=true WHERE request_id=$1',[d.id]);
+  const lines=[{caseLineId:d.lines[0].id,description:'TEST product in pieces',quantity:24,uom:'PC',unitPurchaseCost:10}];
+  await assert.rejects(repository.prepareSpecialPurchaseOrder(d.id,{expectedRevision:d.revision,lines},context),{code:'SPECIAL_VENDOR_DISCOUNT_INVALID'});
+  assert.equal((await repository.getSpecialStockCase(d.id)).revision,d.revision);
+  d=await repository.prepareSpecialPurchaseOrder(d.id,{expectedRevision:d.revision,lines:lines.map(l=>({...l,vendorDiscountPercent:15}))},context);
+  assert.deepEqual([d.vendorDiscountReview.amount,d.vendorDiscountReview.grossTotal,d.vendorDiscountReview.netTotal],[36,240,204]);
+  assert.equal(d.purchaseOrderLines[0].unitPurchaseCost,10);
+  assert.equal(d.vendorDiscountReview.lines[0].vendorDiscountPercent,15);
+  assert.equal(d.vendorDiscountReview.lines[0].netTotal,204);
+  assert.equal(d.vendorDiscountReview.lines[0].grossUnitCost,10);
+  assert.equal(d.salesOrderLines[0].nativeDiscountPercent,10);
+  assert.equal(d.netsuiteSalesRepId,123);
+  assert.equal(d.requestedBy,context.operatorId);
+  const sales=await repository.getSpecialStockCase(d.id,{audience:'sales',authorizedStoreLocationIds:[1]});
+  assert.equal(sales.vendorDiscountReview,undefined);
+  assert.equal(sales.events.some(e=>e.eventType==='special_vendor_discount_confirmed'),false);
+  assert.equal(sales.purchaseOrderLines[0].unitPurchaseCost,undefined);
+  // A retry with the original gross inputs must not discount already-net costs again.
+  d=await repository.prepareSpecialPurchaseOrder(d.id,{expectedRevision:d.revision,lines:lines.map(l=>({...l,vendorDiscountPercent:15}))},context);
+  assert.equal(d.purchaseOrderLines[0].unitPurchaseCost,10);
+  assert.equal(d.vendorDiscountReview.lines[0].vendorDiscountPercent,15);
+  assert.equal(d.vendorDiscountReview.lines[0].netTotal,204);
+  const operationId='01911111-1111-7111-8111-111111111139';
+  // Reproduce the durable pre-submission attention state of SPREQ-000011.
+  await query("UPDATE sales_special_stock_cases SET purchase_order_operation_status='attention',purchase_order_operation_id=$2 WHERE request_id=$1",[d.id,operationId]);
+  d=await repository.getSpecialStockCase(d.id);
+  assert.equal(d.purchaseOrderSubmissionStartedAt,null);
+  await assert.rejects(repository.prepareSpecialPurchaseOrder(d.id,{expectedRevision:d.revision,operationId:'01911111-1111-7111-8111-111111111140',lines:lines.map(l=>({...l,vendorDiscountPercent:0}))},context),{code:'SPECIAL_OPERATION_BUSY'});
+  d=await repository.prepareSpecialPurchaseOrder(d.id,{expectedRevision:d.revision,operationId,lines:lines.map(l=>({...l,vendorDiscountPercent:0}))},context);
+  assert.equal(d.vendorDiscountReview.amount,0);
+  assert.equal(d.purchaseOrderLines[0].unitPurchaseCost,10);
+  await query('UPDATE sales_special_stock_cases SET purchase_order_submission_started_at=now() WHERE request_id=$1',[d.id]);
+  await assert.rejects(repository.prepareSpecialPurchaseOrder(d.id,{expectedRevision:d.revision,operationId,lines:lines.map(l=>({...l,vendorDiscountPercent:15}))},context),{code:'SPECIAL_OPERATION_BUSY'});
 }));

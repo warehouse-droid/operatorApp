@@ -1,0 +1,58 @@
+--- a/src/special-stock-documents.js
++++ b/src/special-stock-documents.js
+@@ -17,6 +17,13 @@
+ function quotePackQuantities(line) {
+   const native = specialPackPayload(line);
+   return Object.fromEntries(Object.entries(SPECIAL_PACK_FIELDS).map(([field,key]) => [field,native[key] ?? null]));
++}
++
++/** @param {bigint} grossSubtotal @param {bigint} subtotal */
++function quoteDiscountSummary(grossSubtotal, subtotal) {
++  const discount = grossSubtotal - subtotal;
++  return { grossSubtotalMinor: moneyMinor(grossSubtotal), discountMinor: moneyMinor(discount),
++    discountPercent: grossSubtotal === 0n ? 0 : Number((discount * 10000n + grossSubtotal / 2n) / grossSubtotal) / 100 };
+ }
+ 
+ // Reuse the Field Sales MBBS presentation and configuration without creating a
+@@ -48,11 +55,14 @@
+       description: `${line.description}${discount ? `\nDiscount: ${discount}%` : ''}`,
+       quantity: String(quantity), unit: line.uom, unitRate: String(unitRate),
+       packQuantities: line.packQuantities || quotePackQuantities(line),
++      grossAmountMinor: Math.round(specialLineSubtotal(quantity, unitRate, 0) * 100),
+       amountMinor: Math.round(specialLineSubtotal(quantity, unitRate, discount) * 100) };
+   });
+   const subtotal = lines.reduce((sum, line) => sum + BigInt(line.amountMinor), 0n);
++  const grossSubtotal = lines.reduce((sum, line) => sum + BigInt(line.grossAmountMinor), 0n);
+   const tax = (subtotal * BigInt(profile.taxBps) + 5000n) / 10000n;
+-  const totals = { subtotalMinor: moneyMinor(subtotal), taxMinor: moneyMinor(tax), totalMinor: moneyMinor(subtotal + tax), taxBps: profile.taxBps };
++  const totals = { ...quoteDiscountSummary(grossSubtotal, subtotal),
++    subtotalMinor: moneyMinor(subtotal), taxMinor: moneyMinor(tax), totalMinor: moneyMinor(subtotal + tax), taxBps: profile.taxBps };
+   const destination = detail.fulfillmentMethod === 'mbt_delivery' ? detail.deliveryAddress
+     : detail.fulfillmentMethod === 'vendor_pickup' ? 'Customer pickup at vendor yard' : `Pickup at ${detail.storeName || 'inquired yard'}`;
+   return { number: draft ? 'MBBS-QUOTE-DRAFT' : `Q-${detail.requestRef}`, selected_revision: draft ? 1 : detail.revision,
+--- a/src/field-sales/company-pdf.js
++++ b/src/field-sales/company-pdf.js
+@@ -16,6 +16,11 @@
+ }
+ const money=n=>new Intl.NumberFormat('en-CA',{style:'currency',currency:'CAD'}).format(n/100);
+ const rate=n=>new Intl.NumberFormat('en-CA',{style:'currency',currency:'CAD',minimumFractionDigits:2,maximumFractionDigits:6}).format(Number(n));
++function quoteTotalRows(totals){
++ const rows=[['Subtotal',totals.subtotalMinor,false],[`HST (${totals.taxBps/100}%)`,totals.taxMinor,false],['Total CAD',totals.totalMinor,true]];
++ if(Number.isSafeInteger(totals.discountMinor)){rows.unshift([`Total Discount (${totals.discountPercent}%)`,totals.discountMinor,false]);}
++ return rows;
++}
+ export function companyQuotePdf(quote,company) {
+  const s=quote.snapshot,combined=s.schemaVersion===3;
+  if(company&&(!COMPANIES.includes(company)||combined&&!s.companies[company]||!combined&&company!==s.company)){return Promise.reject(fail('This revision has no document for that company.',404));}
+@@ -84,8 +89,9 @@
+    y+=height;
+    doc.moveTo(36,y-4).lineTo(576,y-4).strokeColor('#ddd').lineWidth(.5).stroke();
+   }
+-  if(y+80>675){doc.addPage();y=58;}y+=8;
+-  for(const [label,value,total] of [['Subtotal',totals.subtotalMinor,false],[`HST (${totals.taxBps/100}%)`,totals.taxMinor,false],['Total CAD',totals.totalMinor,true]]){
++  const totalRows=quoteTotalRows(totals);
++  if(y+totalRows.length*24+8>675){doc.addPage();y=58;}y+=8;
++  for(const [label,value,total] of totalRows){
+    if(total){doc.rect(36,y-2,540,24).fill('#e4e4e4');}
+    text(label,330,y+2,143,9,true,'right');text(money(value),482,y+2,89,9,total,'right');y+=24;
+   }

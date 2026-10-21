@@ -29,6 +29,10 @@ export function createOperatorNetSuitePostingAdmission({
       clientLocationId: input.clientLocationId,
       deferTargets: true
     }));
+    if (resolution.netSuitePostingOwner === "transfer_background") {
+      await assertLocalCompletionAllowed(resolution);
+      return { mode: "local_only", reason: "transfer_background_owned", policy: null, resolution };
+    }
     if (resolution.netSuitePostingOwner === "driver_completion") {
       await assertLocalCompletionAllowed(resolution);
       return {

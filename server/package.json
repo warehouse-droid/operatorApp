@@ -381,7 +381,7 @@
     "test:scm-weight-schedule": "node src/scm-weight-schedule-harness.js",
     "test:scm-schedule-row-refresh": "node src/scm-schedule-row-refresh-harness.js",
     "test:scm-schedule-formatting": "node src/scm-schedule-formatting-harness.js",
-    "test:scm-schedule-column-filters": "node src/scm-schedule-column-filter-harness.js",
+    "test:scm-schedule-column-filters": "node --test src/scm-schedule-column-filter-harness.js test/dispatch/frontend/scm-schedule-multi-sort.test.js",
     "test:scm-schedule-column-filter-integration": "node src/scm-schedule-column-filter-integration-harness.js",
     "test:scm-menu-navigation": "node src/scm-menu-navigation-harness.js",
     "test:scm-vendor-management": "node src/scm-vendor-management-harness.js",

@@ -2,7 +2,7 @@
 'use strict';
 {
   const esc=window.RegularStockUI.esc,number=window.RegularStockUI.number;
-  const state={mount:null,api:null,pools:[],requests:[],pool:null,orders:[],selectedPo:null,error:'',busy:false,choices:new Map(),reason:'',search:'',tab:'pools',filters:{},options:{},sortBy:'createdAt',direction:'asc',reject:null};
+  const state={unifiedStatus:'active',outcome:'',waitingReason:'',mount:null,api:null,pools:[],requests:[],pool:null,orders:[],selectedPo:null,error:'',busy:false,choices:new Map(),reason:'',search:'',tab:'pools',filters:{},options:{},sortBy:'createdAt',direction:'asc',reject:null};
   let searchTimer=null,generation=0,updates=null,checking=false;
   const active=()=>window.MBBSStockRequestTabs?.isActive('waitlist');
   const totals=pool=>`<div class="waitlist-totals">${[['PO item total',pool.capacityQty],['Allocated',pool.heldQty],['Converted to SO',pool.convertedQty],['Available',pool.availableQty]].map(([label,qty])=>`<span><small>${label}</small><strong>${number(qty)} ${esc(pool.salesUom)}</strong></span>`).join('')}</div>`;
@@ -19,22 +19,23 @@
   function requestFilters(){
     const fields={sellingYardId:'Selling yard',vendorKey:'Vendor',itemId:'Item',customerId:'Customer'};
     const sortFields={createdAt:'Submitted date',requestRef:'Request',customerName:'Customer',vendorName:'Vendor',itemCode:'Item',sellingYard:'Selling yard',requestedQty:'Requested quantity',waitingQty:'Waiting quantity',heldQty:'Allocated quantity'};
-    return `<div class="waitlist-toolbar waitlist-filters">${Object.entries(fields).map(([field,label])=>`<label><span>${label}</span><select aria-label="${label}" data-waitlist-filter="${field}"><option value="">All ${label.toLowerCase()}s</option>${(state.options[field]||[]).map(option=>`<option value="${esc(option.value)}" ${state.filters[field]===option.value?'selected':''}>${esc(option.label)}</option>`).join('')}</select></label>`).join('')}
+    return `<div class="waitlist-toolbar waitlist-filters">${window.RegularStockStatus?.filters(state,'waitlist')||''}${Object.entries(fields).map(([field,label])=>`<label><span>${label}</span><select aria-label="${label}" data-waitlist-filter="${field}"><option value="">All ${label.toLowerCase()}s</option>${(state.options[field]||[]).map(option=>`<option value="${esc(option.value)}" ${state.filters[field]===option.value?'selected':''}>${esc(option.label)}</option>`).join('')}</select></label>`).join('')}
       <label><span>Sort by</span><select aria-label="Sort by" data-waitlist-sort-by>${Object.entries(sortFields).map(([field,label])=>`<option value="${field}" ${state.sortBy===field?'selected':''}>${label}</option>`).join('')}</select></label>
       <label><span>Sort direction</span><select aria-label="Sort direction" data-waitlist-sort-direction><option value="asc" ${state.direction==='asc'?'selected':''}>Ascending</option><option value="desc" ${state.direction==='desc'?'selected':''}>Descending</option></select></label><button type="button" data-waitlist-clear-filters>Clear filters</button></div>`;
   }
   function rejectAction(request){
+    if(request.closed || request.remainingQty===0)return '';
     if(state.reject?.id!==request.id)return `<button type="button" class="danger" data-waitlist-reject="${request.id}" ${state.busy||request.converting?'disabled':''}>Reject</button>${request.converting?'<small>SO creation in progress</small>':''}`;
     return `<form data-waitlist-reject-form="${request.id}" data-operation-key="${state.reject.operationKey}" class="waitlist-reject-form"><label><span>Rejection reason *</span><input name="reason" value="${esc(state.reject.reason)}" required maxlength="2000" /></label><small>Closes remaining demand and returns unused allocations.</small><button class="danger" ${state.busy?'disabled':''}>Confirm rejection</button><button type="button" data-waitlist-cancel-reject ${state.busy?'disabled':''}>Cancel</button></form>`;
   }
   function requestRow(request){
     const r=request,orders=(r.recentQueuedPurchaseOrders||[]).map(po=>`<div><strong>${esc(po.ref)}</strong>${po.isSplit?`<small>Source ${esc(po.sourceRef)}</small>`:''}<small>${po.eta?'ETA '+esc(po.eta):'ETA not set'}</small></div>`).join('')||'<small>No queued PO</small>';
-    return `<tr data-waitlist-request-row="${r.id}"><td><strong>${esc(r.requestRef)}</strong><small>${esc(new Date(r.createdAt).toLocaleString())}</small></td><td>${esc(r.customerName)}</td><td>${esc(r.vendorName||'No vendor')}</td><td>${esc(r.itemCode)}${r.itemDisplayName!==r.itemCode?`<small>${esc(r.itemDisplayName)}</small>`:''}</td><td>${esc(r.sellingYard)}</td><td>${number(r.requestedQty)} ${esc(r.salesUom)}</td><td>${number(r.waitingQty)} ${esc(r.salesUom)}</td><td>${number(r.heldQty)} ${esc(r.salesUom)}${r.converting?'<small>Creating SO</small>':''}</td><td class="waitlist-recent-pos">${orders}</td><td>${rejectAction(r)}</td></tr>`;
+    return `<tr data-waitlist-request-row="${r.id}"><td><strong>${esc(r.requestRef)}</strong>${window.RegularStockStatus?.render(r)||''}<small>${esc(new Date(r.createdAt).toLocaleString())}</small></td><td>${esc(r.customerName)}</td><td>${esc(r.vendorName||'No vendor')}</td><td>${esc(r.itemCode)}${r.itemDisplayName!==r.itemCode?`<small>${esc(r.itemDisplayName)}</small>`:''}</td><td>${esc(r.sellingYard)}</td><td>${number(r.requestedQty)} ${esc(r.salesUom)}</td><td>${number(r.waitingQty)} ${esc(r.salesUom)}</td><td>${number(r.heldQty)} ${esc(r.salesUom)}${r.converting?'<small>Creating SO</small>':''}</td><td class="waitlist-recent-pos">${orders}</td><td>${rejectAction(r)}</td></tr>`;
   }
   function waitingRequests(){
     const rows=window.SCMWaitlistList.select(state.requests,{filters:state.filters,sortBy:state.sortBy,direction:state.direction});
     const columns=[['requestRef','Request'],['customerName','Customer'],['vendorName','Vendor'],['itemCode','Item'],['sellingYard','Selling yard'],['requestedQty','Requested'],['waitingQty','Waiting'],['heldQty','Allocated']];
-    return `<section class="stock-request-section">${requestFilters()}<p>Showing ${rows.length} of ${state.requests.length} waiting requests.</p><div class="waitlist-table-wrap"><table class="waitlist-table"><thead><tr>${columns.map(([field,label])=>`<th aria-sort="${state.sortBy===field?(state.direction==='asc'?'ascending':'descending'):'none'}"><button type="button" data-waitlist-sort="${field}">${label}${state.sortBy===field?(state.direction==='asc'?' ↑':' ↓'):''}</button></th>`).join('')}<th>Recent queued POs</th><th>Actions</th></tr></thead><tbody>
+    return `<section class="stock-request-section">${requestFilters()}<p>Showing ${rows.length} of ${state.requests.length} requests.</p><div class="waitlist-table-wrap"><table class="waitlist-table"><thead><tr>${columns.map(([field,label])=>`<th aria-sort="${state.sortBy===field?(state.direction==='asc'?'ascending':'descending'):'none'}"><button type="button" data-waitlist-sort="${field}">${label}${state.sortBy===field?(state.direction==='asc'?' ↑':' ↓'):''}</button></th>`).join('')}<th>Recent queued POs</th><th>Actions</th></tr></thead><tbody>
       ${rows.map(requestRow).join('')||'<tr><td colspan="10">No waiting requests match these filters.</td></tr>'}</tbody></table></div></section>`;
   }
   function render(){
@@ -43,14 +44,15 @@
     state.mount.innerHTML=`<div class="waitlist-workspace">${window.MBBSStockRequestTabs.html()}<div class="stock-request-heading"><div><h1>Regular waitlist</h1><p>Assign PO supply to customer demand, then Sales creates the SO.</p></div><button type="button" data-waitlist-refresh>Refresh</button></div>
       ${state.error?`<p class="stock-request-error" role="alert">${esc(state.error)}</p>`:''}
       ${returned.map(p=>`<div class="waitlist-returned">Stock returned to <strong>${esc(p.purchaseOrderRef)} · ${esc(p.itemCode)}</strong>. ${number(p.availableQty)} ${esc(p.salesUom)} available. <button type="button" data-waitlist-pool="${p.id}">Re-allocate</button></div>`).join('')}
-      <div class="waitlist-toolbar"><button type="button" data-waitlist-view="pools">PO pools</button><button type="button" data-waitlist-view="requests">All waiting requests (${state.requests.length})</button></div>
+      <div class="waitlist-toolbar"><button type="button" data-waitlist-view="pools">PO pools</button><button type="button" data-waitlist-view="requests">${state.unifiedStatus==='active'?'All waiting requests':'Requests'} (${state.requests.length})</button></div>
       ${state.tab==='requests'?waitingRequests():`<section class="stock-request-section"><h3>Add PO / split PO pool</h3><form data-waitlist-pool-form><div class="waitlist-toolbar"><label><span>Find existing PO / split PO</span><input data-waitlist-po-search type="search" value="${esc(state.search)}" placeholder="PO reference" /></label><label><span>PO *</span><select data-waitlist-po required><option value="">Select an existing PO</option>${state.orders.map(o=>`<option value="${o.id}" ${state.selectedPo?.id===o.id?'selected':''}>${esc(o.ref)}</option>`).join('')}</select></label><label><span>Item *</span><select name="itemId" required><option value="">Select one item</option>${(state.selectedPo?.items||[]).map(i=>`<option value="${i.itemId}">${esc(i.itemCode)} · ${i.quantity==null?'Unit review required':number(i.quantity)+' '+esc(i.salesUom)}</option>`).join('')}</select></label><button ${state.busy?'disabled':''}>Open pool</button></div></form></section>
         <div class="waitlist-layout"><aside class="waitlist-pool-list">${state.pools.map(p=>`<button type="button" data-waitlist-pool="${p.id}" aria-pressed="${state.pool?.id===p.id}"><strong>${esc(p.purchaseOrderRef)} · ${esc(p.itemCode)}</strong><small>${number(p.availableQty)} ${esc(p.salesUom)} available${p.attention?' · Review PO':''}</small></button>`).join('')||'<p>No PO pools yet.</p>'}</aside><div>${poolDetail(state.pool)}</div></div>`}</div>`;
     updates?.paint();
   }
+  const requestsUrl=()=>'/api/scm/waitlist/requests?'+(window.RegularStockStatus?.params(state).toString()||'');
   async function load(){
     const readVersion=updates?.version;
-    const version=++generation;const [pools,requests]=await Promise.all([state.api('/api/scm/waitlist/pools'),state.api('/api/scm/waitlist/requests')]);
+    const version=++generation;const [pools,requests]=await Promise.all([state.api('/api/scm/waitlist/pools'),state.api(requestsUrl())]);
     if(version!==generation||!active())return;state.pools=pools.pools;state.requests=requests.requests;
     const options=window.SCMWaitlistList.facets(state.requests);
     for(const field of Object.keys(options)){const selected=(state.options[field]||[]).find(option=>option.value===state.filters[field]);if(selected&&!options[field].some(option=>option.value===selected.value))options[field].push(selected);}
@@ -87,6 +89,11 @@
   });
   document.addEventListener('change',/** @param {Event & {target:HTMLInputElement}} event */ event=>{
     if(!active())return;
+    if(event.target.dataset.waitlistStatusFilter){
+      const key=event.target.dataset.waitlistStatusFilter;state[key]=event.target.value;
+      window.RegularStockStatus?.changed(state,key,'waitlist');
+      void load().catch(error=>{state.error=error.message;render();});return;
+    }
     if(event.target.dataset.waitlistFilter){state.filters[event.target.dataset.waitlistFilter]=event.target.value;render();}
     if(event.target.matches('[data-waitlist-sort-by]')){state.sortBy=event.target.value;render();}
     if(event.target.matches('[data-waitlist-sort-direction]')){state.direction=event.target.value;render();}
@@ -99,7 +106,7 @@
       if(event.target.closest('[data-waitlist-refresh]'))await load();const view=/** @type {HTMLButtonElement|null} */ (event.target.closest('button[data-waitlist-view]'));if(view){state.tab=view.dataset.waitlistView;render();}
       const reject=/** @type {HTMLButtonElement|null} */ (event.target.closest('[data-waitlist-reject]'));if(reject){state.reject={id:Number(reject.dataset.waitlistReject),operationKey:crypto.randomUUID(),reason:''};render();}
       if(event.target.closest('[data-waitlist-cancel-reject]')){state.reject=null;render();}
-      if(event.target.closest('[data-waitlist-clear-filters]')){state.filters={};render();}
+      if(event.target.closest('[data-waitlist-clear-filters]')){state.filters={};Object.assign(state,window.RegularStockStatus?.defaults());window.RegularStockStatus?.save('waitlist',state);await load();}
       const sort=/** @type {HTMLButtonElement|null} */ (event.target.closest('[data-waitlist-sort]'));if(sort){state.direction=state.sortBy===sort.dataset.waitlistSort&&state.direction==='asc'?'desc':'asc';state.sortBy=sort.dataset.waitlistSort;render();}}
     catch(error){state.error=error.message;render();}
   });
@@ -118,17 +125,18 @@
   async function check(){
     if(!active()||document.hidden||state.busy||checking||updates?.pending)return;
     const current=generation;checking=true;
-    try{const [pools,requests]=await Promise.all([state.api('/api/scm/waitlist/pools'),state.api('/api/scm/waitlist/requests')]);
+    try{const [pools,requests]=await Promise.all([state.api('/api/scm/waitlist/pools'),state.api(requestsUrl())]);
       if(current===generation&&active()&&JSON.stringify([pools.pools,requests.requests])!==JSON.stringify([state.pools,state.requests]))updates?.changed();
     }catch{/* Retain the displayed pool when a background check fails. */}finally{checking=false;}
   }
   const poll=setInterval(check,15000);
   window.addEventListener('pagehide',()=>clearInterval(poll),{once:true});
   window.SCMWaitlist={refresh,async open({mount,api}){
+    await window.RegularStockStatus?.ready;Object.assign(state,window.RegularStockStatus?.restore('waitlist'));
     state.mount=mount;state.api=api;state.error='';
     const params=new URL(location.href).searchParams,target=Number(params.get('requestId'));
     const linked=Number.isSafeInteger(target)&&target>0;
-    if(linked){state.tab='requests';state.filters={};}
+    if(linked){state.tab='requests';state.filters={};Object.assign(state,{unifiedStatus:'all',outcome:'',waitingReason:''});}
     updates||=window.StockRequestView?.create({mount,active,detailSelector:'.waitlist-layout>div',feedbackSelector:'.waitlist-workspace>.waitlist-toolbar'});
     render();await load();
     if(linked){const row=state.mount.querySelector(`[data-waitlist-request-row="${target}"]`);if(row){row.tabIndex=-1;row.focus({preventScroll:true});row.scrollIntoView({block:'center'});}}

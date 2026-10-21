@@ -29,6 +29,18 @@ before(async()=>{
     const path=new URL(req.url,base).pathname;
     calls.push({method:req.method,path});active++;peak=Math.max(peak,active);
     try {
+      if(req.method==="POST"&&path.endsWith('/query/v1/suiteql')){
+        const id=Number(JSON.parse(body).q.match(/WHERE t\.id = (\d+)/u)[1]);
+        res.writeHead(200,{"content-type":"application/json"});
+        res.end(JSON.stringify({items:[
+          {id,status:'B',rest_order_line:24,order_line:'1234',item_id:42,item_type:'InvtPart',quantity:-360,fulfilled_quantity:0,location_id:15},
+          {id,status:'B',rest_order_line:25,order_line:'1235',item_id:43,item_type:'InvtPart',quantity:-2,fulfilled_quantity:0,location_id:15}
+        ]}));return;
+      }
+      if(req.method==="GET"&&/\/salesOrder\/\d+$/u.test(path)){
+        res.writeHead(200,{"content-type":"application/json"});
+        res.end(JSON.stringify({item:{items:[{line:24,item:{id:'42'}},{line:25,item:{id:'43'}}]}}));return;
+      }
       if(req.method==="POST"&&path.includes("/!transform/")){
         const sourceId=Number(path.split("/")[6]);
         if(sourceId===failSource){res.writeHead(400,{"content-type":"application/json"});res.end(JSON.stringify({"o:errorDetails":[{"o:errorCode":"INVALID_QUANTITY"}]}));return;}
@@ -82,14 +94,18 @@ function processor() {
     workerId:"direct-http-test",finalize:async()=>{finalized++;return {verified:true};}});
 }
 
-test("actual HTTP + database: direct SO IF and PO IR each perform only create then verify",async()=>{
+test("actual HTTP + database: SO reads current source then creates and verifies once; PO keeps its direct path",async()=>{
   for(const kind of ["SO","PO"]){
     const command=draft(kind);const begin=calls.length;
     await repo.createOrReplayOperatorNetSuitePostingCommand(command);
     const result=await processor().process(command.requestId);
     assert.equal(result.status,"completed");assert.equal(result.steps[0].attemptCount,1);
-    assert.deepEqual(calls.slice(begin).map(call=>call.method),["POST","GET"]);
-    assert.ok(calls.slice(begin).every(call=>!call.path.includes("eid:")&&!call.path.includes("suiteql")));
+    const observed=calls.slice(begin);
+    assert.deepEqual(observed.map(call=>call.method),kind==="SO"?["POST","GET","POST","GET"]:["POST","GET"]);
+    assert.ok(observed.every(call=>!call.path.includes("eid:")));
+    assert.equal(observed.filter(call=>call.path.includes('suiteql')).length,kind==="SO"?1:0);
+    assert.equal(observed.filter(call=>/\/salesOrder\//u.test(call.path)).length,kind==="SO"?1:0);
+    assert.equal(observed.filter(call=>call.path.includes('/!transform/')).length,1);
     assert.equal(records.get(String(result.steps[0].netSuiteTransactionId)).item.items[0].quantity,360);
   }
 });

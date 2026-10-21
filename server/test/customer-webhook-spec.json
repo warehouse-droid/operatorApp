@@ -1,0 +1,33 @@
+{
+  "feature": "NetSuite customers appear in the shared application customer directory after save",
+  "tier": 3,
+  "specApproval": "not obtained (autonomous run); customer source confirmed by user",
+  "setup": "Existing Node test runner, fast-check, c8, ESLint and TypeScript. No new dependencies, migrations, commits or production data writes. Standard isolated Compose with teardown registered before startup.",
+  "contract": "POST /api/webhooks/netsuite/customer; x-mbbs-webhook-secret; netsuite-customer/v1",
+  "scenarios": [
+    "Valid create returns 200 only after canonical customer, return projection and system audit commit; existing customer searches find it.",
+    "Repeated and concurrent delivery creates one customer and one canonical event; equivalent payload reports unchanged.",
+    "Newer updates replace source-owned fields; older events are ignored; same-time conflicting values return 409 without overwriting.",
+    "Inactive customers disappear from active searches; no hard customer deletion or modification of unrelated customers or local site profiles.",
+    "Missing configuration returns 503; absent or wrong header secret returns 401; mirror consumer and wrong NetSuite account return 403.",
+    "Malformed JSON, invalid IDs, invalid timestamps, invalid currency, missing full snapshot fields and oversized bodies are rejected without database writes.",
+    "A persistence failure rolls back canonical record, return projection, canonical event, sync run and audit together and returns a retryable failure.",
+    "Sender runs on create/edit/xedit, loads the full saved customer (including inline edits), resolves actual currency ISO code and sends an authenticated HTTPS JSON snapshot.",
+    "Sender skips deletes and non-customer stages, reports configuration/HTTP/transport failures without logging secrets or customer payloads, and does not block the saved customer.",
+    "Existing customer sync, projection and source-ordering regression suites continue to pass. Production remains healthy; this task's test containers, volumes and networks are removed."
+  ],
+  "failureModel": {
+    "unauthorizedWrite": "HTTP credential, account-binding and malformed-input tests",
+    "duplicateOrStaleWrite": "PostgreSQL concurrency, replay and reordered-event tests",
+    "partialWrite": "Injected failure at audit boundary with real PostgreSQL rollback assertions",
+    "customerNotVisible": "Real HTTP to database to existing customer search integration tests",
+    "partialInlineEdit": "SuiteScript VM contract test that requires a record.load",
+    "silentSenderFailure": "Assertions on sanitized error logs for response and transport failures",
+    "productionResourceExhaustion": "mbbs-tests.slice, bounded Compose services, cleanup trap and production health readback"
+  },
+  "knownLimits": [
+    "NetSuite script installation requires access to the user's NetSuite account.",
+    "No durable NetSuite outbound retry queue: failed sends are logged and can be replayed by saving the customer again.",
+    "No hard-delete propagation or removal of existing child addresses/contacts."
+  ]
+}

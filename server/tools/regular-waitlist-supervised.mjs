@@ -1,0 +1,11 @@
+import assert from 'node:assert/strict';
+import {spawn} from 'node:child_process';
+import {mkdirSync} from 'node:fs';
+const label=process.argv[2];assert(['baseline-full','final-full'].includes(label));
+assert.equal(process.env.MBT_TEST_ISOLATED,'1');assert.equal(process.env.NETSUITE_DIRECT_ACCESS_ENABLED,'false');
+mkdirSync('test-artifacts/regular-waitlist',{recursive:true});
+const suite=spawn(process.execPath,['tools/regular-waitlist-suite.mjs',...process.argv.slice(3)],{stdio:'inherit'});
+const watcher=spawn(process.execPath,['tools/regular-waitlist-watchdog.mjs',String(suite.pid),label],{stdio:'inherit'});
+const result=await new Promise((resolve,reject)=>{suite.once('error',reject);suite.once('exit',(code,signal)=>resolve(signal?1:code));});
+await new Promise((resolve,reject)=>{watcher.once('error',reject);watcher.once('exit',resolve);});
+process.exitCode=result;

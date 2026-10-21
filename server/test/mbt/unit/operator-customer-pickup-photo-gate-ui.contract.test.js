@@ -93,7 +93,11 @@ test("S7: Operator cache revision ships the live-policy client once; later toggl
     source("public/operator.html"),
     source("public/service-worker.js")
   ]);
-  assert.match(html, /operator\.js\?v=20260917-load-followup-v1/u);
-  assert.match(serviceWorker, /mbbs-yard-operator-20260917-load-followup-v1/u);
-  assert.match(serviceWorker, /operator\.js\?v=20260917-load-followup-v1/u);
+  const pageAssets = [...html.matchAll(/\/operator\.js\?v=([^"\s]+)/gu)];
+  const cachedAssets = [...serviceWorker.matchAll(/\/operator\.js\?v=([^"\s]+)/gu)];
+  assert.equal(pageAssets.length, 1);
+  assert.equal(cachedAssets.length, 1);
+  assert.equal(pageAssets[0][1], cachedAssets[0][1]);
+  assert.equal(/const CACHE_NAME = "([^"]+)";/u.exec(serviceWorker)?.[1],
+    `mbbs-yard-operator-${pageAssets[0][1]}`);
 });

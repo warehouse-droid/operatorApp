@@ -21,13 +21,19 @@ function fixture({ failure = false, incomplete = false, changeSelection = false,
   const requests = [];
   const functions = cargoFunctions("../../public/dispatch.js", [
     "dispatchGroupOrderNeedsHydration", "hydrateDispatchGroupSelection", "hydrateDispatchOrder", "applyTargetedDispatchOrderUpdate",
-    "canonicalDispatchOrderType", "isAggregateDispatchCoGroup"
+    "canonicalDispatchOrderType", "isAggregateDispatchCoGroup", "dispatchOrderReadToken", "dispatchOrderReadIsCurrent"
   ], {
+    dispatchGroupHydrationPromise: null, dispatchGroupHydrationRefs: new Set(),
+    dispatchGroupRefreshPending: false, dispatchGroupHydrationInvalidated: false,
+    dispatchOrderRefreshEpoch: 0, dispatchOrderReadSequence: 0, localPlanGeneration: 0,
+    currentPlan: { id: '364' }, currentPlanDate: '2026-10-20', orderPoolRefreshTimer: null,
+    window: { clearTimeout() {} }, dispatchOrderReadRequests: new Map(), dispatchOrderAppliedReads: new Map(),
+    dispatchOrderRefKey: value => String(value).toUpperCase(),
     selectedOrders: () => selected.map((id) => orders.find((order) => order.id === id)),
     orderById: (id) => orders.find((order) => order.id === id),
     dispatchOrderHydrationPromises: new Map(),
     fetch: async (url) => {
-      const id = decodeURIComponent(url.split("/").at(-1));
+      const id = decodeURIComponent(new URL(url, "http://fixture").pathname.split("/").at(-1));
       requests.push(id);
       if (failure && id === "SOB119855") { throw new Error("Details unavailable"); }
       if (changeSelection) { selected = ["SOB119854"]; }

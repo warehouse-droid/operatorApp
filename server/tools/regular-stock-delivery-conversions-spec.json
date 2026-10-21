@@ -1,0 +1,18 @@
+{
+  "tier": 3,
+  "specApproval": "not obtained (autonomous run); user authorized the general delivery fix and TOB01183 correction",
+  "acceptance": [
+    "SO-derived regular Delivery quantities retain the existing full-line versus backorder selection and include PLT, LYR, SEC and PCS counts from the item conversion snapshot.",
+    "The request, refreshed approval calculation, local transfer and NetSuite payload all carry packing counts that represent the exact selected Sales quantity.",
+    "Approval recalculation updates packing counts when stock or conversion factors change, rather than retaining the earlier breakdown.",
+    "Manual stocking conversion inputs, kit handling, route approval, reservations, official PALLET quantity and idempotent retry remain unchanged.",
+    "TOB01183 is read back from NetSuite and local missing conversion metadata is reconciled with an audit event, without creating another TO or changing execution state.",
+    "Only validated runtime changes are deployed as an overlay of the current live image."
+  ],
+  "setup": {
+    "runtimeFiles": ["src/stock-request-repository.js"],
+    "newDependencies": [],
+    "gitCommits": false,
+    "artifacts": "server/test-artifacts/regular-stock-delivery-conversions"
+  }
+}

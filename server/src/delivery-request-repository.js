@@ -45,6 +45,8 @@ function actionMessage(action,current,next,reply) {
   const slot=window=>`${window.date} ${window.start}–${window.end}`;
   const includesTransfer=[...(current.salesOrderRefs || []),...(next.salesOrderRefs || [])].some(ref=>ref.startsWith('TO'));
   const messages={
+    'set-expiry':()=>`Approval expiry changed: ${current.approvalExpiresAt} → ${next.approvalExpiresAt}.`,
+    expire:()=> 'Dispatch manually expired this request. Sales must re-raise it for a new approval.',
     relink:()=>`${includesTransfer?'Order':'Sales Order'} links changed: ${current.salesOrderRefs.join(', ')} → ${next.salesOrderRefs.join(', ')}.`,
     'request-time-change':()=>`Requested time change: ${slot(current.confirmedWindow)} → ${slot(next.pendingWindow)}. The approved time remains active.`,
     'counter-time-change':()=>`Counter-proposed time change: ${slot(current.pendingWindow)} → ${slot(next.pendingWindow)}. The approved time remains active until Sales accepts.`,

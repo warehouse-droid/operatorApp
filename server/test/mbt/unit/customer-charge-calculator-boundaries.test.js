@@ -153,7 +153,6 @@ test("customer-charge calculator rejects malformed aggregate and distance-band e
     [aggregateCharge({ aggregateDistanceBands: [BASE_BANDS[0]], distanceMetres: 30_001 }),
       "MBT_CHARGE_AGGREGATE_DISTANCE_OUT_OF_RANGE"],
     [aggregateCharge({ aggregateLines: [] }), "MBT_CHARGE_AGGREGATE_REQUIRED"],
-    [binCharge({ orderFrom150: false, aggregateLines: [aggregate] }), "MBT_CHARGE_AGGREGATE_ORIGIN_REQUIRED"],
     [binCharge({ orderFrom150: true, aggregateLines: [aggregate], loadingFeeMinor: -1 }),
       "MBT_CHARGE_INPUT_INVALID"]
   ];

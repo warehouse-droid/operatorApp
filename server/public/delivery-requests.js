@@ -1,4 +1,5 @@
 /* global requireDispatchLogin, dispatchLogout, readDispatchAuthToken */
+import {parseDeliveryExpiryTime,formatDeliveryExpiryDeadline} from './delivery-request-expiry-time.js';
 (() => {
   const root = document.getElementById('deliveryRequestsApp');
   const audience = location.pathname.startsWith('/dispatch/') ? 'dispatch' : 'sales';
@@ -296,13 +297,64 @@
   }
   function approvalControls(row) {
     const editableSales=audience==='sales';
-    return `${audience==='dispatch' && ['submitted','proposed'].includes(row.status)?`<div class="dr-actions"><button type="button" class="primary" data-action="confirm">OK — preapprove</button></div>${slotForm('propose',row.requestedWindow,'Propose another time')}`:''}
+    return `${dispatchExpiryControls(row)}${audience==='dispatch' && ['submitted','proposed'].includes(row.status)?slotForm('propose',row.requestedWindow,'Propose another time'):''}
       ${editableSales && row.status==='proposed'?`<button type="button" class="primary" data-action="accept" data-approval-dependent>Accept proposed time</button>`:''}
       ${editableSales && row.status==='preapproved'?`<form data-form="secure" class="dr-slot"><h3>Sales / Transfer Order linkage</h3><div data-sales-orders>${salesOrderInput()}</div>
         <p class="dr-muted">Enter one Delivery Sales Order (SO) or Transfer Order (TO) per box. TOs must involve the requesting yard. Use + to add another (up to 50). Saving secures the approval and stops expiry.</p><button class="primary" data-approval-dependent>Secure approval</button></form>`:''}
       ${editableSales && row.status==='confirmed'?`<form data-form="relink" class="dr-slot"><h3>Sales / Transfer Order linkage</h3><div data-sales-orders>${row.salesOrderRefs.map((ref,index)=>salesOrderInput(index,ref,true,row.salesOrderRefs.length)).join('')}</div>
         <p class="dr-muted">Exchange an SO or TO number or unlink a row, then save. At least one order must remain. The approved delivery time stays the same.</p><button class="primary">Save order links</button></form>`:''}
       ${editableSales && ['proposed','preapproved'].includes(row.status)?slotForm('counter',row.requestedWindow,'Request another time'):''}`;
+  }
+  function dispatchExpiryControls(row) {
+    if(audience!=='dispatch' || !['submitted','proposed','preapproved'].includes(row.status)) {return '';}
+    const active=Boolean(row.approvalExpiresAt);
+    return `<div class="dr-actions dr-approval-actions">${row.status!=='preapproved'?'<button type="button" class="primary" data-action="confirm">OK — preapprove</button>':''}
+      <label class="dr-expiry-field">Override expiry<input type="text" name="expiryTime" data-expiry-input maxlength="40" autocomplete="off" placeholder="until 05:30 pm"
+        value="${active?esc(formatDeliveryExpiryDeadline(row.approvalExpiresAt)):''}" aria-describedby="dr-expiry-help dr-expiry-error"></label>
+      ${active?'<button type="button" data-action="set-expiry" data-approval-dependent>Save expiry</button>':''}</div>
+      <p class="dr-muted" id="dr-expiry-help">This request only · Toronto time. Enter e.g. 530pm or 17:30. A time already passed means tomorrow.${active?'':' Leave blank for the default '+state.meta.settings.approvalHours+' hours.'}</p>
+      <p class="dr-window-error" id="dr-expiry-error" data-expiry-error aria-live="polite" hidden></p>`;
+  }
+  function expiryFields(required=false) {
+    const input=root.querySelector('[data-expiry-input]');
+    if(!input) {return {};}
+    const value=input.value.trim(),parsed=parseDeliveryExpiryTime(value);
+    const invalid=Boolean(value && !parsed) || (required && !value);
+    input.setCustomValidity(invalid?'Enter a valid expiry time, such as until 05:30 pm.':'');
+    input.setAttribute('aria-invalid',String(invalid));
+    const error=root.querySelector('[data-expiry-error]');error.textContent=input.validationMessage;error.hidden=!invalid;
+    if(invalid) {input.reportValidity();return null;}
+    input.value=parsed?.formatted || '';
+    return parsed?{expiryTime:parsed.formatted}:{};
+  }
+  async function saveExpiry(action) {
+    const fields=expiryFields(action==='set-expiry');
+    if(fields) {await executeAction(action,fields);}
+  }
+  async function submitSlot(kind,fields) {
+    const expiry=kind==='propose'?expiryFields():{};if(!expiry) {return;}
+    await executeAction(kind,{window:{date:fields.get('date'),start:fields.get('start'),end:fields.get('end')},message:fields.get('message'),...expiry});
+  }
+  function confirmExpiry(button) {
+    return new Promise(resolve=>{
+      const dialog=document.createElement('dialog');dialog.className='dr-expiry-dialog';
+      dialog.setAttribute('aria-labelledby','dr-expire-title');dialog.setAttribute('aria-describedby','dr-expire-warning');
+      dialog.innerHTML=`<h2 id="dr-expire-title">Expire request?</h2><p id="dr-expire-warning">Expire <strong>${esc(state.detail.requestRef)}</strong> immediately? Sales will no longer be able to secure this request and must re-raise it for a new Dispatch approval.</p>
+        <div class="dr-actions"><button type="button" data-keep>Keep request</button><button type="button" class="danger" data-expire>Expire now</button></div>`;
+      const close=answer=>{
+        dialog.remove();window.removeEventListener('mbbs-auth-operator-changed',cancel);window.removeEventListener('pagehide',cancel);
+        if(button.isConnected) {button.focus();}resolve(answer);
+      };
+      const cancel=()=>close(false);
+      dialog.querySelector('[data-keep]').addEventListener('click',cancel);
+      dialog.querySelector('[data-expire]').addEventListener('click',()=>close(true));
+      dialog.addEventListener('cancel',event=>{event.preventDefault();cancel();});
+      window.addEventListener('mbbs-auth-operator-changed',cancel);window.addEventListener('pagehide',cancel);
+      document.body.append(dialog);dialog.showModal();dialog.querySelector('[data-keep]').focus();
+    });
+  }
+  async function expireRequest(button) {
+    if(await confirmExpiry(button)) {await executeAction('expire');}
   }
   function salesOrderInput(index=0,ref='',linked=false,count=1) {
     return `<div class="dr-sales-order ${linked?'dr-linked-order':''}" data-sales-order><label><span data-order-label>Order ${index+1} (SO / TO)</span><input name="salesOrderRefs" value="${esc(ref)}" placeholder="SO123 or TO123" maxlength="80" autocomplete="off" required></label>
@@ -356,6 +408,7 @@
     const editableSales=audience==='sales';
     return `<div class="dr-actions">${editableSales && row.status==='submitted'?'<button type="button" data-action="edit">Edit request</button>':''}
         ${editableSales && row.status==='expired'?'<button type="button" class="primary" data-action="reraise">Re-raise request</button>':''}
+        ${audience==='dispatch' && ['submitted','proposed','preapproved'].includes(row.status)?'<button type="button" class="danger" data-action="expire">Expire request</button>':''}
         ${row.status!=='cancelled'?'<button type="button" data-action="cancel">Cancel request</button>':''}<button type="button" data-action="reload">Refresh request</button></div>`;
   }
   function instructionOrderRefs(row) {return row.salesOrderRefs.filter(ref=>ref.startsWith('SO'));}
@@ -457,6 +510,7 @@
     state.instruction=await api(`${instructionPath()}/media/${encodeURIComponent(button.dataset.id)}`,{method:'DELETE',body:JSON.stringify({expectedRevision:state.instruction.revision})});renderInstruction();
   }
   const clickActions={new:()=>startDraft(),open:button=>open(button.dataset.id),refresh:refreshPage,reload:discardDraft,discard:discardDraft,
+    confirm:()=>saveExpiry('confirm'),'set-expiry':()=>saveExpiry('set-expiry'),expire:expireRequest,
     quote:calculateQuote,edit:()=>startDraft(state.detail,'edit'),reraise:()=>startDraft(state.detail,'reraise'),
     'add-yard':editYards,'remove-yard':editYards,'add-trip-leg':editTripLegs,'remove-trip-leg':editTripLegs,'add-order':editSalesOrders,'remove-order':editSalesOrders,
     'preview-estimate':openDocumentPreview,'preview-order':openDocumentPreview,
@@ -485,7 +539,7 @@
       else if(kind==='settings') {
         const values=Object.fromEntries(['pos','bin','approvalHours','reminderHours'].map(key=>[key,Number(fields.get(key))]));
         state.meta.settings=await api(`${endpoint}/settings`,{method:'PUT',body:JSON.stringify({...values,expectedRevision:state.meta.settings.revision})});notice('Request settings saved.');
-      } else {await executeAction(kind,{window:{date:fields.get('date'),start:fields.get('start'),end:fields.get('end')},message:fields.get('message')});}
+      } else {await submitSlot(kind,fields);}
     });
   });
   root.addEventListener('input',event=>{
@@ -494,6 +548,7 @@
     if(event.target.matches('[data-pricing]')) {state.quote=null;const quote=root.querySelector('[data-quote]');if(quote) {quote.textContent='Delivery details changed. Calculate the charge again.';}const submit=root.querySelector('[data-submit]');if(submit) {submit.disabled=true;}const total=root.querySelector('[data-total-units]');if(total) {total.textContent=String(collectDraft().totalUnits);}}
   });
   root.addEventListener('change',event=>{
+    if(event.target.matches('[data-expiry-input]')) {expiryFields();}
     if(event.target.matches('[data-time-input]')) {event.target.value=formattedTime(event.target.value);}
     if(event.target.matches('[name=date],[name=start],[name=end]')) {validateWindow(event.target.form);}
     if(event.target.matches('[data-status]')) {void loadList().catch(error=>notice(error.message,true));}

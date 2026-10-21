@@ -7,6 +7,7 @@ import { dispatchLoadAssignment } from "../dispatch-load-assignment.js";
 import { insertMbtAuditEvent } from "./audit-repository.js";
 import { assignMbtBinFrontLeg, confirmMbtBinDispatchPlan } from "./bin-dispatch-service.js";
 import { assertPlanningCapacity } from "./bin-planning-capacity.js";
+import { assertBinWorkflowPlanDependencies } from "./bin-order-workflow-planning.js";
 import { stagePlanningAssignment, withdrawPlanningAssignment, publishPlanningAssignments } from "./bin-planning-assignments.js";
 import { releasePlanningReservations } from "./bin-planning-reservations.js";
 import { sequenceBinVisit, binVisitGroups } from "./bin-planning-domain.js";
@@ -76,7 +77,7 @@ function applyPlanningStopTimings(plan, input, stopTimings, visit) {
   const site = visit.site_snapshot || {};
   const address = [site.addressLine1, site.city, site.region].filter(Boolean).join(", ");
   for (const stop of assigned.stops.filter((/** @type {any} */ s) => s.mbt?.visitId === input.visitId)) {
-    stop.planningAddress = String(stop.yardCode || address);
+    stop.planningAddress = String(stop.planningAddress || stop.yardCode || address);
   }
   for (const row of stopTimings) {
     const stop = assigned.stops.find((/** @type {any} */ s) => s.mbt?.visitId === input.visitId && Number(s.mbt.stopSequence) === row.sequence);
@@ -313,6 +314,9 @@ export async function runMbtBinPlanningCommand(raw, boundary) {
       if (input.action !== "cancel" && input.action !== "advance") {
         assertPlanningSchedule(plan);
         await assertPlanningCapacity(plan);
+        const ids=new Set(plan.trucks.flatMap((/** @type {any} */ t)=>t.loads || [])
+          .flatMap((/** @type {any} */ l)=>l.stops || []).map((/** @type {any} */ s)=>s.mbt?.visitId).filter(Boolean));
+        for (const id of ids) {await assertBinWorkflowPlanDependencies(String(id),false);}
       }
       await syncPlanningProjections(plan);
       await insertMbtAuditEvent({ actor: input.actor, correlationId, requestId, idempotencyKey: input.idempotencyKey,

@@ -1,0 +1,48 @@
+{
+  "feature": "Regular stock request / Backorder: Already Ordered",
+  "spec approval": "not obtained (autonomous run)",
+  "authorizedBy": "User explicitly requested SCM Already Ordered status, mandatory PO number, optional PO ref number, and immediate line completion without SO/PO linking or further steps.",
+  "contract": [
+    "Only SCM can save Already Ordered on an active Regular Backorder line.",
+    "PO number is a trimmed nonempty string of at most 120 characters; optional PO ref number is a trimmed string of at most 200 characters. Control characters and nonstrings are rejected.",
+    "Saved references are plain references; no existing synced order, vendor lookup, ETA, Sales acceptance, PO planning, or remote mutation is required.",
+    "The selected line completes atomically with a revision increment and audit event. Its reference fields remain visible to Sales and SCM after refresh.",
+    "Completed lines have no edit, decision, response, readiness, SO, or PO actions. Other lines retain their normal workflow and purchase readiness excludes completed lines.",
+    "A request with only Already Ordered and declined/closed lines is Completed if at least one is Already Ordered. Only declined/closed lines still close the request.",
+    "Detail, SQL stage view, pending/completed queues, and alerts agree. Completed lines do not demand customer replies or readiness reminders.",
+    "Foreign lines, unauthorized roles/yards, stale revisions and concurrent writes cannot corrupt or reopen completion. Special requests and other Regular types do not gain this status.",
+    "SCM UI shows both reference fields only for Already Ordered, enforces PO number, hides normal stock-check fields, explains immediate completion, and displays saved completion to both roles."
+  ],
+  "verification": [
+    "RED against captured production",
+    "HTTP/database integration",
+    "property stage and gating invariants",
+    "real browser SCM/Sales workflow",
+    "Backorder and shared Special regression comparison",
+    "type and lint baseline comparison",
+    "changed-line coverage",
+    "manual semantic mutations",
+    "bounded disposable test teardown"
+  ],
+  "deployment": "Scoped production overlay, additive constrained schema migration, unchanged existing records and configuration, retained rollback image, exact runtime verification.",
+  "validationClarifications": [
+    "SCM uses queue=closed for completed requests; Sales uses bucket=completed. Compare unchanged lines using the same audience because SCM includes private purchase fields. These correct test inputs, without changing the completion contract.",
+    "The negative Special-route test now explicitly enables and restores the Special feature flag, checks normal-status foreign-workflow routing returns 404, and checks Already Ordered returns 400/SPECIAL_RESPONSE_STATUS_INVALID. This removes dependence on earlier suites changing the feature flag and strengthens the isolation assertion."
+  ],
+  "failureModel": {
+    "partial or concurrent completion": "transaction, case/line row locks, expected revision, HTTP race test",
+    "mandatory PO bypass or hostile text": "HTTP input matrix, text round-trip property, database constraints, browser escaping",
+    "completed line reopened or false whole-request completion": "terminal action rejection, mixed workflow, stage and readiness properties",
+    "follow-up prompts after completion": "real SCM/Sales browser with pending information and a linked PO",
+    "migration corrupts existing data or fails mid-change": "isolated migration replay and transaction rollback with unchanged row assertions",
+    "existing shared workflow regression": "captured production suite and diagnostic multiset comparison"
+  },
+  "setupActual": {
+    "tier": 3,
+    "dependenciesAdded": [],
+    "toolchain": "Existing bounded test image; versions recorded in proofs report",
+    "git": "Preserve unrelated dirty workspace; scoped runtime overlay against captured production",
+    "database": "Disposable isolated Compose PostgreSQL; production schema migration only after verification",
+    "knownLimit": "Automatic code rollback is permitted only before any new Already Ordered rows have been saved; the additive schema and reference data are retained."
+  }
+}

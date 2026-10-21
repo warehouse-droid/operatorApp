@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { readFile } from "node:fs/promises";
-import { beginRollbackContext, closeDb } from "./db.js";
+import { beginRollbackContext, closeDb, query } from "./db.js";
 import { createOperator } from "./auth-repository.js";
 import {
   getScmSchedulePreference,
@@ -30,9 +30,8 @@ for (const expected of [
   assert(client.includes(expected), `Schedule preference client is missing ${expected}.`);
 }
 assert(
-  client.includes('key === "kind" && !scmScheduleCanShowTypeFilter()')
-    && client.includes('key === "method" && !scmScheduleCanShowScmWorkingControls()'),
-  "Hidden Type or Method preferences can still constrain an unsupported schedule view."
+  client.includes('key === "method" && !scmScheduleCanShowMethodFilter()'),
+  "Hidden Method preferences can still constrain the Dispatch view."
 );
 const applyHandler = client.match(/async function applyScmScheduleFilters\(\) \{([\s\S]*?)\n\}/)?.[1] || "";
 assert(applyHandler.includes("saveScmScheduleFilterPreference()"), "Apply does not persist the signed-in user's filters.");
@@ -53,7 +52,7 @@ for (const expected of [
 ]) {
   assert(server.includes(expected), `Schedule preference routes are missing ${expected}.`);
 }
-assert(html.includes("/scm-schedule.js?v=20260910-search-vendor-complete-v1"),
+assert(html.includes("/scm-schedule.js?v=20261001-schedule-multi-sort-v1"),
   "Schedule preference client cache bust is missing.");
 assert(migration.includes("PRIMARY KEY (operator_id, surface)"), "Schedule preferences are not isolated by user and surface.");
 assert(migration.includes("REFERENCES operators(id) ON DELETE CASCADE"), "Deleted staff accounts retain schedule preferences.");
@@ -69,6 +68,9 @@ assert.deepEqual(
     surface: "scm",
     kind: "Sp.O",
     method: "MBT",
+    kinds: ["Sp.O"],
+    methods: ["MBT"],
+    dropoffPoints: [],
     status: []
   }
 );
@@ -82,6 +84,9 @@ assert.deepEqual(
     surface: "scm",
     kind: "PO",
     method: "Vendor",
+    kinds: ["PO"],
+    methods: ["Vendor"],
+    dropoffPoints: [],
     status: ["Queued", "Priority"]
   }
 );
@@ -95,9 +100,12 @@ assert.deepEqual(
     surface: "dispatch",
     kind: "TO",
     method: "",
+    kinds: ["TO"],
+    methods: ["MBT"],
+    dropoffPoints: [],
     status: ["Completed"]
   },
-  "Dispatch must persist its visible Type filter but never its hidden Method filter."
+  "Dispatch keeps the legacy Method field empty while retaining Method selections for its Completed view."
 );
 assert.throws(
   () => normalizeScmSchedulePreference({ status: ["Not a status"] }, { surface: "scm" }),
@@ -111,6 +119,14 @@ assert.throws(
   () => normalizeScmSchedulePreference({}, { surface: "other" }),
   /surface must be scm, dispatch, or sales/
 );
+assert.deepEqual(normalizeScmSchedulePreference({
+  kinds: ["TO", "sp.o", "TO"], methods: ["MBT", "Vendor", "MBT"], dropoffPoints: ["3445", "150", "3445"]
+}, { surface: "scm" }), {
+  surface: "scm", kind: "TO", method: "MBT", kinds: ["TO", "Sp.O"], methods: ["MBT", "Vendor"],
+  dropoffPoints: ["3445", "150"], status: []
+});
+assert.throws(() => normalizeScmSchedulePreference({ kinds: ["PO", "Invalid"] }, { surface: "scm" }), /Invalid PO\/TO Schedule Type/);
+assert.throws(() => normalizeScmSchedulePreference({ dropoffPoints: ["3445", "Unknown"] }, { surface: "scm" }), /Invalid PO\/TO Schedule Drop-off Point/);
 
 const rollback = await beginRollbackContext();
 try {
@@ -154,6 +170,31 @@ try {
     assert.equal(saved.method, "Customer Pickup");
     assert.deepEqual(saved.status, ["Queued", "Hold"]);
 
+    const multi = { kinds: ["Sp.O", "TO"], methods: ["MBT", "Vendor"], dropoffPoints: ["3445", "150"], status: ["Queued"] };
+    await updateScmSchedulePreference(first.id, "scm", multi);
+    const reloadedMulti = await getScmSchedulePreference(first.id, "scm");
+    for (const field of Object.keys(multi)) assert.deepEqual(reloadedMulti[field], multi[field]);
+    await updateScmSchedulePreference(first.id, "scm", { kinds: [], methods: [], dropoffPoints: [], status: [] });
+    const cleared = await getScmSchedulePreference(first.id, "scm");
+    assert.deepEqual(cleared.kinds, []);
+    assert.deepEqual(cleared.methods, []);
+    assert.deepEqual(cleared.dropoffPoints, []);
+    assert.equal(cleared.kind, "");
+    assert.equal(cleared.method, "");
+
+    // Rows written by an older client keep their single selections during the upgrade.
+    await query(`INSERT INTO scm_schedule_user_preferences (operator_id, surface, order_kind, method)
+      VALUES ($1, 'sales', 'TO', 'Vendor')`, [first.id]);
+    const multiMigration = await readFile(new URL("../migrations/248_scm_schedule_multi_filters.sql", import.meta.url), "utf8");
+    await query(multiMigration);
+    await query(multiMigration);
+    const backfilled = await query("SELECT order_kinds, methods FROM scm_schedule_user_preferences WHERE operator_id = $1 AND surface = 'sales'", [first.id]);
+    assert.deepEqual(backfilled.rows[0].order_kinds, ["TO"]);
+    assert.deepEqual(backfilled.rows[0].methods, ["Vendor"]);
+    const salesSaved = await updateScmSchedulePreference(first.id, "sales", multi);
+    assert.deepEqual(salesSaved.kinds, multi.kinds);
+    assert.deepEqual(salesSaved.methods, multi.methods);
+
     const otherSurface = await getScmSchedulePreference(first.id, "dispatch");
     assert.equal(otherSurface.persisted, false, "SCM preference leaked into the Dispatch surface.");
     const otherUser = await getScmSchedulePreference(second.id, "scm");
@@ -167,6 +208,10 @@ try {
     assert.equal(dispatchSaved.kind, "PO");
     assert.equal(dispatchSaved.method, "");
     assert.deepEqual(dispatchSaved.status, ["Completed"]);
+    const dispatchMulti = await updateScmSchedulePreference(second.id, "dispatch", multi);
+    assert.deepEqual(dispatchMulti.kinds, multi.kinds);
+    assert.deepEqual(dispatchMulti.dropoffPoints, multi.dropoffPoints);
+    assert.deepEqual(dispatchMulti.methods, multi.methods, "Method selections must remain available in the Completed view.");
   });
 
   console.log("Per-user PO/TO Schedule filter preference harness passed.");

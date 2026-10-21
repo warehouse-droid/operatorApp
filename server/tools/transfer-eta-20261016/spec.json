@@ -1,0 +1,31 @@
+{
+  "approval": "not obtained (autonomous run)",
+  "tier": 3,
+  "request": "New Wait for Transfer stock checks use SO placement +5 working days.",
+  "scenarios": [
+    "New Special and Backorder vendor_transfer responses ignore fixed client dates and persist a relative SO placement policy.",
+    "Before a linked SO: Sales can accept, no concrete ETA or readiness reminder; SCM can confirm not ready without a date.",
+    "Successful SO link materializes ETA five Ontario working days after placement, excluding placement day, weekends and public holidays.",
+    "Automatic SO submission uses its original Toronto submission date on recovery; manual SO links use the mirrored SO transaction date. Missing source dates fall back to link date.",
+    "Placement and ETA are stable across retries and reloads; failed links change nothing.",
+    "Only new-policy active transfer lines receive dates; existing fixed ETAs and unrelated statuses remain unchanged.",
+    "Backorder checks submitted after SO link immediately calculate from saved placement date.",
+    "After placement SCM can revise readiness ETA for a delay; subsequent links do not overwrite that revision. Ready clears the ETA and reminder.",
+    "SCM hides date input for transfer stock response, shows relative label before SO; Sales displays relative label and acceptance; both show concrete ETA after placement.",
+    "Existing decline visibility, conversations, authorization and order operations remain intact."
+  ],
+  "failureModel": {
+    "wrong calendar or timezone": "unit and property tests including Thanksgiving, Christmas and Toronto midnight",
+    "premature or drifting ETA": "repository transaction tests, retry and failed-link assertions",
+    "partial line updates": "transaction rollback and mixed-line integration test",
+    "legacy ETAs rewritten": "migration preservation and line selection assertions",
+    "UI prevents accepting pending ETA": "actual browser form tests",
+    "schema rollout mismatch": "isolated forward/rollback rehearsal, schema-only migration before app restart"
+  },
+  "setup": {
+    "dependencies": "none; reuse installed bounded Compose test image and toolchain",
+    "git": "preserve dirty workspace; scoped baseline and runtime hashes, no commits",
+    "artifacts": "tools/transfer-eta-20261016 and test-artifacts/transfer-eta-20261016",
+    "deployment": "scoped changes over captured live image; app-only update with rollback; no live business writes"
+  }
+}

@@ -1,8 +1,8 @@
 import {traceDriverCompletion} from "./driver-completion-trace.js";
 import {mountStockRequestConversationRoutes} from './stock-request-conversation-router.js';
 import { previewOperatorOrderReopen, reopenOperatorOrder, searchOperatorReopenOrders } from "./operator-order-reopen-repository.js";
-import { createCustomerWebhookRouter } from './netsuite-customer-webhook-router.js';
 import { createPasswordResetRouter } from './password-reset-router.js';
+import { createCustomerWebhookRouter } from './netsuite-customer-webhook-router.js';
 import { listTransferPostingJobs } from './transfer-order-posting-repository.js';
 import { retryTransferPostingJob } from './transfer-order-posting-service.js';
 import { dispatchDependencyOrderRefs } from './yard-dependency-structure.js';
@@ -15,6 +15,7 @@ import { createBossApprovalNetSuite } from './netsuite.js';
 import { saveSmartScmProposalLineOrder } from "./smart-scm-line-order-repository.js";
 import {enqueueDeliveryOperation,getDeliveryOperation,activeDeliveryOperation,createDeliveryOperationRuntime} from './regular-stock-delivery-operations.js';
 import {submitRegularStockRequest,editRegularStockRequest,decideRegularStockRequest,refreshRegularStockEvidence,regularStockAlerts,acknowledgeRegularStockDecisions,reraiseRegularStockRequest} from './regular-stock-request-service.js';
+import {closeExpiredRegularStockRequest} from './regular-stock-expiry.js';
 import {mountBackorderRoutes} from './backorder-request-routes.js';
 import {resolveRegularStockRequest} from './regular-stock-resolution.js';
 import {replyRegularStockRequest} from './regular-stock-replies.js';
@@ -325,7 +326,7 @@ import {
 import { applyActiveTransitCoMetadata, clearCancelledTransitCoMetadata, evaluateExecutedPrefixPolicy } from "./dispatch-planner-performance.js";
 import { getDispatchSourceReviewPayload, acknowledgeDispatchExecutedOrderReviews, prepareDispatchExecutedOrderComparison, resolveDispatchSourceOrderReviews } from "./dispatch-executed-order-review-repository.js";
 import { preserveDispatchPlanAddresses } from "./dispatch-address-guard.js";
-import { applyDispatchPlanDelta, buildDispatchPlanDelta } from "./dispatch-planner-optimization.js";
+import { applyDispatchPlanDelta, buildDispatchPlanDelta, compactDispatchOrderCard } from "./dispatch-planner-optimization.js";
 import { DispatchPlanEditLeaseError, acquireDispatchPlanEditLease, assertDispatchPlanEditLease, getDispatchPlanEditLease, heartbeatDispatchPlanEditLease, releaseDispatchPlanEditLease, listActiveDispatchPlanEditors, kickDispatchPlanEditor } from "./dispatch-plan-lease-repository.js";
 import { withDispatchPlanWrite, getDispatchPlanWriteReplay } from './dispatch-plan-write.js';
 import {
@@ -546,6 +547,7 @@ import {
   getSpecialStockCase,
   issueSpecialStockMedia,
   linkSpecialPurchaseOrder,
+  markSpecialPurchaseOrderSentToVendor,
   linkSpecialSalesOrder,
   listSpecialDispatchHandoffs,
   listSpecialStockCases,
@@ -1117,6 +1119,7 @@ function sendDispatchLoadAssignmentConflictResponse(res, conflicts = []) {
 
 const DISPATCH_RECOVERY_EXCLUDED_ERROR_CODES = new Set([
   "DISPATCH_SPLIT_ALLOCATED",
+  "DISPATCH_SPLIT_QUANTITY_MISMATCH",
   "DISPATCH_COMMAND_ID_REUSED",
   "DISPATCH_PLAN_DATE_MISMATCH",
   "DISPATCH_PLAN_FENCE_REQUIRED",
@@ -1231,8 +1234,8 @@ function mergeDispatchTruckSequence(latestTrucks = [], requestedTrucks = []) {
   return merged;
 }
 
-async function dispatchPlannedAssignmentsFromProjection() {
-  const rows = await listDispatchPlanOrderAssignmentsProjection();
+async function dispatchPlannedAssignmentsFromProjection({ includeSnapshots = true } = {}) {
+  const rows = await listDispatchPlanOrderAssignmentsProjection({ includeSnapshots });
   const assignments = new Map();
   for (const row of rows) {
     if (assignments.has(row.orderRef)) continue;
@@ -1250,8 +1253,8 @@ async function dispatchPlannedAssignmentsFromProjection() {
   return assignments;
 }
 
-async function dispatchPlannedAssignmentsFromSnapshots() {
-  return dispatchPlannedAssignmentsFromProjection();
+async function dispatchPlannedAssignmentsFromSnapshots(options = {}) {
+  return dispatchPlannedAssignmentsFromProjection(options);
 }
 
 async function removeStaleCoPlannedAssignments(assignments) {
@@ -1287,8 +1290,8 @@ async function enrichDispatchOrdersWithPlanAssignments(orders = []) {
   });
 }
 
-async function listDispatchPlannedAssignments() {
-  const plannedAssignments = await dispatchPlannedAssignmentsFromSnapshots();
+async function listDispatchPlannedAssignments(options = {}) {
+  const plannedAssignments = await dispatchPlannedAssignmentsFromSnapshots(options);
   return [...plannedAssignments.entries()]
     .map(([orderRef, details]) => ({ orderRef, ...details }))
     .sort((a, b) => String(a.orderRef).localeCompare(String(b.orderRef)));
@@ -2208,16 +2211,18 @@ const dispatchOrderResponseSingleFlight = createSingleFlight({
 });
 
 function listDispatchOrdersForResponse(options = {}) {
+  if (options.fresh) return loadDispatchOrdersForResponse(options);
   return dispatchOrderResponseSingleFlight.run(options);
 }
 
-async function targetedDispatchMutationOrders(orderRefs = []) {
+async function targetedDispatchMutationOrders(orderRefs = [], { fresh = false } = {}) {
   const refs = [...new Set((orderRefs || [])
     .map((ref) => String(ref || "").trim().toLowerCase())
     .filter(Boolean))];
   if (!refs.length) return [];
   const feeds = await Promise.all(refs.map((search) => listDispatchOrdersForResponse({
     search,
+    fresh,
     exactOrderRefs: [search],
     includeCompletedScmSearch: true
   })));
@@ -2230,7 +2235,8 @@ async function targetedDispatchMutationOrders(orderRefs = []) {
       if (key && !byId.has(key)) byId.set(key, order);
     }
   }
-  return [...byId.values()];
+  return [...byId.values()].map((order) => ({ ...order, catalogHydrated: true,
+    catalogDetailSignature: compactDispatchOrderCard(order).catalogDetailSignature }));
 }
 
 async function refreshDispatchOrderCatalogRefsNow(orderRefs = [], {
@@ -2264,7 +2270,7 @@ async function refreshDispatchOrderCatalogRefsNow(orderRefs = [], {
 async function dispatchMutationOrderResponse(req, orderRefs = [], { legacyType = null } = {}) {
   if (req.query?.response === "targeted") {
     dispatchPrivateNoStore(req.res);
-    return { orders: await targetedDispatchMutationOrders(orderRefs) };
+    return { orders: await targetedDispatchMutationOrders(orderRefs, { fresh: true }) };
   }
   return { orders: await listDispatchOrdersForResponse({ type: legacyType }) };
 }
@@ -12238,6 +12244,7 @@ app.get("/api/sales/stock-requests", requireSalesAccess, requirePrivateSalesReco
         authorizedDestinationLocationIds,
         bucket: req.query.bucket,
         status: req.query.status,
+        unifiedStatus: req.query.unifiedStatus, outcome: req.query.outcome, waitingReason: req.query.waitingReason,
         type: req.query.type, stage:req.query.stage,
         search: req.query.search,
         allStatuses: req.query.allStatuses === "1",
@@ -12320,6 +12327,12 @@ app.post('/api/sales/stock-requests/:id/reply',requireSalesAccess,requirePrivate
     emitStockRequestUpdate('sales-stocking-reply',{requestId:request.id});res.json(request);
   }catch(error){next(error);}
 });
+app.post('/api/sales/stock-requests/:id/close-expired', requireSalesAccess, requirePrivateSalesRecordAccess, async(req,res,next)=>{
+  try{
+    const request=await closeExpiredRegularStockRequest(req.params.id,req.body||{},{operatorId:req.operator.id,authorizedDestinationLocationIds:operatorSalesYardLocationIds(req.operator)});
+    emitStockRequestUpdate('regular-expired-closed',{requestId:request.id});res.json(request);
+  }catch(error){next(error);}
+});
 app.post('/api/sales/stock-requests/:id/re-raise', requireSalesAccess, requirePrivateSalesRecordAccess, async(req,res,next)=>{
   try {
     const request=await reraiseRegularStockRequest(req.params.id,req.body||{},{operatorId:req.operator.id,authorizedDestinationLocationIds:operatorSalesYardLocationIds(req.operator),...(await getSalesStockRequestAvailabilityPolicy())});
@@ -12396,6 +12409,7 @@ app.get("/api/scm/stock-requests", requireScmAccess, async (req, res, next) => {
     const [requests, filterOptions] = await Promise.all([
       listScmStockRequests({
         queue: req.query.queue,
+        unifiedStatus: req.query.unifiedStatus, outcome: req.query.outcome, waitingReason: req.query.waitingReason,
         type: req.query.type, stage:req.query.stage,
         search: req.query.search,
         allStatuses: req.query.allStatuses === "1",
@@ -13182,6 +13196,14 @@ app.post('/api/scm/special-stock-requests/:id/purchase-order/skip', requireSmart
   } catch (error) { next(error); }
 });
 
+app.post('/api/scm/special-stock-requests/:id/purchase-order/sent-to-vendor', requireSmartScmWriteAccess, requireSpecialStockWorkflow, async (req, res, next) => {
+  try {
+    const detail = await markSpecialPurchaseOrderSentToVendor(req.params.id, req.body || {}, { operatorId: /** @type {any} */ (req).operator.id });
+    emitSpecialStockUpdate('purchase-order-sent-to-vendor', { requestId: detail.id, purchaseOrderId: detail.purchaseOrderId });
+    res.json(detail);
+  } catch (error) { next(error); }
+});
+
 app.post("/api/scm/special-stock-requests/:id/purchase-order/link", requireSmartScmWriteAccess, requireSpecialStockWorkflow, async (req, res, next) => {
   try {
     const detail = await linkSpecialPurchaseOrder(req.params.id, { ...req.body, verifiedRemote: false, operationId: null }, { operatorId: req.operator.id });
@@ -13708,12 +13730,17 @@ app.get("/api/dispatch/v2/order-feed/:id", async (req, res, next) => {
   try {
     dispatchPrivateNoStore(res);
     let order = null;
-    if ((await dispatchOrderPoolRuntimePolicy()).effective) {
+    if (req.query.fresh !== "true" && (await dispatchOrderPoolRuntimePolicy()).effective) {
       order = await getDispatchOrderCatalogOrder(req.params.id);
     }
-    if (!order) order = (await targetedDispatchMutationOrders([req.params.id]))[0] || null;
+    if (!order) {
+      const candidates = await targetedDispatchMutationOrders([req.params.id], { fresh: req.query.fresh === "true" });
+      order = candidates.find((candidate) => String(candidate.id).toLowerCase() === String(req.params.id).toLowerCase()
+        || (/^\d+$/.test(req.params.id) && String(candidate.netsuiteId) === String(req.params.id))) || null;
+    }
     if (!order) return res.status(404).json({ error: "Dispatch order not found", code: "DISPATCH_ORDER_NOT_FOUND" });
-    res.json({ order });
+    res.json({ order: { ...order, catalogHydrated: true,
+      catalogDetailSignature: compactDispatchOrderCard(order).catalogDetailSignature } });
   } catch (error) {
     next(error);
   }
@@ -15762,6 +15789,10 @@ async function executeScmDependencyHttpCommand(req, command, surface) {
     emitAppEvent("dispatch.orders.updated", {
       source: "scm-dependency-management",
       orderId: command.targetRef,
+      orderRefs: [...new Set([command.targetRef, result.dependency?.dispatchTargetRef,
+        result.dependency?.salesOrderRef, result.dependency?.transferOrderRef,
+        result.cancelled?.salesOrderRef, result.cancelled?.transferOrderRef, result.cancelled?.poOrderRef,
+        command.payload?.poRef, command.payload?.transferOrderRef].filter(Boolean))],
       refreshOrderPool: true,
       planId: result.planId || command.planId || null
     });
@@ -17784,7 +17815,7 @@ app.delete("/api/dispatch/scm/purchase-order-splits/:ref", async (req, res, next
 
 app.get("/api/dispatch/planned-assignments", async (req, res, next) => {
   try {
-    res.json(await listDispatchPlannedAssignments());
+    res.json(await listDispatchPlannedAssignments({ includeSnapshots: req.query.includeSnapshots !== "false" }));
   } catch (error) {
     next(error);
   }
@@ -18133,6 +18164,7 @@ app.post("/api/dispatch/split-orders/resplit", async (req, res, next) => {
       assertEditLease: () => requireDispatchPlanEditLease(req)
     });
     emitAppEvent("dispatch.orders.updated", { orderId: req.body?.orderRef, change: "order_resplit",
+      orderRefs: result.orders.map((order) => order.id),
       retiredGlobalOrderRefs: result.retiredGlobalOrderRefs, sourceSessionId: req.body?.audit?.sessionId, refreshOrderPool: true });
     res.json(result);
   } catch (error) {
@@ -18900,7 +18932,7 @@ app.post("/api/auth/logout", requireOperator, async (req, res, next) => {
   }
 });
 
-// Account preferences are independent of the currently selected yard.
+// Account preferences and phone layout policy are independent of the selected yard.
 app.use("/api/operator/preferences", requireOperator, requireOperatorAccess, createOperatorPreferencesRouter());
 app.use("/api/operator/phone-layout-policy", requireOperator, requireOperatorAccess, createOperatorPhonePolicyRouter());
 
@@ -25239,6 +25271,8 @@ export async function dispatchOrderCatalogTick() {
         });
         await completeDispatchOrderCatalogRefresh(refresh.id);
         summary.completed += 1;
+        emitAppEvent("dispatch.orders.updated", { source: "dispatch-catalog-ready", catalogAlreadyQueued: true,
+          orderRef: refresh.orderRef || "", type: refresh.orderType || "" });
       } catch (error) {
         summary.failed += 1;
         await failDispatchOrderCatalogRefresh(refresh.id, error);

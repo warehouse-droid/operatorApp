@@ -32,11 +32,11 @@ test('SOR-6 collision fails without modifying unrelated custom work',async()=>wi
  await assert.rejects(reconcileSorReturnDrafts('SOR98800901',[draft]),/already|collision|exists/i);
  assert.equal((await query("SELECT pickup_location FROM dispatch_custom_orders WHERE ref_number='SOR98800901-Return'")).rows[0].pickup_location,'Other site');
 },{rollback:true}));
-test('SOR-7 collection is blocked before delivery, allowed after, and blocked for review',async()=>withTransaction(async()=>{
+test('SOR-7 collection does not depend on delivery completion and still blocks for review',async()=>withTransaction(async()=>{
  const {draft}=await fixture();await reconcileSorReturnDrafts('SOR98800901',[draft]);
  const job={stopType:'pickup',orderRefs:[draft.refNumber]};
- assert.equal((await getSorReturnReadiness(job.orderRefs))[0].allowed,false);
- await assert.rejects(assertSorReturnReady(job),error=>error.code==='SOR_RETURN_NOT_READY');
+ assert.equal((await getSorReturnReadiness(job.orderRefs))[0].allowed,true);
+ await assertSorReturnReady(job);
  await query("INSERT INTO driver_job_records(job_id,driver_login,stop_type,order_refs,status) VALUES('sor-parent-done','driver','dropoff','[\"SOR98800901\"]','complete')");
  assert.equal((await getSorReturnReadiness(job.orderRefs))[0].allowed,true);
  await assertSorReturnReady(job);

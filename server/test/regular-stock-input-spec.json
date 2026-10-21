@@ -1,0 +1,30 @@
+{
+  "spec approval": "not obtained (autonomous run)",
+  "tier": 3,
+  "scope": "Regular stock Status multi-select, persistent Sales action alerts, Close expired approvals",
+  "acceptance": [
+    "Sales and SCM show one Status menu with checkboxes for six canonical states; selected states match OR before pagination; empty means all; default active; old single values supported; legacy case stage choices migrate and no longer restrict invisibly.",
+    "Sales action alerts belong to the requester within existing yard scope, cover awaiting SO, expired approval, requested updates, Backorder confirmations and allocated Waitlist; mixed requests with one Sales line still alert. Reading the request does not clear an unresolved action. Completion clears it. Existing informational updates remain.",
+    "Expired unused Pickup and legacy Delivery approvals expose Close beside Re-raise. Closing is audited, transactional and revision checked, appears in Closed history, and removes expiry/Sales action prompts. Retries do not duplicate closure. Active, terminal, foreign-yard, Stocking, Waitlist and handoff/transfer work cannot be closed with this action.",
+    "No schema or dependency changes, NetSuite writes, production test data, commits, or deployment are required. Preserve existing unrelated workspace edits."
+  ],
+  "failure_model": {
+    "filter omits rows": "unit/property, HTTP OR and pagination, browser persistence",
+    "alerts wrong audience or vanish on read": "requester/yard and acknowledgement integration tests",
+    "close races with handoff or stale revision": "row lock, stale revision and concurrent close tests; guard persisted handoffs/transfers",
+    "terminal expiry resurrects work": "domain/browser regression",
+    "invalid input": "parser properties and API errors"
+  },
+  "setup": "Use cached Node, PostgreSQL, Playwright and lint/type tools in standard isolated Compose with mbbs-tests.slice. Persist test runner, tests, source snapshots and logs in existing folders. Register teardown before creating containers. No package installation.",
+  "limits": [
+    "No production-scale latency target supplied; no benchmark promised.",
+    "Chromium only; other browser engines unverified."
+  ],
+  "additions": [
+    "User added STREQ-000164 and STREQ-000120: Stocking purchase demand added to PO/TO proposal completes that line of request work; released and received lines retain their outcomes; any unresolved review/reply keeps the request active.",
+    "User added STREQ-000037 and STREQ-000015: legacy converted lines with an existing noncancelled local TO count as completed request handoff. This does not mark the TO as confirmed, dispatched or received. Modern Pickup/Delivery physical-progress behavior remains unchanged.",
+    "Supersedes the previous legacy-handoff assumption: actual NetSuite TOs must be checked; unconfirmed local drafts remain active by default. User authorized a one-time closure of obsolete STTO-000009 and STTO-000021, followed by completing STREQ-000015 and STREQ-000037. Record real TOB00935/TOB01014 as Received and TOB01040 as Closed without falsifying received quantities.",
+    "Release the requested features after workspace and exact production-overlay validation. Capture the current image for rollback, apply only task-scoped runtime changes, preserve configuration and dependent services, verify public assets and all four named request statuses, and remove all disposable test resources. Deployment does not require schema changes or additional data repairs.",
+    "SCM status controls must show disabled during an in-flight save, preventing silently ignored filter clicks while Resolve finishes. Browser regressions retain their existing business assertions and use the new checkbox controls."
+  ]
+}

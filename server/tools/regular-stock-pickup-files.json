@@ -1,0 +1,16 @@
+[
+  "src/regular-stock-domain.js",
+  "src/regular-stock-request-service.js",
+  "src/regular-stock-handoff.js",
+  "src/stock-request-repository.js",
+  "src/server.js",
+  "public/regular-stock-ui.js",
+  "public/scm-stock-requests.js",
+  "public/scm-smart.js",
+  "public/sales-stock-requests.html",
+  "public/scm-stock-requests.html",
+  "public/scm-smart.html",
+  "src/regular-stock-pickup.js",
+  "public/scm-stock-pickup.js",
+  "public/scm-stock-pickup.css"
+]

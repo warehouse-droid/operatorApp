@@ -1,0 +1,53 @@
+{
+  "tier": 3,
+  "specApproval": "not obtained (autonomous run)",
+  "scope": "Synchronize existing direct-to-customer TO links after NetSuite SO or TO line refreshes. Manual link creation and yard replenishment retain their existing rules.",
+  "acceptance": [
+    "A refreshed TO with Parkwall 90 PC, newly added Windermere 91.88 SQFT and PALLET 3 EACH updates a stale 6 PC link across its exact sales-order group; operator residuals become zero for the two material lines and three still-unloaded PALLET units.",
+    "Refreshing either linked SO lines or TO lines updates coverage, decreases removed quantities, and matches replacement items by current item and unit.",
+    "The total linked quantity never exceeds active TO supply or the exact sales target's demand after other allocations and recorded yard loads.",
+    "Repeated refreshes are idempotent, concurrent linked-TO refreshes do not duplicate coverage, and duplicate item rows consume each physical TO quantity only once.",
+    "Cancelled and replenishment links are untouched; unrelated and unmatched items are never silently assigned.",
+    "Historical loads, delivered quantities, receipts, photos, posting commands and external NetSuite transactions remain unchanged; actual allocation changes have before/after audit records.",
+    "A failed reconciliation rolls back its allocation and audit changes together. Missing or retired targets produce an explicit result rather than an invented target."
+  ],
+  "failureModel": {
+    "overAllocation": "Exact fixtures plus randomized conservation properties and integration checks for competing TO/PO supply.",
+    "wrongSourceLine": "Group, duplicate item, changed item and unit mismatch scenarios.",
+    "historyCorruption": "Recorded-progress regression assertions and no external-write ports in the synchronizer.",
+    "raceOrPartialWrite": "Concurrent reconciliation and rollback integration scenarios; shared target advisory lock.",
+    "silentRefreshFailure": "Audit assertions and actual order-sync entry-point integration tests."
+  },
+  "setup": {
+    "dependencies": [],
+    "git": "Preserve all pre-existing workspace edits; no commits or staging.",
+    "tests": "Use docker-compose.mbt-test.yml with isolated named projects, mbbs-tests.slice budgets, init, bounded tmpfs and disposable-test labels. Register down --volumes --remove-orphans teardown before creation and verify both container lists.",
+    "artifacts": "Keep logs, source hashes, specification and evidence JSON in server/test-artifacts/linked-direct-ship-sync."
+  },
+  "production": "Prepare and validate code and a concrete reconciliation preview before any deployment or durable repair.",
+  "amendments": [
+    "User confirmed full matching TO coverage rather than preserving shortage-only allocations.",
+    "User requires item lookup because NetSuite line numbers can change. Match current item and unit inside the exact linked target; rekey the existing allocation to its current SO and TO rows without losing recorded history.",
+    "The existing database constraint requires positive allocations. Add migration 286 to permit a finite zero requirement so removed source lines retain their recorded history instead of deleting allocation rows. Negative and nonfinite requirements remain rejected.",
+    "The production audit shows NetSuite edits occurred while the link was replenishment, followed by switching it to direct shipping and grouping the SOs. Reconcile on direct-mode conversion and actual group target moves too, so matching PALLET demand in the new group is included.",
+    "Grouping's established contract preserves material allocations. Revision: full item reconciliation occurs on NetSuite refresh and direct-mode conversion; group target moves reconcile PALLET packaging only. The group's exact existing material allocation, source row and execution history remain unchanged.",
+    "Target moves during refresh raise DIRECT_SHIP_TARGET_CHANGED and must be retried against the current target. Mode/unlink mutation locks use the same target-before-row order as NetSuite refresh to avoid a proven deadlock.",
+    {
+      "userRequirement": "Both lines of SOA10172 become no yard load required, so it should disappear from the operator screen.",
+      "acceptance": [
+        "Active and planned delivery lists hide a direct-TO order/group when every remaining unloaded pickable quantity is covered by active direct-TO allocations and no yard work, packing or blocked quantities remain.",
+        "Grouped SO children must not reappear individually after the completed group is hidden.",
+        "Partial or cancelled direct supply, packed stock, blocked allocations and authorized reloads remain discoverable.",
+        "Existing PO-only reference discovery is preserved. No order status, loading history, receipts or NetSuite fulfillment is changed by list filtering."
+      ]
+    },
+    {
+      "userClarification": "If only direct ship lines are left, filter the whole order. If at least one line needs yard loading, keep the order and show its direct ship lines.",
+      "supersedes": "The prior autonomous exception preserving PO-only reference cards; fully linked PO or TO reference lines remain available through order detail but do not create active yard work.",
+      "acceptance": [
+        "Use actual no_yard_load_required projections, rather than a specific linked order type, to decide whether only direct supply remains.",
+        "Keep direct reference lines in detail whenever any yard loading remains. Preserve packing, blocked-quantity and authorized-reload work."
+      ]
+    }
+  ]
+}

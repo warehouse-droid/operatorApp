@@ -1,0 +1,18 @@
+[
+  "public/regular-stock-status.js",
+  "public/regular-stock-status-ui.js",
+  "public/sales-stock-list-filters.js",
+  "public/sales-stock-requests.js",
+  "public/scm-stock-requests.js",
+  "public/regular-stock-alert.js",
+  "public/regular-stock-ui.js",
+  "public/sales-stock-requests.html",
+  "public/scm-stock-requests.html",
+  "public/app-sidebar.js",
+  "src/regular-stock-request-service.js",
+  "src/regular-stock-domain.js",
+  "src/stock-request-repository.js",
+  "src/server.js",
+  "public/stock-requests.css",
+  "src/regular-stock-expiry.js"
+]

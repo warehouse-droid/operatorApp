@@ -1,0 +1,16 @@
+{
+  "files": {
+    "src/regular-stock-domain.js": "2ceeb3282a780d8024cf5ea233ce0a84f6093d8edf7319a9680e180dac87f251",
+    "src/regular-stock-request-service.js": "8c959614f03d2ef2b6b0fa86f18ec6485b257c4333932ca1b25af9b0a3552963",
+    "src/regular-stock-handoff.js": "70aa5de92b42a0b81cd8eef1e4afeacdd16b9c677840c739d02b0913d406617b",
+    "src/stock-request-repository.js": "2410613fe3af2a1a6521606c4db885c7c8529a41303afbf06ecda11f15511e80",
+    "src/server.js": "8f71e8c06108089050778a649c7039b38dfb92878332864c161fc3cf3e3770d6",
+    "public/regular-stock-ui.js": "f3f58e6bd20666995132bbf14579f6590d6036bb68633c1eb4a24746c742c3b9",
+    "public/scm-stock-requests.js": "a5d2084a40be41ecd411556f9d443d1fe267f4975586fc70878d4fff2829421e",
+    "public/scm-smart.js": "975d612b1e3f3ea084a67862523a7f572055c36c5cfb6c74d314d7d1f734bfa9",
+    "public/sales-stock-requests.html": "cf56e386e933d20c31171fbff248136989258b338eb382cf229a348bdd591087",
+    "public/scm-stock-requests.html": "557becd077e4c1134e6f6ca9ab240f09c50ba804166f6a797cf8fdf47f159bd3",
+    "public/scm-smart.html": "49708e265cb28627e15db36dbf178b120d096ff807416a01b59b93490fdd600e"
+  },
+  "packageSha256": "192d82c4ff0808e9d93cc924916041caf02d0c0e50398446f5206f804a05e3df"
+}

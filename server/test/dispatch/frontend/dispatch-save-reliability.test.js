@@ -8,10 +8,10 @@ const source = readFileSync(new URL('../../../public/dispatch.js', import.meta.u
 const declarations = parse(source, { ecmaVersion: 'latest', sourceType: 'script', range: true }).body;
 function subject(names, overrides = {}) {
   const context = vm.createContext({
-    console, setTimeout, clearTimeout, Promise, Date, Map, Set,
+    console, setTimeout, clearTimeout, Promise, Date, Map, Set, structuredClone,
     currentPlan: { id: '1', planDate: '2027-05-01', revision: 4, digest: 'acknowledged' }, currentPlanDate: '2027-05-01',
     dispatchConfig: { plannerCommandMode: 'off' }, dispatchSessionId: 'session', planEditLeaseToken: 'test-lease',
-    localPlanDirty: true, localPlanGeneration: 2, lastAcknowledgedPlanState: {},
+    localPlanDirty: true, localPlanGeneration: 2, lastAcknowledgedPlanState: {}, dispatchOrderRefreshEpoch: 0, dispatchPlanLoadSequence: 0,
     saveQueued: false, saveInFlight: false, routeNotice: '', confirmInFlight: false, blockedRemotePlanUpdate: false,
     pendingPlanSaveAttempt: null, blockedPlanSaveFence: null,
     dispatchPlanActionPromise: null, pendingDispatchPlanAction: null,
@@ -23,9 +23,10 @@ function subject(names, overrides = {}) {
     clearStoredDispatchEditLease: () => {}, leaveDispatchEditMode: () => {}, isDispatchHistoryEditMode: () => false,
     dispatchLeaseRequestPayload: () => ({}), dispatchPlannerSnapshotState: 'ready',
     shouldUseDispatchIncrementalSave: () => false, stablePlanHashPayload: () => 'hash', planSummary: () => ({}),
+    displayDate: value => String(value),
     ...overrides
   });
-  for (const name of [...['dispatchFrozenSaveFetch'].filter(name => declarations.some(n => n.id?.name === name)), ...names]) {
+  for (const name of [...['dispatchFrozenSaveFetch', 'preserveMbtReadOnlyLoads', 'isMbtPlanningLoad', 'confirmedPlanNotice', 'googleRouteRefreshStatusText'].filter(name => declarations.some(n => n.id?.name === name)), ...names]) {
     const node = declarations.find(n => n.type === 'FunctionDeclaration' && n.id.name === name);
     assert.ok(node, `missing implementation: ${name}`);
     // Preserve character offsets as well as line numbers for precise V8 ranges.

@@ -1,0 +1,14 @@
+{
+  "files": {
+    "src/regular-stock-domain.js": "d1b0cc8cabc06599d7bc9ab8754cc6e44242d1626fb849d9dd0624d4b724bfd7",
+    "src/regular-stock-request-service.js": "1b2f95b0c6b1f0c82afe17feb1395f1b1ac1d448ff2c23900f9926fc393bc3aa",
+    "public/regular-stock-ui.js": "2adba79b92d6a6f2501622bb09b1fbb9e7b103b5dcc776fc306abef8a01b93a5",
+    "public/sales-stock-requests.js": "ef2fc9208c09d956e9de71e881ff59fab326fcf1b22e124e375e43bb06146cc6",
+    "public/sales-stock-requests.html": "fe462b21031ebb7348ec3fa433a160d584d9d50265940f2bc053121568e8b3e3",
+    "public/scm-stock-requests.html": "288b5b0a1d9342d86f619ba58f7c001750f89eef484b11997e1118daa299fd6c",
+    "public/scm-smart.html": "07d3ee85bbac697f2c8288e885a819dcdf711e2e9b3af0ee074674c2d203c64a",
+    "src/special-stock-documents.js": "04eef4d0f89e4f85f33a151fec86ba1af0c8359024041d834eea5f510e7570ca",
+    "src/field-sales/company-pdf.js": "41c25377b64cf9ece18a0faf80a425059046d21348f1731f3c8964ddf20a31ae"
+  },
+  "packageSha256": "192d82c4ff0808e9d93cc924916041caf02d0c0e50398446f5206f804a05e3df"
+}

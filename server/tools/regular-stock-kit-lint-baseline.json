@@ -1,0 +1,6 @@
+{
+  "src/regular-stock-netsuite-adapter.js": [],
+  "src/regular-stock-delivery-domain.js": [],
+  "src/regular-stock-domain.js": [],
+  "src/regular-stock-handoff.js": []
+}

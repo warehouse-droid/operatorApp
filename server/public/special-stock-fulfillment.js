@@ -40,16 +40,18 @@ export function specialFulfillmentEditor(detail, {before='',after=''} = {}) {
   const savedNotes = `<div class="special-request-notes">${note}${specialSalesInternalRemarkForm(detail)}</div>`;
   if(!canEditSpecialFulfillment(detail)) return summary(`<span><small>Delivery method</small><strong>${escape(specialFulfillmentLabel(detail.fulfillmentMethod))}</strong></span>`) + savedNotes;
   const header = canEditSpecialHeader(detail);
-  const pending=['applying','attention'].includes(detail.fulfillmentChange?.status),draft=pending?detail.fulfillmentChange.target:detail;
+  const pending=['applying','attention','failed'].includes(detail.fulfillmentChange?.status),draft=pending?detail.fulfillmentChange.target:detail;
   const deliveryFeeRate = savedSpecialDeliveryFee(detail);
   return `<form class="stock-request-form special-summary-form" data-special-fulfillment-form ${header ? 'data-special-header-form' : ''}>
     ${header ? `<input type="hidden" name="expectedRevision" value="${escape(detail.revision)}"><p class="stock-request-error" data-special-header-conflict hidden>This request changed. Your header entries are kept. Reload the header before saving.</p>` : ''}
-    ${summary(`<span class="special-summary-delivery"><small>Delivery method</small><select name="fulfillmentMethod" aria-label="Delivery method" required ${pending?'disabled':''}>${Object.entries(methods).map(([value,label])=>`<option value="${value}" ${draft.fulfillmentMethod===value?'selected':''}>${label}</option>`).join('')}</select>
-      <button type="submit" class="primary" ${pending?'title="Retry the saved delivery update"':''}>${header ? 'Save header' : 'Save'}</button></span>`)}
+    ${summary(`<span class="special-summary-delivery"><small>Delivery method</small><select name="fulfillmentMethod" aria-label="Delivery method" required>${Object.entries(methods).map(([value,label])=>`<option value="${value}" ${draft.fulfillmentMethod===value?'selected':''}>${label}</option>`).join('')}</select>
+      <button type="submit" class="primary">${header ? 'Save header' : 'Save'}</button></span>`)}
     ${header ? '' : '<p class="stock-request-muted">Delivery method can change after SO and PO linking and PO reference updates. SCM and Dispatch are alerted when the method changes. Yard pickup uses the inquired MBBS yard.</p>'}
     ${header ? `<div class="special-request-notes"><label><span>Note</span><textarea name="remarks" rows="4" maxlength="8000">\n${escape(detail.remarks)}</textarea></label>${specialSalesInternalRemarkField(detail)}</div><button type="button" data-special-sales-action="reload-header" hidden>Reload header</button>` : ''}
-    ${pending?`<p class="stock-request-error">Delivery update incomplete. Retry the saved change. ${escape(detail.fulfillmentChange.error)}</p>`:''}
-    <fieldset class="stock-request-line-fields special-fulfillment-fields" data-special-delivery-fields ${pending?'disabled':''} ${draft.fulfillmentMethod==='mbt_delivery'?'':'hidden'}>
+    ${pending?`<p class="stock-request-error">Delivery update incomplete. Edit the header and save again, or retry the saved change. ${escape(detail.fulfillmentChange.error)}</p>
+      <div class="stock-request-actions"><button type="button" data-special-sales-action="retry-delivery">Retry saved change</button>
+      ${!detail.fulfillmentChange.hasPlan?'<button type="button" data-special-sales-action="discard-delivery">Discard unapplied change</button>':''}</div>`:''}
+    <fieldset class="stock-request-line-fields special-fulfillment-fields" data-special-delivery-fields ${draft.fulfillmentMethod==='mbt_delivery'?'':'hidden'}>
       <label class="stock-request-wide"><span>Delivery address *</span><input name="deliveryAddress" required value="${escape(draft.deliveryAddress)}"></label>
       <label><span>Contact name</span><input name="deliveryContactName" value="${escape(draft.deliveryContactName)}"></label>
       <label><span>Contact phone</span><input name="deliveryContactPhone" value="${escape(draft.deliveryContactPhone)}"></label>

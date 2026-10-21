@@ -1,0 +1,17 @@
+[
+  "src/special-stock-request-netsuite.js",
+  "src/special-stock-request-service.js",
+  "src/netsuite.js",
+  "src/order-sync-repository.js",
+  "src/netsuite-mirror-repository.js",
+  "src/scm-purchase-order-catalog-repository.js",
+  "src/dispatch-repository.js",
+  "src/scm-netsuite-po-history-service.js",
+  "migrations/247_purchase_order_note.sql",
+  "src/server.js",
+  "public/scm-special-stock-requests.js",
+  "public/special-stock-po-routing.js",
+  "public/scm-stock-requests.html",
+  "src/special-stock-purchase-order-note-adapter.js",
+  "src/special-stock-purchase-order-routing.js"
+]

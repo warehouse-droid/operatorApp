@@ -1,0 +1,23 @@
+{
+  "specApproval": "not obtained (autonomous run)",
+  "tier": 3,
+  "setup": "Use existing Node, TypeScript, ESLint, fast-check, c8 and Playwright tooling. No dependencies, migrations or commits. Preserve unrelated workspace changes. Run through the existing bounded disposable Compose wrapper with teardown registered before startup.",
+  "behaviors": [
+    "Dispatch sees a free-text override next to pre-approval. Change normalizes 530pm, 5:30 PM, 17:30 and until 05:30 pm to until 05:30 pm. Blank keeps the configured default for a new approval; malformed input cannot submit.",
+    "Override uses the next occurrence of the entered Toronto wall-clock time, today or tomorrow. Server determines the date. Handle winter/summer offsets and repeated fall-back times; reject nonexistent spring-forward times.",
+    "Confirm/propose may override only that request. Accept retains the deadline. Active proposed/preapproved requests allow Dispatch to save a new deadline without changing their window, quote or status. Reminder is relative to the new deadline and never before the save time.",
+    "Dispatch sees a red Expire request button for submitted/proposed/preapproved requests. A warning names the request and explains Sales must re-raise. Cancel/Escape makes no request; confirm expires it immediately.",
+    "Sales, public users and wrong-yard actors cannot change expiry. Secured, expired and cancelled requests reject manual expiry and deadline changes. Requests past their automatic deadline cannot be revived.",
+    "Revision checks, transaction locks and idempotency prevent conflicting deadline, secure and expiry actions. Exactly one competing action commits. Manual expiry records the Dispatch actor and alerts Sales; later scheduler ticks cannot repeat expiry.",
+    "Default three-hour expiry, global settings, other requests, existing request workflows, SO/TO links and delivery instruction behavior survive unchanged. New tests include generated parsing round-trips, hostile input, HTTP/database races and browser confirmation behavior."
+  ],
+  "amendments": ["Repository discovery: Dispatch has access across all delivery yards. Preserve that existing policy; wrong-yard restrictions apply to Sales. No new Dispatch yard restriction is introduced."],
+  "failureModel": {
+    "wrong_deadline_or_timezone": "Fixed-clock winter, summer, midnight and DST tests; generated parsing round-trips.",
+    "unintended_global_or_other_request_change": "Database assertions compare settings and a second request.",
+    "unauthorized_or_stale_mutation": "Role, yard, revision and hostile-input tests over the real router/service.",
+    "secure_expire_update_races": "Concurrent database actions must have one winner and consistent links/events.",
+    "accidental_expiry": "Browser warning cancel, Escape and confirmation tests, red button computed style.",
+    "resource_or_cleanup_failure": "Existing shared test slice and Compose limits; teardown verifies containers, volumes, networks and production health."
+  }
+}

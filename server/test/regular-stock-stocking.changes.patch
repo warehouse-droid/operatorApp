@@ -1,0 +1,470 @@
+--- a/server/src/regular-stock-domain.js
++++ b/server/src/regular-stock-domain.js
+@@ -20,12 +20,18 @@
+ /** @param {number} a @param {number} b */
+ const sameQty = (a, b) => Math.abs(Number(a) - Number(b)) <= 1e-6;
+ 
++/** @param {{regular?:{deliveryMethod?:string,pickupTransfer?:unknown,handoffStatus?:string}}} request */
++export function isRegularStockingRequest(request) {
++  return request.regular?.deliveryMethod === 'stocking' || Boolean(request.regular?.pickupTransfer) && !request.regular?.handoffStatus;
++}
++
+ /** @param {{lines?:RegularLine[],policies?:StockPolicy[],arrivalAt:string|number|Date,deliveryMethod?:string,leadHours?:number,autoApprovalEnabled?:boolean,now?:string|number|Date}} input */
+ export function evaluateRegularStockApproval({ lines = [], policies = [], arrivalAt, deliveryMethod = 'delivery', leadHours = 5, autoApprovalEnabled = true, now = new Date() }) {
+   const hours = normalizeRegularLeadHours(leadHours);
+   const nowMs = new Date(now).getTime(), arrivalMs = new Date(arrivalAt).getTime();
+   if (!Number.isFinite(nowMs) || !Number.isFinite(arrivalMs)) throw regularError('A valid arrival instant is required.', 'REGULAR_ARRIVAL_INVALID', 400);
+-  const enoughTime = arrivalMs >= nowMs + hours * 3600000;
++  const leadTimeApplies = deliveryMethod === 'delivery';
++  const enoughTime = !leadTimeApplies || arrivalMs >= nowMs + hours * 3600000;
+   const totals = new Map();
+   for (const line of lines) {
+     if (!valid(line.salesQty) || Number(line.salesQty) <= 0) throw regularError('Positive quantities are required.');
+@@ -43,22 +49,22 @@
+     return { lineId: Number(line.id), itemId: Number(line.itemId), sourceLocationId: Number(line.sourceLocationId),
+       requestedQuantity: Number(line.salesQty), groupedRequestedQuantity: requested, availableQuantity: available,
+       safetyQuantity: safety, remainingQuantity: remaining, shortfallQuantity: known ? Math.max(0, Number(safety) - Number(remaining)) : null,
+-      unit: line.salesUom, stockEligible: safe, reasons: [...(deliveryMethod === 'pickup' ? ['pickup_scm_review'] : []), ...(!autoApprovalEnabled ? ['auto_approval_disabled'] : []), ...(!known ? ['policy_unavailable'] : !safe ? ['below_safety'] : []), ...(!enoughTime ? ['short_lead_time'] : [])] };
++      unit: line.salesUom, stockEligible: safe, reasons: [...(deliveryMethod === 'stocking' ? ['stocking_scm_review'] : []), ...(!autoApprovalEnabled ? ['auto_approval_disabled'] : []), ...(!known ? ['policy_unavailable'] : !safe ? ['below_safety'] : []), ...(!enoughTime ? ['short_lead_time'] : [])] };
+   });
+-  return { automatic: deliveryMethod !== 'pickup' && autoApprovalEnabled && evidence.length > 0 && enoughTime && evidence.every(line => line.stockEligible), deliveryMethod, autoApprovalEnabled, leadHours: hours,
++  return { automatic: deliveryMethod !== 'stocking' && autoApprovalEnabled && evidence.length > 0 && enoughTime && evidence.every(line => line.stockEligible), deliveryMethod, autoApprovalEnabled, leadHours: hours, leadTimeApplies,
+     evaluatedAt: new Date(nowMs).toISOString(), arrivalAt: new Date(arrivalMs).toISOString(), enoughTime, lines: evidence };
+ }
+ 
+-/** @param {{regular?:{deliveryMethod?:string,approvalExpiresAt?:string|null,handoffStatus?:string}}} request @param {Date|string|number} [now] */
++/** @param {{regular?:{deliveryMethod?:string,pickupTransfer?:unknown,approvalExpiresAt?:string|null,handoffStatus?:string}}} request @param {Date|string|number} [now] */
+ export function regularApprovalExpired(request,now=new Date()) {
+-  return request.regular?.deliveryMethod !== 'pickup' && !request.regular?.handoffStatus && !!request.regular?.approvalExpiresAt
++  return !isRegularStockingRequest(request) && !request.regular?.handoffStatus && !!request.regular?.approvalExpiresAt
+     && new Date(now).getTime()>=new Date(request.regular.approvalExpiresAt).getTime();
+ }
+ 
+-/** @param {{regular?:{deliveryMethod?:string,approvalExpiresAt?:string|null,approvalValidityMinutes?:number,handoffStatus?:string}}} request @param {Date|string|number} [now] */
++/** @param {{regular?:{deliveryMethod?:string,pickupTransfer?:unknown,approvalExpiresAt?:string|null,approvalValidityMinutes?:number,handoffStatus?:string}}} request @param {Date|string|number} [now] */
+ export function requireRegularStockApproval(request,now=new Date()) {
+   if(request.regular?.handoffStatus)return;
+-  if(request.regular?.deliveryMethod==='pickup')throw regularError('Pickup requests require SCM to convert directly to TOs. A Sales Order is not required.','REGULAR_PICKUP_SCM_REQUIRED');
++  if(isRegularStockingRequest(request))throw regularError('Stocking requests require SCM to convert directly to TOs. A Sales Order is not required.','REGULAR_PICKUP_SCM_REQUIRED');
+   if(regularApprovalExpired(request,now))throw regularError(`Approval expired after ${request.regular?.approvalValidityMinutes || 15} minutes. Re-raise this request to obtain a new approval.`,'REGULAR_APPROVAL_EXPIRED');
+   if(!request.regular?.approvalExpiresAt || !Number.isFinite(new Date(request.regular.approvalExpiresAt).getTime()))throw regularError('Finish all SCM decisions before entering the SO.','REGULAR_APPROVAL_REQUIRED');
+ }
+--- a/server/src/regular-stock-request-service.js
++++ b/server/src/regular-stock-request-service.js
+@@ -2,7 +2,7 @@
+ import { createSalesStockRequest, updateSalesStockRequest, getScmStockRequest, getSalesStockRequest, recordStockRequestEvent, decideSalesStockRequestLines } from './stock-request-repository.js';
+ import { refreshStockRequestItemsAvailability } from './stock-request-service.js';
+ import { normalizeRegularArrival, normalizeRegularLeadHours, normalizeRegularApprovalMinutes } from '../public/regular-stock-input.js';
+-import { evaluateRegularStockApproval, regularError, regularApprovalExpired } from './regular-stock-domain.js';
++import { evaluateRegularStockApproval, regularError, regularApprovalExpired, isRegularStockingRequest } from './regular-stock-domain.js';
+ import { assertStockRequestDestinationAccess } from './stock-request-domain.js';
+ import { findSpecialCustomer } from './special-stock-customer-directory.js';
+ 
+@@ -32,7 +32,7 @@
+ 
+ async function inputDetails(input) {
+   const deliveryMethod = String(input.deliveryMethod || '').toLowerCase();
+-  if (!['pickup', 'delivery'].includes(deliveryMethod)) throw regularError('Select Pickup or Delivery.', 'REGULAR_DELIVERY_REQUIRED', 400);
++  if (!['pickup', 'delivery', 'stocking'].includes(deliveryMethod)) throw regularError('Select Pickup, Delivery or Stocking.', 'REGULAR_DELIVERY_REQUIRED', 400);
+   const arrival = normalizeRegularArrival(input.arrivalDate, input.arrivalTime);
+   let customerId = null;
+   let customerName = String(input.customerName || '').trim();
+@@ -136,7 +136,7 @@
+   const before = await getScmStockRequest(id);
+   if (before.workflowVersion !== 2) return decideSalesStockRequestLines(id, input, context);
+   const decision = String(input.decision || '');
+-  if(before.regular.deliveryMethod==='pickup' && decision!=='reject')throw regularError('Use Convert to TO to approve and transfer a pickup request.','REGULAR_PICKUP_SCM_REQUIRED');
++  if(isRegularStockingRequest(before) && decision!=='reject')throw regularError('Use Convert to TO to approve and transfer a Stocking request.','REGULAR_PICKUP_SCM_REQUIRED');
+   if (!['stock', 'po', 'reject'].includes(decision)) throw regularError('Choose TO/location change, PO replenishment, or Reject.', 'REGULAR_DECISION_INVALID', 400);
+   const reason = String(input.reason || '').trim();
+   if (reason.length > 1000 || decision === 'reject' && !reason) throw regularError('Rejection requires a reason, at most 1000 characters.', 'REGULAR_REASON_REQUIRED', 400);
+@@ -148,8 +148,8 @@
+     const request = await getScmStockRequest(id);
+     if (input.expectedRevision === undefined) throw regularError('Request revision is required.');
+     const selected = request.lines.filter(line => lineIds.includes(line.id));
+-    const pendingPickup=request.regular.deliveryMethod==='pickup' && !request.regular.pickupTransfer && !request.regular.handoffStatus;
+-    if (selected.length !== lineIds.length || selected.some(line => line.status !== 'submitted' && !(pendingPickup && decision==='reject' && line.status==='approved'))) throw regularError('Only undecided lines can be reviewed.');
++    const pendingStocking=isRegularStockingRequest(request) && !request.regular.pickupTransfer && !request.regular.handoffStatus;
++    if (selected.length !== lineIds.length || selected.some(line => line.status !== 'submitted' && !(pendingStocking && decision==='reject' && line.status==='approved'))) throw regularError('Only undecided lines can be reviewed.');
+     const snapshot = evaluateRegularStockApproval({ lines: request.lines, policies: evidence.policies, arrivalAt: request.regular.arrivalAt,
+       deliveryMethod: request.regular.deliveryMethod, leadHours: request.regular.approval.leadHours, now: (dependencies.now || (() => new Date()))() });
+     for (const line of selected) await query(`UPDATE sales_stock_request_lines SET regular_decision=$2,status=$3,
+@@ -173,7 +173,7 @@
+   if (scm) {
+     const { rows } = await query(`SELECT count(*)::int AS count FROM sales_stock_requests r WHERE r.workflow_version=2 AND r.request_type='regular'
+       AND EXISTS(SELECT 1 FROM sales_stock_request_lines l WHERE l.request_id=r.id AND (l.status='submitted'
+-        OR (l.status='approved' AND r.regular_details->>'deliveryMethod'='pickup'
++        OR (l.status='approved' AND r.regular_details->>'deliveryMethod'='stocking'
+           AND NOT r.regular_details ? 'pickupTransfer' AND NOT r.regular_details ? 'handoffStatus')))`);
+     return { manualReview: rows[0].count, total: rows[0].count };
+   }
+--- a/server/src/regular-stock-handoff.js
++++ b/server/src/regular-stock-handoff.js
+@@ -188,7 +188,7 @@
+ 
+ export async function previewRegularStockSalesOrder(id,input,context,{readOrder=readRegularStockSalesOrderFromNetSuite,now=()=>new Date()}={}){
+   const request=await getSalesStockRequest(id,context);
+-  if(request.workflowVersion===2 && request.regular.deliveryMethod==='pickup' && !request.regular.handoffStatus)requireRegularStockApproval(request,now());
++  if(request.workflowVersion===2 && (request.regular.deliveryMethod==='stocking' || request.regular.pickupTransfer) && !request.regular.handoffStatus)requireRegularStockApproval(request,now());
+   if(request.workflowVersion!==2||request.lines.some(line=>line.status==='submitted'))throw regularError('Finish all SCM decisions before entering the SO.');
+   const existing=(await query('SELECT * FROM regular_stock_handoffs WHERE request_id=$1',[id])).rows[0];
+   if(existing){
+--- a/server/src/stock-request-repository.js
++++ b/server/src/stock-request-repository.js
+@@ -1209,12 +1209,12 @@
+       SELECT 1 FROM sales_stock_request_lines line
+        WHERE line.request_id = request.id
+          AND (line.status IN ('submitted', 'changes_requested') OR
+-           (line.status='approved' AND request.workflow_version=2 AND request.regular_details->>'deliveryMethod'='pickup'
++           (line.status='approved' AND request.workflow_version=2 AND request.regular_details->>'deliveryMethod'='stocking'
+              AND NOT request.regular_details ? 'pickupTransfer' AND NOT request.regular_details ? 'handoffStatus'))
+     )`);
+   } else if (normalizedQueue === "approved") {
+     clauses.push("EXISTS(SELECT 1 FROM sales_stock_request_lines line WHERE line.request_id=request.id AND line.status='approved')");
+-    clauses.push("NOT (request.workflow_version=2 AND COALESCE(request.regular_details->>'deliveryMethod','')='pickup' AND NOT request.regular_details ? 'handoffStatus')");
++    clauses.push("NOT (request.workflow_version=2 AND COALESCE(request.regular_details->>'deliveryMethod','')='stocking' AND NOT request.regular_details ? 'handoffStatus')");
+   } else if (normalizedQueue === "pending_to") {
+     clauses.push(`EXISTS (
+       SELECT 1 FROM sales_stock_transfers transfer
+@@ -1438,8 +1438,8 @@
+ // Preview and confirmation use the same authoritative item conversions. No edits are saved here.
+ export async function normalizePickupStockRequestDraft(request, input) {
+   const lines = input.lines;
+-  if (!Array.isArray(lines) || !lines.length || lines.length > 100) throw stockRequestError('Include between 1 and 100 pickup items.');
+-  if (lines.some(line => !line || typeof line !== 'object' || Array.isArray(line))) throw stockRequestError('Every pickup item must be a valid request line.');
++  if (!Array.isArray(lines) || !lines.length || lines.length > 100) throw stockRequestError('Include between 1 and 100 Stocking items.');
++  if (lines.some(line => !line || typeof line !== 'object' || Array.isArray(line))) throw stockRequestError('Every Stocking item must be a valid request line.');
+   const editable = request.lines.filter(line => ['submitted', 'approved'].includes(line.status));
+   const existingIds = lines.filter(line => line.id !== undefined && line.id !== null).map(line => requiredId(line.id, 'stock-request line'));
+   if (new Set(existingIds).size !== existingIds.length || existingIds.length !== editable.length
+--- a/server/public/regular-stock-ui.js
++++ b/server/public/regular-stock-ui.js
+@@ -14,18 +14,19 @@
+     if(composer.workflowVersion !== 2)return '';
+     return `<div class="stock-request-line-fields regular-stock-fields">
+       <label><span>${t('Customer (optional)','客户（选填）')}</span><input data-regular-field="customerName" maxlength="200" value="${esc(composer.customerName)}" /></label>
+-      <label><span>${t('Delivery method','取货方式')} *</span><select data-regular-field="deliveryMethod" required><option value="">${t('Select…','请选择…')}</option><option value="pickup" ${composer.deliveryMethod==='pickup'?'selected':''}>${t('Pickup','自取')}</option><option value="delivery" ${composer.deliveryMethod==='delivery'?'selected':''}>${t('Delivery','送货')}</option></select></label>
++      <label><span>${t('Delivery method','取货方式')} *</span><select data-regular-field="deliveryMethod" required><option value="">${t('Select…','请选择…')}</option><option value="pickup" ${composer.deliveryMethod==='pickup'?'selected':''}>${t('Pickup','自取')}</option><option value="delivery" ${composer.deliveryMethod==='delivery'?'selected':''}>${t('Delivery','送货')}</option><option value="stocking" ${composer.deliveryMethod==='stocking'?'selected':''}>${t('Stocking','备货')}</option></select></label>
+       <label><span>${t('Expected arrival date','预计到达日期')} *</span><input data-regular-field="arrivalDate" autocomplete="off" required placeholder="YYYY-MM-DD" value="${esc(composer.arrivalDate)}" /></label>
+       <label><span>${t('Expected arrival time (Toronto)','预计到达时间（多伦多）')} *</span><input data-regular-field="arrivalTime" autocomplete="off" required placeholder="15:00 / 3pm" value="${esc(composer.arrivalTime)}" /></label>
++      <p class="stock-request-wide regular-stock-method-help">${t('Pickup: pre-approval, then Sales enters the SO; no minimum lead time. Delivery: pre-approval with the configured lead time, then SO. Stocking: SCM review and direct TO creation; no SO required.','自取：预先批准后由销售输入 SO，无需最短提前时间。送货：按配置的提前时间预先批准，再输入 SO。备货：须 SCM 审核并直接建立 TO，无需 SO。')}</p>
+     </div>`;
+   }
+-  const pickup=request=>request?.regular?.deliveryMethod==='pickup'&&!request.regular.handoffStatus;
+-  const approvalExpired=request=>!pickup(request) && !request?.regular?.handoffStatus && !!request?.regular?.approvalExpiresAt && Date.now()>=new Date(request.regular.approvalExpiresAt).getTime();
++  const stocking=request=>(request?.regular?.deliveryMethod==='stocking'||!!request?.regular?.pickupTransfer)&&!request.regular.handoffStatus;
++  const approvalExpired=request=>!stocking(request) && !request?.regular?.handoffStatus && !!request?.regular?.approvalExpiresAt && Date.now()>=new Date(request.regular.approvalExpiresAt).getTime();
+   function reviewReasons(request) {
+     const approval=request.regular?.approval || {},reasons=[];
+-    if(pickup(request))reasons.push(t('Pickup requires SCM review and direct TO creation.','自取申请须 SCM 审核并直接建立调货单。'));
++    if(stocking(request))reasons.push(t('Stocking always requires SCM review and direct TO creation.','备货申请始终须 SCM 审核并直接建立调货单。'));
+     if(approval.autoApprovalEnabled===false)reasons.push(t('Auto-approval is turned off. SCM must review this request.','自动批准已关闭，须由 SCM 审核此申请。'));
+-    if(approval.enoughTime===false)reasons.push(t(`Required at least ${number(approval.leadHours)} hours of lead time.`,`须至少提前 ${number(approval.leadHours)} 小时申请。`));
++    if(approval.leadTimeApplies!==false && !stocking(request) && approval.enoughTime===false)reasons.push(t(`Required at least ${number(approval.leadHours)} hours of lead time.`,`须至少提前 ${number(approval.leadHours)} 小时申请。`));
+     for(const evidence of approval.lines || []){
+       const line=request.lines?.find(line=>line.id===evidence.lineId) || {};
+       const name=line.itemName || line.itemId || evidence.itemId, yard=line.sourceName || line.sourceLocationId || '';
+@@ -40,13 +41,13 @@
+     const r=request.regular||{}, a=r.approval||{}, reasons=reviewReasons(request);
+     return `<div class="stock-request-summary regular-stock-summary">
+       <span><small>${t('Customer','客户')}</small><strong>${esc(r.customerName||'—')}</strong></span>
+-      <span><small>${t('Method','取货方式')}</small><strong>${r.deliveryMethod==='pickup'?t('Pickup','自取'):t('Delivery','送货')}</strong></span>
++      <span><small>${t('Method','取货方式')}</small><strong>${stocking(request)?t('Stocking','备货'):r.deliveryMethod==='pickup'?t('Pickup','自取'):t('Delivery','送货')}</strong></span>
+       <span><small>${t('Expected arrival · Toronto','预计到达 · 多伦多')}</small><strong>${esc(r.arrivalDate)} ${esc(r.arrivalTime)}</strong></span>
+-      <span><small>${t('Review route','审核方式')}</small><strong>${a.automatic&&!pickup(request)?t('Automatically approved','自动批准'):t('SCM review','SCM 人工审核')}</strong></span>
+-      <span><small>${t('Minimum lead time at submission','提交时最短提前时间')}</small><strong>${number(a.leadHours)} ${t('hours','小时')}</strong></span>
+-      ${r.approvalExpiresAt&&!r.handoffStatus&&!pickup(request)?`<span><small>${t('Approval valid until','批准有效期至')}</small><strong>${esc(window.MBBS_I18N?.displayDateTime?.(r.approvalExpiresAt)||r.approvalExpiresAt)}</strong></span>`:''}
++      <span><small>${t('Review route','审核方式')}</small><strong>${a.automatic&&!stocking(request)?t('Automatically approved','自动批准'):t('SCM review','SCM 人工审核')}</strong></span>
++      <span><small>${t('Minimum lead time at submission','提交时最短提前时间')}</small><strong>${stocking(request)?t('SCM review required','须 SCM 审核'):a.leadTimeApplies===false?t('No minimum lead time','无需最短提前时间'):`${number(a.leadHours)} ${t('hours','小时')}`}</strong></span>
++      ${r.approvalExpiresAt&&!r.handoffStatus&&!stocking(request)?`<span><small>${t('Approval valid until','批准有效期至')}</small><strong>${esc(window.MBBS_I18N?.displayDateTime?.(r.approvalExpiresAt)||r.approvalExpiresAt)}</strong></span>`:''}
+       ${r.salesOrderRef?`<span><small>SO</small><strong>${esc(r.salesOrderRef)}</strong></span>`:''}
+-    </div>${(!a.automatic||pickup(request))&&reasons.length?`<section class="stock-request-notice regular-stock-review-reasons"><strong>${t('Why SCM review is required','需要 SCM 审核的原因')}</strong><ul>${reasons.map(reason=>`<li>${esc(reason)}</li>`).join('')}</ul></section>`:''}
++    </div>${(!a.automatic||stocking(request))&&reasons.length?`<section class="stock-request-notice regular-stock-review-reasons"><strong>${t('Why SCM review is required','需要 SCM 审核的原因')}</strong><ul>${reasons.map(reason=>`<li>${esc(reason)}</li>`).join('')}</ul></section>`:''}
+     ${approvalExpired(request)?`<p class="stock-request-notice stock-request-error">${t('Approval expired. Sales can re-raise this request for a fresh review.','批准已过期，销售可重新提交申请以重新审核。')}</p>`:''}
+     ${r.handoffError?`<p class="stock-request-notice stock-request-error">${esc(r.handoffError)}</p>`:''}`;
+   }
+@@ -84,16 +85,16 @@
+     if(request?.workflowVersion!==2)return '';
+     const r=request.regular||{};
+     if(r.handoffStatus==='complete')return completedAction(request);
+-    if(pickup(request))return pickupResult(request);
++    if(stocking(request))return stockingResult(request);
+     if(approvalExpired(request))return `<section class="stock-request-section regular-stock-expired"><h3>${t('Approval expired','批准已过期')}</h3><p>${t(`The ${r.approvalValidityMinutes || 15}-minute approval window has ended. Re-raise the approved items to check current stock and approval rules.`,`批准的 ${r.approvalValidityMinutes || 15} 分钟有效期已结束。请重新提交已批准的商品，以检查最新库存和审核规则。`)}</p><button class="primary" data-sales-stock-action="re-raise" type="button" ${saving?'disabled':''}>${t('Re-raise request','重新提交申请')}</button></section>`;
+     if(request.lines.some(line=>line.status==='submitted'))return `<p class="stock-request-notice">${t('Waiting for SCM to finish reviewing all lines before entering the SO number.','待 SCM 审核所有商品行后，请输入销售订单号。')}</p>`;
+     if(!request.lines.some(line=>['stock','po'].includes(line.decision)))return '';
+     return `<section class="stock-request-section regular-stock-so"><h3>${t('Sales Order','销售订单')}</h3><p>${t('Create the SO at your own sales yard, then enter its number. Review and confirm the planned action before it is processed.','请在您的销售货场建立销售订单，再输入订单号，请先查看并确认将执行的操作。')}</p><label><span>${t('SO number','销售订单号')}</span><input data-regular-so maxlength="80" value="${esc(r.salesOrderRef||r.soInput)}" ${r.salesOrderRef?'readonly':''} /></label>${(r.soChoices||[]).map(choice=>`<label><span>${esc(choice.itemName||choice.itemId)} · ${t("Select SO line","选择销售订单行")}</span><select data-regular-so-line="${choice.itemId}">${choice.lines.map(line=>`<option value="${line.id}">${line.id} · ${number(line.quantity)} ${esc(line.uom)}</option>`).join('')}</select></label>`).join('')}<button class="primary" data-sales-stock-action="link-so" type="button" ${saving?'disabled':''}>${saving?t('Processing…','处理中…'):r.salesOrderRef?t('Retry / check progress','重试 / 查看进度'):t('Review SO routing','查看订单安排')}</button></section>`;
+   }
+-  function pickupResult(request) {
++  function stockingResult(request) {
+     const state=request.regular?.pickupTransfer;
+-    if(!state)return request.lines.some(line=>['submitted','approved'].includes(line.status))?`<p class="stock-request-notice">${t('Waiting for SCM to review quantities and create the Transfer Orders. No SO number is required for pickup.','待 SCM 审核数量并建立调货单。自取申请无需输入销售订单号。')}</p>`:'';
+-    return `<section class="stock-request-notice regular-stock-result"><strong>${state.status==='complete'?t('Pickup TOs created by SCM','SCM 已建立自取调货单'):t('SCM pickup conversion in progress','SCM 正在处理自取调货单')}</strong>
++    if(!state)return request.lines.some(line=>['submitted','approved'].includes(line.status))?`<p class="stock-request-notice">${t('Waiting for SCM to review quantities and create the Transfer Orders. No SO number is required for Stocking.','待 SCM 审核数量并建立调货单。备货申请无需输入销售订单号。')}</p>`:'';
++    return `<section class="stock-request-notice regular-stock-result"><strong>${state.status==='complete'?t('Stocking TOs created by SCM','SCM 已建立备货调货单'):t('SCM Stocking conversion in progress','SCM 正在处理备货调货单')}</strong>
+       <p class="regular-pickup-action" style="white-space:pre-line">${esc(actionText(state.plan.action,state.status==='complete'))}</p>
+       ${(state.transfers||(request.transfers||[]).filter(row=>row.netsuiteTransferOrderRef).map(row=>({reference:row.netsuiteTransferOrderRef,sourceName:row.sourceName,destinationName:row.destinationName}))).map(row=>`<p>${esc(row.reference)} · ${esc(row.sourceName)} → ${esc(row.destinationName)}</p>`).join('')}
+       ${state.error?`<p class="stock-request-error">${esc(state.error)} · ${t('SCM can retry the saved conversion.','SCM 可重试已保存的转换。')}</p>`:''}
+@@ -107,5 +108,5 @@
+     for(const key of ['arrivalDate','arrivalTime']) {const input=root.querySelector(`[data-regular-field="${key}"]`);if(input){input.value=composer[key];input.setCustomValidity('');}}
+     return arrival;
+   }
+-  window.RegularStockUI={t,esc,number,decision,fields,summary,safety,salesOrder,normalize,confirmationMessage,apiError,approvalExpired,pickup,pickupResult};
++  window.RegularStockUI={t,esc,number,decision,fields,summary,safety,salesOrder,normalize,confirmationMessage,apiError,approvalExpired,stocking,stockingResult};
+ })();
+--- a/server/public/scm-stock-requests.js
++++ b/server/public/scm-stock-requests.js
+@@ -215,11 +215,11 @@
+ }
+ 
+ function scmStockActionable(line) {
+-  return line.status==='submitted' || line.status==='changes_requested' || (line.status==='approved' && window.RegularStockUI.pickup(scmStockState.detail) && !scmStockState.detail.regular.pickupTransfer);
++  return line.status==='submitted' || line.status==='changes_requested' || (line.status==='approved' && window.RegularStockUI.stocking(scmStockState.detail) && !scmStockState.detail.regular.pickupTransfer);
+ }
+ 
+ function scmStockPickupButton(request) {
+-  if(!window.RegularStockUI.pickup(request) || request.regular.pickupTransfer?.status==='complete')return '';
++  if(!window.RegularStockUI.stocking(request) || request.regular.pickupTransfer?.status==='complete')return '';
+   return `<button class="primary" data-scm-stock-action="pickup-convert" type="button">${request.regular.pickupTransfer?window.RegularStockUI.t('Retry / check TO creation','重试 / 查看调货单'):window.RegularStockUI.t('Convert to TO','转换为调货单')}</button>`;
+ }
+ 
+@@ -241,13 +241,13 @@
+       <span><small>First SCM decision</small><strong>${scmStockDate(request.firstScmDecisionAt)}</strong></span>
+     </div>
+     ${window.RegularStockUI.summary(request)}
+-    ${window.RegularStockUI.pickup(request)?window.RegularStockUI.pickupResult(request):''}
++    ${window.RegularStockUI.stocking(request)?window.RegularStockUI.stockingResult(request):''}
+     ${request.regular?.pickupTransfer?scmStockPickupButton(request):''}
+     ${request.remarks ? `<div class="stock-request-notice"><strong>Sales remark:</strong> ${scmStockEscape(request.remarks)}</div>` : ""}
+     ${scmStockBackorderNotice(selectable)}
+     <div class="stock-request-actions" ${snapshot?'hidden':''}>
+       <button data-scm-stock-action="select-all" type="button" ${selectable.length ? "" : "disabled"}>Select actionable lines</button>
+-      ${request.workflowVersion===2 ? `<button data-scm-stock-action="refresh-evidence" type="button">${window.RegularStockUI.t('Refresh stock evidence','刷新库存数据')}</button>${window.RegularStockUI.pickup(request)?scmStockPickupButton(request):`<button class="primary" data-scm-stock-action="approve-stock" type="button" ${canRequestChanges?'':'disabled'}>${window.RegularStockUI.t('Approve · TO / location change','批准 · 调货 / 更改地点')}</button><button data-scm-stock-action="approve-po" type="button" ${canRequestChanges?'':'disabled'}>${window.RegularStockUI.t('Approve · source replenishment PO','批准 · 原货场采购补货')}</button>`}` : `<button class="primary" data-scm-stock-action="convert" type="button" ${scmStockState.selectedLineIds.size ? "" : "disabled"}>Convert to TO</button>
++      ${request.workflowVersion===2 ? `<button data-scm-stock-action="refresh-evidence" type="button">${window.RegularStockUI.t('Refresh stock evidence','刷新库存数据')}</button>${window.RegularStockUI.stocking(request)?scmStockPickupButton(request):`<button class="primary" data-scm-stock-action="approve-stock" type="button" ${canRequestChanges?'':'disabled'}>${window.RegularStockUI.t('Approve · TO / location change','批准 · 调货 / 更改地点')}</button><button data-scm-stock-action="approve-po" type="button" ${canRequestChanges?'':'disabled'}>${window.RegularStockUI.t('Approve · source replenishment PO','批准 · 原货场采购补货')}</button>`}` : `<button class="primary" data-scm-stock-action="convert" type="button" ${scmStockState.selectedLineIds.size ? "" : "disabled"}>Convert to TO</button>
+       <button data-scm-stock-action="request-changes" type="button" ${canRequestChanges ? "" : "disabled"}>Request Changes</button>`}
+       <button class="danger" data-scm-stock-action="reject" type="button" ${selectable.length ? "" : "disabled"}>${selected.length ? "Reject selected" : "Reject all actionable"}</button>
+     </div>
+@@ -311,7 +311,7 @@
+       ${scmStockPill(transfer.status)}
+     </div>
+     ${scmStockTransferList(request)}
+-    ${request.regular?.pickupTransfer?window.RegularStockUI.pickupResult(request)+scmStockPickupButton(request):''}
++    ${request.regular?.pickupTransfer?window.RegularStockUI.stockingResult(request)+scmStockPickupButton(request):''}
+     <div class="stock-request-summary">
+       <span><small>From location</small><strong>${scmStockEscape(transfer.sourceName)}</strong></span>
+       <span><small>To location</small><strong>${scmStockEscape(transfer.destinationName)}</strong></span>
+@@ -504,7 +504,7 @@
+ 
+ function scmStockOpenDecision(decision) {
+   const allowedStatuses = decision === "reject"
+-    ? new Set(window.RegularStockUI.pickup(scmStockState.detail)?["submitted", "changes_requested", "approved"]:["submitted", "changes_requested"])
++    ? new Set(window.RegularStockUI.stocking(scmStockState.detail)?["submitted", "changes_requested", "approved"]:["submitted", "changes_requested"])
+     : new Set(["submitted"]);
+   const eligible = (scmStockState.detail?.lines || []).filter((line) => allowedStatuses.has(line.status));
+   const selected = eligible.filter((line) => scmStockState.selectedLineIds.has(line.id));
+@@ -669,7 +669,7 @@
+     if(action==='approve-stock')return scmStockOpenDecision('stock');
+     if(action==='pickup-convert')return window.RegularPickupUI.open(scmStockState.detail,{api:scmStockApi,onComplete:async()=>{
+       scmStockState.queue='pending_to';localStorage.setItem('mbbs.scm.stockRequests.queue','pending_to');
+-      scmStockState.notice=window.RegularStockUI.t('SCM approved the pickup request and created its Transfer Orders.','SCM 已批准自取申请并建立调货单。');
++      scmStockState.notice=window.RegularStockUI.t('SCM approved the Stocking request and created its Transfer Orders.','SCM 已批准备货申请并建立调货单。');
+       await scmStockLoad({preserveSelection:true});
+     }});
+     if(action==='approve-po')return scmStockOpenDecision('po');
+--- a/server/public/scm-smart.js
++++ b/server/public/scm-smart.js
+@@ -740,9 +740,9 @@
+     <form class="smart-section" id="smartSettingsForm">
+       <div class="smart-section-head"><div><h2>Smart SCM controls</h2><p>Live execution is guarded by both this setting and a server environment flag. Daily planning uses the configured Toronto-local schedule.</p></div>${smartCanWrite() ? `<button class="smart-button primary" type="submit">Save settings</button>` : ""}</div>
+       <div class="smart-section-body smart-form-grid">
+-        <label class="smart-field"><span>${window.RegularStockUI.t('Stock request auto-approval','库存申请自动批准')}</span><input name="regularStockAutoApprovalEnabled" type="checkbox" ${settings.regularStockAutoApprovalEnabled!==false?'checked':''} ${smartCanWrite()?'':'disabled'} /><small>${window.RegularStockUI.t('Pickup always requires SCM review. When off, delivery also requires SCM review.','自取申请始终须 SCM 审核。关闭后，送货申请也须 SCM 审核。')}</small></label>
++        <label class="smart-field"><span>${window.RegularStockUI.t('Stock request auto-approval','库存申请自动批准')}</span><input name="regularStockAutoApprovalEnabled" type="checkbox" ${settings.regularStockAutoApprovalEnabled!==false?'checked':''} ${smartCanWrite()?'':'disabled'} /><small>${window.RegularStockUI.t('Stocking always requires SCM review. When off, Pickup and Delivery also require SCM review.','备货申请始终须 SCM 审核。关闭后，自取和送货申请也须 SCM 审核。')}</small></label>
+         <label class="smart-field"><span>${window.RegularStockUI.t('Stock request approval validity (minutes)','库存申请批准有效期（分钟）')}</span><input name="regularStockApprovalMinutes" type="number" min="1" max="10080" step="1" required value="${smartEscape(settings.regularStockApprovalMinutes ?? 15)}" ${smartCanWrite()?'':'disabled'} /><small>${window.RegularStockUI.t('Default 15. Starts after all items are reviewed; applies to new approvals. Sales can re-raise an expired request.','默认 15。所有商品审核完成后开始计时，适用于新的批准。销售可重新提交已过期的申请。')}</small></label>
+-        <label class="smart-field"><span>${window.RegularStockUI.t('Stock request auto-approval lead time (hours)','库存申请自动批准提前时间（小时）')}</span><input name="regularStockLeadHours" type="number" min="0" max="87600" step="any" required value="${smartEscape(settings.regularStockLeadHours ?? 5)}" ${smartCanWrite()?'':'disabled'} /><small>${window.RegularStockUI.t('Default 5. Requests arriving sooner require SCM review. Zero disables the lead-time restriction; applies to new submissions only.','默认 5。早于此时间须 SCM 审核，设为 0 关闭提前时间限制；仅适用于新提交的申请。')}</small></label>
++        <label class="smart-field"><span>${window.RegularStockUI.t('Stock request auto-approval lead time (hours)','库存申请自动批准提前时间（小时）')}</span><input name="regularStockLeadHours" type="number" min="0" max="87600" step="any" required value="${smartEscape(settings.regularStockLeadHours ?? 5)}" ${smartCanWrite()?'':'disabled'} /><small>${window.RegularStockUI.t('Delivery only; Pickup has no minimum lead time. Default 5. Earlier deliveries require SCM review. Zero disables this restriction; new submissions only.','仅适用于送货；自取无需最短提前时间。默认 5。更早送货须 SCM 审核，设为 0 关闭限制；仅适用于新申请。')}</small></label>
+         <label class="smart-field"><span>Execution mode</span><select name="executionMode" ${smartCanWrite() ? "" : "disabled"}><option value="mock" ${settings.executionMode === "mock" ? "selected" : ""}>Mock — no NetSuite write</option><option value="live" ${settings.executionMode === "live" ? "selected" : ""}>Live — guarded NetSuite PO + TO</option></select><small>Live mode inserts confirmed POs and TOs into NetSuite; TO confirmation also queues the NetSuite picking ticket.</small></label>
+         <label class="smart-field"><span>Forecast mode</span><select name="forecastMode" ${smartCanWrite() ? "" : "disabled"}><option value="formula" ${settings.forecastMode === "formula" ? "selected" : ""}>Formula only</option><option value="shadow" ${settings.forecastMode === "shadow" ? "selected" : ""}>Formula + shadow comparison</option><option value="hybrid" ${settings.forecastMode === "hybrid" ? "selected" : ""}>Promoted prediction segments</option></select><small>Hybrid uses prediction only for explicitly promoted yard/series segments.</small></label>
+         <label class="smart-field"><span>Daily run time</span><input name="dailyTime" type="time" value="${smartEscape(settings.dailyTime || "06:00")}" ${smartCanWrite() ? "" : "disabled"} /><small>${smartEscape(settings.timeZone || "America/Toronto")}</small></label>
+--- a/server/public/sales-stock-requests.html
++++ b/server/public/sales-stock-requests.html
+@@ -5,19 +5,19 @@
+     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+     <title>MBBS Sales Request Stock</title>
+     <link rel="stylesheet" href="/dispatch.css?v=20260811-stock-request-v1" />
+-    <link rel="stylesheet" href="/stock-requests.css?v=20260928-enhancements-v1&regular=20260929-pickup" />
+-    <link rel="stylesheet" href="/regular-stock-dialog.css?v=20260929-pickup" />
++    <link rel="stylesheet" href="/stock-requests.css?v=20260928-enhancements-v1&regular=20260929-stocking" />
++    <link rel="stylesheet" href="/regular-stock-dialog.css?v=20260929-stocking" />
+     <link rel="stylesheet" href="/i18n.css?v=20260701-i18n-v2" />
+   </head>
+   <body class="sales-stock-requests-page">
+     <main class="dispatch-shell stock-request-shell" id="salesStockRequestApp"></main>
+     <script src="/i18n.js?v=20260815-customer-pickup-photo-gate-v1"></script>
+-    <script src="/app-sidebar.js?v=20260928-enhancements-v1&regular=20260929-pickup"></script>
++    <script src="/app-sidebar.js?v=20260928-enhancements-v1&regular=20260929-stocking"></script>
+     <script src="/dispatch-auth.js?v=20260811-stock-request-private-v1"></script>
+     <script src="/delivery-instruction-upload.js?v=20260812-delivery-image-720p-v1"></script>
+-    <script src="/regular-stock-ui.js?v=20260929-pickup"></script>
+-    <script src="/regular-stock-dialog.js?v=20260929-pickup"></script>
+-    <script src="/sales-stock-requests.js?v=20260927-yard-layout-v1&regular=20260929-pickup"></script>
++    <script src="/regular-stock-ui.js?v=20260929-stocking"></script>
++    <script src="/regular-stock-dialog.js?v=20260929-stocking"></script>
++    <script src="/sales-stock-requests.js?v=20260927-yard-layout-v1&regular=20260929-stocking"></script>
+     <script src="/sales-special-stock-requests.js?v=20260928-enhancements-v1"></script>
+   </body>
+ </html>
+--- a/server/public/scm-stock-requests.html
++++ b/server/public/scm-stock-requests.html
+@@ -5,24 +5,24 @@
+     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+     <title>MBBS SCM Stock Requests</title>
+     <link rel="stylesheet" href="/dispatch.css?v=20260811-stock-request-v1" />
+-    <link rel="stylesheet" href="/stock-requests.css?v=20260928-enhancements-v1&regular=20260929-pickup" />
++    <link rel="stylesheet" href="/stock-requests.css?v=20260928-enhancements-v1&regular=20260929-stocking" />
+     <link rel="stylesheet" href="/aggregate-requests.css?v=20260925-aggregate-alert-v1" />
+-    <link rel="stylesheet" href="/scm-stock-pickup.css?v=20260929-pickup" />
+-    <link rel="stylesheet" href="/regular-stock-dialog.css?v=20260929-pickup" />
++    <link rel="stylesheet" href="/scm-stock-pickup.css?v=20260929-stocking" />
++    <link rel="stylesheet" href="/regular-stock-dialog.css?v=20260929-stocking" />
+     <link rel="stylesheet" href="/i18n.css?v=20260701-i18n-v2" />
+   </head>
+   <body class="scm-stock-requests-page">
+     <main class="dispatch-shell stock-request-shell" id="scmStockRequestApp"></main>
+     <script src="/i18n.js?v=20260923-aggregate-terminology-layout-v1"></script>
+-    <script src="/app-sidebar.js?v=20260928-batch-discount-v1&regular=20260929-pickup"></script>
++    <script src="/app-sidebar.js?v=20260928-batch-discount-v1&regular=20260929-stocking"></script>
+     <script src="/dispatch-auth.js?v=20260922-aggregate-v1"></script>
+     <script src="/aggregate-requests-i18n.js?v=20260925-aggregate-confirmation-date-v1"></script>
+     <script src="/scm-stock-request-tabs.js?v=20260926-special-queue-v1"></script>
+     <script src="/aggregate-requests.js?v=20260925-aggregate-confirmation-date-v1"></script>
+-    <script src="/regular-stock-ui.js?v=20260929-pickup"></script>
+-    <script src="/regular-stock-dialog.js?v=20260929-pickup"></script>
+-    <script src="/scm-stock-pickup.js?v=20260929-pickup"></script>
+-    <script src="/scm-stock-requests.js?v=20260927-yard-layout-v1&regular=20260929-pickup"></script>
++    <script src="/regular-stock-ui.js?v=20260929-stocking"></script>
++    <script src="/regular-stock-dialog.js?v=20260929-stocking"></script>
++    <script src="/scm-stock-pickup.js?v=20260929-stocking"></script>
++    <script src="/scm-stock-requests.js?v=20260927-yard-layout-v1&regular=20260929-stocking"></script>
+     <script src="/scm-special-stock-requests.js?v=20260928-enhancements-v1"></script>
+   </body>
+ </html>
+--- a/server/public/scm-smart.html
++++ b/server/public/scm-smart.html
+@@ -5,7 +5,7 @@
+     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+     <title>MBBS Smart SCM</title>
+     <link rel="stylesheet" href="/dispatch.css?v=20260720-smart-scm-v1" />
+-    <link rel="stylesheet" href="/scm-smart.css?v=20260801-blanket-ui-v2&regular=20260929-pickup" />
++    <link rel="stylesheet" href="/scm-smart.css?v=20260801-blanket-ui-v2&regular=20260929-stocking" />
+     <link rel="stylesheet" href="/scm-smart-vendor.css?v=20260812-vendor-price-source-v1" />
+     <link rel="stylesheet" href="/scm-smart-blanket.css?v=20260807-blanket-editor-v1" />
+     <link rel="stylesheet" href="/scm-smart-proposals.css?v=20260801-proposal-priority-v3" />
+@@ -15,13 +15,13 @@
+   <body>
+     <main class="smart-shell" id="smartScmApp"></main>
+     <script src="/i18n.js?v=20260815-customer-pickup-photo-gate-v1"></script>
+-    <script src="/app-sidebar.js?v=20260819-scm-custom-orders-v1&regular=20260929-pickup"></script>
++    <script src="/app-sidebar.js?v=20260819-scm-custom-orders-v1&regular=20260929-stocking"></script>
+     <script src="/dispatch-auth.js?v=20260716-multi-role-v1"></script>
+-    <script src="/regular-stock-ui.js?v=20260929-pickup"></script>
+-  <script src="/scm-smart.js?v=20260826-phased-planning-v1&regular=20260929-pickup"></script>
++    <script src="/regular-stock-ui.js?v=20260929-stocking"></script>
++  <script src="/scm-smart.js?v=20260826-phased-planning-v1&regular=20260929-stocking"></script>
+     <script src="/scm-smart-blanket.js?v=20260812-blanket-source-items-v1"></script>
+     <script src="/scm-smart-vendor.js?v=20260915-created-po-sync-v1"></script>
+-    <script src="/scm-smart-proposals.js?v=20260826-phased-planning-v1&regular=20260929-pickup"></script>
++    <script src="/scm-smart-proposals.js?v=20260826-phased-planning-v1&regular=20260929-stocking"></script>
+     <script src="/scm-smart-exclusions.js?v=20260915-blanket-auto-resume-v1"></script>
+   </body>
+ </html>
+--- a/server/src/regular-stock-pickup.js
++++ b/server/src/regular-stock-pickup.js
+@@ -5,7 +5,7 @@
+ import { confirmAndPrintStockTransfer, refreshStockRequestItemsAvailability } from './stock-request-service.js';
+ import { createTransferOrderInNetSuite } from './netsuite.js';
+ import { regularStockPolicies } from './regular-stock-request-service.js';
+-import { regularError, evaluateRegularStockApproval } from './regular-stock-domain.js';
++import { regularError, evaluateRegularStockApproval, isRegularStockingRequest } from './regular-stock-domain.js';
+ import { groupStockRequestLinesForTransfer, stockRequestPalletQuantity, STOCK_REQUEST_MAX_QUANTITY } from './stock-request-domain.js';
+ import { regularStockConfirmationToken } from './regular-stock-confirmation.js';
+ 
+@@ -14,8 +14,8 @@
+   && ['pending_fulfillment', 'partially_fulfilled', 'pending_receipt', 'received', 'closed'].includes(transfer.status);
+ 
+ function requirePickup(request) {
+-  if (request.workflowVersion !== 2 || request.regular.deliveryMethod !== 'pickup' || request.regular.handoffStatus) {
+-    throw regularError('Only pickup requests without an existing SO action can be converted by SCM.', 'REGULAR_PICKUP_REQUIRED');
++  if (request.workflowVersion !== 2 || !isRegularStockingRequest(request) || request.regular.handoffStatus) {
++    throw regularError('Only Stocking requests without an existing SO action can be converted by SCM.', 'REGULAR_PICKUP_REQUIRED');
+   }
+ }
+ 
+@@ -24,7 +24,7 @@
+     throw regularError('This request changed. Reload and review it again.', 'STOCK_REQUEST_REVISION_CONFLICT');
+   }
+   if (!request.lines.some(line => ['submitted', 'approved'].includes(line.status)) || request.transfers.length) {
+-    throw regularError('This request has no items available for a new pickup conversion.');
++    throw regularError('This request has no items available for a new Stocking conversion.');
+   }
+ }
+ 
+@@ -70,7 +70,7 @@
+   await (dependencies.refreshAvailability || refreshStockRequestItemsAvailability)(itemIds);
+   const normalized = await normalizePickupStockRequestDraft(request, input);
+   const policies = await (dependencies.loadPolicies || regularStockPolicies)(itemIds);
+-  const evidence = evaluateRegularStockApproval({ lines: normalized, policies, deliveryMethod: 'pickup',
++  const evidence = evaluateRegularStockApproval({ lines: normalized, policies, deliveryMethod: 'stocking',
+     arrivalAt: request.regular.arrivalAt, leadHours: request.regular.approval.leadHours,
+     now: (dependencies.now || (() => new Date()))() });
+   return { plan: pickupPlan(request, normalized, input), evidence };
+@@ -105,7 +105,7 @@
+     for (const entry of evidence.lines) await query('UPDATE sales_stock_request_lines SET approval_evidence=$2::jsonb WHERE id=$1', [entry.lineId, JSON.stringify(entry)]);
+     const event = await query(`INSERT INTO sales_stock_request_events(request_id,event_type,actor_id,details)
+       VALUES($1,'regular_manual_decision',$2,$3::jsonb) RETURNING id`, [current.id, context.operatorId,
+-      JSON.stringify({ decision: 'stock', reason: 'SCM pickup conversion', before: current.lines, after: lines, evidence })]);
++      JSON.stringify({ decision: 'stock', reason: 'SCM Stocking conversion', before: current.lines, after: lines, evidence })]);
+     const startedAt = new Date().toISOString();
+     await query(`UPDATE sales_stock_requests SET manual_decision_event_id=$2,regular_details=regular_details||$3::jsonb WHERE id=$1`,
+       [current.id, event.rows[0].id, JSON.stringify({ approvedAt: startedAt, approvalExpiresAt: null })]);
+@@ -178,7 +178,7 @@
+   let acquired = false;
+   try {
+     acquired = (await client.query('SELECT pg_try_advisory_lock(hashtextextended($1,0)) AS acquired', [key])).rows[0].acquired;
+-    if (!acquired) throw regularError('This pickup conversion is already running. Refresh to see its progress.', 'REGULAR_PICKUP_RUNNING');
++    if (!acquired) throw regularError('This Stocking conversion is already running. Refresh to see its progress.', 'REGULAR_PICKUP_RUNNING');
+     return await execute(id, input, context, dependencies);
+   } finally {
+     if (acquired) await client.query('SELECT pg_advisory_unlock(hashtextextended($1,0))', [key]).catch(() => {});
+--- a/server/public/scm-stock-pickup.js
++++ b/server/public/scm-stock-pickup.js
+@@ -105,7 +105,7 @@
+ 
+   function showResume(state) {
+     state.dialog.querySelector('[data-pickup-edit]').hidden=true;
+-    state.dialog.querySelector('[data-pickup-history]').innerHTML=ui().pickupResult(state.request);
++    state.dialog.querySelector('[data-pickup-history]').innerHTML=ui().stockingResult(state.request);
+     state.dialog.querySelector('[data-pickup-submit]').textContent=ui().t('Review saved TO action','查看已保存的调货操作');
+   }
+ 
+@@ -118,7 +118,7 @@
+     const {esc,t}=ui(),dialog=document.createElement('dialog');dialog.className='scm-pickup-dialog';
+     dialog.setAttribute('aria-labelledby','pickupTitle');
+     const state={request,api,onComplete,dialog,lines:request.lines.filter(line=>['submitted','approved'].includes(line.status)).map(line=>({...line})),pallets:{},results:[],searchGeneration:0};
+-    dialog.innerHTML=`<form><header><div><h2 id="pickupTitle">${t('Convert pickup request to TO','将自取申请转换为调货单')}</h2><p>${esc(request.requestRef)} · ${t('Destination','目的货场')} ${esc(request.destinationName)}</p></div><button type="button" data-pickup-close aria-label="${t('Close','关闭')}">×</button></header>
++    dialog.innerHTML=`<form><header><div><h2 id="pickupTitle">${t('Convert Stocking request to TO','将备货申请转换为调货单')}</h2><p>${esc(request.requestRef)} · ${t('Destination','目的货场')} ${esc(request.destinationName)}</p></div><button type="button" data-pickup-close aria-label="${t('Close','关闭')}">×</button></header>
+       <p>${t('Review every item and quantity. SCM approval will create one Transfer Order per source yard.','请审核所有商品和数量。SCM 批准后，每个发货货场将建立一张调货单。')}</p>
+       <p data-pickup-error class="stock-request-error" role="alert" hidden></p><div data-pickup-history></div>
+       <div data-pickup-edit><div data-pickup-lines></div><label class="pickup-search">${t('Add an item','添加商品')}<input data-pickup-search type="search" autocomplete="off" placeholder="${t('Type an item code or description…','输入商品编号或描述…')}" aria-controls="pickupResults" /></label><div id="pickupResults" data-pickup-results aria-live="polite"></div>
+--- a/server/public/sales-stock-requests.js
++++ b/server/public/sales-stock-requests.js
+@@ -747,9 +747,8 @@
+   } finally {
+     salesStockState.saving = false;
+     operation.close();
+-    if (salesStockState.composer || salesStockState.error) {
+-      renderSalesStockRequests();
+-    } else if (salesStockState.refreshPending) {
++    renderSalesStockRequests();
++    if (!salesStockState.composer && !salesStockState.error && salesStockState.refreshPending) {
+       salesStockState.refreshPending = false;
+       await salesStockLoad({ preserveSelection: true, background: true });
+     }

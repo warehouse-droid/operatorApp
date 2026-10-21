@@ -1,0 +1,21 @@
+[
+  "public/backorder-stock-requests.js",
+  "public/regular-stock-delivery.js",
+  "public/regular-stock-purchase.js",
+  "public/regular-stock-status-ui.js",
+  "public/regular-stock-status.css",
+  "public/regular-stock-status.js",
+  "public/regular-waitlist.js",
+  "public/sales-stock-requests.html",
+  "public/sales-stock-requests.js",
+  "public/scm-stock-requests.html",
+  "public/scm-stock-requests.js",
+  "public/scm-waitlist.js",
+  "public/stock-requests.css",
+  "src/regular-stock-status-query.js",
+  "src/regular-waitlist-repository.js",
+  "src/regular-waitlist-router.js",
+  "src/server.js",
+  "src/special-stock-request-repository.js",
+  "src/stock-request-repository.js"
+]

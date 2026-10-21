@@ -1,0 +1,377 @@
+{
+  "spec": "server/test/delivery-expiry-20261016.spec.json",
+  "specApproval": "not obtained (autonomous run)",
+  "sourceCommit": "946ae51d949dd657c5e7f02aa6b69291813fff45",
+  "sourceState": {
+    "src/delivery-request-domain.js": {
+      "sha256": "672c03438fd3d96fff4dd6a6ffe430e97049d1366bc5f6cafb1bf72bdcb514e9",
+      "lines": [
+        2,
+        21,
+        22,
+        394,
+        395,
+        397,
+        398,
+        399,
+        401,
+        407,
+        444,
+        445,
+        446,
+        447,
+        448,
+        449,
+        450,
+        451,
+        452,
+        515
+      ]
+    },
+    "src/delivery-request-repository.js": {
+      "sha256": "c21a88139cb14d7575f02aa329e0736de5f0841a95c254c67178fba9a55cf3b7",
+      "lines": [
+        48,
+        49
+      ]
+    },
+    "public/delivery-request-expiry-time.js": {
+      "sha256": "29a5d6621b5182b8c4cb8002962a01f60d041b3457a5e45900ddc5cf14d6a6d7",
+      "lines": [
+        1,
+        2,
+        3,
+        4,
+        5,
+        6,
+        7,
+        8,
+        9,
+        10,
+        11,
+        12,
+        13,
+        14,
+        15,
+        16,
+        17,
+        18,
+        19,
+        20,
+        21,
+        22,
+        23,
+        24,
+        25,
+        26,
+        27,
+        28,
+        29,
+        30,
+        31,
+        32,
+        33,
+        34,
+        35,
+        36,
+        37,
+        38,
+        39,
+        40,
+        41,
+        42,
+        43,
+        44,
+        45,
+        46,
+        47,
+        48,
+        49,
+        50,
+        51,
+        52,
+        53,
+        54,
+        55
+      ]
+    },
+    "public/delivery-requests.js": {
+      "sha256": "2d498a01e1bc4e6d665bfbac9aec906de72414ebfbce253d47fc5ba9acb0e260",
+      "lines": [
+        2,
+        300,
+        307,
+        308,
+        309,
+        310,
+        311,
+        312,
+        313,
+        314,
+        315,
+        316,
+        317,
+        318,
+        319,
+        320,
+        321,
+        322,
+        323,
+        324,
+        325,
+        326,
+        327,
+        328,
+        329,
+        330,
+        331,
+        332,
+        333,
+        334,
+        335,
+        336,
+        337,
+        338,
+        339,
+        340,
+        341,
+        342,
+        343,
+        344,
+        345,
+        346,
+        347,
+        348,
+        349,
+        350,
+        351,
+        352,
+        353,
+        354,
+        355,
+        356,
+        357,
+        411,
+        513,
+        542,
+        551
+      ]
+    },
+    "public/delivery-requests.css": {
+      "sha256": "8b0a29ad20eaefff8fc85e0a330f8d43532c1f730e32ee7c61aa8ae5c4d966dc",
+      "lines": [
+        10,
+        11,
+        12,
+        13,
+        14,
+        15,
+        16,
+        17
+      ]
+    },
+    "public/delivery-requests.html": {
+      "sha256": "783a5d1471e38be06814c404e29c5fde93c6aecbf473389206538c5d58c06609",
+      "lines": [
+        7,
+        15
+      ]
+    },
+    "public/delivery-request-alert.js": {
+      "sha256": "f649cd1472fa58a92963b3da538240973792870ab553bed78a96800ac703c009",
+      "lines": [
+        61
+      ]
+    }
+  },
+  "reproduce": "bash server/tools/delivery-expiry-check.sh final && python3 server/tools/delivery-expiry-report.py",
+  "baseline": {
+    "files": 33,
+    "passed": 258,
+    "newTestsInitiallyFailed": 15,
+    "preexistingVisibilityRegression": "Initially passed; independently verified by the Sales-controls mutation."
+  },
+  "tests": {
+    "tests": 275,
+    "pass": 275,
+    "fail": 0,
+    "skipped": 0,
+    "files": 35,
+    "shuffleSeed": 16102026
+  },
+  "types": "Passed scoped TypeScript check, including the shared time parser.",
+  "lintAndSyntax": "Passed with zero errors and zero warnings; existing complexity limit 12 retained.",
+  "changedLineCoverage": {
+    "covered": 135,
+    "total": 135,
+    "uncovered": [],
+    "unmeasured": [],
+    "files": {
+      "src/delivery-request-domain.js": {
+        "covered": 20,
+        "total": 20
+      },
+      "src/delivery-request-repository.js": {
+        "covered": 2,
+        "total": 2
+      },
+      "public/delivery-request-expiry-time.js": {
+        "covered": 55,
+        "total": 55
+      },
+      "public/delivery-requests.js": {
+        "covered": 57,
+        "total": 57
+      },
+      "public/delivery-request-alert.js": {
+        "covered": 1,
+        "total": 1
+      }
+    }
+  },
+  "mutations": [
+    {
+      "name": "override is ignored",
+      "killed": true,
+      "restored": true,
+      "propertyKilled": true
+    },
+    {
+      "name": "Sales can manually expire",
+      "killed": true,
+      "restored": true
+    },
+    {
+      "name": "manual expiry cancels instead",
+      "killed": true,
+      "restored": true
+    },
+    {
+      "name": "PM is parsed as AM",
+      "killed": true,
+      "restored": true,
+      "propertyKilled": true
+    },
+    {
+      "name": "past clock times become immediate deadlines",
+      "killed": true,
+      "restored": true,
+      "propertyKilled": true
+    },
+    {
+      "name": "Sales receives Dispatch expiry controls",
+      "killed": true,
+      "restored": true
+    },
+    {
+      "name": "Sales is not told the deadline changed",
+      "killed": true,
+      "restored": true
+    }
+  ],
+  "properties": {
+    "clockCases": 200,
+    "seed": 16102026,
+    "independentPropertyMutantsKilled": 3
+  },
+  "realExecution": "Actual Express routes, PostgreSQL transactions, Chromium desktop/mobile pages, reminders, alerts and dialog confirmation were exercised in isolated containers.",
+  "behaviorMapping": {
+    "freeTypingFormattingValidationAndDefault": [
+      "expiry UI: free type",
+      "expiry UI: proposal",
+      "expiry override: malformed"
+    ],
+    "torontoClockAndDst": [
+      "expiry override: next Toronto occurrence",
+      "expiry override: generated clock"
+    ],
+    "perRequestOnlyAndReminder": [
+      "expiry HTTP: override and update",
+      "expiry override: updating and accepting"
+    ],
+    "redWarningCancelEscapeConfirm": [
+      "manual expiry UI: red button warns"
+    ],
+    "accessStatesAndStaleRequests": [
+      "expiry HTTP: authorization",
+      "expiry controls: Sales",
+      "expiry controls: terminal states"
+    ],
+    "atomicityIdempotencyAndAudit": [
+      "expiry races:",
+      "manual expiry HTTP: rollback"
+    ],
+    "salesAlerts": [
+      "expiry alerts: Sales sees"
+    ],
+    "existingApprovalPricingOrderLinksAndInstructions": [
+      "all 33 pre-existing delivery test files"
+    ]
+  },
+  "cleanup": {
+    "compose": "down --volumes --remove-orphans",
+    "sharedBudget": "mbbs-tests.slice",
+    "containersVolumesAndNetworksRemoved": true,
+    "dockerPsAndPsAllVerified": true,
+    "productionHealth": [
+      "/mbbs-operator-app-app-1 running healthy",
+      "/mbbs-operator-app-db-1 running healthy",
+      "/mbbs-operator-app-webhook-worker-1 running ",
+      "/mbbs-operator-app-ollama-1 running healthy"
+    ]
+  },
+  "versions": {
+    "node": "v20.20.2",
+    "typescript": "7.0.2",
+    "eslint": "10.8.0",
+    "fast-check": "4.9.0",
+    "c8": "12.0.0",
+    "@playwright/test": "1.62.1"
+  },
+  "environmentChanges": "No new dependencies, database migrations, credentials, git commits or production test data.",
+  "resolvedFailures": [
+    "Initial acceptance tests failed on missing expiry behavior.",
+    "Browser fixtures now isolate requests and mark initially opened fixtures read, preventing startup alerts from intercepting controls.",
+    "The status assertion now selects the status paragraph explicitly, preserving its exact expected value.",
+    "Type nullability, parser complexity and a const lint issue were fixed without relaxing assertions or lint thresholds."
+  ],
+  "limits": [
+    "The entire repository test suite was not run; verification covers every delivery request/instruction test file and its integration boundaries.",
+    "Browser checks use Chromium; other browser engines were not run.",
+    "No external NetSuite writes were made. Integration tests use disposable data and boundary fixtures.",
+    "Dependency audit and migration rollback rehearsal are not applicable: neither dependencies nor schema changed.",
+    "Clock-only overrides mean the next Toronto occurrence, today or tomorrow. Secured requests keep their expiry stopped."
+  ],
+  "artifacts": "server/test-artifacts/delivery-expiry-20261016/final",
+  "deployment": {
+    "deployed": true,
+    "at": "2026-10-16T14:42:52.451665+00:00",
+    "imageId": "sha256:90e464f59cc28aecfbb1ae9208a0e088120aa903f04ebc6d2a97a03e5662e5cd",
+    "changedFiles": [
+      "src/delivery-request-domain.js",
+      "src/delivery-request-repository.js",
+      "public/delivery-request-expiry-time.js",
+      "public/delivery-requests.js",
+      "public/delivery-requests.css",
+      "public/delivery-requests.html",
+      "public/delivery-request-alert.js"
+    ],
+    "runtimeFilesVerified": 1412,
+    "configurationPreserved": true,
+    "dependenciesUnchanged": true,
+    "schemaChanged": false,
+    "testsPassed": 275,
+    "http": {
+      "http://127.0.0.1:3000": {
+        "health": 200,
+        "publicAssetsVerified": 5,
+        "anonymousApisDenied": 2
+      },
+      "https://test.mbbsoperation.com": {
+        "health": 200,
+        "publicAssetsVerified": 5,
+        "anonymousApisDenied": 2
+      }
+    }
+  }
+}

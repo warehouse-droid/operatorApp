@@ -31,7 +31,8 @@ export function mountWaitlistRoutes(app,{salesGuards,scmRead,scmWrite,salesConte
     emit('stocking-line-waitlisted',{requestId:result.request.id,waitlistRequestId:result.waitlistRequest.id});res.status(201).json(result);
   }));
   scm.get('/purchase-orders',route(async(req,res)=>res.json({purchaseOrders:await searchWaitlistPurchaseOrders(req.query.search)})));
-  scm.get('/requests',route(async(req,res)=>res.json({requests:await listWaitlistRequests({search:req.query.search,includeClosed:req.query.includeClosed==='true'})})));
+  scm.get('/requests',route(async(req,res)=>res.json({requests:await listWaitlistRequests({search:req.query.search,includeClosed:req.query.includeClosed==='true',
+    unifiedStatus:req.query.unifiedStatus,outcome:req.query.outcome,waitingReason:req.query.waitingReason})})));
   scm.get('/requests/:id',route(async(req,res)=>res.json(await getWaitlistRequest(req.params.id))));
   scm.post('/requests/:id/reject',scmWrite,route(async(req,res)=>{
     const request=await rejectWaitlistRequest(req.params.id,req.body||{},context(req));emit('waitlist-rejected',{requestId:request.id});res.json(request);

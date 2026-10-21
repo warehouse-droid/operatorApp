@@ -1,0 +1,756 @@
+--- a/src/transfer-order-posting-domain.js
++++ b/src/transfer-order-posting-domain.js
+@@ -25,6 +25,48 @@
+   return (!job.snapshot.planId || String(event.plan_id)===String(job.snapshot.planId))
+     && (!job.snapshot.loadId || event.load_id===job.snapshot.loadId)
+     && (!job.snapshot.planDate || String(event.plan_date).slice(0,10)===job.snapshot.planDate);
++}
++
++/** @param {Record<string,any>} job @param {Record<string,any>} other */
++function samePhysicalScope(job,other) {
++  return String(job.local_to_id)===String(other.local_to_id) && job.order_ref===other.order_ref
++    && ['planId','loadId','planDate'].every(key=>String(job.snapshot[key] ?? '')===String(other.snapshot[key] ?? ''));
++}
++
++/** @param {Record<string,any>[]} jobs */
++function itemQuantities(jobs) {
++  /** @type {Map<string,number>} */ const quantities=new Map();
++  for(const job of jobs) {
++    for(const line of job.snapshot.lines || []) {
++      const quantity=Number(line.quantity),itemId=Number(line.itemId);
++      if(!Number.isFinite(quantity) || quantity<=0 || !Number.isSafeInteger(itemId) || itemId<=0) {
++        throw invalid('The saved physical transfer quantity or item is invalid.');
++      }
++      const key=String(itemId);
++      quantities.set(key,(quantities.get(key) || 0)+quantity);
++    }
++  }
++  return quantities;
++}
++
++/** Durable records are joined by the repository; status alone is never physical evidence.
++ * @param {Record<string,any>} job @param {Record<string,any>[]} evidence */
++export function transferPostingPhysicalStatus(job,evidence) {
++  // Direct-to-customer transfers have no inbound yard; their linked SO drop owns completion.
++  if(job.snapshot.driverTarget){return null;}
++  const matching=evidence.filter(other=>other.operator_record_valid && samePhysicalScope(job,other));
++  const loads=matching.filter(other=>other.transaction_type==='IF');
++  if(!loads.length){return 'waiting_load';}
++  if(!matching.some(other=>other.id===job.id)){return job.transaction_type==='IF'?'waiting_load':'waiting_receipt';}
++  const receipts=matching.filter(other=>other.transaction_type==='IR');
++  const loaded=itemQuantities(loads),received=itemQuantities(receipts);
++  if(!loaded.size || !receipts.length || [...loaded].some(([item,quantity])=>(received.get(item) || 0)+0.000001<quantity)) {
++    return 'waiting_receipt';
++  }
++  if(job.transaction_type==='IR' && loads.some(load=>load.status!=='completed'
++    || !load.result?.transactions?.length || load.result.transactions.some((/** @type {Record<string,any>} */ transaction)=>
++      transaction.transactionType!=='IF' || !(Number(transaction.transactionId)>0)))) {return 'waiting_fulfillment';}
++  return null;
+ }
+ 
+ /** Effective events must come from dispatch_effective_order_completion_events. */
+--- a/src/transfer-order-posting-repository.js
++++ b/src/transfer-order-posting-repository.js
+@@ -1,7 +1,7 @@
+ // @ts-check
+ import {isDeepStrictEqual} from 'node:util';
+ import {query,withTransaction} from './db.js';
+-import {transferPostingCompletion} from './transfer-order-posting-domain.js';
++import {transferPostingCompletion,transferPostingPhysicalStatus} from './transfer-order-posting-domain.js';
+ import {fulfillmentTransactions} from './item-fulfillment-parts-domain.js';
+ import {linkedTransferDriverScope,transferPostingDate} from './transfer-order-posting-link-domain.js';
+ 
+@@ -68,10 +68,28 @@
+     [linked?'SO':'TO',refs.map((/** @type {unknown} */ ref)=>String(ref).toUpperCase())])).rows;
+ }
+ 
++/** @param {Record<string,any>} job */
++export async function readTransferPhysicalStatus(job) {
++  const evidence=(await query(`SELECT job.*,
++      CASE WHEN job.transaction_type='IF' THEN load.id IS NOT NULL ELSE receipt.id IS NOT NULL END AS operator_record_valid
++    FROM transfer_order_posting_jobs job
++    LEFT JOIN operator_load_records load ON job.transaction_type='IF' AND load.id=job.operator_record_id
++      AND load.order_id=job.local_to_id AND load.order_family='transfer_order' AND load.load_type='transfer_order_load'
++    LEFT JOIN receiving_receipt_records receipt ON job.transaction_type='IR' AND receipt.id=job.operator_record_id
++      AND receipt.order_id=job.local_to_id AND receipt.receipt_status IN ('partial_received','received')
++    WHERE job.local_to_id=$1`,[job.local_to_id])).rows;
++  return transferPostingPhysicalStatus(job,evidence);
++}
++
+ /** @param {Record<string,any>} step */
+ export async function assertTransferPostingStepReady(step) {
+   const job=(await query('SELECT * FROM transfer_order_posting_jobs WHERE command_id=$1',[step.commandId])).rows[0];
+   if(!job){return;} // Existing non-background commands retain their original recovery contract.
++  const physicalStatus=await readTransferPhysicalStatus(job);
++  if(physicalStatus) {
++    throw Object.assign(new Error(`The matching local load/receiving receipt or verified IF evidence is missing (${physicalStatus}).`),
++      {code:'TRANSFER_POSTING_EVIDENCE_INVALID',postingNotAttempted:true});
++  }
+   const event=transferPostingCompletion(job,await readTransferCompletionEvents(job));
+   const linkedIds=event?.linkedEvents?.map((/** @type {Record<string,any>} */ e)=>String(e.id)).sort();
+   if(!event || String(event.id)!==String(job.completion_event_id)
+@@ -117,9 +135,33 @@
+     WHERE local_to_id=$1 AND transaction_type='IR' GROUP BY line->>'sourceLineKey'`,[orderId])).rows.map((/** @type {Record<string,any>} */ row)=>[row.key,Number(row.quantity)]));
+ }
+ 
+-/** @param {Record<string,any>} line @param {Map<string,number>} progress */
+-export function applyTransferReceiptProgress(line,progress) {
+-  return {...line,receiving_completed_qty:Math.max(Number(line.netsuite_received_qty)||0,progress.get(String(line.line_id))||0)};
++/** @param {Record<string,any>} line @param {Map<string,number>} progress @param {boolean} [physicalOnly] */
++export function applyTransferReceiptProgress(line,progress,physicalOnly=false) {
++  const saved=progress.get(String(line.line_id)) || 0;
++  return {...line,receiving_completed_qty:physicalOnly?saved:Math.max(Number(line.netsuite_received_qty)||0,saved)};
++}
++
++/** @param {unknown} orderId */
++export async function readTransferLoadedQuantities(orderId) {
++  const rows=(await query(`SELECT item_id,SUM(quantity) AS quantity FROM (
++      SELECT line->>'lineId' AS line_id,line->>'itemId' AS item_id,MAX((line->>'loadedQty')::numeric) AS quantity
++      FROM operator_load_records load CROSS JOIN LATERAL jsonb_array_elements(load.line_snapshot) line
++      WHERE load.order_id=$1 AND load.order_family='transfer_order' AND load.load_type='transfer_order_load'
++      GROUP BY line->>'lineId',line->>'itemId'
++    ) loaded GROUP BY item_id`,[orderId])).rows;
++  return new Map(rows.map((/** @type {Record<string,any>} */ row)=>[String(row.item_id),Number(row.quantity)]));
++}
++
++/** @param {Record<string,any>[]} lines @param {Map<string,number>} loaded */
++export function applyTransferLoadedQuantities(lines,loaded) {
++  const remaining=new Map(loaded);
++  return lines.map(line=>{
++    const key=String(line.item_id),total=Number(line.quantity) || 0;
++    const quantity=Math.min(total,remaining.get(key) || 0);
++    remaining.set(key,Math.max(0,(remaining.get(key) || 0)-quantity));
++    return {...line,transfer_order_quantity:total,
++      receiving_unavailable_qty:total-quantity+(Number(line.receiving_completed_qty) || 0)};
++  });
+ }
+ 
+ export async function listTransferPostingJobs() {
+--- a/src/transfer-order-posting-service.js
++++ b/src/transfer-order-posting-service.js
+@@ -6,7 +6,7 @@
+ import {createOperatorNetSuitePostingRealSourceResolver,fetchLiveSourceFromNetSuite} from './operator-netsuite-posting-targets.js';
+ import {createOrReplayOperatorNetSuitePostingCommand,getOperatorNetSuitePostingCommand} from './operator-netsuite-posting-repository.js';
+ import {buildTransferPostingDraft,transferPostingCompletion} from './transfer-order-posting-domain.js';
+-import {readTransferCompletionEvents} from './transfer-order-posting-repository.js';
++import {readTransferCompletionEvents,readTransferPhysicalStatus} from './transfer-order-posting-repository.js';
+ 
+ const resolveStored=createOperatorNetSuitePostingRealSourceResolver({query,fetchLiveSource:fetchLiveSourceFromNetSuite,useStoredOrderLines:true});
+ 
+@@ -35,6 +35,11 @@
+   return (await query('UPDATE transfer_order_posting_jobs SET status=$2,last_error=$3,updated_at=now() WHERE id=$1 RETURNING *',[id,status,error])).rows[0];
+ }
+ 
++/** @param {string|null} status @returns {status is string} */
++function waitingForPhysicalRecord(status) {
++  return Boolean(status && status!=='waiting_fulfillment');
++}
++
+ /** @param {string} id @param {{resolveSource?:Function,getPolicy?:Function}} [dependencies] */
+ export async function prepareTransferPostingJob(id,{resolveSource=resolveTransferSource,getPolicy=getOperatorNetSuitePostingPolicy}={}) {
+   try {
+@@ -43,15 +48,14 @@
+       if(!job){return null;}
+       if(job.command_id){return {...job,command:await getOperatorNetSuitePostingCommand(job.command_id)};}
+       if(['attention','completed'].includes(job.status)){return job;}
++      const physicalStatus=await readTransferPhysicalStatus(job);
++      if(waitingForPhysicalRecord(physicalStatus)){return waitFor(id,physicalStatus);}
+       const event=transferPostingCompletion(job,await readTransferCompletionEvents(job));
+       if(!event){return waitFor(id,'waiting_driver');}
++      if(physicalStatus){return waitFor(id,physicalStatus);}
+       const policy=await getPolicy({functionKey:job.transaction_type==='IF'?'delivery_prep':'receiving',
+         locationId:outboundYardLocationId(job.snapshot.locationId),lock:true});
+       if(!policy.effective){return waitFor(id,'gate_disabled','The yard posting gate is disabled.');}
+-      if(job.transaction_type==='IR' && (await query(`SELECT id FROM transfer_order_posting_jobs
+-        WHERE local_to_id=$1 AND transaction_type='IF' AND status<>'completed' LIMIT 1`,[job.local_to_id])).rowCount) {
+-        return waitFor(id,'waiting_fulfillment','Waiting for transfer fulfillment to finish.');
+-      }
+       const record=(await query(job.transaction_type==='IF'
+         ? 'SELECT photo_data_urls FROM operator_load_records WHERE id=$1 AND order_id=$2'
+         : 'SELECT photo_data_urls FROM receiving_receipt_records WHERE id=$1 AND order_id=$2',[job.operator_record_id,job.local_to_id])).rows[0];
+--- a/src/receiving-repository.js
++++ b/src/receiving-repository.js
+@@ -1,12 +1,18 @@
+ import { isBackgroundPhotoReference } from "./operator-background-photos.js";
+ import { query, withTransaction } from "./db.js";
+-import { captureTransferPosting,readTransferReceiptProgress,applyTransferReceiptProgress } from './transfer-order-posting-repository.js';
++import { captureTransferPosting,readTransferReceiptProgress,applyTransferReceiptProgress,
++  readTransferLoadedQuantities,applyTransferLoadedQuantities } from './transfer-order-posting-repository.js';
+ import { readReceivingReceiptProgress, applyReceivingReceiptProgress, receivingQuantityAfterReceipt } from "./receiving-receipt-progress.js";
+ import { readReceivingPoSplitReservations, applyReceivingPoSplitReservations } from "./receiving-po-split-progress.js";
+ import { writeAudit } from "./auth-repository.js";
+ import { netSuiteClosedOrderFamilySql } from "./netsuite-closed-order-policy.js";
+ import { assertNoClosedNetSuiteOrders, listClosedNetSuiteOrders } from "./netsuite-closed-order-repository.js";
+ import { receivingOrderYards, scopeReceivingOrderYard } from "./receiving-yard-scope.js";
++
++function transferLocalLoadExistsSql() {
++  return `EXISTS (SELECT 1 FROM operator_load_records load
++    WHERE load.order_id=t.netsuite_id AND load.order_family='transfer_order' AND load.load_type='transfer_order_load')`;
++}
+ 
+ function normalizeNumber(value) {
+   if (value === null || value === undefined || value === "") return null;
+@@ -329,6 +335,7 @@
+               from_location AS source_location,
+               to_location_id AS destination_location_id,
+               status_text,
++              ${transferLocalLoadExistsSql()} AS has_local_load,
+               netsuite_active
+ 	       FROM transfer_orders t
+ 	       WHERE t.to_location_id IS NOT NULL
+@@ -342,7 +349,7 @@
+          )
+      ) transfer_receiving_source
+      WHERE netsuite_active = true
+-       AND (status_text ILIKE '%Pending Receipt%' OR status_text ILIKE '%Partially Received%')
++       AND has_local_load
+        ${destinationClause}
+      GROUP BY source_location_id, source_location
+      ORDER BY source_location`,
+@@ -354,7 +361,8 @@
+ export async function listReceivingOrders({ orderType, vendor = null, sourceLocationId = null, destinationLocationId = null, search = null, itemSearch = null } = {}) {
+   const params = [orderType];
+   let destinationParameter = null;
+-  const clauses = ["ro.order_type = $1", "ro.netsuite_active = true", "ro.receipt_status IS DISTINCT FROM 'received'", "(ro.status_text ILIKE '%Pending Receipt%' OR ro.status_text ILIKE '%Partially Received%')"];
++  const clauses = ["ro.order_type = $1", "ro.netsuite_active = true", "ro.receipt_status IS DISTINCT FROM 'received'",
++    "((ro.order_type='transfer_order' AND ro.has_local_load) OR (ro.order_type='purchase_order' AND (ro.status_text ILIKE '%Pending Receipt%' OR ro.status_text ILIKE '%Partially Received%')))"];
+   if (vendor) {
+     params.push(vendor);
+     clauses.push(`ro.vendor = $${params.length}`);
+@@ -399,7 +407,7 @@
+               COALESCE(${scheduleDestinationLocationIdSql("schedule.dropoff_point")}, po.destination_location_id) AS destination_location_id,
+               COALESCE(NULLIF(BTRIM(schedule.dropoff_point), ''), po.destination_location) AS destination_location,
+               NULLIF(BTRIM(schedule.dropoff_point), '') AS destination_override,
+-              po.netsuite_active, po.synced_at, po.receipt_status, po.memo, po.expected_delivery_date,
++              false AS has_local_load, po.netsuite_active, po.synced_at, po.receipt_status, po.memo, po.expected_delivery_date,
+               po.dispatch_vendor_yard, po.dispatch_address, po.dispatch_window_start,
+               po.dispatch_window_end, po.dispatch_instructions
+ 	       FROM purchase_orders po
+@@ -417,7 +425,7 @@
+               from_location_id AS source_location_id, from_location AS source_location,
+               to_location_id AS destination_location_id, to_location AS destination_location,
+               NULL::text AS destination_override,
+-              netsuite_active, synced_at, receiving_status AS receipt_status, memo, expected_delivery_date,
++              ${transferLocalLoadExistsSql()} AS has_local_load, netsuite_active, synced_at, receiving_status AS receipt_status, memo, expected_delivery_date,
+               NULL::text AS dispatch_vendor_yard, dispatch_address, dispatch_window_start,
+               dispatch_window_end, dispatch_instructions
+ 	       FROM transfer_orders t
+@@ -471,7 +479,7 @@
+               COALESCE(${scheduleDestinationLocationIdSql("schedule.dropoff_point")}, po.destination_location_id) AS destination_location_id,
+               COALESCE(NULLIF(BTRIM(schedule.dropoff_point), ''), po.destination_location) AS destination_location,
+               NULLIF(BTRIM(schedule.dropoff_point), '') AS destination_override,
+-              po.netsuite_active, po.synced_at, po.receipt_status, po.memo, po.expected_delivery_date,
++              false AS has_local_load, po.netsuite_active, po.synced_at, po.receipt_status, po.memo, po.expected_delivery_date,
+               po.dispatch_vendor_yard, po.dispatch_address, po.dispatch_window_start,
+               po.dispatch_window_end, po.dispatch_instructions
+ 	       FROM purchase_orders po
+@@ -489,7 +497,7 @@
+               from_location_id AS source_location_id, from_location AS source_location,
+               to_location_id AS destination_location_id, to_location AS destination_location,
+               NULL::text AS destination_override,
+-              netsuite_active, synced_at, receiving_status AS receipt_status, memo, expected_delivery_date,
++              ${transferLocalLoadExistsSql()} AS has_local_load, netsuite_active, synced_at, receiving_status AS receipt_status, memo, expected_delivery_date,
+               NULL::text AS dispatch_vendor_yard, dispatch_address, dispatch_window_start,
+               dispatch_window_end, dispatch_instructions
+ 	       FROM transfer_orders t
+@@ -561,7 +569,10 @@
+     ? supportedReceivingDestinationLocationId(receivingOrder.destination_override)
+     : null;
+   const overrideLocation = supportedReceivingDestinationLocation(overrideLocationId);
+-  const projectedLines = lines.rows.map((line) => overrideLocationId
++  const loadedLines = receivingOrder.order_type==='transfer_order' && !includeNetSuiteClosed
++    ? applyTransferLoadedQuantities(lines.rows.map(line=>applyTransferReceiptProgress(line,transferReceipts,true)),await readTransferLoadedQuantities(orderId))
++    : lines.rows;
++  const projectedLines = loadedLines.map((line) => overrideLocationId
+     ? {
+         ...line,
+         netsuite_location_id: line.location_id,
+@@ -576,7 +587,7 @@
+       receiving_yard_location_ids: receivingOrderYards({ ...receivingOrder, lines: projectedLines })
+     } : {}),
+     lines: projectedLines.map((/** @type {Record<string,any>} */ line) => applyPoAllocationFields(receipts
+-      ? applyReceivingPoSplitReservations(applyReceivingReceiptProgress(line, receipts), splitReservations) : applyTransferReceiptProgress(line,transferReceipts)))
++      ? applyReceivingPoSplitReservations(applyReceivingReceiptProgress(line, receipts), splitReservations) : applyTransferReceiptProgress(line,transferReceipts,!includeNetSuiteClosed)))
+       .filter(hasReceivingDisplayQuantity)
+   };
+   return destinationLocationId === null ? result : scopeReceivingOrderYard(result, destinationLocationId);
+@@ -632,8 +643,11 @@
+   const receipts = raw.order_type === "purchase_order" ? await readReceivingReceiptProgress(query, orderId) : null;
+   const transferReceipts = raw.order_type === 'transfer_order' ? await readTransferReceiptProgress(orderId) : new Map();
+   const splitReservations = receipts ? await readReceivingPoSplitReservations(query, orderId) : new Map();
+-  const current = applyPoAllocationFields(receipts
+-    ? applyReceivingPoSplitReservations(applyReceivingReceiptProgress(raw, receipts), splitReservations) : applyTransferReceiptProgress(raw,transferReceipts));
++  const current = raw.order_type==='transfer_order'
++    ? {...(await getReceivingOrder(orderId))?.lines.find(line=>String(line.id)===String(lineRowId)),order_type:raw.order_type}
++    : applyPoAllocationFields(receipts
++      ? applyReceivingPoSplitReservations(applyReceivingReceiptProgress(raw, receipts), splitReservations) : applyTransferReceiptProgress(raw,transferReceipts));
++  if(!current.id){throw new Error('This transfer line has no loaded quantity available to receive.');}
+   const available = receivingUnitAvailability(current);
+   const salesOnly = isSalesQuantityOnlyLine(current);
+   const pallets = salesOnly ? 0 : Math.min(positiveQuantity(values.pallets), available.pallets);
+@@ -812,6 +826,9 @@
+ export async function getReceivableReceivingOrder(orderId, { includeNetSuiteClosed = false, destinationLocationId = null } = {}) {
+   const order = await getReceivingOrder(orderId, { includeNetSuiteClosed });
+   if (!order) throw new Error("Receiving order not found.");
++  if(order.order_type==='transfer_order' && !includeNetSuiteClosed && !order.has_local_load) {
++    throw Object.assign(new Error('The outbound yard must load this Transfer Order before it can be received.'),{status:409,code:'TRANSFER_NOT_LOADED'});
++  }
+   if (order.receipt_status === "received") {
+     throw Object.assign(new Error("This order has already been received. Return to Receiving for open orders."), {
+       status: 409, code: "RECEIVING_ALREADY_COMPLETED"
+@@ -1547,6 +1564,9 @@
+   }
+   const order = await getReceivingOrder(orderId, { includeNetSuiteClosed: allowNetSuiteCompleted });
+   if (!order) throw new Error("Receiving order not found.");
++  if(order.order_type==='transfer_order' && !allowNetSuiteCompleted && !order.has_local_load) {
++    throw Object.assign(new Error('The outbound yard must load this Transfer Order before it can be received.'),{status:409,code:'TRANSFER_NOT_LOADED'});
++  }
+   const receivedQuantities = new Map((payload?.item?.items || [])
+     .filter((/** @type {Record<string,any>} */ item) => item.itemReceive !== false && item.itemreceive !== false && positiveQuantity(item.quantity) > 0)
+     .map((/** @type {Record<string,any>} */ item) => [String(item.orderLine), positiveQuantity(item.quantity)]));
+@@ -1555,13 +1575,24 @@
+     .map((item) => Number(item.orderLine))
+     .filter((id) => Number.isInteger(id));
+ 
++  if(order.order_type==='transfer_order' && !allowNetSuiteCompleted) {
++    if(!receivedQuantities.size){throw new Error('No loaded transfer quantity was selected to receive.');}
++    for(const [key,quantity] of receivedQuantities) {
++      const line=order.lines.find(candidate=>String(candidate.line_id)===key);
++      if(!line || quantity>remainingSalesQuantity(line)+0.000001) {
++        throw Object.assign(new Error('Received quantity cannot exceed the locally loaded transfer quantity.'),{status:409});
++      }
++    }
++  }
++
+   const remainingLines = (order.lines || []).filter((line) => {
+     if (!line.netsuite_active || !["InvtPart", "NonInvtPart"].includes(line.item_type || "")) return false;
+     if (order.order_type === "purchase_order") {
+       return receivingQuantityAfterReceipt(line, receivedQuantities.get(String(line.line_id)) || 0) > 0.000001;
+     }
+     if (!receivedIds.includes(Number(line.line_id))) return true;
+-    if (receivedSalesQuantity(line) + 0.000001 < remainingSalesQuantity(line)) return true;
++    if ((receivedQuantities.get(String(line.line_id)) || 0) + netsuiteReceivedBaseline(line) + 0.000001
++      < positiveQuantity(line.transfer_order_quantity ?? line.original_quantity ?? line.quantity)) return true;
+     return false;
+   });
+   const receiptStatus = remainingLines.length ? "partial_received" : "received";
+@@ -1711,7 +1742,7 @@
+   const clauses = [
+     "ro.order_type = $1",
+     "ro.netsuite_active = true",
+-    "(ro.status_text ILIKE '%Pending Receipt%' OR ro.status_text ILIKE '%Partially Received%')",
++    "((ro.order_type='transfer_order' AND ro.has_local_load) OR (ro.order_type='purchase_order' AND (ro.status_text ILIKE '%Pending Receipt%' OR ro.status_text ILIKE '%Partially Received%')))",
+     "rol.netsuite_active = true",
+     "(rol.item_name ILIKE $2 OR rol.item_description ILIKE $2)"
+   ];
+@@ -1734,7 +1765,7 @@
+               NULL::bigint AS source_location_id,
+               COALESCE(${scheduleDestinationLocationIdSql("schedule.dropoff_point")}, po.destination_location_id) AS destination_location_id,
+               NULLIF(BTRIM(schedule.dropoff_point), '') AS destination_override,
+-              po.status_text, po.netsuite_active
++              po.status_text, false AS has_local_load, po.netsuite_active
+ 	       FROM purchase_orders po
+          LEFT JOIN scm_transport_schedule schedule
+            ON schedule.order_kind = 'PO'
+@@ -1745,7 +1776,7 @@
+        SELECT netsuite_id, 'transfer_order'::text AS order_type, NULL::text AS vendor,
+               from_location_id AS source_location_id, to_location_id AS destination_location_id,
+               NULL::text AS destination_override,
+-              status_text, netsuite_active
++              status_text, ${transferLocalLoadExistsSql()} AS has_local_load, netsuite_active
+ 	       FROM transfer_orders t
+ 	       WHERE t.to_location_id IS NOT NULL
+            AND t.receiving_status IS DISTINCT FROM 'received'
+--- a/src/delivery-repository.js
++++ b/src/delivery-repository.js
+@@ -2026,9 +2026,9 @@
+         AND netsuite_active = true
+         AND (
+           (order_type = 'sales_order' AND (status = 'B' OR status_text ILIKE '%Pending Fulfillment%' OR status_text ILIKE '%Partially Fulfilled%' OR fulfillment_status = 'partial_fulfilled'))
+-          OR (order_type = 'transfer_order' AND (status_text ILIKE '%Pending Fulfillment%' OR status_text ILIKE '%Partially Fulfilled%' OR fulfillment_status = 'partial_fulfilled'))
++          OR order_type = 'transfer_order'
+         )
+-        AND fulfillment_status <> 'fulfilled'
++        AND (order_type = 'transfer_order' OR fulfillment_status <> 'fulfilled')
+         AND (${hasRemainingQty} OR ${hasPackedQty} OR ${hasProgressQty} OR ${hasDirectDependency})
+      ORDER BY dispatch_planned DESC, warning_count DESC, underpack_count DESC, trandate DESC, tranid DESC`
+     ,
+--- a/src/server.js
++++ b/src/server.js
+@@ -7654,23 +7654,11 @@
+             to_lyr = COALESCE($14::numeric, to_lyr),
+             to_sec = COALESCE($15::numeric, to_sec),
+             to_pcs = COALESCE($16::numeric, to_pcs),
+-            loaded_qty = CASE WHEN $17::boolean THEN $18 ELSE loaded_qty END,
+-            loaded_uom = CASE WHEN $17::boolean THEN COALESCE(NULLIF($5, ''), loaded_uom) ELSE loaded_uom END,
+-            packed_pallet_qty = CASE WHEN $17::boolean THEN 0 ELSE packed_pallet_qty END,
+-            packed_layer_qty = CASE WHEN $17::boolean THEN 0 ELSE packed_layer_qty END,
+-            packed_piece_qty = CASE WHEN $17::boolean THEN 0 ELSE packed_piece_qty END,
+-            packed_section_qty = CASE WHEN $17::boolean THEN 0 ELSE packed_section_qty END,
+             fulfilled_pallet_qty = CASE WHEN $17::boolean THEN $19 ELSE fulfilled_pallet_qty END,
+             fulfilled_layer_qty = CASE WHEN $17::boolean THEN $20 ELSE fulfilled_layer_qty END,
+             fulfilled_piece_qty = CASE WHEN $17::boolean THEN $21 ELSE fulfilled_piece_qty END,
+             fulfilled_section_qty = CASE WHEN $17::boolean THEN $22 ELSE fulfilled_section_qty END,
+             netsuite_received_qty = CASE WHEN $17::boolean THEN netsuite_received_qty ELSE $18 END,
+-            received_pallet_qty = CASE WHEN $17::boolean THEN received_pallet_qty ELSE 0 END,
+-            received_layer_qty = CASE WHEN $17::boolean THEN received_layer_qty ELSE 0 END,
+-            received_piece_qty = CASE WHEN $17::boolean THEN received_piece_qty ELSE 0 END,
+-            received_section_qty = CASE WHEN $17::boolean THEN received_section_qty ELSE 0 END,
+-            confirmed = false,
+-            confirmed_at = null,
+             netsuite_active = true,
+             sync_exception = null,
+             sync_exception_at = null,
+@@ -7849,7 +7837,7 @@
+   return { lines: lines.length, ...summary, receiptStatus };
+ }
+ 
+-async function reconcileTransferOrderProgress(progress) {
++export async function reconcileTransferOrderProgress(progress) {
+   const outboundLines = transferProgressLinesForStage(progress, "outbound");
+   const receivingLines = transferProgressLinesForStage(progress, "receiving");
+   for (const line of outboundLines) await updateTransferOrderLineFromProgress(progress.id, line, "outbound");
+@@ -7862,12 +7850,8 @@
+     `UPDATE transfer_orders
+         SET status = COALESCE($2, status),
+             status_text = COALESCE($3, status_text),
+-            outbound_operator_status = $4,
+-            local_yard_order_status = $5,
+-            fulfillment_status = $6,
+-            receiving_status = $7,
+-            fulfilled_at = CASE WHEN $6 IN ('fulfilled', 'partial_fulfilled') THEN COALESCE(fulfilled_at, now()) ELSE fulfilled_at END,
+-            received_at = CASE WHEN $7 IN ('received', 'partial_received') THEN COALESCE(received_at, now()) ELSE received_at END,
++            fulfillment_status = $4,
++            fulfilled_at = CASE WHEN $4 IN ('fulfilled', 'partial_fulfilled') THEN COALESCE(fulfilled_at, now()) ELSE fulfilled_at END,
+             status_updated_at = now(),
+             synced_at = now()
+       WHERE netsuite_id = $1`,
+@@ -7875,10 +7859,7 @@
+       progress.id,
+       progress.status || null,
+       progress.status_text || null,
+-      outboundStatus.operatorStatus,
+-      outboundStatus.yardStatus,
+-      outboundStatus.fulfillmentStatus,
+-      receiptStatus
++      outboundStatus.fulfillmentStatus
+     ]
+   );
+   await enqueueNetSuiteMirrorOrderEvent("transfer_order", progress.id, { changeType: "progress" });
+--- a/src/order-sync-repository.js
++++ b/src/order-sync-repository.js
+@@ -994,7 +994,7 @@
+         normalized.to_lyr,
+         normalized.to_sec,
+         normalized.to_pcs,
+-        stage === "outbound" ? normalized.netsuite_received_qty : 0,
++        0, // Truck loading is a local Operator milestone, independent of NetSuite fulfillment.
+         normalized.unit,
+         JSON.stringify(normalized.raw || {}),
+         normalized.item_type,
+@@ -1553,7 +1553,7 @@
+   const params = [];
+   const clauses = [];
+   if (isTransfer) {
+-    clauses.push("receiving_status IS NOT NULL");
++    clauses.push("to_location_id IS NOT NULL");
+     if (sourceLocationId) {
+       params.push(sourceLocationId);
+       clauses.push(`from_location_id = $${params.length}`);
+@@ -1579,77 +1579,11 @@
+   return result.rows.map((row) => row.netsuite_id);
+ }
+ 
+-export async function markMissingInboundOrders({ orderFamily, activeOrderIds = [], sourceLocationId = null, destinationLocationId = null } = {}) {
+-  const ids = activeOrderIds.map((id) => Number(id)).filter((id) => Number.isInteger(id));
+-  const isTransfer = orderFamily === "transfer_order";
+-  const params = [ids];
+-  const clauses = ["netsuite_id > 0", "NOT (netsuite_id = ANY($1::bigint[]))"];
+-  if (isTransfer) {
+-    clauses.push("receiving_status IS NOT NULL");
+-    if (sourceLocationId) {
+-      params.push(sourceLocationId);
+-      clauses.push(`from_location_id = $${params.length}`);
+-    }
+-    if (destinationLocationId) {
+-      params.push(destinationLocationId);
+-      clauses.push(`to_location_id = $${params.length}`);
+-    }
+-  } else if (destinationLocationId) {
+-    params.push(destinationLocationId);
+-    clauses.push(`destination_location_id = $${params.length}`);
+-  }
+-  if (!isTransfer) {
+-    // The NetSuite PO discovery query only returns currently open receipts. Once a
+-    // PO enters local tracking, absence from that result cannot mean deletion: it
+-    // may have been received in NetSuite while local split work is still active.
+-    return;
+-  }
+-
+-  await query(
+-    `UPDATE transfer_order_lines
+-        SET netsuite_active = false,
+-            sync_exception = CASE WHEN (
+-              COALESCE(received_pallet_qty, 0)
+-              + COALESCE(received_layer_qty, 0)
+-              + COALESCE(received_section_qty, 0)
+-              + COALESCE(received_piece_qty, 0)
+-            ) > 0 THEN 'line_deleted' ELSE sync_exception END,
+-            sync_exception_at = CASE WHEN (
+-              COALESCE(received_pallet_qty, 0)
+-              + COALESCE(received_layer_qty, 0)
+-              + COALESCE(received_section_qty, 0)
+-              + COALESCE(received_piece_qty, 0)
+-            ) > 0 THEN now() ELSE sync_exception_at END,
+-            synced_at = now()
+-      WHERE line_stage = 'receiving'
+-        AND transfer_order_id IN (
+-          SELECT netsuite_id
+-            FROM transfer_orders
+-           WHERE ${clauses.join(" AND ")}
+-        )
+-        AND netsuite_active = true`,
+-    params
+-  );
+-
+-  const missingOrders = await query(
+-    `UPDATE transfer_orders
+-        SET netsuite_active = false,
+-            netsuite_missing_at = now(),
+-            synced_at = now()
+-      WHERE ${clauses.join(" AND ")}
+-        AND NOT EXISTS (
+-          SELECT 1
+-            FROM transfer_order_lines l
+-           WHERE l.transfer_order_id = transfer_orders.netsuite_id
+-             AND l.netsuite_active = true
+-        )
+-      RETURNING netsuite_id`,
+-    params
+-  );
+-  for (const row of missingOrders.rows) {
+-    await syncOrderDependenciesForTransferOrder(row.netsuite_id);
+-    await enqueueNetSuiteMirrorOrderEvent("transfer_order", row.netsuite_id, { changeType: "missing" });
+-  }
++export async function markMissingInboundOrders(_options = {}) {
++  // Open-receipt discovery is not a deletion feed. Keep locally tracked PO/TO
++  // work across remote statuses; individual refresh and Closed-order checks
++  // remain responsible for source availability.
++  return;
+ }
+ 
+ export async function markMissingInboundOrderLines(orderId, activeLineIds = []) {
+--- a/src/netsuite.js
++++ b/src/netsuite.js
+@@ -2620,8 +2620,6 @@
+       AND tl.quantity < 0
+       AND tl.mainline = 'F'
+       AND tl.taxline = 'F'
+-      AND ${outboundStatusFilterSql("t")}
+-      AND ${openLineFilterSql("tl")}
+       ${locationFilter}
+     ORDER BY t.trandate DESC
+   `);
+@@ -3312,8 +3310,6 @@
+       AND tl.quantity > 0
+       AND tl.mainline = 'F'
+       AND tl.taxline = 'F'
+-      AND ${receivingStatusFilterSql("t")}
+-      AND ${openLineFilterSql("tl")}
+       ${sourceFilter}
+     ORDER BY t.trandate DESC
+   `);
+--- a/test/mbt/integration/transfer-order-background-posting.test.js
++++ b/test/mbt/integration/transfer-order-background-posting.test.js
+@@ -4,7 +4,7 @@
+ import test,{after} from 'node:test';
+ import {query,beginRollbackContext,closeDb,withTransaction} from '../../../src/db.js';
+ import {finalizeTransferPosting,assertTransferPostingStepReady,listTransferPostingJobs} from '../../../src/transfer-order-posting-repository.js';
+-import {prepareTransferPostingJob,retryTransferPostingJob,transferPostingTick,resolveTransferSource} from '../../../src/transfer-order-posting-service.js';
++import {prepareTransferPostingJob as prepareTransferPostingJobRaw,retryTransferPostingJob,transferPostingTick,resolveTransferSource} from '../../../src/transfer-order-posting-service.js';
+ import * as postingRepository from '../../../src/operator-netsuite-posting-repository.js';
+ import {createOperatorNetSuitePostingProcessor} from '../../../src/operator-netsuite-posting-service.js';
+ import {createOperatorNetSuitePostingAdapter} from '../../../src/operator-netsuite-posting-netsuite-adapter.js';
+@@ -34,24 +34,45 @@
+ const photos=['r2://fixture/a','r2://fixture/b'];
+ async function load(f){await recordDeliveryLoad(f.id,f.operator,{photoDataUrls:photos,requestId:crypto.randomUUID()});
+  return (await query("SELECT * FROM transfer_order_posting_jobs WHERE local_to_id=$1 AND transaction_type='IF'",[f.id])).rows[0];}
+-async function receive(f){await recordReceivingReceipt(f.id,f.operator,{photoDataUrls:photos,payload:{item:{items:[{orderLine:5073151,itemReceive:true,quantity:5}]}},response:{localOnly:true}});
+- return (await query("SELECT * FROM transfer_order_posting_jobs WHERE local_to_id=$1 AND transaction_type='IR'",[f.id])).rows[0];}
++async function receive(f){
++ if(!(await query("SELECT id FROM operator_load_records WHERE order_id=$1 AND load_type='transfer_order_load'",[f.id])).rowCount)await load(f);
++ const order=await getReceivingOrder(f.id),quantity=Number(order.lines[0]?.quantity || 0);
++ await query("UPDATE transfer_order_lines SET received_piece_qty=$2 WHERE transfer_order_id=$1 AND line_stage='receiving'",[f.id,quantity]);
++ await recordReceivingReceipt(f.id,f.operator,{photoDataUrls:photos,payload:{item:{items:[{orderLine:5073151,itemReceive:true,quantity}]}},response:{localOnly:true}});
++ return (await query("SELECT * FROM transfer_order_posting_jobs WHERE local_to_id=$1 AND transaction_type='IR' ORDER BY created_at DESC,id DESC",[f.id])).rows[0];
++}
++// These existing worker tests assume completed physical prerequisites. Supply both
++// yard records; the new yard-flow suite separately verifies each missing signal.
++async function prepareCompletedYards(id,options){
++ const job=(await query('SELECT * FROM transfer_order_posting_jobs WHERE id=$1',[id])).rows[0];
++ if(!job)return prepareTransferPostingJobRaw(id,options);
++ const f={id:Number(job.local_to_id),ref:job.order_ref,operator:job.operator_id};
++ if(job.transaction_type==='IF'){
++  const order=await getReceivingOrder(f.id);
++  if(order.lines.some(line=>Number(line.quantity)>0))await receive(f);
++ }else{
++  const loaded=(await query("SELECT id FROM transfer_order_posting_jobs WHERE local_to_id=$1 AND transaction_type='IF' ORDER BY created_at LIMIT 1",[f.id])).rows[0];
++  const ready=await prepareTransferPostingJobRaw(loaded.id,deps(f));
++  if(ready?.command)await engine().processor.process(ready.command.id);
++ }
++ return prepareTransferPostingJobRaw(id,options);
++}
+ function deps(f,type='IF'){return {getPolicy:input=>getOperatorNetSuitePostingPolicy({...input,directAccessEnabled:true}),
+  resolveSource:async()=>({sourceOrderKind:'TO',sourceNetSuiteId:f.id,sourceOrderRef:f.ref,
+  availableLines:[{sourceLineKey:type==='IF'?'5073149':'5073151',orderLine:type==='IF'?2:3,itemId:2299,location:null,orderedQuantity:5,remainingQuantity:5,completedQuantity:0}]})};}
+ for(const type of ['IF','IR'])for(const driverFirst of [true,false])test(`${type}: real local ${driverFirst?'Driver-first':'Operator-first'} completion gates backend admission`,()=>rollback(async()=>{
+  const f=await seed();if(driverFirst)await deliver(f);
+  const job=await (type==='IF'?load(f):receive(f));assert.ok(job,'Local completion must atomically capture a durable job');
+- if(!driverFirst){const waiting=await prepareTransferPostingJob(job.id,{...deps(f,type),resolveSource:async()=>assert.fail('Do not consult NetSuite before Driver completion')});
++ if(!driverFirst){const waiting=await prepareCompletedYards(job.id,{...deps(f,type),resolveSource:async()=>assert.fail('Do not consult NetSuite before Driver completion')});
+   assert.equal(waiting.status,'waiting_driver');await deliver(f);}
+- const ready=await prepareTransferPostingJob(job.id,deps(f,type));assert.ok(ready.command,JSON.stringify(ready));assert.equal(ready.command.status,'queued');
++ const ready=await prepareCompletedYards(job.id,deps(f,type));assert.ok(ready.command,JSON.stringify(ready));assert.equal(ready.command.status,'queued');
+  assert.equal(ready.command.steps[0].payload.item.items[0].quantity,5);
+- const replay=await prepareTransferPostingJob(job.id,deps(f,type));assert.equal(replay.command.id,ready.command.id);
+- assert.equal((await query('SELECT id FROM transfer_order_posting_jobs WHERE local_to_id=$1',[f.id])).rowCount,1);
++ const replay=await prepareCompletedYards(job.id,deps(f,type));assert.equal(replay.command.id,ready.command.id);
++ assert.equal((await query('SELECT id FROM transfer_order_posting_jobs WHERE local_to_id=$1',[f.id])).rowCount,2);
+ }));
+ test('bad NetSuite reference stays Admin attention while local load remains saved',()=>rollback(async()=>{
+  const f=await seed();const job=await load(f);assert.ok(job);await deliver(f);
+- await assert.rejects(prepareTransferPostingJob(job.id,{...deps(f),resolveSource:async()=>{throw new Error('Invalid NetSuite source line');}}),/Invalid NetSuite/);
++ await assert.rejects(prepareCompletedYards(job.id,{...deps(f),resolveSource:async()=>{throw new Error('Invalid NetSuite source line');}}),/Invalid NetSuite/);
+  const saved=(await query('SELECT * FROM transfer_order_posting_jobs WHERE id=$1',[job.id])).rows[0];
+  assert.equal(saved.status,'attention');assert.match(saved.last_error,/Invalid NetSuite/);
+  assert.equal(Number((await getDeliveryOrder(f.id)).lines[0].loaded_qty),5);
+@@ -68,7 +89,7 @@
+ }));
+ test('background finalization attaches evidence without repeating the local receipt',()=>rollback(async()=>{
+  const f=await seed();const job=await receive(f);await deliver(f);
+- const ready=await prepareTransferPostingJob(job.id,deps(f,'IR'));
++ const ready=await prepareCompletedYards(job.id,deps(f,'IR'));
+  const command={...ready.command,steps:ready.command.steps.map(step=>({...step,status:'posted',netSuiteTransactionId:12345,netSuiteTransactionRef:'IR-TEST'}))};
+  await finalizeTransferPosting(command);await finalizeTransferPosting(command);
+  assert.equal((await query('SELECT id FROM receiving_receipt_records WHERE order_id=$1',[f.id])).rowCount,1);
+@@ -78,23 +99,23 @@
+ 
+ test('partial loads retain independent immutable quantities and do not freeze further Operator work',()=>rollback(async()=>{
+  const f=await seed();await query("UPDATE transfer_order_lines SET packed_piece_qty=2 WHERE transfer_order_id=$1 AND line_stage='outbound'",[f.id]);
+- const first=await load(f);await deliver(f);await prepareTransferPostingJob(first.id,deps(f));
++ const first=await load(f);await deliver(f);await prepareCompletedYards(first.id,deps(f));
+  await query("UPDATE transfer_orders SET outbound_operator_status='packed' WHERE netsuite_id=$1",[f.id]);
+  await query("UPDATE transfer_order_lines SET packed_piece_qty=3,confirmed=true WHERE transfer_order_id=$1 AND line_stage='outbound'",[f.id]);
+- await load(f);const jobs=(await query("SELECT * FROM transfer_order_posting_jobs WHERE local_to_id=$1 ORDER BY created_at,id",[f.id])).rows;
++ await load(f);const jobs=(await query("SELECT * FROM transfer_order_posting_jobs WHERE local_to_id=$1 AND transaction_type='IF' ORDER BY created_at,id",[f.id])).rows;
+  assert.deepEqual(jobs.map(j=>j.snapshot.lines[0].quantity).sort(),[2,3]);
+  const second=jobs.find(j=>j.id!==first.id);
+- assert.equal((await prepareTransferPostingJob(second.id,deps(f))).status,'waiting_posting');
++ assert.equal((await prepareCompletedYards(second.id,deps(f))).status,'waiting_posting');
+  assert.equal(Number((await getDeliveryOrder(f.id)).lines[0].loaded_qty),5);
+  assert.equal((await query("SELECT local_order_key FROM operator_netsuite_posting_order_claims WHERE local_order_key=$1 AND active",[`delivery_prep:transfer_order:${f.id}`])).rowCount,0);
+ }));
+ 
+ test('wrong load and withdrawn Driver completion cannot admit or post',()=>rollback(async()=>{
+- const f=await seed();const job=await load(f);await deliver(f);
+- await query("UPDATE transfer_order_posting_jobs SET snapshot=snapshot||'{\"loadId\":\"other-load\"}'::jsonb WHERE id=$1",[job.id]);
+- assert.equal((await prepareTransferPostingJob(job.id,deps(f))).status,'waiting_driver');
+- await query("UPDATE transfer_order_posting_jobs SET snapshot=snapshot||jsonb_build_object('loadId',$2::text) WHERE id=$1",[job.id,f.load]);
+- const ready=await prepareTransferPostingJob(job.id,deps(f));
++ const f=await seed();const job=await load(f);await receive(f);await deliver(f);
++ await query("UPDATE transfer_order_posting_jobs SET snapshot=snapshot||'{\"loadId\":\"other-load\"}'::jsonb WHERE local_to_id=$1",[f.id]);
++ assert.equal((await prepareCompletedYards(job.id,deps(f))).status,'waiting_driver');
++ await query("UPDATE transfer_order_posting_jobs SET snapshot=snapshot||jsonb_build_object('loadId',$2::text) WHERE local_to_id=$1",[f.id,f.load]);
++ const ready=await prepareCompletedYards(job.id,deps(f));
+  await query("UPDATE driver_job_records SET mbt_assignment_withdrawn_at=now() WHERE job_id=$1",[f.drop]);
+  await assert.rejects(assertTransferPostingStepReady(ready.command.steps[0]),/no longer effective/);
+ }));
+@@ -102,8 +123,8 @@
+ test('disabled gates and unfinished fulfillment retain receipt work for Admin',()=>rollback(async()=>{
+  const f=await seed();const loaded=await load(f),received=await receive(f);await deliver(f);
+  await query("UPDATE mbt_feature_flags SET enabled=false WHERE flag_key='operator_netsuite_delivery_prep_if_3445'");
+- assert.equal((await prepareTransferPostingJob(loaded.id,deps(f))).status,'gate_disabled');
+- assert.equal((await prepareTransferPostingJob(received.id,deps(f,'IR'))).status,'waiting_fulfillment');
++ assert.equal((await prepareCompletedYards(loaded.id,deps(f))).status,'gate_disabled');
++ assert.equal((await prepareTransferPostingJobRaw(received.id,deps(f,'IR'))).status,'waiting_fulfillment');
+  const listed=await listTransferPostingJobs();assert.ok(listed.some(j=>j.id===loaded.id&&j.status==='gate_disabled'));
+ }));
+ 
+@@ -128,7 +149,7 @@
+  return {processor,transforms:()=>transforms};
+ }
+ for(const mode of ['success','reject','timeout'])test(`real durable worker ${mode} preserves local quantities and external identity`,()=>rollback(async()=>{
+- const f=await seed(),job=await load(f);await deliver(f);const ready=await prepareTransferPostingJob(job.id,deps(f));
++ const f=await seed(),job=await load(f);await deliver(f);const ready=await prepareCompletedYards(job.id,deps(f));
+  const worker=engine(mode);let result=await worker.processor.process(ready.command.id);
+  if(mode==='reject'){
+   assert.equal(result.status,'failed');assert.equal(Number((await getDeliveryOrder(f.id)).lines[0].loaded_qty),5);
+@@ -143,7 +164,7 @@
+ }));
+ 
+ test('uncertain posting without visible remote evidence cannot transform again on an Admin retry',()=>rollback(async()=>{
+- const f=await seed(),job=await load(f);await deliver(f);const ready=await prepareTransferPostingJob(job.id,deps(f));
++ const f=await seed(),job=await load(f);await deliver(f);const ready=await prepareCompletedYards(job.id,deps(f));
+  const worker=engine('unknown');let result=await worker.processor.process(ready.command.id);
+  assert.equal(result.status,'attention');assert.equal(worker.transforms(),1);
+  await retryTransferPostingJob(job.id);result=await worker.processor.process(ready.command.id);
+@@ -158,11 +179,11 @@
+    VALUES($1,current_date,$2,$2,$3,'drop')`,[f.plan,f.ref,'assigned-load']);
+  const job=await load(f),today=(await query('SELECT current_date::text AS date')).rows[0].date;
+  assert.equal(String(job.snapshot.planId),String(f.plan));assert.equal(job.snapshot.loadId,'assigned-load');assert.equal(job.snapshot.planDate,today);
+- assert.equal((await prepareTransferPostingJob(job.id,deps(f))).status,'waiting_driver');
++ assert.equal((await prepareCompletedYards(job.id,deps(f))).status,'waiting_driver');
+  await query(`INSERT INTO driver_job_records(job_id,plan_id,plan_date,load_id,driver_login,stop_type,order_refs,status,completed_at,job_details)
+    SELECT $2,plan_id,plan_date,'assigned-load',driver_login,stop_type,order_refs,status,completed_at,job_details
+    FROM driver_job_records WHERE job_id=$1`,[f.drop,`${f.drop}-assigned`]);
+- assert.equal((await prepareTransferPostingJob(job.id,deps(f))).status,'admitted');
++ assert.equal((await prepareCompletedYards(job.id,deps(f))).status,'admitted');
+  assert.equal(await assertTransferPostingStepReady({commandId:crypto.randomUUID()}),undefined);
+ }));
+ 
+@@ -185,24 +206,24 @@
+  for(const plan of [f.plan,f.plan+1])await query(`INSERT INTO dispatch_plan_order_assignments(plan_id,plan_date,order_ref,planned_order_ref,load_id)
+    VALUES($1,current_date,$2,$2,$3)`,[plan,f.ref,plan===f.plan?f.load:'other-load']);
+  const job=await load(f);
+- await assert.rejects(prepareTransferPostingJob(job.id,deps(f)),/ambiguous/);
++ await assert.rejects(prepareCompletedYards(job.id,deps(f)),/ambiguous/);
+  assert.equal((await query('SELECT status FROM transfer_order_posting_jobs WHERE id=$1',[job.id])).rows[0].status,'attention');
+  assert.equal(Number((await getDeliveryOrder(f.id)).lines[0].loaded_qty),5);
+ }));
+ 
+ test('pre-admission failures retry only through Admin and scheduler remains local-safe',()=>rollback(async()=>{
+  const f=await seed(),job=await load(f);await deliver(f);
+- await assert.rejects(prepareTransferPostingJob(job.id,{...deps(f),resolveSource:async()=>{throw new Error('Unavailable source');}}));
+- assert.equal((await prepareTransferPostingJob(job.id,deps(f))).status,'attention');
++ await assert.rejects(prepareCompletedYards(job.id,{...deps(f),resolveSource:async()=>{throw new Error('Unavailable source');}}));
++ assert.equal((await prepareCompletedYards(job.id,deps(f))).status,'attention');
+  await retryTransferPostingJob(job.id);const enqueued=[];
+- await transferPostingTick({directAccessEnabled:true,prepare:id=>id===job.id?prepareTransferPostingJob(id,deps(f)):null,enqueue:async id=>enqueued.push(id)});
++ await transferPostingTick({directAccessEnabled:true,prepare:id=>id===job.id?prepareCompletedYards(id,deps(f)):null,enqueue:async id=>enqueued.push(id)});
+  assert.equal(enqueued.length,1);
+  assert.deepEqual(await transferPostingTick({directAccessEnabled:false,enqueue:async()=>assert.fail()}),{discovered:0});
+ }));
+ 
+ test('independent concurrent workers admit exactly one command',async()=>{
+- const f=await seed(),job=await load(f);await deliver(f);
+- const results=await Promise.all([prepareTransferPostingJob(job.id,deps(f)),prepareTransferPostingJob(job.id,deps(f))]);
++ const f=await seed(),job=await load(f);await receive(f);await deliver(f);
++ const results=await Promise.all([prepareCompletedYards(job.id,deps(f)),prepareCompletedYards(job.id,deps(f))]);
+  const commands=results.filter(Boolean).map(r=>r.command.id);
+  assert.equal(new Set(commands).size,1);
+  assert.equal((await query('SELECT id FROM operator_netsuite_posting_commands WHERE request_id=$1',[job.id])).rowCount,1);
+@@ -224,12 +245,12 @@
+ 
+ test('unverified or forged finalization cannot alter the locally saved record',()=>rollback(async()=>{
+  const f=await seed(),job=await receive(f);await deliver(f);
+- const ready=await prepareTransferPostingJob(job.id,deps(f,'IR'));
++ const ready=await prepareCompletedYards(job.id,deps(f,'IR'));
+  await assert.rejects(finalizeTransferPosting(ready.command),/must be verified/);
+  const forged=structuredClone(ready.command);forged.inputSnapshot.transferEvidence.operatorRecordId++;
+  await assert.rejects(finalizeTransferPosting(forged),/does not match/);
+  assert.equal((await query('SELECT item_receipt_id FROM receiving_receipt_records WHERE order_id=$1',[f.id])).rows[0].item_receipt_id,null);
+- assert.equal(await prepareTransferPostingJob(crypto.randomUUID()),null);
++ assert.equal(await prepareCompletedYards(crypto.randomUUID()),null);
+  await assert.rejects(retryTransferPostingJob(crypto.randomUUID()),{status:404});
+ }));
+ 

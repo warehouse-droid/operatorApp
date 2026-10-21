@@ -34,6 +34,12 @@ Create an ignored custom-format PostgreSQL backup:
 powershell -ExecutionPolicy Bypass -File docker/backup-docker-db.ps1
 ```
 
+Full database backups are stored under `backups/production`. The host's daily
+`operatorapp-storage-cleanup` timer retains the five newest full `.dump` backups
+under `backups`, ordered by modification time. Keep partial schema, repair and
+deployment snapshots in `docker/backups`, `operatorapp-deploy-backups` or
+`server/deployments`; those locations are outside full-database retention.
+
 Normal operation:
 
 ```powershell

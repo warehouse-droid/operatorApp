@@ -1,0 +1,34 @@
+{
+  "task": "Prevent loss or excess of quantities when creating dispatch splits",
+  "tier": 3,
+  "specApproval": "not obtained (autonomous run); user explicitly authorized the checking fix",
+  "acceptance": [
+    "An 8432 SQFT source split into 1860 and 2356 is rejected with the 4216 SQFT shortage, without removing the source, saving a plan, or inserting split records.",
+    "An 8432 SQFT source split into 1860 and 6572 succeeds; excess allocation is rejected.",
+    "Validate each source line independently even when SKUs repeat or different lines' shortages and excesses cancel.",
+    "Reject negative, non-finite, missing, duplicate, unknown, or mismatched item/unit identities at the server boundary.",
+    "The split dialog updates its balance warning and confirmation availability as inputs change; confirmation also rechecks the quantities.",
+    "Both legacy snapshot saves and v2 commands reject invalid SO/TO split changes under the existing fleet transaction lock.",
+    "Use authoritative source lines and retained active sibling definitions rather than trusting client totals or supplied source quantities.",
+    "Unchanged existing split definitions and historical records remain usable; already validated unfinished re-splits continue to work.",
+    "Decimal quantities within the existing six-decimal precision, mixed packing units, balanced multi-line splits, and completed sibling history remain supported.",
+    "A rejected request must leave plan revision, snapshots, split definitions, and audit/command receipts unchanged.",
+    "Quantity mismatches return HTTP 409 and must not be archived as successful recovery drafts; normal recovery behavior remains supported.",
+    "Transfer lines lacking a NetSuite line key use their stable local line row identity."
+  ],
+  "failureModel": {
+    "browserBypass": "server integration and HTTP tests for both save paths",
+    "partialWrite": "compare persistent state before and after rejected requests",
+    "staleSourceOrConcurrentChange": "authoritative database quantities plus existing fleet lock; concurrency test",
+    "offsettingLineErrors": "per-line unit, property, and adversarial tests",
+    "falseRejection": "balanced properties, decimals, packing-unit and historical/re-split regressions",
+    "unrelatedDeploymentChanges": "capture running source, patch only scoped files, verify runtime hashes and preserved configuration"
+  },
+  "setup": {
+    "dependencies": "No new dependencies; use existing Node test runner, fast-check, Playwright, c8, ESLint, and TypeScript.",
+    "tests": "Repository isolated Compose configuration, mbbs-tests.slice, bounded memory/CPU/PIDs/tmpfs; register finally teardown before startup.",
+    "git": "Preserve existing workspace changes. No repository-wide reset or commit.",
+    "artifacts": "Store specification, source capture, regression logs, coverage, mutation evidence, and deployment rollback files in existing repository artifact/tool folders.",
+    "deployment": "Publish the verified scoped fix to the live application, preserving production data and service configuration."
+  }
+}

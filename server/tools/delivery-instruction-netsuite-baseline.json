@@ -1,0 +1,13 @@
+{
+  "files": {
+    "src/delivery-instruction-netsuite.js": null,
+    "src/delivery-instruction-repository.js": "185658a05741a8dd8e6880c01bdcc7bc00f5ca5a45987e57eea76aa296ca353d",
+    "src/netsuite.js": "d27da66439d5f8cd2b8e2c7d4973c01f70657853f5dba00dac076d1632d56c3e",
+    "src/server.js": "049f9bf6ab63906893d265d23547bd96bb7aff82e3f4689d5dfea56c85d4b0e3",
+    "public/sales-delivery-instructions.js": "a4d5085b9a3ea8812eabfccb0b50da482ddcdba9b9a6fc6ad0dd7aabf2908ff0",
+    "public/sales-delivery-instructions.html": "22eb7c1ac7d99677cc39eb7282612615a3d94bc5f8e876068e29b1a7b9d8e010",
+    "public/delivery-instructions.css": "ea46da647b0311483d6f1dda51a4b802f70814563d95eaa7ddfdaa24dced450e",
+    "public/i18n.js": "e84a4ba192ca2797263c7c453068f8d50ffe9a7f58ec99b1beeb4c99d563dcbf"
+  },
+  "packageSha256": "192d82c4ff0808e9d93cc924916041caf02d0c0e50398446f5206f804a05e3df"
+}

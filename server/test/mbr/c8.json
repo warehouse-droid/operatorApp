@@ -1,0 +1,1 @@
+{"all":true,"check-coverage":false,"include":["src/mbr/**/*.js","public/mbr/domain.js"],"exclude":[],"reporter":["text","json","json-summary","lcov"],"report-dir":"test-artifacts/mbr-contract/coverage-node","temp-directory":"/tmp/mbr-c8"}

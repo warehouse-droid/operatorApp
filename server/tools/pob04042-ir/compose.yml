@@ -1,0 +1,14 @@
+services:
+  migrate:
+    image: mbbs-operator-app:special-po-warning-20261019
+    build: !reset null
+    labels:
+      com.mbbs.lifecycle: disposable-test
+  test:
+    image: mbbs-operator-app:special-po-warning-20261019
+    build: !reset null
+    labels:
+      com.mbbs.lifecycle: disposable-test
+    volumes:
+      - ./server/tools/pob04042-ir:/app/tools/pob04042-ir:ro
+    command: ["node", "--experimental-test-coverage", "--test", "tools/pob04042-ir/recover.test.mjs"]

@@ -10,6 +10,88 @@ import {
 
 after(closeDb);
 
+async function destinationEditFixture({localFulfilled=0,localReceived=0,priorFulfilled=0,authoritativeFulfilled=0,authoritativeReceived=0}={}) {
+  const {suffix,sourceId,lineKey}=fixtureIdentity();
+  const sourceRef=`TO-DEST-EDIT-${suffix}`;
+  await insertTransferOrder({sourceId,sourceRef,lineKey,fulfilled:localFulfilled,received:localReceived,dispatchPlanned:true});
+  await query("UPDATE transfer_orders SET from_location_id=28,from_location='2967',outbound_operator_status='packed' WHERE netsuite_id=$1",[sourceId]);
+  await query("UPDATE transfer_order_lines SET location_id=28,location='2967',packed_piece_qty=10 WHERE transfer_order_id=$1 AND line_stage='outbound'",[sourceId]);
+  await query(`INSERT INTO scm_transport_schedule(order_kind,source_table,source_id,order_ref,status,created_by,updated_by)
+    VALUES('TO','transfer_orders',$1,$2,'Planned','test','test')`,[sourceId,sourceRef]);
+  await insertPriorState({sourceId,sourceRef});
+  await query("UPDATE scm_reconciliation_order_state SET destination_location_id=1,destination_location='3445',fulfilled_qty=$2 WHERE source_order_netsuite_id=$1 AND order_kind='TO'",[sourceId,priorFulfilled]);
+  const authoritative=authoritativeTransfer({sourceId,sourceRef,lineKey,quantity:10,fulfilled:authoritativeFulfilled,received:authoritativeReceived});
+  authoritative.sourceLocationId=28;authoritative.sourceLocation='2967';
+  authoritative.destinationLocationId=15;authoritative.destinationLocation='12441';
+  for(const line of authoritative.lines) {
+    line.locationId=line.stage==='outbound'?28:15;
+    line.location=line.stage==='outbound'?'2967':'12441';
+  }
+  return {sourceId,sourceRef,lineKey,authoritative};
+}
+
+test('TOB01230 destination edit: planned and packed work with zero movement reconciles without review',()=>inRollback(async()=>{
+  const f=await destinationEditFixture();
+  const before=(await query('SELECT id,loaded_qty,received_sales_qty,packed_piece_qty FROM transfer_order_lines WHERE transfer_order_id=$1 ORDER BY id',[f.sourceId])).rows;
+  const result=await reconcileScmOrderFamily({kind:'TO',sourceOrderId:f.sourceId,source:'manual',dryRun:false,authoritativeOrder:f.authoritative});
+  assert.equal(result.applicationStatus,'Planned');assert.notEqual(result.reconciliationStatus,'review');
+  assert.ok(!result.reason);
+  assert.equal(Number(result.evidence.destinationLocationId),15);
+  assert.equal(Number((await query("SELECT destination_location_id FROM scm_reconciliation_order_state WHERE order_kind='TO' AND source_order_netsuite_id=$1",[f.sourceId])).rows[0].destination_location_id),15);
+  assert.deepEqual((await query('SELECT id,loaded_qty,received_sales_qty,packed_piece_qty FROM transfer_order_lines WHERE transfer_order_id=$1 ORDER BY id',[f.sourceId])).rows,before);
+  assert.equal((await query(`SELECT count(*)::int AS n FROM scm_reconciliation_review_cases c JOIN scm_reconciliation_order_state s ON s.id=c.order_state_id WHERE s.source_order_netsuite_id=$1 AND c.status='open'`,[f.sourceId])).rows[0].n,0);
+}));
+
+test('a synced destination-only TO edit does not require review against an older planned reconciliation snapshot',()=>inRollback(async()=>{
+  const f=await destinationEditFixture();
+  await query("UPDATE transfer_orders SET to_location_id=15,to_location='12441' WHERE netsuite_id=$1",[f.sourceId]);
+  await query("UPDATE transfer_order_lines SET location_id=15,location='12441' WHERE transfer_order_id=$1 AND line_stage='receiving'",[f.sourceId]);
+  const result=await reconcileScmOrderFamily({kind:'TO',sourceOrderId:f.sourceId,source:'manual',dryRun:true});
+  assert.equal(result.applicationStatus,'Planned');assert.notEqual(result.reconciliationStatus,'review');assert.ok(!result.reason);
+}));
+
+test('destination edits after current shipment or receipt progress remain reviewable',()=>inRollback(async()=>{
+  for(const values of [{localFulfilled:2,authoritativeFulfilled:2},{localFulfilled:2,localReceived:1,authoritativeFulfilled:2,authoritativeReceived:1}]) {
+    const f=await destinationEditFixture(values);
+    const result=await reconcileScmOrderFamily({kind:'TO',sourceOrderId:f.sourceId,source:'manual',dryRun:true,authoritativeOrder:f.authoritative});
+    assert.equal(result.reconciliationStatus,'review');assert.match(result.reason,/destination changed/i);
+  }
+}));
+
+test('NetSuite transfer headers showing shipment or receipt progress protect destination edits without local quantities',()=>inRollback(async()=>{
+  for(const [status,statusText] of [['F','Transfer Order : Pending Receipt'],['E','Transfer Order : Pending Receipt/Partially Fulfilled'],
+    ['D','Transfer Order : Partially Fulfilled'],[null,'Transfer Order : Pending Receipt']]) {
+    const f=await destinationEditFixture();
+    f.authoritative.status=status;f.authoritative.statusText=statusText;
+    const result=await reconcileScmOrderFamily({kind:'TO',sourceOrderId:f.sourceId,source:'manual',dryRun:true,authoritativeOrder:f.authoritative});
+    assert.equal(result.reconciliationStatus,'review',statusText);assert.match(result.reason,/destination changed/i);
+  }
+}));
+
+test('previous shipment evidence protects a destination edit when its latest authoritative quantity is zero',()=>inRollback(async()=>{
+  const f=await destinationEditFixture({priorFulfilled:2});
+  const result=await reconcileScmOrderFamily({kind:'TO',sourceOrderId:f.sourceId,source:'manual',dryRun:true,authoritativeOrder:f.authoritative});
+  assert.equal(result.reconciliationStatus,'review');assert.match(result.reason,/destination changed/i);
+}));
+
+test('recorded local yard loads protect a destination edit before their NetSuite fulfillment is observed',()=>inRollback(async()=>{
+  const f=await destinationEditFixture({localFulfilled:2});
+  const result=await reconcileScmOrderFamily({kind:'TO',sourceOrderId:f.sourceId,source:'manual',dryRun:true,authoritativeOrder:f.authoritative});
+  assert.equal(result.reconciliationStatus,'review');assert.match(result.reason,/destination changed/i);
+}));
+
+test('a previously accepted destination-only TO review stays resolved on repeated reconciliation',()=>inRollback(async()=>{
+  const f=await destinationEditFixture();
+  const review=(await query(`INSERT INTO scm_reconciliation_review_cases(case_key,order_state_id,review_code,severity,status,reason,resolved_at,resolved_by,resolution_action,resolution_note)
+    SELECT $2,id,'reconciliation_conflict','blocking','resolved','The destination changed after planning or operational progress.',now(),'fixture','accept','Destination edit accepted'
+    FROM scm_reconciliation_order_state WHERE order_kind='TO' AND source_order_netsuite_id=$1 RETURNING id,status,resolved_at,resolution_action,resolution_note`,[f.sourceId,`accepted-destination-${f.sourceId}`])).rows[0];
+  for(let i=0;i<2;i++) {
+    const result=await reconcileScmOrderFamily({kind:'TO',sourceOrderId:f.sourceId,source:'manual',dryRun:false,authoritativeOrder:f.authoritative});
+    assert.notEqual(result.reconciliationStatus,'review');
+  }
+  assert.deepEqual((await query('SELECT id,status,resolved_at,resolution_action,resolution_note FROM scm_reconciliation_review_cases WHERE id=$1',[review.id])).rows[0],review);
+}));
+
 async function inRollback(operation) {
   const rollback = await beginRollbackContext();
   try {

@@ -97,7 +97,7 @@
   }
   function scm(request,editor) {
     const {t,esc,number}=ui();
-    return `<div class="stock-request-heading"><h2>${esc(request.requestRef)}</h2><span>${t('Delivery','送货')}</span></div>${summary(request)}${progress(request,true)}
+    return `<div class="stock-request-heading"><h2>${esc(request.requestRef)}</h2><span>${t('Delivery','送货')}</span>${window.RegularStockStatus?.render(request) || ''}</div>${summary(request)}${progress(request,true)}
       ${request.regular.deliveryApproval==='pending'&&request.status==='submitted'?`<div class="stock-request-actions"><button class="primary" data-scm-stock-action="approve-stock" type="button">${t('Approve and create TO','批准并建立调货单')}</button><button class="danger" data-scm-stock-action="reject" type="button">${t('Reject','拒绝')}</button></div>`:''}
       ${editor}<section class="stock-request-section"><h3>${t('Transfer quantities','调货数量')}</h3>${request.lines.map(line=>`<article class="stock-request-line"><strong>${esc(line.itemName)}</strong><p>${number(line.salesQty)} ${esc(line.salesUom)}</p>${line.decisionReason?`<p>${esc(line.decisionReason)}</p>`:''}</article>`).join('')}</section>`;
   }

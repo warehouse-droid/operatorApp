@@ -1,0 +1,25 @@
+{
+  "task": "Unilock request line live availability",
+  "tier": 2,
+  "specApproval": "not obtained (autonomous run)",
+  "setup": "Use existing isolated Compose, Node test, Playwright, ESLint, TypeScript, c8 and fast-check. No dependencies, schema migrations or commits.",
+  "behaviors": [
+    "Unilock special and regular backorder requests have Live Stock Check on the right of Line responses; other vendors do not.",
+    "Each eligible line displays its own queued, checking, In stock, Low inventory, Next Production with ISO ETA, unavailable or failed result beside ETA and pickup.",
+    "A result opens that exact job and private evidence, even when older than the latest 30 checks.",
+    "Only exact vendor SKU or a unique complete name/colour/size match is selected automatically; ambiguous descriptions require SCM catalogue selection.",
+    "Selections and results survive reload through job metadata; changed product, quantity or vendor requires a fresh check.",
+    "Concurrent clicks reuse active jobs for the same line and fingerprint; a batch validates atomically and queues at most 100 checks.",
+    "Request lines, manual ETA, pickup, supply decisions, orders and revision remain unchanged.",
+    "Only SCM-authorized users can read or queue checks and evidence; crafted lines, products, fingerprints and non-Unilock vendors are rejected.",
+    "Transient GET failures retry at most twice and record retries; POST actions and semantic failures are never replayed.",
+    "Existing partial shipment postbacks, delayed date navigation, lower availability evidence and zero cart writes remain covered."
+  ],
+  "failureModel": {
+    "wrongVariantOrStaleResult": "Exact matching, SCM selection, immutable line fingerprint, adversarial matching tests",
+    "duplicateOrPartialBatch": "Database transaction, vendor queue lock, concurrent calls and rollback tests",
+    "crossRequestLeak": "SCM router authorization, server-owned request/line/product lookup, browser request-switch race test",
+    "portalInstability": "Bounded read-only retries, recorded diagnostics, adapter fixture failure injection",
+    "hostOrDeployment": "Registered disposable test teardown, bounded Compose, captured live source overlay, exact-image boot and automatic rollback"
+  }
+}

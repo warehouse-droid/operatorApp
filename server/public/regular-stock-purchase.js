@@ -40,7 +40,7 @@
   function detail(request,scm=false,options={}) {
     const pending=request.lines.some(item=>item.status==='submitted');
     const requestStatus=window.RegularStockReply?.status(request)||request.bucket||request.status;
-    return `<div class="stock-request-heading"><div><h2>${esc(request.requestRef)}</h2><p>${t('Stocking · Purchase','备货 · 采购')} · ${esc(request.destinationName)}</p></div><span class="stock-request-pill">${esc(window.RegularStockReply?.label(requestStatus)||status(requestStatus))}</span></div>
+    return `<div class="stock-request-heading"><div><h2>${esc(request.requestRef)}</h2><p>${t('Stocking · Purchase','备货 · 采购')} · ${esc(request.destinationName)}</p></div>${window.RegularStockStatus?.render(request) || `<span class="stock-request-pill">${esc(window.RegularStockReply?.label(requestStatus)||status(requestStatus))}</span>`}</div>
       ${window.RegularStockUI.customer(request)}
       ${request.regular?.resolution?'':`<p class="stock-request-notice">${t('SCM manual review is required. Purchase quantities are rounded up to whole pallets.','须由 SCM 人工审核。采购数量将向上取整至整托盘。')}</p>`}${request.remarks?`<p>${esc(request.remarks)}</p>`:''}
       ${scm&&!request.regular?.resolution?`<div class="stock-request-actions"><button data-scm-stock-action="refresh-evidence" type="button" ${options.busy?'disabled':''}>${t('Refresh stock evidence','刷新库存数据')}</button></div>`:!scm&&!request.firstScmDecisionAt&&pending?`<div class="stock-request-actions"><button data-sales-stock-action="edit" type="button">${t('Edit request','编辑申请')}</button><button class="danger" data-sales-stock-action="cancel" type="button">${t('Cancel request','取消申请')}</button></div>`:''}

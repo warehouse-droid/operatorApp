@@ -1,4 +1,5 @@
 import { specialPackPayload } from '../public/special-stock-line-details.js';
+import { normalizeSalesOrderPackPayload } from '../public/order-pack-quantities.js';
 import {
   specialPurchaseOrderMarker,
   specialSalesOrderMarker
@@ -40,7 +41,7 @@ function itemPayload(line, { purchase = false, netsuiteLocationId } = {}) {
   };
   if (!purchase) {
     payload.price = reference(-1);
-    if (Number(line.itemId) === 2055) Object.assign(payload, specialPackPayload(line));
+    Object.assign(payload, specialPackPayload(line));
   }
   // Transaction units are scalar IDs in REST, unlike item/entity references.
   if (line.unitId) payload.units = String(line.unitId);
@@ -119,7 +120,7 @@ export function buildSpecialSalesOrderPayload({
       addrText: String(draft.deliveryAddress || "").trim()
     };
   }
-  return payload;
+  return normalizeSalesOrderPackPayload(payload);
 }
 
 /** @param {{caseId?:number,vendorId?:number,netsuiteLocationId?:number,subsidiaryId?:string|number|null,salesOrderRef?:string|null,remarks?:string|null,lines?:any[],vendorDiscountReview?:any}} input */

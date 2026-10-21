@@ -1,0 +1,57 @@
+{
+  "tier": 3,
+  "specApproval": "not obtained (autonomous run)",
+  "task": "Prevent failed delivery updates from permanently locking Special requests",
+  "scenarios": [
+    "A Sales Order with one native order-level Custom Discount% query row absent from the REST item sublist supports delivery-header preparation and update, preserving every commercial field.",
+    "Missing, duplicate or foreign material rows still reject before any NetSuite write. Existing financial adjustment readers remain strict.",
+    "Delivery preparation failure without a persisted remote plan is recorded as failed and releases request editing; error, target and audit history remain available.",
+    "Sales can discard an unapplied failed or abandoned delivery attempt without any NetSuite call, with store, revision, journal ownership and active-operation protection.",
+    "An incomplete delivery header remains editable. Saving edited details replaces the old attempt, retains its audit evidence, and uses a new current NetSuite baseline. Explicit Retry retains the original saved target and plan.",
+    "A potentially applied saved plan cannot be silently discarded; retry or explicit replacement remains available. Concurrent operations retain their advisory and row locks.",
+    "Unrelated readiness and historical line-reconciliation warnings do not prevent a delivery-header save. Fulfillment, planning, order-creation and quantity-review guards remain enforced.",
+    "A readiness reminder does not prevent requesting closure. Linked-order fulfillment/billing protections remain unless the user explicitly chooses a separate request-only closure behavior."
+  ],
+  "failureModel": {
+    "commercialDataLoss": "Network-boundary tests assert header-only PATCH and unchanged materials, rates, discounts and order links",
+    "permanentLock": "Preparation failure, retry, replacement and cancellation database/API/browser regressions",
+    "unsafeCancellation": "Saved-plan rejection, scope/revision checks and active-operation lock tests",
+    "concurrentOrStaleSave": "Existing advisory lock plus row revision checks, explicit stale-journal tests",
+    "discountMismatch": "Malformed/duplicate/foreign row examples and generated discount-row cases"
+  },
+  "setup": {
+    "dependencies": [],
+    "git": "Preserve unrelated workspace changes; no commits or reset",
+    "tools": "Existing Node, fast-check, c8, TypeScript, ESLint and Playwright",
+    "tests": "Use standard isolated Compose, mbbs-tests.slice and bounded containers; register teardown first and remove all disposable containers, volumes and networks",
+    "release": "Capture current production image; apply only scoped changes; verify candidate runtime and retain image rollback",
+    "productionData": "Read-only diagnosis; use normal recovery APIs only for explicitly authorized recovery. Do not change NetSuite order lines."
+  },
+  "amendments": [
+    {
+      "reason": "An uncertain remote delivery may already be applied, including when replacing it with pickup.",
+      "scenarios": [
+        "Retain the previous plan as recovery evidence until a replacement is prepared; failed re-preparation stays recoverable and cannot be discarded.",
+        "A replacement pickup re-reads and verifies NetSuite even when the original application method is already pickup."
+      ],
+      "existingAssertionChange": "The legacy pickup preflight failure now expects nonblocking failed status, as explicitly required by scenario 3. All retry/target/idempotence assertions retained."
+    },
+    {
+      "userClarification": "Close SPREQ-000021 and both linked NetSuite orders; do not archive only the application request.",
+      "closureInvestigation": "Readiness is not the stored blocker. Verify safe closure of already fulfilled/billed lines against NetSuite documentation; never change fulfillment, billing, pricing or quantity records."
+    },
+    {
+      "userAuthorization": "Close the request and both SO and PO in NetSuite, preserving posted history.",
+      "scenarios": [
+        "Normal confirmed closure explicitly closes the remaining lines, even when prior fulfillment/receipt or billing exists. Legacy plans retain their stricter semantics.",
+        "Snapshot fulfillment and billing quantities before writing; any concurrent change stops closure before the first write. Only isClosed flags change.",
+        "Readiness reminders neither block Sales requesting closure nor SCM confirmation; reminders disappear after verified closure."
+      ],
+      "documentation": [
+        "https://docs.oracle.com/en/cloud/saas/netsuite/ns-online-help/section_4698204292.html",
+        "https://docs.oracle.com/en/cloud/saas/netsuite/ns-online-help/section_N2415338.html"
+      ],
+      "existingAssertionChange": "Service preparation input now explicitly includes closeRemaining:true; existing identity and commercial preservation assertions retained."
+    }
+  ]
+}

@@ -1,0 +1,15 @@
+# Special Item quantity confirmation and documents
+
+spec approval: not obtained (autonomous run)
+
+User intent: fix the transient exact-reviewed-line error when SCM confirms a Sales quantity change; offer a local MBBS quote from the new request until a real SO exists; preview linked SO and PO inside the application.
+
+- During an issued quantity review, webhook reconciliation accepts the original or exact target quantity only after SCM confirmation and persistence of the remote plan. Each alternative is bound to the case line, remote order and unique line, unchanged item/UOM/description, and saved proposal. Pending, rejected, completed, unrelated and unplanned changes remain strict. Dispatch remains blocked while applying or recovering.
+- SPREQ-000007's existing 500 → 50 review is already approved. Verify both existing orders without resubmission. SPREQ-000006 must remain byte-for-byte unchanged under the existing case fingerprint.
+- Quotes use the existing Field Sales MBBS PDF renderer, company profile, tax and expiry settings. They need no NetSuite estimate, catalog lookup, or write. An unsaved request can preview a draft; a saved request can preview/download its current quote throughout pre-SO stages. Pricing follows current saved Sales quantities, discounts and ancillary charges, never SCM purchase costs. A real SO ends quote availability.
+- The quote endpoints enforce existing login, Sales permissions, yard scope and workflow flag. Previewing must not create a case, order, estimate or quote posting. Saved quote revisions cannot be substituted by request input.
+- SO/PO previews fetch the current authorized case and show linked references, status, parties, exact lines and permitted rates. Sales must not receive purchase costs; SCM may see them. All customer/item text is escaped. Missing or test-skipped orders have no real-order preview.
+- Preview dialogs preserve form edits, provide close/Escape and keyboard focus, handle errors, release blob URLs, and remain usable on desktop and mobile. Quote PDFs can be downloaded.
+- User addition: save SO/PO PDFs after first preview until a local change. Persist a PDF per case/order/audience, keyed by the relevant local order contents and MBBS profile. Repeated previews return the identical saved bytes; audit-only revision changes do not regenerate. Changes to quantities, units, descriptions, prices, parties, status or delivery fields regenerate the next preview. Concurrent first previews generate once. Every cache hit rechecks authorization. Sales PO copies omit purchase prices and must never share SCM PDF bytes. These are app-generated order previews from the locally linked order details, without a NetSuite write or additional PDF RESTlet deployment.
+
+Evidence: real PostgreSQL plus real quantity service/adapter with webhook interleaving; property and negative tests for transition boundaries; authenticated HTTP tests for quote access and no writes; PDF text/layout checks; browser interactions for both audiences; scoped syntax/lint/type, changed-line coverage, mutation and regression checks. Deployment must preserve service configuration and unrelated changes.

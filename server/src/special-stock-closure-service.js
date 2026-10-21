@@ -37,7 +37,7 @@ export function createSpecialClosureService(dependencies = {}) {
             if (kind === 'purchase_order' && !id) continue;
             orders.push({kind,id});
           }
-          plan = await deps.preparePlan({orders});
+          plan = await deps.preparePlan({orders,closeRemaining:true});
         }
         await deps.savePlan(caseId,{reviewId:input.reviewId,plan});
         const result = await deps.applyPlan(plan);

@@ -26,6 +26,14 @@ function readSelectedEnvFileSync() {
   }
 }
 
+/** @param {Record<string, string | undefined>} env */
+function palletBalanceRestletUrl(env) {
+  return String(env.NETSUITE_PALLET_BALANCE_RESTLET_URL
+    ?? (env.NETSUITE_ACCOUNT_ID === "6518947"
+      ? "https://6518947.restlets.api.netsuite.com/app/site/hosting/restlet.nl?script=505&deploy=1"
+      : "")).trim();
+}
+
 function buildConfig(env) {
   const mirrorRole = ["source", "consumer"].includes(String(env.NETSUITE_MIRROR_ROLE || "").trim().toLowerCase())
     ? String(env.NETSUITE_MIRROR_ROLE).trim().toLowerCase()
@@ -135,6 +143,7 @@ function buildConfig(env) {
       authUrl: env.NETSUITE_AUTH_URL,
       tokenUrl: env.NETSUITE_TOKEN_URL,
       restBaseUrl: env.NETSUITE_REST_BASE_URL,
+      palletBalanceRestletUrl: palletBalanceRestletUrl(env),
       scopes: env.NETSUITE_SCOPES || "rest_webservices",
       m2mSettingsPath: path.resolve(env.NETSUITE_M2M_SETTINGS_PATH || path.join(dataDir, "netsuite-m2m-settings.json")),
       m2mMasterKeyPath: path.resolve(env.NETSUITE_M2M_MASTER_KEY_PATH || path.join(dataDir, ".netsuite-m2m-master-key")),

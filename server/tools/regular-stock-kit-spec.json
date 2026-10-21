@@ -1,0 +1,31 @@
+{
+  "tier": 3,
+  "specApproval": "not obtained (autonomous run); user authorized the general fix and SOB121863 TO creation",
+  "acceptance": [
+    "A fully committed single-level kit with hidden components and no stock unit does not block unrelated backordered inventory lines.",
+    "Visible SO lines match SuiteQL by exact line and item identities; only positively identified children of visible kit parents are excluded from REST line counts.",
+    "Hidden components retain stable identities, item types, quantities, units, locations, fulfillment and backorder evidence in the saved SO snapshot.",
+    "Malformed, orphaned, nested, duplicated, visible-as-hidden and location-inconsistent kit components fail before order writes.",
+    "A kit or its inventory components with a positive or unknown backorder requires a clear component-transfer review instead of silently skipping the kit or putting a kit parent on a TO.",
+    "Retry rejects changed kit membership, quantities, units, locations, backorders or fulfillment before TO creation.",
+    "Pickup location changes still verify all visible materials and preserve kit component evidence; PALLET, charges, discounts and subtotal handling remains covered.",
+    "Regular Delivery keeps existing full-line/backorder quantity selection, stock reservations, approval routing and idempotent TO retry behavior.",
+    "The scoped production image contains only this task's runtime changes and retains the live environment, data, worker and unrelated files.",
+    "Retry SOB121863 on its latest attempted route (3445 to 2967), verify the saved and authoritative NetSuite TO identity and report its number."
+  ],
+  "failureModel": {
+    "silently omitted order lines": "exact visible matching and hostile snapshot regressions",
+    "duplicated component stock": "separate visible duplicate-item and hidden child regression/property tests",
+    "unsupported kit TO": "positive and unknown kit/component backorder rejection tests",
+    "changed order during retry": "persisted snapshot integration tests and mutation testing",
+    "duplicate live TO": "existing external ID recovery, serialized request service and authoritative verification",
+    "unrelated deployment changes": "production baseline image overlay, whole-tree hashes and rollback"
+  },
+  "setup": {
+    "newDependencies": [],
+    "gitCommits": false,
+    "testRuntime": "existing mbbs-regular-v2:test image, disposable PostgreSQL database on an internal Docker network",
+    "artifacts": "server/test-artifacts/regular-stock-kit and server/deployments/regular-stock-kit-20261001",
+    "runtimeFiles": ["src/regular-stock-netsuite-adapter.js", "src/regular-stock-delivery-domain.js", "src/regular-stock-domain.js", "src/regular-stock-handoff.js"]
+  }
+}

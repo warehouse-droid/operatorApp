@@ -1,0 +1,7 @@
+[
+  "src/server.js",
+  "public/scm-special-stock-requests.js",
+  "public/special-stock-po-routing.js",
+  "public/scm-stock-requests.html",
+  "src/scm-purchase-order-catalog-repository.js"
+]

@@ -1,0 +1,106 @@
+{
+  "tier": 3,
+  "specApproval": "not obtained (autonomous run)",
+  "scope": "Dispatch freshness after PO/TO linking, groups, splits, ungrouping, further splits and CO changes",
+  "setup": "Existing Node, fast-check, Playwright, ESLint and isolated bounded Compose tools; no new dependencies, commits, production writes or data migrations.",
+  "behaviors": [
+    "Fresh targeted reads bypass the asynchronous catalog and resolve the requested identity.",
+    "Affected order references and related group/split/CO cards refresh even outside the active browse page.",
+    "A read started before a local mutation or plan switch cannot apply afterward; overlapping requests keep the newest result.",
+    "An unchanged compact card preserves hydrated cargo and nested details; a changed card requires fresh detail before planning.",
+    "Authoritative nested group details replace outdated operational fields while local group membership and active driver evidence remain protected.",
+    "Further split returns and adopts a matching revision and digest; the subsequent save is accepted.",
+    "Catalog completion notifies connected Dispatch clients without recursively queuing another catalog refresh.",
+    "Order hydration begins on hover/focus and is coalesced, reducing the need to retry dragging.",
+    "Refresh failures are visible and do not clear the board, overwrite an open link draft, or silently unlock an unverifiable plan.",
+    "After a temporary bootstrap failure, idle polling retries a complete verified snapshot; unsaved or pending mutations block this recovery.",
+    "A slow browse page cannot overwrite a more recent targeted response for the same order.",
+    "Affected cards on another plan date refresh after group and split plan events.",
+    "A compact catalog card with a different content hash is verified against direct local data before it can replace hydrated details, even when the catalog request starts after the mutation.",
+    {
+      "name": "search-pagination-and-legacy-catalog-lag",
+      "given": "A link has completed and full details are verified",
+      "when": "Search, its next page, or the legacy feed returns an older compact card",
+      "then": "Direct verification retains the committed details"
+    },
+    {
+      "name": "data-clear-pending-read",
+      "given": "An order detail request is in flight",
+      "when": "Operational order data is cleared before that request returns",
+      "then": "The old response cannot restore the removed card"
+    },
+    {
+      "name": "http-refresh-identities",
+      "given": "A targeted mutation or further split succeeds",
+      "when": "Its acknowledgement and event are published",
+      "then": "Full details carry a matching signature and events identify the replacement orders"
+    },
+    {
+      "name": "full-day-playwright-replay",
+      "requestedByUser": true,
+      "given": "A fresh isolated application database and two real browser sessions",
+      "when": "A compressed dispatch day performs PO/TO linking and unlinking, split and further split, grouping and ungrouping, unsplit, CO creation/cancellation, drag/drop, undo/redo, saves, reload and confirmation",
+      "then": "Every action persists correctly, quantities are conserved, both sessions converge, retired identities stay retired, and the final plan can be reopened from storage",
+      "test": "test/dispatch/frontend/dispatch-full-day.browser.test.mjs"
+    },
+    {
+      "name": "immediate-selection-actions",
+      "given": "The dispatcher selects a different order",
+      "when": "An order action is clicked before the delayed full render",
+      "then": "The action targets the newly selected order immediately",
+      "test": "dispatch-freshness.browser.test.mjs: immediate order actions"
+    },
+    {
+      "name": "human-action-latency",
+      "requestedByUser": true,
+      "given": "The full-day replay uses actual clicks, typed references and drag gestures",
+      "when": "Each page load, search, selection, link, unlink, split, group, CO, drag and save completes",
+      "then": "Its response wait is recorded separately from typing or dragging, every wait over 1500 ms is marked slow even when functionally successful, and failed actions retain their evidence",
+      "test": "dispatch-full-day.browser.test.mjs: action-timings.csv and Playwright traces"
+    },
+    {
+      "name": "retired-assignment-cache",
+      "given": "A previously assigned group is ungrouped or another derived order is retired",
+      "when": "The pool and assignments refresh",
+      "then": "Its old assignment evidence cannot resolve the retired identity, while unretired child evidence remains available",
+      "test": "dispatch-freshness.browser.test.mjs: locally ungrouped order"
+    },
+    {
+      "name": "new-day-observer-plan-discovery",
+      "given": "A browser opens a day before its first plan exists",
+      "when": "A same-day plan event announces creation by another dispatcher",
+      "then": "The browser loads the new verified snapshot and follows future revisions, without replacing a local unsaved draft",
+      "test": "dispatch-freshness.browser.test.mjs: empty day and unsaved draft; full-day replay second browser"
+    },
+    {
+      "name": "backend-and-both-browsers-without-manual-refresh",
+      "requestedByUser": true,
+      "given": "Two real browser sessions and fresh reads from the isolated application's PostgreSQL-backed endpoints",
+      "when": "PO or TO links change, orders split or further split, groups change, COs change, a drag autosaves, or the plan saves or confirms",
+      "then": "Operational order content including nested group children, retired identities, and saved plan revision, digest and load stops match both browsers without any manual refresh or intervening Save in an order-mutation check; timings share the initiating action's clock and mark convergence over 1500 ms slow",
+      "test": "dispatch-full-day.browser.test.mjs: consistencyChecks and refreshAudit"
+    },
+    {
+      "name": "group-relationship-pickups-survive-rental-projection",
+      "given": "A grouped sales order has committed PO or TO pickups and children based at yard 3445",
+      "when": "The backend applies rental-order decoration to fresh dispatch details",
+      "then": "Ordinary SO groups retain their pickup summary and source address; actual rental groups move their base to 3445 while retaining linked PO/TO pickups, so the backend and browser agree",
+      "test": "dispatch-freshness-sor.test.js and full-day group PO link/unlink consistency"
+    },
+    {
+      "name": "selection-repaint-preserves-active-drag",
+      "given": "The dispatcher begins dragging immediately after selecting an order",
+      "when": "The delayed selection repaint would run while the pointer is held",
+      "then": "The drag source remains mounted and the drop can complete without a second attempt",
+      "test": "dispatch-freshness.browser.test.mjs: selection-drag-source; full-day native dragTo"
+    }
+  ],
+  "failureModel": {
+    "late reads undo mutations": "Deferred-response and randomized interleaving tests",
+    "derived identity resurrection or quantity loss": "Group/split/CO regression suites and retirement assertions",
+    "revision without matching content digest": "Isolated database mutation followed by fenced save",
+    "catalog delay leaves old data": "Fresh-read and catalog-completion event assertions",
+    "refresh storm or slow drag": "Coalescing, bounded concurrency and browser request-count checks",
+    "driver history or unsaved edits overwritten": "Existing save, active evidence and CO preservation suites"
+  }
+}

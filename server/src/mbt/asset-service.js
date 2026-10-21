@@ -854,6 +854,10 @@ export async function reserveAsset(database, input) {
   try {
     return await withAssetTransaction(database, async (client) => {
       const state = await lockAssetState(client, reservation.assetId);
+      const workflowHold = await client.query(
+        "SELECT 1 FROM mbt_bin_workflow_claims WHERE asset_id=$1 AND released_at IS NULL LIMIT 1",
+        [reservation.assetId]);
+      if (workflowHold.rowCount) {throw assetReservationConflict(reservation.assetId);}
       await assertReservationAvailable(client, reservation, state);
       const visit = await assertReservationVisit(client, reservation, state);
       if (reservation.reservationMode === "exact_hold") {

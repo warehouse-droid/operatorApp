@@ -24,6 +24,7 @@ export function splitTargetBrowser(orders = splitTargetOrders(), selection = ["S
     tooltipItemRowsForOrder: target => target.items.map(item => `<span>${item.quantity}</span>`).join(""),
     escapeHtml: value => String(value ?? ""), orderUnitText: () => "pieces",
     orderFootprintPallets: target => target.pallets, orderWeightLbs: target => target.weight,
+    findStop: () => null,
     formatLbs: value => `${value} lbs`,
     isDispatchPlanningRestricted: () => false, isReviewOnlyOrder: () => false,
     isScmReconciliationBlocked: () => false, isSalesOrderReattempt: () => false,

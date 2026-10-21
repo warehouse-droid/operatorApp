@@ -1,9 +1,10 @@
 import assert from "node:assert/strict";
 import { createServer } from "node:http";
-import { readFile, mkdir } from "node:fs/promises";
+import { readFile, mkdir, writeFile } from "node:fs/promises";
 import path from "node:path";
 import test, { before, after } from "node:test";
 import { chromium, webkit } from "playwright";
+import { mutate } from "../../../tools/operator-group-camera-mutants.mjs";
 
 let server, base;
 before(async () => {
@@ -12,7 +13,8 @@ before(async () => {
     const file = name === "/operator" ? "operator.html" : name.slice(1);
     if (file.includes("..")) return res.writeHead(404).end();
     try {
-      const bytes = await readFile(path.resolve("public", file));
+      let bytes = await readFile(path.resolve("public", file));
+      if (file === "operator.js") bytes = mutate(bytes.toString(),process.env.OPERATOR_GROUP_CAMERA_MUTANT);
       res.writeHead(200, { "content-type": { ".html": "text/html", ".js": "text/javascript", ".css": "text/css" }[path.extname(file)] || "application/octet-stream" }).end(bytes);
     } catch { res.writeHead(404).end(); }
   }).listen(0, "127.0.0.1");
@@ -21,21 +23,32 @@ before(async () => {
 });
 after(async () => { if (server) await new Promise((resolve) => server.close(resolve)); });
 
-async function setup(engine, mobile) {
+async function setup(engine, mobile, realVideo = false, android = false) {
   const browser = await engine.launch({ headless: true, args: engine === chromium ? ["--no-sandbox"] : [] });
-  const context = await browser.newContext({ viewport: mobile ? { width: 390, height: 844 } : { width: 1200, height: 900 }, isMobile: mobile, hasTouch: mobile, serviceWorkers: "block" });
+  const context = await browser.newContext({ viewport: mobile ? { width: 390, height: 844 } : { width: 1200, height: 900 }, isMobile: mobile, hasTouch: mobile, serviceWorkers: "block",
+    ...(android ? {userAgent:"Mozilla/5.0 (Linux; Android 14; Tablet) AppleWebKit/537.36 Chrome/140.0.0.0 Safari/537.36"} : {}) });
   const page = await context.newPage();
+  if (engine === chromium && process.env.OPERATOR_CAMERA_COVERAGE) await page.coverage.startJSCoverage({includeRawScriptCoverage:true});
   const errors = [];
   page.on("pageerror", (error) => errors.push(error.message));
   page.setDefaultTimeout(6000);
-  await page.addInitScript(() => {
+  await page.addInitScript((realVideo) => {
     localStorage.setItem("mbbs.staff.token", "auto-camera-test");
     window.EventSource = class { addEventListener() {} close() {} };
-    window.cameraTest = { calls: [], streams: [], pending: [], mode: "success" };
+    window.cameraTest = { calls: [], streams: [], pending: [], mode: "success", constraints: [] };
     const makeStream = () => {
       const entry = { stopped: false };
-      const track = { stop() { entry.stopped = true; }, getSettings: () => ({}), getCapabilities: () => ({}), applyConstraints: async () => {} };
-      const stream = new MediaStream();
+      let stream = new MediaStream();
+      if (realVideo && window.cameraTest.mode !== "starved") {
+        const canvas = document.createElement("canvas"); canvas.width = 320; canvas.height = 240;
+        const paint = () => { canvas.getContext("2d").fillStyle = "#ff4000"; canvas.getContext("2d").fillRect(0, 0, 320, 240); };
+        paint(); entry.timer = setInterval(paint, 50); stream = canvas.captureStream(20);
+      }
+      const realTrack = stream.getVideoTracks()[0];
+      const track = realTrack || { getSettings: () => ({}), getCapabilities: () => ({ width: { max: 8192 }, height: { max: 6144 } }),
+        applyConstraints: async value => window.cameraTest.constraints.push(value) };
+      const stop = realTrack?.stop.bind(realTrack);
+      track.stop = () => { entry.stopped = true; clearInterval(entry.timer); stop?.(); };
       stream.getTracks = stream.getVideoTracks = () => [track];
       window.cameraTest.streams.push(entry);
       return stream;
@@ -50,15 +63,19 @@ async function setup(engine, mobile) {
         return makeStream();
       }
     } });
-    HTMLMediaElement.prototype.play = async () => {};
-    Object.defineProperty(HTMLVideoElement.prototype, "videoWidth", { configurable: true, get: () => 1280 });
-    Object.defineProperty(HTMLVideoElement.prototype, "videoHeight", { configurable: true, get: () => 720 });
+    if (!realVideo) {
+      HTMLMediaElement.prototype.play = async () => {};
+      Object.defineProperty(HTMLVideoElement.prototype, "videoWidth", { configurable: true, get: () => 1280 });
+      Object.defineProperty(HTMLVideoElement.prototype, "videoHeight", { configurable: true, get: () => 720 });
+      Object.defineProperty(HTMLMediaElement.prototype, "readyState", { configurable: true, get: () => 4 });
+      Object.defineProperty(HTMLMediaElement.prototype, "paused", { configurable: true, get: () => false });
+    }
     window.ImageCapture = class { async takePhoto() {
       const canvas = document.createElement("canvas"); canvas.width = 64; canvas.height = 32;
       canvas.getContext("2d").fillRect(0, 0, 64, 32);
       return new Promise((resolve) => canvas.toBlob(resolve, "image/jpeg"));
     } };
-  });
+  }, realVideo);
   await page.route("**/api/**", async (route) => {
     const url = new URL(route.request().url());
     let data = [];
@@ -73,8 +90,152 @@ async function setup(engine, mobile) {
   await page.goto(`${base}/operator`);
   await page.locator('[data-action="open-module"][data-module="delivery"]').waitFor();
   assert.equal(await page.evaluate(() => window.cameraTest.calls.length), 0, "Menu and order lookup do not open a photo camera.");
-  return { browser, context, page, errors, close: async () => { await context.close(); await browser.close(); } };
+  return { browser, context, page, errors, close: async () => {
+    if (engine === chromium && process.env.OPERATOR_CAMERA_COVERAGE) {
+      const rows = (await page.coverage.stopJSCoverage()).filter(row => row.url.includes("/operator.js?"));
+      await mkdir("test-artifacts/operator-group-camera/browser-coverage",{recursive:true});
+      await writeFile(`test-artifacts/operator-group-camera/browser-coverage/${Date.now()}.json`,JSON.stringify(rows));
+    }
+    await context.close(); await browser.close();
+  } };
 }
+
+for (const [name, engine, mobile] of [["desktop", chromium, false], ["touch", webkit, true]]) {
+  test(`${name}: live photo preview survives screen rerenders without replacing its video`, async () => {
+    const run = await setup(engine, mobile, true), { page } = run;
+    try {
+      await enter(page, "delivery");
+      await page.waitForFunction(() => document.getElementById("fulfillmentCamera")?.readyState >= 2);
+      await page.evaluate(() => { window.previewBefore = document.getElementById("fulfillmentCamera"); render(); render(); render(); });
+      assert.equal(await page.evaluate(() => window.previewBefore === document.getElementById("fulfillmentCamera")), true,
+        "Keep the playing element while updating the photo screen");
+      await page.waitForFunction(() => document.getElementById("fulfillmentCamera")?.readyState >= 2);
+      const red = await page.evaluate(() => {
+        const canvas = document.createElement("canvas"); canvas.width = canvas.height = 1;
+        const ctx = canvas.getContext("2d"); ctx.drawImage(document.getElementById("fulfillmentCamera"),0,0,1,1);
+        return ctx.getImageData(0,0,1,1).data[0];
+      });
+      assert(red > 200, "The preview contains actual frames, not a black element");
+      await page.locator('[data-action="stop-camera"]').click();
+      assert.equal(await page.evaluate(() => window.cameraTest.streams.every(stream => stream.stopped)), true);
+      assert.equal(await page.evaluate(() => window.previewBefore.srcObject), null);
+      assert.deepEqual(run.errors, []);
+    } finally { await run.close(); }
+  });
+}
+
+test("photo preview uses bounded tablet video dimensions without promoting to sensor maximum", async () => {
+  const run = await setup(chromium, false), { page } = run;
+  try {
+    await enter(page, "receipt-po");
+    await page.locator("#receiptCamera").waitFor();
+    const state = await page.evaluate(() => window.cameraTest);
+    assert(state.calls.every(call => call.video.width.ideal <= 1920 && call.video.height.ideal <= 1080));
+    assert(state.constraints.every(value => !value.width || value.width.ideal <= 1920));
+  } finally { await run.close(); }
+});
+
+test("missing camera frames retry once at a lower resolution then show an error", async () => {
+  const run = await setup(chromium, false, true), { page } = run;
+  try {
+    await page.evaluate(() => { window.cameraTest.mode = "starved"; });
+    await enter(page, "delivery");
+    await page.waitForFunction(() => window.cameraTest.calls.length === 2, null, { timeout: 7000 });
+    const calls = await page.evaluate(() => window.cameraTest.calls);
+    assert(calls[1].video.width.ideal < calls[0].video.width.ideal);
+    await page.locator("#toast").getByText(/preview.*(start|frame)|camera.*(restart|retry)/i).waitFor({ timeout: 7000 });
+    assert.equal(await page.locator("#fulfillmentCamera").count(), 0);
+    assert.equal(await page.evaluate(() => window.cameraTest.streams.every(stream => stream.stopped)), true);
+    await page.evaluate(() => { render(); render(); });
+    assert.equal(await page.evaluate(() => window.cameraTest.calls.length), 2);
+    assert.deepEqual(run.errors, []);
+  } finally { await run.close(); }
+});
+
+test("closing a stalled preview cancels its pending recovery", async () => {
+  const run = await setup(chromium, false, true), { page } = run;
+  try {
+    await page.evaluate(() => { window.cameraTest.mode = "starved"; });
+    await enter(page, "delivery");
+    await page.locator("#fulfillmentCamera").waitFor();
+    await page.locator('[data-action="stop-camera"]').click();
+    await page.waitForTimeout(4500);
+    assert.equal(await page.evaluate(() => window.cameraTest.calls.length),1);
+    assert.equal(await page.locator("#fulfillmentCamera").count(),0);
+  } finally { await run.close(); }
+});
+
+test("playback rejection recovers and stale playback rejection cannot close a new camera", async () => {
+  const run = await setup(chromium, false), { page } = run;
+  try {
+    await page.evaluate(() => {
+      HTMLMediaElement.prototype.play = function() {
+        if (window.cameraTest.calls.length === 1) return Promise.reject(new Error("Preview failed"));
+        return Promise.resolve();
+      };
+    });
+    await enter(page,"delivery");
+    await page.waitForFunction(() => window.cameraTest.calls.length === 2 && fulfillmentCameraActive);
+    assert.equal(await page.evaluate(() => window.cameraTest.streams[0].stopped),true);
+    assert.equal(await page.evaluate(() => window.cameraTest.streams[1].stopped),false);
+    await page.locator('[data-action="stop-camera"]').click();
+    await page.evaluate(() => { HTMLMediaElement.prototype.play = () => new Promise((_, reject) => { window.rejectOldPlayback = reject; }); });
+    await page.locator('[data-action="start-camera"]').click();
+    await page.waitForFunction(() => window.rejectOldPlayback);
+    await page.locator('[data-action="stop-camera"]').click();
+    await page.evaluate(() => { HTMLMediaElement.prototype.play = async () => {}; });
+    await page.locator('[data-action="start-camera"]').click();
+    await page.locator("#fulfillmentCamera").waitFor();
+    await page.evaluate(() => window.rejectOldPlayback(new Error("Old preview failed")));
+    await page.waitForTimeout(150);
+    assert.equal(await page.evaluate(() => window.cameraTest.calls.length),4);
+    assert.equal(await page.evaluate(() => window.cameraTest.streams.filter(stream => !stream.stopped).length),1);
+    assert.deepEqual(run.errors,[]);
+  } finally { await run.close(); }
+});
+
+test("video fallback capture refuses a live track without a ready frame", async () => {
+  const run = await setup(chromium,false,true), { page } = run;
+  try {
+    await page.evaluate(() => { window.ImageCapture = undefined; window.cameraTest.mode = "starved"; });
+    await enter(page,"delivery");
+    await page.locator("#fulfillmentCamera").waitFor();
+    const error = await page.evaluate(async () => {
+      try { await captureCameraPhotoDataUrl(fulfillmentCameraStream,document.getElementById("fulfillmentCamera")); return "captured"; }
+      catch (failure) { return failure.message; }
+    });
+    assert.match(error,/not ready/i);
+  } finally { await run.close(); }
+});
+
+test("Android bottom actions stay above navigation space as the visible viewport changes", async () => {
+  const run = await setup(chromium,true,false,true), {page}=run;
+  try {
+    await page.setViewportSize({width:1000,height:800});
+    await enter(page,"receipt-po");
+    await page.locator("#receiptCamera").waitFor();
+    assert.equal(await page.evaluate(() => parseFloat(getComputedStyle(document.getElementById("app")).paddingBottom)),15,
+      "Keep the normal 15 px gap inside the usable screen");
+    await page.evaluate(() => {
+      window.previewBefore=document.getElementById("receiptCamera");
+      document.documentElement.style.setProperty("--operator-bottom-inset","24px");
+      Object.defineProperty(window.visualViewport,"height",{configurable:true,get:()=>560});
+      window.visualViewport.dispatchEvent(new Event("resize"));
+    });
+    await page.waitForFunction(() => document.getElementById("app").getBoundingClientRect().bottom <= 536);
+    const bounds=await page.evaluate(() => {
+      const action=document.querySelector('[data-action="confirm-receive"]');
+      return {bottom:action.getBoundingClientRect().bottom,unchanged:window.previewBefore===document.getElementById("receiptCamera")};
+    });
+    assert(bounds.bottom<=560-24-15,"The actual bottom action must remain above the bar with 15 px clearance");
+    assert(bounds.unchanged,"Viewport updates must not rebuild the playing camera");
+    await page.evaluate(() => {delete window.visualViewport.height;document.documentElement.style.removeProperty("--operator-bottom-inset");window.visualViewport.dispatchEvent(new Event("resize"));});
+    await page.waitForFunction(() => document.getElementById("app").getBoundingClientRect().height>700);
+    await mkdir("test-artifacts/operator-group-camera",{recursive:true});
+    await page.screenshot({path:"test-artifacts/operator-group-camera/android-bottom.png",fullPage:true});
+    assert.deepEqual(run.errors,[]);
+  } finally {await run.close();}
+});
 
 async function enter(page, kind) {
   await page.evaluate(async (kind) => {

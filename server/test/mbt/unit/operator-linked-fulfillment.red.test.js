@@ -157,7 +157,7 @@ test("L5 Delivery SO loading is local-only even when the old Delivery Prep IF ga
   assert.equal(commandCreates, 0);
 });
 
-test("L5/L12 target ownership is Driver completion only for Delivery SOs", async () => {
+test("L5/L12 Delivery SO and TO posting requires Driver completion", async () => {
   const orders = new Map([
     ["101", {
       netsuite_id: 101,
@@ -193,10 +193,10 @@ test("L5/L12 target ownership is Driver completion only for Delivery SOs", async
   const transfer = await resolve({ functionKey: "delivery_prep", orderId: 201, deferTargets: true });
   assert.equal(delivery.netSuitePostingOwner, "driver_completion");
   assert.equal(pickup.netSuitePostingOwner, "operator");
-  assert.equal(transfer.netSuitePostingOwner, "operator");
+  assert.equal(transfer.netSuitePostingOwner, "transfer_background");
 });
 
-test("L12 Customer Pickup SO and native TO Delivery Prep keep Operator NetSuite ownership", async () => {
+test("L12 Legacy Operator-owned commands retain recovery admission support", async () => {
   const seen = [];
   const admit = createOperatorNetSuitePostingAdmission({
     resolveTargets: async (input) => ({

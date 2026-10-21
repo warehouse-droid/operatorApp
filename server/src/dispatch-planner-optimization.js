@@ -1,4 +1,5 @@
 import { dispatchOrderFirstSeenAt, dispatchOrderSourceDate } from "./dispatch-order-recency.js";
+import { createHash } from "node:crypto";
 
 const DISPATCH_PLANNER_MODES = new Set(["off", "shadow", "on"]);
 const CARD_ITEM_LIMIT = 8;
@@ -109,6 +110,9 @@ export function compactDispatchOrderCard(order = {}) {
     .map(compactCardItem);
   card.itemCount = Array.isArray(order.items) ? order.items.length : 0;
   card.catalogHydrated = false;
+  const detail = Object.fromEntries(Object.entries(order)
+    .filter(([key]) => !["catalogHydrated", "catalogDetailSignature"].includes(key)));
+  card.catalogDetailSignature = createHash("sha256").update(stableJson(detail)).digest("hex");
   return card;
 }
 

@@ -8,6 +8,8 @@ import {app} from '../src/server.js';
 import {query,closeDb} from '../src/db.js';
 import {createOperator,loginOperator} from '../src/auth-repository.js';
 import {createCountSheet} from '../src/count-sheet-repository.js';
+import {refreshCountSheetInventory} from '../src/count-sheet-stock-refresh.js';
+import {confirmFreshCycleCount} from '../src/cycle-count-stock-refresh.js';
 let server,base,browser,op,manager;
 const coverage=[];
 const sku={item_id:980400,item_name:'Browser Paver',item_description:'40 pieces per pallet',item_type:'InvtPart',location_id:1,stock_unit:'PCS',sales_unit:'PCS',sales_unit_id:191,to_plt:40,to_pcs:1};
@@ -16,7 +18,7 @@ before(async()=>{
   for(const role of ['operator','yard_manager']) {
     const username=`inventory-browser-${crypto.randomUUID()}`,password=crypto.randomUUID();
     const actor=await createOperator({username,password,displayName:role,role,operatorYardLocationIds:[1],yardLocationIds:[1]});
-    const session={actor,...await loginOperator(username,password)};if(role==='operator')op=session;else manager=session;
+    const session={actor,...await loginOperator(username,password)};if(role==='operator'){op=session;}else {manager=session;}
   }
   await query("INSERT INTO inventory_items(item_id,item_name,item_description,item_type,stock_unit,to_plt,to_pcs) VALUES(980400,'Browser Paver','40 pieces per pallet','InvtPart','PCS',40,1) ON CONFLICT DO NOTHING");
   await query('INSERT INTO inventory_balances(item_id,location_id,quantity_on_hand,quantity_available) VALUES(980400,1,400,400) ON CONFLICT DO NOTHING');
@@ -28,6 +30,22 @@ async function pageFor(session,path) {
   const context=await browser.newContext({viewport:{width:1280,height:800},serviceWorkers:'block',permissions:['camera']});
   await context.addInitScript(token=>localStorage.setItem('mbbs.staff.token',token),session.token);
   const page=await context.newPage();page.setDefaultTimeout(6000);await page.coverage.startJSCoverage({resetOnNavigation:false});
+  await page.route('**/api/count-sheets/*/refresh-inventory',async route=>{
+    assert.equal(route.request().method(),'POST');
+    const id=new URL(route.request().url()).pathname.split('/').at(-2);
+    const refreshed=await refreshCountSheetInventory(session.actor,id,{fetchBalances:async(items,yards)=>{
+      assert.deepEqual(items,[sku.item_id]);assert.deepEqual(yards,[1]);
+      return [{...sku,quantity_on_hand:400,quantity_available:400}];
+    }});
+    await route.fulfill({json:refreshed});
+  });
+  await page.route('**/api/cycle-count/lines',async route=>{
+    const result=await confirmFreshCycleCount(session.actor,route.request().postDataJSON(),{fetchBalances:async(items,yards)=>{
+      assert.deepEqual(items,[sku.item_id]);assert.deepEqual(yards,[1]);
+      return [{...sku,quantity_on_hand:400,quantity_available:400}];
+    }});
+    await route.fulfill({json:result});
+  });
   await page.goto(base+path);return {page,context};
 }
 async function finish(page,context,name) {
@@ -40,7 +58,7 @@ test('K2/C2-C3: operator takes sheet, calculates 108 PLT and submits',async()=>{
   await page.locator('button[data-module="inventory"]').click();await page.locator('button[data-module="count-sheets"]').click();
   await page.locator(`[data-inv-action="take"][data-id="${sheet.id}"]`).click();
   await page.locator(`[data-inv-action="count-item"][data-id="${sku.item_id}"]`).click();
-  for(const key of ['1','2','×','9','=']) await page.locator(`[data-inv-action="count-key"][data-key="${key}"]`).click();
+  for(const key of ['1','2','×','9','=']) {await page.locator(`[data-inv-action="count-key"][data-key="${key}"]`).click();}
   await expect(page.locator('[data-count-value="pallets"]')).toHaveText('108');
   const width=await page.locator('.cycle-grid .selected-panel').evaluate(e=>e.getBoundingClientRect().width);assert.equal(Math.round(width),360);
   await page.screenshot({path:'test-artifacts/operator-inventory-calculator.png',fullPage:true});
@@ -56,10 +74,10 @@ test('K1/K2/R1: existing cycle count preserves units, validates calculations and
   await page.locator('#cycleSearch').fill('Browser Paver');
   await page.locator('[data-action="select-inventory-item"][data-item="980400"]').click();
   const key=async value=>page.locator(`[data-action="cycle-key"][data-key="${value}"]`).click();
-  for(const value of ['1','2','×','9','=']) await key(value);
+  for(const value of ['1','2','×','9','=']) {await key(value);}
   await expect(page.locator('[data-cycle-display="cycle-pallets"]')).toHaveText('108');
   await page.locator('[data-action="select-cycle-unit"][data-unit="cycle-pieces"]').click();
-  for(const value of ['5','−','7']) await key(value);
+  for(const value of ['5','−','7']) {await key(value);}
   await page.locator('[data-action="confirm-cycle-line"]').click();
   await expect(page.locator('[data-action="confirm-cycle-line"]')).toBeVisible();
   await key('Clear');await key('2');

@@ -1,6 +1,18 @@
 import { specialPurchaseOrderDisplayRef } from './special-stock-po-reference.js';
-import { specialSalesOrderFulfilled } from './special-stock-workflow.js';
+import { specialSalesOrderFulfilled, specialPurchaseOrderDispatchReady } from './special-stock-workflow.js';
 const escape = value => String(value ?? '').replace(/[&<>"']/g, char => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[char]));
+
+/** @param {Record<string,any>} detail */
+export function specialSupplyWaitingStatus(detail) {
+  if (['dispatch_arrangement','completed','closed'].includes(detail.stage)
+      || detail.purchaseOrderId && specialPurchaseOrderDispatchReady(detail)) return '';
+  const statuses = new Set((detail.lines || []).filter(line => !line.removedAt
+    && !['declined','closed'].includes(line.salesDecision)).map(line => line.supplyStatus));
+  const labels = [['vendor_transfer','Waiting for Transfer'],['production','Waiting for Production']]
+    .filter(([status]) => statuses.has(status))
+    .map(([status,label]) => `<span class="stock-request-pill stock-request-waiting" data-stock-request-waiting="${status}">${label}</span>`);
+  return labels.join('');
+}
 
 export function specialClosureNeedsScm(detail) {
   return detail.closeStatus === 'closure_pending' && Boolean(detail.closureReview?.id)
@@ -96,8 +108,8 @@ function orderProgress(detail, label, state, skipped, compact, audience) {
     arrival: !compact && state?.planned ? `Est. arrival: ${arrivals.join(', ') || 'Not available'}` : '' };
 }
 
-/** @param {Record<string,any>} detail @param {PlanningOrder} value @param {boolean} compact @param {{audience:string,showOrderPreviews:boolean}} options */
-function planningOrderCard(detail, value, compact, { audience, showOrderPreviews }) {
+/** @param {Record<string,any>} detail @param {PlanningOrder} value @param {boolean} compact @param {{audience:string,showOrderPreviews:boolean,purchaseOrderActions:string}} options */
+function planningOrderCard(detail, value, compact, { audience, showOrderPreviews, purchaseOrderActions }) {
   const [label, id, state, reference, kind, skipped] = value;
   const progress = orderProgress(detail, label, state, skipped, compact, audience);
   const tag = compact ? 'span' : 'div';
@@ -108,11 +120,12 @@ function planningOrderCard(detail, value, compact, { audience, showOrderPreviews
     ${completed ? `<small class="special-planning-completed-time">${completed}</small>` : ''}
     ${!compact && audience !== 'sales' && nativeStatus ? `<small>NetSuite: ${escape(nativeStatus)}</small>` : ''}
     ${progress.arrival ? `<small class="special-planning-eta">${escape(progress.arrival)}</small>` : ''}</span>
-    ${preview ? `<button type="button" data-special-document="${kind}" data-case-id="${escape(detail.id)}">Preview ${label}</button>` : ''}</${tag}>`;
+    ${preview ? `<button type="button" data-special-document="${kind}" data-case-id="${escape(detail.id)}">Preview ${label}</button>` : ''}
+    ${label === 'PO' && audience === 'scm' && !compact && id && !skipped ? purchaseOrderActions : ''}</${tag}>`;
 }
 
 /** @param {Record<string,any>} detail */
-export function specialPlanningStatus(detail, compact = false, { showOrderPreviews = false, audience = 'scm', showApprovalNotice = true } = {}) {
+export function specialPlanningStatus(detail, compact = false, { showOrderPreviews = false, audience = 'scm', showApprovalNotice = true, purchaseOrderActions = '' } = {}) {
   const notice = showApprovalNotice && detail.purchaseOrderId && detail.purchaseOrderApproved === false && !['closed','completed'].includes(detail.stage)
     ? `<div class="stock-request-notice" role="status">${detail.purchaseOrderPendingApproval ? 'PO approval pending' : 'PO approval not confirmed'}${compact ? '' : ' — request remains Confirmed until NetSuite approval. Status updates automatically.'}</div>` : '';
   const planning = detail.dispatchPlanning;
@@ -120,7 +133,7 @@ export function specialPlanningStatus(detail, compact = false, { showOrderPrevie
   const values = [['SO', detail.salesOrderId, planning?.salesOrder, detail.salesOrderRef, 'sales_order', detail.salesOrderSkipped],
     ['PO', detail.purchaseOrderId, planning?.purchaseOrder, specialPurchaseOrderDisplayRef(detail), 'purchase_order', detail.purchaseOrderSkipped]];
   if (audience === 'sales' || showOrderPreviews && !compact) {
-    const orders = values.filter(([, id, , , , skipped]) => id || skipped).map(value => planningOrderCard(detail, value, compact, { audience, showOrderPreviews }));
+    const orders = values.filter(([, id, , , , skipped]) => id || skipped).map(value => planningOrderCard(detail, value, compact, { audience, showOrderPreviews, purchaseOrderActions }));
     if (!orders.length) return notice;
     const tag = compact ? 'span' : 'div';
     const salesClasses = audience === 'sales' ? ` special-sales-planning${compact ? ' is-compact' : ' special-sales-order-documents'}` : '';
@@ -151,7 +164,7 @@ export function specialClosureStatus(detail, audience) {
   const notice = `<p><strong>${message}</strong></p><p>${escape(detail.closureReason)}</p>${review.error ? `<p class="stock-request-error">${escape(review.error)}</p>` : ''}`;
   if (audience !== 'scm') return `<section class="stock-request-notice">${notice}</section>`;
   return `<section class="stock-request-section"><form class="stock-request-form" data-special-closure-review-form>${notice}
-    <p>Confirmation closes ${escape(detail.salesOrderRef)} and ${escape(detail.purchaseOrderRef)} in NetSuite and cancels this request locally.</p>
+    <p>Confirmation closes ${escape(detail.salesOrderRef)} and ${escape(detail.purchaseOrderRef)} in NetSuite and cancels this request locally. Remaining fulfillment and billing are cancelled; existing fulfillments, receipts and invoices are kept. Readiness reminders do not prevent closure.</p>
     <label><span>Review note</span><input name="reason" /></label><div class="stock-request-actions">
       <button class="danger" type="submit" value="approve">${review.status === 'pending' ? 'Confirm closure of SO and PO' : 'Retry closure of SO and PO'}</button>
       ${!review.remoteStarted && review.status !== 'applying' ? '<button type="submit" value="reject">Reject closure</button>' : ''}

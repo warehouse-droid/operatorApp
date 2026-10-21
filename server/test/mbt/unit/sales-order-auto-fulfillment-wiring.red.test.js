@@ -6,7 +6,7 @@ import test from "node:test";
 
 const source = (relativePath) => readFile(new URL(`../../../${relativePath}`, import.meta.url), "utf8");
 
-test("L5/L12 Delivery SO ownership changes without changing Customer Pickup or native TO ownership", async () => {
+test("L5/L12 Sales Order delivery defers to Driver completion; TO milestones use background posting", async () => {
   const [admission, targets] = await Promise.all([
     source("src/operator-netsuite-posting-admission.js"),
     source("src/operator-netsuite-posting-targets.js")
@@ -15,7 +15,7 @@ test("L5/L12 Delivery SO ownership changes without changing Customer Pickup or n
   assert.match(admission, /reason: "driver_completion_owned"/u);
   assert.match(targets, /const netSuitePostingOwner = functionKey === "delivery_prep"/u);
   assert.match(targets, /\? "driver_completion"[\s\S]*: "operator"/u);
-  assert.match(targets, /order_type === "sales_order"/u);
+  assert.match(targets, /"transfer_background"/u);
 });
 
 test("L6/L10 the scheduler is wired only to a Sales Order Item Fulfillment", async () => {

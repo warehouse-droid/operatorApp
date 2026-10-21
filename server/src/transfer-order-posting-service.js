@@ -72,7 +72,8 @@ export async function prepareTransferPostingJob(id,{resolveSource=resolveTransfe
       const admission=await transferAdmissionInput(job,record.photo_data_urls);
       const draft=buildTransferPostingDraft({...job,snapshot:admission.snapshot},source,policy,event);
       const created=await createOrReplayOperatorNetSuitePostingCommand(draft);
-      const completionIds=(event.linkedEvents || [event]).map((/** @type {Record<string,any>} */ e)=>String(e.id)).sort();
+      const completionIds=(event.linkedEvents || [event]).filter((/** @type {Record<string,any>} */ e)=>e.id!==null)
+        .map((/** @type {Record<string,any>} */ e)=>String(e.id)).sort();
       await query(`UPDATE transfer_order_posting_jobs SET command_id=$2,completion_event_id=$3,status='admitted',last_error=NULL,
         snapshot=snapshot||jsonb_build_object('completionEventIds',$4::jsonb)
           ||CASE WHEN $5::jsonb IS NULL THEN '{}'::jsonb ELSE jsonb_build_object('verifiedFulfillment',$5::jsonb) END,updated_at=now() WHERE id=$1`,
@@ -102,7 +103,7 @@ export async function retryTransferPostingJob(id) {
         await query('UPDATE operator_netsuite_posting_order_claims SET active=true,released_at=NULL WHERE command_id=$1',[job.command_id]);
         await query("UPDATE operator_netsuite_posting_commands SET status='queued',last_error=NULL,updated_at=now() WHERE id=$1",[job.command_id]);
       }
-    } else {await waitFor(id,'waiting_driver');}
+    } else {await waitFor(id,job.snapshot.driverTarget || job.snapshot.linkError?'waiting_driver':'waiting_posting');}
     return job;
   });
 }

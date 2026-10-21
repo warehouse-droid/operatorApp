@@ -1,0 +1,9 @@
+services:
+  db:
+    image: sha256:9a8afca54e7861fd90fab5fdf4c42477a6b1cb7d293595148e674e0a3181de15
+  migrate:
+    image: sha256:90e464f59cc28aecfbb1ae9208a0e088120aa903f04ebc6d2a97a03e5662e5cd
+  test:
+    image: sha256:90e464f59cc28aecfbb1ae9208a0e088120aa903f04ebc6d2a97a03e5662e5cd
+    volumes:
+      - /home/ubuntu/apps/operatorApp/server/test:/app/test:ro

@@ -1,0 +1,15 @@
+import assert from 'node:assert/strict';
+import { spawnSync } from 'node:child_process';
+import { readFileSync, writeFileSync } from 'node:fs';
+import { createHash } from 'node:crypto';
+const out = '/app/test-artifacts/special-workflow-review/line-decline-20261003';
+assert.equal(process.env.MBT_TEST_ISOLATED, '1');
+const tests = ['test/mbt/unit/special-line-decline.test.js', 'test/mbt/integration/special-line-decline-http.test.js', 'test/mbt/integration/special-line-decline-browser.test.js'];
+const result = spawnSync(process.execPath, ['--test', '--test-concurrency=1', ...tests], { env: process.env, encoding: 'utf8', timeout: 180000, maxBuffer: 10000000 });
+const log = (result.stdout || '') + (result.stderr || ''); writeFileSync(out + '/release-app-tests.log', log);
+assert.equal(result.status, 0, log.slice(-8000));
+const counts = Object.fromEntries(['tests', 'pass', 'fail', 'skipped'].map(key => [key, Number(log.match(new RegExp(`^# ${key} (\\d+)$`, 'm'))?.[1] || 0)]));
+const files = JSON.parse(readFileSync('tools/special-line-decline-files.json'));
+const sourceHashes = Object.fromEntries(files.map(file => [file, createHash('sha256').update(readFileSync(file)).digest('hex')]));
+writeFileSync(out + '/release-app-checks.json', JSON.stringify({ passed: true, results: [counts], sourceHashes }, null, 2));
+console.log(JSON.stringify(counts));

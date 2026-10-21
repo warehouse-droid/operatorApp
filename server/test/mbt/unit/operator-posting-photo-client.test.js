@@ -10,7 +10,7 @@ function functionText(name, next) {
 }
 const photos = ["data:image/jpeg;base64,cGhvdG8x", "data:image/jpeg;base64,cGhvdG8y"];
 
-test("delivery Sales Orders remain local operations owned by driver completion", () => {
+test("Delivery Prep SOs, TOs and groups save locally for background posting", () => {
   const start = source.indexOf("function operatorNetSuitePostingIsLocalOnly(");
   const fn = source.slice(start, source.indexOf("async function loadOperatorNetSuitePostingPolicy(", start));
   const context = vm.createContext({});
@@ -18,9 +18,9 @@ test("delivery Sales Orders remain local operations owned by driver completion",
   const local = context.operatorNetSuitePostingIsLocalOnly;
   assert.equal(local({ order_type: "sales_order" }, "delivery_prep"), true);
   assert.equal(local({ order_type: "sales_order" }, "customer_pickup"), false);
-  assert.equal(local({ order_type: "transfer_order" }, "delivery_prep"), false);
+  assert.equal(local({ order_type: "transfer_order" }, "delivery_prep"), true);
   assert.equal(local({ is_dispatch_group: true, child_orders: [{ order_type: "sales_order" }, { order_type: "co_order" }] }, "delivery_prep"), true);
-  assert.equal(local({ is_dispatch_group: true, child_orders: [{ order_type: "sales_order" }, { order_type: "transfer_order" }] }, "delivery_prep"), false);
+  assert.equal(local({ is_dispatch_group: true, child_orders: [{ order_type: "sales_order" }, { order_type: "transfer_order" }] }, "delivery_prep"), true);
 });
 
 for (const kind of ["delivery", "pickup", "receiving"]) {

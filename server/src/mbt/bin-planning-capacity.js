@@ -12,13 +12,25 @@ export async function assertPlanningCapacity(plan) {
     .flatMap((/** @type {any} */ l) => l.stops || []).map((/** @type {any} */ s) => s.mbt?.visitId).filter(Boolean))];
   if (!visits.length) {return true;}
   const steps = await query(`SELECT v.service_visit_id::text,v.actual_started_at,v.planned_truck_id::text,
-      v.service_action,s.action_code,s.status,a.bin_type_id=v.bin_type_id AS type_matches,COALESCE(s.expected_asset_id,v.expected_asset_id,v.outgoing_asset_id)::text AS expected_asset_id,a.tare_weight_kg,b.maximum_payload_kg,
+      v.service_action,v.service_snapshot->'binWorkflow' AS bin_workflow,m.movement_type,
+      s.action_code,s.status,a.bin_type_id=v.bin_type_id AS type_matches,COALESCE(s.expected_asset_id,v.expected_asset_id,v.outgoing_asset_id)::text AS expected_asset_id,a.tare_weight_kg,b.maximum_payload_kg,
       st.location_kind,st.truck_id::text,st.lifecycle_status,a.active,a.under_maintenance,
-      st.customer_site_profile_id::text,v.customer_site_profile_id::text AS visit_site_id
+      st.customer_site_profile_id::text,v.customer_site_profile_id::text AS visit_site_id,
+      (SELECT p.part_role FROM mbt_bin_workflow_dependencies d
+        JOIN mbt_bin_order_parts p ON p.visit_id=d.prerequisite_visit_id
+        JOIN mbt_service_visits prior ON prior.service_visit_id=p.visit_id
+        JOIN dispatch_plans pp ON pp.id::text=prior.dispatch_plan_id
+        JOIN dispatch_plans current_plan ON current_plan.id::text=v.dispatch_plan_id
+        JOIN mbt_visit_steps ps ON ps.service_visit_id=p.visit_id AND ps.action_code=d.prerequisite_action_code
+        WHERE d.dependent_visit_id=v.service_visit_id AND p.asset_id=COALESCE(s.expected_asset_id,v.expected_asset_id)
+          AND ps.status<>'completed' AND pp.plan_date<current_plan.plan_date
+          AND (p.part_role='delivery' OR prior.planned_truck_id=v.planned_truck_id)
+        ORDER BY pp.plan_date DESC LIMIT 1) AS prior_day_role
     FROM mbt_service_visits v JOIN mbt_visit_steps s ON s.service_visit_id=v.service_visit_id
     LEFT JOIN mbt_bin_assets a ON a.asset_id=COALESCE(s.expected_asset_id,v.expected_asset_id,v.outgoing_asset_id)
     LEFT JOIN mbt_bin_types b ON b.bin_type_id=a.bin_type_id
     LEFT JOIN mbt_bin_asset_state st ON st.asset_id=a.asset_id
+    LEFT JOIN mbt_bin_movements m ON m.movement_id=st.last_movement_id
     WHERE v.service_visit_id=ANY($1::uuid[]) ORDER BY v.service_visit_id,s.sequence_number`, [visits]);
   const byAction = new Map(steps.rows.map((/** @type {any} */ s) => [`${s.service_visit_id}:${s.action_code}`, s]));
   const capacities = await query("SELECT id::text,bin_slot_capacity,capacity_lbs FROM dispatch_trucks WHERE id=ANY($1::bigint[])", [trucks.map((/** @type {any} */ t) => t.id)]);
@@ -59,11 +71,17 @@ function appendStepMovement(stop, truckId, step, initial, movements) {
 
 /** @param {any} step @param {string} truckId @param {Map<string, any>} initial @param {number} tare @param {number} loaded */
 function recordInitialCustody(step, truckId, initial, tare, loaded) {
-  if (!step.actual_started_at || !["truck", "dump_site"].includes(step.location_kind)) {return;}
+  if (step.prior_day_role==="delivery") {return;}
+  if (step.prior_day_role==="collection") {
+    initial.set(step.expected_asset_id,{assetId:step.expected_asset_id,weightLbs:tare});
+    return;
+  }
+  if ((!step.actual_started_at && !step.bin_workflow) || !["truck", "dump_site"].includes(step.location_kind)) {return;}
   if (step.location_kind === "truck" && step.truck_id !== truckId) {
     throw planningError(409, "MBT_BIN_CUSTODY_CONFLICT", "The bin is aboard another truck.");
   }
-  const empty = step.location_kind === "dump_site" || step.service_action === "delivery";
+  const empty = step.location_kind === "dump_site" || step.service_action === "delivery"
+    || (step.bin_workflow && /dump|empty/u.test(String(step.movement_type)));
   initial.set(step.expected_asset_id, { assetId: step.expected_asset_id, weightLbs: empty ? tare : loaded });
 }
 

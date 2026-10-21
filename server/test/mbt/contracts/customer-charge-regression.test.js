@@ -439,7 +439,7 @@ test("the generated mixed-payment history is cash first then card exchange with 
   assert.equal(history.requests[1].aggregateLines.length > 0, true);
 });
 
-test("non-garbage bins reject every size except 14YD and aggregate combinations require Order from 150", () => {
+test("non-garbage bins reject every size except 14YD and aggregate origin is independently selectable", () => {
   const calculate = calculator();
   assert.throws(() => calculate({
     kind: "add_bin",
@@ -460,7 +460,7 @@ test("non-garbage bins reject every size except 14YD and aggregate combinations 
     aggregateLines: [],
     loadingFeeMinor: 5_000
   }), (error) => error?.code === "MBT_CHARGE_BIN_CONTENT_SIZE_INVALID");
-  assert.throws(() => calculate({
+  const aggregate = calculate({
     kind: "add_bin",
     paymentMethod: "cash",
     currentContractTotalMinor: 0,
@@ -484,5 +484,7 @@ test("non-garbage bins reject every size except 14YD and aggregate combinations 
       densityLbsPerYard: 2_600
     }],
     loadingFeeMinor: 5_000
-  }), (error) => error?.code === "MBT_CHARGE_AGGREGATE_ORIGIN_REQUIRED");
+  });
+  assert.equal(aggregate.orderFrom150, false);
+  assert.equal(aggregate.lines.filter((line) => line.lineCode === "aggregate_loading_fee").length, 1);
 });

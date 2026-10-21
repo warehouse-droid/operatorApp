@@ -1,0 +1,16 @@
+[
+  "public/dispatch.css",
+  "public/dispatch.html",
+  "public/dispatch.js",
+  "public/mbt-planning.html",
+  "public/mbt-planning.js",
+  "src/dispatch-load-assignment.js",
+  "src/driver-repository.js",
+  "src/mbt/bin-dispatch-service.js",
+  "src/mbt/bin-planning-assignments.js",
+  "src/mbt/bin-planning-board.js",
+  "src/mbt/bin-planning-domain.js",
+  "src/mbt/bin-planning-metadata.js",
+  "src/mbt/bin-planning-service.js",
+  "src/server.js"
+]

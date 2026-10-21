@@ -1,0 +1,12 @@
+{
+  "tests": 302,
+  "passed": 301,
+  "failures": [
+    "/app/src/smart-scm-harness.js"
+  ],
+  "exitCode": 1,
+  "randomFailures": [
+    "/app/src/smart-scm-vendor-alternative-harness.js"
+  ],
+  "randomFailureEvidence": "test-artifacts/regular-stock-kit/fixture-proof/fixture-proof.json"
+}

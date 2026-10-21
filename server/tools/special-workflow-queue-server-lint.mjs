@@ -1,0 +1,10 @@
+import {ESLint} from 'eslint';
+import {readFileSync,writeFileSync} from 'node:fs';
+import assert from 'node:assert/strict';
+const out='test-artifacts/special-workflow-review/queue-access';
+const lint=new ESLint({overrideConfigFile:'tools/special-workflow-queue-eslint.config.mjs'});
+const messages=async source=>(await lint.lintText(source,{filePath:'src/server.js'}))[0].messages.map(({suggestions:_suggestions,fix:_fix,...message})=>message);
+const baseline=await messages(readFileSync(`${out}/baseline/src/server.js`,'utf8'));
+const current=await messages(readFileSync('src/server.js','utf8'));
+assert.deepEqual(current,baseline,'No new lint violations in the large existing server');
+writeFileSync(`${out}/server-lint-existing.json`,JSON.stringify(baseline,null,2));console.log(JSON.stringify({unchangedExistingViolations:baseline.length,newViolations:0}));

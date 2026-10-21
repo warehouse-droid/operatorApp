@@ -1,0 +1,87 @@
+{
+  "tier": 3,
+  "specApproval": "not obtained (autonomous run)",
+  "problem": "2967sales cannot open SOA09895 with Target Yard 2967 and Base Yard 3445.",
+  "scenarios": [
+    "Sales assigned to Target Yard 2967 may preview, submit, list, filter, read and retry current SO-based Delivery to Base Yard 3445; the reverse route also works.",
+    "Sales assigned to either paired yard may discover the opposite SO Base Yard before selecting Target Yard.",
+    "Paired target access creates one transfer in Target-to-Base direction and preserves SO quantities and duplicate-submit/retry safety.",
+    "Asynchronous preview, submit, retry and operation polling retain access; removing the actor's yard access denies queued work and result reads.",
+    "Target access applies only to regular workflowVersion 2 Delivery version 1 on the 3445/2967 pair. Unrelated yards, other methods, historical versions, malformed yards and empty access remain denied.",
+    "Existing assigned-destination access and the 150 Sales exception remain supported. Existing property expectations explicitly expand to include assigned paired targets.",
+    "Production verification is read-only; tests use synthetic orders and never production credentials or volumes. Dispose of every task test container, volume and network."
+  ],
+  "failureModel": {
+    "overbroadAccess": "exhaustive yard/method/version SQL and detail matrix, seeded fast-check properties and hostile inputs",
+    "listDetailMismatch": "same fixtures tested through SQL list, filter, detail and HTTP",
+    "revokedAuthorization": "queued-operation and polling revocation tests",
+    "duplicateExternalWrites": "synthetic transfer confirmation count and duplicate submission/retry assertions",
+    "liveRegression": "overlay exact tested files on captured live image, compare baseline/candidate regressions, configuration hashes, rollback image and live health"
+  },
+  "setup": {
+    "dependencies": [],
+    "tools": "existing Node test runner, fast-check, c8, ESLint, TypeScript, Python and bounded standard isolated Compose",
+    "git": "preserve unrelated working-tree changes; no commits",
+    "artifacts": "tests, reproducible runner, mutation script, spec and evidence in existing repository tools/test-artifacts folders",
+    "deployment": "apply validated overlay to current production app image with rollback; preserve other services and configuration",
+    "reproduction": {
+      "entryPoint": "sudo -n python3 server/tools/delivery-yard-access-20261007/validate.py",
+      "testImage": "mbbs-delivery-requests:final",
+      "testImageRecipe": "docker build --target test-e2e -f server/Dockerfile.test -t mbbs-delivery-requests:final server (existing pinned package-lock and Node base; build only if the retained test image is unavailable)",
+      "behavior": "Fresh disposable baseline, then complete candidate regression, focused, coverage, static, mutation/property-only and reversed-order validation. Baseline failures are recorded; candidate must introduce zero new failures. Both stacks register cleanup before startup."
+    }
+  },
+  "revisions": [
+    {
+      "trigger": "User also requests checkboxes for the two backordered lines of SOA09883.",
+      "scenarios": [
+        "All eligible backordered lines start checked; Sales may uncheck individual SO lines, including repeated items, and preview only checked quantities and pallets.",
+        "Unchecked lines stay visible and remain unchanged on the SO; a shortage on an unchecked line cannot prevent transfer of a checked line.",
+        "Only selected remote SO line IDs create request lines, line owners, handoff mappings and TO quantities. Persist selection for duplicate submission, asynchronous reload and retry.",
+        "Reject empty submissions, malformed IDs, duplicate IDs, unknown IDs and non-backordered selected lines before saving or external writes. Preview with none selected shows the choices and disables submission.",
+        "Retry cannot expand or replace the saved selection. Legacy callers omitting selection retain all-line behavior.",
+        "Real browser verifies line checkbox state, recalculated quantities/PALLET, checked-only submit payload and request summary. Publish updated script cache versions."
+      ],
+      "failureModel": {
+        "wrongLineTransferred": "remote line ID validation, subset properties, repeated-item tests, persisted plan and transfer assertions",
+        "selectionLostOnRetry": "selection conflict and async retry tests",
+        "selectionHiddenByShortage": "preview returns candidates even when selected quantities cannot be calculated"
+      }
+    },
+    {
+      "trigger": "User confirms EVERY authenticated Sales account should perform regular stock Delivery on both 3445 -> 2967 and 2967 -> 3445, independent of yard assignment. This supersedes the original assigned-target and yard-revocation scenarios.",
+      "scenarios": [
+        "Every active authenticated Sales account, including yard 12441, yard 150 and no yard assignment, can discover, preview, submit, list, filter, read, retry and poll current Delivery requests on both paired routes.",
+        "Keep existing assigned-destination access for other routes, and restrict the shared pair to current regular workflow 2 Delivery version 1; other methods and historical records retain yard restrictions.",
+        "A Sales account with no assigned yard can start a Delivery request from the regular stock page.",
+        "Removing a yard assignment no longer revokes the paired route; deactivating the account or removing the Sales role still rejects queued work before external reads.",
+        "The line selection behavior remains unchanged: transfer checked lines only, preserving unchecked SO lines."
+      ],
+      "failureModel": {
+        "hiddenPairForNoYards": "SQL list/detail/filter matrix includes empty authorized IDs; browser mobile uses an unassigned Sales account",
+        "overbroadOtherMethods": "method/version/route matrix, hostile inputs and properties",
+        "lostLoginGuard": "anonymous and dispatcher HTTP denials; inactive queued actor denial"
+      }
+    },
+    {
+      "trigger": "Validation scope after the Sales-access clarification interrupts the original whole-repository baseline and candidate attempts. Keep their partial logs and pre-existing failure evidence; complete the stock-request component regression suite and fresh focused gauntlet.",
+      "validation": [
+        "All non-browser stock-request, regular-stock, stocking, backorder and waitlist component tests, isolated per file, compared with the captured live runtime baseline.",
+        "Focused live-browser tests cover desktop and mobile, yard 12441 and unassigned Sales, line selection, disabled empty submit, asynchronous reload and checked-only persisted transfer.",
+        "Fresh focused suite, changed-line coverage, type checking, lint, diff secret scan, six manual mutations, property-only mutant reruns and reverse-order focused suite.",
+        "Report whole-repository verification as incomplete; retain partial full-suite logs and list unrelated baseline failures explicitly."
+      ]
+    },
+    {
+      "trigger": "The component comparison surfaced the old filter-options contract expecting [1] for yard 3445 Sales and [] for unassigned Sales. Those exact assertions conflict with the user-confirmed universal paired route rule.",
+      "scenarios": [
+        "Filter options must include Base Yards [1,28] for Sales assigned to 3445 and for Sales with no assigned yard. Vendors and request access on unrelated routes remain scoped."
+      ],
+      "testRevision": "Preserve original stock-request-repository.test.js in the baseline overlay and change only these two exact yard-option expectations to [1,28]. The new paired Delivery list/detail/filter matrix already verifies the corresponding route grants."
+    },
+    {
+      "trigger": "Repeat verification exposed a synthetic inventory fixture retaining the previous run vendor via INSERT ON CONFLICT DO NOTHING. The authorization and transfer assertions passed; the vendor-filter assertion correctly rejected the stale fixture.",
+      "testStructureRevision": "Initialize the synthetic inventory item vendor on every isolated run via ON CONFLICT(item_id) DO UPDATE SET vendor=EXCLUDED.vendor. All behavioral assertions stay unchanged. Re-run the focused coverage, mutations and reverse-order suite."
+    }
+  ]
+}

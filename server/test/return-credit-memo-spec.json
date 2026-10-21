@@ -1,0 +1,36 @@
+{
+  "feature": "Direct Credit Memos for Operator pallet and stock returns",
+  "tier": 3,
+  "specApproval": "not obtained (autonomous run); user explicitly selected direct Credit Memo creation",
+  "setup": {
+    "dependencies": "Use existing Node test runner, fast-check, c8, TypeScript, ESLint and Playwright from the existing test image; no dependency or lockfile changes.",
+    "git": "Preserve all pre-existing workspace edits; no commits or resets.",
+    "environment": "Standard isolated Compose services with mbbs-tests.slice and existing resource limits. Register cleanup before startup, remove containers/volumes/networks, retain logs and verify production health.",
+    "artifacts": "server/test-artifacts/return-credit-memo-20261008; reproducible runner in server/tools/return-credit-memo-20261008",
+    "deployment": "Implement and test in the workspace; do not enable production gates or create live financial transactions."
+  },
+  "scenarios": [
+    "G1: Eight new admin gates, stock/pallet at yards 3445/2967/12441/150, default off. Enabled CM gate selects CM ahead of that function's RA gate; disabled/missing CM gate retains existing RA/local behavior. Direct-access ceiling still applies.",
+    "G2: A stale review is rejected before any posting. Admission locks both flags; admitted transaction type is immutable across retries and gate changes.",
+    "P1: Stock, pallet, and combined confirmations in CM mode POST one standalone creditMemo with the accepted customer, yard, date, items, units, quantities, rates and reasons. No RA is created. Stock source identity is retained in line descriptions and the local immutable intent, without claiming native Sales Order transformation.",
+    "P2: Mixed stock/pallet batches cannot post different transaction types. If both functions are effective but disagree, fail before creating any transaction; if either is off, retain whole-batch local-only behavior.",
+    "V1: Readback must exactly match identity and item intent before success. Wrong customer, yard, item, source description, units, quantity, rate, reason, missing reference or inactive newly-created transaction fails closed and retains the ID for recovery.",
+    "R1: Concurrent submissions/retries, lost responses and local rollback cannot duplicate a Credit Memo; uncertain creation is recovery-only. A definite rejection remains retryable. Failed synchronous submissions remain drafts.",
+    "Q1: PALLET reservations stop double counting once the direct CM is observed remotely; unobserved and uncertain returns remain reserved. Stock quantities remain reserved against their source line, without counting a directly observed CM twice.",
+    "L1: Reconciliation, manual linking and void protection use the admitted type. Existing admitted RAs and legacy returns remain unchanged.",
+    "U1: Admin displays the new per-yard CM gates and precedence; Operator review, success and history show Credit Memo or RA accurately without exposing financial/private fields."
+  ],
+  "failureModel": {
+    "duplicateCredits": "Concurrent and ambiguous-response integration tests; durable attempt marker and external ID lookup; mutation test removes retry guard.",
+    "wrongAmountOrCustomer": "Boundary contract readback tests and generated payload/snapshot invariants.",
+    "unexpectedPosting": "Off/absent gate, environment ceiling, stale revision and mixed-mode tests.",
+    "returnQuotaCorruption": "Observed/unobserved pallet and stock reservation tests, including staged drafts.",
+    "misleadingSuccess": "Failure draft and UI behavior checks; audit event assertions.",
+    "hostImpact": "Standard resource-constrained disposable Compose environment, teardown verification and live health read only."
+  },
+  "knownLimits": ["NetSuite network is mocked at its HTTP boundary; no live Credit Memo is created. Account-specific mandatory fields and inventory/tax settings require sandbox validation before enabling the new gates."],
+  "amendments": [
+    "2026-10-08: The existing direct-access ceiling blocks NetSuite return lookups as well as mutations. G1 preserves that rejection (and verifies zero posts) instead of promising that a new submission can always be saved locally when direct access is disabled. Both posting flags off with direct reads enabled still saves locally.",
+    "2026-10-08: U1 also covers the personal history projection and Control/Sales status labels so no direct CM appears as an RA in another view."
+  ]
+}

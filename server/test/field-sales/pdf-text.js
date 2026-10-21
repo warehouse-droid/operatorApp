@@ -3,7 +3,13 @@ import { inflateSync } from 'node:zlib';
 // strings: this catches missing Chinese glyphs and wrong values in emitted PDFs.
 export function pdfText(pdf,contentIds) {
  const objects=new Map([...pdf.toString('latin1').matchAll(/(\d+) 0 obj\s*([\s\S]*?)endobj/g)].map(m=>[m[1],m[2]]));
- const stream=id=>{const obj=objects.get(String(id))||'',m=obj.match(/stream\r?\n([\s\S]*?)\r?\nendstream/);if(!m){return '';}return (/FlateDecode/.test(obj)?inflateSync(Buffer.from(m[1],'latin1')):Buffer.from(m[1],'latin1')).toString('utf8');};
+ const stream=id=>{const obj=objects.get(String(id))||'',m=obj.match(/stream\r?\n/);if(!m){return '';}
+  // PDFKit declares the byte length. A trailing compressed 0x0d byte is data,
+  // even when the following PDF delimiter is a newline.
+  const length=Number(obj.slice(0,m.index).match(/\/Length\s+(\d+)\b/)?.[1]);
+  if(!Number.isSafeInteger(length)||length<0)throw Error('PDFKit stream length is missing');
+  const bytes=Buffer.from(obj.slice(m.index+m[0].length,m.index+m[0].length+length),'latin1');
+  return (/FlateDecode/.test(obj)?inflateSync(bytes):bytes).toString('utf8');};
  const unicode=hex=>{const b=Buffer.from(hex.replace(/\s/g,''),'hex');return b.swap16().toString('utf16le');};
  const maps=new Map(),fonts=new Map();
  for(const [id,obj] of objects){const ref=obj.match(/\/ToUnicode (\d+) 0 R/);if(!ref){continue;}const cmap=stream(ref[1]),map=new Map();

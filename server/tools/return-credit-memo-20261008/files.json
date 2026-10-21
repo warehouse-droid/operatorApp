@@ -1,0 +1,22 @@
+[
+  "src/operator-netsuite-posting-policy.js",
+  "src/operator-netsuite-posting-policy-repository.js",
+  "src/mbt/feature-gate-catalog.js",
+  "src/return-credit-memo.js",
+  "src/return-batch-ra-domain.js",
+  "src/return-batch-ra-service.js",
+  "src/return-submission-draft.js",
+  "src/return-repository.js",
+  "src/server.js",
+  "src/history-repository.js",
+  "public/operator.js",
+  "public/mbt-gates.js",
+  "public/control.js",
+  "public/sales.js",
+  "public/service-worker.js",
+  "public/operator.html",
+  "public/mbt-gates.html",
+  "public/control.html",
+  "public/sales.html",
+  "migrations/273_operator_return_credit_memo_gates.sql"
+]

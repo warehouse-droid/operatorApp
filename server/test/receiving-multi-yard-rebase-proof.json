@@ -1,0 +1,7 @@
+{
+  "oldServerHash": "58baee286b80a7fa77e7b51aed8ca4bf061f06229a9d184486fa0ed908e262e0",
+  "newServerHash": "5fd8f11f07366ca26dc94fefb41e127d36514469034580f14ad0e925059a13da",
+  "existingBaselineAddition": "      if (order) {\n        await upsertScmPurchaseOrderCatalog({ orders: [order], source: \"detail-first-load\" });\n        order = await getScmPurchaseOrderCatalogOrder(req.params.ref, { includeRestricted });\n      }\n",
+  "scope": "Existing SCM catalog first-load fallback; outside all receiving routes and receipt code.",
+  "workspaceMatch": true
+}

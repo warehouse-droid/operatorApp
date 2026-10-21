@@ -1,4 +1,5 @@
 import { SPECIAL_PACK_FIELDS } from '../public/special-stock-line-details.js';
+import { normalizePackQuantity } from '../public/order-pack-quantities.js';
 import { sumSpecialAmounts } from './special-stock-discount-total.js';
 import { specialRestUnitId } from './special-stock-netsuite-adapter.js';
 import { prepareSpecialAdjustmentPlan, specialAdjustmentMatches } from './special-stock-adjustment-adapter.js';
@@ -61,8 +62,8 @@ function snapshotLine(line, row) {
     createPo: String(line.createPo?.id ?? line.createPo ?? ''),
     ...(Number(line.item.id) === 2055 ? { pack: Object.fromEntries(Object.entries(SPECIAL_PACK_FIELDS).map(([field, native]) => [field, Number(line[native] ?? 0)])) } : {}) };
 }
-/** @param {Identity} order @param {Transport} transport @returns {Promise<{record:Raw,snapshot:Snapshot}>} */
-export async function readSpecialRestOrder(order, { rest, queryAll }) {
+/** @param {Identity} order @param {Transport} transport @param {{allowHeaderDiscount?:boolean}} options @returns {Promise<{record:Raw,snapshot:Snapshot}>} */
+export async function readSpecialRestOrder(order, { rest, queryAll }, { allowHeaderDiscount = false } = {}) {
   const [response, rows] = await Promise.all([
     rest(`${recordPath(order)}?expandSubResources=true`),
     queryAll(`SELECT tl.uniquekey, tl.id AS rest_line_id, tl.item, t.status,
@@ -74,7 +75,12 @@ export async function readSpecialRestOrder(order, { rest, queryAll }) {
   const record = response.data;
   /** @type {Raw[]|undefined} */
   const source = record?.item?.items;
-  if (!record || !Array.isArray(source) || !source.length || source.length > 200 || rows.length !== source.length
+  // NetSuite exposes the native header discount as a query row, outside item.items.
+  // Delivery-only edits preserve that header and never rewrite the item sublist.
+  const headerDiscounts = allowHeaderDiscount && String(record?.discountItem?.id) === '10716' && Array.isArray(source)
+    ? rows.filter(row => Number(row.item) === 10716 && !source.some(line => Number(line.line) === Number(row.rest_line_id))) : [];
+  if (!record || !Array.isArray(source) || !source.length || source.length > 200 || headerDiscounts.length > 1
+    || rows.length - headerDiscounts.length !== source.length
     || new Set(rows.map(row => String(row.uniquekey))).size !== rows.length) throw conflict('A complete, distinct NetSuite order is required.');
   const lines = source.map(line => snapshotLine(line, rows.find(row => Number(row.rest_line_id) === id(line.line))));
   if (new Set(lines.map(line => line.remoteLineId)).size !== lines.length) throw conflict('NetSuite returned duplicate line identities.');
@@ -168,7 +174,7 @@ function itemPayload(line, source, sales) {
     if (line.quantity !== null) payload.quantity = line.quantity;
     if (line.description !== String(source.description || '')) payload.description = line.description;
     for (const [field, native] of Object.entries(SPECIAL_PACK_FIELDS)) {
-      if (line.pack && Number(line.pack[field] ?? 0) !== Number(source[native] ?? 0)) payload[native] = line.pack[field] ?? 0;
+      if (line.pack && Number(line.pack[field] ?? 0) !== Number(source[native] ?? 0)) payload[native] = sales ? normalizePackQuantity(line.pack[field]) : line.pack[field] ?? 0;
     }
     if (!line.rate.endsWith('%') && (Number(source.rate) !== Number(line.rate) || line.itemId === 10716)) {
       payload.rate = Number(line.rate);

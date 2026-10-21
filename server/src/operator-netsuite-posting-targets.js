@@ -586,8 +586,10 @@ export function createOperatorNetSuitePostingTargetResolver({
     ));
     const postingChildren = children.filter((/** @type {Record<string, any>} */ child) => !localChildren.includes(child));
     const netSuitePostingOwner = functionKey === "delivery_prep"
-      || (functionKey === "receiving" && root.order_type === "transfer_order")
+      && root.order_type !== "transfer_order"
       ? "driver_completion"
+      : ((functionKey === "delivery_prep" || functionKey === "receiving") && root.order_type === "transfer_order")
+      ? "transfer_background"
       : "operator";
     const baseResolution = {
       functionKey,

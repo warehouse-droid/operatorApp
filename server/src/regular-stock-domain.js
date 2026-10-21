@@ -66,9 +66,10 @@ export function evaluateRegularStockApproval({ lines = [], policies = [], arriva
     evaluatedAt: new Date(nowMs).toISOString(), arrivalAt: leadTimeApplies ? new Date(arrivalMs).toISOString() : null, enoughTime, lines: evidence };
 }
 
-/** @param {{regular?:{deliveryMethod?:string,pickupTransfer?:unknown,approvalExpiresAt?:string|null,handoffStatus?:string}}} request @param {Date|string|number} [now] */
+/** @param {{status?:string,regular?:{deliveryMethod?:string,deliveryVersion?:number,pickupTransfer?:unknown,approvalExpiresAt?:string|null,handoffStatus?:string}}} request @param {Date|string|number} [now] */
 export function regularApprovalExpired(request,now=new Date()) {
-  return !isRegularStockingRequest(request) && !request.regular?.handoffStatus && !!request.regular?.approvalExpiresAt
+  return !['completed','closed','cancelled'].includes(request.status||'') && !['waitlist','backorder'].includes(request.regular?.deliveryMethod||'')
+    && request.regular?.deliveryVersion!==1 && !isRegularStockingRequest(request) && !request.regular?.handoffStatus && !!request.regular?.approvalExpiresAt
     && new Date(now).getTime()>=new Date(request.regular.approvalExpiresAt).getTime();
 }
 

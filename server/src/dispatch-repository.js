@@ -39,7 +39,7 @@ import {
   uniqueDispatchLocations
 } from "./dispatch-location.js";
 import { dispatchOrderPalletQuantity } from "./dispatch-special-order-pallets.js";
-import { projectPurchaseOrderRouteResidual } from "./dispatch-po-route-projection.js";
+import { dispatchLinkPhysicalQuantities, projectPurchaseOrderRouteResidual } from "./dispatch-po-route-projection.js";
 import { purchaseOrderPickupSql } from "./dispatch-po-pickup-sql.js";
 import { scmScheduleRouteOptions } from "./scm-schedule-route-options.js";
 import {
@@ -53,8 +53,10 @@ import {
 import {
   isRemarkOnlyScmSchedulePatch,
   normalizeScmScheduleRemarkOverride,
-  resolveScmScheduleRemark
+  resolveScmScheduleRemark,
+  scmScheduleRemarkSql
 } from "./scm-schedule-remark.js";
+import { SCM_SCHEDULE_SPECIAL_ORDER_CTES } from "./scm-schedule-special-order.js";
 import { createCoalescingWorkQueue } from "./coalescing-work-queue.js";
 
 function toNumber(value) {
@@ -3799,6 +3801,7 @@ export async function listScmSchedule({
       UNION ALL SELECT * FROM base_to
       UNION ALL SELECT * FROM base_vrma
     ),
+    ${SCM_SCHEDULE_SPECIAL_ORDER_CTES}
     direct_planned AS MATERIALIZED (
       SELECT DISTINCT ON (
                upper(assignment.assignment->>'dispatchOrderKind'),
@@ -4008,7 +4011,8 @@ export async function listScmSchedule({
       b.dispatch_ref,
       b.party,
       COALESCE(NULLIF(s.display_ref, ''), b.order_ref) AS display_ref,
-      COALESCE(s.is_special_order, false) AS is_special_order,
+      special_order.is_special_order,
+      special_order.is_automatic_special_order,
       b.is_blanket_po,
       CASE WHEN b.order_kind = 'VRMA' THEN 'MBT' ELSE COALESCE(s.method, 'MBT') END AS method,
       NULLIF(s.pickup_point, '') AS schedule_pickup_point,
@@ -4025,6 +4029,7 @@ export async function listScmSchedule({
       COALESCE(NULLIF(s.content, ''), b.content, '') AS content,
       NULLIF(BTRIM(s.remark_override), '') AS remark_override,
       COALESCE(NULLIF(BTRIM(b.source_memo), ''), '') AS netsuite_memo,
+      COALESCE(special_requests.remark_prefix, '') AS remark_prefix,
       COALESCE(b.total_pallet_qty, 0) AS total_pallet_qty,
       COALESCE(NULLIF(s.weight_lbs, 0), b.weight_lbs, 0) AS weight_lbs,
       COALESCE(
@@ -4063,6 +4068,19 @@ export async function listScmSchedule({
     LEFT JOIN scm_transport_schedule s
       ON s.order_kind = b.order_kind
      AND lower(s.order_ref) = lower(b.order_ref)
+    LEFT JOIN po_special_items special_items
+      ON b.order_kind = 'PO' AND special_items.schedule_po_id = b.source_id
+    LEFT JOIN po_special_requests special_requests
+      ON b.order_kind = 'PO' AND special_requests.schedule_po_id = b.source_id
+    CROSS JOIN LATERAL (
+      SELECT special_items.schedule_po_id IS NOT NULL OR special_requests.schedule_po_id IS NOT NULL
+               AS is_automatic_special_order,
+             COALESCE(s.is_special_order, false)
+               OR special_items.schedule_po_id IS NOT NULL OR special_requests.schedule_po_id IS NOT NULL
+               AS is_special_order,
+             ${scmScheduleRemarkSql({ orderKind: "b.order_kind", remarkOverride: "s.remark_override",
+               netSuiteMemo: "b.source_memo", remarkPrefix: "special_requests.remark_prefix" })} AS remark
+    ) special_order
     LEFT JOIN planned
       ON planned.order_kind = b.order_kind
      AND lower(planned.order_ref) = lower(b.order_ref)
@@ -4195,7 +4213,7 @@ export async function listScmSchedule({
       END AS status
     ) effective_status
     WHERE (cardinality($25::text[]) = 0 OR lower(b.order_ref) = ANY($25::text[]))
-      AND ($1 = '' OR lower(concat_ws(' ', b.order_ref, b.source_ref, b.dispatch_ref, b.party, b.pickup_point, b.dropoff_point, b.brand, b.content, s.remark_override, CASE WHEN b.order_kind IN ('PO', 'TO') THEN b.source_memo ELSE NULL END, s.packing_slip_ref, s.group_ref)) LIKE '%' || $1 || '%')
+      AND ($1 = '' OR lower(concat_ws(' ', b.order_ref, b.source_ref, b.dispatch_ref, b.party, b.pickup_point, b.dropoff_point, b.brand, b.content, special_order.remark, s.remark_override, CASE WHEN b.order_kind IN ('PO', 'TO') THEN b.source_memo ELSE NULL END, s.packing_slip_ref, s.group_ref)) LIKE '%' || $1 || '%')
       AND (
         $26::boolean
         OR $9 = 'blanket'
@@ -4222,7 +4240,7 @@ export async function listScmSchedule({
       AND (cardinality($3::text[]) = 0 OR COALESCE(s.method, 'MBT') = ANY($3::text[]))
       AND (
         cardinality($4::text[]) = 0
-        OR ('Sp.O' = ANY($4::text[]) AND b.order_kind = 'PO' AND COALESCE(s.is_special_order, false))
+        OR ('Sp.O' = ANY($4::text[]) AND b.order_kind = 'PO' AND special_order.is_special_order)
         OR b.order_kind = ANY($4::text[])
       )
       AND (
@@ -4244,11 +4262,7 @@ export async function listScmSchedule({
       AND ($15 = '' OR lower(COALESCE(NULLIF(s.content, ''), b.content, '')) LIKE '%' || $15 || '%')
       AND (
         $16 = ''
-        OR lower(COALESCE(
-          NULLIF(BTRIM(s.remark_override), ''),
-          CASE WHEN b.order_kind IN ('PO', 'TO') THEN NULLIF(BTRIM(b.source_memo), '') END,
-          ''
-        )) LIKE '%' || $16 || '%'
+        OR lower(special_order.remark) LIKE '%' || $16 || '%'
       )
       AND (
         $17 = ''
@@ -4412,7 +4426,8 @@ export async function listScmSchedule({
     const remark = resolveScmScheduleRemark({
       orderKind: row.order_kind,
       remarkOverride: row.remark_override,
-      netSuiteMemo: row.netsuite_memo
+      netSuiteMemo: row.netsuite_memo,
+      remarkPrefix: row.remark_prefix
     });
     return {
       scheduleId: Number(row.schedule_id || 0),
@@ -4425,6 +4440,7 @@ export async function listScmSchedule({
       party: row.party || "",
       displayRef: row.display_ref || row.order_ref,
       isSpecialOrder: row.is_special_order === true,
+      isAutomaticSpecialOrder: row.is_automatic_special_order === true,
       isBlanket: row.is_blanket_po === true,
       method: row.method || "MBT",
       pickupPoint,
@@ -8151,9 +8167,16 @@ function allocationMatchesDispatchItem(allocation = {}, item = {}, sourceRefs = 
 
 function allocatedDispatchPhysicalQuantity(item = {}, field, explicitAllocated, allocatedSalesQty) {
   const explicit = positiveQuantity(explicitAllocated);
-  if (!isMbbsSpecialLine(item)) return explicit;
   const totalPhysical = positiveQuantity(item[field]);
   const totalSales = positiveQuantity(item.quantity ?? item.salesQty);
+  // Count sales units and loose pieces describe the same cargo only when the
+  // line itself demonstrates a one-to-one count. Independent packing and
+  // area/weight units must keep their explicit physical allocations.
+  const countPieces = field === "pieces" && totalSales > 0 && totalPhysical === totalSales
+    && /^(EACH|EA|PCS|PC|PIECES?)$/u.test(String(item.unit || "").trim().toUpperCase())
+    && ![item.pallets, item.layers, item.sections].some(value => positiveQuantity(value) > 0)
+    && positiveQuantity(item.toPcs ?? item.to_pcs) <= 1;
+  if (!isMbbsSpecialLine(item) && !countPieces) return explicit;
   if (!totalPhysical || !totalSales) return Math.min(totalPhysical || explicit, explicit);
   const salesCoverage = Math.min(positiveQuantity(allocatedSalesQty) / totalSales, 1);
   return Number(Math.min(totalPhysical, Math.max(explicit, totalPhysical * salesCoverage)).toFixed(6));
@@ -8183,6 +8206,11 @@ function selectedDirectServicePoLineIds(allocations = []) {
 function applyTargetPoAllocationsToOrder(order = {}, allocations = []) {
   const serviceSalesLines = selectedServiceSalesLines(allocations);
   const directServicePoLineIds = selectedDirectServicePoLineIds(allocations);
+  const matchesCandidate = (candidate, allocation) =>
+    (candidate.childOrderDetails || []).some(child => matchesCandidate(child, allocation))
+    || (candidate.items || []).some(item => allocationMatchesDispatchItem(
+      allocation, item, [candidate.id, candidate.originalOrderId]
+    ));
   const applyItems = (candidate) => {
     const sources = [candidate.id, candidate.originalOrderId];
     const childOrderDetails = (candidate.childOrderDetails || []).map(applyItems);
@@ -8235,45 +8263,47 @@ function applyTargetPoAllocationsToOrder(order = {}, allocations = []) {
             poAllocatedSalesQty: allocatedSalesQty
           };
         });
-    return { ...candidate, childOrderDetails, items };
-  };
-  const enriched = applyItems(order);
-  const manifestByLocation = new Map();
-  for (const allocation of allocations) {
-    if (directServicePoLineIds.has(String(allocation.po_line_id || "").trim())) continue;
-    const location = allocation.po_vendor_yard || allocation.po_vendor || "";
-    if (!location) continue;
-    const key = `${allocation.po_order_ref || ""}|${location}`;
-    const entry = manifestByLocation.get(key) || {
-      poOrderRef: allocation.po_order_ref || "",
-      location,
-      address: allocation.po_address || "",
-      items: []
+    // Driver jobs expand a group into its members. Keep each member's own
+    // dated pickup evidence as well as the aggregate group manifest.
+    const manifestByLocation = new Map();
+    for (const allocation of allocations) {
+      if (candidate !== order && !matchesCandidate(candidate, allocation)) continue;
+      if (directServicePoLineIds.has(String(allocation.po_line_id || "").trim())) continue;
+      const location = allocation.po_vendor_yard || allocation.po_vendor || "";
+      if (!location) continue;
+      const key = `${allocation.po_order_ref || ""}|${location}`;
+      const entry = manifestByLocation.get(key) || {
+        poOrderRef: allocation.po_order_ref || "",
+        location,
+        address: allocation.po_address || "",
+        items: []
+      };
+      const salesQuantityOnly = isMbbsSpecialLine(allocation);
+      entry.items.push({
+        itemId: allocation.item_id,
+        itemName: allocation.item_name,
+        sku: allocation.sku,
+        unit: allocation.unit || "",
+        pallets: salesQuantityOnly ? 0 : positiveQuantity(allocation.allocated_pallet_qty),
+        layers: salesQuantityOnly ? 0 : positiveQuantity(allocation.allocated_layer_qty),
+        sections: salesQuantityOnly ? 0 : positiveQuantity(allocation.allocated_section_qty),
+        pieces: salesQuantityOnly ? 0 : positiveQuantity(allocation.allocated_piece_qty),
+        quantity: positiveQuantity(allocation.allocated_sales_qty),
+        itemWeight: positiveQuantity(allocation.item_weight)
+      });
+      manifestByLocation.set(key, entry);
+    }
+    const poPickupManifest = [...manifestByLocation.values()];
+    return {
+      ...candidate, childOrderDetails, items,
+      pickupLocations: uniqueDispatchLocations([
+        ...(candidate.pickupLocations || []),
+        ...poPickupManifest.map(entry => entry.location).filter(Boolean)
+      ]),
+      poPickupManifest
     };
-    const salesQuantityOnly = isMbbsSpecialLine(allocation);
-    entry.items.push({
-      itemId: allocation.item_id,
-      itemName: allocation.item_name,
-      sku: allocation.sku,
-      unit: allocation.unit || "",
-      pallets: salesQuantityOnly ? 0 : positiveQuantity(allocation.allocated_pallet_qty),
-      layers: salesQuantityOnly ? 0 : positiveQuantity(allocation.allocated_layer_qty),
-      sections: salesQuantityOnly ? 0 : positiveQuantity(allocation.allocated_section_qty),
-      pieces: salesQuantityOnly ? 0 : positiveQuantity(allocation.allocated_piece_qty),
-      quantity: positiveQuantity(allocation.allocated_sales_qty),
-      itemWeight: positiveQuantity(allocation.item_weight)
-    });
-    manifestByLocation.set(key, entry);
-  }
-  const poPickupManifest = [...manifestByLocation.values()];
-  return {
-    ...enriched,
-    pickupLocations: uniqueDispatchLocations([
-      ...(enriched.pickupLocations || []),
-      ...poPickupManifest.map((entry) => entry.location).filter(Boolean)
-    ]),
-    poPickupManifest
   };
+  return applyItems(order);
 }
 
 export async function enrichDispatchOrdersWithPoTargetAllocations(orders = [], {
@@ -8378,7 +8408,7 @@ function targetLineAsAllocationRow(line = {}) {
     allocated_pallet_qty: line.poAllocatedPallets,
     allocated_layer_qty: line.poAllocatedLayers,
     allocated_section_qty: line.poAllocatedSections,
-    allocated_piece_qty: line.poAllocatedPieces,
+    allocated_piece_qty: allocatedDispatchPhysicalQuantity(line, "pieces", line.poAllocatedPieces, line.poAllocatedSalesQty),
     allocated_sales_qty: line.poAllocatedSalesQty
   };
 }
@@ -8733,18 +8763,24 @@ async function createSalesOrderPoAllocationWithExecutor(executor, {
   }
 
   const specialSalesQuantityOnly = isMbbsSpecialLine(salesLine);
+  const baseSelection = Object.hasOwn(quantities, "salesQty")
+    && !["pallets", "layers", "sections", "pieces"].some(field => Number(quantities[field] || 0) !== 0);
+  if (baseSelection && (!Number.isFinite(Number(quantities.salesQty)) || Number(quantities.salesQty) <= 0)) {
+    throw new Error("Enter a positive, finite base quantity.");
+  }
+  const physical = baseSelection ? dispatchLinkPhysicalQuantities(Number(quantities.salesQty), salesLine) : quantities;
 
-  const submittedPallets = positiveQuantity(quantities.pallets);
-  const submittedLayers = positiveQuantity(quantities.layers);
-  const submittedSections = positiveQuantity(quantities.sections);
-  const submittedPieces = positiveQuantity(quantities.pieces);
+  const submittedPallets = positiveQuantity(physical.pallets);
+  const submittedLayers = positiveQuantity(physical.layers);
+  const submittedSections = positiveQuantity(physical.sections);
+  const submittedPieces = positiveQuantity(physical.pieces);
   const pallets = specialSalesQuantityOnly ? 0 : submittedPallets;
   const layers = specialSalesQuantityOnly ? 0 : submittedLayers;
   const sections = specialSalesQuantityOnly ? 0 : submittedSections;
   const pieces = specialSalesQuantityOnly ? 0 : submittedPieces;
   const independentSalesQty = !specialSalesQuantityOnly && !hasConversion(salesLine) && hasCustomQuantity(salesLine);
   const conversionLine = independentSalesQty ? salesLine : hasConversion(salesLine) ? salesLine : poLine;
-  let salesQty = roundDispatchQuantity(specialSalesQuantityOnly
+  let salesQty = roundDispatchQuantity(specialSalesQuantityOnly || baseSelection
     ? positiveQuantity(quantities.salesQty)
     : lineSalesQty(conversionLine, { ...quantities, pallets, layers, sections, pieces }));
   if (specialSalesQuantityOnly && salesQty <= 0) {
@@ -8763,11 +8799,17 @@ async function createSalesOrderPoAllocationWithExecutor(executor, {
   ];
   const itemLabel = salesLine.sku || salesLine.item_name || poLine.sku || poLine.item_name || "item";
   for (const [unit, value, label] of checks) {
-    if (!value) continue;
+    if (baseSelection || !value) continue;
     const salesAvailable = availableUnitQty(salesLine, unit);
     const poAvailable = availableUnitQty(poLine, unit);
-    if (value > salesAvailable) throw new Error(`${itemLabel}: SO open quantity is only ${salesAvailable} ${label}.`);
-    if (value > poAvailable) throw new Error(`${itemLabel}: PO ${poLine.po_order_ref} only has ${poAvailable} ${label} available.`);
+    if (value > salesAvailable) throw Object.assign(
+      new Error(`${itemLabel}: SO open quantity is only ${salesAvailable} ${label}.`),
+      { status: 400, code: "DISPATCH_PO_LINK_QUANTITY_EXCEEDED" }
+    );
+    if (value > poAvailable) throw Object.assign(
+      new Error(`${itemLabel}: PO ${poLine.po_order_ref} only has ${poAvailable} ${label} available.`),
+      { status: 400, code: "DISPATCH_PO_LINK_QUANTITY_EXCEEDED" }
+    );
   }
   const salesRemaining = Math.max(positiveQuantity(salesLine.quantity) - positiveQuantity(salesLine.allocated_sales_qty), 0);
   const poRemaining = Math.max(positiveQuantity(poLine.quantity) - purchaseOrderReceivedBaseline(poLine) - positiveQuantity(poLine.allocated_sales_qty), 0);
@@ -8780,8 +8822,14 @@ async function createSalesOrderPoAllocationWithExecutor(executor, {
     if (!fullPhysical) throw new Error(`${itemLabel}: enter the sales-unit quantity for a partial manual PLT/LYR/SEC/PCS allocation.`);
     salesQty = salesRemaining;
   }
-  if (salesQty > salesRemaining + 0.000001) throw new Error(`${itemLabel}: SO open sales quantity is only ${salesRemaining}.`);
-  if (salesQty > poRemaining + 0.000001) throw new Error(`${itemLabel}: PO ${poLine.po_order_ref} only has ${poRemaining} sales quantity available.`);
+  if (salesQty > salesRemaining + 0.000001) throw Object.assign(
+    new Error(`${itemLabel}: SO open sales quantity is only ${salesRemaining}.`),
+    { status: 400, code: "DISPATCH_PO_LINK_QUANTITY_EXCEEDED" }
+  );
+  if (salesQty > poRemaining + 0.000001) throw Object.assign(
+    new Error(`${itemLabel}: PO ${poLine.po_order_ref} only has ${poRemaining} sales quantity available.`),
+    { status: 400, code: "DISPATCH_PO_LINK_QUANTITY_EXCEEDED" }
+  );
   salesQty = roundDispatchQuantity(Math.min(salesQty, salesRemaining, poRemaining));
   if (pallets + layers + sections + pieces + salesQty <= 0) throw new Error("Allocation quantity is required.");
 
@@ -8814,6 +8862,7 @@ async function createSalesOrderPoAllocationWithExecutor(executor, {
       salesQty,
       createdBy || null,
       JSON.stringify({
+        ...(baseSelection ? { quantityBasis: "base", baseUnit: salesLine.unit || "" } : {}),
         poVendor: poLine.vendor || "",
         poVendorYard: poLine.dispatch_vendor_yard || "",
         poAddress: poLine.dispatch_address || ""

@@ -14,7 +14,7 @@ Approved source: the user-approved implementation plan in the conversation.
 
 - Sales and Dispatch share one additional-text value and the same gallery. Replacement uploads keep the original gallery position and retain the old file unless the new registration commits.
 - Mutations require the current revision; a stale revision returns conflict without changing text or media.
-- A Driver-completed Sales Order drop-off is read-only; reopening it makes it editable again.
+- A Sales Order becomes read-only after all its active split drop-offs are Driver-completed (or its own drop-off when unsplit). Partial delivery remains editable; cancelled splits are excluded, and reopening an active delivery makes the shared instructions editable again.
 - Each Sales Order permits at most five active JPEG/PNG/WebP/HEIC/HEIF/MP4/MOV/WebM objects, each at most 25 MiB.
 - Media is uploaded unchanged, registered only under its issued upload identity, and soft-deleted with audit identity.
 - Issuing an upload reserves one of the five slots. Its additive registration remains valid after an unrelated text edit, without overwriting that text; exact registration retries are idempotent.

@@ -378,64 +378,32 @@ test("durable native TO failures retain the whole load; verified remote steps ar
   assert.equal(writes.length, 2);
 });
 
-test("HTTP admission with the native gate enabled posts only TO and resumes the retained batch", async () => {
+test("HTTP admission saves SO and TO locally with the native gate enabled and waits for Driver completion", async () => {
   const f = await fixture(), transfer = await addTransfer(f), batch = await preview(f);
-  const previous = { ...config.netsuite }, fetchBoundary = globalThis.fetch, calls = [];
-  let allowTransform = false, savedRecord = null;
-  await query("INSERT INTO netsuite_tokens(id,access_token,expires_at) VALUES(1,'test-consolidation-token',now()+INTERVAL '1 hour') ON CONFLICT(id) DO UPDATE SET access_token=EXCLUDED.access_token,expires_at=EXCLUDED.expires_at");
+  const previous = { ...config.netsuite }, fetchBoundary = globalThis.fetch;
   await query("UPDATE mbt_feature_flags SET enabled=true WHERE flag_key='operator_netsuite_delivery_prep_if_3445'");
   config.netsuite.directAccessEnabled = true;
   config.netsuite.restBaseUrl = "https://netsuite.invalid/services/rest";
-  const json = (value, status = 200, headers = {}) => new Response(JSON.stringify(value), { status, headers: { "content-type": "application/json", ...headers } });
   globalThis.fetch = async (input, options = {}) => {
     const url = new URL(String(input));
-    if (url.origin === base) return fetchBoundary(input, options);
-    assert.equal(url.hostname, "netsuite.invalid", "No real external requests are permitted");
-    calls.push({ path: url.pathname, method: options.method, body: options.body });
-    if (url.pathname.endsWith("/suiteql")) {
-      const sql = JSON.parse(options.body).q;
-      if (sql.includes('FROM location l')) return json({ items: [{ id: 1 }, { id: 28 }, { id: 15 }, { id: 26 }], hasMore: false });
-      if (sql.includes("next_transaction.id")) return json({ items: savedRecord ? [{ id: savedRecord.id }] : [], hasMore: false });
-      if (sql.includes("NextTransactionLineLink")) return json({ items: [], hasMore: false });
-      assert.match(sql, /t\.type AS record_type/);
-      return json({ hasMore: false, items: [-20, -20, 20].map((quantity, index) => ({ id: Number(transfer.orderId), record_type: "TrnfrOrd", tranid: transfer.tranid,
-        order_line_number: index + 2, source_line_key: String(index + 1), do_not_print_line: index === 0 ? "F" : "T", line_sequence_number: index + 1,
-        item_id: 889201, item_name: "Item A", item_type: "InvtPart", signed_quantity: quantity, ordered_quantity: 20,
-        cumulative_progress_quantity: 0, progress_raw: 0, unit: "PC", source_location_id: 1, destination_location_id: 28, to_pcs: 1 })) });
-    }
-    if (url.pathname.includes("/!transform/")) {
-      assert.match(url.pathname, new RegExp(`/transferorder/${transfer.orderId}/!transform/itemfulfillment$`));
-      if (!allowTransform) return json({ error: "Injected native rejection" }, 400);
-      const payload = JSON.parse(options.body);
-      savedRecord = { id: 88001, tranId: "IF-CONSOL-TEST", transactionType: "IF", externalId: payload.externalId,
-        createdFromId: Number(transfer.orderId), item: payload.item };
-      return json({}, 201, { location: "https://netsuite.invalid/services/rest/record/v1/itemFulfillment/88001" });
-    }
-    if (url.pathname.includes("/itemFulfillment/")) return json(savedRecord);
-    assert.match(url.pathname, new RegExp(`/transferOrder/${transfer.orderId}$`));
-    return json({ item: { items: [{ orderLine: 2, item: { id: "889201" }, quantity: 20 }] } });
+    assert.equal(url.origin, base, "Local loading must not consult NetSuite, even with its gate enabled");
+    return fetchBoundary(input, options);
   };
   try {
     const accepted = await request(f.first, `/${batch.id}/submit`, "POST", { photoRefs: photos(batch.id), queueIf: true });
     assert.equal(accepted.status, 200, JSON.stringify(accepted.data));
-    assert.equal(accepted.data.commandId, batch.id);
-    await operatorNetSuitePostingRuntime.enqueue(batch.id);
-    assert.equal((await posting.getOperatorNetSuitePostingCommand(batch.id)).status, "attention");
-    assert.equal((await request(f.first, `/${batch.id}`)).data.status, "pending");
-    allowTransform = true;
+    assert.equal(accepted.data.commandId, null);
+    assert.equal((await request(f.first, `/${batch.id}`)).data.status, "completed");
     assert.equal((await request(f.first, `/${batch.id}/resume`, "POST", {})).status, 200);
     assert.equal((await request(f.first, `/${batch.id}/resume`, "POST", {})).status, 200);
-    await operatorNetSuitePostingRuntime.enqueue(batch.id);
-    const completed = await request(f.first, `/${batch.id}`);
-    assert.equal(completed.data.status, "completed", completed.data.error);
-    const command = await posting.getOperatorNetSuitePostingCommand(batch.id);
-    assert.equal(command.steps.length, 1);
-    assert.equal(command.steps[0].sourceOrderKind, "TO");
-    assert.equal(command.steps[0].netSuiteTransactionId, 88001);
-    assert.equal(calls.some((call) => /salesorder/i.test(call.path)), false);
+    assert.equal(await posting.getOperatorNetSuitePostingCommand(batch.id), null);
+    const jobs=(await query('SELECT * FROM transfer_order_posting_jobs WHERE local_to_id=$1',[transfer.orderId])).rows;
+    assert.equal(jobs.length,1);
+    assert.equal(jobs[0].status,'waiting_driver');
+    assert.equal(jobs[0].command_id,null);
+    assert.equal(jobs[0].snapshot.lines[0].quantity,20);
     assert.equal((await query("SELECT 1 FROM operator_load_records WHERE response->>'consolidationLoadId'=$1", [batch.id])).rowCount, 3);
   } finally {
-    await operatorNetSuitePostingRuntime.enqueue(batch.id);
     globalThis.fetch = fetchBoundary;
     Object.assign(config.netsuite, previous);
     await query("UPDATE mbt_feature_flags SET enabled=false WHERE flag_key='operator_netsuite_delivery_prep_if_3445'");

@@ -7,8 +7,9 @@ function harness({ syncFails = false } = {}) {
   const detail = { id: 42, revision: 8, vendorId: 9, customerId: 10, salesOrderId: 11,
     salesOrderApproved: true, operationalYardLocationId: 1, storeName: '3445',
     salesOrderLines: [{ caseLineId: 1, itemId: 2055, remoteLineId: 701, quantity: 10, uom: 'PC', description: 'Before' }],
-    purchaseOrderLines: [{ caseLineId: 1, itemId: 2055, quantity: 10, uom: 'PC', description: 'After', unitPurchaseCost: 2 }] };
-  const service = createSpecialStockRequestService({
+    vendorDiscountReview: { mode: 'per_line', amount: 0, lines: [{caseLineId:1,vendorDiscountPercent:0}] }, purchaseOrderLines: [{ caseLineId: 1, itemId: 2055, quantity: 10, uom: 'PC', description: 'After', unitPurchaseCost: 2 }] };
+  const service = createSpecialStockRequestService({ assertPurchaseOrderReady: async () => {}, selectSalesRep: async () => ({ id: 123, name: 'TEST NetSuite Rep' }),
+    findLinkedPurchaseOrder: async () => null,
     getCase: async () => detail,
     markSubmitted: async () => detail,
     claimOperation: async () => detail,

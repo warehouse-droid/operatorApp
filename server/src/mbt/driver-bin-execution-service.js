@@ -5,6 +5,8 @@ import crypto from "node:crypto";
 import { query, withTransaction } from "../db.js";
 import { DISPATCH_FLEET_PLANNING_LOCK } from "../dispatch-fleet-status.js";
 import { releaseMbtBinSuccessorToPool } from "./bin-planning-repository.js";
+import { binVisitDisplayReference } from "./bin-order-workflow-repository.js";
+import { assertBinWorkflowPrerequisites, finishBinWorkflowStep } from "./bin-order-workflow-execution.js";
 import { compareDriverPwaVersions } from "../driver-client-version.js";
 import { recordDriverJobPhotos, startDriverJob } from "../driver-repository.js";
 import { recordAssetMovement } from "./asset-service.js";
@@ -120,7 +122,7 @@ async function assetIdentities(ids) {
 /** @param {string} visitId @param {boolean} [forUpdate] */
 async function visitExecutionRows(visitId, forUpdate = false) {
   const visitResult = await query(
-    `SELECT visit.service_visit_id::text, visit.contract_id::text,
+    `SELECT visit.service_visit_id::text, visit.contract_id::text, visit.service_line_id::text,
             visit.visit_number::int, visit.visit_reference, visit.service_action,
             visit.status, visit.revision::int, visit.customer_site_profile_id::text,
             visit.service_template_version_id::text, template.revision::int AS template_revision,
@@ -342,6 +344,10 @@ function siteAddressForVisit(visit) {
  * @param {Record<string, any>} stop
  */
 function operationalPresentation(baseJob, visit, step, stop) {
+  if (visit.service_snapshot?.binWorkflow) {
+    const configured = visit.service_snapshot.mandatoryStops.find((/** @type {any} */ s)=>s.actionCode === step.action_code);
+    if (configured?.location) {return {location:configured.location.name,address:configured.location.address};}
+  }
   const locationRole = firstText(step.location_role, stop.locationRole);
   let location = firstText(stop.yardCode, baseJob.location);
   let address = firstText(baseJob.address, location);
@@ -510,7 +516,7 @@ export async function materializeMbtDriverBinJob(baseJob, versions) {
     orderTypes: ["BIN"],
     orders: [],
     requiredPhotos: requiredPhotoCount(requirements),
-    mbt: materializedMbtSnapshot({
+    mbt: {...materializedMbtSnapshot({
       baseJob,
       visit,
       step,
@@ -520,7 +526,7 @@ export async function materializeMbtDriverBinJob(baseJob, versions) {
       requirements,
       actionCode,
       minimumClientVersion
-    })
+    }), displayReference:await binVisitDisplayReference(visitId,actionCode)}
   };
 }
 
@@ -938,6 +944,7 @@ export async function startMbtDriverBinJob(input, { capability }) {
     }
     const step = currentStep(rows, input.job);
     assertPriorStepsComplete(rows, step);
+    await assertBinWorkflowPrerequisites(rows.visit,step,normalized.occurredAt);
     if (manifestContext) {
       const lockedStates = await lockExactAssetStates(input.job);
       assertCompleteManifestChronology(manifestContext, normalized, lockedStates);
@@ -1430,6 +1437,10 @@ function movementLocation(context, kind) {
   const visit = context.rows.visit;
   const jobMbt = objectValue(context.job.mbt);
   const capability = objectValue(jobMbt.capabilitySnapshot);
+  if (kind === "to_yard" && visit.service_snapshot?.binWorkflow) {
+    const stop = visit.service_snapshot.mandatoryStops.find((/** @type {any} */ s)=>s.actionCode === context.step.action_code);
+    return {kind:"yard",reference:stop.location.yardCode || stop.location.name,yardId:stop.location.id};
+  }
   if (kind === "to_truck") {
     return {
       kind: "truck",
@@ -1490,14 +1501,17 @@ function expectedLocationForStatus(context, status) {
     return {
       kind: "dump_site",
       identityField: "dump_site_id",
-      identity: firstText(visit.dump_site_id)
+      identity: visit.service_snapshot?.binWorkflow?.role==="delivery"
+        ? firstText(visit.service_snapshot.binWorkflow.source?.id) : firstText(visit.dump_site_id)
     };
   }
   if (["available", "reserved"].includes(status)) {
     return {
       kind: "yard",
       identityField: "yard_id",
-      identity: firstText(capability.baseYardId)
+      identity: visit.service_snapshot?.binWorkflow
+        ? firstText(visit.service_snapshot.binWorkflow.source?.id)
+        : firstText(capability.baseYardId)
     };
   }
   return null;
@@ -1572,7 +1586,8 @@ function singleMovementPlan(context, actionCode, kind, templateBefore, templateA
     asset,
     kind,
     role: "expected",
-    beforeStatuses: templateBefore ? [templateBefore] : defaultBeforeStatuses(actionCode),
+    beforeStatuses: context.rows.visit.service_snapshot?.binWorkflow?.source?.kind==="dump_site" && actionCode==="collect_empty_bin"
+      ? ["at_dump"] : templateBefore ? [templateBefore] : defaultBeforeStatuses(actionCode),
     afterStatus: derivedAfter
   }];
 }
@@ -1586,7 +1601,9 @@ function singleMovementPlan(context, actionCode, kind, templateBefore, templateA
  */
 function movementPlans(context) {
   const actionCode = String(context.step.action_code);
-  const kind = movementKind(actionCode);
+  // Dumping empties the bin; it remains physically aboard this truck.
+  const kind = context.rows.visit.service_snapshot?.binWorkflow && actionCode === "dump_bin"
+    ? "to_truck" : movementKind(actionCode);
   if (kind === "none") {return [];}
   const templateBefore = nullableString(context.step.required_asset_status_before);
   const templateAfter = nullableString(context.step.required_asset_status_after);
@@ -1656,7 +1673,8 @@ function assertMovementPreconditions(context, plans, lockedStates) {
  * @param {Record<string, any> | null} manifestContext
  */
 async function assertActiveDumpAcceptance(context, manifestContext) {
-  if (!manifestContext || movementKind(String(context.step.action_code)) !== "to_dump") {return;}
+  if ((!manifestContext && !context.rows.visit.service_snapshot?.binWorkflow)
+      || movementKind(String(context.step.action_code)) !== "to_dump") {return;}
   const dumpSiteId = nullableString(context.rows.visit.dump_site_id);
   const materialId = nullableString(context.rows.visit.material_id);
   if (!dumpSiteId || !materialId) {
@@ -1786,6 +1804,7 @@ async function finishStepAndVisit(context) {
     );
     await releaseMbtBinSuccessorToPool(String(context.rows.visit.service_visit_id), `driver:${context.normalized.driverLogin}`);
   }
+  await finishBinWorkflowStep(context,visitCompleted);
   return visitCompleted;
 }
 
@@ -1799,7 +1818,7 @@ async function insertBillingTrigger(context, visitCompleted, receipt) {
      ) VALUES ($1, $2::uuid, $3, $4, $5, 'local_only', $6::jsonb)`,
     [
       crypto.randomUUID(), context.normalized.eventId, context.rows.visit.contract_id,
-      context.rows.visit.service_visit_id, kind,
+      context.rows.visit.service_snapshot?.binWorkflow?.billingOwnerVisitId || context.rows.visit.service_visit_id, kind,
       JSON.stringify({
         jobId: context.normalized.jobId,
         actionCode: context.step.action_code,
@@ -1843,6 +1862,7 @@ export async function completeMbtDriverBinJob(input, { capability, hooks = {} })
     }
     const step = currentStep(rows, input.job);
     assertPriorStepsComplete(rows, step);
+    await assertBinWorkflowPrerequisites(rows.visit,step,normalized.occurredAt);
     if (normalized.details.actionCode !== String(step.action_code)) {
       throw failure(409, "MBT_DRIVER_BIN_REVIEW_REQUIRED", "The saved BIN action no longer matches its visit step.", {
         eventId: normalized.eventId

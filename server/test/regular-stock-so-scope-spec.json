@@ -1,0 +1,33 @@
+{
+  "request": "STREQ-000105: an unchanged selected transfer line must not be blocked by edits to unselected SO lines",
+  "tier": 3,
+  "specApproval": "not obtained (autonomous run); user explicitly authorized the selected-line fix",
+  "scope": "SO-based Delivery transfer validation; preserve other regular-stock workflows",
+  "behaviors": [
+    "Adding, removing, editing or reordering unselected SO lines after approval permits the saved selected transfer",
+    "A selected line is matched by its stable remote line identity; removing and recreating the same item is rejected",
+    "Selected item, quantity, REST quantity, unit, yard, backorder or fulfillment changes still stop transfer execution",
+    "SO identity, customer and header yard changes still stop transfer execution",
+    "The transfer and dependency allocations contain only the originally selected lines and quantities",
+    "Manual approvals and automatic approvals use the same selected-line check",
+    "A retry after remote commitment reuses the existing local and remote transfer",
+    "Non-Delivery regular-stock handoffs retain whole-order validation"
+  ],
+  "existingContractChange": "The two integration cases that blocked a selected material transfer on changes to a separate, unselected kit now require successful execution. Adapter validation of kit consistency and non-Delivery kit checks remain intact.",
+  "failureModel": {
+    "unrelatedLineBlocks": "RED reproduction and generated unselected edits",
+    "selectedChangeBypassed": "negative integration cases, property checks and manual mutation",
+    "selectionExpanded": "assert saved owners, mappings, transfer lines and quantities",
+    "duplicateTransferOnRetry": "partial-commit recovery integration case and existing concurrency suite",
+    "unrelatedWorkspaceDeployment": "production snapshot plus one-file overlay with before/after hashes",
+    "hostResourceLeak": "standard isolated Compose resource limits, teardown registered before startup, docker ps and ps -a verification"
+  },
+  "setup": {
+    "runtimeFiles": ["src/regular-stock-handoff.js"],
+    "dependencies": "No new dependencies; reuse installed Node test runner, fast-check, c8, ESLint and TypeScript",
+    "git": "Preserve pre-existing workspace changes; capture task-only source baseline and diff; no commits",
+    "artifacts": "test-artifacts/regular-stock-so-scope-20261008 and deployments/regular-stock-so-scope-20261008",
+    "execution": "Read-only production diagnosis; isolated synthetic test data; scoped application image deployment with rollback; no automatic execution of the live request"
+  },
+  "knownLimits": ["Existing remote write/read race window is unchanged", "The earlier duplicate transfer-line synchronization error and incorrect Completed label are separate from this validation change"]
+}

@@ -11,7 +11,7 @@
   function detail(request){
     const w=request.waitlist,line=request.lines[0],value=draft(request),inProgress=w.state==='converting',terminal=['closed','completed'].includes(w.state);
     const labels={waiting:'Waiting',partially_allocated:'Partially allocated',allocated:'Allocated',converting:'Creating SO',closed:w.closureType==='rejected'?'Rejected':'Closed',completed:'Converted'};
-    return `<div class="stock-request-heading"><div><h2>${esc(request.requestRef)}</h2><p>Waitlist · ${esc(request.regular.customerName)} · Sales yard ${esc(request.destinationName)}</p></div><strong>${labels[w.state]||esc(w.state)}</strong></div>
+    return `<div class="stock-request-heading"><div><h2>${esc(request.requestRef)}</h2><p>Waitlist · ${esc(request.regular.customerName)} · Sales yard ${esc(request.destinationName)}</p></div>${window.RegularStockStatus?.render(request) || `<strong>${labels[w.state]||esc(w.state)}</strong>`}</div>
       <section class="stock-request-section"><h3>${esc(line.itemName)}</h3><div class="waitlist-totals">${[['Requested',w.requestedQty],['Allocated',w.heldQty],['Converted to SO',w.convertedQty],['Waiting',w.waitingQty]].map(([label,qty])=>`<span><small>${label}</small><strong>${number(qty)} ${esc(line.salesUom)}</strong></span>`).join('')}</div>
       <p>Submitted ${esc(new Date(request.createdAt).toLocaleString())}. Allocation follows selling-yard priority, then the original request time.</p>${request.remarks?`<p>${esc(request.remarks)}</p>`:''}
       ${w.closeReason?`<p>${w.closureType==='rejected'?'Rejected':'Closed'}: ${esc(w.closeReason)}</p>`:''}</section>

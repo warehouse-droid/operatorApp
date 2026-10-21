@@ -18,6 +18,7 @@ let renderedContent = Buffer.from("%PDF-1.4\nMBBS sandbox stub\n").toString("bas
 let getContentsCalls = 0;
 const renderCalls = [];
 const recordLoadCalls = [];
+const searchCalls = [];
 const auditLogs = [];
 const errorLogs = [];
 
@@ -120,7 +121,8 @@ const modules = new Map([
   ["N/log", logModule],
   ["N/record", recordModule],
   ["N/render", renderModule],
-  ["N/runtime", runtimeModule]
+  ["N/runtime", runtimeModule],
+  ["N/search", { Type: { SALES_ORDER: "salesorder", PURCHASE_ORDER: "purchaseorder" }, create(options) { searchCalls.push(options); return { run: () => ({ getRange: () => [{id: options.filters[0][2]}] }) }; } }]
 ]);
 
 const context = vm.createContext({
@@ -136,12 +138,13 @@ assert.equal(typeof entryPoints?.post, "function");
 const health = entryPoints.get({ action: "health", requireSandbox: "true" });
 assert.equal(health.ok, true);
 assert.equal(health.action, "health");
-assert.equal(health.version, "3.0.0");
+assert.equal(health.version, "3.4.0");
 assert.equal(health.sandbox, true);
 assert.equal(health.environment, "SANDBOX");
 assert.equal(health.accountId, "123456_SB1");
 assert.equal(health.capabilities.pickingTicket, true);
 assert.equal(health.capabilities.purchaseOrderPdf, true);
+assert.equal(health.capabilities.estimatePdf, true);
 assert.equal(health.capabilities.updatePurchaseOrder, true);
 assert.equal(health.capabilities.metadataOnly, true);
 
@@ -176,7 +179,8 @@ assert.equal(poPdf.ok, true);
 assert.equal(poPdf.action, "purchaseOrderPdf");
 assert.equal(poPdf.entityId, 321);
 assert.equal(poPdf.contentBase64, renderedContent);
-assert.deepEqual(recordLoadCalls[0], { type: "purchaseorder", id: 321, isDynamic: false });
+assert.equal(recordLoadCalls.length, 0);
+assert.equal(searchCalls[0].type, "purchaseorder");
 
 const updatedPo = entryPoints.post({
   action: "updatePurchaseOrder",

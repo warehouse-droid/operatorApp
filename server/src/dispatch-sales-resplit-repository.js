@@ -212,7 +212,7 @@ export async function resplitUnfinishedSalesOrder(input = {}) {
     await assertSalesDeliveryPlanningAllowed([row.split_ref], "split the unfinished order");
     await assertNoActiveOrderDependenciesByRefs([row.split_ref], "split this unfinished order");
     await assertNoActiveConsolidationClaimsByRefs([row.split_ref], "split this unfinished order");
-    const seed = await getNextDispatchSplitSuffix({ originalOrderId: row.parent_order_ref, orderType: "SO" });
+    const seed = await getNextDispatchSplitSuffix({ originalOrderId: row.split_ref, orderType: "SO" });
     const orders = buildSalesResplits(source, input.parts ?? [], seed.nextSuffix);
     const parent = (await query("SELECT netsuite_id FROM sales_orders WHERE tranid=$1 AND netsuite_id>0 FOR UPDATE", [row.parent_order_ref])).rows[0];
     if (!parent) { throw failure("DISPATCH_SPLIT_NOT_FOUND", "The original Sales Order was not found. Refresh Orders."); }
@@ -220,7 +220,11 @@ export async function resplitUnfinishedSalesOrder(input = {}) {
     for (const order of orders) { order.netsuiteId = String(await materializeSalesSplitOrder(order, parent)); }
     await syncDispatchGlobalOrderSplitsFromPlan({ id: plan.id, planDate: plan.plan_date, revision: plan.revision, orders, trucks: [] });
     await deactivateDispatchGlobalOrderDefinitions([row.split_ref]);
-    const result = { orders, retiredGlobalOrderRefs: [row.split_ref], planRevision: Number((await query("SELECT revision FROM dispatch_plans WHERE id=$1", [plan.id])).rows[0].revision) };
+    const persisted = (await query(`SELECT p.id,p.plan_date,p.revision,p.status,p.note,s.saved_at,s.orders,s.trucks,s.summary
+      FROM dispatch_plans p JOIN dispatch_plan_snapshots s ON s.plan_id=p.id WHERE p.id=$1`, [plan.id])).rows[0];
+    const acknowledged = persistedDispatchPlan(persisted);
+    if (!acknowledged) throw failure("DISPATCH_SPLIT_STALE", "The saved plan snapshot is unavailable. Reload before splitting.");
+    const result = { orders, retiredGlobalOrderRefs: [row.split_ref], planRevision: acknowledged.revision, planDigest: acknowledged.digest };
     await query("UPDATE dispatch_global_order_splits SET full_order=full_order||$2::jsonb WHERE split_ref=$1",
       [row.split_ref, JSON.stringify({ resplitReplacement: { requestHash, result } })]);
     await writeDispatchAudit({ action: "order_resplit", entityType: "order", entityId: row.split_ref, orderId: row.split_ref,

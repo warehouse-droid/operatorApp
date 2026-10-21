@@ -1,0 +1,870 @@
+--- a/server/src/regular-stock-domain.js
++++ b/server/src/regular-stock-domain.js
+@@ -20,8 +20,8 @@
+ /** @param {number} a @param {number} b */
+ const sameQty = (a, b) => Math.abs(Number(a) - Number(b)) <= 1e-6;
+ 
+-/** @param {{lines?:RegularLine[],policies?:StockPolicy[],arrivalAt:string|number|Date,leadHours?:number,autoApprovalEnabled?:boolean,now?:string|number|Date}} input */
+-export function evaluateRegularStockApproval({ lines = [], policies = [], arrivalAt, leadHours = 5, autoApprovalEnabled = true, now = new Date() }) {
++/** @param {{lines?:RegularLine[],policies?:StockPolicy[],arrivalAt:string|number|Date,deliveryMethod?:string,leadHours?:number,autoApprovalEnabled?:boolean,now?:string|number|Date}} input */
++export function evaluateRegularStockApproval({ lines = [], policies = [], arrivalAt, deliveryMethod = 'delivery', leadHours = 5, autoApprovalEnabled = true, now = new Date() }) {
+   const hours = normalizeRegularLeadHours(leadHours);
+   const nowMs = new Date(now).getTime(), arrivalMs = new Date(arrivalAt).getTime();
+   if (!Number.isFinite(nowMs) || !Number.isFinite(arrivalMs)) throw regularError('A valid arrival instant is required.', 'REGULAR_ARRIVAL_INVALID', 400);
+@@ -43,21 +43,22 @@
+     return { lineId: Number(line.id), itemId: Number(line.itemId), sourceLocationId: Number(line.sourceLocationId),
+       requestedQuantity: Number(line.salesQty), groupedRequestedQuantity: requested, availableQuantity: available,
+       safetyQuantity: safety, remainingQuantity: remaining, shortfallQuantity: known ? Math.max(0, Number(safety) - Number(remaining)) : null,
+-      unit: line.salesUom, stockEligible: safe, reasons: [...(!autoApprovalEnabled ? ['auto_approval_disabled'] : []), ...(!known ? ['policy_unavailable'] : !safe ? ['below_safety'] : []), ...(!enoughTime ? ['short_lead_time'] : [])] };
++      unit: line.salesUom, stockEligible: safe, reasons: [...(deliveryMethod === 'pickup' ? ['pickup_scm_review'] : []), ...(!autoApprovalEnabled ? ['auto_approval_disabled'] : []), ...(!known ? ['policy_unavailable'] : !safe ? ['below_safety'] : []), ...(!enoughTime ? ['short_lead_time'] : [])] };
+   });
+-  return { automatic: autoApprovalEnabled && evidence.length > 0 && enoughTime && evidence.every(line => line.stockEligible), autoApprovalEnabled, leadHours: hours,
++  return { automatic: deliveryMethod !== 'pickup' && autoApprovalEnabled && evidence.length > 0 && enoughTime && evidence.every(line => line.stockEligible), deliveryMethod, autoApprovalEnabled, leadHours: hours,
+     evaluatedAt: new Date(nowMs).toISOString(), arrivalAt: new Date(arrivalMs).toISOString(), enoughTime, lines: evidence };
+ }
+ 
+-/** @param {{regular?:{approvalExpiresAt?:string|null,handoffStatus?:string}}} request @param {Date|string|number} [now] */
++/** @param {{regular?:{deliveryMethod?:string,approvalExpiresAt?:string|null,handoffStatus?:string}}} request @param {Date|string|number} [now] */
+ export function regularApprovalExpired(request,now=new Date()) {
+-  return !request.regular?.handoffStatus && !!request.regular?.approvalExpiresAt
++  return request.regular?.deliveryMethod !== 'pickup' && !request.regular?.handoffStatus && !!request.regular?.approvalExpiresAt
+     && new Date(now).getTime()>=new Date(request.regular.approvalExpiresAt).getTime();
+ }
+ 
+-/** @param {{regular?:{approvalExpiresAt?:string|null,approvalValidityMinutes?:number,handoffStatus?:string}}} request @param {Date|string|number} [now] */
++/** @param {{regular?:{deliveryMethod?:string,approvalExpiresAt?:string|null,approvalValidityMinutes?:number,handoffStatus?:string}}} request @param {Date|string|number} [now] */
+ export function requireRegularStockApproval(request,now=new Date()) {
+   if(request.regular?.handoffStatus)return;
++  if(request.regular?.deliveryMethod==='pickup')throw regularError('Pickup requests require SCM to convert directly to TOs. A Sales Order is not required.','REGULAR_PICKUP_SCM_REQUIRED');
+   if(regularApprovalExpired(request,now))throw regularError(`Approval expired after ${request.regular?.approvalValidityMinutes || 15} minutes. Re-raise this request to obtain a new approval.`,'REGULAR_APPROVAL_EXPIRED');
+   if(!request.regular?.approvalExpiresAt || !Number.isFinite(new Date(request.regular.approvalExpiresAt).getTime()))throw regularError('Finish all SCM decisions before entering the SO.','REGULAR_APPROVAL_REQUIRED');
+ }
+--- a/server/src/regular-stock-request-service.js
++++ b/server/src/regular-stock-request-service.js
+@@ -64,7 +64,7 @@
+   const leadHours = normalizeRegularLeadHours(setting.rows[0]?.regular_stock_lead_hours ?? 5);
+   const autoApprovalEnabled=setting.rows[0]?.regular_stock_auto_approval_enabled ?? true;
+   const minutes=normalizeRegularApprovalMinutes(setting.rows[0]?.regular_stock_approval_minutes ?? 15);
+-  const approval = evaluateRegularStockApproval({ lines: request.lines, policies: evidence.policies, arrivalAt: details.arrivalAt, leadHours, autoApprovalEnabled, now });
++  const approval = evaluateRegularStockApproval({ lines: request.lines, policies: evidence.policies, arrivalAt: details.arrivalAt, deliveryMethod: details.deliveryMethod, leadHours, autoApprovalEnabled, now });
+   const window=approval.automatic?approvalWindow(now,minutes):{approvedAt:null,approvalValidityMinutes:minutes,approvalExpiresAt:null};
+   await query(`UPDATE sales_stock_requests SET workflow_version=2,regular_details=$2::jsonb,
+     status=$3,first_scm_decision_at=CASE WHEN $4 THEN now() ELSE first_scm_decision_at END WHERE id=$1`,
+@@ -124,10 +124,10 @@
+ export async function refreshRegularStockEvidence(id, dependencies = {}) {
+   const request = await getScmStockRequest(id);
+   if (request.workflowVersion !== 2) return request;
+-  if(request.regular.handoffStatus==='complete' || request.status==='completed')return request;
++  if(request.regular.pickupTransfer || request.regular.handoffStatus==='complete' || request.status==='completed')return request;
+   const evidence = await collectEvidence(request.lines.map(line => line.itemId), dependencies);
+   const current = evaluateRegularStockApproval({ lines: request.lines, policies: evidence.policies, arrivalAt: request.regular.arrivalAt,
+-    leadHours: request.regular.approval.leadHours, autoApprovalEnabled:request.regular.approval.autoApprovalEnabled, now: request.regular.approval.evaluatedAt });
++    deliveryMethod: request.regular.deliveryMethod, leadHours: request.regular.approval.leadHours, autoApprovalEnabled:request.regular.approval.autoApprovalEnabled, now: request.regular.approval.evaluatedAt });
+   // Current review evidence is separate from the immutable approval snapshot.
+   return { ...request, currentEvidence: current.lines, evidenceError: evidence.error };
+ }
+@@ -136,6 +136,7 @@
+   const before = await getScmStockRequest(id);
+   if (before.workflowVersion !== 2) return decideSalesStockRequestLines(id, input, context);
+   const decision = String(input.decision || '');
++  if(before.regular.deliveryMethod==='pickup' && decision!=='reject')throw regularError('Use Convert to TO to approve and transfer a pickup request.','REGULAR_PICKUP_SCM_REQUIRED');
+   if (!['stock', 'po', 'reject'].includes(decision)) throw regularError('Choose TO/location change, PO replenishment, or Reject.', 'REGULAR_DECISION_INVALID', 400);
+   const reason = String(input.reason || '').trim();
+   if (reason.length > 1000 || decision === 'reject' && !reason) throw regularError('Rejection requires a reason, at most 1000 characters.', 'REGULAR_REASON_REQUIRED', 400);
+@@ -147,9 +148,10 @@
+     const request = await getScmStockRequest(id);
+     if (input.expectedRevision === undefined) throw regularError('Request revision is required.');
+     const selected = request.lines.filter(line => lineIds.includes(line.id));
+-    if (selected.length !== lineIds.length || selected.some(line => line.status !== 'submitted')) throw regularError('Only undecided lines can be reviewed.');
++    const pendingPickup=request.regular.deliveryMethod==='pickup' && !request.regular.pickupTransfer && !request.regular.handoffStatus;
++    if (selected.length !== lineIds.length || selected.some(line => line.status !== 'submitted' && !(pendingPickup && decision==='reject' && line.status==='approved'))) throw regularError('Only undecided lines can be reviewed.');
+     const snapshot = evaluateRegularStockApproval({ lines: request.lines, policies: evidence.policies, arrivalAt: request.regular.arrivalAt,
+-      leadHours: request.regular.approval.leadHours, now: (dependencies.now || (() => new Date()))() });
++      deliveryMethod: request.regular.deliveryMethod, leadHours: request.regular.approval.leadHours, now: (dependencies.now || (() => new Date()))() });
+     for (const line of selected) await query(`UPDATE sales_stock_request_lines SET regular_decision=$2,status=$3,
+       decision_reason=$4,decided_by=$5,decided_at=now(),approval_evidence=$6::jsonb,updated_at=now() WHERE id=$1`,
+     [line.id, decision, decision === 'reject' ? 'rejected' : 'approved', reason, context.operatorId,
+@@ -170,7 +172,9 @@
+ export async function regularStockAlerts({ scm = false, operatorId, authorizedDestinationLocationIds = [] } = {}) {
+   if (scm) {
+     const { rows } = await query(`SELECT count(*)::int AS count FROM sales_stock_requests r WHERE r.workflow_version=2 AND r.request_type='regular'
+-      AND EXISTS(SELECT 1 FROM sales_stock_request_lines l WHERE l.request_id=r.id AND l.status='submitted')`);
++      AND EXISTS(SELECT 1 FROM sales_stock_request_lines l WHERE l.request_id=r.id AND (l.status='submitted'
++        OR (l.status='approved' AND r.regular_details->>'deliveryMethod'='pickup'
++          AND NOT r.regular_details ? 'pickupTransfer' AND NOT r.regular_details ? 'handoffStatus')))`);
+     return { manualReview: rows[0].count, total: rows[0].count };
+   }
+   if (!operatorId || !authorizedDestinationLocationIds.length) return { unread: 0, total: 0, requests: [] };
+--- a/server/src/regular-stock-handoff.js
++++ b/server/src/regular-stock-handoff.js
+@@ -188,6 +188,7 @@
+ 
+ export async function previewRegularStockSalesOrder(id,input,context,{readOrder=readRegularStockSalesOrderFromNetSuite,now=()=>new Date()}={}){
+   const request=await getSalesStockRequest(id,context);
++  if(request.workflowVersion===2 && request.regular.deliveryMethod==='pickup' && !request.regular.handoffStatus)requireRegularStockApproval(request,now());
+   if(request.workflowVersion!==2||request.lines.some(line=>line.status==='submitted'))throw regularError('Finish all SCM decisions before entering the SO.');
+   const existing=(await query('SELECT * FROM regular_stock_handoffs WHERE request_id=$1',[id])).rows[0];
+   if(existing){
+--- a/server/src/stock-request-repository.js
++++ b/server/src/stock-request-repository.js
+@@ -1208,10 +1208,13 @@
+     clauses.push(`EXISTS (
+       SELECT 1 FROM sales_stock_request_lines line
+        WHERE line.request_id = request.id
+-         AND line.status IN ('submitted', 'changes_requested')
++         AND (line.status IN ('submitted', 'changes_requested') OR
++           (line.status='approved' AND request.workflow_version=2 AND request.regular_details->>'deliveryMethod'='pickup'
++             AND NOT request.regular_details ? 'pickupTransfer' AND NOT request.regular_details ? 'handoffStatus'))
+     )`);
+   } else if (normalizedQueue === "approved") {
+     clauses.push("EXISTS(SELECT 1 FROM sales_stock_request_lines line WHERE line.request_id=request.id AND line.status='approved')");
++    clauses.push("NOT (request.workflow_version=2 AND COALESCE(request.regular_details->>'deliveryMethod','')='pickup' AND NOT request.regular_details ? 'handoffStatus')");
+   } else if (normalizedQueue === "pending_to") {
+     clauses.push(`EXISTS (
+       SELECT 1 FROM sales_stock_transfers transfer
+@@ -1430,6 +1433,49 @@
+ 
+ export async function recordStockRequestEvent(values) {
+   return recordEvent(values);
++}
++
++// Preview and confirmation use the same authoritative item conversions. No edits are saved here.
++export async function normalizePickupStockRequestDraft(request, input) {
++  const lines = input.lines;
++  if (!Array.isArray(lines) || !lines.length || lines.length > 100) throw stockRequestError('Include between 1 and 100 pickup items.');
++  if (lines.some(line => !line || typeof line !== 'object' || Array.isArray(line))) throw stockRequestError('Every pickup item must be a valid request line.');
++  const editable = request.lines.filter(line => ['submitted', 'approved'].includes(line.status));
++  const existingIds = lines.filter(line => line.id !== undefined && line.id !== null).map(line => requiredId(line.id, 'stock-request line'));
++  if (new Set(existingIds).size !== existingIds.length || existingIds.length !== editable.length
++    || editable.some(line => !existingIds.includes(line.id))) {
++    throw stockRequestError('Include every actionable request line exactly once. Rejected items cannot be converted.');
++  }
++  if (request.lines.length + lines.length - existingIds.length > 100) throw stockRequestError('A request can contain at most 100 items.');
++  const items = await inventoryItems(lines.map(line => line.itemId), { forShare: true });
++  return lines.map(line => {
++    const item = items.get(Number(line.itemId));
++    if (!item) throw stockRequestError('Inventory item was not found.', 404, 'STOCK_REQUEST_ITEM_NOT_FOUND');
++    if (line.id != null && editable.find(existing => existing.id === Number(line.id))?.itemId !== Number(line.itemId)) {
++      throw stockRequestError('An existing request item cannot be replaced. Add the item as a new line.');
++    }
++    if (String(item.item_name).trim().toUpperCase() === 'PALLET') throw stockRequestError('Set PALLET quantities for each transfer route instead of adding a stock line.');
++    return normalizeLineInput(line, item, request.destinationLocationId);
++  });
++}
++
++// The caller holds the request lock and saves the approval and transfer records in this transaction.
++export async function savePickupStockRequestDraft(request, lines, operatorId) {
++  const saved = [];
++  for (const line of lines) {
++    let id = line.id;
++    if (id) {
++      await query(`UPDATE sales_stock_request_lines SET source_location_id=$3,source_name=$4,
++        sales_qty=$5,sales_uom=$6,quantity_mode=$7,pallet_qty=$8,layer_qty=$9,section_qty=$10,piece_qty=$11,
++        to_plt=$12,to_lyr=$13,to_sec=$14,to_pcs=$15,updated_at=now() WHERE request_id=$1 AND id=$2`,
++      [request.id,id,line.sourceLocationId,line.sourceName,line.salesQty,line.salesUom,line.quantityMode,
++        line.pallets,line.layers,line.sections,line.pieces,line.toPlt,line.toLyr,line.toSec,line.toPcs]);
++    } else id = Number((await insertLine(request.id, line)).id);
++    await query(`UPDATE sales_stock_request_lines SET status='approved',regular_decision='stock',
++      decision_reason=NULL,decided_by=$2,decided_at=now(),updated_at=now() WHERE id=$1`, [id,operatorId]);
++    saved.push({ ...line, id });
++  }
++  return saved;
+ }
+ 
+ export async function updateScmStockRequestLine(requestId, lineId, input = {}, { operatorId } = {}) {
+@@ -1944,6 +1990,9 @@
+ export async function reviseStockTransferQuantities(transferId, input = {}, { operatorId = null } = {}) {
+   return withTransaction(async () => {
+     const transfer = await getStockTransfer(transferId, { forUpdate: true });
++    if (transfer.workflowVersion===2 && (await query("SELECT regular_details ? 'pickupTransfer' AS pickup FROM sales_stock_requests WHERE id=$1",[transfer.requestId])).rows[0]?.pickup) {
++      throw stockRequestError('Pickup TO quantities are locked once conversion starts. Resume the saved conversion.',409,'REGULAR_PICKUP_LOCKED');
++    }
+     if(transfer.workflowVersion===2 && Array.isArray(input.lines) && input.lines.length)throw stockRequestError('SO-linked stock-request material quantities are locked after approval.',409,'REGULAR_TRANSFER_LOCKED');
+     const expected = requiredRevision(input.expectedRevision);
+     const revisionRequestId = String(input.requestId || "").trim();
+--- a/server/src/server.js
++++ b/server/src/server.js
+@@ -1,4 +1,5 @@
+ import {submitRegularStockRequest,editRegularStockRequest,decideRegularStockRequest,refreshRegularStockEvidence,regularStockAlerts,acknowledgeRegularStockDecisions,reraiseRegularStockRequest} from './regular-stock-request-service.js';
++import {previewPickupStockTransfers,convertPickupStockTransfers} from './regular-stock-pickup.js';
+ import {linkRegularStockSalesOrder,previewRegularStockSalesOrder} from './regular-stock-handoff.js';
+ import {releaseRegularReplenishment} from './regular-stock-replenishment.js';
+ import { createSpecialExpiryRuntime } from './special-stock-expiry.js';
+@@ -12264,6 +12265,23 @@
+ app.get('/api/scm/stock-requests/alerts', requireScmAccess, async(_req,res,next)=>{
+   try {res.setHeader('Cache-Control','private, no-store');res.json(await regularStockAlerts({scm:true}));} catch(error){next(error);}
+ });
++app.get('/api/scm/stock-request-items', requireScmAccess, async(req,res,next)=>{
++  try {res.setHeader('Cache-Control','private, no-store');res.json({items:await searchStockRequestItems({search:req.query.search,limit:req.query.limit})});} catch(error){next(error);}
++});
++app.post('/api/scm/stock-request-items/:itemId/availability/refresh', requireScmAccess, async(req,res,next)=>{
++  try {res.setHeader('Cache-Control','private, no-store');res.json(await refreshStockRequestItemAvailability(req.params.itemId));} catch(error){next(error);}
++});
++app.post('/api/scm/stock-requests/:id/pickup-preview', requireSmartScmWriteAccess, async(req,res,next)=>{
++  try {res.json(await previewPickupStockTransfers(req.params.id,req.body||{},{operatorId:req.operator.id}));} catch(error){next(error);}
++});
++app.post('/api/scm/stock-requests/:id/pickup-convert', requireSmartScmWriteAccess, async(req,res,next)=>{
++  try {
++    const request=await convertPickupStockTransfers(req.params.id,req.body||{},{operatorId:req.operator.id});
++    emitStockRequestUpdate('scm-pickup-convert',{requestId:request.id});
++    emitAppEvent('dispatch.orders.updated',{source:'scm-pickup-convert'});
++    res.json(request);
++  } catch(error){emitStockRequestUpdate('scm-pickup-attention',{requestId:Number(req.params.id)});next(error);}
++});
+ app.post('/api/scm/stock-requests/:id/evidence', requireScmAccess, async(req,res,next)=>{
+   try {res.json(await refreshRegularStockEvidence(req.params.id));} catch(error){next(error);}
+ });
+--- a/server/public/regular-stock-ui.js
++++ b/server/public/regular-stock-ui.js
+@@ -19,9 +19,11 @@
+       <label><span>${t('Expected arrival time (Toronto)','预计到达时间（多伦多）')} *</span><input data-regular-field="arrivalTime" autocomplete="off" required placeholder="15:00 / 3pm" value="${esc(composer.arrivalTime)}" /></label>
+     </div>`;
+   }
+-  const approvalExpired=request=>!request?.regular?.handoffStatus && !!request?.regular?.approvalExpiresAt && Date.now()>=new Date(request.regular.approvalExpiresAt).getTime();
++  const pickup=request=>request?.regular?.deliveryMethod==='pickup'&&!request.regular.handoffStatus;
++  const approvalExpired=request=>!pickup(request) && !request?.regular?.handoffStatus && !!request?.regular?.approvalExpiresAt && Date.now()>=new Date(request.regular.approvalExpiresAt).getTime();
+   function reviewReasons(request) {
+     const approval=request.regular?.approval || {},reasons=[];
++    if(pickup(request))reasons.push(t('Pickup requires SCM review and direct TO creation.','自取申请须 SCM 审核并直接建立调货单。'));
+     if(approval.autoApprovalEnabled===false)reasons.push(t('Auto-approval is turned off. SCM must review this request.','自动批准已关闭，须由 SCM 审核此申请。'));
+     if(approval.enoughTime===false)reasons.push(t(`Required at least ${number(approval.leadHours)} hours of lead time.`,`须至少提前 ${number(approval.leadHours)} 小时申请。`));
+     for(const evidence of approval.lines || []){
+@@ -40,22 +42,24 @@
+       <span><small>${t('Customer','客户')}</small><strong>${esc(r.customerName||'—')}</strong></span>
+       <span><small>${t('Method','取货方式')}</small><strong>${r.deliveryMethod==='pickup'?t('Pickup','自取'):t('Delivery','送货')}</strong></span>
+       <span><small>${t('Expected arrival · Toronto','预计到达 · 多伦多')}</small><strong>${esc(r.arrivalDate)} ${esc(r.arrivalTime)}</strong></span>
+-      <span><small>${t('Review route','审核方式')}</small><strong>${a.automatic?t('Automatically approved','自动批准'):t('SCM review','SCM 人工审核')}</strong></span>
++      <span><small>${t('Review route','审核方式')}</small><strong>${a.automatic&&!pickup(request)?t('Automatically approved','自动批准'):t('SCM review','SCM 人工审核')}</strong></span>
+       <span><small>${t('Minimum lead time at submission','提交时最短提前时间')}</small><strong>${number(a.leadHours)} ${t('hours','小时')}</strong></span>
+-      ${r.approvalExpiresAt&&!r.handoffStatus?`<span><small>${t('Approval valid until','批准有效期至')}</small><strong>${esc(window.MBBS_I18N?.displayDateTime?.(r.approvalExpiresAt)||r.approvalExpiresAt)}</strong></span>`:''}
++      ${r.approvalExpiresAt&&!r.handoffStatus&&!pickup(request)?`<span><small>${t('Approval valid until','批准有效期至')}</small><strong>${esc(window.MBBS_I18N?.displayDateTime?.(r.approvalExpiresAt)||r.approvalExpiresAt)}</strong></span>`:''}
+       ${r.salesOrderRef?`<span><small>SO</small><strong>${esc(r.salesOrderRef)}</strong></span>`:''}
+-    </div>${!a.automatic&&reasons.length?`<section class="stock-request-notice regular-stock-review-reasons"><strong>${t('Why SCM review is required','需要 SCM 审核的原因')}</strong><ul>${reasons.map(reason=>`<li>${esc(reason)}</li>`).join('')}</ul></section>`:''}
++    </div>${(!a.automatic||pickup(request))&&reasons.length?`<section class="stock-request-notice regular-stock-review-reasons"><strong>${t('Why SCM review is required','需要 SCM 审核的原因')}</strong><ul>${reasons.map(reason=>`<li>${esc(reason)}</li>`).join('')}</ul></section>`:''}
+     ${approvalExpired(request)?`<p class="stock-request-notice stock-request-error">${t('Approval expired. Sales can re-raise this request for a fresh review.','批准已过期，销售可重新提交申请以重新审核。')}</p>`:''}
+     ${r.handoffError?`<p class="stock-request-notice stock-request-error">${esc(r.handoffError)}</p>`:''}`;
+   }
+   function safety(request,line) {
+     if(request?.workflowVersion!==2)return '';
+-    const complete=request.regular?.handoffStatus==='complete' || request.status==='completed';
++    const complete=!!request.regular?.pickupTransfer || request.regular?.handoffStatus==='complete' || request.status==='completed';
+     const e=(!complete && request.currentEvidence?.find(entry=>entry.lineId===line.id))||line.approvalEvidence||{};
+     const labels=[[complete?t('Available at approval','批准时可用库存'):t('Available','可用库存'),e.availableQuantity],[t('Requested (all matching lines)','申请数量（相同货品合计）'),e.groupedRequestedQuantity],[t('Safety stock required','所需安全库存'),e.safetyQuantity],[complete?t('Remaining after approved request','批准扣除申请后的库存'):t('After shipment','发货后库存'),e.remainingQuantity],[t('Below safety by','低于安全库存'),e.shortfallQuantity]];
+     return `<div class="regular-stock-safety" aria-label="${t('Safety stock review','安全库存审核')}">${labels.map(([label,value])=>`<span><small>${label}</small><strong>${number(value)} ${esc(e.unit||line.salesUom)}</strong></span>`).join('')}</div>${e.reasons?.includes('policy_unavailable')?`<p class="stock-request-notice">${t('Safety or availability evidence is unavailable. SCM must review this line.','安全库存或可用库存数据不足，须 SCM 人工审核此行。')}</p>`:''}${line.decision?`<p><strong>${decision(line.decision)}</strong></p>`:''}`;
+   }
+   function actionText(action,completed=false) {
++    if(action.mode==='pickup')return t(`${action.requestRef}: ${completed?'Transfer Orders issued':'Approve and issue Transfer Orders'} to ${action.destinationName}.`,`${action.requestRef}：${completed?'已开立':'批准并开立'}调货单至 ${action.destinationName}。`)
++      +'\n'+(action.routes||[]).map(route=>`${route.sourceName} → ${route.destinationName}\n${(route.items||[]).map(item=>`${item.itemName}: ${number(item.quantity)} ${item.unit}`).join('\n')}\nPALLET: ${number(route.palletQuantity)}`).join('\n\n')+(action.review?'\n\n'+action.review:'');
+     if(action.mode==='location')return completed
+       ? t(`${action.salesOrderRef}: Item line locations were changed to ${action.sourceName}.`,`${action.salesOrderRef}：商品行地点已更改为 ${action.sourceName}。`)
+       : t(`${action.salesOrderRef}: Change all ${action.lineCount} item line locations from ${action.destinationName} to ${action.sourceName}, including PALLET, discount, subtotal and delivery fee lines where present.`,`${action.salesOrderRef}：将全部 ${action.lineCount} 个商品行地点从 ${action.destinationName} 更改为 ${action.sourceName}，包括托盘、折扣、小计及送货费行（如有）。`);
+@@ -80,10 +84,20 @@
+     if(request?.workflowVersion!==2)return '';
+     const r=request.regular||{};
+     if(r.handoffStatus==='complete')return completedAction(request);
++    if(pickup(request))return pickupResult(request);
+     if(approvalExpired(request))return `<section class="stock-request-section regular-stock-expired"><h3>${t('Approval expired','批准已过期')}</h3><p>${t(`The ${r.approvalValidityMinutes || 15}-minute approval window has ended. Re-raise the approved items to check current stock and approval rules.`,`批准的 ${r.approvalValidityMinutes || 15} 分钟有效期已结束。请重新提交已批准的商品，以检查最新库存和审核规则。`)}</p><button class="primary" data-sales-stock-action="re-raise" type="button" ${saving?'disabled':''}>${t('Re-raise request','重新提交申请')}</button></section>`;
+     if(request.lines.some(line=>line.status==='submitted'))return `<p class="stock-request-notice">${t('Waiting for SCM to finish reviewing all lines before entering the SO number.','待 SCM 审核所有商品行后，请输入销售订单号。')}</p>`;
+     if(!request.lines.some(line=>['stock','po'].includes(line.decision)))return '';
+     return `<section class="stock-request-section regular-stock-so"><h3>${t('Sales Order','销售订单')}</h3><p>${t('Create the SO at your own sales yard, then enter its number. Review and confirm the planned action before it is processed.','请在您的销售货场建立销售订单，再输入订单号，请先查看并确认将执行的操作。')}</p><label><span>${t('SO number','销售订单号')}</span><input data-regular-so maxlength="80" value="${esc(r.salesOrderRef||r.soInput)}" ${r.salesOrderRef?'readonly':''} /></label>${(r.soChoices||[]).map(choice=>`<label><span>${esc(choice.itemName||choice.itemId)} · ${t("Select SO line","选择销售订单行")}</span><select data-regular-so-line="${choice.itemId}">${choice.lines.map(line=>`<option value="${line.id}">${line.id} · ${number(line.quantity)} ${esc(line.uom)}</option>`).join('')}</select></label>`).join('')}<button class="primary" data-sales-stock-action="link-so" type="button" ${saving?'disabled':''}>${saving?t('Processing…','处理中…'):r.salesOrderRef?t('Retry / check progress','重试 / 查看进度'):t('Review SO routing','查看订单安排')}</button></section>`;
++  }
++  function pickupResult(request) {
++    const state=request.regular?.pickupTransfer;
++    if(!state)return request.lines.some(line=>['submitted','approved'].includes(line.status))?`<p class="stock-request-notice">${t('Waiting for SCM to review quantities and create the Transfer Orders. No SO number is required for pickup.','待 SCM 审核数量并建立调货单。自取申请无需输入销售订单号。')}</p>`:'';
++    return `<section class="stock-request-notice regular-stock-result"><strong>${state.status==='complete'?t('Pickup TOs created by SCM','SCM 已建立自取调货单'):t('SCM pickup conversion in progress','SCM 正在处理自取调货单')}</strong>
++      <p class="regular-pickup-action" style="white-space:pre-line">${esc(actionText(state.plan.action,state.status==='complete'))}</p>
++      ${(state.transfers||(request.transfers||[]).filter(row=>row.netsuiteTransferOrderRef).map(row=>({reference:row.netsuiteTransferOrderRef,sourceName:row.sourceName,destinationName:row.destinationName}))).map(row=>`<p>${esc(row.reference)} · ${esc(row.sourceName)} → ${esc(row.destinationName)}</p>`).join('')}
++      ${state.error?`<p class="stock-request-error">${esc(state.error)} · ${t('SCM can retry the saved conversion.','SCM 可重试已保存的转换。')}</p>`:''}
++      ${state.completedAt?`<small>${t('Completed','完成时间')}: ${esc(window.MBBS_I18N?.displayDateTime?.(state.completedAt)||state.completedAt)}</small>`:''}</section>`;
+   }
+   async function normalize(composer,root) {
+     if(!composer?.arrivalDate||!composer?.arrivalTime)return;
+@@ -93,5 +107,5 @@
+     for(const key of ['arrivalDate','arrivalTime']) {const input=root.querySelector(`[data-regular-field="${key}"]`);if(input){input.value=composer[key];input.setCustomValidity('');}}
+     return arrival;
+   }
+-  window.RegularStockUI={t,esc,number,decision,fields,summary,safety,salesOrder,normalize,confirmationMessage,apiError,approvalExpired};
++  window.RegularStockUI={t,esc,number,decision,fields,summary,safety,salesOrder,normalize,confirmationMessage,apiError,approvalExpired,pickup,pickupResult};
+ })();
+--- a/server/public/scm-stock-requests.js
++++ b/server/public/scm-stock-requests.js
+@@ -60,10 +60,7 @@
+   const contentType = response.headers.get("content-type") || "";
+   const payload = contentType.includes("application/json") ? await response.json() : await response.text();
+   if (!response.ok) {
+-    const error = new Error(payload?.error || payload || `Request failed (${response.status})`);
+-    error.status = response.status;
+-    error.code = payload?.code || "";
+-    throw error;
++    throw window.RegularStockUI.apiError(payload,response.status);
+   }
+   return payload;
+ }
+@@ -180,9 +177,9 @@
+ }
+ 
+ function scmStockRequestLine(line) {
+-  const actionable = line.status === "submitted" || line.status === "changes_requested";
++  const actionable = scmStockActionable(line);
+   const editable = line.status === "submitted";
+-  const snapshot=scmStockState.detail.workflowVersion===2 && (scmStockState.detail.regular?.handoffStatus==='complete' || scmStockState.detail.status==='completed');
++  const snapshot=scmStockState.detail.workflowVersion===2 && (!!scmStockState.detail.regular?.pickupTransfer || scmStockState.detail.regular?.handoffStatus==='complete' || scmStockState.detail.status==='completed');
+   return `<article class="stock-request-line" data-scm-stock-line-id="${Number(line.id)}">
+     <header>
+       <div class="stock-request-status-line">${actionable ? `<input data-scm-stock-select-line type="checkbox" ${scmStockState.selectedLineIds.has(line.id) ? "checked" : ""} aria-label="Select ${scmStockEscape(line.itemName)}" />` : ""}<div><strong>${scmStockEscape(line.itemName)}</strong><div class="stock-request-muted">${scmStockEscape(line.itemDescription || "")}</div></div></div>
+@@ -217,13 +214,22 @@
+   </section>`;
+ }
+ 
++function scmStockActionable(line) {
++  return line.status==='submitted' || line.status==='changes_requested' || (line.status==='approved' && window.RegularStockUI.pickup(scmStockState.detail) && !scmStockState.detail.regular.pickupTransfer);
++}
++
++function scmStockPickupButton(request) {
++  if(!window.RegularStockUI.pickup(request) || request.regular.pickupTransfer?.status==='complete')return '';
++  return `<button class="primary" data-scm-stock-action="pickup-convert" type="button">${request.regular.pickupTransfer?window.RegularStockUI.t('Retry / check TO creation','重试 / 查看调货单'):window.RegularStockUI.t('Convert to TO','转换为调货单')}</button>`;
++}
++
+ function scmStockRequestDetail() {
+   const request = scmStockState.detail;
+   if (!request) return `<div class="stock-request-empty"><strong>Select a request</strong><span>All-yard availability and line decisions will appear here.</span></div>`;
+-  const selectable = request.lines.filter((line) => line.status === "submitted" || line.status === "changes_requested");
++  const selectable = request.lines.filter(scmStockActionable);
+   const selected = request.lines.filter((line) => scmStockState.selectedLineIds.has(line.id));
+   const canRequestChanges = selected.length > 0 && selected.every((line) => line.status === "submitted");
+-  const snapshot=request.workflowVersion===2 && (request.regular?.handoffStatus==='complete' || request.status==='completed');
++  const snapshot=request.workflowVersion===2 && (!!request.regular?.pickupTransfer || request.regular?.handoffStatus==='complete' || request.status==='completed');
+   return `<div class="stock-request-heading">
+       <div><h2>${scmStockEscape(request.requestRef)}</h2><p>${scmStockEscape(request.requestedByName || request.requestedBy || "")} · destination ${scmStockEscape(request.destinationName)}</p></div>
+       ${scmStockPill(request.bucket || request.status)}
+@@ -235,11 +241,13 @@
+       <span><small>First SCM decision</small><strong>${scmStockDate(request.firstScmDecisionAt)}</strong></span>
+     </div>
+     ${window.RegularStockUI.summary(request)}
++    ${window.RegularStockUI.pickup(request)?window.RegularStockUI.pickupResult(request):''}
++    ${request.regular?.pickupTransfer?scmStockPickupButton(request):''}
+     ${request.remarks ? `<div class="stock-request-notice"><strong>Sales remark:</strong> ${scmStockEscape(request.remarks)}</div>` : ""}
+     ${scmStockBackorderNotice(selectable)}
+     <div class="stock-request-actions" ${snapshot?'hidden':''}>
+       <button data-scm-stock-action="select-all" type="button" ${selectable.length ? "" : "disabled"}>Select actionable lines</button>
+-      ${request.workflowVersion===2 ? `<button data-scm-stock-action="refresh-evidence" type="button">${window.RegularStockUI.t('Refresh stock evidence','刷新库存数据')}</button><button class="primary" data-scm-stock-action="approve-stock" type="button" ${canRequestChanges?'':'disabled'}>${window.RegularStockUI.t('Approve · TO / location change','批准 · 调货 / 更改地点')}</button><button data-scm-stock-action="approve-po" type="button" ${canRequestChanges?'':'disabled'}>${window.RegularStockUI.t('Approve · source replenishment PO','批准 · 原货场采购补货')}</button>` : `<button class="primary" data-scm-stock-action="convert" type="button" ${scmStockState.selectedLineIds.size ? "" : "disabled"}>Convert to TO</button>
++      ${request.workflowVersion===2 ? `<button data-scm-stock-action="refresh-evidence" type="button">${window.RegularStockUI.t('Refresh stock evidence','刷新库存数据')}</button>${window.RegularStockUI.pickup(request)?scmStockPickupButton(request):`<button class="primary" data-scm-stock-action="approve-stock" type="button" ${canRequestChanges?'':'disabled'}>${window.RegularStockUI.t('Approve · TO / location change','批准 · 调货 / 更改地点')}</button><button data-scm-stock-action="approve-po" type="button" ${canRequestChanges?'':'disabled'}>${window.RegularStockUI.t('Approve · source replenishment PO','批准 · 原货场采购补货')}</button>`}` : `<button class="primary" data-scm-stock-action="convert" type="button" ${scmStockState.selectedLineIds.size ? "" : "disabled"}>Convert to TO</button>
+       <button data-scm-stock-action="request-changes" type="button" ${canRequestChanges ? "" : "disabled"}>Request Changes</button>`}
+       <button class="danger" data-scm-stock-action="reject" type="button" ${selectable.length ? "" : "disabled"}>${selected.length ? "Reject selected" : "Reject all actionable"}</button>
+     </div>
+@@ -289,7 +297,7 @@
+   scmStockState.selectedTransferId = transfer.id;
+   const canEdit = request.workflowVersion !== 2 && !["partially_fulfilled", "pending_receipt", "received", "cancelled", "closed"].includes(transfer.status);
+   const canEditStructure = request.workflowVersion !== 2 && scmStockCanRestructureTransfer(transfer);
+-  const canConfirm = ["pending_local", "attention"].includes(transfer.status);
++  const canConfirm = !request.regular?.pickupTransfer && ["pending_local", "attention"].includes(transfer.status);
+   const hasPrinted = Boolean(transfer.printJobId || transfer.printGeneration);
+   const canRejectPending = request.workflowVersion !== 2 && transfer.status === "pending_local"
+     && transfer.confirmationStatus === "idle"
+@@ -303,6 +311,7 @@
+       ${scmStockPill(transfer.status)}
+     </div>
+     ${scmStockTransferList(request)}
++    ${request.regular?.pickupTransfer?window.RegularStockUI.pickupResult(request)+scmStockPickupButton(request):''}
+     <div class="stock-request-summary">
+       <span><small>From location</small><strong>${scmStockEscape(transfer.sourceName)}</strong></span>
+       <span><small>To location</small><strong>${scmStockEscape(transfer.destinationName)}</strong></span>
+@@ -317,7 +326,7 @@
+     ${transfer.printInvalidatedAt ? `<div class="stock-request-notice">The prior ticket was invalidated by a quantity change. Save/sync, then use Re-print.</div>` : ""}
+     ${request.remarks ? `<div class="stock-request-notice"><strong>Sales remark:</strong> ${scmStockEscape(request.remarks)}</div>` : ""}
+     ${request.status==='completed'?'':scmStockBackorderNotice(transfer.lines, { transfer })}
+-    ${request.workflowVersion===2 && request.status==='completed'?`<section class="stock-request-section"><h3>${window.RegularStockUI.t('Request lines · saved decision snapshot','申请商品 · 已保存的审核记录')}</h3>${request.lines.map(line=>`<article class="stock-request-line"><strong>${scmStockEscape(line.itemName)} · ${scmStockEscape(line.sourceName)}</strong>${window.RegularStockUI.safety(request,line)}</article>`).join('')}</section>`:''}
++    ${request.workflowVersion===2 && (request.regular?.pickupTransfer || request.status==='completed')?`<section class="stock-request-section"><h3>${window.RegularStockUI.t('Request lines · saved decision snapshot','申请商品 · 已保存的审核记录')}</h3>${request.lines.map(line=>`<article class="stock-request-line"><strong>${scmStockEscape(line.itemName)} · ${scmStockEscape(line.sourceName)}</strong>${window.RegularStockUI.safety(request,line)}</article>`).join('')}</section>`:''}
+     <section class="stock-request-section"><h3>TO material lines</h3>
+       ${canEditStructure ? `<div class="stock-request-notice">Change a line's outbound location to move it into a separate local Pending TO for that route. Remove a line to return it to the Request queue. These route changes are available before Confirm TO + Print.</div>` : ""}
+       <div class="stock-request-lines">${transfer.lines.map((line) => scmStockTransferLine(line, { canEditQuantities: canEdit, canEditStructure })).join("")}</div>
+@@ -495,7 +504,7 @@
+ 
+ function scmStockOpenDecision(decision) {
+   const allowedStatuses = decision === "reject"
+-    ? new Set(["submitted", "changes_requested"])
++    ? new Set(window.RegularStockUI.pickup(scmStockState.detail)?["submitted", "changes_requested", "approved"]:["submitted", "changes_requested"])
+     : new Set(["submitted"]);
+   const eligible = (scmStockState.detail?.lines || []).filter((line) => allowedStatuses.has(line.status));
+   const selected = eligible.filter((line) => scmStockState.selectedLineIds.has(line.id));
+@@ -648,7 +657,7 @@
+       return renderScmStockRequests();
+     }
+     if (action === "select-all") {
+-      scmStockState.selectedLineIds = new Set(scmStockState.detail.lines.filter((line) => ["submitted", "changes_requested"].includes(line.status)).map((line) => line.id));
++      scmStockState.selectedLineIds = new Set(scmStockState.detail.lines.filter(scmStockActionable).map((line) => line.id));
+       return renderScmStockRequests();
+     }
+     if (action === "save-line") return await scmStockSaveLine(button);
+@@ -658,6 +667,11 @@
+       return renderScmStockRequests();
+     }
+     if(action==='approve-stock')return scmStockOpenDecision('stock');
++    if(action==='pickup-convert')return window.RegularPickupUI.open(scmStockState.detail,{api:scmStockApi,onComplete:async()=>{
++      scmStockState.queue='pending_to';localStorage.setItem('mbbs.scm.stockRequests.queue','pending_to');
++      scmStockState.notice=window.RegularStockUI.t('SCM approved the pickup request and created its Transfer Orders.','SCM 已批准自取申请并建立调货单。');
++      await scmStockLoad({preserveSelection:true});
++    }});
+     if(action==='approve-po')return scmStockOpenDecision('po');
+     if (action === "request-changes") return scmStockOpenDecision("request_changes");
+     if (action === "reject") return scmStockOpenDecision("reject");
+--- a/server/public/scm-smart.js
++++ b/server/public/scm-smart.js
+@@ -740,7 +740,7 @@
+     <form class="smart-section" id="smartSettingsForm">
+       <div class="smart-section-head"><div><h2>Smart SCM controls</h2><p>Live execution is guarded by both this setting and a server environment flag. Daily planning uses the configured Toronto-local schedule.</p></div>${smartCanWrite() ? `<button class="smart-button primary" type="submit">Save settings</button>` : ""}</div>
+       <div class="smart-section-body smart-form-grid">
+-        <label class="smart-field"><span>${window.RegularStockUI.t('Stock request auto-approval','库存申请自动批准')}</span><input name="regularStockAutoApprovalEnabled" type="checkbox" ${settings.regularStockAutoApprovalEnabled!==false?'checked':''} ${smartCanWrite()?'':'disabled'} /><small>${window.RegularStockUI.t('When off, every new or re-raised request requires SCM review.','关闭后，每个新申请或重新提交的申请均须 SCM 人工审核。')}</small></label>
++        <label class="smart-field"><span>${window.RegularStockUI.t('Stock request auto-approval','库存申请自动批准')}</span><input name="regularStockAutoApprovalEnabled" type="checkbox" ${settings.regularStockAutoApprovalEnabled!==false?'checked':''} ${smartCanWrite()?'':'disabled'} /><small>${window.RegularStockUI.t('Pickup always requires SCM review. When off, delivery also requires SCM review.','自取申请始终须 SCM 审核。关闭后，送货申请也须 SCM 审核。')}</small></label>
+         <label class="smart-field"><span>${window.RegularStockUI.t('Stock request approval validity (minutes)','库存申请批准有效期（分钟）')}</span><input name="regularStockApprovalMinutes" type="number" min="1" max="10080" step="1" required value="${smartEscape(settings.regularStockApprovalMinutes ?? 15)}" ${smartCanWrite()?'':'disabled'} /><small>${window.RegularStockUI.t('Default 15. Starts after all items are reviewed; applies to new approvals. Sales can re-raise an expired request.','默认 15。所有商品审核完成后开始计时，适用于新的批准。销售可重新提交已过期的申请。')}</small></label>
+         <label class="smart-field"><span>${window.RegularStockUI.t('Stock request auto-approval lead time (hours)','库存申请自动批准提前时间（小时）')}</span><input name="regularStockLeadHours" type="number" min="0" max="87600" step="any" required value="${smartEscape(settings.regularStockLeadHours ?? 5)}" ${smartCanWrite()?'':'disabled'} /><small>${window.RegularStockUI.t('Default 5. Requests arriving sooner require SCM review. Zero disables the lead-time restriction; applies to new submissions only.','默认 5。早于此时间须 SCM 审核，设为 0 关闭提前时间限制；仅适用于新提交的申请。')}</small></label>
+         <label class="smart-field"><span>Execution mode</span><select name="executionMode" ${smartCanWrite() ? "" : "disabled"}><option value="mock" ${settings.executionMode === "mock" ? "selected" : ""}>Mock — no NetSuite write</option><option value="live" ${settings.executionMode === "live" ? "selected" : ""}>Live — guarded NetSuite PO + TO</option></select><small>Live mode inserts confirmed POs and TOs into NetSuite; TO confirmation also queues the NetSuite picking ticket.</small></label>
+--- a/server/public/sales-stock-requests.html
++++ b/server/public/sales-stock-requests.html
+@@ -5,19 +5,19 @@
+     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+     <title>MBBS Sales Request Stock</title>
+     <link rel="stylesheet" href="/dispatch.css?v=20260811-stock-request-v1" />
+-    <link rel="stylesheet" href="/stock-requests.css?v=20260928-enhancements-v1&regular=20260929-controls" />
+-    <link rel="stylesheet" href="/regular-stock-dialog.css?v=20260929-controls" />
++    <link rel="stylesheet" href="/stock-requests.css?v=20260928-enhancements-v1&regular=20260929-pickup" />
++    <link rel="stylesheet" href="/regular-stock-dialog.css?v=20260929-pickup" />
+     <link rel="stylesheet" href="/i18n.css?v=20260701-i18n-v2" />
+   </head>
+   <body class="sales-stock-requests-page">
+     <main class="dispatch-shell stock-request-shell" id="salesStockRequestApp"></main>
+     <script src="/i18n.js?v=20260815-customer-pickup-photo-gate-v1"></script>
+-    <script src="/app-sidebar.js?v=20260928-enhancements-v1&regular=20260929-controls"></script>
++    <script src="/app-sidebar.js?v=20260928-enhancements-v1&regular=20260929-pickup"></script>
+     <script src="/dispatch-auth.js?v=20260811-stock-request-private-v1"></script>
+     <script src="/delivery-instruction-upload.js?v=20260812-delivery-image-720p-v1"></script>
+-    <script src="/regular-stock-ui.js?v=20260929-controls"></script>
+-    <script src="/regular-stock-dialog.js?v=20260929-controls"></script>
+-    <script src="/sales-stock-requests.js?v=20260927-yard-layout-v1&regular=20260929-controls"></script>
++    <script src="/regular-stock-ui.js?v=20260929-pickup"></script>
++    <script src="/regular-stock-dialog.js?v=20260929-pickup"></script>
++    <script src="/sales-stock-requests.js?v=20260927-yard-layout-v1&regular=20260929-pickup"></script>
+     <script src="/sales-special-stock-requests.js?v=20260928-enhancements-v1"></script>
+   </body>
+ </html>
+--- a/server/public/scm-stock-requests.html
++++ b/server/public/scm-stock-requests.html
+@@ -5,22 +5,24 @@
+     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+     <title>MBBS SCM Stock Requests</title>
+     <link rel="stylesheet" href="/dispatch.css?v=20260811-stock-request-v1" />
+-    <link rel="stylesheet" href="/stock-requests.css?v=20260928-enhancements-v1&regular=20260929-controls" />
++    <link rel="stylesheet" href="/stock-requests.css?v=20260928-enhancements-v1&regular=20260929-pickup" />
+     <link rel="stylesheet" href="/aggregate-requests.css?v=20260925-aggregate-alert-v1" />
+-    <link rel="stylesheet" href="/regular-stock-dialog.css?v=20260929-controls" />
++    <link rel="stylesheet" href="/scm-stock-pickup.css?v=20260929-pickup" />
++    <link rel="stylesheet" href="/regular-stock-dialog.css?v=20260929-pickup" />
+     <link rel="stylesheet" href="/i18n.css?v=20260701-i18n-v2" />
+   </head>
+   <body class="scm-stock-requests-page">
+     <main class="dispatch-shell stock-request-shell" id="scmStockRequestApp"></main>
+     <script src="/i18n.js?v=20260923-aggregate-terminology-layout-v1"></script>
+-    <script src="/app-sidebar.js?v=20260928-batch-discount-v1&regular=20260929-controls"></script>
++    <script src="/app-sidebar.js?v=20260928-batch-discount-v1&regular=20260929-pickup"></script>
+     <script src="/dispatch-auth.js?v=20260922-aggregate-v1"></script>
+     <script src="/aggregate-requests-i18n.js?v=20260925-aggregate-confirmation-date-v1"></script>
+     <script src="/scm-stock-request-tabs.js?v=20260926-special-queue-v1"></script>
+     <script src="/aggregate-requests.js?v=20260925-aggregate-confirmation-date-v1"></script>
+-    <script src="/regular-stock-ui.js?v=20260929-controls"></script>
+-    <script src="/regular-stock-dialog.js?v=20260929-controls"></script>
+-    <script src="/scm-stock-requests.js?v=20260927-yard-layout-v1&regular=20260929-controls"></script>
++    <script src="/regular-stock-ui.js?v=20260929-pickup"></script>
++    <script src="/regular-stock-dialog.js?v=20260929-pickup"></script>
++    <script src="/scm-stock-pickup.js?v=20260929-pickup"></script>
++    <script src="/scm-stock-requests.js?v=20260927-yard-layout-v1&regular=20260929-pickup"></script>
+     <script src="/scm-special-stock-requests.js?v=20260928-enhancements-v1"></script>
+   </body>
+ </html>
+--- a/server/public/scm-smart.html
++++ b/server/public/scm-smart.html
+@@ -5,7 +5,7 @@
+     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+     <title>MBBS Smart SCM</title>
+     <link rel="stylesheet" href="/dispatch.css?v=20260720-smart-scm-v1" />
+-    <link rel="stylesheet" href="/scm-smart.css?v=20260801-blanket-ui-v2&regular=20260929-controls" />
++    <link rel="stylesheet" href="/scm-smart.css?v=20260801-blanket-ui-v2&regular=20260929-pickup" />
+     <link rel="stylesheet" href="/scm-smart-vendor.css?v=20260812-vendor-price-source-v1" />
+     <link rel="stylesheet" href="/scm-smart-blanket.css?v=20260807-blanket-editor-v1" />
+     <link rel="stylesheet" href="/scm-smart-proposals.css?v=20260801-proposal-priority-v3" />
+@@ -15,13 +15,13 @@
+   <body>
+     <main class="smart-shell" id="smartScmApp"></main>
+     <script src="/i18n.js?v=20260815-customer-pickup-photo-gate-v1"></script>
+-    <script src="/app-sidebar.js?v=20260819-scm-custom-orders-v1&regular=20260929-controls"></script>
++    <script src="/app-sidebar.js?v=20260819-scm-custom-orders-v1&regular=20260929-pickup"></script>
+     <script src="/dispatch-auth.js?v=20260716-multi-role-v1"></script>
+-    <script src="/regular-stock-ui.js?v=20260929-controls"></script>
+-  <script src="/scm-smart.js?v=20260826-phased-planning-v1&regular=20260929-controls"></script>
++    <script src="/regular-stock-ui.js?v=20260929-pickup"></script>
++  <script src="/scm-smart.js?v=20260826-phased-planning-v1&regular=20260929-pickup"></script>
+     <script src="/scm-smart-blanket.js?v=20260812-blanket-source-items-v1"></script>
+     <script src="/scm-smart-vendor.js?v=20260915-created-po-sync-v1"></script>
+-    <script src="/scm-smart-proposals.js?v=20260826-phased-planning-v1&regular=20260929-controls"></script>
++    <script src="/scm-smart-proposals.js?v=20260826-phased-planning-v1&regular=20260929-pickup"></script>
+     <script src="/scm-smart-exclusions.js?v=20260915-blanket-auto-resume-v1"></script>
+   </body>
+ </html>
+--- a/server/src/regular-stock-pickup.js
++++ b/server/src/regular-stock-pickup.js
+@@ -0,0 +1,187 @@
++import { pool, query, withTransaction } from './db.js';
++import { config } from './config.js';
++import { getScmStockRequest, normalizePickupStockRequestDraft, savePickupStockRequestDraft,
++  convertSalesStockRequestLines, recordStockRequestEvent } from './stock-request-repository.js';
++import { confirmAndPrintStockTransfer, refreshStockRequestItemsAvailability } from './stock-request-service.js';
++import { createTransferOrderInNetSuite } from './netsuite.js';
++import { regularStockPolicies } from './regular-stock-request-service.js';
++import { regularError, evaluateRegularStockApproval } from './regular-stock-domain.js';
++import { groupStockRequestLinesForTransfer, stockRequestPalletQuantity, STOCK_REQUEST_MAX_QUANTITY } from './stock-request-domain.js';
++import { regularStockConfirmationToken } from './regular-stock-confirmation.js';
++
++const fingerprint = (id, input) => regularStockConfirmationToken(id, { lines: input.lines, palletQuantities: input.palletQuantities || {} });
++const issued = transfer => !!transfer?.netsuiteTransferOrderId
++  && ['pending_fulfillment', 'partially_fulfilled', 'pending_receipt', 'received', 'closed'].includes(transfer.status);
++
++function requirePickup(request) {
++  if (request.workflowVersion !== 2 || request.regular.deliveryMethod !== 'pickup' || request.regular.handoffStatus) {
++    throw regularError('Only pickup requests without an existing SO action can be converted by SCM.', 'REGULAR_PICKUP_REQUIRED');
++  }
++}
++
++function requireRevision(request, input) {
++  if (!Number.isSafeInteger(Number(input.expectedRevision)) || Number(input.expectedRevision) !== request.revision) {
++    throw regularError('This request changed. Reload and review it again.', 'STOCK_REQUEST_REVISION_CONFLICT');
++  }
++  if (!request.lines.some(line => ['submitted', 'approved'].includes(line.status)) || request.transfers.length) {
++    throw regularError('This request has no items available for a new pickup conversion.');
++  }
++}
++
++function requireConfirmation(id, plan, token) {
++  if (!token) throw regularError('Review and confirm the Transfer Orders before proceeding.', 'REGULAR_CONFIRMATION_REQUIRED');
++  if (token !== regularStockConfirmationToken(id, plan)) {
++    throw regularError('The items, quantities or transfer routes changed. Review the updated action and confirm again.', 'REGULAR_CONFIRMATION_CHANGED');
++  }
++}
++
++function savedPreview(request, input) {
++  const saved = request.regular.pickupTransfer;
++  if (input.lines !== undefined && fingerprint(request.id, input) !== saved.inputFingerprint) {
++    throw regularError('TO creation has already started. Resume the saved quantities and routes.', 'REGULAR_PICKUP_LOCKED');
++  }
++  return { action: saved.plan.action, lines: saved.plan.lines, evidence: saved.evidence,
++    confirmationToken: regularStockConfirmationToken(request.id, saved.plan), resuming: true };
++}
++
++function pickupPlan(request, lines, input) {
++  const routes = groupStockRequestLinesForTransfer(lines).map(group => {
++    const pallet = stockRequestPalletQuantity(group.lines);
++    const value = input.palletQuantities?.[group.sourceLocationId];
++    if ((value === undefined || value === null || value === '') && pallet.requiresManualQuantity) {
++      throw regularError(`Enter the PALLET quantity for source ${group.lines[0].sourceName}.`, 'REGULAR_PICKUP_PALLETS_REQUIRED', 400);
++    }
++    const quantity = value === undefined ? pallet.automaticQuantity : Number(value);
++    if (!Number.isFinite(quantity) || quantity < 0 || quantity > STOCK_REQUEST_MAX_QUANTITY) {
++      throw regularError('PALLET quantities must be finite, non-negative numbers within the quantity limit.', 'REGULAR_PICKUP_PALLETS_INVALID', 400);
++    }
++    return { sourceLocationId: group.sourceLocationId, sourceName: group.lines[0].sourceName,
++      destinationLocationId: request.destinationLocationId, destinationName: request.destinationName,
++      palletQuantity: quantity, items: group.lines.map(line => ({ itemName: line.itemName, quantity: line.salesQty, unit: line.salesUom })) };
++  });
++  return { revision: request.revision, lines,
++    action: { mode: 'pickup', requestRef: request.requestRef, destinationName: request.destinationName, routes } };
++}
++
++async function prepare(request, input, dependencies) {
++  requireRevision(request, input);
++  const lines = await normalizePickupStockRequestDraft(request, input);
++  const itemIds = [...new Set(lines.map(line => line.itemId))];
++  await (dependencies.refreshAvailability || refreshStockRequestItemsAvailability)(itemIds);
++  const normalized = await normalizePickupStockRequestDraft(request, input);
++  const policies = await (dependencies.loadPolicies || regularStockPolicies)(itemIds);
++  const evidence = evaluateRegularStockApproval({ lines: normalized, policies, deliveryMethod: 'pickup',
++    arrivalAt: request.regular.arrivalAt, leadHours: request.regular.approval.leadHours,
++    now: (dependencies.now || (() => new Date()))() });
++  return { plan: pickupPlan(request, normalized, input), evidence };
++}
++
++export async function previewPickupStockTransfers(id, input, _context, dependencies = {}) {
++  const request = await getScmStockRequest(id);
++  requirePickup(request);
++  if (request.regular.pickupTransfer) return savedPreview(request, input);
++  const { plan, evidence } = await prepare(request, input, dependencies);
++  return { action: plan.action, lines: plan.lines, evidence, confirmationToken: regularStockConfirmationToken(id, plan), resuming: false };
++}
++
++async function saveState(id, state) {
++  await query(`UPDATE sales_stock_requests SET regular_details=jsonb_set(regular_details,'{pickupTransfer}',$2::jsonb),
++    revision=revision+1,updated_at=now() WHERE id=$1`, [id, JSON.stringify(state)]);
++}
++
++async function claim(request, input, context, dependencies) {
++  const prepared = await prepare(request, input, dependencies);
++  requireConfirmation(request.id, prepared.plan, input.confirmationToken);
++  return withTransaction(async () => {
++    await query('SELECT id FROM sales_stock_requests WHERE id=$1 FOR UPDATE', [request.id]);
++    const current = await getScmStockRequest(request.id);
++    requirePickup(current);
++    requireRevision(current, input);
++    const normalized = await normalizePickupStockRequestDraft(current, input);
++    const plan = pickupPlan(current, normalized, input);
++    requireConfirmation(current.id, plan, input.confirmationToken);
++    const lines = await savePickupStockRequestDraft(current, normalized, context.operatorId);
++    const evidence = { ...prepared.evidence, lines: prepared.evidence.lines.map((entry, index) => ({ ...entry, lineId: lines[index].id })) };
++    for (const entry of evidence.lines) await query('UPDATE sales_stock_request_lines SET approval_evidence=$2::jsonb WHERE id=$1', [entry.lineId, JSON.stringify(entry)]);
++    const event = await query(`INSERT INTO sales_stock_request_events(request_id,event_type,actor_id,details)
++      VALUES($1,'regular_manual_decision',$2,$3::jsonb) RETURNING id`, [current.id, context.operatorId,
++      JSON.stringify({ decision: 'stock', reason: 'SCM pickup conversion', before: current.lines, after: lines, evidence })]);
++    const startedAt = new Date().toISOString();
++    await query(`UPDATE sales_stock_requests SET manual_decision_event_id=$2,regular_details=regular_details||$3::jsonb WHERE id=$1`,
++      [current.id, event.rows[0].id, JSON.stringify({ approvedAt: startedAt, approvalExpiresAt: null })]);
++    const converted = await convertSalesStockRequestLines(current.id,
++      { expectedRevision: current.revision, lineIds: lines.map(line => line.id) }, { ...context, approvedHandoff: true });
++    for (const transfer of converted.transfers) {
++      const route = plan.action.routes.find(entry => entry.sourceLocationId === transfer.sourceLocationId);
++      await query(`UPDATE sales_stock_transfers SET pallet_quantity=$2,pallet_quantity_manually_adjusted=true WHERE id=$1`, [transfer.id, route.palletQuantity]);
++    }
++    const state = { status: 'executing', startedAt, plan, evidence, inputFingerprint: fingerprint(current.id, input),
++      transferIds: converted.transfers.map(transfer => transfer.id), error: null };
++    await saveState(current.id, state);
++    return state;
++  });
++}
++
++async function issueTransfers(id, state, context, dependencies) {
++  const confirm = dependencies.confirmTransfer || (transfer => confirmAndPrintStockTransfer(transfer.id,
++    { expectedRevision: transfer.revision, requestId: `regular-pickup:${id}:${transfer.id}` }, { id: context.operatorId },
++    { ensurePrinter: async () => {}, createRemote: (payload, options) => createTransferOrderInNetSuite(
++      { ...payload, externalId: `MBBS_REGULAR_PICKUP_${id}_${transfer.id}` }, options) }));
++  for (const transferId of state.transferIds) {
++    const transfer = (await getScmStockRequest(id)).transfers.find(entry => entry.id === transferId);
++    if (issued(transfer)) continue;
++    try { await confirm(transfer); } catch (error) {
++      // Print failures do not undo a committed TO. Recover the durable NetSuite result.
++      const saved = (await getScmStockRequest(id)).transfers.find(entry => entry.id === transferId);
++      if (!issued(saved)) throw error;
++    }
++    const saved = (await getScmStockRequest(id)).transfers.find(entry => entry.id === transferId);
++    if (!issued(saved)) throw regularError('NetSuite has not confirmed this TO. Retry to recover its status.', 'REGULAR_PICKUP_UNCONFIRMED');
++  }
++}
++
++async function execute(id, input, context, dependencies) {
++  const request = await getScmStockRequest(id);
++  requirePickup(request);
++  let state = request.regular.pickupTransfer;
++  if (state) {
++    savedPreview(request, input);
++    requireConfirmation(id, state.plan, input.confirmationToken);
++    if (state.status === 'complete') return request;
++  }
++  if (!(dependencies.liveExecutionEnabled ?? config.smartScm.liveExecutionEnabled)) throw regularError('Live NetSuite execution is disabled.', 'REGULAR_LIVE_DISABLED');
++  state = state || await claim(request, input, context, dependencies);
++  try {
++    await saveState(id, { ...state, status: 'executing', error: null });
++    await issueTransfers(id, state, context, dependencies);
++    await (dependencies.refreshAvailability || refreshStockRequestItemsAvailability)([...new Set(state.plan.lines.map(line => line.itemId))]);
++    await withTransaction(async () => {
++      await query('SELECT id FROM sales_stock_requests WHERE id=$1 FOR UPDATE', [id]);
++      const completed = await getScmStockRequest(id);
++      const transfers = completed.transfers.map(transfer => ({ reference: transfer.netsuiteTransferOrderRef,
++        sourceName: transfer.sourceName, destinationName: transfer.destinationName }));
++      const result = { ...state, status: 'complete', error: null, completedAt: new Date().toISOString(), transfers };
++      await saveState(id, result);
++      await recordStockRequestEvent({ requestId: Number(id), eventType: 'regular_pickup_to_complete', actorId: context.operatorId,
++        details: { action: state.plan.action, transfers, completedAt: result.completedAt } });
++    });
++    return getScmStockRequest(id);
++  } catch (error) {
++    await saveState(id, { ...state, status: 'attention', error: String(error.message).slice(0, 1000) });
++    throw error;
++  }
++}
++
++export async function convertPickupStockTransfers(id, input, context, dependencies = {}) {
++  const client = await pool.connect();
++  const key = `regular-stock-pickup:${Number(id)}`;
++  let acquired = false;
++  try {
++    acquired = (await client.query('SELECT pg_try_advisory_lock(hashtextextended($1,0)) AS acquired', [key])).rows[0].acquired;
++    if (!acquired) throw regularError('This pickup conversion is already running. Refresh to see its progress.', 'REGULAR_PICKUP_RUNNING');
++    return await execute(id, input, context, dependencies);
++  } finally {
++    if (acquired) await client.query('SELECT pg_advisory_unlock(hashtextextended($1,0))', [key]).catch(() => {});
++    client.release();
++  }
++}
+--- a/server/public/scm-stock-pickup.js
++++ b/server/public/scm-stock-pickup.js
+@@ -0,0 +1,148 @@
++(() => {
++  const ui=()=>window.RegularStockUI;
++  const units=[['pallets','toPlt','PLT'],['layers','toLyr','LYR'],['sections','toSec','SEC'],['pieces','toPcs','PCS']];
++  const yards=[{id:1,name:'3445'},{id:28,name:'2967'},{id:15,name:'12441'},{id:26,name:'150'}];
++  let editor=null;
++  const quantity=line=>units.some(([,conversion])=>line[conversion]>0)
++    ? units.reduce((total,[field,conversion])=>total+Number(line[field]||0)*Number(line[conversion]||0),0) : Number(line.salesQty||0);
++  const payload=line=>({...(line.id?{id:line.id}:{}),itemId:line.itemId,sourceLocationId:line.sourceLocationId,
++    ...Object.fromEntries(units.some(([,conversion])=>line[conversion]>0)
++      ? units.filter(([,conversion])=>line[conversion]>0).map(([field])=>[field,line[field]||0]) : [['salesQty',line.salesQty||0]])});
++
++  function rowHtml(line,index,destination) {
++    const {esc,number,t}=ui(),fields=units.filter(([,conversion])=>line[conversion]>0);
++    return `<article class="pickup-line" data-pickup-row="${index}"><header><div><strong>${esc(line.itemName)}</strong><p>${esc(line.itemDescription||'')}</p></div>${!line.id?`<button data-pickup-remove="${index}" type="button">${t('Remove','移除')}</button>`:''}</header>
++      <div class="pickup-fields"><label>${t('Source yard','发货货场')}<select data-pickup-field="sourceLocationId">${yards.filter(yard=>yard.id!==destination).map(yard=>`<option value="${yard.id}" ${yard.id===Number(line.sourceLocationId)?'selected':''}>${yard.name}</option>`).join('')}</select></label>
++      ${(fields.length?fields:[['salesQty',null,line.salesUom]]).map(([field,conversion,label])=>`<label>${esc(label)}${conversion?` × ${number(line[conversion])}`:''}<input data-pickup-field="${field}" type="number" min="0" max="1000000000" step="any" value="${esc(line[field]||0)}" /></label>`).join('')}</div>
++      <p data-pickup-total></p></article>`;
++  }
++
++  function drawRoutes(state) {
++    const {esc,number,t}=ui(),groups=new Map();
++    state.lines.forEach(line=>{
++      const source=Number(line.sourceLocationId);
++      if(!groups.has(source))groups.set(source,new Map());
++      const items=groups.get(source),item=items.get(line.itemId)||{qty:0,toPlt:line.toPlt};
++      item.qty+=quantity(line);items.set(line.itemId,item);
++    });
++    state.dialog.querySelector('[data-pickup-routes]').innerHTML=[...groups].map(([source,items])=>{
++      const manual=[...items.values()].some(item=>!(item.toPlt>0));
++      const automatic=[...items.values()].reduce((sum,item)=>sum+(item.toPlt>0?Math.ceil(item.qty/item.toPlt):0),0);
++      const value=state.pallets[source] ?? (manual?'':automatic);
++      return `<label>${esc(yards.find(yard=>yard.id===source)?.name)} → ${esc(state.request.destinationName)} · PALLET${manual?' *':''}<input data-pickup-pallet="${source}" type="number" min="0" max="1000000000" step="any" required value="${esc(value)}" /><small>${manual?t('Enter the total pallet quantity for this TO.','请输入此调货单的总托盘数量。'):t(`Calculated: ${number(automatic)}. Adjust if needed.`,`计算数量：${number(automatic)}。可按需要调整。`)}</small></label>`;
++    }).join('');
++    for(const row of state.dialog.querySelectorAll('[data-pickup-row]')){
++      const line=state.lines[Number(row.dataset.pickupRow)];
++      row.querySelector('[data-pickup-total]').textContent=`${t('Transfer quantity','调货数量')}: ${number(quantity(line))} ${line.salesUom}`;
++    }
++  }
++
++  function drawLines(state) {
++    state.dialog.querySelector('[data-pickup-lines]').innerHTML=state.lines.map((line,index)=>rowHtml(line,index,state.request.destinationLocationId)).join('');
++    drawRoutes(state);
++  }
++
++  function error(state,error) {
++    const output=state.dialog.querySelector('[data-pickup-error]');output.textContent=error.message;output.hidden=false;
++  }
++
++  async function search(state) {
++    const term=state.dialog.querySelector('[data-pickup-search]').value.trim(),generation=++state.searchGeneration;
++    const list=state.dialog.querySelector('[data-pickup-results]');list.replaceChildren();
++    if(term.length<2)return;
++    try {
++      const result=await state.api(`/api/scm/stock-request-items?search=${encodeURIComponent(term)}&limit=20`);
++      if(editor!==state || generation!==state.searchGeneration)return;
++      state.results=result.items.filter(item=>item.itemCode?.trim().toUpperCase()!=='PALLET');
++      list.innerHTML=state.results.length?state.results.map((item,index)=>`<button type="button" data-pickup-add="${index}"><strong>${ui().esc(item.itemCode)}</strong><span>${ui().esc(item.description)}</span></button>`).join(''):`<p>${ui().t('No matching items','没有匹配的商品')}</p>`;
++    } catch(caught){if(editor===state&&generation===state.searchGeneration)error(state,caught);}
++  }
++
++  async function add(state,index) {
++    const item=state.results[index];
++    if(!item)return;
++    await window.RegularStockDialog.withBusy(ui().t('Loading item quantities and yard availability…','正在载入商品数量和货场库存…'),async()=>{
++      const availability=await state.api(`/api/scm/stock-request-items/${item.itemId}/availability/refresh`,{method:'POST',body:'{}'});
++      const source=availability.yards.filter(yard=>yard.locationId!==state.request.destinationLocationId)
++        .sort((a,b)=>b.requestableAvailable-a.requestableAvailable)[0];
++      const line={...availability.item,itemName:availability.item.itemCode,itemDescription:availability.item.description,sourceLocationId:source.locationId};
++      const available=units.filter(([,conversion])=>line[conversion]>0);
++      line[available.length?available[available.length-1][0]:'salesQty']=1;
++      state.lines.push(line);drawLines(state);
++      state.searchGeneration++;state.results=[];
++      state.dialog.querySelector('[data-pickup-search]').value='';state.dialog.querySelector('[data-pickup-results]').replaceChildren();
++    });
++  }
++
++  async function convert(state) {
++    const input=state.request.regular.pickupTransfer?{}:{expectedRevision:state.request.revision,lines:state.lines.map(payload),
++      palletQuantities:Object.fromEntries([...state.dialog.querySelectorAll('[data-pickup-pallet]')].map(field=>[field.dataset.pickupPallet,field.value]))};
++    if(!state.dialog.querySelector('form').reportValidity())return;
++    const operation=window.RegularStockDialog.begin(ui().t('Checking quantities, safety stock and TO routes…','正在检查数量、安全库存和调货路线…'));
++    let complete=false;
++    try {
++      const path=`/api/scm/stock-requests/${state.request.id}`;
++      const preview=await state.api(`${path}/pickup-preview`,{method:'POST',body:JSON.stringify(input)});
++      const review=preview.evidence?.lines?.map((entry,index)=>`${preview.lines[index]?.itemName}: ${ui().t('After shipment','发货后')} ${ui().number(entry.remainingQuantity)} ${entry.unit||''}; ${ui().t('Safety stock required','所需安全库存')} ${ui().number(entry.safetyQuantity)} ${entry.unit||''}; ${ui().t('Below safety by','低于安全库存')} ${ui().number(entry.shortfallQuantity)} ${entry.unit||''}`).join('\n');
++      const confirmation={...preview,action:{...preview.action,review}};
++      if(!await operation.confirm(confirmation))return;
++      operation.wait(ui().t('Creating Transfer Orders in NetSuite. Please wait…','正在 NetSuite 建立调货单，请稍候…'));
++      await state.api(`${path}/pickup-convert`,{method:'POST',body:JSON.stringify({...input,confirmationToken:preview.confirmationToken})});
++      complete=true;
++      await state.onComplete();
++    } catch(caught) {
++      // Read the durable state after a timeout or partial failure; only the saved conversion may resume.
++      try {
++        const request=await state.api(`/api/scm/stock-requests/${state.request.id}`);
++        if(request.regular.pickupTransfer){state.request=request;showResume(state);}
++      } catch { /* Keep the original, precise conversion error visible. */ }
++      error(state,caught);
++    } finally {
++      operation.close();
++      if(complete)close(state);
++    }
++  }
++
++  function showResume(state) {
++    state.dialog.querySelector('[data-pickup-edit]').hidden=true;
++    state.dialog.querySelector('[data-pickup-history]').innerHTML=ui().pickupResult(state.request);
++    state.dialog.querySelector('[data-pickup-submit]').textContent=ui().t('Review saved TO action','查看已保存的调货操作');
++  }
++
++  function close(state) {
++    clearTimeout(state.timer);state.searchGeneration++;state.dialog.close();state.dialog.remove();editor=null;
++  }
++
++  function open(request,{api,onComplete}) {
++    if(editor||window.RegularStockDialog.isBusy())return;
++    const {esc,t}=ui(),dialog=document.createElement('dialog');dialog.className='scm-pickup-dialog';
++    dialog.setAttribute('aria-labelledby','pickupTitle');
++    const state={request,api,onComplete,dialog,lines:request.lines.filter(line=>['submitted','approved'].includes(line.status)).map(line=>({...line})),pallets:{},results:[],searchGeneration:0};
++    dialog.innerHTML=`<form><header><div><h2 id="pickupTitle">${t('Convert pickup request to TO','将自取申请转换为调货单')}</h2><p>${esc(request.requestRef)} · ${t('Destination','目的货场')} ${esc(request.destinationName)}</p></div><button type="button" data-pickup-close aria-label="${t('Close','关闭')}">×</button></header>
++      <p>${t('Review every item and quantity. SCM approval will create one Transfer Order per source yard.','请审核所有商品和数量。SCM 批准后，每个发货货场将建立一张调货单。')}</p>
++      <p data-pickup-error class="stock-request-error" role="alert" hidden></p><div data-pickup-history></div>
++      <div data-pickup-edit><div data-pickup-lines></div><label class="pickup-search">${t('Add an item','添加商品')}<input data-pickup-search type="search" autocomplete="off" placeholder="${t('Type an item code or description…','输入商品编号或描述…')}" aria-controls="pickupResults" /></label><div id="pickupResults" data-pickup-results aria-live="polite"></div>
++      <h3>${t('PALLET quantities per TO','每张调货单的托盘数量')}</h3><div data-pickup-routes class="pickup-fields"></div></div>
++      <footer><button data-pickup-close type="button">${t('Cancel','取消')}</button><button data-pickup-submit type="submit" class="primary">${t('Review and convert to TO','审核并转换为调货单')}</button></footer></form>`;
++    editor=state;document.body.append(dialog);drawLines(state);if(request.regular.pickupTransfer)showResume(state);
++    dialog.addEventListener('cancel',event=>{event.preventDefault();if(!window.RegularStockDialog.isBusy())close(state);});
++    dialog.addEventListener('input',event=>{
++      const field=event.target;if(window.RegularStockDialog.isBusy())return;
++      if(field.hasAttribute('data-pickup-search')){clearTimeout(state.timer);state.searchGeneration++;state.timer=setTimeout(()=>search(state),220);return;}
++      if(field.dataset.pickupPallet){state.pallets[field.dataset.pickupPallet]=field.value;return;}
++      if(field.dataset.pickupField){const line=state.lines[Number(field.closest('[data-pickup-row]').dataset.pickupRow)];line[field.dataset.pickupField]=Number(field.value);drawRoutes(state);}
++    });
++    dialog.addEventListener('keydown',event=>{
++      if(event.key==='ArrowDown'&&event.target.hasAttribute('data-pickup-search')){event.preventDefault();dialog.querySelector('[data-pickup-add]')?.focus();}
++    });
++    dialog.addEventListener('click',async event=>{
++      const button=event.target.closest('button');if(!button||button.disabled||window.RegularStockDialog.isBusy())return;
++      if(button.hasAttribute('data-pickup-close'))return close(state);
++      if(button.hasAttribute('data-pickup-remove')){state.lines.splice(Number(button.dataset.pickupRemove),1);drawLines(state);}
++      if(button.hasAttribute('data-pickup-add')){try{await add(state,Number(button.dataset.pickupAdd));}catch(caught){error(state,caught);}}
++    });
++    dialog.querySelector('form').addEventListener('submit',event=>{event.preventDefault();if(!window.RegularStockDialog.isBusy())void convert(state);});
++    dialog.showModal();dialog.querySelector('[data-pickup-field]')?.focus();
++  }
++  window.RegularPickupUI={open};
++})();
+--- a/server/public/scm-stock-pickup.css
++++ b/server/public/scm-stock-pickup.css
+@@ -0,0 +1,15 @@
++.scm-pickup-dialog{border:0;border-radius:18px;padding:24px;width:min(880px,calc(100vw - 32px));max-height:88vh;box-shadow:0 24px 80px #102b4d55;color:#17304d;background:#fff}
++.scm-pickup-dialog::backdrop{background:#10223bb3;backdrop-filter:blur(3px)}
++.scm-pickup-dialog header,.scm-pickup-dialog footer{display:flex;gap:16px;align-items:center;justify-content:space-between}
++.scm-pickup-dialog h2{margin:0;font-size:1.4rem}.scm-pickup-dialog p{line-height:1.5}
++.scm-pickup-dialog button{padding:10px 16px;border:1px solid #ced7e1;border-radius:9px;background:#f5f8fc;color:#17304d;cursor:pointer}
++.scm-pickup-dialog button.primary{background:#1b559b;color:#fff;border-color:#1b559b}.scm-pickup-dialog button:disabled{opacity:.5;cursor:wait}
++.pickup-line{margin:16px 0;padding:16px;border:1px solid #d5dfe9;border-radius:12px;background:#f8fafc}
++.pickup-line header p{font-size:.85rem;margin:6px 0;color:#53687e}.pickup-line [data-pickup-total]{font-weight:600}
++.pickup-fields{display:flex;gap:12px;flex-wrap:wrap;margin-top:14px}.pickup-fields label{flex:1 1 130px}
++.scm-pickup-dialog label{display:flex;flex-direction:column;gap:6px;font-weight:600}.scm-pickup-dialog label small{font-weight:400;color:#53687e}
++.scm-pickup-dialog input,.scm-pickup-dialog select{font:inherit;padding:10px;border:1px solid #bbcbdc;border-radius:8px;min-width:0;width:100%;box-sizing:border-box}
++[data-pickup-results]{max-height:230px;overflow:auto;margin:6px 0 16px}[data-pickup-results] button{display:flex;flex-direction:column;width:100%;text-align:left;gap:5px;margin-bottom:4px}[data-pickup-results] span{font-size:.85rem}
++.scm-pickup-dialog footer{position:sticky;bottom:-24px;background:#fff;border-top:1px solid #d5dfe9;padding:16px 0;margin-top:20px;justify-content:flex-end}
++.scm-pickup-dialog [hidden]{display:none!important}.regular-pickup-action{white-space:pre-line}
++@media(max-width:600px){.scm-pickup-dialog{padding:16px}.scm-pickup-dialog h2{font-size:1.15rem}.pickup-fields label{flex-basis:100px}.scm-pickup-dialog footer{bottom:-16px}}

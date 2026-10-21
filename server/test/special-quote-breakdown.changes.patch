@@ -1,0 +1,26 @@
+--- a/src/field-sales/company-pdf.js
++++ b/src/field-sales/company-pdf.js
+@@ -16,9 +16,13 @@
+ }
+ const money=n=>new Intl.NumberFormat('en-CA',{style:'currency',currency:'CAD'}).format(n/100);
+ const rate=n=>new Intl.NumberFormat('en-CA',{style:'currency',currency:'CAD',minimumFractionDigits:2,maximumFractionDigits:6}).format(Number(n));
++function quoteLineAmount(line){return line.grossAmountMinor??line.amountMinor;}
+ function quoteTotalRows(totals){
+  const rows=[['Subtotal',totals.subtotalMinor,false],[`HST (${totals.taxBps/100}%)`,totals.taxMinor,false],['Total CAD',totals.totalMinor,true]];
+- if(Number.isSafeInteger(totals.discountMinor)){rows.unshift([`Total Discount (${totals.discountPercent}%)`,totals.discountMinor,false]);}
++ if(Number.isSafeInteger(totals.discountMinor)){rows.splice(0,1,
++  ['Subtotal before discount',totals.grossSubtotalMinor,false],
++  [`Total Discount (${totals.discountPercent}%)`,totals.discountMinor,false],
++  ['Subtotal after discount',totals.subtotalMinor,false]);}
+  return rows;
+ }
+ export function companyQuotePdf(quote,company) {
+@@ -73,7 +77,7 @@
+   tableHeader();
+   for(const line of s.lines){
+    const hasSku=String(line.sku??'').trim().length>0,descriptionOffset=hasSku?14:0;
+-   const cells=[line.quantity,line.unit,line.description,rate(line.unitRate),money(line.amountMinor),
++   const cells=[line.quantity,line.unit,line.description,rate(line.unitRate),money(quoteLineAmount(line)),
+     ...(packing?['palletQty','sectionQty','layerQty','pieceQty'].map(field=>String(line.packQuantities?.[field]??'')):[])];
+    doc.font('regular').fontSize(9);
+    const height=packing?Math.max(30,...cells.map((value,i)=>{

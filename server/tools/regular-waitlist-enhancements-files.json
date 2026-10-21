@@ -1,0 +1,14 @@
+[
+  "src/regular-waitlist-domain.js",
+  "src/regular-waitlist-supply.js",
+  "src/regular-waitlist-repository.js",
+  "src/regular-waitlist-router.js",
+  "src/regular-waitlist-netsuite.js",
+  "src/regular-stock-request-service.js",
+  "public/regular-waitlist.js",
+  "public/scm-waitlist.js",
+  "public/scm-waitlist-list.js",
+  "public/regular-waitlist.css",
+  "public/sales-stock-requests.html",
+  "public/scm-stock-requests.html"
+]

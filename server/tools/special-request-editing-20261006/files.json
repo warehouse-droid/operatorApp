@@ -1,0 +1,16 @@
+[
+  "public/special-stock-fulfillment.js",
+  "public/sales-special-stock-requests.js",
+  "public/sales-stock-requests.html",
+  "public/scm-stock-requests.html",
+  "public/stock-requests.css",
+  "public/special-stock-delivery-fee.js",
+  "src/special-stock-request-domain.js",
+  "src/special-stock-documents.js",
+  "src/special-stock-request-repository.js",
+  "src/special-stock-request-netsuite.js",
+  "public/stock-request-view.js",
+  "public/sales-stock-requests.js",
+  "public/scm-stock-requests.js",
+  "src/special-stock-request-service.js"
+]

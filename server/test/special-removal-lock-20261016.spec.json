@@ -1,0 +1,28 @@
+{
+  "request": "SPREQ-000063: removing request lines is blocked",
+  "tier": 3,
+  "specApproval": "not obtained (autonomous run)",
+  "diagnosis": "A delivery change failed during preparation, with status attention and no persisted remote plan. General edit guards also block local request-only adjustments.",
+  "scenarios": [
+    "A failed delivery change with no saved remote plan permits a local removal proposal and SCM approval; the removed row and audit history remain, all issued SO/PO/Dispatch records and the delivery failure journal remain identical.",
+    "An applying delivery change blocks local adjustments, with or without a saved plan.",
+    "A failed delivery change with a saved plan blocks local adjustments because NetSuite may have been changed.",
+    "Remote quantity adjustments and ordinary case edits remain blocked by every applying or attention delivery change.",
+    "The same guards are rechecked at SCM claim and completion, so a delivery operation started after a proposal prevents approval without changing lines.",
+    "Existing access control, revision checks, closed/completed request locks, rollback and audit behavior remain intact."
+  ],
+  "failureModel": {
+    "unsafeOverlap": "Unit truth table, generated state properties, and database request/claim/finish guard checks",
+    "orderOrHistoryLoss": "Before/after SQL snapshots, audit event assertions, existing rollback tests",
+    "unrelatedEditUnlock": "Default edit guard rejection test",
+    "deploymentDrift": "Capture live image; overlay only two runtime files; compare full runtime hashes; retain rollback image"
+  },
+  "setup": {
+    "dependencies": [],
+    "tools": "Existing Node test runner, fast-check, c8, TypeScript, ESLint and isolated Docker Compose runner",
+    "git": "Preserve existing workspace edits; no commits or reset",
+    "artifacts": "Tests, runner and release scripts, JSON evidence, logs and scoped patch under existing server folders",
+    "testing": "Use mbbs-tests.slice and docker-compose.mbt-test.yml; register finally teardown before launch; remove all test containers, volumes and networks and verify production health",
+    "production": "Deploy a scoped application fix; do not select or remove any user request lines and do not modify NetSuite records"
+  }
+}

@@ -1,0 +1,7 @@
+[
+  "public/scm-request-line-visibility.js",
+  "public/scm-special-stock-requests.js",
+  "public/backorder-stock-requests.js",
+  "public/scm-stock-requests.js",
+  "public/scm-stock-requests.html"
+]

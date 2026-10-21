@@ -1,0 +1,24 @@
+{
+  "tier": 3,
+  "specApproval": "not obtained (autonomous run)",
+  "request": "Allow SCM to correct item names when saving a stock response, including requests awaiting customer confirmation; keep corrected vendor names consistent with the line.",
+  "acceptance": [
+    "An SCM stock response exposes a required Item name input, prefilled with the current productName, while the request is awaiting customer confirmation.",
+    "Saving a corrected productName and vendorName updates the line product name and brand together, with one case revision and an audit record of the prior names.",
+    "Omitting productName preserves compatibility with existing response callers; explicit blank or over-500-character names are rejected.",
+    "A stale revision, mixed vendor, foreign line, or invalid later line rejects the whole save without partial name, stock, audit, or revision changes.",
+    "Readiness checks retain their current fields and issued-order protections; name editing uses the existing pre-SO stock response workflow.",
+    "Quantities, Sales prices, discounts, packing and customer decisions are preserved by a spelling correction.",
+    "The actual browser posts the corrected name, preserves edits after a failed save, and escapes the saved text.",
+    "The stock-check HTTP endpoint saves the name only for authenticated SCM, rejecting unauthenticated, Sales-role and stale requests.",
+    "SPREQ-000016 line 25 is corrected from best wat to BWS using its already-recorded vendor, preserving its item name and stock details, with an audit entry."
+  ],
+  "failureModel": {
+    "lost edits": "revision and atomic batch rollback integration tests",
+    "unsafe names": "blank, length, Unicode and HTML browser/property tests",
+    "vendor divergence": "case and line consistency integration tests",
+    "issued order mismatch": "existing SO lock integration tests and browser absence of item-name editing after SO creation",
+    "price or quantity changes": "integration assertions and affected existing quote/pricing tests"
+  },
+  "setup": "Use existing Node, PostgreSQL, Playwright, ESLint, TypeScript, c8 and fast-check in the isolated test runner. No dependencies, migrations or commits. Capture source and test baselines; release only the four changed runtime files to the existing test site with rollback."
+}

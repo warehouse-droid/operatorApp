@@ -1,0 +1,13 @@
+[
+  "migrations/259_special_sales_internal_remark.sql",
+  "public/special-stock-internal-remark.js",
+  "public/special-stock-fulfillment.js",
+  "public/special-stock-request-actions.js",
+  "public/sales-special-stock-requests.js",
+  "public/sales-stock-requests.html",
+  "public/special-stock-documents.css",
+  "src/special-stock-request-domain.js",
+  "src/special-stock-request-repository.js",
+  "src/special-stock-request-policy.js",
+  "src/server.js"
+]

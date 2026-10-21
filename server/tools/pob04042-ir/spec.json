@@ -1,0 +1,23 @@
+{
+  "scope": "Reconcile existing IR15183 for POB04042 into local receipt history; no NetSuite transaction writes and no application deployment.",
+  "tier": 3,
+  "specApproval": "not obtained (autonomous run)",
+  "setup": "Use existing Node and dependencies, isolated bounded Docker tests, existing repository finalizer; no new dependencies, git commits, or migrations.",
+  "acceptance": [
+    "The posted receipt must match command external ID, PO ID, IR ID, all five selected line quantities, items, units and locations.",
+    "The sole additional line must be source PO line 22, item 3025, Other Charge / Purchase, quantity 1, freight amount 130.42, at location 1, without inventory accruals.",
+    "Reject altered identity, missing or additional inventory, mismatched freight, ambiguous line identity, or unreceived lines.",
+    "Reconcile through the existing posting repository and receiving finalizer; preserve the immutable request, photos and original uncertain attempt.",
+    "Resume, claim, recovered attempt, receipt history, order reference and audit must commit atomically; failed or dry runs leave business state unchanged.",
+    "Repeated or simultaneous recovery produces one receipt record and no new NetSuite transaction.",
+    "After repair the public job response and receipt history show IR15183; test resources are removed and production health remains good."
+  ],
+  "failureModel": {
+    "wrongReceiptOrInventory": "Exact source, request, receipt and line verification; hostile input tests and mutations.",
+    "unconfirmedCharge": "Incident-specific source-backed freight validation, including type, quantity, rate, amount and location.",
+    "duplicateReceipt": "No transform capability; existing command lock plus idempotent receipt finalization; repeat/concurrent isolated tests.",
+    "partialLocalCommit": "One outer database transaction; isolated rollback and injected failure tests.",
+    "lostEvidence": "Preserve original request and failed attempt; record recovery proof in saved response and audit.",
+    "recurrence": "General automatic handling of unselected PO freight remains outside this incident repair."
+  }
+}

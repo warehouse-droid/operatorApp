@@ -1,0 +1,40 @@
+{
+  "scope": "Local VRMA orders only; estimate remains maximum. Finalize when Operator confirms outbound load, not on packing.",
+  "specApproval": "not obtained (autonomous run); user explicitly confirmed local-only scope and upper bound",
+  "tier": 3,
+  "setup": {
+    "dependencies": [],
+    "git": "preserve existing changes, no commits",
+    "testEnvironment": "isolated standard Compose, mbbs-tests.slice, bounded resources, teardown trap before launch",
+    "production": "User requested old short-loaded local VRMA balances disappear. Stage and test scoped live-source release; audit and repair eligible historical orders after deployment."
+  },
+  "scenarios": [
+    "Estimate 100, packed 80: final quantity and loaded quantity 80; abandon 20; Loaded status, no remainder.",
+    "Untouched line estimate 40 becomes zero with abandoned 40, retained in history.",
+    "Original estimate and abandoned amount survive in load proof and audit.",
+    "Confirming or editing packing alone preserves estimate and open balance.",
+    "Estimate is maximum; sales-only and converted packaging remain capped.",
+    "Converted rounding shortage is actual loaded quantity, never rounded up to the estimate.",
+    "Prior partial load plus new load becomes cumulative final quantity.",
+    "Empty load rejects; duplicate/concurrent load produces one durable record.",
+    "Storage failure rolls back quantities, status, history and audit together.",
+    "Sales and transfer partial loading still retain their balances; no inventory or NetSuite writes.",
+    "SCM can complete finalized VRMA without forced quantity override.",
+    "Operator confirmation explains abandonment for local VRMA and retains existing wording for other orders.",
+    "Converted local VRMA overages smaller than normal rounding tolerance are rejected.",
+    "SCM schedule displays actual finalized quantity and weight.",
+    "Historical short-loaded local VRMA with proof, no active packing and no consolidation claim is finalized to already-loaded quantity; audit retains all prior lines; dry-run does not mutate; rerun does nothing.",
+    "Historical orders with active packing or no proof, and other order types, are excluded from cleanup.",
+    "Sales-only PLT estimate 100 and load 80 preserves final quantity 80 and Dispatch pallet count 80.",
+    "Historical maintenance rejects omitted, empty, or greater-than-500 reference lists."
+  ],
+  "failureModel": {
+    "premature closure": "packing-only regression",
+    "wrong order types": "SO/TO integration regression",
+    "lost estimate": "load history and audit assertions",
+    "duplicate loads": "concurrent load race",
+    "partial writes": "injected trigger failure rollback",
+    "over estimate or rounding inflation": "boundary and randomized quantity cases",
+    "silent UI mismatch": "rendered confirmation test"
+  }
+}

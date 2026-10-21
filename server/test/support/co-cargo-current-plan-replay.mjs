@@ -29,8 +29,8 @@ try {
     const names = ["dispatchLocationHierarchyRoot", "normalizedPickupLocation", "sameDispatchLocation",
       "uniqueDispatchLocationLabels", "orderRequiresPickupLocation", "pickupStopOrderRefs", "pickupStopIncludesOrder",
       "pickupOrdersForStop", "isMbbsSpecialLinkLine", "isOperationalDispatchItem", "itemHasQuantity", "tooltipItemsForOrder",
-      "poRouteProjectionForOrder", "routeItemsForOrder", "positiveBalance", "isOwnYardCode", "directPickupEntriesForLocation",
-      "directPickupItemsForLocation", "poPickupEntriesForLocation", "poPickupItemsForLocation", "directPickupAllocatedForItem",
+      "poRouteProjectionForOrder", "routeItemsForOrder", "positiveBalance", "isOwnYardCode", "retainedDirectPickupManifest", "groupPickupSourceItems", "directPickupEntriesForLocation",
+      "directPickupItemsForLocation", "poPickupEntriesForLocation", "poPickupItemsForLocation", "directPickupAllocatedForItem", "spreadDirectPickupAllocation",
       "itemForPickupLocation", "requiredPickupLocations", "opaqueDispatchStopId", "materializePickupVisitOrderRefs",
       "driverActivityDetails", "dispatchEditableRouteBoundary", "makePickupStop", "enablePickupVisitSchema", "ensurePickupStops", "syncPickupStops"];
     const ui = productionFunctions("../../public/dispatch.js", names, {

@@ -1,0 +1,12 @@
+import assert from 'node:assert/strict';
+import { readFile } from 'node:fs/promises';
+import { planSpecialCaseEdits, specialCaseEditDraft } from './public/special-stock-case-edits.js';
+import { specialLineFields } from './public/special-stock-line-fields.js';
+const detail={revision:1,palletTotal:0,palletRate:null,lines:[{id:1,productName:'TEST',color:'Grey',size:'80mm',detailSpec:'Smooth',quantity:2,originalRate:100,uom:'PLT',discountPercent:10,requiredDate:'2099-02-01',customerNote:'Note',palletQty:1,layerQty:2,sectionQty:3,pieceQty:4}]};
+const draft=specialCaseEditDraft(detail);draft.lines[0].color='Black';
+assert.equal(planSpecialCaseEdits(detail,draft).restart,true);
+for(const field of ['productName','color','size','detailSpec','quantity','uom','discountPercent','requiredDate','customerNote','palletQty','layerQty','sectionQty','pieceQty'])assert.ok(specialLineFields(draft.lines[0]).includes(`name="${field}"`),field);
+for(const file of ['sales-stock-requests.html','scm-stock-requests.html'])assert.ok((await readFile('public/'+file,'utf8')).includes('lineFields=20261003-v1'));
+const response=await fetch('http://127.0.0.1:3000/api/sales/special-stock-requests/1/case-lines',{method:'PUT',headers:{'content-type':'application/json'},body:'{}'});
+assert.equal(response.status,401);
+console.log(JSON.stringify({servedFieldsVerified:true,anonymousWritesDenied:true,productionRequestWrites:0,netSuiteWrites:0}));

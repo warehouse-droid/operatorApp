@@ -20,6 +20,44 @@ const orderDraft = {
   ancillaryLines: [{ itemId: 1987, quantity: 1, uom: "EA", rate: 250, description: "Delivery Charge" }]
 };
 
+test('new special SOs explicitly disable inherited transaction emailing', () => {
+  for (const fulfillmentMethod of ['mbt_delivery', 'yard_pickup', 'vendor_pickup']) {
+    const payload = buildSpecialSalesOrderPayload({
+      caseId: 42, draft: { ...orderDraft, fulfillmentMethod },
+      netsuiteLocationId: 10, deliveryMethodId: 2, pickupMethodId: 1
+    });
+    assert.equal(payload.toBeEmailed, false);
+    assert.equal(Object.hasOwn(payload, 'email'), false);
+  }
+});
+
+test('delivery SO custbody7 preserves instructions and the complete public Note', () => {
+  const remarks = '  TERMS / 条款\nLine one\n\nLine two — no returns.  ';
+  const payload = buildSpecialSalesOrderPayload({
+    caseId: 42, draft: { ...orderDraft, remarks, salesInternalRemark: 'PRIVATE MARGIN' },
+    netsuiteLocationId: 10, deliveryMethodId: 2
+  });
+  assert.equal(payload.custbody7, [
+    'Delivery Address: 37 Sunmount Rd, Scarborough, ON M1T 2A4',
+    'Delivery Date: 2026-09-10',
+    'Delivery Time: 09:00-12:00',
+    'Contact:  ',
+    'Drop-off Loc: Call before unloading.'
+  ].join('\n') + '\n\n' + remarks.trim());
+  assert.equal(JSON.stringify(payload).includes('PRIVATE MARGIN'), false);
+});
+
+test('pickup SO custbody7 carries the Note and omits an empty Note', () => {
+  for (const remarks of ['Pickup note / 自提\nKeep dry.', '', '  \n  ', undefined]) {
+    const payload = buildSpecialSalesOrderPayload({
+      caseId: 42, draft: { ...orderDraft, fulfillmentMethod: 'yard_pickup', remarks },
+      netsuiteLocationId: 10, pickupMethodId: 1
+    });
+    assert.equal(payload.custbody7, remarks?.trim() || undefined);
+    assert.equal(Object.hasOwn(payload, 'shippingAddress'), false);
+  }
+});
+
 test("standalone SO payload carries marker, exact accepted lines, delivery method, date, and instructions", () => {
   const payload = buildSpecialSalesOrderPayload({
     caseId: 42,
@@ -54,6 +92,21 @@ test("PO payload uses the same yard and only the exact material mappings", () =>
   assert.equal(payload.entity.id, "3243");
   assert.equal(payload.item.items.length, 1);
   assert.match(payload.memo, /MBBS-SPECIAL-PO:42/u);
+});
+
+test('new PO payload disables emailing and retains the SO reference with the public Note', () => {
+  const base = { caseId: 42, vendorId: 3243, netsuiteLocationId: 10,
+    lines: [{ itemId: 2055, quantity: 768, unitPurchaseCost: 2.1 }] };
+  for (const salesOrderRef of ['SOTEST42', '']) {
+    for (const remarks of [' TERMS / 条款\n\nDo not split delivery. ', '', undefined]) {
+      const payload = buildSpecialPurchaseOrderPayload({ ...base, salesOrderRef, remarks, salesInternalRemark: 'PRIVATE MARGIN' });
+      assert.equal(payload.toBeEmailed, false);
+      const expected = [salesOrderRef ? `for ${salesOrderRef}` : '', remarks?.trim()].filter(Boolean).join('\n\n');
+      assert.equal(payload.custbody7, expected || undefined);
+      assert.equal(JSON.stringify(payload).includes('PRIVATE MARGIN'), false);
+      assert.equal(payload.item.items[0].rate, 2.1);
+    }
+  }
 });
 
 test("pickup payload and remote payload validation fail closed", () => {

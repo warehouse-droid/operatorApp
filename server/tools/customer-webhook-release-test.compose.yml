@@ -1,0 +1,17 @@
+services:
+  db:
+    labels:
+      com.mbbs.lifecycle: disposable-test
+  test:
+    image: mbbs-operator-app:customer-webhook-20261009
+    build: !reset null
+    labels:
+      com.mbbs.lifecycle: disposable-test
+    environment:
+      NETSUITE_ACCOUNT_ID: CUSTOMER_WEBHOOK_TEST
+    volumes:
+      - ./server/test:/app/test:ro
+      - ./server/test-artifacts/operator-to-yard-flow-tooling/node_modules:/app/test/node_modules:ro
+      - ./server/tools/customer-webhook-runtime.mjs:/app/tools/customer-webhook-runtime.mjs:ro
+      - ./server/netsuite-customer-webhook-user-event.js:/app/netsuite-customer-webhook-user-event.js:ro
+      - ./server/deployments/customer-webhook-20261009/runtime:/app/test-artifacts/customer-webhook/final

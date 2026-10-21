@@ -1,5 +1,5 @@
 import { specialRestUnitId } from './special-stock-netsuite-adapter.js';
-/** @typedef {{line:number,remoteLineId:number,itemId:number,closed:boolean,queryOnly?:boolean,queryFingerprint:string|null,quantity?:number|null,unitId?:string|number,rate?:string|null,description?:string}} ClosureLine */
+/** @typedef {{line:number,remoteLineId:number,itemId:number,closed:boolean,queryOnly?:boolean,queryFingerprint:string|null,quantity?:number|null,unitId?:string|number,rate?:string|null,description?:string,executedQuantity?:number,billedQuantity?:number}} ClosureLine */
 /** @typedef {Record<string,any>} Raw */
 /** @typedef {{id:number,kind:string}} Identity */
 /** @typedef {Identity & {lines:ClosureLine[]}} PreparedOrder */
@@ -36,26 +36,33 @@ function workflowLocked(error) {
   return cause.status === 400 && cause.netsuiteErrorCodes?.includes('USER_ERROR')
     && /record has been locked by a user defined workflow/i.test(cause.message);
 }
-/** @param {Raw[]} rows @returns {ClosureLine[]} */
-function closedQueryLines(rows) {
+/** @param {Raw} row @param {boolean} closeRemaining */
+function activity(row, closeRemaining) {
+  const executedQuantity=Number(row.execution_quantity),billedQuantity=Number(row.billed_quantity);
+  if(row.execution_quantity==null || row.billed_quantity==null || !Number.isFinite(executedQuantity) || !Number.isFinite(billedQuantity)
+    || executedQuantity<0 || billedQuantity<0) throw conflict('NetSuite fulfillment and billing quantities could not be verified.');
+  if(!closeRemaining && (executedQuantity!==0 || billedQuantity!==0)) throw conflict('Closing requires unfulfilled, unreceived and unbilled order lines.');
+  return {executedQuantity,billedQuantity};
+}
+/** @param {Raw[]} rows @param {boolean} closeRemaining @returns {ClosureLine[]} */
+function closedQueryLines(rows, closeRemaining) {
   if (!rows.length || rows.length > 200) throw conflict('Complete closed-order evidence is required.');
   const lines = rows.map(row => {
     const fingerprint = queryFingerprint(row);
     if (!/^(?:Closed|Cancelled|Canceled)$/i.test(String(row.status_text || '').replace(/^(Sales Order|Purchase Order)\s*:\s*/i,''))
-      || (Number(row.item) !== 10716 && !['T',true].includes(row.line_closed)) || row.execution_quantity == null || Number(row.execution_quantity) !== 0
-      || row.billed_quantity == null || Number(row.billed_quantity) !== 0 || !fingerprint) {
+      || (Number(row.item) !== 10716 && !['T',true].includes(row.line_closed)) || !fingerprint) {
       throw conflict('The workflow-locked order is not verified closed, unexecuted and unbilled.');
     }
     return { line: id(row.rest_line_id), remoteLineId: id(row.uniquekey), itemId: id(row.item),
-      closed: true, queryOnly: true, queryFingerprint: fingerprint };
+      closed: true, queryOnly: true, queryFingerprint: fingerprint, ...activity(row,closeRemaining) };
   });
   if (new Set(lines.map(line=>line.line)).size !== lines.length || new Set(lines.map(line=>line.remoteLineId)).size !== lines.length) {
     throw conflict('NetSuite returned inconsistent closed-order identities.');
   }
   return lines;
 }
-/** @param {Identity} order @param {Boundary} boundary @returns {Promise<ClosureLine[]>} */
-async function read(order, { rest, queryAll }) {
+/** @param {Identity} order @param {Boundary} boundary @param {boolean} closeRemaining @returns {Promise<ClosureLine[]>} */
+async function read(order, { rest, queryAll }, closeRemaining) {
   const sql = `SELECT tl.uniquekey,tl.id AS rest_line_id,tl.item,
     tl.quantity AS base_quantity,tl.rate AS line_rate,tl.ratepercent AS line_rate_percent,
     tl.units AS unit_id,tl.memo AS description,
@@ -70,22 +77,23 @@ async function read(order, { rest, queryAll }) {
     if (!workflowLocked(error)) throw error;
     // Closed-state workflows can prevent even GET. Fresh query evidence verifies
     // terminal state without reopening a record or changing workflow permissions.
-    return closedQueryLines(await queryAll(sql));
+    return closedQueryLines(await queryAll(sql),closeRemaining);
   }
   if (!Array.isArray(source) || !source.length || !rows.length) throw conflict('The complete NetSuite order lines could not be verified.');
   const lines = source.map(line => {
     const matches = rows.filter(row => Number(row.rest_line_id) === id(line.line)), row = matches[0];
     if (matches.length !== 1 || Number(row.item) !== Number(line.item?.id)
-      || row.execution_quantity == null || Number(row.execution_quantity) !== 0
-      || row.billed_quantity == null || Number(row.billed_quantity) !== 0
       || !['T','F',true,false].includes(row.line_closed)
-      || !/^(?:Pending Approval|Pending Submission|Pending Fulfillment|Pending Receipt|Closed|Cancelled|Canceled)$/i.test(String(row.status_text || '').replace(/^(Sales Order|Purchase Order)\s*:\s*/i,''))) {
-      throw conflict('Closing requires unfulfilled, unreceived and unbilled order lines.');
+      || !(closeRemaining
+        ? /^(?:Pending Approval|Pending Submission|Pending Fulfillment|Pending Receipt|Partially Fulfilled|Partially Received|Pending Billing|Pending Bill|Pending Billing\/Partially Fulfilled|Pending Billing\/Partially Received|Billed|Fully Billed|Closed|Cancelled|Canceled)$/i
+        : /^(?:Pending Approval|Pending Submission|Pending Fulfillment|Pending Receipt|Closed|Cancelled|Canceled)$/i
+      ).test(String(row.status_text || '').replace(/^(Sales Order|Purchase Order)\s*:\s*/i,''))) {
+      throw conflict('The exact NetSuite line identities and order status must be verified before closing.');
     }
     const discount=Number(line.item?.id)===10716;
     const closed = discount || ['T',true].includes(row.line_closed);
     if (!discount && closed !== (line.isClosed === true)) throw conflict('NetSuite closure status is still synchronizing. Preview and retry.');
-    return { ...snapshot(line), remoteLineId: id(row.uniquekey), closed, queryFingerprint: queryFingerprint(row) };
+    return { ...snapshot(line), remoteLineId: id(row.uniquekey), closed, queryFingerprint: queryFingerprint(row), ...activity(row,closeRemaining) };
   });
   if (new Set(lines.map(line => line.line)).size !== lines.length || lines.length !== rows.length) throw conflict('NetSuite returned inconsistent order lines.');
   return lines;
@@ -98,6 +106,7 @@ function assertBaseline(order, current) {
     const queryOnly = before.queryOnly || after?.queryOnly;
     const fields = /** @type {(keyof ClosureLine)[]} */ (['quantity','unitId','rate','description']);
     if (!after || after.remoteLineId !== before.remoteLineId || after.itemId !== before.itemId || (before.closed && !after.closed)
+      || (before.executedQuantity ?? 0)!==after.executedQuantity || (before.billedQuantity ?? 0)!==after.billedQuantity
       || (queryOnly ? !before.queryFingerprint || before.queryFingerprint !== after.queryFingerprint
         : fields.some(key => after[key] !== before[key]))) {
       throw conflict('NetSuite order lines changed after SCM confirmation. Resolve the difference before closing.');
@@ -113,34 +122,35 @@ function assertClosureOrders(orders) {
     throw conflict('The exact linked Sales Order and any linked Purchase Order are required.');
   }
 }
-/** @param {{orders:Identity[]}} input @param {Boundary} boundary */
-export async function prepareSpecialClosurePlan({ orders }, boundary) {
+/** @param {{orders:Identity[],closeRemaining?:boolean}} input @param {Boundary} boundary */
+export async function prepareSpecialClosurePlan({ orders, closeRemaining=false }, boundary) {
   assertClosureOrders(orders);
   const prepared = [];
   for (const order of orders) {
     path(order);
-    const lines = await read(order, boundary);
+    const lines = await read(order, boundary, closeRemaining);
     // Closing targets the complete current order, including edits made in NetSuite.
     // The request's saved lines are only historical; they do not define this action.
     prepared.push({ id: id(order.id), kind: order.kind, lines });
   }
-  return { version: 1, orders: prepared.sort((a,b) => (a.kind === 'purchase_order' ? 0 : 1) - (b.kind === 'purchase_order' ? 0 : 1)) };
+  return { version: 1, ...(closeRemaining?{closeRemaining:true}:{}), orders: prepared.sort((a,b) => (a.kind === 'purchase_order' ? 0 : 1) - (b.kind === 'purchase_order' ? 0 : 1)) };
 }
-/** @param {{version:number,orders:PreparedOrder[]}} plan @param {Boundary} boundary */
+/** @param {{version:number,orders:PreparedOrder[],closeRemaining?:boolean}} plan @param {Boundary} boundary */
 export async function applySpecialClosurePlan(plan, boundary) {
   if (plan?.version !== 1) throw conflict('A saved closure plan is required.');
   assertClosureOrders(plan.orders);
+  const closeRemaining=plan.closeRemaining===true;
   // Verify every linked order before the first write, and every readback.
-  for (const order of plan.orders) assertBaseline(order, await read(order, boundary));
+  for (const order of plan.orders) assertBaseline(order, await read(order, boundary, closeRemaining));
   for (const order of plan.orders) {
-    const current = await read(order, boundary); assertBaseline(order, current);
+    const current = await read(order, boundary, closeRemaining); assertBaseline(order, current);
     const open = current.filter(line => !line.closed);
     if (open.length) await boundary.rest(path(order), { method: 'PATCH', body: { item: { items: open.map(line => ({ line: line.line, isClosed: true })) } } });
-    const after = await read(order,boundary); assertBaseline(order,after);
+    const after = await read(order,boundary,closeRemaining); assertBaseline(order,after);
     if (after.some(line=>!line.closed)) throw conflict('NetSuite did not confirm this order closed. Retry closure.');
   }
   for (const order of plan.orders) {
-    const current = await read(order, boundary); assertBaseline(order, current);
+    const current = await read(order, boundary, closeRemaining); assertBaseline(order, current);
     if (current.some(line => !line.closed)) throw conflict('NetSuite has not confirmed the linked orders closed. Retry closure.');
   }
   return { verifiedOrderIds: plan.orders.map(order => order.id) };

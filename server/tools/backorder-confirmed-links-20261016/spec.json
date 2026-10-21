@@ -1,0 +1,29 @@
+{
+  "request": "Regular backorder: Sales can link an SO and SCM can link a PO at Confirmed, in either order.",
+  "tier": 3,
+  "specApproval": "not obtained (autonomous run); implements the user's requested stage change",
+  "scenarios": [
+    "A reviewed, accepted backorder permits Sales SO linkage before any PO exists.",
+    "SCM can link the PO before or after the SO, using the same reviewed/accepted material readiness.",
+    "SO linkage does not depend on missing, unassigned, cancelled, or active PO plans.",
+    "Unreviewed, pending, changed, or all-resolved-without-accepted materials cannot authorize a new link, including forged client readiness flags.",
+    "Role and yard access, terminal request protection, canonical order validation, revision conflicts, and audit events remain enforced.",
+    "Concurrent SO and PO saves from one revision allow one save; refreshing and retrying saves the other without losing either link.",
+    "The real Sales and SCM screens show their link forms at Confirmed and explain the same prerequisite before confirmation.",
+    "Special Item and stocking workflows, NetSuite write restrictions, and dispatch/completion stages retain their existing behavior."
+  ],
+  "failureModel": {
+    "earlyOrForgedLinks": "HTTP rejection and property tests use persisted material readiness",
+    "roleOrYardBypass": "authenticated API rejection tests",
+    "lostConcurrentSave": "parallel HTTP saves, revision and audit assertions, then retry",
+    "frontendBackendMismatch": "real Playwright browser plus shared predicate properties",
+    "unrelatedDeploymentDrift": "three-file patch over captured production source, exact image hashes and configuration verification"
+  },
+  "setup": {
+    "dependencies": [],
+    "git": "Preserve the dirty workspace; no commits or reset.",
+    "tests": "Existing Node, fast-check, Playwright, c8, ESLint, and TypeScript in the standard isolated Compose stack; mbbs-tests.slice and existing bounds; teardown registered before startup.",
+    "artifacts": "tools/backorder-confirmed-links-20261016, test-artifacts/backorder-confirmed-links-20261016, deployments/backorder-confirmed-links-20261016",
+    "database": "Disposable synthetic test database only; no production migration."
+  }
+}

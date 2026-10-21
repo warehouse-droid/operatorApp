@@ -1,0 +1,229 @@
+--- a/server/src/regular-stock-domain.js
++++ b/server/src/regular-stock-domain.js
+@@ -25,12 +25,13 @@
+   return request.regular?.deliveryMethod === 'stocking' || Boolean(request.regular?.pickupTransfer) && !request.regular?.handoffStatus;
+ }
+ 
+-/** @param {{lines?:RegularLine[],policies?:StockPolicy[],arrivalAt:string|number|Date,deliveryMethod?:string,leadHours?:number,autoApprovalEnabled?:boolean,now?:string|number|Date}} input */
++/** @param {{lines?:RegularLine[],policies?:StockPolicy[],arrivalAt?:string|number|Date|null,deliveryMethod?:string,leadHours?:number,autoApprovalEnabled?:boolean,now?:string|number|Date}} input */
+ export function evaluateRegularStockApproval({ lines = [], policies = [], arrivalAt, deliveryMethod = 'delivery', leadHours = 5, autoApprovalEnabled = true, now = new Date() }) {
+   const hours = normalizeRegularLeadHours(leadHours);
+-  const nowMs = new Date(now).getTime(), arrivalMs = new Date(arrivalAt).getTime();
+-  if (!Number.isFinite(nowMs) || !Number.isFinite(arrivalMs)) throw regularError('A valid arrival instant is required.', 'REGULAR_ARRIVAL_INVALID', 400);
+   const leadTimeApplies = deliveryMethod === 'delivery';
++  const nowMs = new Date(now).getTime();
++  const arrivalMs = leadTimeApplies && arrivalAt != null ? new Date(arrivalAt).getTime() : NaN;
++  if (!Number.isFinite(nowMs) || (leadTimeApplies && !Number.isFinite(arrivalMs))) throw regularError('A valid arrival instant is required.', 'REGULAR_ARRIVAL_INVALID', 400);
+   const enoughTime = !leadTimeApplies || arrivalMs >= nowMs + hours * 3600000;
+   const totals = new Map();
+   for (const line of lines) {
+@@ -52,7 +53,7 @@
+       unit: line.salesUom, stockEligible: safe, reasons: [...(deliveryMethod === 'stocking' ? ['stocking_scm_review'] : []), ...(!autoApprovalEnabled ? ['auto_approval_disabled'] : []), ...(!known ? ['policy_unavailable'] : !safe ? ['below_safety'] : []), ...(!enoughTime ? ['short_lead_time'] : [])] };
+   });
+   return { automatic: deliveryMethod !== 'stocking' && autoApprovalEnabled && evidence.length > 0 && enoughTime && evidence.every(line => line.stockEligible), deliveryMethod, autoApprovalEnabled, leadHours: hours, leadTimeApplies,
+-    evaluatedAt: new Date(nowMs).toISOString(), arrivalAt: new Date(arrivalMs).toISOString(), enoughTime, lines: evidence };
++    evaluatedAt: new Date(nowMs).toISOString(), arrivalAt: leadTimeApplies ? new Date(arrivalMs).toISOString() : null, enoughTime, lines: evidence };
+ }
+ 
+ /** @param {{regular?:{deliveryMethod?:string,pickupTransfer?:unknown,approvalExpiresAt?:string|null,handoffStatus?:string}}} request @param {Date|string|number} [now] */
+--- a/server/src/regular-stock-request-service.js
++++ b/server/src/regular-stock-request-service.js
+@@ -33,7 +33,8 @@
+ async function inputDetails(input) {
+   const deliveryMethod = String(input.deliveryMethod || '').toLowerCase();
+   if (!['pickup', 'delivery', 'stocking'].includes(deliveryMethod)) throw regularError('Select Pickup, Delivery or Stocking.', 'REGULAR_DELIVERY_REQUIRED', 400);
+-  const arrival = normalizeRegularArrival(input.arrivalDate, input.arrivalTime);
++  const arrival = deliveryMethod === 'delivery' ? normalizeRegularArrival(input.arrivalDate, input.arrivalTime)
++    : {date:null,time:null,arrivalAt:null,timeZone:'America/Toronto'};
+   let customerId = null;
+   let customerName = String(input.customerName || '').trim();
+   if (customerName.length > 200 || /[\u0000-\u001f]/u.test(customerName)) throw regularError('Customer name must be at most 200 characters.', 'REGULAR_CUSTOMER_INVALID', 400);
+--- a/server/public/regular-stock-ui.js
++++ b/server/public/regular-stock-ui.js
+@@ -15,8 +15,8 @@
+     return `<div class="stock-request-line-fields regular-stock-fields">
+       <label><span>${t('Customer (optional)','客户（选填）')}</span><input data-regular-field="customerName" maxlength="200" value="${esc(composer.customerName)}" /></label>
+       <label><span>${t('Delivery method','取货方式')} *</span><select data-regular-field="deliveryMethod" required><option value="">${t('Select…','请选择…')}</option><option value="pickup" ${composer.deliveryMethod==='pickup'?'selected':''}>${t('Pickup','自取')}</option><option value="delivery" ${composer.deliveryMethod==='delivery'?'selected':''}>${t('Delivery','送货')}</option><option value="stocking" ${composer.deliveryMethod==='stocking'?'selected':''}>${t('Stocking','备货')}</option></select></label>
+-      <label><span>${t('Expected arrival date','预计到达日期')} *</span><input data-regular-field="arrivalDate" autocomplete="off" required placeholder="YYYY-MM-DD" value="${esc(composer.arrivalDate)}" /></label>
+-      <label><span>${t('Expected arrival time (Toronto)','预计到达时间（多伦多）')} *</span><input data-regular-field="arrivalTime" autocomplete="off" required placeholder="15:00 / 3pm" value="${esc(composer.arrivalTime)}" /></label>
++      ${composer.deliveryMethod==='delivery'?`<label><span>${t('Expected arrival date','预计到达日期')} *</span><input data-regular-field="arrivalDate" autocomplete="off" required placeholder="YYYY-MM-DD" value="${esc(composer.arrivalDate)}" /></label>
++      <label><span>${t('Expected arrival time (Toronto)','预计到达时间（多伦多）')} *</span><input data-regular-field="arrivalTime" autocomplete="off" required placeholder="15:00 / 3pm" value="${esc(composer.arrivalTime)}" /></label>`:''}
+       <p class="stock-request-wide regular-stock-method-help">${t('Pickup: pre-approval, then Sales enters the SO; no minimum lead time. Delivery: pre-approval with the configured lead time, then SO. Stocking: SCM review and direct TO creation; no SO required.','自取：预先批准后由销售输入 SO，无需最短提前时间。送货：按配置的提前时间预先批准，再输入 SO。备货：须 SCM 审核并直接建立 TO，无需 SO。')}</p>
+     </div>`;
+   }
+@@ -42,7 +42,7 @@
+     return `<div class="stock-request-summary regular-stock-summary">
+       <span><small>${t('Customer','客户')}</small><strong>${esc(r.customerName||'—')}</strong></span>
+       <span><small>${t('Method','取货方式')}</small><strong>${stocking(request)?t('Stocking','备货'):r.deliveryMethod==='pickup'?t('Pickup','自取'):t('Delivery','送货')}</strong></span>
+-      <span><small>${t('Expected arrival · Toronto','预计到达 · 多伦多')}</small><strong>${esc(r.arrivalDate)} ${esc(r.arrivalTime)}</strong></span>
++      ${r.arrivalDate&&r.arrivalTime?`<span><small>${t('Expected arrival · Toronto','预计到达 · 多伦多')}</small><strong>${esc(r.arrivalDate)} ${esc(r.arrivalTime)}</strong></span>`:''}
+       <span><small>${t('Review route','审核方式')}</small><strong>${a.automatic&&!stocking(request)?t('Automatically approved','自动批准'):t('SCM review','SCM 人工审核')}</strong></span>
+       <span><small>${t('Minimum lead time at submission','提交时最短提前时间')}</small><strong>${stocking(request)?t('SCM review required','须 SCM 审核'):a.leadTimeApplies===false?t('No minimum lead time','无需最短提前时间'):`${number(a.leadHours)} ${t('hours','小时')}`}</strong></span>
+       ${r.approvalExpiresAt&&!r.handoffStatus&&!stocking(request)?`<span><small>${t('Approval valid until','批准有效期至')}</small><strong>${esc(window.MBBS_I18N?.displayDateTime?.(r.approvalExpiresAt)||r.approvalExpiresAt)}</strong></span>`:''}
+@@ -101,9 +101,11 @@
+       ${state.completedAt?`<small>${t('Completed','完成时间')}: ${esc(window.MBBS_I18N?.displayDateTime?.(state.completedAt)||state.completedAt)}</small>`:''}</section>`;
+   }
+   async function normalize(composer,root) {
+-    if(!composer?.arrivalDate||!composer?.arrivalTime)return;
++    if(composer?.deliveryMethod!=='delivery'||!composer.arrivalDate||!composer.arrivalTime)return;
++    const {arrivalDate,arrivalTime}=composer;
+     const {normalizeRegularArrival}=await import('/regular-stock-input.js?v=20260929-controls');
+-    const arrival=normalizeRegularArrival(composer.arrivalDate,composer.arrivalTime);
++    if(composer.deliveryMethod!=='delivery'||composer.arrivalDate!==arrivalDate||composer.arrivalTime!==arrivalTime)return;
++    const arrival=normalizeRegularArrival(arrivalDate,arrivalTime);
+     composer.arrivalDate=arrival.date;composer.arrivalTime=arrival.time;
+     for(const key of ['arrivalDate','arrivalTime']) {const input=root.querySelector(`[data-regular-field="${key}"]`);if(input){input.value=composer[key];input.setCustomValidity('');}}
+     return arrival;
+--- a/server/public/sales-stock-requests.js
++++ b/server/public/sales-stock-requests.js
+@@ -725,7 +725,8 @@
+     if (!destinationLocationId) throw new Error("Select a valid supported destination yard.");
+     if(composer.workflowVersion===2)await window.RegularStockUI.normalize(composer,salesStockRequestApp);
+     const body = {
+-      ...(composer.workflowVersion===2?{customerName:composer.customerName,deliveryMethod:composer.deliveryMethod,arrivalDate:composer.arrivalDate,arrivalTime:composer.arrivalTime}:{}),
++      ...(composer.workflowVersion===2?{customerName:composer.customerName,deliveryMethod:composer.deliveryMethod,
++        ...(composer.deliveryMethod==='delivery'?{arrivalDate:composer.arrivalDate,arrivalTime:composer.arrivalTime}:{})}:{}),
+       destinationLocationId,
+       remarks: composer.remarks,
+       lines: composer.lines.map(salesStockLinePayload),
+@@ -798,7 +799,12 @@
+ });
+ 
+ salesStockRequestApp.addEventListener("change", (event) => {
+-  if(event.target.dataset.regularField && salesStockState.composer){salesStockState.composer[event.target.dataset.regularField]=event.target.value;return;}
++  if(event.target.dataset.regularField && salesStockState.composer){
++    const field=event.target.dataset.regularField;
++    salesStockState.composer[field]=event.target.value;
++    if(field==='deliveryMethod')renderSalesStockRequests();
++    return;
++  }
+   if (event.target.matches("[data-sales-stock-filter]")) {
+     const filterName = event.target.dataset.salesStockFilter;
+     const yardName = event.target.type === 'checkbox' ? event.target.name : null;
+@@ -835,7 +841,7 @@
+     await window.RegularStockUI.normalize(composer,salesStockRequestApp);
+     if(composer===salesStockState.composer)salesStockRequestApp.querySelector(`[data-regular-field="${field}"]`)?.setCustomValidity('');
+   }catch(error){
+-    if(composer===salesStockState.composer&&composer?.arrivalDate===date&&composer?.arrivalTime===time){
++    if(composer===salesStockState.composer&&composer?.deliveryMethod==='delivery'&&composer.arrivalDate===date&&composer.arrivalTime===time){
+       salesStockRequestApp.querySelector(`[data-regular-field="${field}"]`)?.setCustomValidity(error.message);
+     }
+   }
+--- a/server/public/sales-stock-requests.html
++++ b/server/public/sales-stock-requests.html
+@@ -15,9 +15,9 @@
+     <script src="/app-sidebar.js?v=20260928-enhancements-v1&regular=20260929-stocking"></script>
+     <script src="/dispatch-auth.js?v=20260811-stock-request-private-v1"></script>
+     <script src="/delivery-instruction-upload.js?v=20260812-delivery-image-720p-v1"></script>
+-    <script src="/regular-stock-ui.js?v=20260929-stocking"></script>
++    <script src="/regular-stock-ui.js?v=20260929-arrival"></script>
+     <script src="/regular-stock-dialog.js?v=20260929-stocking"></script>
+-    <script src="/sales-stock-requests.js?v=20260927-yard-layout-v1&regular=20260929-stocking"></script>
++    <script src="/sales-stock-requests.js?v=20260927-yard-layout-v1&regular=20260929-arrival"></script>
+     <script src="/sales-special-stock-requests.js?v=20260928-enhancements-v1"></script>
+   </body>
+ </html>
+--- a/server/public/scm-stock-requests.html
++++ b/server/public/scm-stock-requests.html
+@@ -19,7 +19,7 @@
+     <script src="/aggregate-requests-i18n.js?v=20260925-aggregate-confirmation-date-v1"></script>
+     <script src="/scm-stock-request-tabs.js?v=20260926-special-queue-v1"></script>
+     <script src="/aggregate-requests.js?v=20260925-aggregate-confirmation-date-v1"></script>
+-    <script src="/regular-stock-ui.js?v=20260929-stocking"></script>
++    <script src="/regular-stock-ui.js?v=20260929-arrival"></script>
+     <script src="/regular-stock-dialog.js?v=20260929-stocking"></script>
+     <script src="/scm-stock-pickup.js?v=20260929-stocking"></script>
+     <script src="/scm-stock-requests.js?v=20260927-yard-layout-v1&regular=20260929-stocking"></script>
+--- a/server/public/scm-smart.html
++++ b/server/public/scm-smart.html
+@@ -17,7 +17,7 @@
+     <script src="/i18n.js?v=20260815-customer-pickup-photo-gate-v1"></script>
+     <script src="/app-sidebar.js?v=20260819-scm-custom-orders-v1&regular=20260929-stocking"></script>
+     <script src="/dispatch-auth.js?v=20260716-multi-role-v1"></script>
+-    <script src="/regular-stock-ui.js?v=20260929-stocking"></script>
++    <script src="/regular-stock-ui.js?v=20260929-arrival"></script>
+   <script src="/scm-smart.js?v=20260826-phased-planning-v1&regular=20260929-stocking"></script>
+     <script src="/scm-smart-blanket.js?v=20260812-blanket-source-items-v1"></script>
+     <script src="/scm-smart-vendor.js?v=20260915-created-po-sync-v1"></script>
+--- a/server/src/special-stock-documents.js
++++ b/server/src/special-stock-documents.js
+@@ -1,4 +1,4 @@
+-import { specialItemDescription } from '../public/special-stock-line-details.js';
++import { specialItemDescription, specialPackPayload, SPECIAL_PACK_FIELDS } from '../public/special-stock-line-details.js';
+ import { createHash } from 'node:crypto';
+ import { query, withTransaction } from './db.js';
+ import { getSpecialStockCase } from './special-stock-request-repository.js';
+@@ -13,6 +13,11 @@
+   if (value < 0n || value > BigInt(Number.MAX_SAFE_INTEGER)) throw invalid('The quote total is too large.');
+   return Number(value);
+ };
++
++function quotePackQuantities(line) {
++  const native = specialPackPayload(line);
++  return Object.fromEntries(Object.entries(SPECIAL_PACK_FIELDS).map(([field,key]) => [field,native[key] ?? null]));
++}
+ 
+ // Reuse the Field Sales MBBS presentation and configuration without creating a
+ // Field Sales record, looking up a NetSuite item, or posting an estimate.
+@@ -31,7 +36,8 @@
+     return { description: `MBBS-Special\n${description}`, quantity: legacy ? orderLine?.quantity : draft ? line.quantity : line.packageQuantity ?? line.quantity,
+       uom: legacy ? orderLine?.uom : line.rateUom || line.uom,
+       rate: legacy ? orderLine?.rate : draft ? line.rate : line.originalRate,
+-      discountPercent: legacy ? 0 : line.discountPercent };
++      discountPercent: legacy ? 0 : line.discountPercent,
++      packQuantities: quotePackQuantities(legacy ? {...line,...orderLine} : line) };
+   });
+   inputs.push(...saved.filter(line => line.ancillary).map(line => ({ ...line, discountPercent: 0 })));
+   if (!inputs.length) throw invalid('Add a priced item to preview the quote.');
+@@ -41,6 +47,7 @@
+     return { id: String(index + 1), company: 'MBBS', itemId: String(index + 1), sku: '',
+       description: `${line.description}${discount ? `\nDiscount: ${discount}%` : ''}`,
+       quantity: String(quantity), unit: line.uom, unitRate: String(unitRate),
++      packQuantities: line.packQuantities || quotePackQuantities(line),
+       amountMinor: Math.round(specialLineSubtotal(quantity, unitRate, discount) * 100) };
+   });
+   const subtotal = lines.reduce((sum, line) => sum + BigInt(line.amountMinor), 0n);
+@@ -49,7 +56,7 @@
+   const destination = detail.fulfillmentMethod === 'mbt_delivery' ? detail.deliveryAddress
+     : detail.fulfillmentMethod === 'vendor_pickup' ? 'Customer pickup at vendor yard' : `Pickup at ${detail.storeName || 'inquired yard'}`;
+   return { number: draft ? 'MBBS-QUOTE-DRAFT' : `Q-${detail.requestRef}`, selected_revision: draft ? 1 : detail.revision,
+-    snapshot: { schemaVersion: 2, simpleDetails: true, company: 'MBBS', currency: 'CAD',
++    snapshot: { schemaVersion: 2, simpleDetails: true, showPackQuantities: true, company: 'MBBS', currency: 'CAD',
+       ...quoteDates(detail.inquiryDate, profile), ...(detail.expiresOn ? {validUntil: detail.expiresOn} : {}), customerName: detail.customerName, phone: detail.customerPhone || '',
+       salesRep: detail.netsuiteSalesRepName || (draft ? operatorName : detail.requestedByName || ''), shippingMethod: detail.fulfillmentMethod === 'mbt_delivery' ? 'Delivery' : 'Pick-Up',
+       jobsite: { address: destination }, note: [draft ? 'Draft quote' : '', detail.remarks].filter(Boolean).join('\n'),
+--- a/server/src/field-sales/company-pdf.js
++++ b/server/src/field-sales/company-pdf.js
+@@ -59,14 +59,28 @@
+    doc.rect(x,110,142,18).fill('#d4d4d4');text(label,x+5,113,132,8,true);text(body,x+5,132,132,8);infoBottom=Math.max(infoBottom,doc.y);
+   }
+   let y=Math.max(207,infoBottom+18);
+-  const tableHeader=()=>{doc.rect(36,y,540,23).fill('#e4e4e4');for(const [label,x,w,align] of [['Quantity',40,51,'right'],['UOM',98,38,'left'],['Item',142,256,'left'],['Rate',404,72,'right'],['Amount',482,89,'right']]){text(label,x,y+5,w,8,true,align);}y+=28;};
++  const packing=s.showPackQuantities===true;
++  const columns=packing
++   ? [['Quantity',40,45,'right'],['UOM',91,31,'left'],['Item',128,174,'left'],['Rate',308,57,'right'],['Amount',371,69,'right'],['PLT',446,27,'right'],['SEC',479,27,'right'],['LYR',512,27,'right'],['PCS',545,27,'right']]
++   : [['Quantity',40,51,'right'],['UOM',98,38,'left'],['Item',142,256,'left'],['Rate',404,72,'right'],['Amount',482,89,'right']];
++  const tableHeader=()=>{doc.rect(36,y,540,23).fill('#e4e4e4');for(const [label,x,w,align] of columns){text(label,x,y+5,w,packing?7:8,true,align);}y+=28;};
+   const newPage=()=>{doc.addPage();y=58;tableHeader();};
+   tableHeader();
+   for(const line of s.lines){
+-   doc.font('regular').fontSize(9);const height=Math.max(30,doc.heightOfString(line.description,{width:254})+24);
++   const cells=[line.quantity,line.unit,line.description,rate(line.unitRate),money(line.amountMinor),
++    ...(packing?['palletQty','sectionQty','layerQty','pieceQty'].map(field=>String(line.packQuantities?.[field]??'')):[])];
++   doc.font('regular').fontSize(9);
++   const height=packing?Math.max(30,...cells.map((value,i)=>{
++    doc.font('regular').fontSize(i===2?9:8);
++    return doc.heightOfString(String(value??''),{width:columns[i][2]-2,lineGap:1})+(i===2?24:8);
++   })):Math.max(30,doc.heightOfString(line.description,{width:254})+24);
+    if(y+height>675){newPage();}
+-   text(line.quantity,40,y,51,9,false,'right');text(line.unit,98,y,38,8);text(line.sku,142,y,254,9,true);text(line.description,142,y+14,254,9);
+-   text(rate(line.unitRate),404,y,72,9,false,'right');text(money(line.amountMinor),482,y,89,9,false,'right');y+=height;
++   for(const [i,value] of cells.entries()){
++    const [,x,width,align]=columns[i];
++    if(i===2){text(line.sku,x,y,width-2,9,true);text(value,x,y+14,width-2,9);}
++    else text(value,x,y,width,packing||i===1?8:9,false,align);
++   }
++   y+=height;
+    doc.moveTo(36,y-4).lineTo(576,y-4).strokeColor('#ddd').lineWidth(.5).stroke();
+   }
+   if(y+80>675){doc.addPage();y=58;}y+=8;

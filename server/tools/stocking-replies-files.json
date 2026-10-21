@@ -1,0 +1,21 @@
+[
+  "src/regular-stock-delivery-access.js",
+  "src/regular-stock-request-service.js",
+  "src/stock-request-repository.js",
+  "src/regular-stock-purchase-service.js",
+  "src/server.js",
+  "public/sales-stock-requests.js",
+  "public/scm-stock-requests.js",
+  "public/regular-stock-purchase.js",
+  "public/regular-stock-alert.js",
+  "public/app-sidebar.js",
+  "public/sales-stock-requests.html",
+  "public/scm-stock-requests.html",
+  "src/special-stock-documents.js",
+  "src/regular-stock-stocking-access.js",
+  "src/regular-stock-reply-domain.js",
+  "src/regular-stock-replies.js",
+  "public/regular-stock-reply.js",
+  "public/scm-smart.css",
+  "public/scm-smart.html"
+]

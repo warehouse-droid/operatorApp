@@ -1,0 +1,124 @@
+--- a/src/sor-rental-policy.js
++++ b/src/sor-rental-policy.js
+@@ -24,8 +24,6 @@
+ }
+ 
+ export function projectSorOrder(order = {}, policies = new Map()) {
+-  // A CO owns its route and cargo; source children describe the later delivery.
+-  if (clean(order.type).toUpperCase() === 'CO' || /^CO-/iu.test(clean(order.id))) {return order;}
+   if (Array.isArray(order.childOrderDetails) && order.childOrderDetails.length) {
+     const children = order.childOrderDetails.map(child => projectSorOrder(child, policies));
+     const byLine = new Map(children.flatMap(child => (child.items || []).filter(item=>item.lineRowId !== null && item.lineRowId !== undefined).map(item => [String(item.lineRowId), item])));
+--- a/src/yard-dependency-structure.js
++++ b/src/yard-dependency-structure.js
+@@ -18,9 +18,6 @@
+ }
+ 
+ export function dispatchDependencyOrderRefs(order = {}) {
+-  const ownRefs = [order.id, order.tranid].map(text).filter(Boolean);
+-  const coOrder = text(order.type).toUpperCase() === 'CO'
+-    || ownRefs.some((ref) => /^CO-/iu.test(ref));
+   return [...new Set([
+     order.id,
+     order.tranid,
+@@ -29,8 +26,7 @@
+     ...(Array.isArray(order.childOrderDetails)
+       ? order.childOrderDetails.flatMap((child) => [child?.id, child?.originalOrderId])
+       : [])
+-  ].map(text).filter((ref) => Boolean(ref)
+-    && (!coOrder || ownRefs.includes(ref) || /^CO-/iu.test(ref))))];
++  ].map(text).filter(Boolean))];
+ }
+ 
+ export function everySalesAssignmentFollowsTransfer(
+--- a/public/dispatch.js
++++ b/public/dispatch.js
+@@ -3287,7 +3287,6 @@
+   };
+   const visit = (order = {}) => {
+     if (!order || typeof order !== "object" || visited.has(order)) return;
+-    if (order.type === "CO" || /^CO-/iu.test(String(order.id || ""))) return;
+     visited.add(order);
+     for (const child of Array.isArray(order.childOrderDetails) ? order.childOrderDetails : []) visit(child);
+     for (const dependency of Array.isArray(order.orderDependencies) ? order.orderDependencies : []) {
+@@ -3477,20 +3476,6 @@
+ function normalizeOrder(order) {
+   const id = String(order.id || "");
+   const type = canonicalDispatchOrderType(order.type, id);
+-  if (type === "CO") {
+-    order = {
+-      ...order,
+-      transitCo: null,
+-      orderDependencies: [],
+-      dependencyLabels: [],
+-      directPickupManifest: [],
+-      dependencyDirectPickup: false,
+-      dependencyWaitingForTransfer: false,
+-      dependencyAttention: false,
+-      dependencyUncovered: false,
+-      dependencyUncoveredQuantity: 0
+-    };
+-  }
+   const items = Array.isArray(order.items) ? order.items : [];
+   const groupMembers = Array.isArray(order.childOrders) && order.childOrders.length
+     ? flattenDispatchGroupMembers({ ...order, type })
+@@ -3499,7 +3484,7 @@
+         childOrderDetails: Array.isArray(order.childOrderDetails) ? order.childOrderDetails : [],
+         groupAliases: Array.isArray(order.groupAliases) ? order.groupAliases : []
+       };
+-  const groupedDependencySources = type !== "CO" && groupMembers.childOrders.length
++  const groupedDependencySources = groupMembers.childOrders.length
+     ? [
+         ...groupMembers.childOrderDetails,
+         {
+@@ -3515,7 +3500,7 @@
+     ? groupedOrderDependencyLabels(groupedDependencySources, orderDependencies)
+     : order.dependencyLabels;
+   const dependencyChildren = groupedDependencySources.length ? groupMembers.childOrderDetails : [];
+-  const directPickupManifest = type !== "CO" && groupMembers.childOrders.length
++  const directPickupManifest = groupMembers.childOrders.length
+     ? [...new Map([...groupMembers.childOrderDetails, order]
+         .flatMap((member) => member.directPickupManifest || [])
+         .map((entry) => [String(entry.dependencyId || entry.transferOrderRef), entry])).values()]
+@@ -3730,7 +3715,6 @@
+ }
+ 
+ function normalizeReplenishmentDependentInsertIndex(order, targetLoad, insertIndex = null) {
+-  if (order?.type === "CO" || /^CO-/iu.test(String(order?.id || ""))) return insertIndex;
+   if (!targetLoad) return insertIndex;
+   let completionBoundary = -1;
+   for (const dependency of order?.orderDependencies || []) {
+@@ -3804,7 +3788,6 @@
+ }
+ 
+ function replenishmentPlacementBlockMessage(order, targetTruck, targetLoad, insertIndex = null) {
+-  if (order?.type === "CO" || /^CO-/iu.test(String(order?.id || ""))) return "";
+   const dependencies = (order?.orderDependencies || []).filter((dependency) =>
+     dependency.mode === "yard_replenishment" && dependency.status !== "cancelled"
+   );
+@@ -15019,14 +15002,12 @@
+ }
+ 
+ function dispatchGroupingRefs(order = {}) {
+-  const coOrder = order.type === "CO" || /^CO-/iu.test(String(order.id || ""));
+   return new Set([
+     order.id,
+     ...(order.childOrders || []),
+     ...(order.groupAliases || []),
+     ...(order.childOrderDetails || []).flatMap((child) => [child?.id, child?.originalOrderId])
+-  ].map((value) => String(value || "")).filter((ref) => ref
+-    && (!coOrder || ref === String(order.id || "") || /^CO-/iu.test(ref))));
++  ].map((value) => String(value || "")).filter(Boolean));
+ }
+ 
+ function prepareGroupedOrderPlanning(groupItems = []) {
+--- a/public/dispatch.html
++++ b/public/dispatch.html
+@@ -15,6 +15,6 @@
+     <script src="/dispatch-auth.js?v=20260724-sales-auth-v2"></script>
+     <script src="/delivery-instruction-upload.js?v=20260812-delivery-image-720p-v1"></script>
+     <script src="/dispatch-address-guard.js?v=20260920-executed-review-v1"></script>
+-    <script src="/dispatch.js?v=20261001-goa-co-planning-v1"></script>
++    <script src="/dispatch.js?v=20260930-search-session-v1"></script>
+   </body>
+ </html>

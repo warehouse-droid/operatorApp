@@ -82,7 +82,7 @@ for (const [scenario, code] of [["operator", "OPERATOR_ACTIVITY_STARTED"], ["clo
     const f = await seedTransferDependency();
     await seedTransferJob(f);
     const command = unlinkCommand(f);
-    if (scenario === "operator") { await query("UPDATE sales_order_lines SET confirmed=true WHERE id=$1", [f.salesLineId]); }
+    if (scenario === "operator") { await query("UPDATE sales_order_lines SET loaded_qty=1 WHERE id=$1", [f.salesLineId]); }
     if (scenario === "closed-target") { await query("UPDATE sales_orders SET status='H',status_text='Sales Order : Closed' WHERE netsuite_id=$1", [f.salesId]); }
     if (scenario === "revision") { command.expectedPlanRevision -= 1; }
     if (scenario === "signature") { command.targetSignature = "stale"; }

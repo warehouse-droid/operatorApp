@@ -1,0 +1,106 @@
+--- a/src/order-sync-repository.js
++++ b/src/order-sync-repository.js
+@@ -4,7 +4,6 @@
+ import { readNetSuiteOrderLine } from "./netsuite-order-line.js";
+ import { enrichPurchaseOrderDispatch, enrichSalesOrderDispatch, enrichTransferDispatch } from "./dispatch-enrichment.js";
+ import { syncOrderDependenciesForTransferOrder } from "./order-dependency-repository.js";
+-import { reconcileLinkedDirectShipQuantities } from "./linked-direct-ship-sync-repository.js";
+ import { enqueueNetSuiteMirrorOrderEvent } from "./netsuite-mirror-repository.js";
+ import { resumeSmartScmBlanketCoveredPlanningExclusions } from "./smart-scm-planning-exclusion-repository.js";
+ 
+@@ -871,7 +870,6 @@
+       detailsKey: "line"
+     });
+   }
+-  await reconcileLinkedDirectShipQuantities({ salesOrderId: Number(orderId) });
+   await enqueueNetSuiteMirrorOrderEvent("sales_order", orderId);
+ }
+ 
+@@ -1025,7 +1023,6 @@
+     });
+   }
+   await syncOrderDependenciesForTransferOrder(orderId);
+-  await reconcileLinkedDirectShipQuantities({ transferOrderId: Number(orderId) });
+   await enqueueNetSuiteMirrorOrderEvent("transfer_order", orderId);
+ }
+ 
+@@ -1147,8 +1144,6 @@
+       details: row
+     });
+   }
+-  await reconcileLinkedDirectShipQuantities(orderType === "transfer_order"
+-    ? { transferOrderId: Number(orderId) } : { salesOrderId: Number(orderId) });
+   await enqueueNetSuiteMirrorOrderEvent(orderType, orderId, { changeType: result.rowCount ? "missing" : "upsert" });
+ }
+ 
+--- a/src/order-dependency-repository.js
++++ b/src/order-dependency-repository.js
+@@ -6,7 +6,6 @@
+ import { completedTransferUnlinkAllowed } from "./scm-dependency-management-policy.js";
+ import { writeDispatchAudit } from "./dispatch-audit-repository.js";
+ import { resolveDispatchSalesTarget } from "./dispatch-order-target-repository.js";
+-import { reconcileLinkedDirectShipQuantities } from "./linked-direct-ship-sync-repository.js";
+ import { dispatchLoadAssignment } from "./dispatch-load-assignment.js";
+ import { DISPATCH_FLEET_PLANNING_LOCK } from "./dispatch-fleet-status.js";
+ import {
+@@ -4346,15 +4345,8 @@
+   requestedPlanDate,
+   { allowHistoricalGroupTarget = false } = {}
+ ) {
+-  const lockTarget = (await query(
+-    "SELECT COALESCE(dispatch_target_ref,sales_order_ref) AS ref FROM order_dependencies WHERE id=$1",
+-    [Number(dependencyId)]
+-  )).rows[0]?.ref;
+-  if (lockTarget) {
+-    await query("SELECT pg_advisory_xact_lock(hashtextextended($1,0))", [`order-dependency:${text(lockTarget).toLowerCase()}`]);
+-  }
+   const result = await query(
+-    `SELECT id, status, sales_order_ref, dispatch_target_ref, dispatch_target_kind,
++    `SELECT id, status, dispatch_target_ref, dispatch_target_kind,
+             planned_plan_id, planned_date::text AS planned_date
+        FROM order_dependencies
+       WHERE id = $1
+@@ -4367,10 +4359,6 @@
+     throw error;
+   }
+   const dependency = result.rows[0];
+-  if (lockTarget && text(dependency.dispatch_target_ref || dependency.sales_order_ref) !== text(lockTarget)) {
+-    throw Object.assign(new Error("This dependency moved to another target. Refresh its current link before retrying."),
+-      {status:409,code:"ORDER_DEPENDENCY_TARGET_CHANGED"});
+-  }
+   if (
+     dependency.status === "cancelled"
+     || dependency.dispatch_target_kind !== "group"
+@@ -4481,9 +4469,6 @@
+       [Number(dependencyId), normalizedMode, operatorId]
+     );
+     if (!result.rowCount) throw new Error("This dependency has already started and its mode cannot be changed.");
+-    if (normalizedMode === "direct_to_customer") {
+-      await reconcileLinkedDirectShipQuantities({ transferOrderId: Number(result.rows[0].transfer_order_id) });
+-    }
+     return (await loadDependencies({ salesOrderRef: result.rows[0].dispatch_target_ref || result.rows[0].sales_order_ref })).find((row) => String(row.id) === String(dependencyId));
+   });
+ }
+@@ -5184,10 +5169,6 @@
+         );
+       }
+     }
+-    const changedIds = new Set([...remapped, ...released].map(change => String(change.dependencyId)));
+-    for (const dependency of dependencies.filter(row => changedIds.has(String(row.id)) && row.mode === "direct_to_customer")) {
+-      await reconcileLinkedDirectShipQuantities({ transferOrderId: Number(dependency.transferOrderId), palletOnly: true });
+-    }
+     return { remapped, released };
+   });
+ }
+--- a/src/direct-to-completion-repository.js
++++ b/src/direct-to-completion-repository.js
+@@ -75,8 +75,7 @@
+     const lines=directReceiptLines(outbound,receiving);
+     if(!lines){return {status:'waiting_identity'};}
+     const allocations=(await query(`SELECT dl.* FROM order_dependency_lines dl JOIN order_dependencies d ON d.id=dl.dependency_id
+-      WHERE d.transfer_order_id=$1 AND d.dependency_mode='direct_to_customer' AND d.status<>'cancelled'
+-        AND dl.allocated_quantity>0`,[orderId])).rows;
++      WHERE d.transfer_order_id=$1 AND d.dependency_mode='direct_to_customer' AND d.status<>'cancelled'`,[orderId])).rows;
+     if(!completeMaterialCoverage(outbound,allocations)){return {status:'waiting_material'};}
+     const receipts=(await query("SELECT * FROM receiving_receipt_records WHERE order_id=$1 AND receipt_status='local_direct_receipt' ORDER BY id DESC",[orderId])).rows;
+     if(!receipts.length){return {status:'waiting_receipt'};}

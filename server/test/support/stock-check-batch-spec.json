@@ -1,0 +1,15 @@
+{
+  "task": "Prevent multi-line Unilock description matching from timing out",
+  "tier": 2,
+  "specApproval": "not obtained (autonomous correction requested by user)",
+  "behaviors": [
+    "One request containing the historical 80mm and 60mm Beacon Hill Smooth Random Fossil descriptions returns both exact catalogue products within the existing 90-second matching deadline.",
+    "Catalogue colours stated as complete phrases in descriptions constrain candidates; overlapping colour names use the longest complete phrase and conflicting colours require manual review.",
+    "S or T immediately after a stated mm/cm thickness constrain Smooth or Textured catalogue finishes.",
+    "Prompt input excludes empty fields and a specification identical to the product description; cache invalidation still uses all original descriptors.",
+    "The Qwen3 4B model and inference settings, prompt instructions and 90-second timeout remain unchanged.",
+    "Existing exact-variant, confidence, duplicate-identity, side, quantity and evidence safeguards remain active.",
+    "Historical evaluation does not create live stock jobs, modify requests or catalogue records, or touch the Unilock cart."
+  ],
+  "setup": "Existing bounded disposable Compose, tools and dependencies. No schema changes, new dependencies or commits."
+}

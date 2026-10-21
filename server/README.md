@@ -98,6 +98,7 @@ POST /api/delivery/orders/:id/lines/:lineId/unpack
 POST /api/delivery/orders/:id/unpack
 POST /api/delivery/orders/:id/prepared
 POST /api/webhooks/netsuite/order
+POST /api/webhooks/netsuite/customer
 POST /api/inventory/sync
 GET  /api/inventory/facets
 GET  /api/inventory/items
@@ -112,6 +113,90 @@ Delivery order list supports filters:
 GET /api/delivery/orders?locationId=1&status=active
 GET /api/delivery/orders?locationId=13&status=packed
 ```
+
+## NetSuite Customer Webhook
+
+The customer webhook writes saved NetSuite customers to the shared customer
+master and Return customer directory in one transaction. Customers become
+available to existing customer searches (including special orders and NetSuite
+customer selection) as soon as the response succeeds. This does not create
+separate field-sales prospect records or write back to NetSuite.
+
+1. Deploy the application containing `src/netsuite-customer-webhook*.js` and the
+   route in `src/server.js`. Existing customer-master migrations must be applied.
+   No additional migration is required.
+2. Keep `NETSUITE_ACCOUNT_ID` set to the source NetSuite account and
+   `NETSUITE_WEBHOOK_SECRET` set to the existing private shared secret in the
+   application's active environment. Never put the secret in the script source.
+3. Upload `netsuite-customer-webhook-user-event.js` to NetSuite and create a
+   **User Event Script** with a **Customer** deployment, status **Released**.
+   Enable Create, Edit and XEdit and the needed execution contexts (UI, web
+   services and CSV imports). CSV imports must run server SuiteScript.
+4. Add these script parameters and set their deployment values:
+
+   | Parameter ID | Value |
+   | --- | --- |
+   | `custscript_mbbs_customer_webhook_url` | `https://YOUR-APPLICATION/api/webhooks/netsuite/customer` |
+   | `custscript_mbbs_customer_webhook_secret` | Same private value as `NETSUITE_WEBHOOK_SECRET` |
+
+5. Save a customer and confirm the script execution log says
+   `MBBS customer webhook sent` with HTTP 200. Search for its customer number in
+   the application. For previously saved customers, save them again to send
+   their current snapshot.
+
+The sender reloads the saved record for inline edits, since NetSuite supplies
+only edited fields in an XEdit event. See Oracle's
+[afterSubmit documentation](https://docs.oracle.com/en/cloud/saas/netsuite/ns-online-help/section_4407992281.html).
+The deployment role needs access to Customer, Currency and customer addresses.
+
+The endpoint requires `Content-Type: application/json` and the
+`x-mbbs-webhook-secret` header. It accepts at most 256 KB. Example body:
+
+```json
+{
+  "schemaVersion": "netsuite-customer/v1",
+  "recordType": "customer",
+  "eventType": "create",
+  "accountId": "YOUR_NETSUITE_ACCOUNT",
+  "customer": {
+    "netsuiteId": "12345",
+    "entityNumber": "C12345",
+    "legalName": "Example Customer Ltd",
+    "displayName": "Example Customer Ltd",
+    "currency": "CAD",
+    "email": "customer@example.com",
+    "phone": "5550101234",
+    "active": true,
+    "terms": "Net 30",
+    "taxStatus": "",
+    "creditStatus": "AUTO",
+    "sourceModifiedAt": "2026-10-01T12:00:00.000Z",
+    "addresses": [],
+    "subsidiaries": []
+  }
+}
+```
+
+Required snapshot fields must be present even when empty. `currency` is the
+actual three-letter ISO code, not a NetSuite currency ID or display name.
+Use the record's last modification time in UTC, not the delivery time.
+Responses are 200 with `action: created|updated|unchanged|ignored`, 400 for an
+invalid payload, 401 for invalid credentials, 403 for an incorrect account or
+mirror consumer, 409 for conflicting snapshots at the same source timestamp,
+413 for oversized input, and 503 for missing configuration or a save failure.
+Duplicate delivery is safe; stale events cannot replace newer data. Conflict
+details and successful applies are retained in the existing sync/audit tables.
+
+The script logs failed delivery without preventing the NetSuite save. It has
+no durable outbound retry queue: after correcting a configuration or temporary
+failure, save the customer again. A 409 requires inspecting the customer sync
+conflict and sending a newer authoritative snapshot. Inactive customer updates
+remove active selection and the Return projection. Deletes, leads and prospects
+are skipped; existing child addresses/contacts are not removed by omission.
+
+Reproduce validation from the repository root with
+`bash server/tools/customer-webhook-gauntlet.sh`. Tests use synthetic customers
+inside bounded disposable Compose containers and remove the database afterward.
 
 ## NetSuite Webhook
 

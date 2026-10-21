@@ -1,0 +1,625 @@
+[
+  {
+    "id": "-179615128203145",
+    "ref": "LOINC-033146",
+    "tranid": "LOINC-033146",
+    "lines": [
+      {
+        "id": "-133494951737527",
+        "line_id": "4904192",
+        "item_id": "1784",
+        "item_name": "PALLET",
+        "sku": "PALLET",
+        "item_description": "**PALLET DEPOSIT** INTERLOCK,CEMENT, CONCRETE",
+        "item_type": "InvtPart",
+        "quantity": "11",
+        "unit": "EACH",
+        "pallet_qty": "0",
+        "layer_qty": "0",
+        "section_qty": "0",
+        "piece_qty": "0",
+        "received_pallet_qty": "0",
+        "received_layer_qty": "0",
+        "received_section_qty": "0",
+        "received_piece_qty": "0",
+        "netsuite_received_qty": "0",
+        "netsuite_received_baseline_qty": "0",
+        "received_sales_qty": "0"
+      },
+      {
+        "id": "-46359598770550",
+        "line_id": "4904191",
+        "item_id": "2055",
+        "item_name": "MBBS-Special Order",
+        "sku": "MBBS-Special Order",
+        "item_description": "Blu 60 HD2 Smooth Combo\nSHALE GREY\n1bdl=135.39sq.ft,1lay=12.31sq.ft \n(item# 100004V1-101)",
+        "item_type": "NonInvtPart",
+        "quantity": "1489.29",
+        "unit": "SQFT",
+        "pallet_qty": "0",
+        "layer_qty": "0",
+        "section_qty": "0",
+        "piece_qty": "0",
+        "received_pallet_qty": "0",
+        "received_layer_qty": "0",
+        "received_section_qty": "0",
+        "received_piece_qty": "0",
+        "netsuite_received_qty": "0",
+        "netsuite_received_baseline_qty": "0",
+        "received_sales_qty": "0"
+      }
+    ],
+    "allocations": [
+      {
+        "sales_order_id": "-258416193066378",
+        "sales_order_ref": "SOM06255-S2",
+        "sales_line_id": "-39847566315893",
+        "po_line_id": "-46359598770550",
+        "item_id": "2055",
+        "allocated_pallet_qty": "0",
+        "allocated_layer_qty": "0",
+        "allocated_section_qty": "0",
+        "allocated_piece_qty": "0",
+        "allocated_sales_qty": "1274.4",
+        "status": "cancelled",
+        "dispatch_target_ref": "SOM06255-S2",
+        "dispatch_target_line_key": "SOM06255-S2::SOM06255-S2::412406"
+      },
+      {
+        "sales_order_id": "-249382364623888",
+        "sales_order_ref": "SOM06256-S2",
+        "sales_line_id": "-281139366017401",
+        "po_line_id": "-46359598770550",
+        "item_id": "2055",
+        "allocated_pallet_qty": "0",
+        "allocated_layer_qty": "0",
+        "allocated_section_qty": "0",
+        "allocated_piece_qty": "0",
+        "allocated_sales_qty": "52.75",
+        "status": "cancelled",
+        "dispatch_target_ref": "SOM06256-S2",
+        "dispatch_target_line_key": "SOM06256-S2::SOM06256-S2::412412"
+      },
+      {
+        "sales_order_id": "-14850163832951",
+        "sales_order_ref": "SOM06255-S1",
+        "sales_line_id": "-219104741028314",
+        "po_line_id": "-46359598770550",
+        "item_id": "2055",
+        "allocated_pallet_qty": "0",
+        "allocated_layer_qty": "0",
+        "allocated_section_qty": "0",
+        "allocated_piece_qty": "0",
+        "allocated_sales_qty": "1489.29",
+        "status": "active",
+        "dispatch_target_ref": "SOM06255-S1",
+        "dispatch_target_line_key": "SOM06255-S1::SOM06255-S1::412407"
+      }
+    ],
+    "jobs": [
+      {
+        "job_id": "324:T4:T4-L1789349637541-7959d8854096b:stop-350cfb03-6677-48d9-a74d-36aa37808ecb",
+        "plan_date": "2026-09-14T00:00:00.000Z",
+        "stop_type": "pickup",
+        "order_refs": [
+          "SOM06255-S1"
+        ],
+        "status": "complete",
+        "completed_at": "2026-09-14T16:10:42.660Z",
+        "job_details": {
+          "orderTypes": [
+            "SO"
+          ],
+          "orders": [
+            {
+              "orderRef": "SOM06255-S1",
+              "orderType": "SALES_ORDER"
+            }
+          ]
+        },
+        "load_id": "T4-L1789349637541-7959d8854096b",
+        "load_name": "Load 1",
+        "stop_id": "stop-350cfb03-6677-48d9-a74d-36aa37808ecb"
+      },
+      {
+        "job_id": "324:T4:T4-L1789349637541-7959d8854096b:T4-L1789349637541-7959d8854096b-SOM06255-S1-1789401952686-5925ce625bbe18",
+        "plan_date": "2026-09-14T00:00:00.000Z",
+        "stop_type": "dropoff",
+        "order_refs": [
+          "SOM06255-S1"
+        ],
+        "status": "complete",
+        "completed_at": "2026-09-14T16:11:31.619Z",
+        "job_details": {
+          "orderTypes": [
+            "SO"
+          ],
+          "orders": [
+            {
+              "orderRef": "SOM06255-S1",
+              "orderType": "SALES_ORDER"
+            },
+            {
+              "orderRef": "SOM06256-S1",
+              "orderType": "SALES_ORDER"
+            }
+          ]
+        },
+        "load_id": "T4-L1789349637541-7959d8854096b",
+        "load_name": "Load 1",
+        "stop_id": "T4-L1789349637541-7959d8854096b-SOM06255-S1-1789401952686-5925ce625bbe18"
+      },
+      {
+        "job_id": "343:T5:T5-L1790802618906-1948df55737158:stop-1dbefc86-7d21-46e5-83a3-d07a83855e15",
+        "plan_date": "2026-10-01T00:00:00.000Z",
+        "stop_type": "pickup",
+        "order_refs": [
+          "SOM06663",
+          "SOM06662",
+          "SOM06256-S2",
+          "SOM06255-S2",
+          "LOINC-033778"
+        ],
+        "status": "complete",
+        "completed_at": "2026-10-01T15:57:06.141Z",
+        "job_details": {
+          "orderTypes": [
+            "SO",
+            "PO"
+          ],
+          "orders": [
+            {
+              "orderRef": "SOM06663",
+              "orderType": "SALES_ORDER"
+            },
+            {
+              "orderRef": "SOM06662",
+              "orderType": "SALES_ORDER"
+            },
+            {
+              "orderRef": "SOM06256-S2",
+              "orderType": "SALES_ORDER"
+            },
+            {
+              "orderRef": "SOM06255-S2",
+              "orderType": "SALES_ORDER"
+            },
+            {
+              "orderRef": "LOINC-033778",
+              "orderType": "PURCHASE_ORDER"
+            }
+          ]
+        },
+        "load_id": "T5-L1790802618906-1948df55737158",
+        "load_name": "Load 2",
+        "stop_id": "stop-1dbefc86-7d21-46e5-83a3-d07a83855e15"
+      },
+      {
+        "job_id": "343:T5:T5-L1790802618906-1948df55737158:T5-L1790802618906-1948df55737158-GOM-6255S2-6256S2-6662-6663-1790863124365-7100c9ff82187",
+        "plan_date": "2026-10-01T00:00:00.000Z",
+        "stop_type": "dropoff",
+        "order_refs": [
+          "SOM06663",
+          "SOM06662",
+          "SOM06256-S2",
+          "SOM06255-S2"
+        ],
+        "status": "complete",
+        "completed_at": "2026-10-01T17:37:53.866Z",
+        "job_details": {
+          "orderTypes": [
+            "SO"
+          ],
+          "orders": [
+            {
+              "orderRef": "SOM06663",
+              "orderType": "SALES_ORDER"
+            },
+            {
+              "orderRef": "SOM06662",
+              "orderType": "SALES_ORDER"
+            },
+            {
+              "orderRef": "SOM06256-S2",
+              "orderType": "SALES_ORDER"
+            },
+            {
+              "orderRef": "SOM06255-S2",
+              "orderType": "SALES_ORDER"
+            }
+          ]
+        },
+        "load_id": "T5-L1790802618906-1948df55737158",
+        "load_name": "Load 2",
+        "stop_id": "T5-L1790802618906-1948df55737158-GOM-6255S2-6256S2-6662-6663-1790863124365-7100c9ff82187"
+      }
+    ],
+    "expectedStatus": "Completed",
+    "expectedCompletedAt": "2026-09-14T16:11:31.619Z"
+  },
+  {
+    "id": "-43808732443904",
+    "ref": "LOINC-035332",
+    "tranid": "LOINC-035332",
+    "lines": [
+      {
+        "id": "-276273522646852",
+        "line_id": "4931428",
+        "item_id": "2055",
+        "item_name": "MBBS-Special Order",
+        "sku": "MBBS-Special Order",
+        "item_description": "SPLIT Pallet Fee",
+        "item_type": "NonInvtPart",
+        "quantity": "1",
+        "unit": "EACH",
+        "pallet_qty": "0",
+        "layer_qty": "0",
+        "section_qty": "0",
+        "piece_qty": "0",
+        "received_pallet_qty": "0",
+        "received_layer_qty": "0",
+        "received_section_qty": "0",
+        "received_piece_qty": "0",
+        "netsuite_received_qty": "0",
+        "netsuite_received_baseline_qty": "0",
+        "received_sales_qty": "0"
+      },
+      {
+        "id": "-185255808788333",
+        "line_id": "4904190",
+        "item_id": "1784",
+        "item_name": "PALLET",
+        "sku": "PALLET",
+        "item_description": "**PALLET DEPOSIT** INTERLOCK,CEMENT, CONCRETE",
+        "item_type": "InvtPart",
+        "quantity": "15",
+        "unit": "EACH",
+        "pallet_qty": "0",
+        "layer_qty": "0",
+        "section_qty": "0",
+        "piece_qty": "0",
+        "received_pallet_qty": "0",
+        "received_layer_qty": "0",
+        "received_section_qty": "0",
+        "received_piece_qty": "0",
+        "netsuite_received_qty": "0",
+        "netsuite_received_baseline_qty": "0",
+        "received_sales_qty": "0"
+      },
+      {
+        "id": "-107954889990126",
+        "line_id": "4931429",
+        "item_id": "1784",
+        "item_name": "PALLET",
+        "sku": "PALLET",
+        "item_description": "**PALLET DEPOSIT** INTERLOCK,CEMENT, CONCRETE",
+        "item_type": "InvtPart",
+        "quantity": "1",
+        "unit": "EACH",
+        "pallet_qty": "0",
+        "layer_qty": "0",
+        "section_qty": "0",
+        "piece_qty": "0",
+        "received_pallet_qty": "0",
+        "received_layer_qty": "0",
+        "received_section_qty": "0",
+        "received_piece_qty": "0",
+        "netsuite_received_qty": "0",
+        "netsuite_received_baseline_qty": "0",
+        "received_sales_qty": "0"
+      },
+      {
+        "id": "-41838901457692",
+        "line_id": "4904189",
+        "item_id": "2055",
+        "item_name": "MBBS-Special Order",
+        "sku": "MBBS-Special Order",
+        "item_description": "Blu 80 HD2 Smooth\nSHALE GREY\n1bdl=84.96sq.ft,1lay=10.62sq.ft\n(item#100024-101)",
+        "item_type": "NonInvtPart",
+        "quantity": "1274.4",
+        "unit": "SQFT",
+        "pallet_qty": "0",
+        "layer_qty": "0",
+        "section_qty": "0",
+        "piece_qty": "0",
+        "received_pallet_qty": "0",
+        "received_layer_qty": "0",
+        "received_section_qty": "0",
+        "received_piece_qty": "0",
+        "netsuite_received_qty": "0",
+        "netsuite_received_baseline_qty": "0",
+        "received_sales_qty": "0"
+      },
+      {
+        "id": "-7771653148199",
+        "line_id": "4931427",
+        "item_id": "2055",
+        "item_name": "MBBS-Special Order",
+        "sku": "MBBS-Special Order",
+        "item_description": "Blu 80 HD2 Smooth (6x13)\nONYX BLACK\n1layer=10.55",
+        "item_type": "NonInvtPart",
+        "quantity": "52.75",
+        "unit": "SQFT",
+        "pallet_qty": "0",
+        "layer_qty": "0",
+        "section_qty": "0",
+        "piece_qty": "0",
+        "received_pallet_qty": "0",
+        "received_layer_qty": "0",
+        "received_section_qty": "0",
+        "received_piece_qty": "0",
+        "netsuite_received_qty": "0",
+        "netsuite_received_baseline_qty": "0",
+        "received_sales_qty": "0"
+      }
+    ],
+    "allocations": [
+      {
+        "sales_order_id": "-258416193066378",
+        "sales_order_ref": "SOM06255-S2",
+        "sales_line_id": "-39847566315893",
+        "po_line_id": "-41838901457692",
+        "item_id": "2055",
+        "allocated_pallet_qty": "0",
+        "allocated_layer_qty": "0",
+        "allocated_section_qty": "0",
+        "allocated_piece_qty": "0",
+        "allocated_sales_qty": "1274.4",
+        "status": "active",
+        "dispatch_target_ref": "SOM06255-S2",
+        "dispatch_target_line_key": "SOM06255-S2::SOM06255-S2::412406"
+      },
+      {
+        "sales_order_id": "-249382364623888",
+        "sales_order_ref": "SOM06256-S2",
+        "sales_line_id": "-281139366017401",
+        "po_line_id": "-7771653148199",
+        "item_id": "2055",
+        "allocated_pallet_qty": "0",
+        "allocated_layer_qty": "0",
+        "allocated_section_qty": "0",
+        "allocated_piece_qty": "0",
+        "allocated_sales_qty": "52.75",
+        "status": "active",
+        "dispatch_target_ref": "SOM06256-S2",
+        "dispatch_target_line_key": "SOM06256-S2::SOM06256-S2::412412"
+      }
+    ],
+    "jobs": [
+      {
+        "job_id": "343:T5:T5-L1790802618906-1948df55737158:stop-1dbefc86-7d21-46e5-83a3-d07a83855e15",
+        "plan_date": "2026-10-01T00:00:00.000Z",
+        "stop_type": "pickup",
+        "order_refs": [
+          "SOM06663",
+          "SOM06662",
+          "SOM06256-S2",
+          "SOM06255-S2",
+          "LOINC-033778"
+        ],
+        "status": "complete",
+        "completed_at": "2026-10-01T15:57:06.141Z",
+        "job_details": {
+          "orderTypes": [
+            "SO",
+            "PO"
+          ],
+          "orders": [
+            {
+              "orderRef": "SOM06663",
+              "orderType": "SALES_ORDER"
+            },
+            {
+              "orderRef": "SOM06662",
+              "orderType": "SALES_ORDER"
+            },
+            {
+              "orderRef": "SOM06256-S2",
+              "orderType": "SALES_ORDER"
+            },
+            {
+              "orderRef": "SOM06255-S2",
+              "orderType": "SALES_ORDER"
+            },
+            {
+              "orderRef": "LOINC-033778",
+              "orderType": "PURCHASE_ORDER"
+            }
+          ]
+        },
+        "load_id": "T5-L1790802618906-1948df55737158",
+        "load_name": "Load 2",
+        "stop_id": "stop-1dbefc86-7d21-46e5-83a3-d07a83855e15"
+      },
+      {
+        "job_id": "343:T5:T5-L1790802618906-1948df55737158:T5-L1790802618906-1948df55737158-GOM-6255S2-6256S2-6662-6663-1790863124365-7100c9ff82187",
+        "plan_date": "2026-10-01T00:00:00.000Z",
+        "stop_type": "dropoff",
+        "order_refs": [
+          "SOM06663",
+          "SOM06662",
+          "SOM06256-S2",
+          "SOM06255-S2"
+        ],
+        "status": "complete",
+        "completed_at": "2026-10-01T17:37:53.866Z",
+        "job_details": {
+          "orderTypes": [
+            "SO"
+          ],
+          "orders": [
+            {
+              "orderRef": "SOM06663",
+              "orderType": "SALES_ORDER"
+            },
+            {
+              "orderRef": "SOM06662",
+              "orderType": "SALES_ORDER"
+            },
+            {
+              "orderRef": "SOM06256-S2",
+              "orderType": "SALES_ORDER"
+            },
+            {
+              "orderRef": "SOM06255-S2",
+              "orderType": "SALES_ORDER"
+            }
+          ]
+        },
+        "load_id": "T5-L1790802618906-1948df55737158",
+        "load_name": "Load 2",
+        "stop_id": "T5-L1790802618906-1948df55737158-GOM-6255S2-6256S2-6662-6663-1790863124365-7100c9ff82187"
+      }
+    ],
+    "expectedStatus": "Completed",
+    "expectedCompletedAt": "2026-10-01T17:37:53.866Z"
+  },
+  {
+    "id": "1025403",
+    "ref": "PO#B03964",
+    "tranid": "POB03964",
+    "lines": [
+      {
+        "id": "490933",
+        "line_id": "5046362",
+        "item_id": "2055",
+        "item_name": "MBBS-Special Order",
+        "sku": "MBBS-Special Order",
+        "item_description": "Trevista Textured 50mm Grey Mix\n125.4sqft/plt",
+        "item_type": "NonInvtPart",
+        "quantity": "250.8",
+        "unit": "SQFT",
+        "pallet_qty": "2",
+        "layer_qty": "0",
+        "section_qty": "0",
+        "piece_qty": "0",
+        "received_pallet_qty": null,
+        "received_layer_qty": null,
+        "received_section_qty": null,
+        "received_piece_qty": null,
+        "netsuite_received_qty": "0",
+        "netsuite_received_baseline_qty": "0",
+        "received_sales_qty": "0"
+      },
+      {
+        "id": "490934",
+        "line_id": "5046363",
+        "item_id": "2055",
+        "item_name": "MBBS-Special Order",
+        "sku": "MBBS-Special Order",
+        "item_description": "Richmond 50mm T 6x13 - Ultra Black \n147.6 sqft/plt",
+        "item_type": "NonInvtPart",
+        "quantity": "147.6",
+        "unit": "SQFT",
+        "pallet_qty": "1",
+        "layer_qty": "0",
+        "section_qty": "0",
+        "piece_qty": "0",
+        "received_pallet_qty": null,
+        "received_layer_qty": null,
+        "received_section_qty": null,
+        "received_piece_qty": null,
+        "netsuite_received_qty": "0",
+        "netsuite_received_baseline_qty": "0",
+        "received_sales_qty": "0"
+      },
+      {
+        "id": "490935",
+        "line_id": "5046364",
+        "item_id": "1784",
+        "item_name": "PALLET",
+        "sku": "PALLET",
+        "item_description": "**PALLET DEPOSIT** INTERLOCK,CEMENT, CONCRETE",
+        "item_type": "InvtPart",
+        "quantity": "3",
+        "unit": "EACH",
+        "pallet_qty": "0",
+        "layer_qty": "0",
+        "section_qty": "0",
+        "piece_qty": "0",
+        "received_pallet_qty": null,
+        "received_layer_qty": null,
+        "received_section_qty": null,
+        "received_piece_qty": null,
+        "netsuite_received_qty": "0",
+        "netsuite_received_baseline_qty": "0",
+        "received_sales_qty": "0"
+      }
+    ],
+    "allocations": [
+      {
+        "sales_order_id": "1025260",
+        "sales_order_ref": "SOB121672",
+        "sales_line_id": "490728",
+        "po_line_id": "490933",
+        "item_id": "2055",
+        "allocated_pallet_qty": "0",
+        "allocated_layer_qty": "0",
+        "allocated_section_qty": "0",
+        "allocated_piece_qty": "0",
+        "allocated_sales_qty": "250.8",
+        "status": "active",
+        "dispatch_target_ref": "SOB121672",
+        "dispatch_target_line_key": "SOB121672::SOB121672::490728"
+      },
+      {
+        "sales_order_id": "1025260",
+        "sales_order_ref": "SOB121672",
+        "sales_line_id": "490729",
+        "po_line_id": "490934",
+        "item_id": "2055",
+        "allocated_pallet_qty": "0",
+        "allocated_layer_qty": "0",
+        "allocated_section_qty": "0",
+        "allocated_piece_qty": "0",
+        "allocated_sales_qty": "147.6",
+        "status": "active",
+        "dispatch_target_ref": "SOB121672",
+        "dispatch_target_line_key": "SOB121672::SOB121672::490729"
+      },
+      {
+        "sales_order_id": "1025260",
+        "sales_order_ref": "SOB121672",
+        "sales_line_id": "490730",
+        "po_line_id": "490935",
+        "item_id": "1784",
+        "allocated_pallet_qty": "0",
+        "allocated_layer_qty": "0",
+        "allocated_section_qty": "0",
+        "allocated_piece_qty": "0",
+        "allocated_sales_qty": "3",
+        "status": "active",
+        "dispatch_target_ref": "SOB121672",
+        "dispatch_target_line_key": "SOB121672::SOB121672::490730"
+      }
+    ],
+    "jobs": [
+      {
+        "job_id": "344:T1:T1-L1790887829256-b276a5fe967e3:stop-e6806d80-999e-4ea7-a57f-4bf0dc3739e0",
+        "plan_date": "2026-10-02T00:00:00.000Z",
+        "stop_type": "pickup",
+        "order_refs": [
+          "SOB121672"
+        ],
+        "status": "complete",
+        "completed_at": "2026-10-02T10:45:18.560Z",
+        "job_details": {
+          "orderTypes": [
+            "SO"
+          ],
+          "orders": [
+            {
+              "orderRef": "SOB121672",
+              "orderType": "SALES_ORDER"
+            }
+          ]
+        },
+        "load_id": "T1-L1790887829256-b276a5fe967e3",
+        "load_name": "Load 1",
+        "stop_id": "stop-e6806d80-999e-4ea7-a57f-4bf0dc3739e0"
+      }
+    ],
+    "expectedStatus": "In Transit",
+    "expectedCompletedAt": ""
+  }
+]

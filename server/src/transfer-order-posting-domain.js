@@ -99,10 +99,12 @@ export function transferPostingPhysicalStatus(job,evidence) {
   const loads=matching.filter(other=>other.transaction_type==='IF');
   if(!loads.length){return 'waiting_load';}
   if(!matching.some(other=>other.id===job.id)){return job.transaction_type==='IF'?'waiting_load':'waiting_receipt';}
+  if(job.transaction_type==='IF'){return itemQuantities([job]).size ? null : 'waiting_load';}
   const receipts=matching.filter(other=>other.transaction_type==='IR');
   const loaded=itemQuantities(loads),received=itemQuantities(receipts);
-  if(!loaded.size || !receipts.length || [...loaded].some(([item,quantity])=>(received.get(item) || 0)+0.000001<quantity)) {
-    return 'waiting_receipt';
+  if(!received.size){return 'waiting_receipt';}
+  if([...received].some(([item,quantity])=>(loaded.get(item) || 0)+0.000001<quantity)) {
+    return 'waiting_load';
   }
   if(job.transaction_type==='IR' && loads.some(load=>load.status!=='completed'
     || !load.result?.transactions?.length || load.result.transactions.some((/** @type {Record<string,any>} */ transaction)=>
@@ -115,6 +117,9 @@ export function transferPostingPhysicalStatus(job,evidence) {
 export function transferPostingCompletion(job, events) {
   if (!job.operator_record_id) {return null;}
   if (job.snapshot.linkError) {throw invalid(job.snapshot.linkError);}
+  // Yard milestones own ordinary transfers; linked customer deliveries retain
+  // their SO drop-off contract because they have no destination-yard receipt.
+  if (!job.snapshot.driverTarget) {return {id:null};}
   if (job.snapshot.assignmentAmbiguous) {throw invalid('The saved Operator completion has ambiguous dispatch assignments. Review the matching plan and load.');}
   const linked=job.snapshot.driverTarget;
   const refs=(linked?.orderRefs || [job.order_ref]).map((/** @type {unknown} */ ref)=>String(ref).toUpperCase());
@@ -133,9 +138,10 @@ export function transferPostingCompletion(job, events) {
   return matches[0] || null;
 }
 
-/** @param {Record<string,any>} job @param {Record<string,any>} source @param {Record<string,any>} policy @param {Record<string,any>} event */
+/** @param {Record<string,any>} job @param {Record<string,any>} source @param {Record<string,any>} policy @param {Record<string,any>} [event] */
 export function buildTransferPostingDraft(job,source,policy,event) {
-  if(!transferPostingCompletion(job,event.linkedEvents || [event])){throw invalid('Both Operator and Driver completion evidence are required.');}
+  const completion=transferPostingCompletion(job,event?.linkedEvents || (event ? [event] : []));
+  if(!completion){throw invalid('The required Operator or linked delivery completion evidence is missing.');}
   if(source?.sourceOrderKind!=='TO' || !Number.isSafeInteger(Number(source.sourceNetSuiteId)) || Number(source.sourceNetSuiteId)<=0) {
     throw invalid('A valid NetSuite transfer source identity is required.');
   }
@@ -157,7 +163,7 @@ export function buildTransferPostingDraft(job,source,policy,event) {
     functionKey:job.transaction_type==='IF'?'delivery_prep':'receiving',transactionType:job.transaction_type,
     policy,photoRefs:job.snapshot.photos || [],localOrderKeys:[key],
     localOperation:{kind:'transfer_background_posting',orderId:String(job.local_to_id),orderType:'transfer_order'},
-    transferEvidence:{jobId:job.id,operatorRecordId:Number(job.operator_record_id),completionEventId:Number(event.id)},
+    transferEvidence:{jobId:job.id,operatorRecordId:Number(job.operator_record_id),completionEventId:completion.id===null?null:Number(completion.id)},
     ...directTransferDraftEvidence(job),
     targets:[{...source,postingStrategy:'stored_order_line_v1',selectedLines}]});
 }

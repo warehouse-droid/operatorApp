@@ -1,4 +1,5 @@
 import { normalizeSpecialDiscount, specialQuantity } from './special-stock-pricing.js';
+import { normalizePackQuantity } from './order-pack-quantities.js';
 
 export const SPECIAL_LINE_UNITS = ['PLT', 'LYR', 'SEC', 'PCS', 'EACH', 'SQFT'];
 export const SPECIAL_LINE_PACK_FIELDS = ['palletQty', 'layerQty', 'sectionQty', 'pieceQty'];
@@ -15,7 +16,7 @@ export function defaultSpecialLineRequiredDate(today) {
 const invalid = message => Object.assign(new Error(message), { status: 400, code: 'SPECIAL_LINE_FIELD_INVALID' });
 /** @param {Record<string,any>} line @returns {Record<string,any>} */
 export function specialLineFieldValues(line) {
-  return { ...Object.fromEntries(SPECIAL_LINE_SALES_FIELDS.map(field => [field, line[field] ?? (SPECIAL_LINE_PACK_FIELDS.includes(field) || field === 'discountPercent' ? 0 : '')])),
+  return { ...Object.fromEntries(SPECIAL_LINE_SALES_FIELDS.map(field => [field, SPECIAL_LINE_PACK_FIELDS.includes(field) ? normalizePackQuantity(line[field]) : line[field] ?? (field === 'discountPercent' ? 0 : '')])),
     quantity: line.packageQuantity ?? line.quantity, uom: line.rateUom || line.uom || '', rate: line.originalRate ?? line.rate ?? '' };
 }
 /** @param {unknown} value @param {string} field @param {number} maximum */
@@ -36,9 +37,8 @@ export function changedSpecialLineFields(input, before, { sales = false, now = n
     if (!Object.hasOwn(input, field)) continue;
     let value = input[field];
     if (SPECIAL_LINE_PACK_FIELDS.includes(field)) {
-      if (value === '' || value == null) value = 0;
-      if (!['number', 'string'].includes(typeof value) || !Number.isFinite(Number(value)) || Number(value) < 0 || Number(value) > 1e9) throw invalid('PLT, LYR, SEC and PCS must be numbers between 0 and 1000000000.');
-      value = Number(value);
+      try { value = normalizePackQuantity(value); }
+      catch { throw invalid('PLT, LYR, SEC and PCS must be numbers between 0 and 1000000000.'); }
     } else if (field === 'quantity') value = specialQuantity(value);
     else if (field === 'discountPercent') value = normalizeSpecialDiscount(value);
     else if (field === 'uom') {
@@ -65,7 +65,7 @@ const escape = value => String(value ?? '').replace(/[&<>"']/g, char => (/** @ty
  * @param {{sales?:boolean,rateMode?:string,minimumDate?:string,itemLabel?:string,showRequiredDate?:boolean}} [options] */
 export function specialLineFields(line, { sales = true, rateMode = 'required', minimumDate = '', itemLabel = 'Product name *', showRequiredDate = true } = {}) {
   const units = SPECIAL_LINE_UNITS.includes(line.uom) || !line.uom ? SPECIAL_LINE_UNITS : [line.uom, ...SPECIAL_LINE_UNITS];
-  const packing = SPECIAL_LINE_PACK_FIELDS.map((field, index) => `<label><span>${['PLT', 'LYR', 'SEC', 'PCS'][index]}</span><input name="${field}" type="number" min="0" max="1000000000" step="any" value="${escape(line[field])}" /></label>`).join('');
+  const packing = SPECIAL_LINE_PACK_FIELDS.map((field, index) => `<label><span>${['PLT', 'LYR', 'SEC', 'PCS'][index]}</span><input name="${field}" type="number" min="0" max="1000000000" step="any" value="${escape(normalizePackQuantity(line[field]))}" /></label>`).join('');
   const requiredDate = showRequiredDate ? `<label><span>Required date *</span><input name="requiredDate" type="date" ${minimumDate ? `min="${escape(minimumDate)}"` : ''} ${line.requiredDate || minimumDate ? 'required' : ''} value="${escape(line.requiredDate)}" /></label>` : '';
   return `<div class="stock-request-line-fields special-case-initial-grid">
     <div class="special-case-product-row">${(/** @type {Array<[string,string,number]>} */ ([['productName', itemLabel, 500], ['color', 'Colour', 200], ['size', 'Size', 200], ['detailSpec', 'Detail Spec', 2000]])).map(([field, label, max]) => `<label><span>${label}</span>${/[\r\n]/.test(String(line[field] ?? '')) ? `<textarea name="${field}" maxlength="${max}" rows="2" ${field === 'productName' ? 'required' : ''}>${escape(line[field])}</textarea>` : `<input name="${field}" maxlength="${max}" ${field === 'productName' ? 'required' : ''} value="${escape(line[field])}" />`}</label>`).join('')}</div>

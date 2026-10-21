@@ -1,0 +1,20 @@
+[
+  "src/regular-stock-reply-domain.js",
+  "src/regular-stock-replies.js",
+  "src/regular-stock-resolution.js",
+  "src/stock-request-repository.js",
+  "src/regular-stock-purchase-service.js",
+  "src/regular-stock-request-service.js",
+  "public/regular-stock-reply.js",
+  "public/regular-stock-resolution.js",
+  "public/regular-stock-purchase.js",
+  "public/scm-stock-requests.js",
+  "public/sales-stock-requests.js",
+  "public/scm-stock-requests.html",
+  "public/sales-stock-requests.html",
+  "src/regular-stock-line-actions.js",
+  "public/regular-stock-alert.js",
+  "src/regular-stock-purchase-repository.js",
+  "src/regular-stock-waitlist-transition.js",
+  "public/regular-stock-ui.js"
+]

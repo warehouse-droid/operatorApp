@@ -53,6 +53,56 @@ function memoryRepository(candidate = readyCandidate()) {
   };
 }
 
+test('Delivery Prep invalid SO source errors are persisted for Admin without a transform', async()=>{
+  const repository=memoryRepository();
+  const processor=createSalesOrderAutoFulfillmentProcessor({repository,workerId:'test',adapter:{transform:async()=>assert.fail()},
+    fetchLiveOrder:async()=>{throw new Error('Invalid NetSuite Sales Order ID');}});
+  const result=await processor.process('candidate-one');
+  assert.equal(result.status,'attention');
+  assert.match(repository.calls.find(([name])=>name==='attention')[1].error,/Invalid NetSuite Sales Order ID/);
+});
+
+for (const status of ['waiting_evidence', 'discovered']) {
+  test(`unprepared ${status} preserves its reason without any NetSuite or posting call`, async () => {
+    const candidate = readyCandidate({status, sourceSalesOrderId: null, lineSnapshot: [],
+      lastError: 'Operator load evidence is incomplete.'});
+    const repository = memoryRepository(candidate);
+    let remoteCalls = 0;
+    const forbidden = async () => { remoteCalls += 1; throw new Error('Unexpected remote call'); };
+    const processor = createSalesOrderAutoFulfillmentProcessor({repository, workerId:'test',
+      fetchLiveOrder:forbidden, adapter:{hasSplitPlan:forbidden,findByExternalId:forbidden,transform:forbidden}});
+    const result = await processor.process(candidate.id);
+    assert.equal(result.status,status);
+    assert.equal(result.lastError,'Operator load evidence is incomplete.');
+    assert.equal(remoteCalls,0);
+    assert.deepEqual(repository.calls,[]);
+  });
+}
+
+for (const scenario of ['missing record','missing payload','lookup failed']) {
+  test(`explicit recovery ${scenario} never transforms or reconciles from live remaining quantity`, async () => {
+    const candidate=readyCandidate({resolutionAction:'recover',attemptCount:1,
+      payload:{externalId:readyCandidate().externalId,item:{items:[{orderLine:10,quantity:8,itemReceive:true,location:15}]}},
+      liveSnapshot:liveOrder()});
+    if(scenario==='missing payload') candidate.payload={};
+    const repository=memoryRepository(candidate);
+    let transforms=0,liveReads=0;
+    const processor=createSalesOrderAutoFulfillmentProcessor({repository,workerId:'test',
+      fetchLiveOrder:async()=>{liveReads+=1;return liveOrder();},
+      adapter:{findByExternalId:async()=>{if(scenario==='lookup failed')throw new Error('Lookup unavailable');return null;},
+        transform:async()=>{transforms+=1;return {id:9001};},fetchById:async()=>({id:9001}),
+        verify:()=>({id:9001,transactionRef:'IF9001'})}});
+    await processor.process(candidate.id);
+    assert.equal(transforms,0);
+    assert.equal(liveReads,0);
+    assert.equal(repository.calls.some(([name])=>['complete','reconciled','renew'].includes(name)),false);
+    const attention=repository.calls.find(([name])=>name==='attention');
+    assert.ok(attention);
+    assert.equal(attention[1].recoveryRequired,true);
+    assert.match(attention[1].error,/recover|retained|lookup|verif/i);
+  });
+}
+
 test("L9 drift and closed sources stop before any NetSuite transform", async () => {
   for (const [source, expectedCall] of [
     [liveOrder({ closed: true, lines: [] }), "closed"],
@@ -75,6 +125,17 @@ test("L9 drift and closed sources stop before any NetSuite transform", async () 
     assert.equal(transforms, 0);
     assert.equal(repository.calls[0][0], expectedCall);
   }
+});
+
+test('Delivery SO explicitly deselects source billing lines without changing delivered quantities',async()=>{
+ const repository=memoryRepository();let posted;
+ const processor=createSalesOrderAutoFulfillmentProcessor({repository,workerId:'test',
+  fetchLiveOrder:async()=>liveOrder({excludedLines:[{orderLine:11,itemId:4646,location:15}]}),
+  adapter:{findByExternalId:async()=>null,transform:async(_candidate,payload)=>{posted=payload;return {id:9001};},
+   fetchById:async()=>({id:9001}),verify:()=>({id:9001,transactionRef:'IF9001'})}});
+ await processor.process('candidate');
+ assert.deepEqual(posted.item.items,[{orderLine:10,quantity:8,itemReceive:true,location:15},
+  {orderLine:11,itemReceive:false,location:15}]);
 });
 
 test("L10 concurrent workers perform one remote transform and one completion", async () => {

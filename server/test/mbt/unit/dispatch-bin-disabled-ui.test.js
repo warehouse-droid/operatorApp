@@ -25,14 +25,14 @@ test("P3 compatibility: closed BIN gates preserve the established Dispatch order
     /\[\s*"SO"\s*,\s*"PO"\s*,\s*"TO"\s*,\s*"CO"\s*\]\.map\(\(type\)\s*=>/u,
     "The ordinary order-pool tabs must retain their established shape."
   );
-  assert.match(
+  assert.doesNotMatch(
     dispatchSource,
     /mbtBinDispatchEnabled\s*\?\s*`<button[\s\S]{0,500}data-type="BIN"[\s\S]{0,500}:\s*""/u,
-    "The BIN tab must exist only when the capability is confirmed enabled."
+    "BIN assignment belongs on the separate MBT planning page."
   );
 });
 
-test("P3 compatibility: capability discovery and conditional BIN loading follow the ordinary board render", async () => {
+test("Dispatch renders independently without requesting MBT capability or pool data", async () => {
   const declarations = parse(dispatchSource, { ecmaVersion: "latest", sourceType: "script", range: true }).body;
   for (const enabled of [false, true]) {
     const events = [];
@@ -62,10 +62,8 @@ test("P3 compatibility: capability discovery and conditional BIN loading follow 
     }
     await context.initDispatch();
     await new Promise((resolve) => setImmediate(resolve));
-    assert.deepEqual(events, enabled
-      ? ["render", "snapshot", "render", "connected", "capability", "feed", "render"]
-      : ["render", "snapshot", "render", "connected", "capability"]);
-    assert.equal(context.mbtBinDispatchEnabled, enabled);
+    assert.deepEqual(events, ["render", "snapshot", "render", "connected"]);
+    assert.equal(context.mbtBinDispatchEnabled, false);
     if (!enabled) {
       assert.equal(await context.loadMbtBinFrontLegs(), false);
       assert.equal(events.includes("feed"), false, "A disabled BIN gate cannot request the feed, even directly.");

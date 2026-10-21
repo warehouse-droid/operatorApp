@@ -55,11 +55,16 @@
   let specialDocumentActions = () => '';
   /** @type {typeof import('./special-stock-case-status.js').specialPlanningStatus} */
   let specialPlanningStatus = () => '';
+  /** @type {typeof import('./special-stock-case-status.js').specialSupplyWaitingStatus} */
+  let specialSupplyWaitingStatus = () => '';
   let specialClosureStatus = () => '';
   let specialClosureCardAlert = () => '', specialClosureQueueAlert = () => '';
   let compareSpecialScmQueue = (a,b) => Number(Boolean(b.quantityReviewPending)) - Number(Boolean(a.quantityReviewPending));
-  import(new URL('/special-stock-case-status.js?v=20261005-status-following-v1', location.href).href).then(status => {
-    specialPlanningStatus = (detail, compact = false) => status.specialPlanningStatus(detail, compact, { showOrderPreviews: !compact }); specialClosureStatus = status.specialClosureStatus;
+  import(new URL('/special-stock-case-status.js?v=20261016-po-sent-placement-v1&waitingLabels=20261016', location.href).href).then(status => {
+    specialSupplyWaitingStatus = status.specialSupplyWaitingStatus;
+    specialPlanningStatus = (detail, compact = false) => status.specialPlanningStatus(detail, compact, {
+      showOrderPreviews: !compact, purchaseOrderActions: compact ? '' : purchaseSentControls(detail)
+    }); specialClosureStatus = status.specialClosureStatus;
     specialClosureCardAlert = status.specialClosureCardAlert;
     specialClosureQueueAlert = status.specialClosureQueueAlert;
     compareSpecialScmQueue = status.compareSpecialScmQueue;
@@ -134,7 +139,7 @@
     state.requests = window.StockRequestConversation?.order(state.requests) || state.requests;
     if (state.loading && !state.requests.length) return `<div class="stock-request-empty"><strong>Loading Special Item queue…</strong></div>`;
     if (!state.requests.length) return `<div class="stock-request-empty"><strong>No matching cases</strong><span>Sales-submitted Special Item cases appear here.</span></div>`;
-    return state.requests.map((request) => `<button class="stock-request-card ${state.detail?.id === request.id ? "selected" : ""}" data-special-scm-action="select" data-id="${request.id}" type="button"><span class="stock-request-status-line"><strong>${escapeHtml(request.requestRef)}</strong>${pill(request.stage)}</span>${specialPlanningStatus(request, true)}<span>${escapeHtml(request.customerName)} · ${escapeHtml(request.vendorName)}</span><small>${escapeHtml(request.storeName || request.storeLocationId)} · ${request.lines.length} line(s) · ${displayDate(request.updatedAt)}</small>${specialClosureCardAlert(request)}${request.quantityReviewPending ? '<strong class="stock-request-error">Order adjustment · SCM review required</strong>' : ''}${request.readinessAlerts?.length ? `<strong class="stock-request-error">${request.readinessAlerts.length} readiness check(s) due</strong>` : ""}</button>`).join("");
+    return state.requests.map((request) => `<button class="stock-request-card ${state.detail?.id === request.id ? "selected" : ""}" data-special-scm-action="select" data-id="${request.id}" type="button"><span class="stock-request-status-line"><strong>${escapeHtml(request.requestRef)}</strong>${pill(request.stage)}${specialSupplyWaitingStatus(request)}</span>${specialPlanningStatus(request, true)}<span>${escapeHtml(request.customerName)} · ${escapeHtml(request.vendorName)}</span><small>${escapeHtml(request.storeName || request.storeLocationId)} · ${request.lines.length} line(s) · ${displayDate(request.updatedAt)}</small>${specialClosureCardAlert(request)}${request.quantityReviewPending ? '<strong class="stock-request-error">Order adjustment · SCM review required</strong>' : ''}${request.readinessAlerts?.length ? `<strong class="stock-request-error">${request.readinessAlerts.length} readiness check(s) due</strong>` : ""}</button>`).join("");
   }
 
   function canCheckStock(line) {
@@ -175,7 +180,7 @@
     const alert = state.detail.readinessAlerts?.some(item => item.lineId === line.id);
     const html = `<article class="stock-request-line"><header><div><strong>MBBS-Special</strong><p class="special-scm-item-description">${escapeHtml(specialItemDescription(line))}</p><small>${number(line.quantity)} ${escapeHtml(line.uom)}</small></div>${pill(line.salesDecision)}</header>
       <p>${escapeHtml([line.requiredDate ? `Required: ${line.requiredDate}` : '',line.customerNote,`PLT ${line.palletQty ?? '—'} · LYR ${line.layerQty ?? '—'} · SEC ${line.sectionQty ?? '—'} · PCS ${line.pieceQty ?? '—'}`].filter(Boolean).join(' · '))}</p>
-      <p class="stock-live-summary"><span>${specialStockAvailable(line.supplyStatus) ? (line.supplyStatus === 'low_inventory' ? 'Low inventory' : 'Stock ready') : `${line.supplyStatus === 'vendor_transfer' ? 'Wait for Transfer · ' : ''}ETA: ${escapeHtml(specialSupplyEtaLabel(line, 'Not available'))}`} · Pickup: ${escapeHtml(line.vendorYard || 'Awaiting check')}</span>${window.SCMStockCheckLines?.line(state.detail,line) || ''}</p>
+      <p class="stock-live-summary"><span>${specialStockAvailable(line.supplyStatus) ? (line.supplyStatus === 'low_inventory' ? 'Low inventory' : 'Stock ready') : `${line.supplyStatus === 'vendor_transfer' ? 'Wait for Transfer · ' : line.supplyStatus === 'production' ? 'Waiting for Production · ' : ''}ETA: ${escapeHtml(specialSupplyEtaLabel(line, 'Not available'))}`} · Pickup: ${escapeHtml(line.vendorYard || 'Awaiting check')}</span>${window.SCMStockCheckLines?.line(state.detail,line) || ''}</p>
       ${alert ? '<div class="stock-request-notice stock-request-error" role="status">Readiness check due. This alert stays active until SCM confirms stock is ready.</div>' : ''}
       ${line.salesCustomerNote || line.salesDecisionReason ? `<p>Sales: ${escapeHtml(line.salesCustomerNote || line.salesDecisionReason)}</p>` : ''}${responseForm(line)}</article>`;
     return window.SCMRequestLineVisibility?.wrap(state.detail, line, html) || html;
@@ -191,6 +196,15 @@
     return '<label style="max-width:22rem"><span>Manual PO link</span><input name="purchaseOrderRef" maxlength="120" placeholder="Existing synced PO number" style="width:100%" /><small>Link the order number without comparing request or order details.</small></label><button type="submit" data-special-link-po formnovalidate>Link PO</button>';
   }
 
+  /** @param {any} detail */
+  function purchaseSentControls(detail) {
+    if (!detail.purchaseOrderId || detail.informationRequest?.status === 'pending' || detail.quantityReviewPending
+        || ['closed','completed'].includes(detail.stage) || detail.closeStatus === 'closure_pending') return '';
+    if (detail.purchaseOrderSentToVendorAt) return '<p role="status">PO sent to vendor</p>';
+    if (detail.stage === 'dispatch_arrangement') return '';
+    return '<form data-special-po-sent-form><button type="submit">PO Sent to Vendor</button></form>';
+  }
+
   function orderControls(detail) {
     const waitingForStock = detail.lines.some(line => line.salesDecision === 'accepted' && !specialStockAvailable(line.supplyStatus));
     const manualControls = manualPurchaseLinkControls(detail);
@@ -200,7 +214,7 @@
     if (detail.quantityReviewPending) return `<p>PO creation waits for the order adjustment review above.</p>${manualForm}`;
     if (!detail.salesOrderId && !detail.salesOrderSkipped) return `<div class="stock-request-notice">Sales can create the SO after the customer confirms the available stock or accepts the ETA.</div>
       ${manualForm}${detail.lines.every(line => line.supplyStatus === 'no_stock' && !line.availableDate) ? `<form data-special-scm-close-form><label>Closure reason<input name="reason" required /></label><button class="danger" type="submit">Close request — no stock or ETA</button></form>` : ''}`;
-    if (detail.purchaseOrderId || detail.purchaseOrderSkipped) return `<section><h3>${detail.purchaseOrderSkipped ? 'PO creation skipped (test)' : 'Purchase Order'}</h3><p>${detail.salesOrderSkipped ? 'SO creation skipped (test) · ' : ''}${detail.purchaseOrderApproved === false ? 'Waiting for NetSuite PO approval' : waitingForStock ? 'Waiting for SCM readiness confirmation' : detail.fulfillmentMethod === 'vendor_pickup' ? 'Customer pickup at vendor yard' : 'Dispatch Arrangement'}</p>${detail.purchaseOrderCustomLinkage ? '<p>Custom PO linkage: SO and PO details are independent. SO descriptions stay unchanged. Arrange this PO via the yard before SO delivery.</p>' : ''}</section>`;
+    if (detail.purchaseOrderId || detail.purchaseOrderSkipped) return `<section><h3>${detail.purchaseOrderSkipped ? 'PO creation skipped (test)' : 'Purchase Order'}</h3><p>${detail.salesOrderSkipped ? 'SO creation skipped (test) · ' : ''}${detail.stage === 'waiting_vendor_confirmation' ? 'Waiting Vendor Confirmation' : detail.purchaseOrderApproved === false ? 'Waiting for NetSuite PO approval' : waitingForStock ? 'Waiting for SCM readiness confirmation' : detail.fulfillmentMethod === 'vendor_pickup' ? 'Customer pickup at vendor yard' : detail.stage === 'dispatch_arrangement' ? 'Dispatch Arrangement' : 'PO linked'}</p>${detail.purchaseOrderCustomLinkage ? '<p>Custom PO linkage: SO and PO details are independent. SO descriptions stay unchanged. Arrange this PO via the yard before SO delivery.</p>' : ''}</section>`;
     const independentPurchase = detail.salesOrderSource === 'manual_link';
     if (!detail.salesOrderApproved && !independentPurchase) return `<section><h3>SO approval pending</h3><p>NetSuite status updates automatically.</p></section>${manualForm}`;
     const retry = detail.purchaseOrderOperationStatus === 'attention' && Boolean(detail.purchaseOrderSubmissionStartedAt);
@@ -212,7 +226,7 @@
       })) : [...detail.purchaseOrderLines];
     const pallet = purchaseLines.find(line => line.itemId === 1784);
     const palletQuantity = pallet?.quantity ?? detail.vendorDiscountReview?.pallet?.quantity ?? detail.palletTotal ?? 0;
-    return `<section class="stock-request-section"><h3>Review and create Purchase Order</h3><p>${detail.salesOrderSkipped ? 'SO creation skipped for testing. Use Skip PO Creation to continue the test.' : independentPurchase ? 'Review the request materials and vendor costs below to create a standalone NetSuite PO. The linked SO stays unchanged.' : 'The reviewed quantity, UOM and description will update the SO first, then create a standalone NetSuite PO for this request. Sales prices remain unchanged.'}</p>
+    return `<section class="stock-request-section"><h3>Review and create Purchase Order</h3><p>${detail.salesOrderSkipped ? 'SO creation skipped for testing. Use Skip PO Creation to continue the test.' : (independentPurchase || detail.localAdjustedAt) ? 'Review the request materials and vendor costs below to create a standalone NetSuite PO. The linked SO stays unchanged.' : 'The reviewed quantity, UOM and description will update the SO first, then create a standalone NetSuite PO for this request. Sales prices remain unchanged.'}</p>
       <form data-special-po-form><fieldset ${retry ? 'disabled' : ''} style="border:0;padding:0">
       ${purchaseLines.filter(line => !line.ancillary).map(line => `<article class="stock-request-line" data-special-po-line="${line.caseLineId}"><strong>MBBS-Special</strong><div class="stock-request-line-fields">
         <label class="stock-request-wide"><span>Order description *</span><input name="description" required value="${escapeHtml(line.description)}" /></label>
@@ -473,7 +487,7 @@
 
   mount.addEventListener('submit', async event => {
     const form = /** @type {HTMLFormElement} */ (event.target);
-    if (!form.matches('[data-special-information-request-form], [data-special-stock-check-form], [data-special-po-routing-form], [data-special-po-form], [data-special-scm-close-form], [data-special-quantity-review-form], [data-special-closure-review-form]')) return;
+    if (!form.matches('[data-special-information-request-form], [data-special-stock-check-form], [data-special-po-routing-form], [data-special-po-form], [data-special-po-sent-form], [data-special-scm-close-form], [data-special-quantity-review-form], [data-special-closure-review-form]')) return;
     event.preventDefault();
     if (state.busy) return;
     state.busy = true; state.error = '';
@@ -500,6 +514,8 @@
           if (requiresSupplyEta(fields.supplyStatus) && !eta) throw new Error('Enter an ETA for stock awaiting supply.');
           return { ...fields, ...line, availableDate: eta, availabilityMode: fields.supplyStatus === 'vendor_transfer' ? 'so_placement' : eta ? 'dated' : 'no_projection' };
         });
+      } else if (form.matches('[data-special-po-sent-form]')) {
+        path = 'purchase-order/sent-to-vendor';
       } else if (form.matches('[data-special-po-routing-form]')) {
         await poRoutingReady;
         const routing = state.poRouting;

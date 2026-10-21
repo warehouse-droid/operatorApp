@@ -1,3 +1,5 @@
+import {specialSalesReps} from '../../../src/special-stock-sales-reps.js';
+const originalRepSelection=specialSalesReps.select;
 import assert from "node:assert/strict";
 import crypto from "node:crypto";
 import test, { after, before } from "node:test";
@@ -40,6 +42,7 @@ async function login(username) {
 }
 
 before(async () => {
+  specialSalesReps.select=async id=>{assert.equal(Number(id),123);return {id:123,name:"TEST Selected Rep"};};
   originalPublicSalesEnabled = (await getSalesPortalSettings({ fresh: true })).enabled;
   await updateSalesPortalSettings({ enabled: false }, null);
   originalGate = (await query(
@@ -80,6 +83,7 @@ before(async () => {
 });
 
 after(async () => {
+  specialSalesReps.select=originalRepSelection;
   if (originalGate) {
     await query(
       `UPDATE mbt_feature_flags SET enabled = $1, revision = $2
@@ -128,6 +132,7 @@ test("HTTP workflow is fail-closed, role-separated, and keeps SCM costs private"
     token: tokens.get("sales"),
     method: "POST",
     body: {
+      salesRepId: 123,
       storeLocationId: 15,
       fulfillmentMethod: "yard_pickup",
       inquiryDate: "2099-08-21",

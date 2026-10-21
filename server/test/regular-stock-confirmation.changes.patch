@@ -1,0 +1,241 @@
+--- a/server/src/regular-stock-domain.js
++++ b/server/src/regular-stock-domain.js
+@@ -75,7 +75,12 @@
+       && cleanUom(candidate.uom) === cleanUom(lines[0].salesUom)
+       && (!selected || Number(candidate.remoteLineId) === Number(selected)));
+     const exact=matches.filter(candidate=>sameQty(candidate.quantity,quantity));
+-    const candidates=sameQty(matches.reduce((sum,line)=>sum+Number(line.quantity),0),quantity)?matches:exact.length===1?exact:[];
++    const matchedQuantity=matches.reduce((sum,line)=>sum+Number(line.quantity),0);
++    const candidates=sameQty(matchedQuantity,quantity)?matches:exact.length===1?exact:[];
++    if (!candidates.length && matches.length && !exact.length) {
++      const unit=lines[0].salesUom ? ` ${lines[0].salesUom}` : '';
++      mismatch(`Quantity mismatch for ${lines[0].itemName || lines[0].itemId}: the stock request approves ${quantity}${unit}, but ${salesOrder.ref || 'the SO'} has ${matchedQuantity}${unit}. Quantities must match before linking the SO.`);
++    }
+     if (!candidates.length) mismatch(`Select the exact open SO line for ${lines[0].itemName || lines[0].itemId} with quantity ${quantity}.`);
+     for(const candidate of candidates){
+       if (Number(candidate.locationId) !== Number(request.destinationLocationId) || used.has(candidate.remoteLineId)) mismatch('Matched SO lines must still be at your Sales location.');
+--- a/server/src/regular-stock-handoff.js
++++ b/server/src/regular-stock-handoff.js
+@@ -7,6 +7,7 @@
+ import { readRegularStockSalesOrderFromNetSuite, applyRegularStockSalesOrderLocationInNetSuite, createTransferOrderInNetSuite, fetchDeliveryOrderFromNetSuite, fetchDeliveryOrderDetailsFromNetSuite } from './netsuite.js';
+ import { upsertSalesOrders, upsertSalesOrderLines } from './order-sync-repository.js';
+ import { createOrderDependency } from './order-dependency-repository.js';
++import {describeRegularStockAction,regularStockConfirmationToken,requireRegularStockConfirmation} from './regular-stock-confirmation.js';
+ 
+ async function hydrateOrder(order) {
+   const header = await fetchDeliveryOrderFromNetSuite(order.id);
+@@ -30,6 +31,7 @@
+       const request = await getScmStockRequest(id);
+       if (request.lines.some(line => !['approved','rejected','cancelled'].includes(line.status))) throw regularError('Finish all SCM decisions before entering the SO.');
+       const plan = { ...planRegularStockRouting({ request, salesOrder: order, selectedLineIds: input.selectedLineIds || {} }), order };
++      requireRegularStockConfirmation(id,plan,input.confirmationToken);
+       await query('SELECT pg_advisory_xact_lock(hashtextextended($1,0))',[`regular-stock-so:${order.id}`]);
+       for (const remoteLineId of plan.materialLineIds) {
+         const owner = await query('SELECT request_id FROM regular_stock_so_line_owners WHERE sales_order_id=$1 AND remote_line_id=$2',[order.id,remoteLineId]);
+@@ -38,13 +40,15 @@
+       }
+       handoff = (await query(`INSERT INTO regular_stock_handoffs(request_id,sales_order_id,sales_order_ref,plan)
+         VALUES($1,$2,$3,$4::jsonb) RETURNING *`,[id,order.id,order.ref,JSON.stringify(plan)])).rows[0];
++    } else if(handoff.status!=='complete') {
++      requireRegularStockConfirmation(id,handoff.plan,input.confirmationToken);
+     }
+     if (handoff.sales_order_ref.toLowerCase() !== ref.toLowerCase()) throw regularError('This request is already linked to a different SO.');
+     if (handoff.status === 'complete') return handoff;
+     const attemptId = randomUUID();
+     await query(`UPDATE regular_stock_handoffs SET status='executing',attempt_id=$2,lease_until=now()+interval '15 minutes',error=NULL,updated_at=now() WHERE request_id=$1`,[id,attemptId]);
+     await query(`UPDATE sales_stock_requests SET regular_details=regular_details||$2::jsonb,revision=revision+1,updated_at=now() WHERE id=$1`,
+-      [id,JSON.stringify({salesOrderId:Number(handoff.sales_order_id),salesOrderRef:handoff.sales_order_ref,handoffStatus:'executing',handoffError:null,routingMode:handoff.plan.mode})]);
++      [id,JSON.stringify({salesOrderId:Number(handoff.sales_order_id),salesOrderRef:handoff.sales_order_ref,handoffStatus:'executing',handoffError:null,routingMode:handoff.plan.mode,routingAction:describeRegularStockAction(handoff.plan)})]);
+     return {...handoff,status:'executing',attempt_id:attemptId};
+   });
+ }
+@@ -107,9 +111,13 @@
+       WHERE request_id=$1 AND attempt_id=$2 RETURNING request_id`,[id,handoff.attempt_id]);
+     if(!saved.rowCount)throw regularError('The SO handoff was taken over by another attempt.');
+     if(handoff.plan.mode==='location') await query(`UPDATE sales_stock_request_lines SET status='fulfilled',updated_at=now() WHERE request_id=$1 AND regular_decision IN ('stock','po')`,[id]);
+-    await query(`UPDATE sales_stock_requests SET regular_details=regular_details||'{"handoffStatus":"complete","handoffError":null}'::jsonb,
+-      status=CASE WHEN $2 THEN 'completed' ELSE 'active' END,revision=revision+1,updated_at=now() WHERE id=$1`,[id,handoff.plan.mode==='location']);
+-    await recordStockRequestEvent({requestId:Number(id),eventType:'regular_so_handoff_complete',actorId:context.operatorId,details:{mode:handoff.plan.mode,salesOrderRef:handoff.sales_order_ref}});
++    const request=await getScmStockRequest(id);
++    const result={handoffStatus:'complete',handoffError:null,routingAction:describeRegularStockAction(handoff.plan),
++      routingCompletedAt:new Date().toISOString(),routingTransfers:request.transfers.filter(transfer=>transfer.netsuiteTransferOrderRef)
++        .map(transfer=>({reference:transfer.netsuiteTransferOrderRef,sourceName:transfer.sourceName,destinationName:transfer.destinationName}))};
++    await query(`UPDATE sales_stock_requests SET regular_details=regular_details||$3::jsonb,
++      status=CASE WHEN $2 THEN 'completed' ELSE 'active' END,revision=revision+1,updated_at=now() WHERE id=$1`,[id,handoff.plan.mode==='location',JSON.stringify(result)]);
++    await recordStockRequestEvent({requestId:Number(id),eventType:'regular_so_handoff_complete',actorId:context.operatorId,details:{mode:handoff.plan.mode,salesOrderRef:handoff.sales_order_ref,...result}});
+   });
+ }
+ 
+@@ -171,6 +179,12 @@
+ export async function previewRegularStockSalesOrder(id,input,context,{readOrder=readRegularStockSalesOrderFromNetSuite}={}){
+   const request=await getSalesStockRequest(id,context);
+   if(request.workflowVersion!==2||request.lines.some(line=>line.status==='submitted'))throw regularError('Finish all SCM decisions before entering the SO.');
++  const existing=(await query('SELECT * FROM regular_stock_handoffs WHERE request_id=$1',[id])).rows[0];
++  if(existing){
++    if(input.salesOrderRef && existing.sales_order_ref.toLowerCase()!==String(input.salesOrderRef).trim().toLowerCase())throw regularError('This request is already linked to a different SO.');
++    return {salesOrderRef:existing.sales_order_ref,choices:[],action:describeRegularStockAction(existing.plan),
++      confirmationToken:regularStockConfirmationToken(id,existing.plan),resuming:true};
++  }
+   const order=await readOrder(input.salesOrderRef);
+   if(order.locationId!==request.destinationLocationId)throw regularError('The SO must be created at your Sales location.','REGULAR_SO_MISMATCH');
+   const choices=[];
+@@ -178,7 +192,9 @@
+   for(const itemId of items){
+     const quantity=request.lines.filter(line=>line.itemId===itemId&&['stock','po'].includes(line.decision)).reduce((sum,line)=>sum+line.salesQty,0);
+     const matches=order.lines.filter(line=>!line.ancillary&&line.open&&line.itemId===itemId&&Math.abs(line.quantity-quantity)<1e-6);
+-    if(matches.length>1)choices.push({itemId,itemName:matches[0].itemName,lines:matches.map(line=>({id:line.remoteLineId,quantity:line.quantity,uom:line.uom}))});
+-  }
+-  return {salesOrderRef:order.ref,choices};
+-}
++    if(matches.length>1&&!input.selectedLineIds?.[itemId])choices.push({itemId,itemName:matches[0].itemName,lines:matches.map(line=>({id:line.remoteLineId,quantity:line.quantity,uom:line.uom}))});
++  }
++  if(choices.length)return {salesOrderRef:order.ref,choices};
++  const plan={...planRegularStockRouting({request,salesOrder:order,selectedLineIds:input.selectedLineIds || {}}),order};
++  return {salesOrderRef:order.ref,choices:[],action:describeRegularStockAction(plan),confirmationToken:regularStockConfirmationToken(id,plan)};
++}
+--- a/server/public/regular-stock-ui.js
++++ b/server/public/regular-stock-ui.js
+@@ -3,6 +3,13 @@
+   const esc = value => String(value ?? '').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+   const number = value => value == null ? t('Unavailable','暂无数据') : new Intl.NumberFormat('en-CA',{maximumFractionDigits:4}).format(value);
+   const decision = value => ({stock:t('Approved · TO / location change','已批准 · 调货 / 更改地点'),po:t('Approved · source replenishment PO','已批准 · 原货场采购补货'),reject:t('Rejected','已拒绝')})[value] || '';
++  function apiError(payload,status) {
++    const message=[payload?.error?.message,payload?.message,payload?.error,payload]
++      .find(value=>typeof value==='string' && value.trim() && value!=='[object Object]');
++    const error=new Error(message || `Request failed (${status}). Please try again.`);
++    error.status=status;error.code=payload?.error?.code || payload?.code || '';
++    return error;
++  }
+   function fields(composer) {
+     if(composer.workflowVersion !== 2)return '';
+     return `<div class="stock-request-line-fields regular-stock-fields">
+@@ -31,13 +38,34 @@
+     const labels=[[t('Available','可用库存'),e.availableQuantity],[t('Requested (all matching lines)','申请数量（相同货品合计）'),e.groupedRequestedQuantity],[t('Safety stock required','所需安全库存'),e.safetyQuantity],[t('After shipment','发货后库存'),e.remainingQuantity],[t('Below safety by','低于安全库存'),e.shortfallQuantity]];
+     return `<div class="regular-stock-safety" aria-label="${t('Safety stock review','安全库存审核')}">${labels.map(([label,value])=>`<span><small>${label}</small><strong>${number(value)} ${esc(e.unit||line.salesUom)}</strong></span>`).join('')}</div>${e.reasons?.includes('policy_unavailable')?`<p class="stock-request-notice">${t('Safety or availability evidence is unavailable. SCM must review this line.','安全库存或可用库存数据不足，须 SCM 人工审核此行。')}</p>`:''}${line.decision?`<p><strong>${decision(line.decision)}</strong></p>`:''}`;
+   }
++  function actionText(action,completed=false) {
++    if(action.mode==='location')return completed
++      ? t(`${action.salesOrderRef}: Item line locations were changed to ${action.sourceName}.`,`${action.salesOrderRef}：商品行地点已更改为 ${action.sourceName}。`)
++      : t(`${action.salesOrderRef}: Change all ${action.lineCount} item line locations from ${action.destinationName} to ${action.sourceName}, including PALLET, discount, subtotal and delivery fee lines where present.`,`${action.salesOrderRef}：将全部 ${action.lineCount} 个商品行地点从 ${action.destinationName} 更改为 ${action.sourceName}，包括托盘、折扣、小计及送货费行（如有）。`);
++    const routes=(action.routes||[]).map(route=>`${route.sourceName} → ${route.destinationName}`).join('; ');
++    return completed
++      ? t(`${action.salesOrderRef}: Transfer Orders were issued to your sales yard ${action.destinationName}. ${routes}`,`${action.salesOrderRef}：调货单已开立至您的销售货场 ${action.destinationName}。${routes}`)
++      : t(`${action.salesOrderRef}: Issue ${action.routes.length} Transfer Orders for the approved stock: ${routes}.`,`${action.salesOrderRef}：为已批准的库存开立 ${action.routes.length} 张调货单：${routes}。`);
++  }
++  function confirmationMessage(action,resuming=false) {
++    return `${resuming?t('Resume this action; existing orders will be reused.','继续处理此操作；将沿用现有订单。')+'\n\n':''}${actionText(action)}\n\n${t('Confirm to proceed, or Cancel to leave the request unchanged.','确认后执行，或取消以保持申请不变。')}`;
++  }
++  function completedAction(request) {
++    const r=request.regular, transfers=r.routingTransfers || (request.transfers||[]).filter(row=>row.netsuiteTransferOrderRef)
++      .map(row=>({reference:row.netsuiteTransferOrderRef,sourceName:row.sourceName,destinationName:row.destinationName}));
++    const action=r.routingAction || {mode:r.routingMode,salesOrderRef:r.salesOrderRef,sourceName:request.lines.find(line=>['stock','po'].includes(line.decision))?.sourceName || '—',
++      destinationName:request.destinationName || '—',routes:transfers};
++    return `<section class="stock-request-notice regular-stock-result"><strong>${t('SO handoff complete.','销售订单处理完成。')}</strong><p>${esc(actionText(action,true))}</p>
++      ${transfers.map(row=>`<p>${esc(row.reference)} · ${esc(row.sourceName)} → ${esc(row.destinationName)}</p>`).join('')}
++      ${r.routingCompletedAt?`<small>${t('Completed','完成时间')}: ${esc(window.MBBS_I18N?.displayDateTime?.(r.routingCompletedAt)||r.routingCompletedAt)}</small>`:''}</section>`;
++  }
+   function salesOrder(request,saving) {
+     if(request?.workflowVersion!==2)return '';
+     const r=request.regular||{};
+-    if(r.handoffStatus==='complete')return `<p class="stock-request-notice">${t('SO handoff complete.','销售订单处理完成。')} ${r.routingMode==='location'?t('Material line locations were changed to the source yard.','商品行地点已更改为出货场。'):t('Transfer Orders were created to your sales yard.','已创建调货单至您的销售货场。')}</p>`;
++    if(r.handoffStatus==='complete')return completedAction(request);
+     if(request.lines.some(line=>line.status==='submitted'))return `<p class="stock-request-notice">${t('Waiting for SCM to finish reviewing all lines before entering the SO number.','待 SCM 审核所有商品行后，请输入销售订单号。')}</p>`;
+     if(!request.lines.some(line=>['stock','po'].includes(line.decision)))return '';
+-    return `<section class="stock-request-section regular-stock-so"><h3>${t('Sales Order','销售订单')}</h3><p>${t('Create the SO at your own sales yard, then enter its number. The approved routing will be applied automatically.','请在您的销售货场建立销售订单，再输入订单号，系统将自动执行已批准的调货安排。')}</p><label><span>${t('SO number','销售订单号')}</span><input data-regular-so maxlength="80" value="${esc(r.salesOrderRef||r.soInput)}" ${r.salesOrderRef?'readonly':''} /></label>${(r.soChoices||[]).map(choice=>`<label><span>${esc(choice.itemName||choice.itemId)} · ${t("Select SO line","选择销售订单行")}</span><select data-regular-so-line="${choice.itemId}">${choice.lines.map(line=>`<option value="${line.id}">${line.id} · ${number(line.quantity)} ${esc(line.uom)}</option>`).join('')}</select></label>`).join('')}<button class="primary" data-sales-stock-action="link-so" type="button" ${saving?'disabled':''}>${saving?t('Processing…','处理中…'):r.salesOrderRef?t('Retry / check progress','重试 / 查看进度'):t('Apply approved routing','执行已批准的安排')}</button></section>`;
++    return `<section class="stock-request-section regular-stock-so"><h3>${t('Sales Order','销售订单')}</h3><p>${t('Create the SO at your own sales yard, then enter its number. Review and confirm the planned action before it is processed.','请在您的销售货场建立销售订单，再输入订单号，请先查看并确认将执行的操作。')}</p><label><span>${t('SO number','销售订单号')}</span><input data-regular-so maxlength="80" value="${esc(r.salesOrderRef||r.soInput)}" ${r.salesOrderRef?'readonly':''} /></label>${(r.soChoices||[]).map(choice=>`<label><span>${esc(choice.itemName||choice.itemId)} · ${t("Select SO line","选择销售订单行")}</span><select data-regular-so-line="${choice.itemId}">${choice.lines.map(line=>`<option value="${line.id}">${line.id} · ${number(line.quantity)} ${esc(line.uom)}</option>`).join('')}</select></label>`).join('')}<button class="primary" data-sales-stock-action="link-so" type="button" ${saving?'disabled':''}>${saving?t('Processing…','处理中…'):r.salesOrderRef?t('Retry / check progress','重试 / 查看进度'):t('Review SO routing','查看订单安排')}</button></section>`;
+   }
+   async function normalize(composer,root) {
+     if(!composer?.arrivalDate||!composer?.arrivalTime)return;
+@@ -47,5 +75,5 @@
+     for(const key of ['arrivalDate','arrivalTime']) {const input=root.querySelector(`[data-regular-field="${key}"]`);if(input){input.value=composer[key];input.setCustomValidity('');}}
+     return arrival;
+   }
+-  window.RegularStockUI={t,esc,number,decision,fields,summary,safety,salesOrder,normalize};
++  window.RegularStockUI={t,esc,number,decision,fields,summary,safety,salesOrder,normalize,confirmationMessage,apiError};
+ })();
+--- a/server/public/sales-stock-requests.js
++++ b/server/public/sales-stock-requests.js
+@@ -142,10 +142,7 @@
+   const contentType = response.headers.get("content-type") || "";
+   const payload = contentType.includes("application/json") ? await response.json() : await response.text();
+   if (!response.ok) {
+-    const error = new Error(payload?.error || payload || `Request failed (${response.status})`);
+-    error.status = response.status;
+-    error.code = payload?.code || "";
+-    throw error;
++    throw window.RegularStockUI.apiError(payload,response.status);
+   }
+   return payload;
+ }
+@@ -900,18 +897,21 @@
+       const request=salesStockState.detail;
+       const salesOrderRef=salesStockRequestApp.querySelector('[data-regular-so]')?.value.trim();
+       const selectedLineIds=Object.fromEntries([...salesStockRequestApp.querySelectorAll('[data-regular-so-line]')].map(input=>[input.dataset.regularSoLine,Number(input.value)]));
+-      salesStockState.saving=true;button.disabled=true;
++      salesStockState.saving=true;salesStockState.error='';button.disabled=true;
++      request.regular.soInput=salesOrderRef;
++      let attempted=false,completed=false;
+       try{
+-        if(!request.regular.salesOrderRef&&!Object.keys(selectedLineIds).length){
+-          const preview=await salesStockApi(`/api/sales/stock-requests/${request.id}/sales-order/preview`,{method:'POST',body:JSON.stringify({salesOrderRef})});
+-          if(preview.choices.length){
+-            request.regular.soChoices=preview.choices;request.regular.soInput=salesOrderRef;
+-            return;
+-          }
+-        }
+-        const saved=await salesStockApi(`/api/sales/stock-requests/${request.id}/sales-order`,{method:'POST',body:JSON.stringify({salesOrderRef,selectedLineIds,expectedRevision:request.revision})});
+-        salesStockState.bucket=saved.bucket;await salesStockLoad({preserveSelection:true});
+-      }finally{salesStockState.saving=false;if(!request.regular.soChoices)await salesStockLoadDetail(request.id);renderSalesStockRequests();}
++        const preview=await salesStockApi(`/api/sales/stock-requests/${request.id}/sales-order/preview`,{method:'POST',body:JSON.stringify({salesOrderRef,selectedLineIds})});
++        if(preview.choices.length){request.regular.soChoices=preview.choices;return;}
++        if(!confirm(window.RegularStockUI.confirmationMessage(preview.action,preview.resuming)))return;
++        attempted=true;
++        const saved=await salesStockApi(`/api/sales/stock-requests/${request.id}/sales-order`,{method:'POST',body:JSON.stringify({salesOrderRef,selectedLineIds,expectedRevision:request.revision,confirmationToken:preview.confirmationToken})});
++        completed=true;salesStockState.bucket=saved.bucket;await salesStockLoad({preserveSelection:true});
++      }finally{
++        salesStockState.saving=false;
++        if(attempted&&!completed){await salesStockLoadDetail(request.id);salesStockState.detail.regular.soInput=salesOrderRef;}
++        renderSalesStockRequests();
++      }
+       return;
+     }
+     if (action === "edit") return salesStockStartEdit();
+--- a/server/public/sales-stock-requests.html
++++ b/server/public/sales-stock-requests.html
+@@ -14,8 +14,8 @@
+     <script src="/app-sidebar.js?v=20260928-enhancements-v1&regular=20260929"></script>
+     <script src="/dispatch-auth.js?v=20260811-stock-request-private-v1"></script>
+     <script src="/delivery-instruction-upload.js?v=20260812-delivery-image-720p-v1"></script>
+-    <script src="/regular-stock-ui.js?v=20260929"></script>
+-  <script src="/sales-stock-requests.js?v=20260927-yard-layout-v1&regular=20260929"></script>
++    <script src="/regular-stock-ui.js?v=20260929-confirmation-v2"></script>
++  <script src="/sales-stock-requests.js?v=20260927-yard-layout-v1&regular=20260929-confirmation-v2"></script>
+     <script src="/sales-special-stock-requests.js?v=20260928-enhancements-v1"></script>
+   </body>
+ </html>
+--- a/server/src/regular-stock-confirmation.js
++++ b/server/src/regular-stock-confirmation.js
+@@ -0,0 +1,23 @@
++import {createHash} from 'node:crypto';
++import {STOCK_REQUEST_YARDS} from './stock-request-domain.js';
++import {regularError} from './regular-stock-domain.js';
++
++const yardName=id=>STOCK_REQUEST_YARDS.find(yard=>yard.locationId===Number(id))?.yardCode || String(id);
++// Canonical keys keep a saved JSON plan and a fresh preview comparable.
++const canonical=value=>value instanceof Date?value.toISOString():Array.isArray(value)?value.map(canonical):value && typeof value==='object'
++  ? Object.fromEntries(Object.keys(value).sort().filter(key=>value[key]!==undefined).map(key=>[key,canonical(value[key])])) : value;
++export function regularStockConfirmationToken(requestId,plan) {
++  return createHash('sha256').update(JSON.stringify(canonical({requestId:Number(requestId),plan}))).digest('hex');
++}
++export function requireRegularStockConfirmation(requestId,plan,token) {
++  if(!token)throw regularError('Review and confirm the SO routing before proceeding.','REGULAR_CONFIRMATION_REQUIRED');
++  if(token!==regularStockConfirmationToken(requestId,plan))throw regularError('The SO or routing changed. Review the updated action and confirm again.','REGULAR_CONFIRMATION_CHANGED');
++}
++export function describeRegularStockAction(plan) {
++  return {mode:plan.mode,salesOrderRef:plan.salesOrderRef,sourceLocationId:plan.sourceLocationId,
++    sourceName:plan.mode==='location'?yardName(plan.sourceLocationId):null,
++    destinationLocationId:plan.order.locationId,destinationName:yardName(plan.order.locationId),
++    lineCount:plan.order.lines.length,
++    routes:plan.groups.map(group=>({sourceLocationId:group.sourceLocationId,sourceName:yardName(group.sourceLocationId),
++      destinationLocationId:group.destinationLocationId,destinationName:yardName(group.destinationLocationId)}))};
++}

@@ -93,6 +93,8 @@ const context = vm.createContext({
 });
 
 const source = readPublic("scm-smart-vendor.js");
+vm.runInContext(readPublic("scm-smart-line-order-core.js"), context);
+vm.runInContext(readPublic("scm-smart-line-order.js"), context);
 vm.runInContext(source, context, { filename: "scm-smart-vendor.js" });
 
 const heldLine = {

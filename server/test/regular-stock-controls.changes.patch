@@ -1,0 +1,830 @@
+--- a/server/src/regular-stock-domain.js
++++ b/server/src/regular-stock-domain.js
+@@ -20,8 +20,8 @@
+ /** @param {number} a @param {number} b */
+ const sameQty = (a, b) => Math.abs(Number(a) - Number(b)) <= 1e-6;
+ 
+-/** @param {{lines?:RegularLine[],policies?:StockPolicy[],arrivalAt:string|number|Date,leadHours?:number,now?:string|number|Date}} input */
+-export function evaluateRegularStockApproval({ lines = [], policies = [], arrivalAt, leadHours = 5, now = new Date() }) {
++/** @param {{lines?:RegularLine[],policies?:StockPolicy[],arrivalAt:string|number|Date,leadHours?:number,autoApprovalEnabled?:boolean,now?:string|number|Date}} input */
++export function evaluateRegularStockApproval({ lines = [], policies = [], arrivalAt, leadHours = 5, autoApprovalEnabled = true, now = new Date() }) {
+   const hours = normalizeRegularLeadHours(leadHours);
+   const nowMs = new Date(now).getTime(), arrivalMs = new Date(arrivalAt).getTime();
+   if (!Number.isFinite(nowMs) || !Number.isFinite(arrivalMs)) throw regularError('A valid arrival instant is required.', 'REGULAR_ARRIVAL_INVALID', 400);
+@@ -43,10 +43,23 @@
+     return { lineId: Number(line.id), itemId: Number(line.itemId), sourceLocationId: Number(line.sourceLocationId),
+       requestedQuantity: Number(line.salesQty), groupedRequestedQuantity: requested, availableQuantity: available,
+       safetyQuantity: safety, remainingQuantity: remaining, shortfallQuantity: known ? Math.max(0, Number(safety) - Number(remaining)) : null,
+-      unit: line.salesUom, stockEligible: safe, reasons: [...(!known ? ['policy_unavailable'] : !safe ? ['below_safety'] : []), ...(!enoughTime ? ['short_lead_time'] : [])] };
++      unit: line.salesUom, stockEligible: safe, reasons: [...(!autoApprovalEnabled ? ['auto_approval_disabled'] : []), ...(!known ? ['policy_unavailable'] : !safe ? ['below_safety'] : []), ...(!enoughTime ? ['short_lead_time'] : [])] };
+   });
+-  return { automatic: evidence.length > 0 && enoughTime && evidence.every(line => line.stockEligible), leadHours: hours,
++  return { automatic: autoApprovalEnabled && evidence.length > 0 && enoughTime && evidence.every(line => line.stockEligible), autoApprovalEnabled, leadHours: hours,
+     evaluatedAt: new Date(nowMs).toISOString(), arrivalAt: new Date(arrivalMs).toISOString(), enoughTime, lines: evidence };
++}
++
++/** @param {{regular?:{approvalExpiresAt?:string|null,handoffStatus?:string}}} request @param {Date|string|number} [now] */
++export function regularApprovalExpired(request,now=new Date()) {
++  return !request.regular?.handoffStatus && !!request.regular?.approvalExpiresAt
++    && new Date(now).getTime()>=new Date(request.regular.approvalExpiresAt).getTime();
++}
++
++/** @param {{regular?:{approvalExpiresAt?:string|null,approvalValidityMinutes?:number,handoffStatus?:string}}} request @param {Date|string|number} [now] */
++export function requireRegularStockApproval(request,now=new Date()) {
++  if(request.regular?.handoffStatus)return;
++  if(regularApprovalExpired(request,now))throw regularError(`Approval expired after ${request.regular?.approvalValidityMinutes || 15} minutes. Re-raise this request to obtain a new approval.`,'REGULAR_APPROVAL_EXPIRED');
++  if(!request.regular?.approvalExpiresAt || !Number.isFinite(new Date(request.regular.approvalExpiresAt).getTime()))throw regularError('Finish all SCM decisions before entering the SO.','REGULAR_APPROVAL_REQUIRED');
+ }
+ 
+ /** @param {{request:RoutingRequest,salesOrder:SalesOrder,selectedLineIds?:Record<string,number>}} input */
+--- a/server/src/regular-stock-request-service.js
++++ b/server/src/regular-stock-request-service.js
+@@ -1,8 +1,8 @@
+ import { query, withTransaction } from './db.js';
+ import { createSalesStockRequest, updateSalesStockRequest, getScmStockRequest, getSalesStockRequest, recordStockRequestEvent, decideSalesStockRequestLines } from './stock-request-repository.js';
+ import { refreshStockRequestItemsAvailability } from './stock-request-service.js';
+-import { normalizeRegularArrival, normalizeRegularLeadHours } from '../public/regular-stock-input.js';
+-import { evaluateRegularStockApproval, regularError } from './regular-stock-domain.js';
++import { normalizeRegularArrival, normalizeRegularLeadHours, normalizeRegularApprovalMinutes } from '../public/regular-stock-input.js';
++import { evaluateRegularStockApproval, regularError, regularApprovalExpired } from './regular-stock-domain.js';
+ import { assertStockRequestDestinationAccess } from './stock-request-domain.js';
+ import { findSpecialCustomer } from './special-stock-customer-directory.js';
+ 
+@@ -54,16 +54,24 @@
+   }
+ }
+ 
++function approvalWindow(now,minutes) {
++  const approvedAt=new Date(now).toISOString();
++  return {approvedAt,approvalValidityMinutes:minutes,approvalExpiresAt:new Date(new Date(now).getTime()+minutes*60000).toISOString()};
++}
++
+ async function persistApproval(request, details, evidence, now) {
+-  const setting = await query('SELECT regular_stock_lead_hours FROM scm_smart_settings WHERE id=1');
++  const setting = await query('SELECT regular_stock_lead_hours,regular_stock_auto_approval_enabled,regular_stock_approval_minutes FROM scm_smart_settings WHERE id=1');
+   const leadHours = normalizeRegularLeadHours(setting.rows[0]?.regular_stock_lead_hours ?? 5);
+-  const approval = evaluateRegularStockApproval({ lines: request.lines, policies: evidence.policies, arrivalAt: details.arrivalAt, leadHours, now });
++  const autoApprovalEnabled=setting.rows[0]?.regular_stock_auto_approval_enabled ?? true;
++  const minutes=normalizeRegularApprovalMinutes(setting.rows[0]?.regular_stock_approval_minutes ?? 15);
++  const approval = evaluateRegularStockApproval({ lines: request.lines, policies: evidence.policies, arrivalAt: details.arrivalAt, leadHours, autoApprovalEnabled, now });
++  const window=approval.automatic?approvalWindow(now,minutes):{approvedAt:null,approvalValidityMinutes:minutes,approvalExpiresAt:null};
+   await query(`UPDATE sales_stock_requests SET workflow_version=2,regular_details=$2::jsonb,
+     status=$3,first_scm_decision_at=CASE WHEN $4 THEN now() ELSE first_scm_decision_at END WHERE id=$1`,
+-  [request.id, JSON.stringify({ ...details, approval, evidenceError: evidence.error }), approval.automatic ? 'active' : 'submitted', approval.automatic]);
++  [request.id, JSON.stringify({ ...details, approval, ...window, evidenceError: evidence.error }), approval.automatic ? 'active' : 'submitted', approval.automatic]);
+   for (const line of approval.lines) {
+     await query(`UPDATE sales_stock_request_lines SET approval_evidence=$2::jsonb,status=$3,
+-      regular_decision=$4,decided_at=CASE WHEN $5 THEN now() ELSE NULL END WHERE id=$1`,
++      regular_decision=$4,decided_by=NULL,decision_reason=NULL,decided_at=CASE WHEN $5 THEN now() ELSE NULL END WHERE id=$1`,
+     [line.lineId, JSON.stringify(line), approval.automatic ? 'approved' : 'submitted', approval.automatic ? 'stock' : null, approval.automatic]);
+   }
+   await recordStockRequestEvent({ requestId: request.id, eventType: approval.automatic ? 'regular_auto_approved' : 'regular_manual_review', details: approval });
+@@ -92,12 +100,34 @@
+   });
+ }
+ 
++export async function reraiseRegularStockRequest(id,input,context,dependencies={}) {
++  const before=await getSalesStockRequest(id,context);
++  const now=()=> (dependencies.now || (()=>new Date()))();
++  const eligible=request=>request.workflowVersion===2 && regularApprovalExpired(request,now());
++  if(!eligible(before))throw regularError('Only an expired, unused approval can be re-raised.');
++  if(input.expectedRevision===undefined)throw regularError('Request revision is required.');
++  const details=await inputDetails(before.regular);
++  const targets=before.lines.filter(line=>line.status==='approved');
++  if(!targets.length)throw regularError('No expired approved items can be re-raised.');
++  const evidence=await collectEvidence(targets.map(line=>line.itemId),dependencies);
++  return withTransaction(async()=>{
++    await lockRequest(id,input.expectedRevision);
++    const request=await getScmStockRequest(id);
++    if(!eligible(request)||(await query('SELECT 1 FROM regular_stock_handoffs WHERE request_id=$1',[id])).rowCount)throw regularError('This request is already being processed or no longer has an expired approval.');
++    await query('UPDATE sales_stock_requests SET revision=revision+1,manual_decision_event_id=0,updated_at=now() WHERE id=$1',[id]);
++    await recordStockRequestEvent({requestId:Number(id),eventType:'regular_approval_reraised',actorId:context.operatorId,
++      details:{previousApprovalExpiresAt:request.regular.approvalExpiresAt,previousApproval:request.regular.approval}});
++    return persistApproval({...request,lines:request.lines.filter(line=>line.status==='approved')},details,evidence,now());
++  });
++}
++
+ export async function refreshRegularStockEvidence(id, dependencies = {}) {
+   const request = await getScmStockRequest(id);
+   if (request.workflowVersion !== 2) return request;
++  if(request.regular.handoffStatus==='complete' || request.status==='completed')return request;
+   const evidence = await collectEvidence(request.lines.map(line => line.itemId), dependencies);
+   const current = evaluateRegularStockApproval({ lines: request.lines, policies: evidence.policies, arrivalAt: request.regular.arrivalAt,
+-    leadHours: request.regular.approval.leadHours, now: request.regular.approval.evaluatedAt });
++    leadHours: request.regular.approval.leadHours, autoApprovalEnabled:request.regular.approval.autoApprovalEnabled, now: request.regular.approval.evaluatedAt });
+   // Current review evidence is separate from the immutable approval snapshot.
+   return { ...request, currentEvidence: current.lines, evidenceError: evidence.error };
+ }
+@@ -124,11 +154,15 @@
+       decision_reason=$4,decided_by=$5,decided_at=now(),approval_evidence=$6::jsonb,updated_at=now() WHERE id=$1`,
+     [line.id, decision, decision === 'reject' ? 'rejected' : 'approved', reason, context.operatorId,
+       JSON.stringify(snapshot.lines.find(entry => entry.lineId === line.id))]);
++    const updated=await getScmStockRequest(id);
++    const minutes=normalizeRegularApprovalMinutes((await query('SELECT regular_stock_approval_minutes FROM scm_smart_settings WHERE id=1')).rows[0].regular_stock_approval_minutes);
++    const window=updated.lines.some(line=>line.status==='approved') && updated.lines.every(line=>['approved','rejected','cancelled'].includes(line.status))
++      ? approvalWindow((dependencies.now || (()=>new Date()))(),minutes) : {approvedAt:null,approvalExpiresAt:null,approvalValidityMinutes:minutes};
+     const event = await query(`INSERT INTO sales_stock_request_events(request_id,event_type,actor_id,details)
+       VALUES($1,'regular_manual_decision',$2,$3::jsonb) RETURNING id`, [id, context.operatorId, JSON.stringify({ decision, lineIds, reason, evidence: snapshot, evidenceError: evidence.error })]);
+     await query(`UPDATE sales_stock_requests SET revision=revision+1,first_scm_decision_at=COALESCE(first_scm_decision_at,now()),
+       manual_decision_event_id=$2,status=CASE WHEN EXISTS(SELECT 1 FROM sales_stock_request_lines WHERE request_id=$1 AND status NOT IN ('rejected','cancelled','fulfilled','received','closed')) THEN 'active' ELSE 'completed' END,
+-      updated_at=now() WHERE id=$1`, [row.id,event.rows[0].id]);
++      regular_details=regular_details||$3::jsonb,updated_at=now() WHERE id=$1`, [row.id,event.rows[0].id,JSON.stringify(window)]);
+     return getScmStockRequest(id);
+   });
+ }
+--- a/server/src/regular-stock-handoff.js
++++ b/server/src/regular-stock-handoff.js
+@@ -1,7 +1,7 @@
+ import { randomUUID } from 'node:crypto';
+ import { pool, query, withTransaction } from './db.js';
+ import { config } from './config.js';
+-import { planRegularStockRouting, regularError } from './regular-stock-domain.js';
++import { planRegularStockRouting, regularError, requireRegularStockApproval } from './regular-stock-domain.js';
+ import { getSalesStockRequest, getScmStockRequest, convertSalesStockRequestLines, recordStockRequestEvent } from './stock-request-repository.js';
+ import { confirmAndPrintStockTransfer, refreshStockRequestItemsAvailability } from './stock-request-service.js';
+ import { readRegularStockSalesOrderFromNetSuite, applyRegularStockSalesOrderLocationInNetSuite, createTransferOrderInNetSuite, fetchDeliveryOrderFromNetSuite, fetchDeliveryOrderDetailsFromNetSuite } from './netsuite.js';
+@@ -16,12 +16,19 @@
+   await upsertSalesOrderLines(order.id, await fetchDeliveryOrderDetailsFromNetSuite(order.id));
+ }
+ 
+-async function claim(id, input, context, readOrder) {
++async function requireUnusedSalesOrder(requestId,reference,orderId=null) {
++  const existing=(await query(`SELECT r.request_ref FROM regular_stock_handoffs h JOIN sales_stock_requests r ON r.id=h.request_id
++    WHERE h.request_id<>$1 AND (upper(btrim(h.sales_order_ref))=upper(btrim($2)) OR h.sales_order_id=$3) LIMIT 1`,[requestId,String(reference || ''),orderId])).rows[0];
++  if(existing)throw regularError(`${reference} is already linked to ${existing.request_ref} and cannot be reused for another stock request.`,'REGULAR_SO_REUSED');
++}
++
++async function claim(id, input, context, readOrder, now) {
+   const before = await getSalesStockRequest(id, context);
+   if (before.workflowVersion !== 2) throw regularError('This request uses the legacy transfer workflow.');
+   const existing = (await query('SELECT * FROM regular_stock_handoffs WHERE request_id=$1',[id])).rows[0];
+   const ref = String(input.salesOrderRef || before.regular.salesOrderRef || '').trim();
+   if (!ref) throw regularError('Enter the Sales Order number.', 'REGULAR_SO_REQUIRED', 400);
++  if(!existing){requireRegularStockApproval(before,now());await requireUnusedSalesOrder(id,ref);}
+   const order = existing ? existing.plan.order : await readOrder(ref);
+   return withTransaction(async () => {
+     const row = (await query('SELECT * FROM sales_stock_requests WHERE id=$1 FOR UPDATE',[id])).rows[0];
+@@ -29,10 +36,13 @@
+     if (!handoff) {
+       if (Number(input.expectedRevision) !== Number(row.revision)) throw regularError('The request changed. Reload before linking the SO.');
+       const request = await getScmStockRequest(id);
++      requireRegularStockApproval(request,now());
+       if (request.lines.some(line => !['approved','rejected','cancelled'].includes(line.status))) throw regularError('Finish all SCM decisions before entering the SO.');
++      await query('SELECT pg_advisory_xact_lock(hashtextextended($1,0))',[`regular-stock-so:${order.id}`]);
++      requireRegularStockApproval(request,now());
++      await requireUnusedSalesOrder(id,order.ref,order.id);
+       const plan = { ...planRegularStockRouting({ request, salesOrder: order, selectedLineIds: input.selectedLineIds || {} }), order };
+       requireRegularStockConfirmation(id,plan,input.confirmationToken);
+-      await query('SELECT pg_advisory_xact_lock(hashtextextended($1,0))',[`regular-stock-so:${order.id}`]);
+       for (const remoteLineId of plan.materialLineIds) {
+         const owner = await query('SELECT request_id FROM regular_stock_so_line_owners WHERE sales_order_id=$1 AND remote_line_id=$2',[order.id,remoteLineId]);
+         if (owner.rowCount && Number(owner.rows[0].request_id) !== Number(id)) throw regularError('An SO line already belongs to another stock request.');
+@@ -138,7 +148,7 @@
+ 
+ async function executeHandoff(id, input, context, dependencies) {
+   if(!(dependencies.liveExecutionEnabled ?? config.smartScm.liveExecutionEnabled))throw regularError('Live NetSuite execution is disabled.','REGULAR_LIVE_DISABLED');
+-  const handoff=await claim(id,input,context,dependencies.readOrder||readRegularStockSalesOrderFromNetSuite);
++  const handoff=await claim(id,input,context,dependencies.readOrder||readRegularStockSalesOrderFromNetSuite,dependencies.now||(()=>new Date()));
+   if(handoff.status==='complete')return getSalesStockRequest(id,context);
+   try {
+     if(handoff.plan.mode==='location'&&!handoff.location_applied){
+@@ -176,7 +186,7 @@
+   }
+ }
+ 
+-export async function previewRegularStockSalesOrder(id,input,context,{readOrder=readRegularStockSalesOrderFromNetSuite}={}){
++export async function previewRegularStockSalesOrder(id,input,context,{readOrder=readRegularStockSalesOrderFromNetSuite,now=()=>new Date()}={}){
+   const request=await getSalesStockRequest(id,context);
+   if(request.workflowVersion!==2||request.lines.some(line=>line.status==='submitted'))throw regularError('Finish all SCM decisions before entering the SO.');
+   const existing=(await query('SELECT * FROM regular_stock_handoffs WHERE request_id=$1',[id])).rows[0];
+@@ -185,7 +195,11 @@
+     return {salesOrderRef:existing.sales_order_ref,choices:[],action:describeRegularStockAction(existing.plan),
+       confirmationToken:regularStockConfirmationToken(id,existing.plan),resuming:true};
+   }
++  requireRegularStockApproval(request,now());
++  await requireUnusedSalesOrder(id,input.salesOrderRef);
+   const order=await readOrder(input.salesOrderRef);
++  requireRegularStockApproval(await getSalesStockRequest(id,context),now());
++  await requireUnusedSalesOrder(id,order.ref,order.id);
+   if(order.locationId!==request.destinationLocationId)throw regularError('The SO must be created at your Sales location.','REGULAR_SO_MISMATCH');
+   const choices=[];
+   const items=new Set(request.lines.filter(line=>['stock','po'].includes(line.decision)).map(line=>line.itemId));
+@@ -196,5 +210,5 @@
+   }
+   if(choices.length)return {salesOrderRef:order.ref,choices};
+   const plan={...planRegularStockRouting({request,salesOrder:order,selectedLineIds:input.selectedLineIds || {}}),order};
+-  return {salesOrderRef:order.ref,choices:[],action:describeRegularStockAction(plan),confirmationToken:regularStockConfirmationToken(id,plan)};
+-}
++  return {salesOrderRef:order.ref,choices:[],action:describeRegularStockAction(plan),confirmationToken:regularStockConfirmationToken(id,plan),approvalExpiresAt:request.regular.approvalExpiresAt};
++}
+--- a/server/src/smart-scm-repository.js
++++ b/server/src/smart-scm-repository.js
+@@ -1,4 +1,4 @@
+-import { normalizeRegularLeadHours } from '../public/regular-stock-input.js';
++import { normalizeRegularLeadHours, normalizeRegularApprovalMinutes } from '../public/regular-stock-input.js';
+ import { query } from "./db.js";
+ import { writeAudit } from "./auth-repository.js";
+ import { listSmartScmForecastRuns, listSmartScmForecasts, runSmartScmForecast } from "./smart-scm-forecast-repository.js";
+@@ -23,6 +23,8 @@
+ function publicSettings(row) {
+   return {
+     regularStockLeadHours: Number(row.regular_stock_lead_hours ?? 5),
++    regularStockAutoApprovalEnabled: row.regular_stock_auto_approval_enabled ?? true,
++    regularStockApprovalMinutes: Number(row.regular_stock_approval_minutes ?? 15),
+     executionMode: row.execution_mode,
+     forecastMode: row.forecast_mode,
+     dailyEnabled: Boolean(row.daily_enabled),
+@@ -63,6 +65,9 @@
+   if (!currentResult.rowCount) throw new Error("Smart SCM settings are missing. Run migrations first.");
+   const current = currentResult.rows[0];
+   const regularStockLeadHours = normalizeRegularLeadHours(values.regularStockLeadHours === undefined ? current.regular_stock_lead_hours : values.regularStockLeadHours);
++  const regularStockAutoApprovalEnabled=values.regularStockAutoApprovalEnabled===undefined?current.regular_stock_auto_approval_enabled:values.regularStockAutoApprovalEnabled;
++  if(typeof regularStockAutoApprovalEnabled!=='boolean')throw Object.assign(new Error('Stock request auto-approval must be enabled or disabled.'),{status:400});
++  const regularStockApprovalMinutes=normalizeRegularApprovalMinutes(values.regularStockApprovalMinutes===undefined?current.regular_stock_approval_minutes:values.regularStockApprovalMinutes);
+   const executionMode = values.executionMode ?? current.execution_mode;
+   const forecastMode = values.forecastMode ?? current.forecast_mode;
+   const dailyEnabled = values.dailyEnabled === undefined ? current.daily_enabled : Boolean(values.dailyEnabled);
+@@ -156,16 +161,18 @@
+             inventory_planning_mode = $24,
+             updated_by = $25,
+             regular_stock_lead_hours = $26,
++            regular_stock_auto_approval_enabled = $27,
++            regular_stock_approval_minutes = $28,
+             updated_at = now()
+       WHERE id = $1
+       RETURNING *`,
+-    [1, executionMode, forecastMode, dailyEnabled, dailyTime, timeZone, vendorResponseSlaHours, truckCapacityLbs, fullLoadRatio, holdLoadRatio, formulaAverageWeeks, stockoutBenchmarkWeeks, deliverySafetyFactor, pickupSafetyFactor, zeroDemandCoverageEnabled, zeroDemandPickupOrderCount, zeroDemandDeliveryOrderCount, coverageOrderPercentile, coverageHistoryWeeks, coveragePriorStrengthOrders, JSON.stringify(modelActiveSegments), JSON.stringify(routeMatrix), skip12441Enabled, inventoryPlanningMode, operatorId, regularStockLeadHours]
++    [1, executionMode, forecastMode, dailyEnabled, dailyTime, timeZone, vendorResponseSlaHours, truckCapacityLbs, fullLoadRatio, holdLoadRatio, formulaAverageWeeks, stockoutBenchmarkWeeks, deliverySafetyFactor, pickupSafetyFactor, zeroDemandCoverageEnabled, zeroDemandPickupOrderCount, zeroDemandDeliveryOrderCount, coverageOrderPercentile, coverageHistoryWeeks, coveragePriorStrengthOrders, JSON.stringify(modelActiveSegments), JSON.stringify(routeMatrix), skip12441Enabled, inventoryPlanningMode, operatorId, regularStockLeadHours, regularStockAutoApprovalEnabled, regularStockApprovalMinutes]
+   );
+   await writeAudit({
+     actorOperatorId: operatorId,
+     source: "smart_scm",
+     action: "smart_scm.settings.update",
+-    details: { regularStockLeadHours, executionMode, forecastMode, dailyEnabled, dailyTime, timeZone, vendorResponseSlaHours, truckCapacityLbs, fullLoadRatio, holdLoadRatio, formulaAverageWeeks, stockoutBenchmarkWeeks, deliverySafetyFactor, pickupSafetyFactor, zeroDemandCoverageEnabled, zeroDemandPickupOrderCount, zeroDemandDeliveryOrderCount, coverageOrderPercentile, coverageHistoryWeeks, coveragePriorStrengthOrders, skip12441Enabled, inventoryPlanningMode, modelActiveSegments, routeMatrix }
++    details: { regularStockLeadHours, regularStockAutoApprovalEnabled, regularStockApprovalMinutes, executionMode, forecastMode, dailyEnabled, dailyTime, timeZone, vendorResponseSlaHours, truckCapacityLbs, fullLoadRatio, holdLoadRatio, formulaAverageWeeks, stockoutBenchmarkWeeks, deliverySafetyFactor, pickupSafetyFactor, zeroDemandCoverageEnabled, zeroDemandPickupOrderCount, zeroDemandDeliveryOrderCount, coverageOrderPercentile, coverageHistoryWeeks, coveragePriorStrengthOrders, skip12441Enabled, inventoryPlanningMode, modelActiveSegments, routeMatrix }
+   });
+   return publicSettings(result.rows[0]);
+ }
+--- a/server/src/server.js
++++ b/server/src/server.js
+@@ -1,4 +1,4 @@
+-import {submitRegularStockRequest,editRegularStockRequest,decideRegularStockRequest,refreshRegularStockEvidence,regularStockAlerts,acknowledgeRegularStockDecisions} from './regular-stock-request-service.js';
++import {submitRegularStockRequest,editRegularStockRequest,decideRegularStockRequest,refreshRegularStockEvidence,regularStockAlerts,acknowledgeRegularStockDecisions,reraiseRegularStockRequest} from './regular-stock-request-service.js';
+ import {linkRegularStockSalesOrder,previewRegularStockSalesOrder} from './regular-stock-handoff.js';
+ import {releaseRegularReplenishment} from './regular-stock-replenishment.js';
+ import { createSpecialExpiryRuntime } from './special-stock-expiry.js';
+@@ -12164,6 +12164,12 @@
+ app.post('/api/sales/stock-requests/:id/decisions/read', requireSalesAccess, requirePrivateSalesRecordAccess, async(req,res,next)=>{
+   try {res.json(await acknowledgeRegularStockDecisions(req.params.id,req.body||{},{operatorId:req.operator.id,authorizedDestinationLocationIds:operatorSalesYardLocationIds(req.operator)}));} catch(error){next(error);}
+ });
++app.post('/api/sales/stock-requests/:id/re-raise', requireSalesAccess, requirePrivateSalesRecordAccess, async(req,res,next)=>{
++  try {
++    const request=await reraiseRegularStockRequest(req.params.id,req.body||{},{operatorId:req.operator.id,authorizedDestinationLocationIds:operatorSalesYardLocationIds(req.operator),...(await getSalesStockRequestAvailabilityPolicy())});
++    emitStockRequestUpdate('regular-re-raised',{requestId:request.id});res.json(request);
++  }catch(error){next(error);}
++});
+ app.post('/api/sales/stock-requests/:id/sales-order/preview', requireSalesAccess, requirePrivateSalesRecordAccess, async(req,res,next)=>{
+   try {res.setHeader('Cache-Control','private, no-store');res.json(await previewRegularStockSalesOrder(req.params.id,req.body||{},{operatorId:req.operator.id,authorizedDestinationLocationIds:operatorSalesYardLocationIds(req.operator)}));}catch(error){next(error);}
+ });
+--- a/server/public/regular-stock-input.js
++++ b/server/public/regular-stock-input.js
+@@ -46,3 +46,11 @@
+   }
+   return Number(value);
+ }
++
++/** @param {unknown} [value] */
++export function normalizeRegularApprovalMinutes(value = 15) {
++  if(value===null || typeof value==='boolean' || String(value).trim()==='' || !Number.isInteger(Number(value)) || Number(value)<1 || Number(value)>10080) {
++    throw Object.assign(new Error('Approval validity must be a whole number between 1 and 10080 minutes.'),{status:400,code:'REGULAR_APPROVAL_MINUTES_INVALID'});
++  }
++  return Number(value);
++}
+--- a/server/public/regular-stock-ui.js
++++ b/server/public/regular-stock-ui.js
+@@ -19,23 +19,40 @@
+       <label><span>${t('Expected arrival time (Toronto)','预计到达时间（多伦多）')} *</span><input data-regular-field="arrivalTime" autocomplete="off" required placeholder="15:00 / 3pm" value="${esc(composer.arrivalTime)}" /></label>
+     </div>`;
+   }
++  const approvalExpired=request=>!request?.regular?.handoffStatus && !!request?.regular?.approvalExpiresAt && Date.now()>=new Date(request.regular.approvalExpiresAt).getTime();
++  function reviewReasons(request) {
++    const approval=request.regular?.approval || {},reasons=[];
++    if(approval.autoApprovalEnabled===false)reasons.push(t('Auto-approval is turned off. SCM must review this request.','自动批准已关闭，须由 SCM 审核此申请。'));
++    if(approval.enoughTime===false)reasons.push(t(`Required at least ${number(approval.leadHours)} hours of lead time.`,`须至少提前 ${number(approval.leadHours)} 小时申请。`));
++    for(const evidence of approval.lines || []){
++      const line=request.lines?.find(line=>line.id===evidence.lineId) || {};
++      const name=line.itemName || line.itemId || evidence.itemId, yard=line.sourceName || line.sourceLocationId || '';
++      const unit=evidence.unit || line.salesUom || '';
++      if(evidence.reasons?.includes('below_safety'))reasons.push(t(`${name} at ${yard} will be under safety stock after shipment: ${number(evidence.remainingQuantity)} ${unit} remaining; ${number(evidence.safetyQuantity)} ${unit} required.`,`${name}（${yard}）发货后将低于安全库存：剩余 ${number(evidence.remainingQuantity)} ${unit}，安全库存要求 ${number(evidence.safetyQuantity)} ${unit}。`));
++      if(evidence.reasons?.includes('policy_unavailable'))reasons.push(t(`${name} at ${yard}: availability or safety stock is unavailable. SCM must review this item.`,`${name}（${yard}）：可用库存或安全库存数据不足，须 SCM 审核。`));
++    }
++    return [...new Set(reasons)];
++  }
+   function summary(request) {
+     if(request?.workflowVersion!==2)return '';
+-    const r=request.regular||{}, a=r.approval||{};
++    const r=request.regular||{}, a=r.approval||{}, reasons=reviewReasons(request);
+     return `<div class="stock-request-summary regular-stock-summary">
+       <span><small>${t('Customer','客户')}</small><strong>${esc(r.customerName||'—')}</strong></span>
+       <span><small>${t('Method','取货方式')}</small><strong>${r.deliveryMethod==='pickup'?t('Pickup','自取'):t('Delivery','送货')}</strong></span>
+       <span><small>${t('Expected arrival · Toronto','预计到达 · 多伦多')}</small><strong>${esc(r.arrivalDate)} ${esc(r.arrivalTime)}</strong></span>
+       <span><small>${t('Review route','审核方式')}</small><strong>${a.automatic?t('Automatically approved','自动批准'):t('SCM review','SCM 人工审核')}</strong></span>
+       <span><small>${t('Minimum lead time at submission','提交时最短提前时间')}</small><strong>${number(a.leadHours)} ${t('hours','小时')}</strong></span>
++      ${r.approvalExpiresAt&&!r.handoffStatus?`<span><small>${t('Approval valid until','批准有效期至')}</small><strong>${esc(window.MBBS_I18N?.displayDateTime?.(r.approvalExpiresAt)||r.approvalExpiresAt)}</strong></span>`:''}
+       ${r.salesOrderRef?`<span><small>SO</small><strong>${esc(r.salesOrderRef)}</strong></span>`:''}
+-    </div>${!a.automatic && a.enoughTime===false?`<p class="stock-request-notice">${t('Arrival is within the configured lead time; manual review is required.','预计到达时间短于设定的提前时间，须人工审核。')}</p>`:''}
++    </div>${!a.automatic&&reasons.length?`<section class="stock-request-notice regular-stock-review-reasons"><strong>${t('Why SCM review is required','需要 SCM 审核的原因')}</strong><ul>${reasons.map(reason=>`<li>${esc(reason)}</li>`).join('')}</ul></section>`:''}
++    ${approvalExpired(request)?`<p class="stock-request-notice stock-request-error">${t('Approval expired. Sales can re-raise this request for a fresh review.','批准已过期，销售可重新提交申请以重新审核。')}</p>`:''}
+     ${r.handoffError?`<p class="stock-request-notice stock-request-error">${esc(r.handoffError)}</p>`:''}`;
+   }
+   function safety(request,line) {
+     if(request?.workflowVersion!==2)return '';
+-    const e=request.currentEvidence?.find(entry=>entry.lineId===line.id)||line.approvalEvidence||{};
+-    const labels=[[t('Available','可用库存'),e.availableQuantity],[t('Requested (all matching lines)','申请数量（相同货品合计）'),e.groupedRequestedQuantity],[t('Safety stock required','所需安全库存'),e.safetyQuantity],[t('After shipment','发货后库存'),e.remainingQuantity],[t('Below safety by','低于安全库存'),e.shortfallQuantity]];
++    const complete=request.regular?.handoffStatus==='complete' || request.status==='completed';
++    const e=(!complete && request.currentEvidence?.find(entry=>entry.lineId===line.id))||line.approvalEvidence||{};
++    const labels=[[complete?t('Available at approval','批准时可用库存'):t('Available','可用库存'),e.availableQuantity],[t('Requested (all matching lines)','申请数量（相同货品合计）'),e.groupedRequestedQuantity],[t('Safety stock required','所需安全库存'),e.safetyQuantity],[complete?t('Remaining after approved request','批准扣除申请后的库存'):t('After shipment','发货后库存'),e.remainingQuantity],[t('Below safety by','低于安全库存'),e.shortfallQuantity]];
+     return `<div class="regular-stock-safety" aria-label="${t('Safety stock review','安全库存审核')}">${labels.map(([label,value])=>`<span><small>${label}</small><strong>${number(value)} ${esc(e.unit||line.salesUom)}</strong></span>`).join('')}</div>${e.reasons?.includes('policy_unavailable')?`<p class="stock-request-notice">${t('Safety or availability evidence is unavailable. SCM must review this line.','安全库存或可用库存数据不足，须 SCM 人工审核此行。')}</p>`:''}${line.decision?`<p><strong>${decision(line.decision)}</strong></p>`:''}`;
+   }
+   function actionText(action,completed=false) {
+@@ -63,17 +80,18 @@
+     if(request?.workflowVersion!==2)return '';
+     const r=request.regular||{};
+     if(r.handoffStatus==='complete')return completedAction(request);
++    if(approvalExpired(request))return `<section class="stock-request-section regular-stock-expired"><h3>${t('Approval expired','批准已过期')}</h3><p>${t(`The ${r.approvalValidityMinutes || 15}-minute approval window has ended. Re-raise the approved items to check current stock and approval rules.`,`批准的 ${r.approvalValidityMinutes || 15} 分钟有效期已结束。请重新提交已批准的商品，以检查最新库存和审核规则。`)}</p><button class="primary" data-sales-stock-action="re-raise" type="button" ${saving?'disabled':''}>${t('Re-raise request','重新提交申请')}</button></section>`;
+     if(request.lines.some(line=>line.status==='submitted'))return `<p class="stock-request-notice">${t('Waiting for SCM to finish reviewing all lines before entering the SO number.','待 SCM 审核所有商品行后，请输入销售订单号。')}</p>`;
+     if(!request.lines.some(line=>['stock','po'].includes(line.decision)))return '';
+     return `<section class="stock-request-section regular-stock-so"><h3>${t('Sales Order','销售订单')}</h3><p>${t('Create the SO at your own sales yard, then enter its number. Review and confirm the planned action before it is processed.','请在您的销售货场建立销售订单，再输入订单号，请先查看并确认将执行的操作。')}</p><label><span>${t('SO number','销售订单号')}</span><input data-regular-so maxlength="80" value="${esc(r.salesOrderRef||r.soInput)}" ${r.salesOrderRef?'readonly':''} /></label>${(r.soChoices||[]).map(choice=>`<label><span>${esc(choice.itemName||choice.itemId)} · ${t("Select SO line","选择销售订单行")}</span><select data-regular-so-line="${choice.itemId}">${choice.lines.map(line=>`<option value="${line.id}">${line.id} · ${number(line.quantity)} ${esc(line.uom)}</option>`).join('')}</select></label>`).join('')}<button class="primary" data-sales-stock-action="link-so" type="button" ${saving?'disabled':''}>${saving?t('Processing…','处理中…'):r.salesOrderRef?t('Retry / check progress','重试 / 查看进度'):t('Review SO routing','查看订单安排')}</button></section>`;
+   }
+   async function normalize(composer,root) {
+     if(!composer?.arrivalDate||!composer?.arrivalTime)return;
+-    const {normalizeRegularArrival}=await import('/regular-stock-input.js?v=20260929');
++    const {normalizeRegularArrival}=await import('/regular-stock-input.js?v=20260929-controls');
+     const arrival=normalizeRegularArrival(composer.arrivalDate,composer.arrivalTime);
+     composer.arrivalDate=arrival.date;composer.arrivalTime=arrival.time;
+     for(const key of ['arrivalDate','arrivalTime']) {const input=root.querySelector(`[data-regular-field="${key}"]`);if(input){input.value=composer[key];input.setCustomValidity('');}}
+     return arrival;
+   }
+-  window.RegularStockUI={t,esc,number,decision,fields,summary,safety,salesOrder,normalize,confirmationMessage,apiError};
++  window.RegularStockUI={t,esc,number,decision,fields,summary,safety,salesOrder,normalize,confirmationMessage,apiError,approvalExpired};
+ })();
+--- a/server/public/sales-stock-requests.js
++++ b/server/public/sales-stock-requests.js
+@@ -51,6 +51,7 @@
+ 
+ function salesStockStatusLabel(value) {
+   const status = String(value || "unknown").trim().toLowerCase();
++  if (status === "expired") return window.RegularStockUI.t("Approval expired", "批准已过期");
+   if (status === "pending") return salesStockT("salesStock.status.pending", "Pending");
+   if (status === "approved") return window.RegularStockUI.t("Approved · awaiting SO", "已批准 · 待销售订单");
+   if (status === "fulfilled") return window.RegularStockUI.t("SO location updated", "销售订单地点已更新");
+@@ -173,7 +174,7 @@
+   }
+   return salesStockState.requests.map((request) => `
+     <button class="stock-request-card ${salesStockRequestNeedsAttention(request) ? "stock-request-card-attention" : ""} ${Number(request.id) === Number(salesStockState.selectedId) ? "selected" : ""}" data-sales-stock-action="select" data-id="${Number(request.id)}" type="button">
+-      <span class="stock-request-status-line"><strong>${salesStockEscape(request.requestRef)}</strong>${salesStockPill(salesStockRequestNeedsAttention(request) ? "changes_requested" : request.bucket || request.status)}</span>
++      <span class="stock-request-status-line"><strong>${salesStockEscape(request.requestRef)}</strong>${salesStockPill(window.RegularStockUI.approvalExpired(request) ? "expired" : salesStockRequestNeedsAttention(request) ? "changes_requested" : request.bucket || request.status)}</span>
+       <span>${salesStockEscape(request.destinationName)} · ${salesStockTf("salesStock.lineCount", "{count} line(s)", { count: salesStockLineCount(request) })}</span>
+       <small>${salesStockEscape(request.requestedByName || request.requestedBy || "")} · ${salesStockDate(request.updatedAt)}</small>
+     </button>
+@@ -254,6 +255,7 @@
+             ${line.quantityMode === "conversion" ? `<span><small>${salesStockT("salesStock.entered", "Entered")}</small><strong>${salesStockNumber(line.pallets)} PLT · ${salesStockNumber(line.layers)} LYR · ${salesStockNumber(line.sections)} SEC · ${salesStockNumber(line.pieces)} PCS</strong></span>` : ""}
+           </div>
+           ${line.decision ? `<p><strong>${window.RegularStockUI.decision(line.decision)}</strong></p>` : ""}
++          ${request.workflowVersion===2 && (request.regular?.handoffStatus==='complete' || request.status==='completed') ? window.RegularStockUI.safety(request,line) : ''}
+           ${line.decisionReason ? `<div class="stock-request-notice"><strong>${salesStockT("salesStock.scmUpdate", "SCM update:")}</strong> ${salesStockEscape(line.decisionReason)}</div>` : ""}
+         </article>
+       `).join("")}</div>
+@@ -650,6 +652,7 @@
+ }
+ 
+ async function salesStockChooseItem(line, itemId) {
++  if(window.RegularStockDialog.isBusy())return;
+   const item = (salesStockState.suggestions.get(line.key) || []).find((candidate) => Number(candidate.itemId) === Number(itemId));
+   if (!item) return;
+   const composer = salesStockState.composer;
+@@ -665,6 +668,7 @@
+   line.loadingAvailability = true;
+   salesStockState.suggestions.delete(line.key);
+   renderSalesStockRequests();
++  const operation=window.RegularStockDialog.begin(window.RegularStockUI.t('Refreshing availability at all yards…','正在刷新所有货场的可用库存…'));
+   try {
+     const availability = await salesStockApi(`/api/sales/stock-request-items/${Number(item.itemId)}/availability/refresh`, { method: "POST" });
+     if (!isCurrentSelection()) return;
+@@ -684,6 +688,7 @@
+       line.loadingAvailability = false;
+       renderSalesStockRequests();
+     }
++    operation.close();
+   }
+ }
+ 
+@@ -707,12 +712,14 @@
+ }
+ 
+ async function salesStockSaveComposer() {
++  if(salesStockState.saving || window.RegularStockDialog.isBusy())return;
+   const composer = salesStockState.composer;
+   const visibleDestinationLocationId = salesStockRequestApp.querySelector("[data-sales-stock-destination]")?.value;
+   if (visibleDestinationLocationId !== undefined) composer.destinationLocationId = visibleDestinationLocationId;
+   salesStockState.error = "";
+   salesStockState.saving = true;
+   renderSalesStockRequests();
++  const operation=window.RegularStockDialog.begin(window.RegularStockUI.t('Checking current stock and saving your request…','正在检查当前库存并保存您的申请…'));
+   try {
+     const destinationLocationId = salesStockSupportedDestinationLocationId(composer.destinationLocationId);
+     if (!destinationLocationId) throw new Error("Select a valid supported destination yard.");
+@@ -739,6 +746,7 @@
+     salesStockState.error = error.message;
+   } finally {
+     salesStockState.saving = false;
++    operation.close();
+     if (salesStockState.composer || salesStockState.error) {
+       renderSalesStockRequests();
+     } else if (salesStockState.refreshPending) {
+@@ -841,7 +849,7 @@
+ 
+ salesStockRequestApp.addEventListener("click", async (event) => {
+   const button = event.target.closest('[data-sales-stock-action], [data-yard-filter-clear="sourceLocationId"]');
+-  if (!button) return;
++  if (!button || window.RegularStockDialog.isBusy()) return;
+   const action = button.dataset.salesStockAction;
+   try {
+     if (button.dataset.yardFilterClear) {
+@@ -899,19 +907,35 @@
+       const selectedLineIds=Object.fromEntries([...salesStockRequestApp.querySelectorAll('[data-regular-so-line]')].map(input=>[input.dataset.regularSoLine,Number(input.value)]));
+       salesStockState.saving=true;salesStockState.error='';button.disabled=true;
+       request.regular.soInput=salesOrderRef;
++      renderSalesStockRequests();
++      const operation=window.RegularStockDialog.begin(window.RegularStockUI.t('Reading the Sales Order and checking its routing…','正在读取销售订单并检查订单安排…'));
+       let attempted=false,completed=false;
+       try{
+         const preview=await salesStockApi(`/api/sales/stock-requests/${request.id}/sales-order/preview`,{method:'POST',body:JSON.stringify({salesOrderRef,selectedLineIds})});
+         if(preview.choices.length){request.regular.soChoices=preview.choices;return;}
+-        if(!confirm(window.RegularStockUI.confirmationMessage(preview.action,preview.resuming)))return;
++        if(!await operation.confirm(preview))return;
++        operation.wait(preview.action.mode==='location'?window.RegularStockUI.t('Updating the Sales Order location in NetSuite…','正在 NetSuite 中更新销售订单地点…'):window.RegularStockUI.t('Issuing Transfer Orders in NetSuite…','正在 NetSuite 中开立调货单…'));
+         attempted=true;
+         const saved=await salesStockApi(`/api/sales/stock-requests/${request.id}/sales-order`,{method:'POST',body:JSON.stringify({salesOrderRef,selectedLineIds,expectedRevision:request.revision,confirmationToken:preview.confirmationToken})});
+         completed=true;salesStockState.bucket=saved.bucket;await salesStockLoad({preserveSelection:true});
+       }finally{
+         salesStockState.saving=false;
+-        if(attempted&&!completed){await salesStockLoadDetail(request.id);salesStockState.detail.regular.soInput=salesOrderRef;}
+-        renderSalesStockRequests();
++        try{
++          if(attempted&&!completed){await salesStockLoadDetail(request.id);salesStockState.detail.regular.soInput=salesOrderRef;}
++          renderSalesStockRequests();
++        }finally{operation.close();}
+       }
++      return;
++    }
++    if(action==='re-raise'){
++      const request=salesStockState.detail;
++      salesStockState.saving=true;salesStockState.error='';
++      try{
++        await window.RegularStockDialog.withBusy(window.RegularStockUI.t('Refreshing stock and re-evaluating your request…','正在刷新库存并重新审核您的申请…'),async()=>{
++          const saved=await salesStockApi(`/api/sales/stock-requests/${request.id}/re-raise`,{method:'POST',body:JSON.stringify({expectedRevision:request.revision})});
++          salesStockState.bucket=saved.bucket;await salesStockLoad({preserveSelection:true});
++        });
++      }finally{salesStockState.saving=false;renderSalesStockRequests();}
+       return;
+     }
+     if (action === "edit") return salesStockStartEdit();
+@@ -937,6 +961,10 @@
+     renderSalesStockRequests();
+   }
+ });
++
++window.setInterval(()=>{
++  if(!salesStockState.composer && !window.RegularStockDialog.isBusy() && window.RegularStockUI.approvalExpired(salesStockState.detail) && salesStockRequestApp.querySelector('[data-regular-so]'))renderSalesStockRequests();
++},1000);
+ 
+ function salesStockConnectEvents() {
+   if (!("EventSource" in window) || salesStockState.eventSource) return;
+--- a/server/public/scm-stock-requests.js
++++ b/server/public/scm-stock-requests.js
+@@ -128,6 +128,7 @@
+ }
+ 
+ function scmStockSourceOptions(line) {
++  if(scmStockState.detail?.workflowVersion===2 && scmStockState.detail.status==='completed')return `<option value="${Number(line.sourceLocationId)}">${scmStockEscape(line.sourceName)}</option>`;
+   const availability = scmStockAvailability(line.itemId);
+   if (!availability) return `<option value="${Number(line.sourceLocationId)}">${scmStockEscape(line.sourceName)}</option>`;
+   return availability.yards.filter((yard) => Number(yard.locationId) !== Number(line.destinationLocationId)).map((yard) => `<option value="${Number(yard.locationId)}" ${Number(yard.locationId) === Number(line.sourceLocationId) ? "selected" : ""}>${scmStockEscape(yard.yardCode)} · ${scmStockNumber(yard.requestableAvailable)} available</option>`).join("");
+@@ -181,16 +182,17 @@
+ function scmStockRequestLine(line) {
+   const actionable = line.status === "submitted" || line.status === "changes_requested";
+   const editable = line.status === "submitted";
++  const snapshot=scmStockState.detail.workflowVersion===2 && (scmStockState.detail.regular?.handoffStatus==='complete' || scmStockState.detail.status==='completed');
+   return `<article class="stock-request-line" data-scm-stock-line-id="${Number(line.id)}">
+     <header>
+       <div class="stock-request-status-line">${actionable ? `<input data-scm-stock-select-line type="checkbox" ${scmStockState.selectedLineIds.has(line.id) ? "checked" : ""} aria-label="Select ${scmStockEscape(line.itemName)}" />` : ""}<div><strong>${scmStockEscape(line.itemName)}</strong><div class="stock-request-muted">${scmStockEscape(line.itemDescription || "")}</div></div></div>
+       ${scmStockPill(line.status)}
+     </header>
+     <div class="stock-request-line-fields">
+-      <label><span>Source yard</span><select data-scm-stock-source ${editable ? "" : "disabled"}>${scmStockSourceOptions(line)}</select></label>
++      <label><span>Source yard</span><select data-scm-stock-source ${editable ? "" : "disabled"}>${snapshot?`<option>${scmStockEscape(line.sourceName)}</option>`:scmStockSourceOptions(line)}</select></label>
+       ${scmStockQuantityInputs(line, "line", !editable)}
+     </div>
+-    ${scmStockAvailabilityMatrix(line.itemId)}
++    ${snapshot?'':scmStockAvailabilityMatrix(line.itemId)}
+     ${window.RegularStockUI.safety(scmStockState.detail,line)}
+     ${line.decisionReason ? `<div class="stock-request-notice"><strong>Decision reason:</strong> ${scmStockEscape(line.decisionReason)}</div>` : ""}
+     ${editable ? `<div class="stock-request-actions"><button data-scm-stock-action="save-line" type="button">Save line adjustment</button></div>` : ""}
+@@ -221,6 +223,7 @@
+   const selectable = request.lines.filter((line) => line.status === "submitted" || line.status === "changes_requested");
+   const selected = request.lines.filter((line) => scmStockState.selectedLineIds.has(line.id));
+   const canRequestChanges = selected.length > 0 && selected.every((line) => line.status === "submitted");
++  const snapshot=request.workflowVersion===2 && (request.regular?.handoffStatus==='complete' || request.status==='completed');
+   return `<div class="stock-request-heading">
+       <div><h2>${scmStockEscape(request.requestRef)}</h2><p>${scmStockEscape(request.requestedByName || request.requestedBy || "")} · destination ${scmStockEscape(request.destinationName)}</p></div>
+       ${scmStockPill(request.bucket || request.status)}
+@@ -234,14 +237,14 @@
+     ${window.RegularStockUI.summary(request)}
+     ${request.remarks ? `<div class="stock-request-notice"><strong>Sales remark:</strong> ${scmStockEscape(request.remarks)}</div>` : ""}
+     ${scmStockBackorderNotice(selectable)}
+-    <div class="stock-request-actions">
++    <div class="stock-request-actions" ${snapshot?'hidden':''}>
+       <button data-scm-stock-action="select-all" type="button" ${selectable.length ? "" : "disabled"}>Select actionable lines</button>
+       ${request.workflowVersion===2 ? `<button data-scm-stock-action="refresh-evidence" type="button">${window.RegularStockUI.t('Refresh stock evidence','刷新库存数据')}</button><button class="primary" data-scm-stock-action="approve-stock" type="button" ${canRequestChanges?'':'disabled'}>${window.RegularStockUI.t('Approve · TO / location change','批准 · 调货 / 更改地点')}</button><button data-scm-stock-action="approve-po" type="button" ${canRequestChanges?'':'disabled'}>${window.RegularStockUI.t('Approve · source replenishment PO','批准 · 原货场采购补货')}</button>` : `<button class="primary" data-scm-stock-action="convert" type="button" ${scmStockState.selectedLineIds.size ? "" : "disabled"}>Convert to TO</button>
+       <button data-scm-stock-action="request-changes" type="button" ${canRequestChanges ? "" : "disabled"}>Request Changes</button>`}
+       <button class="danger" data-scm-stock-action="reject" type="button" ${selectable.length ? "" : "disabled"}>${selected.length ? "Reject selected" : "Reject all actionable"}</button>
+     </div>
+     ${scmStockDecisionEditor()}
+-    <section class="stock-request-section"><h3>Request lines and all-yard availability</h3><div class="stock-request-lines">${request.lines.map(scmStockRequestLine).join("")}</div></section>`;
++    <section class="stock-request-section"><h3>${snapshot?window.RegularStockUI.t('Request lines · saved decision snapshot','申请商品 · 已保存的审核记录'):'Request lines and all-yard availability'}</h3><div class="stock-request-lines">${request.lines.map(scmStockRequestLine).join("")}</div></section>`;
+ }
+ 
+ function scmStockSelectedTransfer() {
+@@ -313,7 +316,8 @@
+     ${transfer.confirmationError ? `<div class="stock-request-notice stock-request-error"><strong>Attention:</strong> ${scmStockEscape(transfer.confirmationError)}</div>` : ""}
+     ${transfer.printInvalidatedAt ? `<div class="stock-request-notice">The prior ticket was invalidated by a quantity change. Save/sync, then use Re-print.</div>` : ""}
+     ${request.remarks ? `<div class="stock-request-notice"><strong>Sales remark:</strong> ${scmStockEscape(request.remarks)}</div>` : ""}
+-    ${scmStockBackorderNotice(transfer.lines, { transfer })}
++    ${request.status==='completed'?'':scmStockBackorderNotice(transfer.lines, { transfer })}
++    ${request.workflowVersion===2 && request.status==='completed'?`<section class="stock-request-section"><h3>${window.RegularStockUI.t('Request lines · saved decision snapshot','申请商品 · 已保存的审核记录')}</h3>${request.lines.map(line=>`<article class="stock-request-line"><strong>${scmStockEscape(line.itemName)} · ${scmStockEscape(line.sourceName)}</strong>${window.RegularStockUI.safety(request,line)}</article>`).join('')}</section>`:''}
+     <section class="stock-request-section"><h3>TO material lines</h3>
+       ${canEditStructure ? `<div class="stock-request-notice">Change a line's outbound location to move it into a separate local Pending TO for that route. Remove a line to return it to the Request queue. These route changes are available before Confirm TO + Print.</div>` : ""}
+       <div class="stock-request-lines">${transfer.lines.map((line) => scmStockTransferLine(line, { canEditQuantities: canEdit, canEditStructure })).join("")}</div>
+@@ -603,9 +607,13 @@
+ 
+ scmStockRequestApp.addEventListener("click", async (event) => {
+   const button = event.target.closest('[data-scm-stock-action], [data-yard-filter-clear="sourceLocationId"], [data-yard-filter-clear="destinationLocationId"]');
+-  if (!button || scmStockState.busy) return;
++  if (!button || scmStockState.busy || window.RegularStockDialog.isBusy()) return;
+   const action = button.dataset.scmStockAction;
++  let operation;
+   try {
++    if(['refresh-evidence','confirm-decision','save-line','convert','save-transfer','confirm-print','reprint'].includes(action)){
++      operation=window.RegularStockDialog.begin(window.RegularStockUI.t('Checking stock and processing your action…','正在检查库存并处理您的操作…'));
++    }
+     if (button.dataset.yardFilterClear) {
+       scmStockState[button.dataset.yardFilterClear === 'sourceLocationId' ? 'sourceLocationFilter' : 'destinationLocationFilter'] = '';
+       return scmStockLoad({preserveSelection: false});
+@@ -643,7 +651,7 @@
+       scmStockState.selectedLineIds = new Set(scmStockState.detail.lines.filter((line) => ["submitted", "changes_requested"].includes(line.status)).map((line) => line.id));
+       return renderScmStockRequests();
+     }
+-    if (action === "save-line") return scmStockSaveLine(button);
++    if (action === "save-line") return await scmStockSaveLine(button);
+     if(action==='refresh-evidence'){
+       button.disabled=true;
+       scmStockState.detail=await scmStockApi(`/api/scm/stock-requests/${scmStockState.detail.id}/evidence`,{method:'POST',body:'{}'});
+@@ -750,6 +758,7 @@
+     renderScmStockRequests();
+   } finally {
+     scmStockState.busy = false;
++    if(operation){renderScmStockRequests();operation.close();}
+   }
+ });
+ 
+--- a/server/public/scm-smart.js
++++ b/server/public/scm-smart.js
+@@ -740,6 +740,8 @@
+     <form class="smart-section" id="smartSettingsForm">
+       <div class="smart-section-head"><div><h2>Smart SCM controls</h2><p>Live execution is guarded by both this setting and a server environment flag. Daily planning uses the configured Toronto-local schedule.</p></div>${smartCanWrite() ? `<button class="smart-button primary" type="submit">Save settings</button>` : ""}</div>
+       <div class="smart-section-body smart-form-grid">
++        <label class="smart-field"><span>${window.RegularStockUI.t('Stock request auto-approval','库存申请自动批准')}</span><input name="regularStockAutoApprovalEnabled" type="checkbox" ${settings.regularStockAutoApprovalEnabled!==false?'checked':''} ${smartCanWrite()?'':'disabled'} /><small>${window.RegularStockUI.t('When off, every new or re-raised request requires SCM review.','关闭后，每个新申请或重新提交的申请均须 SCM 人工审核。')}</small></label>
++        <label class="smart-field"><span>${window.RegularStockUI.t('Stock request approval validity (minutes)','库存申请批准有效期（分钟）')}</span><input name="regularStockApprovalMinutes" type="number" min="1" max="10080" step="1" required value="${smartEscape(settings.regularStockApprovalMinutes ?? 15)}" ${smartCanWrite()?'':'disabled'} /><small>${window.RegularStockUI.t('Default 15. Starts after all items are reviewed; applies to new approvals. Sales can re-raise an expired request.','默认 15。所有商品审核完成后开始计时，适用于新的批准。销售可重新提交已过期的申请。')}</small></label>
+         <label class="smart-field"><span>${window.RegularStockUI.t('Stock request auto-approval lead time (hours)','库存申请自动批准提前时间（小时）')}</span><input name="regularStockLeadHours" type="number" min="0" max="87600" step="any" required value="${smartEscape(settings.regularStockLeadHours ?? 5)}" ${smartCanWrite()?'':'disabled'} /><small>${window.RegularStockUI.t('Default 5. Requests arriving sooner require SCM review. Zero disables the lead-time restriction; applies to new submissions only.','默认 5。早于此时间须 SCM 审核，设为 0 关闭提前时间限制；仅适用于新提交的申请。')}</small></label>
+         <label class="smart-field"><span>Execution mode</span><select name="executionMode" ${smartCanWrite() ? "" : "disabled"}><option value="mock" ${settings.executionMode === "mock" ? "selected" : ""}>Mock — no NetSuite write</option><option value="live" ${settings.executionMode === "live" ? "selected" : ""}>Live — guarded NetSuite PO + TO</option></select><small>Live mode inserts confirmed POs and TOs into NetSuite; TO confirmation also queues the NetSuite picking ticket.</small></label>
+         <label class="smart-field"><span>Forecast mode</span><select name="forecastMode" ${smartCanWrite() ? "" : "disabled"}><option value="formula" ${settings.forecastMode === "formula" ? "selected" : ""}>Formula only</option><option value="shadow" ${settings.forecastMode === "shadow" ? "selected" : ""}>Formula + shadow comparison</option><option value="hybrid" ${settings.forecastMode === "hybrid" ? "selected" : ""}>Promoted prediction segments</option></select><small>Hybrid uses prediction only for explicitly promoted yard/series segments.</small></label>
+@@ -1380,6 +1382,8 @@
+       method: "PUT",
+       body: {
+         regularStockLeadHours: Number(fields.get("regularStockLeadHours")),
++        regularStockAutoApprovalEnabled: fields.get("regularStockAutoApprovalEnabled") === "on",
++        regularStockApprovalMinutes: Number(fields.get("regularStockApprovalMinutes")),
+         executionMode: fields.get("executionMode"),
+         forecastMode: fields.get("forecastMode"),
+         dailyEnabled: fields.get("dailyEnabled") === "on",
+--- a/server/public/sales-stock-requests.html
++++ b/server/public/sales-stock-requests.html
+@@ -5,17 +5,19 @@
+     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+     <title>MBBS Sales Request Stock</title>
+     <link rel="stylesheet" href="/dispatch.css?v=20260811-stock-request-v1" />
+-    <link rel="stylesheet" href="/stock-requests.css?v=20260928-enhancements-v1&regular=20260929" />
++    <link rel="stylesheet" href="/stock-requests.css?v=20260928-enhancements-v1&regular=20260929-controls" />
++    <link rel="stylesheet" href="/regular-stock-dialog.css?v=20260929-controls" />
+     <link rel="stylesheet" href="/i18n.css?v=20260701-i18n-v2" />
+   </head>
+   <body class="sales-stock-requests-page">
+     <main class="dispatch-shell stock-request-shell" id="salesStockRequestApp"></main>
+     <script src="/i18n.js?v=20260815-customer-pickup-photo-gate-v1"></script>
+-    <script src="/app-sidebar.js?v=20260928-enhancements-v1&regular=20260929"></script>
++    <script src="/app-sidebar.js?v=20260928-enhancements-v1&regular=20260929-controls"></script>
+     <script src="/dispatch-auth.js?v=20260811-stock-request-private-v1"></script>
+     <script src="/delivery-instruction-upload.js?v=20260812-delivery-image-720p-v1"></script>
+-    <script src="/regular-stock-ui.js?v=20260929-confirmation-v2"></script>
+-  <script src="/sales-stock-requests.js?v=20260927-yard-layout-v1&regular=20260929-confirmation-v2"></script>
++    <script src="/regular-stock-ui.js?v=20260929-controls"></script>
++    <script src="/regular-stock-dialog.js?v=20260929-controls"></script>
++    <script src="/sales-stock-requests.js?v=20260927-yard-layout-v1&regular=20260929-controls"></script>
+     <script src="/sales-special-stock-requests.js?v=20260928-enhancements-v1"></script>
+   </body>
+ </html>
+--- a/server/public/scm-stock-requests.html
++++ b/server/public/scm-stock-requests.html
+@@ -5,20 +5,22 @@
+     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+     <title>MBBS SCM Stock Requests</title>
+     <link rel="stylesheet" href="/dispatch.css?v=20260811-stock-request-v1" />
+-    <link rel="stylesheet" href="/stock-requests.css?v=20260928-enhancements-v1&regular=20260929" />
++    <link rel="stylesheet" href="/stock-requests.css?v=20260928-enhancements-v1&regular=20260929-controls" />
+     <link rel="stylesheet" href="/aggregate-requests.css?v=20260925-aggregate-alert-v1" />
++    <link rel="stylesheet" href="/regular-stock-dialog.css?v=20260929-controls" />
+     <link rel="stylesheet" href="/i18n.css?v=20260701-i18n-v2" />
+   </head>
+   <body class="scm-stock-requests-page">
+     <main class="dispatch-shell stock-request-shell" id="scmStockRequestApp"></main>
+     <script src="/i18n.js?v=20260923-aggregate-terminology-layout-v1"></script>
+-    <script src="/app-sidebar.js?v=20260928-batch-discount-v1&regular=20260929"></script>
++    <script src="/app-sidebar.js?v=20260928-batch-discount-v1&regular=20260929-controls"></script>
+     <script src="/dispatch-auth.js?v=20260922-aggregate-v1"></script>
+     <script src="/aggregate-requests-i18n.js?v=20260925-aggregate-confirmation-date-v1"></script>
+     <script src="/scm-stock-request-tabs.js?v=20260926-special-queue-v1"></script>
+     <script src="/aggregate-requests.js?v=20260925-aggregate-confirmation-date-v1"></script>
+-    <script src="/regular-stock-ui.js?v=20260929"></script>
+-  <script src="/scm-stock-requests.js?v=20260927-yard-layout-v1&regular=20260929"></script>
++    <script src="/regular-stock-ui.js?v=20260929-controls"></script>
++    <script src="/regular-stock-dialog.js?v=20260929-controls"></script>
++    <script src="/scm-stock-requests.js?v=20260927-yard-layout-v1&regular=20260929-controls"></script>
+     <script src="/scm-special-stock-requests.js?v=20260928-enhancements-v1"></script>
+   </body>
+ </html>
+--- a/server/public/scm-smart.html
++++ b/server/public/scm-smart.html
+@@ -5,7 +5,7 @@
+     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+     <title>MBBS Smart SCM</title>
+     <link rel="stylesheet" href="/dispatch.css?v=20260720-smart-scm-v1" />
+-    <link rel="stylesheet" href="/scm-smart.css?v=20260801-blanket-ui-v2&regular=20260929" />
++    <link rel="stylesheet" href="/scm-smart.css?v=20260801-blanket-ui-v2&regular=20260929-controls" />
+     <link rel="stylesheet" href="/scm-smart-vendor.css?v=20260812-vendor-price-source-v1" />
+     <link rel="stylesheet" href="/scm-smart-blanket.css?v=20260807-blanket-editor-v1" />
+     <link rel="stylesheet" href="/scm-smart-proposals.css?v=20260801-proposal-priority-v3" />
+@@ -15,13 +15,13 @@
+   <body>
+     <main class="smart-shell" id="smartScmApp"></main>
+     <script src="/i18n.js?v=20260815-customer-pickup-photo-gate-v1"></script>
+-    <script src="/app-sidebar.js?v=20260819-scm-custom-orders-v1&regular=20260929"></script>
++    <script src="/app-sidebar.js?v=20260819-scm-custom-orders-v1&regular=20260929-controls"></script>
+     <script src="/dispatch-auth.js?v=20260716-multi-role-v1"></script>
+-    <script src="/regular-stock-ui.js?v=20260929"></script>
+-  <script src="/scm-smart.js?v=20260826-phased-planning-v1&regular=20260929"></script>
++    <script src="/regular-stock-ui.js?v=20260929-controls"></script>
++  <script src="/scm-smart.js?v=20260826-phased-planning-v1&regular=20260929-controls"></script>
+     <script src="/scm-smart-blanket.js?v=20260812-blanket-source-items-v1"></script>
+     <script src="/scm-smart-vendor.js?v=20260915-created-po-sync-v1"></script>
+-    <script src="/scm-smart-proposals.js?v=20260826-phased-planning-v1&regular=20260929"></script>
++    <script src="/scm-smart-proposals.js?v=20260826-phased-planning-v1&regular=20260929-controls"></script>
+     <script src="/scm-smart-exclusions.js?v=20260915-blanket-auto-resume-v1"></script>
+   </body>
+ </html>
+--- a/server/public/regular-stock-dialog.js
++++ b/server/public/regular-stock-dialog.js
+@@ -0,0 +1,65 @@
++(() => {
++  let active=null;
++  const t=(en,zh)=>window.RegularStockUI.t(en,zh);
++  function begin(message) {
++    if(active)throw new Error(t('An operation is already in progress.','正在处理中，请稍候。'));
++    const focus=document.activeElement,disabled=new Map();
++    const dialog=document.createElement('dialog');dialog.className='regular-stock-dialog';
++    dialog.setAttribute('aria-labelledby','regularStockDialogTitle');
++    dialog.setAttribute('aria-describedby','regularStockDialogMessage');
++    dialog.innerHTML='<div class="regular-dialog-icon" aria-hidden="true"></div><h2 id="regularStockDialogTitle" tabindex="-1"></h2><p id="regularStockDialogMessage"></p><p class="regular-dialog-expiry" aria-live="polite"></p><div class="regular-dialog-actions"></div>';
++    const title=dialog.querySelector('h2'),text=dialog.querySelector('#regularStockDialogMessage'),actions=dialog.querySelector('.regular-dialog-actions'),expiry=dialog.querySelector('.regular-dialog-expiry');
++    let mode='busy',settle=null,timer=null;
++    const lockButtons=()=>{
++      for(const button of document.querySelectorAll('button')){
++        if(dialog.contains(button))continue;
++        if(!disabled.has(button))disabled.set(button,button.disabled);
++        if(!button.disabled)button.disabled=true;
++      }
++    };
++    const observer=new MutationObserver(lockButtons);
++    const finish=answer=>{if(settle){const resolve=settle;settle=null;window.clearInterval(timer);resolve(answer);}};
++    const operation={
++      wait(message){
++        finish(false);mode='busy';dialog.dataset.state='busy';dialog.setAttribute('aria-busy','true');
++        title.textContent=t('Waiting for NetSuite','正在等待 NetSuite');text.textContent=message;
++        expiry.textContent=t('Processing your request. Please wait.','正在处理您的申请，请稍候。');actions.replaceChildren();title.focus();
++      },
++      confirm(preview){
++        mode='confirm';dialog.dataset.state='confirm';dialog.setAttribute('aria-busy','false');
++        title.textContent=preview.action.mode==='location'?t('Confirm SO location change','确认销售订单地点变更'):t('Confirm Transfer Orders','确认调货单');
++        text.textContent=window.RegularStockUI.confirmationMessage(preview.action,preview.resuming);
++        actions.replaceChildren();
++        const cancel=document.createElement('button');cancel.type='button';cancel.textContent=t('Cancel','取消');cancel.dataset.regularDialogCancel='';
++        const confirm=document.createElement('button');confirm.type='button';confirm.className='primary';confirm.dataset.regularDialogConfirm='';
++        confirm.textContent=preview.action.mode==='location'?t('Confirm location change','确认更改地点'):t('Confirm and issue TO','确认并开立调货单');
++        actions.append(cancel,confirm);
++        const updateExpiry=()=>{
++          if(!preview.approvalExpiresAt){expiry.textContent='';return;}
++          const seconds=Math.max(0,Math.ceil((new Date(preview.approvalExpiresAt).getTime()-Date.now())/1000));
++          confirm.disabled=seconds===0;
++          expiry.textContent=seconds?t(`Approval expires in ${Math.floor(seconds/60)}m ${seconds%60}s.`,`批准将在 ${Math.floor(seconds/60)} 分 ${seconds%60} 秒后过期。`)
++            :t('Approval expired. Cancel and re-raise the request.','批准已过期，请取消并重新提交申请。');
++        };
++        updateExpiry();timer=window.setInterval(updateExpiry,1000);cancel.focus();
++        return new Promise(resolve=>{settle=resolve;cancel.onclick=()=>finish(false);confirm.onclick=()=>{
++          updateExpiry();if(confirm.disabled||!settle)return;
++          cancel.disabled=true;confirm.disabled=true;finish(true);
++        };});
++      },
++      close(){
++        finish(false);window.clearInterval(timer);observer.disconnect();dialog.close();dialog.remove();
++        for(const [button,wasDisabled] of disabled)if(button.isConnected)button.disabled=wasDisabled;
++        active=null;if(focus?.isConnected)focus.focus();
++      }
++    };
++    dialog.addEventListener('cancel',event=>{event.preventDefault();if(mode==='confirm')finish(false);});
++    document.body.append(dialog);active=operation;lockButtons();observer.observe(document.body,{childList:true,subtree:true,attributes:true,attributeFilter:['disabled']});
++    dialog.showModal();operation.wait(message);return operation;
++  }
++  async function withBusy(message,work) {
++    const operation=begin(message);
++    try{return await work();}finally{operation.close();}
++  }
++  window.RegularStockDialog={begin,withBusy,isBusy:()=>!!active};
++})();
+--- a/server/public/regular-stock-dialog.css
++++ b/server/public/regular-stock-dialog.css
+@@ -0,0 +1,33 @@
++.regular-stock-dialog {
++  position: fixed; inset: 0; margin: auto; width: min(560px, calc(100vw - 32px));
++  max-height: calc(100dvh - 48px); overflow-y: auto; box-sizing: border-box;
++  padding: 32px; border: 1px solid #bed2d5; border-radius: 20px;
++  background: #fff; color: #1b3036; box-shadow: 0 24px 90px #102f4c55;
++  text-align: center;
++}
++.regular-stock-dialog::backdrop { background: #102731b8; backdrop-filter: blur(3px); }
++.regular-stock-dialog h2 { margin: 16px 0 12px; font-size: 1.5rem; line-height: 1.25; outline: none; }
++.regular-stock-dialog p { white-space: pre-line; overflow-wrap: anywhere; line-height: 1.6; margin: 12px 0; }
++.regular-dialog-icon { width: 44px; height: 44px; margin: auto; border: 4px solid #d2eeee; border-radius: 50%; }
++.regular-stock-dialog[data-state="busy"] .regular-dialog-icon { border-top-color: #087e83; animation: regular-stock-spin 1s linear infinite; }
++.regular-stock-dialog[data-state="confirm"] .regular-dialog-icon { background: #e5f5f3; color: #087b77; border-color: #91d3cc; }
++.regular-stock-dialog[data-state="confirm"] .regular-dialog-icon::after { content: "→"; font-size: 28px; line-height: 40px; }
++.regular-dialog-expiry { color: #5a6973; font-size: .9rem; }
++.regular-dialog-actions { display: flex; gap: 12px; justify-content: center; margin-top: 24px; }
++.regular-dialog-actions:empty { display: none; }
++.regular-dialog-actions button { min-height: 46px; padding: 12px 20px; border-radius: 10px; cursor: pointer; border: 1px solid #bccbd2; font: inherit; font-weight: 650; background: #fff; color: #273d45; }
++.regular-dialog-actions button.primary { background: #087b77; color: #fff; border-color: #087b77; }
++.regular-dialog-actions button:disabled { opacity: .5; cursor: wait; }
++.regular-dialog-actions button:focus-visible { outline: 3px solid #3c9ccc; outline-offset: 3px; }
++.regular-stock-review-reasons ul { margin: 8px 0 0; padding-left: 20px; }
++.regular-stock-review-reasons li + li { margin-top: 8px; }
++@keyframes regular-stock-spin { to { transform: rotate(360deg); } }
++@media (max-width: 480px) {
++  .regular-stock-dialog { padding: 24px 20px; }
++  .regular-dialog-actions { flex-direction: column-reverse; }
++}
++@media (prefers-reduced-motion: reduce) {
++  .regular-stock-dialog[data-state="busy"] .regular-dialog-icon { animation: none; }
++}
++
++.stock-request-actions[hidden]{display:none}
+--- a/server/migrations/240_regular_stock_approval_controls.sql
++++ b/server/migrations/240_regular_stock_approval_controls.sql
+@@ -0,0 +1,19 @@
++ALTER TABLE scm_smart_settings
++  ADD COLUMN regular_stock_auto_approval_enabled boolean NOT NULL DEFAULT true,
++  ADD COLUMN regular_stock_approval_minutes integer NOT NULL DEFAULT 15
++    CHECK (regular_stock_approval_minutes BETWEEN 1 AND 10080);
++
++CREATE UNIQUE INDEX regular_stock_handoffs_sales_order_unique ON regular_stock_handoffs(sales_order_id);
++CREATE UNIQUE INDEX regular_stock_handoffs_sales_ref_unique ON regular_stock_handoffs(upper(btrim(sales_order_ref)));
++
++-- Preserve the original deadline for unused approvals; claimed work can recover.
++WITH approvals AS (
++  SELECT r.id, COALESCE(max(l.decided_at),r.updated_at) AS approved_at
++  FROM sales_stock_requests r JOIN sales_stock_request_lines l ON l.request_id=r.id
++  WHERE r.workflow_version=2 AND NOT EXISTS(SELECT 1 FROM regular_stock_handoffs h WHERE h.request_id=r.id)
++  GROUP BY r.id
++  HAVING bool_or(l.status='approved') AND bool_and(l.status IN ('approved','rejected','cancelled'))
++)
++UPDATE sales_stock_requests r SET regular_details=r.regular_details||jsonb_build_object(
++  'approvedAt',a.approved_at,'approvalValidityMinutes',15,'approvalExpiresAt',a.approved_at+interval '15 minutes')
++FROM approvals a WHERE r.id=a.id AND NOT r.regular_details ? 'approvalExpiresAt';

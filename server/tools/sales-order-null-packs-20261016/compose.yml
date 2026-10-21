@@ -1,0 +1,23 @@
+services:
+  test:
+    image: mbbs-operator-app:dispatch-editor-control-browser-test-20261015
+    working_dir: /app
+    labels:
+      com.mbbs.lifecycle: disposable-test
+    volumes:
+      - /tmp/mbbs-so-null-packs-tools-20261016/node_modules:/app/node_modules:ro
+      - ./server/src:/app/src:ro
+      - ./server/public:/app/public:ro
+      - ./server/test:/app/test:ro
+      - ./server/migrations:/app/migrations:ro
+      - ./server/tools/sales-order-null-packs-20261016:/app/tools/sales-order-null-packs-20261016:ro
+      - ./server/package.json:/app/package.json:ro
+      - ./server/netsuite-field-sales-restlet.js:/app/netsuite-field-sales-restlet.js:ro
+      - ./server/netsuite-smart-scm-picking-ticket-restlet.js:/app/netsuite-smart-scm-picking-ticket-restlet.js:ro
+      - ./server/eslint.mbt.config.js:/app/eslint.mbt.config.js:ro
+  migrate:
+    image: mbbs-operator-app:dispatch-editor-control-browser-test-20261015
+    working_dir: /app
+    volumes:
+      - ./server/src:/app/src:ro
+      - ./server/migrations:/app/migrations:ro

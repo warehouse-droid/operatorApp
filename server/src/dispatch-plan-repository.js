@@ -1,6 +1,7 @@
 import { overlayFulfilledSalesDeliveryPlanning, assertSalesDeliveryPlanningAllowed } from "./dispatch-fulfilled-so-repository.js";
 import { isSalesPackingReconciliationReview } from "./dispatch-fulfilled-so-policy.js";
 import { query, withTransaction } from "./db.js";
+import { assertDispatchSplitQuantityChanges } from './dispatch-split-quantity-repository.js';
 import { deferDispatchPlanMaintenance, enqueueDispatchPlanMaintenance } from "./dispatch-plan-maintenance-queue.js";
 import { applyPendingDispatchPlanMaintenance, notifyDispatchPlanMaintenance } from "./dispatch-plan-maintenance.js";
 import { persistedDispatchPlan } from './dispatch-plan-fence.js';
@@ -1389,6 +1390,7 @@ export async function saveDispatchPlanSnapshot(planId, {
     const existingPlan = currentPlan.rows[0];
     if (!existingPlan) throw new Error("Dispatch plan not found.");
     const previousPlan = persistedDispatchPlan(existingPlan);
+    await assertDispatchSplitQuantityChanges({ orders }, { previousPlan });
     const addressPreserved = preserveDispatchPlanAddresses(previousPlan, { orders, trucks, summary });
     orders = addressPreserved.orders;
     summary = addressPreserved.summary;

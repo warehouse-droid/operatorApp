@@ -1,0 +1,33 @@
+{
+  "runtime": [
+    "src/dispatch-source-notice-policy.js",
+    "src/dispatch-executed-order-review-repository.js",
+    "public/dispatch.js",
+    "public/dispatch.html"
+  ],
+  "primary": [
+    "test/dispatch/unit/dispatch-source-notice-policy.test.js",
+    "test/dispatch/integration/dispatch-source-notice-policy.test.js",
+    "test/dispatch/frontend/dispatch-source-notice-policy.browser.test.mjs"
+  ],
+  "regressions": [
+    "test/dispatch/unit/dispatch-source-decision.test.js",
+    "test/dispatch/unit/dispatch-executed-order-review.test.js",
+    "test/dispatch/property/dispatch-executed-order-review.test.js",
+    "test/dispatch/property/dispatch-planned-source-review.test.js",
+    "test/dispatch/integration/dispatch-source-decision.test.js",
+    "test/dispatch/integration/dispatch-executed-order-review.test.js",
+    "test/dispatch/integration/dispatch-executed-review-active-lines.test.js",
+    "test/dispatch/integration/dispatch-weight-source-review.test.js",
+    "test/dispatch/frontend/dispatch-reviewed-notice.test.js",
+    "test/dispatch/frontend/dispatch-source-replan-notice.test.js",
+    "test/dispatch/frontend/dispatch-source-decision.browser.test.mjs",
+    "test/dispatch/frontend/dispatch-executed-order-review.browser.test.mjs",
+    "test/dispatch/frontend/dispatch-reviewed-notice-dismiss.browser.test.mjs",
+    "test/dispatch/integration/unfinished-sales-resplit.test.js",
+    "test/dispatch/frontend/split-dialog-fast.browser.test.mjs"
+  ],
+  "support": [
+    "test/dispatch-source-notice-policy-spec.md"
+  ]
+}

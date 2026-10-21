@@ -1,0 +1,15 @@
+[
+  "public/backorder-workflow.js",
+  "public/backorder-stock-requests.js",
+  "src/special-stock-request-repository.js",
+  "public/sales-stock-requests.js",
+  "public/scm-stock-requests.js",
+  "public/sales-stock-requests.html",
+  "public/scm-stock-requests.html",
+  "src/special-stock-planning.js",
+  "src/dispatch-plan-repository.js",
+  "migrations/270_backorder_order_completion.sql",
+  "public/stock-request-queue-filter.js",
+  "src/stock-request-repository.js",
+  "src/backorder-request-service.js"
+]

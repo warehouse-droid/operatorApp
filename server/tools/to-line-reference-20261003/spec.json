@@ -1,0 +1,38 @@
+{
+  "task": "Correct transfer fulfillment line references without changing Operator or Dispatch quantities, and reproduce and fix stale failed attempts",
+  "tier": 3,
+  "specApproval": "not obtained (autonomous run); user authorized the TO reference correction and requested reproduction before correcting stale failed attempts",
+  "acceptance": [
+    "TOB01189 visible source lines 1,4,7 must map to the proven outbound fulfillment legs 2,5,8 for the same items and selected quantities 5,1,4; source keys and source-sublist IDs remain distinct.",
+    "Map each TO item using exact retained source/physical-row identity, not an arithmetic +1 or SKU-only lookup; reject missing, duplicate, cross-item, cross-order, or conflicting mappings before posting.",
+    "Preserve all Operator/Dispatch display and packing quantities, conversions, stable line IDs, locations, statuses, plans, and existing fulfillment/receipt history; selected quantity remains attached to its exact fulfillment line.",
+    "Support repeated items, non-consecutive/reordered line IDs, partial confirmed quantities, deselected static-sublist lines, and local splits referencing their exact source lines.",
+    "Future sync/webhooks cannot restore incorrect TO fulfillment mappings; existing cached TOs receive a bounded, inspectable, idempotent mapping repair with concurrency checks and before/after operational hashes.",
+    "TO receipt references remain separately verified; no unproven change to receiving or SO/PO behavior.",
+    "Reproduce an immediate failed-job response and a polled failure in isolated browser execution. Both must clear pending state, show the error, and issue a new request ID only after definitive failure.",
+    "On unknown or active outcomes, retain the request identity and recovery journal to prevent duplicate fulfillment. Opening an order with a previously failed journal clears the stale block.",
+    "No historical failed command is automatically reposted and no live NetSuite fulfillment is created as a test. Correction makes subsequent operator-confirmed attempts use validated references.",
+    "Capture baseline runtime for app and worker, run focused and broad regression plus types/lint/coverage/property/mutation and browser checks, deploy only reviewed files atop each actual runtime image, verify live health and quantities, and retain rollback artifacts."
+  ],
+  "failureModel": {
+    "wrongItemOrQty": "authoritative production fixture, independent expected payloads, property tests and quantity-preservation hashes",
+    "staleMapping": "sync/webhook integration, guarded backfill and repeated-apply test",
+    "duplicateFulfillment": "terminal-vs-uncertain browser retry tests and existing durable-claim regression",
+    "partialRepairOrRace": "transaction rollback rehearsal and version-checked updates",
+    "unrelatedDeploymentChange": "pinned image overlays and runtime file hashes"
+  },
+  "setup": "Existing Docker Node/PostgreSQL/browser images, TypeScript, ESLint, c8 and fast-check. No dependencies, git reset, unrelated edits or checkpoint commits. Persist spec, tests, gauntlet and evidence in the repository; backups outside source.",
+  "clarifications": [
+    "Live IR14414 and IR14413 prove TO receiving uses destination physical lines 3,6,9 independently from visible source 1,4,7 and outbound fulfillment 2,5,8.",
+    "Use an exact posting-boundary mapping from retained physical row evidence for existing and future TOs. Preserve netsuite_order_line as the actual source-sublist ID. No schema migration or business-data rewrite is needed; audit all active TOs and use existing read-only source resolution for webhook rows without complete evidence.",
+    "The Chromium reproduction confirmed immediate failed responses lose posting metadata and retain the pending journal/failed request ID. Polled failures already reset correctly; preserve that behavior and unknown-outcome idempotency.",
+    "User subsequently expanded scope: all Delivery Prep saves locally before NetSuite; TO IF requires Operator load AND matching effective Driver drop-off completion, and TO IR requires Operator receipt AND matching effective Driver drop-off completion, in either order.",
+    "Add a durable transactional TO posting outbox with immutable per-attempt quantities, backend mapping and yard gates, external-ID recovery, Admin attention and audited retry. No historical load/receipt backfill or automatic replay of old failed commands.",
+    "NetSuite failure must not block Operator or change the saved local status. Background completion attaches remote evidence without repeating local load/receipt. Pending or ambiguous transactions retain their existing external identity.",
+    "Tests will cover both gate orders, neither/single/both evidence, mismatched plan/load, cancellation, immutable partial quantities, duplicate saves/workers, transaction rollback, bad IDs, Admin-only errors/retry, and browser local completion without polling NetSuite.",
+    "Update prior ownership assertions that explicitly required synchronous TO posting to the newly requested Driver-completion ownership. Update the prior visible-line receipt expectation to proven physical IF/IR legs. Unrelated stale hard-coded cache tests remain recorded as baseline failures.",
+    "The webhook worker only ingests source data and has no posting runtime, so deploy the app only. Current live special-case-fields build has identical baseline content for every changed file; use that newer base to preserve concurrent fixes.",
+    "Existing noninventory and stored-source regression fixtures now include explicit TO physical evidence and assert separate IF/IR IDs. Consolidation HTTP admission now asserts immediate local completion, one durable TO job waiting for Driver, no NetSuite reads, and idempotent resume.",
+    "Adversarial execution reproduced an ambiguous-assignment gap: two planned loads and one old completion could admit a new local load. Capture this ambiguity with the immutable Operator snapshot and hold posting for Admin instead of selecting an unproven load. Local loading still succeeds."
+  ]
+}

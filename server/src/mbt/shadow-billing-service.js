@@ -539,7 +539,9 @@ async function selectedCalculationDump(input, billingCase, visitId) {
          JOIN mbt_evidence evidence
            ON evidence.evidence_id = receipt.receipt_photo_evidence_id
         WHERE receipt.dump_receipt_id = $1
-          AND receipt.service_visit_id = $2`,
+          AND (receipt.service_visit_id = $2 OR EXISTS (
+            SELECT 1 FROM mbt_bin_order_parts part
+            WHERE part.visit_id=receipt.service_visit_id AND part.order_id=$2))`,
       [receiptId, visitId]
     );
   if (!receiptResult.rowCount) {

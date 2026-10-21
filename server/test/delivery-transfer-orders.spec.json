@@ -1,0 +1,32 @@
+{
+  "feature": "Delivery Requests link Sales Orders and Transfer Orders",
+  "tier": 3,
+  "specApproval": "not obtained (autonomous run); user authorized the feature and existing session authorizes deployment",
+  "setup": {
+    "dependencies": [],
+    "tools": ["existing Node", "PostgreSQL", "Playwright", "fast-check", "c8", "TypeScript", "ESLint"],
+    "git": "Preserve unrelated workspace changes; no commits",
+    "environment": "Standard isolated Compose, mbbs-tests.slice and bounded resources; register teardown before startup; remove test containers, volumes and networks after every run",
+    "artifacts": "server/test-artifacts/delivery-transfer-orders-20261015",
+    "release": "Overlay only tested files onto the current live image; keep rollback image, preserve configuration and dependencies; no production data copied into tests"
+  },
+  "scenarios": [
+    {"id":"references","behavior":"Accept SO123, TO123 or a mixed list; trim and uppercase, deduplicate in input order, require 1–50 entries; reject PO, malformed and nontext inputs."},
+    {"id":"eligible-transfer","behavior":"A retained, active TO can secure approval when the requesting yard equals its sending or receiving yard; missing, inactive, closed/rejected-family and unrelated-yard TOs cannot be linked."},
+    {"id":"atomic-links","behavior":"Mixed-order linking and replacement is atomic. Invalid TOs preserve existing links, status, revision and events. Same-request concurrent edits have one winner; retries are idempotent."},
+    {"id":"approval","behavior":"TO-only approval stops expiry, retains the approved window and quote, supports time changes, and cancellation releases the links. The existing deadline and role/yard checks apply."},
+    {"id":"planning","behavior":"Linked TOs receive priority and approved time in normal and paginated Dispatch feeds; removing a link or cancelling restores the original window."},
+    {"id":"preview","behavior":"Both teams can preview a linked TO summary with reference, sending/receiving yard, memo and original Quantity/PLT/LYR/SEC/PCS. No prices, duplicate receiving-stage lines or retired lines. Unlinked/unauthorized previews are denied."},
+    {"id":"ui","behavior":"Sales can add, exchange and unlink SOs/TOs on desktop/mobile, retaining at least one order. Dispatch has no Sales edit controls. TO-only requests do not call Sales Order instruction endpoints; mixed requests retain SO instructions."},
+    {"id":"compatibility","behavior":"Keep existing SO linkage, native SO PDF preview, quantity-only EST preview, SO instruction editing, pricing, approval timing and notifications. Preserve the existing salesOrderRefs API/storage field and link table; no migration or NetSuite write."}
+  ],
+  "failureModel": {
+    "unauthorizedOrder": "real database and HTTP tests for request audience, yard, missing/closed/inactive TOs and preview membership",
+    "partialOrLostLink": "database rollback, replay and concurrent revision tests",
+    "wrongTimeslot": "normal/paged planning tests, replacement and cancellation assertions",
+    "invalidReference": "hostile-input cases and fast-check normalization properties",
+    "brokenInterface": "browser tests with SO-only, TO-only and mixed links at desktop/mobile sizes",
+    "silentRegression": "complete Delivery Request and instruction regression suites, baseline comparison, static checks, changed-line coverage and manual mutations",
+    "unsafeDeployment": "exact image source hashes, configuration comparison, quiet-operation preflight, automatic rollback and public HTTP health checks"
+  }
+}

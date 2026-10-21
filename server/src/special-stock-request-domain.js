@@ -1,4 +1,5 @@
 import { SPECIAL_LINE_SCM_FIELDS } from '../public/special-stock-line-fields.js';
+import { normalizePackQuantities } from '../public/order-pack-quantities.js';
 import { SPECIAL_TRANSFER_ETA_MODE } from '../public/special-stock-transfer-eta.js';
 import { normalizeSpecialExpiry } from '../public/special-stock-expiry.js';
 import { normalizeSpecialSalesInternalRemark } from '../public/special-stock-internal-remark.js';
@@ -153,7 +154,7 @@ function normalizeCaseLine(line, index, { minimumRequiredDate, workflowKind = 's
     color: text(line.color, { max: 200 }),
     size: text(line.size, { max: 200 }),
     detailSpec: text(line.detailSpec, { max: 2000 }),
-    .../** @type {{palletQty:number,layerQty:number,sectionQty:number,pieceQty:number}} */ (Object.fromEntries(["palletQty", "layerQty", "sectionQty", "pieceQty"].map(field => [field, finiteNumber(line[field] ?? 0, field, {allowZero:true,code:"SPECIAL_PACK_QUANTITY_INVALID"})]))),
+    ...normalizePackQuantities(line),
     quantity: finiteNumber(line.quantity, `Line ${index + 1} quantity`, {
       maximum: SPECIAL_CASE_MAX_QUANTITY,
       code: "SPECIAL_CASE_QUANTITY_INVALID"

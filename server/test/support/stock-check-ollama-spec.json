@@ -1,0 +1,17 @@
+{
+  "task": "Use Ollama for ambiguous Unilock catalogue matching",
+  "tier": 2,
+  "specApproval": "not obtained (autonomous run; user authorized prompt design and read-only historical evaluation)",
+  "setup": "Existing Ollama qwen3:4b-instruct, existing test toolchain and bounded isolated Compose. No dependencies, schema migrations or commits.",
+  "behaviors": [
+    "Live Stock Check asks Ollama to resolve ambiguous material descriptions against variants from the scraped Unilock catalogue.",
+    "Unique exact and saved matches skip Ollama. Ordinary reads and result polling never call the model.",
+    "Only a known candidate SKU with high confidence and compatible explicit colour, dimensions, thickness and handedness may auto-select.",
+    "Uncertain, conflicting, invented, duplicate and malformed matches retain manual selection with a clear explanation.",
+    "Model outages and timeouts leave stock checks usable through manual selection.",
+    "Matching is read-only: no request, response, order, job, cart or catalogue writes. Historical evaluation must not queue live stock jobs.",
+    "Changed requests or catalogue data invalidate a pending match. Duplicate calls share bounded cached inference.",
+    "Model input contains product descriptors and catalogue variants only, without customer details, credentials, prices or internal notes.",
+    "Real historical special-order matching is evaluated against the existing Ollama service from a bounded client, with production data access limited to SELECT."
+  ]
+}

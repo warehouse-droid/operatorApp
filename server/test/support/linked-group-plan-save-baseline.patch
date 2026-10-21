@@ -1,0 +1,57 @@
+--- a/src/server.js
++++ b/src/server.js
+@@ -1,4 +1,3 @@
+-import { dispatchDependencyOrderRefs } from './yard-dependency-structure.js';
+ import { saveSmartScmProposalLineOrder } from "./smart-scm-line-order-repository.js";
+ import {enqueueDeliveryOperation,getDeliveryOperation,activeDeliveryOperation,createDeliveryOperationRuntime} from './regular-stock-delivery-operations.js';
+ import {submitRegularStockRequest,editRegularStockRequest,decideRegularStockRequest,refreshRegularStockEvidence,regularStockAlerts,acknowledgeRegularStockDecisions,reraiseRegularStockRequest} from './regular-stock-request-service.js';
+@@ -6946,14 +6945,11 @@
+   for (const order of plan.orders || []) {
+     const id = String(order?.id || "").trim();
+     if (!id) continue;
+-    const structuralRefs = new Set(dispatchDependencyOrderRefs(order));
+     const childRefs = [...new Set([
+       ...(order?.childOrders || []),
+       ...(order?.childOrderDetails || []).flatMap((child) => [child?.id, child?.originalOrderId])
+-    ].map((value) => String(value || "").trim()).filter(Boolean))]
+-      .filter((ref) => structuralRefs.has(ref)).sort();
+-    const originalRef = String(order?.originalOrderId || "").trim();
+-    const parentRef = structuralRefs.has(originalRef) ? originalRef : "";
++    ].map((value) => String(value || "").trim()).filter(Boolean))].sort();
++    const parentRef = String(order?.originalOrderId || "").trim();
+     if (childRefs.length) {
+       const token = `group:${id}:${childRefs.join("|")}`;
+       containers.set(id, { signature: token, refs: [id, ...childRefs] });
+@@ -7022,29 +7018,10 @@
+     .map(([sourceOrderRef, groupRef]) => ({ sourceOrderRef, groupRef }));
+ }
+ 
+-async function dispatchOrderStructureComparisonPlan(previousPlan = {}, nextPlan = {}) {
+-  const previousRefs = new Set((previousPlan.orders || []).map((order) => String(order?.id || "").trim()));
+-  const groupRefs = [...new Set((nextPlan.orders || [])
+-    .filter((order) => order?.type === "SO"
+-      && (order.childOrders?.length || order.childOrderDetails?.length)
+-      && !previousRefs.has(String(order.id || "").trim()))
+-    .map((order) => String(order.id || "").trim()).filter(Boolean))];
+-  if (!groupRefs.length) return previousPlan;
+-  const established = await query(
+-    `SELECT full_order FROM dispatch_global_order_groups
+-      WHERE group_ref = ANY($1::text[]) AND active = true AND order_type = 'SO'`,
+-    [groupRefs]
+-  );
+-  // Entering a date's snapshot does not recreate an existing global group.
+-  // Compare its persisted members so real membership edits remain protected.
+-  return { ...previousPlan, orders: [...(previousPlan.orders || []), ...established.rows.map((row) => row.full_order)] };
+-}
+-
+ async function assertNoConsolidationStructureConflict(previousPlan, nextPlan) {
+-  const comparisonPlan = await dispatchOrderStructureComparisonPlan(previousPlan, nextPlan);
+-  const changedRefs = changedDispatchOrderStructureRefs(comparisonPlan, nextPlan);
+-  const safeGroupingTargets = safeNormalDependencyGroupingTargets(comparisonPlan, nextPlan);
+-  const safeUngroupTargets = safeEstablishedDependencyUngroupingTargets(comparisonPlan, nextPlan);
++  const changedRefs = changedDispatchOrderStructureRefs(previousPlan, nextPlan);
++  const safeGroupingTargets = safeNormalDependencyGroupingTargets(previousPlan, nextPlan);
++  const safeUngroupTargets = safeEstablishedDependencyUngroupingTargets(previousPlan, nextPlan);
+   const result = { safeGroupingTargets, safeUngroupTargets };
+   if (!changedRefs.length) return result;
+   await assertNoActiveConsolidationClaimsByRefs(changedRefs, "group, ungroup, split, or unsplit these orders");

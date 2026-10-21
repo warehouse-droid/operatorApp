@@ -44,7 +44,7 @@ test("Sales and SCM Special tabs are real feature-gated interfaces", () => {
   for (const required of ["customerName", "vendorName", "productName", "quantity", "requiredDate"]) {
     assert.match(salesSpecial, new RegExp(required, "u"));
   }
-  for (const required of ["supplyStatus", "availableDate", "unitPurchaseCost", "data-special-readiness-form"]) {
+  for (const required of ["supplyStatus", "availableDate", "unitPurchaseCost", "data-special-stock-check-form"]) {
     assert.match(scmSpecial, new RegExp(required, "u"));
   }
   assert.match(scmSpecial, /data-special-scm-vendor-search/u);
@@ -52,7 +52,9 @@ test("Sales and SCM Special tabs are real feature-gated interfaces", () => {
   assert.match(scmSpecial, /data-special-po-form/u);
   assert.match(salesSpecial, /data-special-so-link-search/u);
   assert.match(salesSpecial, /Case inquiry date/u);
-  assert.match(salesSpecial, /NetSuite Quote ID \(optional\)/u);
+  assert.doesNotMatch(salesSpecial, /NetSuite Quote ID \(optional\)/u);
+  assert.match(salesSpecial, /data-special-document="draft_quote"/u);
+  assert.match(salesSpecial, /installSpecialDocumentPreviews/u);
   assert.match(salesSpecial, /data-special-case-customer-search/u);
   assert.match(salesSpecial, /data-special-case-vendor-search/u);
   assert.doesNotMatch(salesSpecial, /data-special-decision-item-search/u);

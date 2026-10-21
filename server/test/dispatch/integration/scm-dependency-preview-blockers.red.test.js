@@ -222,7 +222,7 @@ test("PO link ignores retired rows when a reused split ref has a current active 
   }
 });
 
-test("shared preview allows untouched work but blocks once Operator line work starts", async () => {
+test("shared preview remains available when Operator loading starts", async () => {
   const rollback = await beginRollbackContext();
   try {
     await rollback.run(async () => {
@@ -237,11 +237,10 @@ test("shared preview allows untouched work but blocks once Operator line work st
       assert.equal(untouched.allowed, true);
       assert.deepEqual(untouched.blockers, []);
 
-      await query("UPDATE sales_order_lines SET confirmed = true WHERE id = $1", [seeded.salesLineId]);
+      await query("UPDATE sales_order_lines SET loaded_qty = 1 WHERE id = $1", [seeded.salesLineId]);
       const started = await previewScmDependencyMutation(command, { id: "scm", sessionId: "scm-browser" });
-      assert.equal(started.allowed, false);
-      assert.equal(started.blockers[0].code, "OPERATOR_ACTIVITY_STARTED");
-      assert.ok(started.blockers[0].details.refs.includes(seeded.targetRef));
+      assert.equal(started.allowed, true);
+      assert.deepEqual(started.blockers, []);
     });
   } finally {
     await rollback.rollback();
