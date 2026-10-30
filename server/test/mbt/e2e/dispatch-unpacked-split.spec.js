@@ -1,4 +1,4 @@
-import { expect, test } from "@playwright/test";
+import { expect, test } from "./mbt-e2e-test.js";
 
 async function fixture(page, { ref = "SOM06255", status = "open", fail = false } = {}) {
   const staleOrder = {

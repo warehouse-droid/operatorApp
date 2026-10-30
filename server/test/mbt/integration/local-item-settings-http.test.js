@@ -90,15 +90,17 @@ after(async () => {
   await closeDb();
 });
 
-test("LC07/LC09: local item reads are Admin-only, no-store, bounded, and externally quiet", async () => {
+test("LC07/LC09: local item reads allow authorized Dispatch lookup, are no-store, bounded, and externally quiet", async () => {
   const anonymous = await request("/api/mbt/config/local/items");
   assert.equal(anonymous.response.status, 401);
 
   const dispatcher = await request("/api/mbt/config/local/items", { actor: "dispatcher" });
-  assert.equal(dispatcher.response.status, 403);
+  assert.equal(dispatcher.response.status, 200);
+  assert.match(dispatcher.response.headers.get("cache-control") || "", /no-store/);
 
   const admin = await request("/api/mbt/config/local/items", { actor: "admin" });
   assert.equal(admin.response.status, 200);
+  assert.deepEqual(dispatcher.payload, admin.payload);
   assert.match(admin.response.headers.get("cache-control") || "", /no-store/);
   assert.equal(admin.payload.schemaVersion, "mbt-local-items-v1");
   assert.deepEqual(admin.payload.items.filter(({ systemOwned }) => systemOwned).map(({ itemCode }) => itemCode), [

@@ -1,3 +1,4 @@
+import { seedReviewedLegacyFulfillment } from '../../support/legacy-fulfillment-candidate.mjs';
 // @ts-check
 import assert from "node:assert/strict";
 import crypto from "node:crypto";
@@ -130,9 +131,10 @@ async function seed({ kind = "po", owner = "split", quantity = 947.73, different
   }
   await seedDriverJobs({ kind, missingPickup, differentLoad, pickupJob, dropJob,
     planId, loadId, splitRef, supplyRef });
+  await seedReviewedLegacyFulfillment(splitRef);
   const candidates = (await query(`SELECT id FROM dispatch_sales_order_if_candidates
     WHERE dispatch_order_ref=$1`, [splitRef])).rows;
-  assert.equal(candidates.length, 1, "a real driver completion must enqueue exactly one candidate");
+  assert.equal(candidates.length, 1, "exactly one reviewed historical candidate is retained");
   return { candidateId: candidates[0].id, parentId, parentLine, splitLine,
     splitRef, siblingLine, quantity, pickupJob, dropJob, supplyEvidenceId };
 }

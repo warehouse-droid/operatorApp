@@ -1,3 +1,4 @@
+import { seedReviewedLegacyFulfillment } from '../../support/legacy-fulfillment-candidate.mjs';
 import assert from 'node:assert/strict';
 import crypto from 'node:crypto';
 import test, {after} from 'node:test';
@@ -42,6 +43,7 @@ const dependencies=f=>({fetchSource:async()=>source(f),getPolicy:input=>getOpera
 
 test('fully direct special SO materializes its 270.78 delivered quantity with exact pickup/drop evidence',()=>rollback(async()=>{
   const f=await seed();await deliver(f);
+  await seedReviewedLegacyFulfillment(f.so);
   const candidate=(await query('SELECT id FROM dispatch_sales_order_if_candidates WHERE dispatch_order_ref=$1',[f.so])).rows[0];
   const prepared=await prepareSalesOrderAutoFulfillmentCandidate(candidate.id);
   assert.equal(prepared.status,'queued');assert.equal(prepared.lineSnapshot.length,1);
@@ -170,7 +172,7 @@ test('scheduler retains a command when the remote posting boundary is unavailabl
 
 test('changed direct route identity is held with a persisted pickup-evidence error',()=>rollback(async()=>{
   const f=await seed();await deliver(f);
-  await query("UPDATE purchase_orders SET tranid='CHANGED-'||tranid,dispatch_ref='CHANGED-'||dispatch_ref WHERE netsuite_id=$1",[f.id+1]);
+  await query("UPDATE driver_job_records SET load_id='CHANGED-'||load_id WHERE job_id=$1",[f.drop]);
   const job=(await query('SELECT id FROM dispatch_direct_po_ir_jobs WHERE local_po_id=$1',[f.id+1])).rows[0];
   const tick=await directPoAutoReceiptTick({directAccessEnabled:true,prepare:id=>prepareDirectPoReceiptJob(id,dependencies(f)),enqueue:async()=>assert.fail('invalid proof cannot queue')});
   assert.equal(tick.discovered,1);

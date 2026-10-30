@@ -58,7 +58,7 @@ for(const audience of ['sales','scm'])for(const kind of ['special','backorder'])
       if(audience==='scm'&&kind==='special') {
         for(const id of [1,2])await expect(page.locator(`[data-scm-line-id="${id}"] .stock-live-summary > span`).first())
           .toHaveText('Waiting for Production · ETA: 2099-02-01 · Pickup: TEST Yard');
-        await expect(page.locator('[data-scm-line-id="2"] select[name="ready"]')).toHaveValue('false');
+        await expect(page.locator('[data-scm-line-id="2"] select[name="supplyStatus"]')).toHaveValue('production');
         await expect(page.locator('[data-scm-line-id="3"] .stock-live-summary > span').first())
           .toHaveText('Wait for Transfer · ETA: 2099-02-01 · Pickup: TEST Yard');
       }
@@ -70,7 +70,7 @@ for(const audience of ['sales','scm'])for(const kind of ['special','backorder'])
           })};
       });
       assert.ok(layout.scrollWidth<=layout.width,'Card labels must not overflow');
-      if(width===1920)assert.ok(Math.max(...layout.centers)-Math.min(...layout.centers)<2,'Waiting labels share the heading row when space permits');
+      if(width===1920)assert.ok(Math.max(...layout.centers)-Math.min(...layout.centers)<2,'Waiting labels share the heading row when space permits: '+JSON.stringify(layout));
       else assert.ok(layout.centers[2]>layout.centers[0],'Waiting labels wrap on a narrow card');
       await page.screenshot({path:`${out}/${audience}-${kind}-${width}-waiting.png`,fullPage:true});
       const action=kind==='special'?`data-special-${audience}-action`:`data-${audience}-stock-action`;

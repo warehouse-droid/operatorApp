@@ -21,14 +21,14 @@ function functions(file, names, values) {
 
 function chargeDialog(kind, priorContract = null) {
   const values = {
-    state: { selectedCustomer: { phone: '4165550100', sites: [] }, contract: priorContract,
+    state: { chargeRequests: [], chargeConfigurationByRate: new Map(), selectedCustomer: { phone: '4165550100', sites: [] }, contract: priorContract,
       configuration: { deliveryItems: [{ itemCode: 'DELIVERY_CHARGE_MBBS' }, { itemCode: 'DELIVERY_CHARGE_MBT' }] }, serviceLines: [] },
     selectableServices: () => [{ rateCardVersionId: 'rate' }], contractRateCardVersionId: () => 'rate',
     populateChargeServiceOptions() {}, loadChargeConfiguration: async () => ({}),
     populateContentAndBins() {}, localDateTimeValue: () => '2037-08-03T08:00', fullAddress: () => 'Test site',
     contractLineContent: () => 'garbage', setMessage: message => assert.fail(message),
     customerChargeForm: { reset() {} }, chargeBinFields: { querySelectorAll: () => [] },
-    newContractDialog: { close() {} }, customerChargeDialog: { showModal() {} }, addAggregateRow() {},
+    newContractDialog: { close() {} }, customerChargeDialog: { showModal() {} }, addAggregateRow() {}, addAggregateLine() {},
     Option: function(label, value) { this.text = label; this.value = value; }
   };
   for (const id of ['chargeServiceCode', 'aggregateLineEditor', 'customerChargeSummary', 'confirmCustomerCharge',
@@ -38,6 +38,7 @@ function chargeDialog(kind, priorContract = null) {
     values[id] = { value: '', replaceChildren(...items) { this.options = items; },
       options: [], append(item) { this.options.push(item); } };
   }
+  values.api = async () => values.state.configuration;
   return { api: functions('public/mbt-frontdesk.js', ['openCustomerChargeDialog', 'populateDeliverySelect'], values), values, kind };
 }
 

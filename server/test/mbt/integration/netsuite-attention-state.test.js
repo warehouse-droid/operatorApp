@@ -1,3 +1,4 @@
+import { seedReviewedLegacyFulfillment } from '../../support/legacy-fulfillment-candidate.mjs';
 import assert from 'node:assert/strict';
 import test, {after} from 'node:test';
 import crypto from 'node:crypto';
@@ -14,7 +15,7 @@ async function fixture(work) {
   const event=(await query(`INSERT INTO dispatch_order_completion_events(order_kind,order_ref,dispatch_completed_at,
     completion_evidence_type,completion_evidence_id,actor_type,actor_id,reason)
     VALUES('SO',$1,now(),'driver_job',$2,'driver','attention-test','') RETURNING id`,[ref,crypto.randomUUID()])).rows[0];
-  const candidate=(await query('SELECT id FROM dispatch_sales_order_if_candidates WHERE completion_event_id=$1',[event.id])).rows[0];
+  const candidate=await seedReviewedLegacyFulfillment(ref,event.id);
   await work(candidate.id);
  });}finally{await rollback.rollback();}
 }
@@ -53,6 +54,7 @@ test('waiting work cannot starve newly ready candidates behind the polling limit
    completion_evidence_type,completion_evidence_id,actor_type,actor_id,reason)
    SELECT 'SO','SO-WAIT-'||n,now(),'driver_job',gen_random_uuid()::text,'driver','attention-test',''
    FROM generate_series(1,30) n`);
+ for(const event of (await query("SELECT id,order_ref FROM dispatch_order_completion_events WHERE actor_id='attention-test' AND order_ref LIKE 'SO-WAIT-%'")).rows) {await seedReviewedLegacyFulfillment(event.order_ref,event.id);}
  await query(`UPDATE dispatch_sales_order_if_candidates SET status='waiting_evidence',created_at=now()-interval '1 day',updated_at=now()-interval '1 day'
    WHERE status='discovered'`);
  await query(`UPDATE dispatch_sales_order_if_candidates SET status='queued',created_at=now(),updated_at=now() WHERE id=$1`,[id]);
@@ -74,7 +76,7 @@ test('registered first split uses its bounded planned quantity and resumes only 
  const event=(await query(`INSERT INTO dispatch_order_completion_events(order_kind,order_ref,dispatch_completed_at,
    completion_evidence_type,completion_evidence_id,actor_type,actor_id,reason)
    VALUES('SO',$1,now(),'driver_job',$2,'driver','test','') RETURNING id`,[ref,crypto.randomUUID()])).rows[0];
- const candidate=(await query('SELECT id FROM dispatch_sales_order_if_candidates WHERE completion_event_id=$1',[event.id])).rows[0];
+ const candidate=await seedReviewedLegacyFulfillment(ref,event.id);
  const waiting=await prepareSalesOrderAutoFulfillmentCandidate(candidate.id);
  assert.equal(waiting.status,'waiting_evidence');
  assert.equal(waiting.sourceSalesOrderId,Number(source.netsuite_id));

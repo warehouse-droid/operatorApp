@@ -9,7 +9,7 @@ function detail(overrides={}) {
   return {id:1,revision:1,requestRef:'STREQ-TEST',workflowKind:'backorder',requestType:'regular',workflowVersion:2,stage:'new_enquiry',status:'submitted',fulfillmentMethod:'yard_pickup',destinationLocationId:1,destinationName:'3445',regular:{deliveryMethod:'backorder'},lines:[],transfers:[],events:[],...overrides};
 }
 function html(role,d) {
-  const ui=createBackorderUI({mount:{addEventListener(){}},audience:role,api:async()=>({vendors:[]}),getDetail:()=>d,setDetail(){},render(){}});
+  const ui=createBackorderUI({mount:{addEventListener(){},querySelector(){return null;}},audience:role,api:async()=>({vendors:[]}),getDetail:()=>d,setDetail(){},render(){}});
   return ui.detail(d);
 }
 const line=fc.record({salesDecision:fc.constantFrom('pending','accepted','request_update','declined','closed'),supplyStatus:fc.constantFrom(null,'in_stock','low_inventory','vendor_transfer','production','allocation','no_stock','already_ordered'),stockCheckedAt:fc.constantFrom(null,'2099-01-01T12:00:00Z')});
@@ -24,12 +24,12 @@ test('Both order forms become available at Confirmed independently of the other 
     assert.ok(!html('sales',d).includes('after SCM links the PO'));
   }),{seed:20261007,numRuns:700});
 });
-test('Both link guards require reviewed and accepted open materials, including mixed Already Ordered lines',()=>{
+test('SO linkage accepts reviewed pending materials; PO linkage requires acceptance without an SO, including mixed Already Ordered lines',()=>{
   fc.assert(fc.property(lines,fc.boolean(),(materials,linked)=>{
     const d=detail({lines:materials});
     const open=materials.filter(material=>material.supplyStatus!=='already_ordered'&&!['declined','closed'].includes(material.salesDecision));
-    const accepted=open.length>0&&open.every(material=>Boolean(material.supplyStatus)&&Boolean(material.stockCheckedAt)&&material.salesDecision==='accepted');
     for(const [role,kind,id] of [['sales','sales_order','salesOrderId'],['scm','purchase_order','purchaseOrderId']]){
+      const accepted=open.length>0&&open.every(material=>Boolean(material.supplyStatus&&material.stockCheckedAt)&&(material.salesDecision==='accepted'||kind==='sales_order'&&material.salesDecision==='pending'));
       assert.equal(canLinkBackorderOrder(d,kind),accepted);
       if(accepted)assert.doesNotThrow(()=>assertBackorderOrderLink(d,kind));
       else assert.throws(()=>assertBackorderOrderLink(d,kind),{code:'BACKORDER_SALES_ACCEPTANCE_REQUIRED',status:409});
@@ -41,7 +41,7 @@ test('SO and PO readiness rejects each missing prerequisite and accepts resolved
   const accepted={id:1,salesDecision:'accepted',supplyStatus:'in_stock',stockCheckedAt:'2099-01-01',originalRate:null};
   for(const kind of ['sales_order','purchase_order']){
     for(const change of [{salesDecision:'pending'},{salesDecision:'request_update'},{stockCheckedAt:null},{supplyStatus:null}]){
-      assert.equal(canLinkBackorderOrder(detail({lines:[{...accepted,...change}]}),kind),false);
+      assert.equal(canLinkBackorderOrder(detail({lines:[{...accepted,...change}]}),kind),kind==='sales_order'&&change.salesDecision==='pending');
     }
     for(const resolved of [{salesDecision:'declined'},{salesDecision:'closed'},{salesDecision:'pending',supplyStatus:'already_ordered'}]){
       assert.equal(canLinkBackorderOrder(detail({lines:[accepted,{...accepted,...resolved,id:2}]}),kind),true);
@@ -50,7 +50,7 @@ test('SO and PO readiness rejects each missing prerequisite and accepts resolved
     assert.doesNotThrow(()=>assertBackorderOrderLink({workflowKind:'special'},kind));
   }
   assert.equal(canLinkBackorderOrder(detail({lines:[accepted]}),'invalid'),false);
-  assert.match(html('sales',detail()),/SCM must review stock and Sales must accept every open material before linking an SO/);
+  assert.doesNotMatch(html('sales',detail()),/data-action="sales-order\/link"/);
   assert.doesNotMatch(html('sales',detail()),/after SCM links the PO/);
 });
 test('Terminal Backorders keep order links blocked and only Completed Already Ordered requests offer SO references',()=>{

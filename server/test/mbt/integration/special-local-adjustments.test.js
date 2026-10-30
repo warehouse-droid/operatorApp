@@ -145,7 +145,7 @@ test('all-line removal remains local and completed requests stay locked',()=>fix
   const before=await ordersSnapshot(id);
   d=await repository.requestSpecialQuantityChange(id,proposal(d,d.lines.map(l=>l.id)),context);
   d=await service().reviewQuantityChange(id,decision(d),context);
-  assert.equal(d.lines.length,0);assert.equal(d.stage,'dispatch_arrangement');assert.equal(d.closeStatus,'active');
+  assert.equal(d.lines.length,0);assert.equal(d.stage,'confirmed');assert.equal(d.closeStatus,'active');
   assert.deepEqual(await ordersSnapshot(id),before);
   await query("UPDATE purchase_orders SET receipt_status='received' WHERE netsuite_id=8899802");
   await query("UPDATE sales_orders SET status_text='Pending Billing' WHERE netsuite_id=8899801");

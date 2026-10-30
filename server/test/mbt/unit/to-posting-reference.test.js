@@ -34,8 +34,8 @@ async function draft(lines=rows()){
 
 test('TOB01189 posts exact Operator quantities on fulfillment legs 2,5,8 and preserves source data',async()=>{
   const lines=rows(),before=structuredClone(lines),result=await draft(lines);
-  assert.deepEqual(result.steps[0].payload.item.items,[{orderLine:2,itemReceive:true,quantity:5},
-    {orderLine:5,itemReceive:true,quantity:1},{orderLine:8,itemReceive:true,quantity:4}]);
+  assert.deepEqual(result.steps[0].payload.item.items,[{orderLine:2,itemReceive:true,quantity:5,custcol_plt:2,custcol_lyr:0,custcol_sec:0,custcol_pcs:1},
+    {orderLine:5,itemReceive:true,quantity:1,custcol_plt:0,custcol_lyr:0,custcol_sec:0,custcol_pcs:1},{orderLine:8,itemReceive:true,quantity:4,custcol_plt:0,custcol_lyr:0,custcol_sec:0,custcol_pcs:0}]);
   assert.deepEqual(lines,before);
   assert.deepEqual(result.steps[0].lineSnapshot.map(l=>[l.sourceLineKey,l.quantity,l.orderLine]),
     [['5073149',5,2],['5073152',1,5],['5073155',4,8]]);
@@ -64,8 +64,8 @@ test('partial packing and deselected lines stay attached to their original items
   const lines=rows();lines[0].packed_pallet_qty=1;lines[0].packed_piece_qty=0;
   lines[1].packed_piece_qty=0;lines[1].confirmed=false;
   const result=await draft(lines);
-  assert.deepEqual(result.steps[0].payload.item.items,[{orderLine:2,itemReceive:true,quantity:2},
-    {orderLine:5,itemReceive:false},{orderLine:8,itemReceive:true,quantity:4}]);
+  assert.deepEqual(result.steps[0].payload.item.items,[{orderLine:2,itemReceive:true,quantity:2,custcol_plt:1,custcol_lyr:0,custcol_sec:0,custcol_pcs:0},
+    {orderLine:5,itemReceive:false},{orderLine:8,itemReceive:true,quantity:4,custcol_plt:0,custcol_lyr:0,custcol_sec:0,custcol_pcs:0}]);
 });
 
 for(const [name,change]of[

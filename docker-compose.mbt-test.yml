@@ -2,6 +2,8 @@ name: mbbs-mbt-p1-test
 
 x-test-environment: &test-environment
   NODE_ENV: test
+  XDG_CONFIG_HOME: /tmp/mbbs-test-config
+  XDG_CACHE_HOME: /tmp/mbbs-test-cache
   MBT_TEST_ISOLATED: "1"
   MBBS_ENV_FILE: .env.mbt-test-does-not-exist
   PORT: "3000"

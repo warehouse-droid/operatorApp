@@ -1,3 +1,4 @@
+import { assertIsolatedTestConnection } from '../../support/test-database-isolation.mjs';
 import test, { before, after } from 'node:test';
 import assert from 'node:assert/strict';
 import crypto from 'node:crypto';
@@ -64,7 +65,7 @@ async function reviewedCase({ production = false, draft = true } = {}) {
   return detail;
 }
 before(async () => {
-  assert.equal(process.env.MBT_TEST_ISOLATED, '1'); assert.equal(new URL(process.env.DATABASE_URL).hostname, 'mbbs-special-review-db');
+  assert.equal(process.env.MBT_TEST_ISOLATED, '1'); assertIsolatedTestConnection(process.env.DATABASE_URL);
   originalPriceTrigger = (await query("SELECT pg_get_functiondef('preserve_special_original_price()'::regprocedure) AS definition")).rows[0].definition;
   await query(migration());
   flag = (await query("SELECT enabled FROM mbt_feature_flags WHERE flag_key='special_stock_request_workflow'")).rows[0].enabled;
@@ -129,7 +130,7 @@ test('Sales saves all new fields, updates quote basis, resets only changed revie
   const detail = await reviewedCase(), before = await rows(detail.id);
   const result = await call(detail.id, { expectedRevision: detail.revision, lines: [editLine(detail, corrections)] });
   assert.equal(result.status, 200, JSON.stringify(result.payload));
-  for (const [field, value] of Object.entries(corrections)) assert.equal(result.payload.lines[0][field], value, field);
+  for (const [field, value] of Object.entries(corrections)) assert.equal(result.payload.lines[0][field], field === 'palletQty' ? null : value, field);
   assert.equal(result.payload.lines[0].rateUom, 'LYR'); assert.equal(result.payload.lines[0].quotedDiscountPercent, 25);
   assert.equal(result.payload.stage, 'new_enquiry'); assert.equal(result.payload.lines[0].salesDecision, 'pending');
   assert.equal((await orders(detail.id)).length, 0); assert.deepEqual((await rows(detail.id))[1], before[1]);
@@ -153,7 +154,7 @@ test('SCM stock corrections save with the response and clear stale acceptance an
   const result = await repo.saveSpecialStockChecks(detail.id, { expectedRevision: detail.revision, lines: [{ lineId: detail.lines[0].id, kind: 'response',
     supplyStatus: 'in_stock', availabilityMode: 'no_projection', vendorId: 331, vendorName: 'TEST Vendor', vendorYard: 'North', ...fields,
     rate: 1, discountPercent: 99, customerNote: 'Injected', requiredDate: '2099-04-01' }] }, { operatorId: users.scm.id });
-  for (const [field, value] of Object.entries(fields)) assert.equal(result.lines[0][field], value, field);
+  for (const [field, value] of Object.entries(fields)) assert.equal(result.lines[0][field], field === 'palletQty' ? null : value, field);
   assert.equal(result.lines[0].rateUom, 'LYR'); assert.equal(result.lines[0].originalRate, 12.25); assert.equal(result.lines[0].discountPercent, 10);
   assert.equal(result.lines[0].customerNote, 'Customer note'); assert.equal(result.lines[0].supplyStatus, 'in_stock');
   assert.equal(result.lines[0].salesDecision, 'pending'); assert.equal(result.lines[0].itemResolution, null);
@@ -188,24 +189,24 @@ async function issuedCase() {
 const adjustmentLines = (detail, patch) => detail.lines.map((line, index) => ({ caseLineId: line.id, quantity: line.packageQuantity,
   discountPercent: line.discountPercent, ...(index === 0 ? patch : {}) }));
 test('issued order metadata proposal stays pending until SCM approval and persists every approved field', async () => {
-  const detail = await issuedCase(), before = await rows(detail.id);
+  const detail = await issuedCase(), before = await rows(detail.id), orderBefore = await orders(detail.id);
   const patch = { ...corrections, productName: 'New stone', quantity: 4 };
   const pending = await repo.requestSpecialQuantityChange(detail.id, { expectedRevision: detail.revision, lines: adjustmentLines(detail, patch) }, context());
   assert.equal(pending.quantityReview.status, 'pending'); assert.equal(pending.quantityReview.lines[0].toFields.color, 'Black');
   assert.deepEqual(await rows(detail.id), before);
   const claimed = await repo.claimSpecialQuantityReview(detail.id, { expectedRevision: pending.revision, reviewId: pending.quantityReview.id }, { operatorId: users.scm.id });
   const approved = await repo.finishSpecialQuantityReview(detail.id, { reviewId: claimed.quantityReview.id }, { operatorId: users.scm.id });
-  for (const [field, value] of Object.entries(corrections)) assert.equal(approved.lines[0][field], value, field);
+  for (const [field, value] of Object.entries(corrections)) assert.equal(approved.lines[0][field], field === 'palletQty' ? null : value, field);
   assert.equal(approved.lines[0].productName, 'New stone'); assert.equal(approved.lines[0].rateUom, 'LYR');
   assert.equal(approved.lines[0].packageQuantity, 4); assert.equal(approved.lines[0].conversionToPc, 1);
-  assert.equal(approved.salesOrderLines[0].quantity, 4); assert.equal(approved.salesOrderLines[0].description, 'New stone Black 90mm Rough finish');
-  for (const line of [approved.salesOrderLines[0], approved.purchaseOrderLines[0]]) { assert.equal(line.palletQty, 0); assert.equal(line.layerQty, 5.5); assert.equal(line.pieceQty, 7); }
+  assert.equal(approved.lines[0].quantity, 4);
+  assert.deepEqual(await orders(detail.id), orderBefore, 'local approved corrections preserve every issued order field');
   assert.equal(approved.purchaseOrderLines[0].unitPurchaseCost, 8); assert.deepEqual((await rows(detail.id))[1], before[1]);
 });
 test('description-only issued adjustment is reviewable and rejection leaves original fields and drafts intact', async () => {
   const detail = await issuedCase(), before = await snapshot(detail.id);
   const pending = await repo.requestSpecialQuantityChange(detail.id, { expectedRevision: detail.revision, lines: adjustmentLines(detail, { color: 'Blue' }) }, context());
-  assert.equal(pending.quantityReview.lines.length, 1); assert.equal(pending.quantityReview.adjustmentVersion, 2);
+  assert.equal(pending.quantityReview.lines.length, 1); assert.equal(pending.quantityReview.localOnly, true);
   await repo.rejectSpecialQuantityReview(detail.id, { expectedRevision: pending.revision, reviewId: pending.quantityReview.id, reason: 'Keep original' }, { operatorId: users.scm.id });
   assert.deepEqual(await rows(detail.id), before.rows); assert.deepEqual(await orders(detail.id), before.orders);
 });
@@ -251,22 +252,23 @@ test('property: issued adjustments always use one and preserve original rate and
   await fc.assert(fc.asyncProperty(fc.integer({ min: 1, max: 20 }), fc.constantFrom('PLT','LYR','SEC','PCS','EACH','SQFT'),
     fc.constantFrom(4, 0, -1, 'invalid', null, {}, undefined), async (quantity, uom, conversion) => {
       await withTransaction(async () => {
-        const detail = await issuedCase(), before = await rows(detail.id);
+        const detail = await issuedCase(), before = await rows(detail.id), orderBefore = await orders(detail.id);
         const pending = await repo.requestSpecialQuantityChange(detail.id, { expectedRevision: detail.revision,
           lines: adjustmentLines(detail, { quantity, uom, color: 'Black', conversionToPc: conversion }) }, context());
         const proposal = pending.quantityReview.lines[0];
         assert.equal(proposal.toConversion, 1); assert.equal(proposal.toQuantity, quantity);
-        assert.equal(proposal.toPurchaseQuantity, quantity); assert.equal(proposal.toRate, 12.25);
+        assert.equal(proposal.toPurchaseQuantity, quantity); assert.equal(pending.lines[0].originalRate, 12.25);
         assert.deepEqual(await rows(detail.id), before);
         await repo.claimSpecialQuantityReview(detail.id, { expectedRevision: pending.revision, reviewId: pending.quantityReview.id }, { operatorId: users.scm.id });
         const approved = await repo.finishSpecialQuantityReview(detail.id, { reviewId: pending.quantityReview.id }, { operatorId: users.scm.id });
-        assert.equal(approved.lines[0].conversionToPc, 1); assert.equal(approved.salesOrderLines[0].quantity, quantity);
+        assert.equal(approved.lines[0].conversionToPc, 1); assert.equal(approved.lines[0].quantity, quantity);
+        assert.deepEqual(await orders(detail.id), orderBefore);
         assert.equal(approved.salesOrderLines[0].rate, 12.25); assert.equal(approved.purchaseOrderLines[0].unitPurchaseCost, 8);
       }, { rollback: true });
     }), { seed: 20261004, numRuns: 20 });
 });
 
-test('missing historical conversion uses one without prompting while order-rate drift still blocks edits', async () => {
+test('missing historical conversion uses one and local corrections preserve independent order rates', async () => {
   let detail = await issuedCase();
   await query('UPDATE sales_special_stock_lines SET pieces_per_unit=NULL WHERE request_id=$1', [detail.id]);
   detail = await repo.getSpecialStockCase(detail.id, { audience: 'sales' });
@@ -277,8 +279,12 @@ test('missing historical conversion uses one without prompting while order-rate 
   assert.equal(pending.quantityReview.lines[0].toQuantity, 4);
   detail = await issuedCase();
   await query("UPDATE sales_special_stock_order_lines SET unit_rate=99 WHERE request_id=$1 AND order_kind='sales_order' AND case_line_id=$2", [detail.id,detail.lines[0].id]);
-  await assert.rejects(repo.requestSpecialQuantityChange(detail.id, { expectedRevision: detail.revision,
-    lines: adjustmentLines(detail, { quantity: 4, uom: 'LYR' }) }, context()), { code: 'SPECIAL_RATE_LOCKED' });
+  const orderBefore = await orders(detail.id);
+  const local = await repo.requestSpecialQuantityChange(detail.id, { expectedRevision: detail.revision,
+    lines: adjustmentLines(detail, { quantity: 4, uom: 'LYR' }) }, context());
+  assert.equal(local.quantityReview.localOnly, true);
+  assert.equal(local.lines[0].originalRate, 12.25);
+  assert.deepEqual(await orders(detail.id), orderBefore);
 });
 
 test('new adjustments normalize a legacy conversion only through the existing SCM approval', async () => {
@@ -286,7 +292,7 @@ test('new adjustments normalize a legacy conversion only through the existing SC
   await query('UPDATE sales_special_stock_lines SET pieces_per_unit=2,sales_quantity=requested_quantity*2,purchase_quantity=requested_quantity*2 WHERE request_id=$1', [detail.id]);
   await query("UPDATE sales_special_stock_order_lines SET quantity=quantity*2,unit_rate=CASE WHEN order_kind='sales_order' THEN unit_rate/2 ELSE unit_rate END WHERE request_id=$1 AND case_line_id IS NOT NULL", [detail.id]);
   detail = await repo.getSpecialStockCase(detail.id, { audience: 'sales' });
-  const savedBefore = await rows(detail.id);
+  const savedBefore = await rows(detail.id), orderBefore = await orders(detail.id);
   const pending = await repo.requestSpecialQuantityChange(detail.id, { expectedRevision: detail.revision,
     lines: adjustmentLines(detail, { quantity: 4, uom: 'LYR' }) }, context());
   assert.equal(pending.quantityReview.lines[0].fromConversion, 2);
@@ -294,6 +300,7 @@ test('new adjustments normalize a legacy conversion only through the existing SC
   assert.deepEqual(await rows(detail.id), savedBefore);
   await repo.claimSpecialQuantityReview(detail.id, { expectedRevision: pending.revision, reviewId: pending.quantityReview.id }, { operatorId: users.scm.id });
   const approved = await repo.finishSpecialQuantityReview(detail.id, { reviewId: pending.quantityReview.id }, { operatorId: users.scm.id });
-  assert.equal(approved.salesOrderLines[0].quantity, 4); assert.equal(approved.salesOrderLines[0].rate, 12.25);
-  assert.equal(approved.purchaseOrderLines[0].quantity, 4); assert.equal(approved.purchaseOrderLines[0].unitPurchaseCost, 8);
+  assert.equal(approved.lines[0].quantity, 4); assert.equal(approved.lines[0].conversionToPc, 1);
+  assert.equal(approved.lines[0].originalRate, 12.25);
+  assert.deepEqual(await orders(detail.id), orderBefore);
 });

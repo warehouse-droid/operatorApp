@@ -73,11 +73,13 @@ test('NetSuite progress preserves local packing, receiving drafts and physical s
   assert.equal(order.status_text, 'Pending Receipt');
 }));
 
-test('TO outbound preparation follows local progress across NetSuite delivery statuses', () => yardRollback(async () => {
+test('TO outbound preparation follows local progress until NetSuite Received, without altering local evidence', () => yardRollback(async () => {
   const f = await seedYardTransfer();
+  const savedLines = (await query('SELECT * FROM transfer_order_lines WHERE transfer_order_id=$1 ORDER BY id', [f.id])).rows;
   for (const [status, statusText, fulfillment] of [['B', 'Pending Fulfillment', 'not_fulfilled'], ['F', 'Pending Receipt', 'fulfilled'], ['G', 'Received', 'fulfilled']]) {
     await query('UPDATE transfer_orders SET status=$2,status_text=$3,fulfillment_status=$4 WHERE netsuite_id=$1', [f.id, status, statusText, fulfillment]);
-    assert.ok((await listDeliveryOrders({ locationId: 1, status: 'packed', orderType: 'transfer_order' })).some(o => String(o.netsuite_id) === String(f.id)), statusText);
+    assert.equal((await listDeliveryOrders({ locationId: 1, status: 'packed', orderType: 'transfer_order' })).some(o => String(o.netsuite_id) === String(f.id)), status !== 'G', statusText);
+    assert.deepEqual((await query('SELECT * FROM transfer_order_lines WHERE transfer_order_id=$1 ORDER BY id', [f.id])).rows, savedLines);
   }
 }));
 test('remote received quantity cannot replace the receiving yard physical receipt', () => yardRollback(async () => {

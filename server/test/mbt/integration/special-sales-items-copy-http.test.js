@@ -1,3 +1,4 @@
+import { assertIsolatedTestConnection } from '../../support/test-database-isolation.mjs';
 import test,{before,after} from 'node:test';
 import assert from 'node:assert/strict';
 import crypto from 'node:crypto';
@@ -34,7 +35,8 @@ async function reviewedCase(){
 const rows=async id=>(await query('SELECT * FROM sales_special_stock_lines WHERE request_id=$1 ORDER BY line_number',[id])).rows;
 const events=async id=>(await query("SELECT * FROM sales_special_stock_events WHERE request_id=$1 AND event_type='special_items_added'",[id])).rows;
 before(async()=>{
- assert.equal(process.env.MBT_TEST_ISOLATED,'1');assert.equal(new URL(process.env.DATABASE_URL).hostname,'mbbs-special-review-db');
+ assert.equal(process.env.MBT_TEST_ISOLATED,'1');assertIsolatedTestConnection(process.env.DATABASE_URL);
+ await query("INSERT INTO inventory_items(item_id,item_name) VALUES(2055,'MBBS-Special Order') ON CONFLICT DO NOTHING");
  flag=(await query("SELECT enabled FROM mbt_feature_flags WHERE flag_key='special_stock_request_workflow'")).rows[0].enabled;
  await query("UPDATE mbt_feature_flags SET enabled=true WHERE flag_key='special_stock_request_workflow'");
  server=app.listen(0,'127.0.0.1');await new Promise(resolve=>server.once('listening',resolve));base='http://127.0.0.1:'+server.address().port;
@@ -53,7 +55,7 @@ after(async()=>{
  }finally{await closeDb();}
 });
 test('HTTP add items resets New enquiry, preserves every old SQL column and invalidates the unsent SO draft',async()=>{
- const detail=await reviewedCase(),before=await rows(detail.id);assert.equal(detail.stage,'confirmed');
+ const detail=await reviewedCase(),before=await rows(detail.id);assert.equal(detail.stage,'await_customer_confirmation');
  const response=await call(detail.id,{expectedRevision:detail.revision,lines:[item(),item('Second new item')]});
  assert.equal(response.status,200,JSON.stringify(response.payload));assert.equal(response.payload.id,detail.id);assert.equal(response.payload.stage,'new_enquiry');
  assert.equal(response.payload.revision,detail.revision+1);assert.deepEqual((await rows(detail.id)).slice(0,1),before);

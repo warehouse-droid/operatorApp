@@ -40,7 +40,7 @@ async function post(path,body){
 async function signIn(data){
   const result=await post('/api/auth/login',data),operator=result.operator;
   const roles=[...new Set([...(operator?.roles||[]),operator?.role].map(cleanRole))];
-  const home=staffReturnPath(operator?.homeRoute,roles)||roleRoutes[cleanRole(operator?.role)];
+  const home=staffReturnPath(operator?.homeRoute,roles)||roleRoutes[cleanRole(operator?.role)]||roles.map(role=>roleRoutes[role]).find(Boolean);
   if(!home||!result.token){throw new Error('This account does not have an application route.');}
   for(const key of staffKeys){localStorage.removeItem(key);}
   localStorage.setItem('mbbs.staff.token',result.token);localStorage.setItem('mbbs.staff.role',cleanRole(operator.role));localStorage.setItem('mbbs.staff.roles',JSON.stringify(roles));

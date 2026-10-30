@@ -1,0 +1,77 @@
+{
+  "passed": false,
+  "label": "guard-red-final",
+  "specApproval": "not obtained (autonomous run)",
+  "result": {
+    "fileCount": 1,
+    "tests": 16,
+    "pass": 0,
+    "fail": 16,
+    "cancelled": 0,
+    "skipped": 0,
+    "failedFiles": [
+      {
+        "file": "test/mbt/infrastructure/disposable-connection-guard.test.js",
+        "failures": [
+          "fixture guard accepts only the standard disposable base and per-file databases",
+          "fixture guard rejects live host",
+          "fixture guard rejects loopback host",
+          "fixture guard rejects old unverified alias",
+          "fixture guard rejects live database",
+          "fixture guard rejects live account",
+          "fixture guard rejects unexpected port",
+          "fixture guard rejects host override query",
+          "fixture guard rejects account override query",
+          "fixture guard rejects non-PostgreSQL protocol",
+          "fixture guard rejects malformed clone",
+          "fixture guard rejects missing isolation flag",
+          "fixture guard rejects production mode",
+          "fixture guard rejects malformed URL",
+          "fixture guard rejects arbitrary database names outside the disposable namespace",
+          "fixture guard preserves arbitrary valid clone identities and harmless connection labels"
+        ],
+        "tests": 16,
+        "pass": 0,
+        "fail": 16,
+        "cancelled": 0,
+        "skipped": 0,
+        "firstFailureEvidence": [
+          "\u2716 fixture guard accepts only the standard disposable base and per-file databases (1.88243ms)",
+          "  Error: Disposable connection guard is not implemented.",
+          "      at assertIsolatedTestConnection (file:///app/test/support/test-database-isolation.mjs:15:9)",
+          "      at TestContext.<anonymous> (file:///app/test/mbt/infrastructure/disposable-connection-guard.test.js:11:16)",
+          "      at Test.runInAsyncScope (node:async_hooks:206:9)",
+          "      at Test.run (node:internal/test_runner/test:796:25)",
+          "      at Test.processPendingSubtests (node:internal/test_runner/test:526:18)",
+          "      at node:internal/test_runner/harness:255:12",
+          "      at node:internal/process/task_queues:140:7",
+          "      at AsyncResource.runInAsyncScope (node:async_hooks:206:9)",
+          "      at AsyncResource.runMicrotask (node:internal/process/task_queues:137:8)",
+          "",
+          "\u2716 fixture guard rejects live host (2.30534ms)",
+          "  AssertionError [ERR_ASSERTION]: The input did not match the regular expression /isolated disposable test database/. Input:",
+          "  ",
+          "  'Error: Disposable connection guard is not implemented.'",
+          "  ",
+          "      at TestContext.<anonymous> (file:///app/test/mbt/infrastructure/disposable-connection-guard.test.js:32:12)",
+          "      at Test.runInAsyncScope (node:async_hooks:206:9)",
+          "      at Test.run (node:internal/test_runner/test:796:25)",
+          "      at Test.processPendingSubtests (node:internal/test_runner/test:526:18)",
+          "      at Test.postRun (node:internal/test_runner/test:889:19)",
+          "      at Test.run (node:internal/test_runner/test:835:12)",
+          "      at async Test.processPendingSubtests (node:internal/test_runner/test:526:7) {"
+        ]
+      }
+    ]
+  },
+  "exitCode": 1,
+  "sourceTreeHash": "cc473f91f71187f21185d8ca401312d4dae2dcb8ee722f53d113a471cae347cb",
+  "cleanup": {
+    "exitCode": 0,
+    "leftovers": {
+      "container": [],
+      "volume": [],
+      "network": []
+    }
+  }
+}

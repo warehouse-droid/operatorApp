@@ -5,9 +5,9 @@ import fc from "fast-check";
 import { pool, query, withTransaction, closeDb } from "../../../src/db.js";
 import { getDeliveryOrder, recordDeliveryLoad } from "../../../src/delivery-repository.js";
 import { packingOrder, packingGroup } from "../../support/group-underpack-fixture.mjs";
-import { describeIsolatedTestDatabase } from "../../support/test-database-isolation.mjs";
+import { assertIsolatedTestConnection } from "../../support/test-database-isolation.mjs";
 
-describeIsolatedTestDatabase(process.env.DATABASE_URL);
+assertIsolatedTestConnection(process.env.DATABASE_URL);
 after(async () => {
   try {
     await query("DELETE FROM sales_order_lines WHERE sales_order_id BETWEEN 997000001 AND 997013000");

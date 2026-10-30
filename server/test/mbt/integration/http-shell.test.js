@@ -26,7 +26,7 @@ after(async () => {
 test("F15: all MBT routes render one accessible controlled shell with an explicit controller", async () => {
   for (const [path, surface, controllers, heading] of [
     ["/mbt", "home", ["mbt-home.js"], "MBT Bin Operations"],
-    ["/admin/mbt-gates", "gates", ["mbt-gates.js?v=20260917-return-ra-v1"], "Feature gates"],
+    ["/admin/mbt-gates", "gates", ["mbt-gates.js?v=20261008-return-credit-memo-v1&returnCmOnly=1&stockExchangeControls=20261029"], "Feature gates"],
     ["/mbt/config", "config", ["mbt-shell.js"], "Configuration"],
     ["/mbt/assets", "assets", ["mbt-assets.js"], "Bin asset registry"],
     ["/mbt/frontdesk", "frontdesk", ["mbt-frontdesk.js"], "Front Desk"],
@@ -43,9 +43,9 @@ test("F15: all MBT routes render one accessible controlled shell with an explici
     assert.match(html, /aria-live="polite"/i);
     assert.match(html, new RegExp(`<h1[^>]*>${heading}<\\/h1>`, "i"));
     assert.match(html, /href=["']\/mbt-shell\.css["']/i);
-    assert.match(html, /src=["']\/app-sidebar\.js["']/i);
+    assert.match(html, /src=["']\/app-sidebar\.js(?:\?[^"']+)?["']/i);
     for (const controller of controllers) {
-      assert.match(html, new RegExp(`src=["']/${controller.replace(".", "\\.").replace("?", "\\?")}["']`, "i"));
+      assert.match(html, new RegExp(`src=["']/${controller.replace(".", "\\.").replace("?", "\\?")}${controller.includes("?") ? "" : "(?:\\?[^\"']+)?"}["']`, "i"));
     }
   }
 });

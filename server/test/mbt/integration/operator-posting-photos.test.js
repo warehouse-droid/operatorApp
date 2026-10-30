@@ -31,7 +31,7 @@ async function finish(f, { load = true, fail = false } = {}) {
   return completeOperatorNetSuitePostingCommand({ commandId: f.id, leaseToken: f.leaseToken, finalize: async () => {
     if (fail) {throw new Error("finalization failed");}
     if (!load) {return {};}
-    const record = await query("INSERT INTO operator_load_records(load_type,order_family,operator_id,photo_data_url,photo_data_urls,response) VALUES('sales_order_delivery_load','sales_order',$1,$2,$3,$4) RETURNING id", [actor.id, photos[0], JSON.stringify(photos), JSON.stringify({ operatorNetSuitePosting: { commandId: f.id } })]);
+    const record = await query("INSERT INTO operator_load_records(order_id,order_ref,load_type,order_family,operator_id,photo_data_url,photo_data_urls,response) VALUES(900001,'SO-PHOTO-TEST','sales_order_delivery_load','sales_order',$1,$2,$3,$4) RETURNING id", [actor.id, photos[0], JSON.stringify(photos), JSON.stringify({ operatorNetSuitePosting: { commandId: f.id } })]);
     return { id: record.rows[0].id };
   } });
 }

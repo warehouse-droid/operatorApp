@@ -1,0 +1,28 @@
+{
+  "passed": true,
+  "imageId": "sha256:84764179b5e9d7769b64b1f195be82fd4170f6d7ef3202fc4bdc3f041e4836ff",
+  "scenarios": [
+    {
+      "mode": "candidate",
+      "appStarted": true,
+      "workerStarted": true,
+      "health": 200,
+      "anonymousApi": 401,
+      "workerImageEnvironmentDefaults": {
+        "PLAYWRIGHT_BROWSERS_PATH": "/ms-playwright"
+      },
+      "runtimeFilesPerService": 1627
+    },
+    {
+      "mode": "rollback",
+      "appStarted": true,
+      "workerStarted": true,
+      "health": 200,
+      "anonymousApi": 401
+    }
+  ],
+  "runtimeSourceTreeHash": "52407b85ba1f61c518781308fc389232478ab70c76eff0090e591b57638c259d",
+  "verifiedSourceTreeHash": "28e642496e003c1c79126d486481988d6de5faaca02bbc8ad3792c91ba28fb2b",
+  "pendingMigrations": [],
+  "disposableCleanupVerified": true
+}

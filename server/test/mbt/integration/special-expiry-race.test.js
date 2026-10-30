@@ -1,10 +1,11 @@
+import { assertIsolatedTestConnection } from '../../support/test-database-isolation.mjs';
 import test,{after} from 'node:test';
 import assert from 'node:assert/strict';
 import {pool,query,closeDb} from '../../../src/db.js';
 import {createSpecialStockCase,expireSpecialStockCases,getSpecialStockCase,updateSpecialCaseExpiry} from '../../../src/special-stock-request-repository.js';
 after(closeDb);
 test('expiry skips an order claim lock, observes committed state and concurrent sweepers close once',async()=>{
- assert.equal(process.env.MBT_TEST_ISOLATED,'1');assert.ok(process.env.DATABASE_URL.endsWith('/mbt_verify'));
+ assert.equal(process.env.MBT_TEST_ISOLATED,'1');assertIsolatedTestConnection(process.env.DATABASE_URL);
  const actor='special-expiry-race';const ids=[];const previous=(await query("SELECT enabled FROM mbt_feature_flags WHERE flag_key='special_stock_request_workflow'")).rows[0].enabled;
  const client=await pool.connect();
  try{

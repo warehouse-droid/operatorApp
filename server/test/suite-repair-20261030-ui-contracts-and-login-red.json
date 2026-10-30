@@ -1,0 +1,142 @@
+{
+  "passed": false,
+  "label": "ui-contracts-and-login-red",
+  "specApproval": "not obtained (autonomous run)",
+  "result": {
+    "fileCount": 8,
+    "tests": 58,
+    "pass": 56,
+    "fail": 2,
+    "cancelled": 0,
+    "skipped": 0,
+    "failedFiles": [
+      {
+        "file": "test/mbt/unit/ui-navigation-contract.test.js",
+        "failures": [
+          "F02/F15: root login stores the shared token and honors MBT primary, secondary and server home routes"
+        ],
+        "tests": 3,
+        "pass": 2,
+        "fail": 1,
+        "cancelled": 0,
+        "skipped": 0,
+        "firstFailureEvidence": [
+          "\u2716 F02/F15: root login stores the shared token and honors MBT primary, secondary and server home routes (7.964798ms)",
+          "  Error: This account does not have an application route.",
+          "      at signIn (evalmachine.<anonymous>:43:34)",
+          "      at async TestContext.<anonymous> (file:///app/test/mbt/unit/ui-navigation-contract.test.js:25:7)",
+          "      at async Test.run (node:internal/test_runner/test:797:9)",
+          "      at async Test.processPendingSubtests (node:internal/test_runner/test:526:7)",
+          "",
+          "\u2714 F02: Admin account management exposes the two explicit MBT authorities (0.458934ms)",
+          "\u2714 F02/F15: the shared sidebar recognizes MBT paths and filters its links by live role (0.527214ms)",
+          "\u2139 tests 3",
+          "\u2139 suites 0",
+          "\u2139 pass 2",
+          "\u2139 fail 1",
+          "\u2139 cancelled 0",
+          "\u2139 skipped 0",
+          "\u2139 todo 0",
+          "\u2139 duration_ms 113.861224",
+          "",
+          "\u2716 failing tests:",
+          "",
+          "test at test/mbt/unit/ui-navigation-contract.test.js:13:1",
+          "\u2716 F02/F15: root login stores the shared token and honors MBT primary, secondary and server home routes (7.964798ms)",
+          "  Error: This account does not have an application route.",
+          "      at signIn (evalmachine.<anonymous>:43:34)"
+        ],
+        "failureDetails": [
+          {
+            "test": "F02/F15: root login stores the shared token and honors MBT primary, secondary and server home routes",
+            "message": [
+              "  Error: This account does not have an application route.",
+              "      at signIn (evalmachine.<anonymous>:43:34)",
+              "      at async TestContext.<anonymous> (file:///app/test/mbt/unit/ui-navigation-contract.test.js:25:7)",
+              "      at async Test.run (node:internal/test_runner/test:797:9)",
+              "      at async Test.processPendingSubtests (node:internal/test_runner/test:526:7)",
+              "",
+              "\u2714 F02: Admin account management exposes the two explicit MBT authorities (0.458934ms)",
+              "\u2714 F02/F15: the shared sidebar recognizes MBT paths and filters its links by live role (0.527214ms)"
+            ],
+            "location": null
+          }
+        ]
+      },
+      {
+        "file": "test/mbt/unit/stock-request-ui-contract.test.js",
+        "failures": [
+          "/app/test/mbt/unit/stock-request-ui-contract.test.js"
+        ],
+        "tests": 15,
+        "pass": 14,
+        "fail": 1,
+        "cancelled": 0,
+        "skipped": 0,
+        "firstFailureEvidence": [
+          "\u2716 /app/test/mbt/unit/stock-request-ui-contract.test.js (173.185385ms)",
+          "  'test failed'",
+          "",
+          "\u2139 tests 15",
+          "\u2139 suites 0",
+          "\u2139 pass 14",
+          "\u2139 fail 1",
+          "\u2139 cancelled 0",
+          "\u2139 skipped 0",
+          "\u2139 todo 0",
+          "\u2139 duration_ms 180.864031",
+          "",
+          "\u2716 failing tests:",
+          "",
+          "test at test/mbt/unit/stock-request-ui-contract.test.js:1:1",
+          "\u2716 /app/test/mbt/unit/stock-request-ui-contract.test.js (173.185385ms)",
+          "  'test failed'",
+          ""
+        ],
+        "startupEvidence": [
+          "\u2714 Sales Request Stock page is private, yard-aware, multi-line, and exposes the approved statuses (3.159952ms)",
+          "\u2714 Sales regular stock request cannot retain an empty destination while an authorized yard is displayed (14.444201ms)",
+          "\u2714 SCM Stock Requests page has the two-pane Request and Pending TO workflow (1.513551ms)",
+          "\u2714 role-aware navigation links to Request Stock without changing existing modules (0.87485ms)",
+          "\u2714 stock-request feedback is content-sized and availability shows Sales plus conversion equivalents (6.031028ms)",
+          "\u2714 Sales highlights returned requests and all Sales buckets expose persistent filters (1.726818ms)",
+          "\u2714 SCM exposes Request, Pending TO, Rejected, and Closed queues with the required filters (1.360474ms)",
+          "\u2714 SCM can reverse a returned decision and reject only an unconfirmed local pending TO (1.163827ms)",
+          "\u2714 SCM can remove accepted local TO lines and change their outbound location before confirmation (2.422325ms)",
+          "\u2714 live list rendering restores search focus and ignores stale responses (1.444343ms)",
+          "\u2714 Sales can submit a request remark and both roles display it (1.43937ms)",
+          "\u2714 availability Sales UOM and conversion equivalents render on separate rows (1.817018ms)",
+          "\u2714 Sales explains backorder conversion and SCM shows the calculated shortage (1.930355ms)",
+          "\u2714 Sales Request Stock has complete Simplified Chinese UI and validation coverage (9.574798ms)",
+          "\u2139 Error: Test \"Sales regular stock request cannot retain an empty destination while an authorized yard is displayed\" at test/mbt/unit/stock-request-ui-contract.test.js:26:1 generated asynchronous activity after the test ended. This activity created the error \"TypeError [ERR_VM_DYNAMIC_IMPORT_CALLBACK_MISSING]: A dynamic import callback was not specified.\" and would have caused the test to fail, but instead triggered an unhandledRejection event."
+        ],
+        "failureDetails": [
+          {
+            "test": "/app/test/mbt/unit/stock-request-ui-contract.test.js",
+            "message": [
+              "  'test failed'",
+              "",
+              "\u2139 tests 15",
+              "\u2139 suites 0",
+              "\u2139 pass 14",
+              "\u2139 fail 1",
+              "\u2139 cancelled 0",
+              "\u2139 skipped 0"
+            ],
+            "location": null
+          }
+        ]
+      }
+    ]
+  },
+  "exitCode": 1,
+  "sourceTreeHash": "2dee97ddfb66636c2fda3e9326157cff391823475c1e57dce0a18cf15a1d01b3",
+  "cleanup": {
+    "exitCode": 0,
+    "leftovers": {
+      "container": [],
+      "volume": [],
+      "network": []
+    }
+  }
+}

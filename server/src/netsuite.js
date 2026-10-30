@@ -724,7 +724,9 @@ async function netsuiteRest(path, { method = "GET", body = null, headers = {} } 
         m2mAuthRetry = true;
         continue;
       }
-      if (isConcurrencyLimit(response.status, text) && attempt < 3) {
+      const safeToRetry = method === 'GET' || response.status === 429
+        || lastError.netsuiteErrorCodes.includes('CONCURRENT_REQUEST_LIMIT_EXCEEDED');
+      if (safeToRetry && isConcurrencyLimit(response.status, text) && attempt < 3) {
         await delay(2000 * (attempt + 1));
         continue;
       }

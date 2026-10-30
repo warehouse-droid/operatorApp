@@ -12,8 +12,10 @@ const FROZEN_PRODUCTION_ROOTS = Object.freeze({
   dotenv: "^16.4.5",
   exceljs: "^4.4.0",
   express: "^4.19.2",
+  nodemailer: "10.0.13",
   pdfkit: "0.20.2",
   pg: "^8.11.5",
+  playwright: "1.62.1",
   "qr-scanner": "^1.4.2",
   sharp: "0.35.3",
   "web-push": "3.6.7"

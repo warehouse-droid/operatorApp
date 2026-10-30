@@ -1,3 +1,4 @@
+import { assertIsolatedTestConnection } from '../../support/test-database-isolation.mjs';
 /* global AbortController, TextDecoder */
 import test, { before, after } from 'node:test';
 import assert from 'node:assert/strict';
@@ -15,7 +16,7 @@ const detail = id => repo.getSpecialStockCase(id, { audience: 'scm', dispatchPla
 const lines = async id => (await query('SELECT * FROM sales_special_stock_lines WHERE request_id=$1 ORDER BY id', [id])).rows;
 before(async () => {
   assert.equal(process.env.MBT_TEST_ISOLATED, '1');
-  assert.equal(new URL(process.env.DATABASE_URL).hostname, 'mbbs-special-review-db');
+  assertIsolatedTestConnection(process.env.DATABASE_URL);
   flag = (await query("SELECT enabled FROM mbt_feature_flags WHERE flag_key='special_stock_request_workflow'")).rows[0].enabled;
   await query("UPDATE mbt_feature_flags SET enabled=true WHERE flag_key='special_stock_request_workflow'");
   server = app.listen(0, '127.0.0.1');

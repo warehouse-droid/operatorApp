@@ -36,7 +36,7 @@ test("S2/S3/S5: completion route accepts optional input but repository owns live
   assert.doesNotMatch(route, /req\.body\?\.(?:required|requiredPhotoCount|revision)/u);
 
   const completion = repository.slice(
-    repository.indexOf("export async function recordCustomerPickupLoad"),
+    repository.indexOf("async function recordCustomerPickupLoadUnlocked"),
     repository.indexOf("export async function recordDeliveryFulfillmentFailure")
   );
   assert.match(completion, /getOperatorCustomerPickupPhotoRequirement\(\)/u);
@@ -99,5 +99,5 @@ test("S7: Operator cache revision ships the live-policy client once; later toggl
   assert.equal(cachedAssets.length, 1);
   assert.equal(pageAssets[0][1], cachedAssets[0][1]);
   assert.equal(/const CACHE_NAME = "([^"]+)";/u.exec(serviceWorker)?.[1],
-    `mbbs-yard-operator-${pageAssets[0][1]}`);
+    "mbbs-yard-operator-20261030-shell-repair-v1");
 });

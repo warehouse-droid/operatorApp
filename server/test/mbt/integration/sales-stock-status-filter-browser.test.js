@@ -1,3 +1,4 @@
+import {chooseRegularStatuses,expectRegularStatuses} from '../../support/regular-stock-status-browser.mjs';
 import assert from 'node:assert/strict';
 import test, {before, after} from 'node:test';
 import {mkdirSync, writeFileSync} from 'node:fs';
@@ -38,7 +39,7 @@ after(async () => {
   }
 });
 
-test('Sales multi-select case stages, types and vendors combine correctly without a Status filter, persist, and work on mobile', async () => {
+test('Sales unified statuses, types and vendors combine, persist and work on mobile', async () => {
   const context = await browser.newContext({viewport: {width: 1440, height: 1000}, serviceWorkers: 'block'});
   await context.addInitScript(token => {
     localStorage.setItem('mbbs.staff.token', token);
@@ -73,55 +74,49 @@ test('Sales multi-select case stages, types and vendors combine correctly withou
     await expect(menu(name).locator('input:checked')).toHaveCount(0);
   };
   try {
-    const started = performance.now();
+    const started = performance.now(),active=[records.stocking,records.accepted,records.activeBackorder];
     await page.goto(f.base + '/sales/stock-requests?tab=regular', {waitUntil: 'domcontentloaded'});
-    await shown(Object.values(records));
+    await shown(active);await expectRegularStatuses(page,'sales','active');
     await expect(page.locator('[data-sales-stock-filter="statusFilter"]')).toHaveCount(0);
-    await expect(menu('backorderStageFilter').locator('summary')).toBeVisible();
-    times.push({page:'sales-regular',ms:Math.round(performance.now()-started)});
-
-    await change('backorderStageFilter','new_enquiry'); await shown([records.activeBackorder]);
-    await change('backorderStageFilter','completed',true,true); await shown([records.activeBackorder,records.completedBackorder]);
+    const statuses=page.locator('[data-yard-filter="unifiedStatus"]');
+    await expect(statuses).toBeVisible();times.push({page:'sales-regular',ms:Math.round(performance.now()-started)});
+    await chooseRegularStatuses(page,'sales','pending_scm,completed');await shown([records.stocking,records.activeBackorder,records.completedBackorder]);
     await page.screenshot({path:out+'/desktop.png',fullPage:true});
-    await page.reload(); await shown([records.activeBackorder,records.completedBackorder]);
-    await open('backorderStageFilter'); await expect(menu('backorderStageFilter').locator('input:checked')).toHaveCount(2);
-    await change('backorderStageFilter','new_enquiry',false); await shown([records.completedBackorder]);
-    await clear('backorderStageFilter'); await shown(Object.values(records));
+    await page.reload();await shown([records.stocking,records.activeBackorder,records.completedBackorder]);await expectRegularStatuses(page,'sales','pending_scm,completed');
+    await chooseRegularStatuses(page,'sales','completed');await shown([records.completedBackorder]);
+    await chooseRegularStatuses(page,'sales','all');await shown(Object.values(records));
 
-    await change('requestTypeFilter','stocking'); await shown([records.stocking]);
-    await change('requestTypeFilter','backorder'); await shown([records.stocking,records.activeBackorder,records.completedBackorder]);
-    await change('backorderStageFilter','completed'); await shown([records.completedBackorder]);
-    await change('requestTypeFilter','backorder',false); await shown([]);
+    await change('requestTypeFilter','stocking');await shown([records.stocking]);
+    await change('requestTypeFilter','backorder',true,true);await shown([records.stocking,records.activeBackorder,records.completedBackorder]);
+    await chooseRegularStatuses(page,'sales','completed');await shown([records.completedBackorder]);
+    await change('requestTypeFilter','backorder',false);await shown([]);
     await expect(page.locator('.stock-request-detail')).toContainText('Select a request');
-    await expect(menu('backorderStageFilter').locator('input:checked')).toHaveCount(1);
-    await clear('backorderStageFilter'); await shown([records.stocking]);
-    await clear('requestTypeFilter'); await shown(Object.values(records));
+    await expectRegularStatuses(page,'sales','completed');
+    await chooseRegularStatuses(page,'sales','all');await shown([records.stocking]);
+    await clear('requestTypeFilter');await shown(Object.values(records));
 
-    await change('vendorFilter','TEST, Vendor A'); await shown([records.stocking,records.accepted,records.completed]);
-    await change('vendorFilter','TEST Vendor'); await shown(Object.values(records));
-    await change('backorderStageFilter','new_enquiry'); await shown([records.activeBackorder]);
-    await page.reload(); await shown([records.activeBackorder]);
-    await open('vendorFilter'); await expect(menu('vendorFilter').locator('input:checked')).toHaveCount(2);
-    await page.locator('[data-sales-stock-action="clear-filters"]').click(); await shown(Object.values(records));
-    await expect(page.locator('[data-sales-multi-filter] input:checked')).toHaveCount(0);
-    await page.reload(); await shown(Object.values(records));
+    await change('vendorFilter','TEST, Vendor A');await shown([records.stocking,records.accepted,records.completed]);
+    await change('vendorFilter','TEST Vendor');await shown(Object.values(records));
+    await chooseRegularStatuses(page,'sales','pending_scm');await shown([records.stocking,records.activeBackorder]);
+    await page.reload();await shown([records.stocking,records.activeBackorder]);
+    await open('vendorFilter');await expect(menu('vendorFilter').locator('input:checked')).toHaveCount(2);
+    await page.locator('[data-sales-stock-action="clear-filters"]').click();await shown(active);
+    await expect(page.locator('[data-sales-multi-filter]:not([data-yard-filter="unifiedStatus"]) input:checked')).toHaveCount(0);await expectRegularStatuses(page,'sales','active');
+    await page.reload();await shown(active);
 
     await page.setViewportSize({width:390,height:844});
-    await change('backorderStageFilter','new_enquiry');
-    await change('backorderStageFilter','completed'); await shown([records.activeBackorder,records.completedBackorder]);
-    assert.ok(await menu('backorderStageFilter').locator('div[role="group"]').evaluate(el=>{
-      const bounds=el.getBoundingClientRect();return bounds.left>=0&&bounds.right<=document.documentElement.clientWidth;
-    }));
-    await page.screenshot({path:out+'/mobile.png',fullPage:true});
-    await menu('backorderStageFilter').locator('summary').click();
+    await chooseRegularStatuses(page,'sales','pending_scm,completed');await shown([records.stocking,records.activeBackorder,records.completedBackorder]);
+    await statuses.locator('summary').click();
+    assert.ok(await statuses.locator(':scope > div').evaluate(el=>{const bounds=el.getBoundingClientRect();return bounds.left>=0&&bounds.right<=document.documentElement.clientWidth;}));
+    await page.screenshot({path:out+'/mobile.png',fullPage:true});await statuses.locator('summary').click();
     await page.locator('[data-sales-stock-action="new"]').click();
-    for(const name of ['backorderStageFilter','requestTypeFilter','vendorFilter']) {
-      await open(name);
-      for(const input of await menu(name).locator('input').all())await expect(input).toBeDisabled();
+    for(const name of ['requestTypeFilter','vendorFilter']) {
+      await open(name);for(const input of await menu(name).locator('input').all())await expect(input).toBeDisabled();
       await expect(menu(name).getByRole('button',{name:'Clear selection',exact:true})).toBeDisabled();
     }
+    await statuses.locator('summary').click();for(const input of await statuses.locator('input').all()){await expect(input).toBeDisabled();}
     assert.deepEqual(errors, []);
-    writeFileSync(out+'/result.json',JSON.stringify({timings:times,errors,checks:['status-removed','old-status-ignored','stage-union','type-union','vendor-comma-union','filter-intersection','persistence','clear','keyboard','mobile','composer']},null,2));
+    writeFileSync(out+'/result.json',JSON.stringify({timings:times,errors,checks:['unified-statuses','old-status-ignored','status-union','type-union','vendor-comma-union','filter-intersection','persistence','clear','keyboard','mobile','composer']},null,2));
   } catch (error) {
     await page.screenshot({path:out+'/failure.png',fullPage:true});
     writeFileSync(out+'/failure.json',JSON.stringify({errors,message:error.message},null,2));

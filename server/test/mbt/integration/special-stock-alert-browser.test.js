@@ -62,6 +62,7 @@ async function fixture({ role = 'scm', roles = [role], width = 1440, shell = fal
       return route.fulfill({ body: await readFile('public' + file), contentType: ({ js: 'application/javascript', css: 'text/css', html: 'text/html', svg: 'image/svg+xml' })[file.split('.').at(-1)] || 'application/octet-stream' });
     } catch { return route.fulfill({ status: 404, body: 'Not found' }); }
   });
+  await page.route(url=>url.pathname.endsWith('/special-stock-requests/1'),route=>route.fulfill({json:state.records[0]}));
   await page.goto('http://localhost' + (shell ? '/alert-preview' : '/scm'));
   await page.waitForFunction(() => Boolean(window.MBBSScmSpecialAlert));
   return { page, context, state };
@@ -77,13 +78,13 @@ const transferCase = () => ({ id: 1, requestRef: 'SPREQ-TEST', stage: 'new_enqui
   lines: [{ id: 1, productName: 'TEST slab', quantity: 2, uom: 'PLT', salesDecision: 'pending', vendorYard: 'Vendor yard', salesVisibleNote: 'Sales reply', scmInternalNote: 'Private note' }],
   salesOrderLines: [], purchaseOrderLines: [], events: [], media: [], readinessAlerts: [] });
 
-test('Wait for Transfer requires ETA, sends the date, and keeps the selection after saving', async () => {
+test('production requires ETA while transfer awaits SO placement and retains its selection', async () => {
   const { page, context, state } = await fixture({ records: [transferCase()] });
   try {
     await page.goto('http://localhost/scm/stock-requests?tab=special&requestId=1');
     await page.locator('.stock-request-card[data-id="1"]').click();
     const supply = page.locator('[name=supplyStatus]'), eta = page.locator('[name=availableDate]');
-    await supply.selectOption('vendor_transfer');
+    await supply.selectOption('production');
     await expect(eta).toBeVisible();
     await expect(eta).toBeEnabled();
     assert.equal(await eta.evaluate(node => node.required && !node.validity.valid), true);
@@ -99,16 +100,18 @@ test('Wait for Transfer requires ETA, sends the date, and keeps the selection af
     await page.getByRole('button', { name: 'Save stock check', exact: true }).click();
     await expect.poll(() => state.posts.length).toBe(1);
     assert.equal(state.posts[0].supplyStatus, 'vendor_transfer');
-    assert.equal(state.posts[0].availableDate, '2099-02-01');
-    assert.equal(state.posts[0].availabilityMode, 'dated');
+    assert.equal(state.posts[0].availableDate, null);
+    assert.equal(state.posts[0].availabilityMode, 'so_placement');
     assert.equal(state.posts[0].salesVisibleNote, 'Sales reply');
     assert.equal(state.posts[0].scmInternalNote, 'Private note');
     await expect(supply).toHaveValue('vendor_transfer');
-    await expect(eta).toHaveValue('2099-02-01');
+    await expect(eta).toBeHidden();
+    await expect(page.locator('[data-special-transfer-eta]')).toContainText('SO placement +5 working days');
     await page.reload();
     await page.locator('.stock-request-card[data-id="1"]').click();
     await expect(supply).toHaveValue('vendor_transfer');
-    await expect(eta).toHaveValue('2099-02-01');
+    await expect(eta).toBeHidden();
+    await expect(page.locator('[data-special-transfer-eta]')).toContainText('SO placement +5 working days');
     await page.screenshot({ path: `${out}/wait-for-transfer.png` });
     assert.deepEqual(state.errors, []);
   } finally { await context.close(); }

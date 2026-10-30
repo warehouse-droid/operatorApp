@@ -7,7 +7,8 @@ import { chromium } from '@playwright/test';
 
 const coverage = [];
 after(async () => {
-  const { writeFile } = await import('node:fs/promises');
+  const { writeFile, mkdir } = await import('node:fs/promises');
+  await mkdir('test-artifacts/special-so-link-sqft-20261006', { recursive: true });
   await writeFile('test-artifacts/special-so-link-sqft-20261006/browser-coverage.json', JSON.stringify(coverage));
 });
 async function collect(page) {

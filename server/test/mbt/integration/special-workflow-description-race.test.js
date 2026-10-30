@@ -16,9 +16,36 @@ const context = { operatorId: 'special-description-race', authorizedStoreLocatio
 const soId = 8899801, poId = 8899802;
 const operationId = '01911111-1111-7111-8111-111111111132';
 
-test('discount and pallet adjustment survives an early webhook and lost SO response before committing locally',()=>fixture(async(d,review)=>{
+// New proposals stay local. These recovery tests explicitly retain a journal
+// that had already started remotely before local-only adjustments were introduced.
+async function retainStartedLegacyReview(detail, boundary, { adjustment = false, vendorDiscountTotal } = {}) {
+  const saved = await repo.getSpecialStockCase(detail.id, { audience: 'scm' });
+  const review = { ...saved.quantityReview, localOnly: false, remoteStarted: true,
+    status: 'attention', confirmedBy: context.operatorId, confirmedAt: new Date().toISOString(),
+    ...(adjustment ? { adjustmentVersion: 2 } : {}) };
+  review.lines = review.lines.map(change => ({ ...change,
+    salesUom: 'PC', purchaseUom: 'PC',
+    fromNativeDiscountPercent: 0, toNativeDiscountPercent: change.toDiscountPercent,
+    fromRate: 17, toRate: 17 }));
+  const orders = ['sales_order', 'purchase_order'].map(kind => {
+    const sales = kind === 'sales_order';
+    return { id: sales ? soId : poId, kind, discountMode: 'line',
+      lines: review.lines.map(change => ({
+        ...(sales ? saved.salesOrderLines : saved.purchaseOrderLines).find(line => line.caseLineId === change.caseLineId),
+        unitId: 865, quantity: sales ? change.fromQuantity : change.fromPurchaseQuantity,
+        toQuantity: sales ? change.toQuantity : change.toPurchaseQuantity, rate: sales ? 17 : 5,
+        ...(sales ? { toRate: 17, toNativeDiscountPercent: change.toDiscountPercent } : {}) })),
+      ...(sales && review.pallets ? { pallets: { ...review.pallets, unitId: 246 } } : {}),
+      ...(!sales && vendorDiscountTotal ? { vendorDiscountTotal } : {}) };
+  });
+  review.plan = await (adjustment ? prepareSpecialAdjustmentPlan : prepareSpecialQuantityPlan)({ orders }, boundary);
+  await query('UPDATE sales_special_stock_cases SET quantity_review=$2::jsonb WHERE request_id=$1', [detail.id, JSON.stringify(review)]);
+  return repo.getSpecialStockCase(detail.id, { audience: 'scm' });
+}
+
+test('already-started discount and pallet adjustment survives an early webhook and lost SO response before committing locally',()=>fixture(async(d,review)=>{
   review[0].description='Original';
-  d=await repo.prepareSpecialPurchaseOrder(d.id,{ vendorDiscountAmount: 0,expectedRevision:d.revision,lines:review},context);
+  d=await repo.prepareSpecialPurchaseOrder(d.id, { pallet: {quantity:0}, vendorDiscountAmount: 0,expectedRevision:d.revision,lines:review},context);
   await query("INSERT INTO purchase_orders(netsuite_id,tranid,vendor_id,destination_location_id,status_text,netsuite_active) VALUES($1,'TEST-RACE-PO',8899200,1,'Pending Receipt',true)",[poId]);
   await query("INSERT INTO purchase_order_lines(purchase_order_id,line_id,item_id,item_name,item_description,quantity,unit,netsuite_active) VALUES($1,90201,2055,'MBBS-Special Order','Original',500,'PC',true)",[poId]);
   d=await repo.linkSpecialPurchaseOrder(d.id,{expectedRevision:d.revision,purchaseOrderId:poId,purchaseOrderRef:'TEST-RACE-PO'},context);
@@ -39,6 +66,7 @@ test('discount and pallet adjustment survives an early webhook and lost SO respo
   const service=createSpecialQuantityService({resolveOrderUnits:async lines=>lines.map(line=>({...line,unitId:line.itemId===1784?246:865})),
     prepareAdjustmentPlan:input=>prepareSpecialAdjustmentPlan(input,boundary),applyAdjustmentPlan:plan=>applySpecialAdjustmentPlan(plan,boundary)});
   d=await repo.requestSpecialQuantityChange(d.id,{expectedRevision:d.revision,palletTotal:12,lines:[{caseLineId:d.lines[0].id,quantity:50,discountPercent:10}]},context);
+  d=await retainStartedLegacyReview(d,boundary,{adjustment:true});
   const confirm=()=>service.reviewQuantityChange(d.id,{expectedRevision:d.revision,reviewId:d.quantityReview.id,decision:'approve'},context);
   await assert.rejects(confirm(),/Lost adjustment response/);d=await repo.getSpecialStockCase(d.id);
   assert.equal(d.lines[0].discountPercent,0);assert.equal(d.palletTotal,11);assert.equal(d.quantityReview.status,'attention');
@@ -66,9 +94,9 @@ test('discount and pallet adjustment survives an early webhook and lost SO respo
 }));
 
 for (const loseResponse of [false, true]) {
-  test(`issued quantity confirmation tolerates exact SO/PO webhook transitions${loseResponse ? ' across recovery' : ''}`, () => fixture(async (d, review) => {
+  test(`already-started issued quantity confirmation tolerates exact SO/PO webhook transitions${loseResponse ? ' across recovery' : ''}`, () => fixture(async (d, review) => {
     review[0].description = 'Original';
-    d = await repo.prepareSpecialPurchaseOrder(d.id, { vendorDiscountAmount: 0, expectedRevision: d.revision, lines: review }, context);
+    d = await repo.prepareSpecialPurchaseOrder(d.id, { pallet: {quantity:0}, vendorDiscountAmount: 0, expectedRevision: d.revision, lines: review }, context);
     await query("INSERT INTO purchase_orders(netsuite_id,tranid,vendor_id,destination_location_id,status_text,netsuite_active) VALUES($1,'TEST-RACE-PO',8899200,1,'Pending Receipt',true)", [poId]);
     await query("INSERT INTO purchase_order_lines(purchase_order_id,line_id,item_id,item_name,item_description,quantity,unit,netsuite_active) VALUES($1,90201,2055,'MBBS-Special Order','Original',500,'PC',true)", [poId]);
     d = await repo.linkSpecialPurchaseOrder(d.id, { expectedRevision: d.revision, purchaseOrderId: poId, purchaseOrderRef: 'TEST-RACE-PO' }, context);
@@ -101,6 +129,7 @@ for (const loseResponse of [false, true]) {
       resolveOrderUnits: async lines => lines.map(l => ({ ...l, unitId: l.itemId === 2055 ? 865 : 246 })),
       preparePlan: input => prepareSpecialQuantityPlan(input, boundary), applyPlan: plan => applySpecialQuantityPlan(plan, boundary)
     });
+    d = await retainStartedLegacyReview(d, boundary);
     const confirm = () => service.reviewQuantityChange(d.id, { expectedRevision: d.revision, reviewId: d.quantityReview.id, decision: 'approve' }, context);
     if (loseResponse) {
       await assert.rejects(confirm(), /Response lost/);
@@ -167,7 +196,7 @@ test('document cache retains a valid PDF on rendering failure and checks authori
   assert.equal(updated.cached, false); assert.notDeepEqual(updated.buffer, first.buffer);
 }));
 
-test('SCM PO creation survives SO webhooks after PATCH, before submission and before final linking', () => fixture(async (d, review) => {
+test('independent SCM PO creation preserves the SO through webhooks before submission and final linking', () => fixture(async (d, review) => {
   const remote = [
     { line: 1, item: { id: '2055' }, units: '865', quantity: 500, rate: 17, description: 'Original' },
     { line: 2, item: { id: '1784' }, units: '246', quantity: 11, rate: 40, description: 'PALLET' }
@@ -175,7 +204,7 @@ test('SCM PO creation survives SO webhooks after PATCH, before submission and be
   let posts = 0, patches = 0;
   const webhook = async () => {
     const result = await repo.reconcileSpecialOrderWebhook({ orderKind: 'sales_order', orderId: soId });
-    assert.equal(result.attention, false, 'The exact SCM description is an expected transition');
+    assert.equal(result.attention, false, 'The original SO remains valid throughout independent PO creation');
   };
   const service = createSpecialStockRequestService({ assertPurchaseOrderReady: async () => {}, selectSalesRep: async () => ({ id: 123, name: 'TEST NetSuite Rep' }),
     findLinkedPurchaseOrder: async () => null,
@@ -196,8 +225,8 @@ test('SCM PO creation survives SO webhooks after PATCH, before submission and be
     findMarkerOrders: async () => [],
     createPurchaseOrder: async payload => {
       posts++;
-      assert.equal(remote[0].description, 'SCM reviewed');
-      assert.equal((await repo.getSpecialStockCase(d.id)).salesOrderLines[0].description, 'SCM reviewed');
+      assert.equal(remote[0].description, 'Original');
+      assert.equal((await repo.getSpecialStockCase(d.id)).salesOrderLines[0].description, 'Original');
       assert.equal(payload.item.items[0].description, 'SCM reviewed');
       await query("INSERT INTO purchase_orders(netsuite_id,tranid,vendor_id,destination_location_id,status_text,netsuite_active) VALUES($1,'TEST-RACE-PO',8899200,1,'Pending Receipt',true)", [poId]);
       await query("INSERT INTO purchase_order_lines(purchase_order_id,line_id,item_id,item_name,item_description,quantity,unit,netsuite_active) VALUES($1,90201,2055,'MBBS-Special Order','SCM reviewed',500,'PC',true)", [poId]);
@@ -207,11 +236,11 @@ test('SCM PO creation survives SO webhooks after PATCH, before submission and be
     fetchPurchaseOrderReference: async () => ({ tranid: 'TEST-RACE-PO', status_text: 'Pending Receipt' }),
     sleep: async () => {}
   });
-  const linked = await service.createPurchaseOrder(d.id, { vendorDiscountAmount: 0, expectedRevision: d.revision, operationId, lines: review }, context);
+  const linked = await service.createPurchaseOrder(d.id, { pallet: {quantity:0}, vendorDiscountAmount: 0, expectedRevision: d.revision, operationId, lines: review }, context);
   assert.equal(linked.purchaseOrderId, poId);
   assert.equal(linked.purchaseOrderOperationStatus, 'linked');
   assert.equal(linked.attention, false);
-  assert.equal(posts, 1); assert.equal(patches, 1);
+  assert.equal(posts, 1); assert.equal(patches, 0);
   assert.deepEqual(remote.map(l => [l.quantity, l.units, l.rate]), [[500, '865', 17], [11, '246', 40]]);
   assert.equal(remote[1].description, 'PALLET');
   const warnings = await query("SELECT id FROM sales_special_stock_events WHERE request_id=$1 AND event_type='special_order_line_reconciliation_attention'", [d.id]);
@@ -219,7 +248,7 @@ test('SCM PO creation survives SO webhooks after PATCH, before submission and be
 }));
 
 test('webhook revision changes do not grant another operation ownership or allow a future revision', () => fixture(async (d, review) => {
-  d = await repo.prepareSpecialPurchaseOrder(d.id, { vendorDiscountAmount: 0, expectedRevision: d.revision, lines: review }, context);
+  d = await repo.prepareSpecialPurchaseOrder(d.id, { pallet: {quantity:0}, vendorDiscountAmount: 0, expectedRevision: d.revision, lines: review }, context);
   const owned = await repo.claimSpecialOrderOperation(d.id, { expectedRevision: d.revision, orderKind: 'purchase_order', operationId }, context);
   await repo.reconcileSpecialOrderWebhook({ orderKind: 'sales_order', orderId: soId });
   await assert.rejects(repo.recordSpecialSalesDescriptionsSynced(d.id, { expectedRevision: owned.revision, operationId: '01911111-1111-7111-8111-111111111199', changes: [] }, context), { code: 'SPECIAL_REMOTE_OPERATION_BUSY' });
@@ -230,7 +259,7 @@ test('webhook revision changes do not grant another operation ownership or allow
 }));
 
 test('loss of SO approval during the claimed operation blocks PO submission', () => fixture(async (d, review) => {
-  d = await repo.prepareSpecialPurchaseOrder(d.id, { vendorDiscountAmount: 0, expectedRevision: d.revision, lines: review }, context);
+  d = await repo.prepareSpecialPurchaseOrder(d.id, { pallet: {quantity:0}, vendorDiscountAmount: 0, expectedRevision: d.revision, lines: review }, context);
   const owned = await repo.claimSpecialOrderOperation(d.id, { expectedRevision: d.revision, orderKind: 'purchase_order', operationId }, context);
   await query("UPDATE sales_orders SET status_text='Closed' WHERE netsuite_id=$1", [soId]);
   await repo.reconcileSpecialOrderWebhook({ orderKind: 'sales_order', orderId: soId });
@@ -246,7 +275,7 @@ for (const [name, sql, expected] of [
   ['SO description is unreviewed', "UPDATE sales_order_lines SET item_description='Unreviewed' WHERE sales_order_id=$1 AND line_id=90101", 'SPECIAL_ORDER_COVERAGE_MISMATCH']
 ]) {
   test(`owned PO submission still blocks when ${name}`, () => fixture(async (d, review) => {
-    d = await repo.prepareSpecialPurchaseOrder(d.id, { vendorDiscountAmount: 0, expectedRevision: d.revision, lines: review }, context);
+    d = await repo.prepareSpecialPurchaseOrder(d.id, { pallet: {quantity:0}, vendorDiscountAmount: 0, expectedRevision: d.revision, lines: review }, context);
     const owned = await repo.claimSpecialOrderOperation(d.id, { expectedRevision: d.revision, orderKind: 'purchase_order', operationId }, context);
     await query(sql, [name === 'case closes' ? d.id : soId]);
     if (name !== 'case closes') await repo.reconcileSpecialOrderWebhook({ orderKind: 'sales_order', orderId: soId });
@@ -256,7 +285,7 @@ for (const [name, sql, expected] of [
 }
 
 test('a stopped owner cannot finalize, and description recording cannot conceal a changed commercial line', () => fixture(async (d, review) => {
-  d = await repo.prepareSpecialPurchaseOrder(d.id, { vendorDiscountAmount: 0, expectedRevision: d.revision, lines: review }, context);
+  d = await repo.prepareSpecialPurchaseOrder(d.id, { pallet: {quantity:0}, vendorDiscountAmount: 0, expectedRevision: d.revision, lines: review }, context);
   const owned = await repo.claimSpecialOrderOperation(d.id, { expectedRevision: d.revision, orderKind: 'purchase_order', operationId }, context);
   const material = owned.salesOrderLines.find(l => !l.ancillary);
   for (const patch of [{ quantity: 501 }, { uom: 'SQFT' }, { rate: 18 }]) {
@@ -271,8 +300,14 @@ test('a stopped owner cannot finalize, and description recording cannot conceal 
 }));
 
 for (const [exists, lost] of [[false, false], [true, false], [false, true]]) {
-  test(`real SCM workflow corrects SO quantity/UOM before ${exists ? 'updating the existing native PO' : 'creating a standalone PO'} despite webhooks${lost ? ' and a lost creation response' : ''}`,  () => fixture(async (d, review) => {
+  test(`real SCM workflow preserves SO quantity/UOM while ${exists ? 'recovering the existing native PO' : 'creating an independent PO'} despite webhooks${lost ? ' and a lost creation response' : ''}`,  () => fixture(async (d, review) => {
     review[0] = { ...review[0], quantity: 501, uom: 'EACH' };
+    if (exists) {
+      review[0] = { ...review[0], quantity: 500, uom: 'PC', description: 'Original' };
+      d = await repo.prepareSpecialPurchaseOrder(d.id, { pallet:{quantity:0}, expectedRevision:d.revision, lines:review },context);
+      await query("UPDATE sales_special_stock_cases SET purchase_order_submission_started_at=now(),vendor_discount_review=vendor_discount_review-'independent' WHERE request_id=$1",[d.id]);
+      d = await repo.getSpecialStockCase(d.id,{audience:'scm'});
+    }
     const so = { id: String(soId), orderStatus: { id: 'B' }, item: { items: [
       { line: 1, lineUniqueKey: '90101', item: { id: '2055' }, quantity: 500, units: '865', rate: 17, description: 'Original',
         ...(exists ? { createdPo: { id: String(poId) }, createPo: { id: 'SpecOrd' } } : {}) },
@@ -285,7 +320,7 @@ for (const [exists, lost] of [[false, false], [true, false], [false, true]]) {
     let creates = 0, soCorrections = 0, poUpdates = 0;
     const mirrorPo = async () => {
       await query("INSERT INTO purchase_orders(netsuite_id,tranid,vendor_id,destination_location_id,status_text,netsuite_active) VALUES($1,'TEST-RACE-PO',8899200,1,'Pending Receipt',true)", [poId]);
-      await query("INSERT INTO purchase_order_lines(purchase_order_id,line_id,item_id,item_name,item_description,quantity,unit,netsuite_active) VALUES($1,90201,2055,'MBBS-Special Order','SCM reviewed',501,'EACH',true)", [poId]);
+      await query("INSERT INTO purchase_order_lines(purchase_order_id,line_id,item_id,item_name,item_description,quantity,unit,netsuite_active) VALUES($1,90201,2055,'MBBS-Special Order',$2,$3,$4,true)", [poId,po.item.items[0].description,po.item.items[0].quantity,po.item.items[0].units === '865' ? 'PC' : 'EACH']);
       await repo.reconcileSpecialOrderWebhook({ orderKind: 'sales_order', orderId: soId });
     };
     const boundary = {
@@ -296,7 +331,7 @@ for (const [exists, lost] of [[false, false], [true, false], [false, true]]) {
         if (options.method === 'POST') {
           assert.equal(path, '/record/v1/purchaseOrder');assert.equal(exists,false);assert.equal(po,null);
           assert.equal(options.body.createdFrom,undefined);assert.equal(options.body.externalId,`MBBS-SPECIAL-PO:${d.id}`);
-          assert.equal(so.item.items[0].quantity,501);assert.equal(so.item.items[0].units,'873');assert.equal(so.item.items[0].description,'SCM reviewed');
+          assert.equal(so.item.items[0].quantity,500);assert.equal(so.item.items[0].units,'865');assert.equal(so.item.items[0].description,'Original');
           creates++;
           po={...structuredClone(options.body),id:String(poId),tranId:'TEST-RACE-PO',orderStatus:{id:'B'}};
           po.item.items.forEach((line,index)=>{line.line=4+index;});
@@ -317,7 +352,7 @@ for (const [exists, lost] of [[false, false], [true, false], [false, true]]) {
         }
         if (options.method === 'PATCH' && !isSo) {
           poUpdates++;
-          assert.equal(so.item.items[0].quantity, 501); assert.equal(so.item.items[0].units, '873');
+          assert.equal(so.item.items[0].quantity, 500); assert.equal(so.item.items[0].units, '865');
           if (options.body.memo !== undefined) po.memo = options.body.memo;
           for (const patch of options.body.item?.items || []) Object.assign(po.item.items.find(l => l.line === patch.line), patch);
           await mirrorPo();
@@ -335,20 +370,20 @@ for (const [exists, lost] of [[false, false], [true, false], [false, true]]) {
       finalizeLinkedPurchaseOrder: input => finalizeLinkedSpecialPurchaseOrder(input, boundary),
       fetchPurchaseOrderReference: async () => ({ tranid: 'TEST-RACE-PO', status_text: 'Pending Receipt' }), sleep: async () => {}
     });
-    const linked = await service.createPurchaseOrder(d.id, { vendorDiscountAmount: 0, expectedRevision: d.revision, operationId, lines: review }, context);
+    const linked = await service.createPurchaseOrder(d.id, { pallet: {quantity:0}, vendorDiscountAmount: 0, expectedRevision: d.revision, operationId, lines: review }, context);
     assert.equal(linked.purchaseOrderId, poId); assert.equal(linked.purchaseOrderOperationStatus, 'linked'); assert.equal(linked.attention, false);
-    assert.equal(creates, exists ? 0 : 1); assert.equal(soCorrections, 1); assert.equal(poUpdates, exists ? 1 : 0);
+    assert.equal(creates, exists ? 0 : 1); assert.equal(soCorrections, 0); assert.equal(poUpdates, exists ? 1 : 0);
     assert.equal(po.createdFrom?.id,exists?String(soId):undefined);
     assert.equal(so.item.items[0].createdPo?.id,exists?String(poId):undefined);
-    assert.deepEqual(linked.salesOrderLines.filter(l => !l.ancillary).map(l => [l.quantity, l.uom, l.rate, l.description]), [[501, 'EACH', 17, 'SCM reviewed']]);
-    assert.deepEqual(linked.purchaseOrderLines.map(l => [l.quantity, l.uom, l.unitPurchaseCost, l.description]), [[501, 'EACH', 5, 'SCM reviewed']]);
+    assert.deepEqual(linked.salesOrderLines.filter(l => !l.ancillary).map(l => [l.quantity, l.uom, l.rate, l.description]), [[500, 'PC', 17, 'Original']]);
+    assert.deepEqual(linked.purchaseOrderLines.map(l => [l.quantity, l.uom, l.unitPurchaseCost, l.description]), [exists ? [500, 'PC', 5, 'Original'] : [501, 'EACH', 5, 'SCM reviewed']]);
     assert.deepEqual(so.item.items[1], { line: 2, lineUniqueKey: '90102', item: { id: '1784' }, quantity: 11, units: '246', rate: 40, description: 'PALLET' });
   }));
 }
 
-test('a confirmed quantity change preserves gross PO costs, updates the vendor summary and private review, and accepts its webhook',()=>fixture(async(d,review)=>{
+test('an already-started quantity change preserves gross PO costs, updates the vendor summary and private review, and accepts its webhook',()=>fixture(async(d,review)=>{
   review[0].description='Original';review[0].vendorDiscountPercent=25;
-  d=await repo.prepareSpecialPurchaseOrder(d.id,{expectedRevision:d.revision,lines:review},context);
+  d=await repo.prepareSpecialPurchaseOrder(d.id, { pallet: {quantity:0},expectedRevision:d.revision,lines:review},context);
   assert.equal(d.vendorDiscountReview.amount,625);
   await query("INSERT INTO purchase_orders(netsuite_id,tranid,vendor_id,destination_location_id,status_text,netsuite_active) VALUES($1,'TEST-RACE-PO',8899200,1,'Pending Receipt',true)",[poId]);
   await query("INSERT INTO purchase_order_lines(purchase_order_id,line_id,item_id,item_name,item_description,quantity,unit,netsuite_active,item_type) VALUES($1,90201,2055,'MBBS-Special Order','Original',500,'PC',true,'NonInvtPart'),($1,90202,4981,'Discount','Vendor discount',1,NULL,true,'NonInvtPart')",[poId]);
@@ -366,6 +401,7 @@ test('a confirmed quantity change preserves gross PO costs, updates the vendor s
   const service=createSpecialQuantityService({resolveOrderUnits:async ls=>ls.map(l=>({...l,unitId:l.itemId===1784?246:865})),
     prepareAdjustmentPlan:input=>prepareSpecialAdjustmentPlan(input,boundary),applyAdjustmentPlan:plan=>applySpecialAdjustmentPlan(plan,boundary)});
   d=await repo.requestSpecialQuantityChange(d.id,{expectedRevision:d.revision,lines:[{caseLineId:d.lines[0].id,quantity:50}]},context);
+  d=await retainStartedLegacyReview(d,boundary,{adjustment:true,vendorDiscountTotal:{before:625,after:62.5}});
   d=await service.reviewQuantityChange(d.id,{expectedRevision:d.revision,reviewId:d.quantityReview.id,decision:'approve'},context);
   assert.equal(writes,2);assert.equal(d.purchaseOrderLines[0].unitPurchaseCost,5);
   assert.deepEqual([d.vendorDiscountReview.grossTotal,d.vendorDiscountReview.amount,d.vendorDiscountReview.netTotal],[250,62.5,187.5]);

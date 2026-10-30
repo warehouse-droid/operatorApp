@@ -1,3 +1,4 @@
+import { assertIsolatedTestConnection } from '../../support/test-database-isolation.mjs';
 /* global structuredClone */
 import assert from 'node:assert/strict';
 import crypto from 'node:crypto';
@@ -13,7 +14,7 @@ const cases=[],soIds=[],poIds=[],users={},run=crypto.randomUUID();
 let server,base,transport,gate,counter=0;
 before(async()=>{
   assert.equal(process.env.MBT_TEST_ISOLATED,'1');
-  assert.equal(new URL(process.env.DATABASE_URL).hostname,'mbbs-special-review-db');
+  assertIsolatedTestConnection(process.env.DATABASE_URL);
   transport=await transportFixture();
   gate=(await query("SELECT enabled FROM mbt_feature_flags WHERE flag_key='special_stock_request_workflow'")).rows[0].enabled;
   await query("UPDATE mbt_feature_flags SET enabled=true WHERE flag_key='special_stock_request_workflow'");
@@ -69,7 +70,7 @@ async function fixture({draft=false,unapproved=false,unreviewed=false,skipLink=f
     if(request.method==='GET'&&request.url.pathname.endsWith('/salesOrder/'+soId))return {data:so};
     if(request.method==='GET'&&request.url.pathname.endsWith('/purchaseOrder/'+poId))return {data:po};
     if(request.method==='POST'&&request.url.pathname.endsWith('/record/v1/purchaseOrder')){
-      posted=true;return lost?{status:400,data:{error:'Response lost after commit'}}:{status:204,headers:{location:'/services/rest/record/v1/purchaseOrder/'+poId}};
+      posted=true;return lost?{status:503,data:{error:'Response lost after commit'}}:{status:204,headers:{location:'/services/rest/record/v1/purchaseOrder/'+poId}};
     }
     throw Error('Unexpected remote operation '+request.method+' '+request.url.pathname);
   };

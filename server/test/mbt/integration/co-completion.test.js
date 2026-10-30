@@ -1,3 +1,4 @@
+import { seedReviewedLegacyFulfillment } from '../../support/legacy-fulfillment-candidate.mjs';
 import assert from 'node:assert/strict';
 import test, { after } from 'node:test';
 import { closeDb, query, withTransaction } from '../../../src/db.js';
@@ -39,6 +40,7 @@ test('database boundary corrects a stale grouped CO completion and leaves source
 test('repaired transfer evidence cannot be claimed by an already queued fulfillment candidate', () => isolated(async () => {
   const f = await seedCoFixture();
   const before = await insertLegacyCoJob(f);
+  for (const ref of f.members) {await seedReviewedLegacyFulfillment(ref);}
   await query(`UPDATE mbt_feature_flags SET enabled=true WHERE flag_key='dispatch_netsuite_sales_order_if_2967'`);
   const candidate = (await query(`UPDATE dispatch_sales_order_if_candidates SET status='queued',
     gate_key='dispatch_netsuite_sales_order_if_2967',resolution_action='historical_backfill'
@@ -160,6 +162,7 @@ test('a stale retry cannot undo an audited correction after the completed stop l
 test('the deployment repair detects opaque stop IDs and preserves all protected fields', () => isolated(async () => {
   const f = await seedCoFixture();
   const legacy = await insertLegacyCoJob(f);
+  for (const ref of f.members) {await seedReviewedLegacyFulfillment(ref);}
   await query("UPDATE dispatch_sales_order_if_candidates SET status='gate_disabled' WHERE dispatch_order_ref=ANY($1)", [f.members]);
   const candidates = (await coCompletionCandidates()).filter(row => row.id === legacy.id);
   assert.equal(candidates.length, 1);

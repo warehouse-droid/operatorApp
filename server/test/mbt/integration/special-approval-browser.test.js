@@ -1,3 +1,6 @@
+function applyPurchaseRouting(path,order,record,body) {
+  if (path.endsWith('/purchase-order/routing')) { Object.assign(order.scm,body);record.purchaseOrderReference=body.packingSlipRef; }
+}
 /* global document, localStorage */
 import test, { before, after } from 'node:test';
 import assert from 'node:assert/strict';
@@ -24,7 +27,8 @@ async function fixture(audience, width = 1440, configure = () => {}) {
     lines: [1,2,3].map(id => ({ id, productName: `TEST product ${id}`, quantity: 2, uom: 'PLT', salesDecision: 'pending', supplyStatus: 'in_stock', vendorYard: `Yard ${id}` })),
     salesOrderLines: [], purchaseOrderLines: [], events: [], media: [], readinessAlerts: [] };
   configure(record);
-  const state = { record, posts: [], errors: [], fail: false };
+  const order={id:'VENDOR',originalPoRef:'PO-NATIVE',destinationYard:'3445',netSuiteNote:'',scm:{method:'MBT',status:'Queued',packingSlipRef:'VENDOR',updatedAt:'2099-01-01T00:00:00Z'}};
+  const state = { record, order, posts: [], errors: [], fail: false };
   page.on('pageerror', e => state.errors.push(e.message));
   await page.route('**/*', async route => {
     const { pathname: path, hostname } = new URL(route.request().url());
@@ -33,6 +37,7 @@ async function fixture(audience, width = 1440, configure = () => {}) {
       if (['POST','PUT'].includes(route.request().method())) {
         const body = route.request().postDataJSON(); state.posts.push({ path, body });
         if (state.fail) return route.fulfill({ status: 409, json: { error: 'Review changed. Try again.' } });
+        applyPurchaseRouting(path,order,record,body);
         if (path.endsWith('/sales-order-draft')) record.netsuiteSalesRepId = Number(body.salesRepId);
         if (path.endsWith('/sales-order/create')) { record.salesOrderId = 10; record.salesOrderRef = 'TEST-SO'; }
         if (path.endsWith('/purchase-order/create')) { record.purchaseOrderId = 20; record.purchaseOrderRef = 'TEST-PO'; }
@@ -60,6 +65,8 @@ async function fixture(audience, width = 1440, configure = () => {}) {
     try { return route.fulfill({ body: await readFile('public' + file), contentType: ({ js: 'application/javascript', css: 'text/css', html: 'text/html' })[file.split('.').at(-1)] || 'application/octet-stream' }); }
     catch { return route.fulfill({ status: 404, body: '' }); }
   });
+  await page.route(url=>url.pathname.startsWith('/api/dispatch/scm/v2/purchase-orders/'),route=>route.fulfill({json:{order}}));
+  await page.route(url=>url.pathname.endsWith('/purchase-order/note'),route=>route.fulfill({json:{note:''}}));
   await page.goto(`http://localhost/${audience}/stock-requests?tab=special`);
   await page.locator('.stock-request-card[data-id="1"]').click();
   return { page, context, state };
@@ -116,9 +123,9 @@ test('SCM removal review explains the local effect and identifies the removed ma
  await expect(form.getByRole('button',{name:'Confirm adjustment'})).toBeVisible();
  }finally{await context.close();}
 });
-test('approved PO exposes shared reference form and preserves failed edits',async()=>{
+test('approved PO exposes its reference in shared routing and preserves failed edits',async()=>{
  const {page,context,state}=await fixture('scm',1440,d=>{d.salesOrderId=10;d.purchaseOrderId=20;d.purchaseOrderApproved=true;d.purchaseOrderRef='PO-NATIVE';d.purchaseOrderReference='VENDOR';});
- try{const form=page.locator('[data-special-po-reference-form]');await expect(form).toBeVisible();await form.locator('[name=reference]').fill('NEW-REF');state.fail=true;await form.getByRole('button').click();await expect(form.locator('[name=reference]')).toHaveValue('NEW-REF');state.fail=false;await form.getByRole('button').click();assert.equal(state.posts.at(-1).body.previousReference,'VENDOR');assert.equal(state.posts.at(-1).body.reference,'NEW-REF');}
+ try{const form=page.locator('[data-special-po-routing-form]');await expect(form).toBeVisible();await form.locator('[name=packingSlipRef]').fill('NEW-REF');state.fail=true;await form.getByRole('button',{name:'Save Schedule',exact:true}).click();await expect(page.locator('.stock-request-feedback')).toContainText('Review changed');await expect(form.locator('[name=packingSlipRef]')).toHaveValue('NEW-REF');state.fail=false;await form.getByRole('button',{name:'Save Schedule',exact:true}).click();await expect.poll(()=>state.posts.length).toBe(2);assert.equal(state.posts.at(-1).path,'/api/scm/special-stock-requests/1/purchase-order/routing');assert.equal(state.posts.at(-1).body.expectedUpdatedAt,'2099-01-01T00:00:00Z');assert.equal(state.posts.at(-1).body.packingSlipRef,'NEW-REF');}
  finally{await context.close();}
 });
 test('Sales delivery editor remains available after SO and PO creation',async()=>{
@@ -139,9 +146,9 @@ test('mobile Sales delivery form preserves contact details across method toggles
  await page.screenshot({path:`${out}/sales-delivery-mobile.png`,fullPage:true});
  }finally{await context.close();}
 });
-test('planned Sales order hides delivery editor; SCM pending PO hides reference editor and escapes delivery text',async()=>{
+test('planned Sales order retains delivery editing and SCM displays pending approval with escaped delivery text',async()=>{
  const sales=await fixture('sales',1440,d=>{d.salesOrderId=10;d.dispatchPlanning={anyPlanned:true,salesOrder:{planned:true}};});
- try{await expect(sales.page.locator('[data-special-fulfillment-form]')).toHaveCount(0);}finally{await sales.context.close();}
+ try{await expect(sales.page.locator('[data-special-fulfillment-form]')).toBeVisible();}finally{await sales.context.close();}
  const scm=await fixture('scm',390,d=>{d.salesOrderId=10;d.purchaseOrderId=20;d.purchaseOrderApproved=false;d.purchaseOrderPendingApproval=true;d.fulfillmentMethod='mbt_delivery';d.deliveryAddress='<img src=x onerror=alert(1)>';});
  try{await expect(scm.page.locator('[data-special-po-reference-form]')).toHaveCount(0);await expect(scm.page.locator('.stock-request-detail')).toContainText('PO approval pending');await expect(scm.page.locator('.stock-request-detail img')).toHaveCount(0);assert.equal(await scm.page.evaluate(()=>document.documentElement.scrollWidth>window.innerWidth),false);}
  finally{await scm.context.close();}

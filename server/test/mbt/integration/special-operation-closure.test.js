@@ -70,11 +70,14 @@ test('Sales closure with an issued PO only requests SCM approval, including repe
   assert.deepEqual(writes, []); assert.deepEqual(plans, []);
 }));
 
-test('SO-only closure retains scope, stale revision and executed-order protection', () => fixture(async ({ detail, service, writes, execute }) => {
+test('SO-only closure retains scope and revision guards while preserving prior execution', () => fixture(async ({ detail, service, writes, plans, execute }) => {
   await assert.rejects(service.requestClosure(detail.id, input(detail), { ...context, authorizedStoreLocationIds: [28] }), { status: 403 });
   await assert.rejects(service.requestClosure(detail.id, { ...input(detail), expectedRevision: detail.revision + 1 }, context), { status: 409 });
-  execute(); await assert.rejects(service.requestClosure(detail.id, input(detail), context), { status: 409 });
-  assert.deepEqual(writes, []); assert.equal((await repo.getSpecialStockCase(detail.id)).status, 'active');
+  assert.deepEqual(writes, []);
+  execute(); const closed = await service.requestClosure(detail.id, input(detail), context);
+  assert.equal(closed.status, 'cancelled'); assert.equal(closed.closeStatus, 'closed');
+  assert.equal(plans[0].closeRemaining, true); assert.equal(writes.length, 1);
+  assert.equal((await query('SELECT closure_review FROM sales_special_stock_cases WHERE request_id=$1',[detail.id])).rows[0].closure_review.plan.orders[0].lines[0].executedQuantity, 1);
 }));
 
 test('an unverified SO never cancels locally', () => fixture(async ({ detail }) => {

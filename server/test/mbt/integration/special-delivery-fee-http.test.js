@@ -1,3 +1,4 @@
+import { assertIsolatedTestConnection } from '../../support/test-database-isolation.mjs';
 import assert from 'node:assert/strict';
 import test,{before,after} from 'node:test';
 import crypto from 'node:crypto';
@@ -23,7 +24,7 @@ async function call(path,{body,role='sales',method=body?'POST':'GET'}={}){
 }
 const create='/api/sales/special-stock-requests';
 before(async()=>{
- assert.equal(process.env.MBT_TEST_ISOLATED,'1');assert.equal(process.env.NETSUITE_DIRECT_ACCESS_ENABLED,'false');assert.equal(new URL(process.env.DATABASE_URL).hostname,'mbbs-special-review-db');
+ assert.equal(process.env.MBT_TEST_ISOLATED,'1');assert.equal(process.env.NETSUITE_DIRECT_ACCESS_ENABLED,'false');assertIsolatedTestConnection(process.env.DATABASE_URL);
  flag=(await query("SELECT enabled FROM mbt_feature_flags WHERE flag_key='special_stock_request_workflow'")).rows[0].enabled;
  await query("UPDATE mbt_feature_flags SET enabled=true WHERE flag_key='special_stock_request_workflow'");
  settings=(await query('SELECT data FROM field_sales_settings WHERE singleton')).rows[0].data;

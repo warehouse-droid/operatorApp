@@ -1,3 +1,4 @@
+import { assertIsolatedTestConnection } from '../../support/test-database-isolation.mjs';
 import test, { before, after } from 'node:test';
 import assert from 'node:assert/strict';
 import crypto from 'node:crypto';
@@ -64,7 +65,7 @@ async function reviewedCase({ production = false, draft = true } = {}) {
   return detail;
 }
 before(async () => {
-  assert.equal(process.env.MBT_TEST_ISOLATED, '1'); assert.equal(new URL(process.env.DATABASE_URL).hostname, 'mbbs-special-updates-db-20261002');
+  assert.equal(process.env.MBT_TEST_ISOLATED, '1'); assertIsolatedTestConnection(process.env.DATABASE_URL);
   originalPriceTrigger = (await query("SELECT pg_get_functiondef('preserve_special_original_price()'::regprocedure) AS definition")).rows[0].definition;
   await query(migration());
   flag = (await query("SELECT enabled FROM mbt_feature_flags WHERE flag_key='special_stock_request_workflow'")).rows[0].enabled;
@@ -113,8 +114,8 @@ test('single Sales edit saves PALLET and delivery fee atomically without changin
   assert.deepEqual(await snapshot(detail.id), noOp);
   const free = await call(detail.id, { expectedRevision: changed.revision, deliveryFeeRate: 0 });
   assert.equal(free.status, 200); assert.equal(free.payload.deliveryFeeRate, 0);
-  assert.equal(free.payload.salesOrderLines.filter(l => l.itemId === 1987).length, 1);
-  assert.equal(free.payload.salesOrderLines.find(l => l.itemId === 1987).rate, 0);
+  assert.equal(free.payload.salesOrderLines.filter(l => l.itemId === 1987).length, 0);
+  assert.deepEqual(free.payload.salesOrderLines, changed.salesOrderLines.filter(l => l.itemId !== 1987));
 });
 
 test('quote PDF omits declined stale-draft lines, keeps saved notes readable, and uses edited charges', async () => {

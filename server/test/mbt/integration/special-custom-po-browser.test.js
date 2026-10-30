@@ -36,6 +36,7 @@ async function fixture(width=1440) {
     const file=path==='/scm/stock-requests'?'/scm-stock-requests.html':path;
     try{return route.fulfill({body:await readFile('public'+file),contentType:({js:'application/javascript',css:'text/css',html:'text/html'})[file.split('.').at(-1)]||'application/octet-stream'});}catch{return route.fulfill({status:404,body:''});}
   });
+  await page.route(url=>/\/items\/\d+\/units$/.test(url.pathname),route=>route.fulfill({json:{noUnits:false,defaultUnitId:865,units:[{id:865,name:'PC'},{id:873,name:'EACH'},{id:950,name:'SQFT'}]}}));
   await page.goto('http://localhost/scm/stock-requests?tab=special');await expect(page.locator('[data-special-po-form]')).toBeVisible();
   return {page,state,close:async()=>{assert.deepEqual(state.errors,[]);await writeFile(`${out}/coverage-${++capture}.json`,JSON.stringify(await page.coverage.stopJSCoverage()));await context.close();}};
 }

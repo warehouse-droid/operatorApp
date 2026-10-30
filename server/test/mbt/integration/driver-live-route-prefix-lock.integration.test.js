@@ -146,7 +146,7 @@ test("a rejected cross-load edit changes neither revision nor snapshot, while a 
   }
 });
 
-test("automated billed reconciliation defers instead of deleting a completed route prefix", async () => {
+test("automated closed-order reconciliation defers instead of deleting a completed route prefix", async () => {
   const rollback = await beginRollbackContext();
   try {
     await rollback.run(async () => {
@@ -213,7 +213,7 @@ test("automated billed reconciliation defers instead of deleting a completed rou
       const cleanup = await reconcileSalesOrderFamilyInDispatchPlans({
         canonicalRef: orderRef,
         familyRefs: [orderRef],
-        billed: true,
+        closed: true,
         actor: "driver-route-prefix-test"
       });
       assert.equal(cleanup.deferred, true);

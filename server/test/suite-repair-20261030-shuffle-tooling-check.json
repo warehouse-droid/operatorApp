@@ -1,0 +1,290 @@
+{
+  "passed": true,
+  "label": "shuffle-tooling-check",
+  "specApproval": "not obtained (autonomous run)",
+  "selection": [
+    "test/mbt/integration/regular-waitlist-startup.test.js",
+    "test/mbt/unit/ui-navigation-contract.test.js",
+    "test/mbt/unit/consolidation-load-posting.test.js"
+  ],
+  "result": {
+    "fileCount": 3,
+    "tests": 10,
+    "pass": 10,
+    "fail": 0,
+    "cancelled": 0,
+    "skipped": 0,
+    "failedFiles": []
+  },
+  "exitCode": 0,
+  "sourceTreeHash": "28e642496e003c1c79126d486481988d6de5faaca02bbc8ad3792c91ba28fb2b",
+  "static": {
+    "baselineCommit": "859dbc987d88fdd41b475f3738cefe9704aae3ea",
+    "types": {
+      "baselineCount": 339,
+      "candidateCount": 339,
+      "newCount": 0,
+      "newDiagnostics": []
+    },
+    "lint": {
+      "baselineCount": 722,
+      "candidateCount": 703,
+      "newCount": 0,
+      "newDiagnostics": []
+    },
+    "passed": true
+  },
+  "coverage": {
+    "captures": 7,
+    "changedLines": 60,
+    "covered": 18,
+    "files": [
+      {
+        "file": "public/app-sidebar.js",
+        "changedLines": 5,
+        "covered": 0,
+        "uncovered": [
+          151,
+          152,
+          153,
+          154,
+          222
+        ],
+        "instrumented": false
+      },
+      {
+        "file": "public/login.js",
+        "changedLines": 1,
+        "covered": 1,
+        "uncovered": [],
+        "instrumented": true
+      },
+      {
+        "file": "public/menu-order-model.js",
+        "changedLines": 16,
+        "covered": 16,
+        "uncovered": [],
+        "instrumented": true
+      },
+      {
+        "file": "public/regular-stock-alert.js",
+        "changedLines": 4,
+        "covered": 0,
+        "uncovered": [
+          56,
+          57,
+          58,
+          59
+        ],
+        "instrumented": false
+      },
+      {
+        "file": "public/sales-special-stock-requests.js",
+        "changedLines": 1,
+        "covered": 0,
+        "uncovered": [
+          473
+        ],
+        "instrumented": false
+      },
+      {
+        "file": "public/scm-waitlist.js",
+        "changedLines": 12,
+        "covered": 0,
+        "uncovered": [
+          43,
+          52,
+          71,
+          72,
+          73,
+          74,
+          75,
+          76,
+          77,
+          78,
+          81,
+          92
+        ],
+        "instrumented": false
+      },
+      {
+        "file": "public/service-worker.js",
+        "changedLines": 10,
+        "covered": 0,
+        "uncovered": [
+          1,
+          6,
+          12,
+          13,
+          15,
+          20,
+          25,
+          26,
+          27,
+          28
+        ],
+        "instrumented": false
+      },
+      {
+        "file": "src/consolidation-load-posting.js",
+        "changedLines": 1,
+        "covered": 1,
+        "uncovered": [],
+        "instrumented": true
+      },
+      {
+        "file": "src/delivery-repository.js",
+        "changedLines": 3,
+        "covered": 0,
+        "uncovered": [
+          2314,
+          2315,
+          2316
+        ],
+        "instrumented": true
+      },
+      {
+        "file": "src/netsuite.js",
+        "changedLines": 3,
+        "covered": 0,
+        "uncovered": [
+          727,
+          728,
+          729
+        ],
+        "instrumented": true
+      },
+      {
+        "file": "src/special-stock-request-repository.js",
+        "changedLines": 4,
+        "covered": 0,
+        "uncovered": [
+          1218,
+          1255,
+          3614,
+          3615
+        ],
+        "instrumented": true
+      }
+    ]
+  },
+  "mutations": {
+    "passed": true,
+    "killed": 5,
+    "total": 5,
+    "results": [
+      {
+        "name": "ambiguous-write-retry",
+        "file": "src/netsuite.js",
+        "test": "test/mbt/integration/netsuite-write-retry-safety.test.js",
+        "killed": true,
+        "tests": 5,
+        "failed": 1,
+        "firstFailure": [
+          "an ambiguous write response is never retried even when its message mentions request limits"
+        ]
+      },
+      {
+        "name": "stale-return-clears-new-event",
+        "file": "public/scm-waitlist.js",
+        "test": "test/mbt/integration/scm-waitlist-return-race-browser.test.js",
+        "killed": true,
+        "tests": 1,
+        "failed": 1,
+        "firstFailure": [
+          "returned-pool acknowledgement preserves drafts, reports failure and cannot clear a newer return"
+        ]
+      },
+      {
+        "name": "synchronous-so-consolidation",
+        "file": "src/consolidation-load-posting.js",
+        "test": "test/mbt/unit/consolidation-load-posting.test.js",
+        "killed": true,
+        "tests": 6,
+        "failed": 4,
+        "firstFailure": [
+          "sales_load_background Sales Orders and local CO loads never materialize NetSuite targets"
+        ],
+        "propertyAloneKilled": true,
+        "propertyExitCode": 1,
+        "propertyFailureEvidence": [
+          " Container mbbs-worktree-check-2528350-test-run-31f19a2c48fd Creating ",
+          " Container mbbs-worktree-check-2528350-test-run-31f19a2c48fd Created ",
+          "\ufe63 sales_load_background Sales Orders and local CO loads never materialize NetSuite targets (2.168095ms) # test name does not match pattern",
+          "\ufe63 driver_completion Sales Orders and local CO loads never materialize NetSuite targets (0.189119ms) # test name does not match pattern",
+          "\ufe63 a mixed batch creates only the native TO target while claiming every order (0.162562ms) # test name does not match pattern",
+          "\ufe63 backend gate off keeps a native TO local without reading transform targets (0.138031ms) # test name does not match pattern",
+          "\u2716 properties: any mix of SO, TO and CO can materialize only gated native TOs (17.191678ms)",
+          "  Error: Property failed after 1 tests",
+          "  { seed: 20260915, path: \"0:1:1:0\", endOnFailure: true }",
+          "  Counterexample: [[\"sales_order\"],true]",
+          "  Shrunk 3 time(s)",
+          "  ",
+          "  Hint: Enable verbose mode in order to have the list of all failing values encountered during the run",
+          "      at buildError (file:///app/node_modules/fast-check/lib/fast-check.js:2462:16)",
+          "      at asyncThrowIfFailed (file:///app/node_modules/fast-check/lib/fast-check.js:2474:8) {",
+          "    [cause]: AssertionError [ERR_ASSERTION]: Expected values to be strictly deep-equal:",
+          "    + actual - expected",
+          "    ",
+          "    + [",
+          "    +   '1'",
+          "    + ]",
+          "    - []",
+          "        at file:///app/test/mbt/unit/consolidation-load-posting.test.js:50:12",
+          "        at async AsyncProperty.run (file:///app/node_modules/fast-check/lib/fast-check.js:1217:19)",
+          "        at async asyncRunIt (file:///app/node_modules/fast-check/lib/fast-check.js:2516:15)",
+          "        at async TestContext.<anonymous> (file:///app/test/mbt/unit/consolidation-load-posting.test.js:46:3)",
+          "        at async Test.run (node:internal/test_runner/test:797:9)",
+          "        at async Test.processPendingSubtests (node:internal/test_runner/test:526:7) {",
+          "      generatedMessage: true,",
+          "      code: 'ERR_ASSERTION',",
+          "      actual: [ '1' ],",
+          "      expected: [],",
+          "      operator: 'deepStrictEqual'",
+          "    }",
+          "  }",
+          "",
+          "\ufe63 background TO posting never becomes synchronous in a consolidated load (0.141411ms) # test name does not match pattern",
+          "\u2139 tests 6",
+          "\u2139 suites 0",
+          "\u2139 pass 0",
+          "\u2139 fail 1",
+          "\u2139 cancelled 0",
+          "\u2139 skipped 5",
+          "\u2139 todo 0",
+          "\u2139 duration_ms 181.557748"
+        ]
+      },
+      {
+        "name": "completed-special-edit",
+        "file": "src/special-stock-request-repository.js",
+        "test": "test/mbt/integration/special-case-edits-http.test.js",
+        "killed": true,
+        "tests": 20,
+        "failed": 1,
+        "firstFailure": [
+          "existing or skipped orders, closure, remote submissions, uncertain operations and reviews lock all edits"
+        ]
+      },
+      {
+        "name": "secondary-login-role-lost",
+        "file": "public/login.js",
+        "test": "test/mbt/unit/ui-navigation-contract.test.js",
+        "killed": true,
+        "tests": 3,
+        "failed": 1,
+        "firstFailure": [
+          "F02/F15: root login stores the shared token and honors MBT primary, secondary and server home routes"
+        ]
+      }
+    ]
+  },
+  "cleanup": {
+    "exitCode": 0,
+    "leftovers": {
+      "container": [],
+      "volume": [],
+      "network": []
+    }
+  }
+}

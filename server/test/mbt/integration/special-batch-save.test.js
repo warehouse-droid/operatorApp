@@ -1,3 +1,4 @@
+import { assertIsolatedTestConnection } from '../../support/test-database-isolation.mjs';
 import assert from 'node:assert/strict';
 import test, { after } from 'node:test';
 import { beginRollbackContext, closeDb, query } from '../../../src/db.js';
@@ -9,7 +10,7 @@ const response = (line, extra = {}) => ({ lineId: line.id, kind: 'response', sup
   vendorName: 'TEST Vendor', vendorYard: 'TEST yard', availabilityMode: 'no_projection', ...extra });
 async function fixture(run) {
   assert.equal(process.env.MBT_TEST_ISOLATED, '1');
-  assert.ok(process.env.DATABASE_URL.endsWith('/mbt_verify'));
+  assertIsolatedTestConnection(process.env.DATABASE_URL);
   const transaction = await beginRollbackContext();
   try { await transaction.run(async () => {
     await query("INSERT INTO operators(id,username,display_name,password_hash,password_salt,role,roles,yard_location_ids) VALUES($1,$1,'TEST Batch Rep','hash','salt','sales',ARRAY['sales'],ARRAY[1]) ON CONFLICT DO NOTHING", [context.operatorId]);
@@ -26,7 +27,8 @@ test('one SCM save records all responses, and one Sales save records selected de
   let d = await stock(initial, initial.lines.map((line, i) => response(line, i === 1 ? { supplyStatus: 'vendor_transfer', availabilityMode: 'dated', availableDate: '2099-02-01', scmInternalNote: 'private transfer' } : { salesVisibleNote: `Reply ${i}` })));
   assert.equal(d.revision, initial.revision + 1);
   assert.deepEqual(d.lines.map(l => l.supplyStatus), ['in_stock','vendor_transfer','in_stock']);
-  assert.equal(d.lines[1].availableDate, '2099-02-01');
+  assert.equal(d.lines[1].availableDate, null);
+  assert.equal(d.lines[1].availabilityMode, 'so_placement');
   assert.equal(d.lines[1].scmInternalNote, 'private transfer');
   assert.equal(d.events.filter(e => e.eventType === 'special_supply_response_saved').length, 3);
   d = await decisions(d, [{ lineId: d.lines[0].id, decision: 'accepted', customerNote: 'First' }, { lineId: d.lines[1].id, decision: 'declined', reason: 'Too late' }]);
@@ -39,7 +41,7 @@ test('one SCM save records all responses, and one Sales save records selected de
 
 test('a later invalid SCM line rolls back earlier responses, events and case revision', () => fixture(async d => {
   const before = await repo.getSpecialStockCase(d.id, { audience: 'scm' });
-  await assert.rejects(stock(d, [response(d.lines[0]), response(d.lines[1], { supplyStatus: 'vendor_transfer' })]), { code: 'SPECIAL_RESPONSE_DATE_REQUIRED' });
+  await assert.rejects(stock(d, [response(d.lines[0]), response(d.lines[1], { supplyStatus: 'production', availabilityMode: 'dated' })]), { code: 'SPECIAL_RESPONSE_DATE_REQUIRED' });
   assert.deepEqual(await repo.getSpecialStockCase(d.id, { audience: 'scm' }), before);
 }));
 
@@ -64,8 +66,9 @@ test('batch input rejects empty, oversized, duplicate, foreign and stale writes 
   assert.equal((await repo.getSpecialStockCase(d.id)).revision, saved.revision);
 }));
 
-test('SCM saves readiness and pending responses together while retaining transfer status', () => fixture(async d => {
+test('SCM saves readiness and pending responses together while retaining legacy dated transfer status', () => fixture(async d => {
   d = await stock(d, d.lines.map(l => response(l, { supplyStatus: 'vendor_transfer', availabilityMode: 'dated', availableDate: '2099-02-01' })));
+  await query("UPDATE sales_special_stock_lines SET availability_mode='dated',available_date='2099-02-01' WHERE request_id=$1",[d.id]);
   d = await decisions(d, [{ lineId: d.lines[0].id, decision: 'accepted' }]);
   const revision = d.revision;
   d = await stock(d, [{ lineId: d.lines[0].id, kind: 'readiness', ready: false, eta: '2099-03-01' }, response(d.lines[1], { salesVisibleNote: 'Second reply' })]);

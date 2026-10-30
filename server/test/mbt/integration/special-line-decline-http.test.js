@@ -1,3 +1,4 @@
+import { assertIsolatedTestConnection } from '../../support/test-database-isolation.mjs';
 import test, { before, after } from 'node:test';
 import assert from 'node:assert/strict';
 import crypto from 'node:crypto';
@@ -65,11 +66,13 @@ async function reviewedCase({ production = false, draft = true } = {}) {
   return detail;
 }
 before(async () => {
-  assert.equal(process.env.MBT_TEST_ISOLATED, '1'); assert.equal(new URL(process.env.DATABASE_URL).hostname, 'mbbs-special-updates-db-20261002');
+  assert.equal(process.env.MBT_TEST_ISOLATED, '1'); assertIsolatedTestConnection(process.env.DATABASE_URL);
   originalPriceTrigger = (await query("SELECT pg_get_functiondef('preserve_special_original_price()'::regprocedure) AS definition")).rows[0].definition;
   await query(migration());
   if (existsSync(featureMigration)) await query(readFileSync(featureMigration, 'utf8'));
   await query(readFileSync('migrations/283_special_customer_confirmation.sql', 'utf8'));
+  await query(readFileSync('migrations/296_special_vendor_confirmation.sql', 'utf8'));
+  await query(readFileSync('migrations/321_special_child_po.sql', 'utf8'));
   await query("INSERT INTO netsuite_customers(netsuite_id,entity_number,legal_name,display_name,currency,active,source_modified_at,source_version,payload_hash) VALUES(8899397,'TEST-QUOTE-CUSTOMER','TEST Quote Customer','TEST Quote Customer','CAD',true,now(),'test',repeat('f',64)) ON CONFLICT DO NOTHING");
   flag = (await query("SELECT enabled FROM mbt_feature_flags WHERE flag_key='special_stock_request_workflow'")).rows[0].enabled;
   await query("UPDATE mbt_feature_flags SET enabled=true WHERE flag_key='special_stock_request_workflow'");
@@ -116,11 +119,12 @@ test('decline/revoke recalculates customer confirmation across Sales, SCM and SQ
     await query("UPDATE sales_special_stock_lines SET supply_status='in_stock' WHERE id=$1", [d.lines[1].id]);
     if (mode === 'new_enquiry') await query("UPDATE sales_special_stock_lines SET supply_status=NULL,sales_decision='pending' WHERE id=$1", [d.lines[0].id]);
     if (mode === 'await_customer_confirmation') await query("UPDATE sales_special_stock_lines SET sales_decision='pending' WHERE id=$1", [d.lines[1].id]);
-    d = await getCase(d.id); await assertStage(d, mode);
+    const expectedStage = mode === 'confirmed' ? 'await_customer_confirmation' : mode;
+    d = await getCase(d.id); await assertStage(d, expectedStage);
     const index = mode === 'await_customer_confirmation' ? 1 : 0, before = await snapshot(d.id);
     const changed = await call(d.id, { expectedRevision: d.revision, decisions: [decision(d, index, true)] });
     assert.equal(changed.status, 200, JSON.stringify(changed.payload)); assert.equal(changed.payload.lines[index].salesDecision, 'declined');
-    const declinedStage = 'confirmed';
+    const declinedStage = 'await_customer_confirmation';
     assert.equal(changed.payload.lines.length, 2); assert.equal(changed.payload.status, d.status); await assertStage(changed.payload, declinedStage);
     const current = await rows(d.id); assert.deepEqual(current.map(stableLine), before.rows.map(stableLine));
     assert.deepEqual(current[1 - index], before.rows[1 - index]); assert.deepEqual(await orders(d.id), before.orders);
@@ -130,7 +134,7 @@ test('decline/revoke recalculates customer confirmation across Sales, SCM and SQ
     assert.equal(chargeEdit.payload.deliveryFeeRate, 0); assert.equal(chargeEdit.payload.lineDecisionsNeedReview, true);
     const revoked = await call(d.id, { expectedRevision: chargeEdit.payload.revision, decisions: [decision(d, index, false)] });
     assert.equal(revoked.status, 200); assert.equal(revoked.payload.lines[index].salesDecision, d.lines[index].salesDecision);
-    assert.equal(revoked.payload.status, d.status); await assertStage(revoked.payload, mode);
+    assert.equal(revoked.payload.status, d.status); await assertStage(revoked.payload, expectedStage);
     assert.deepEqual((await rows(d.id)).map(stableLine), before.rows.map(stableLine));
   }
 });
@@ -222,17 +226,17 @@ test('an edited declined line allows remaining accepted lines to confirm; revoki
   const d = await reviewedCase();
   const changed = await call(d.id, { expectedRevision: d.revision, lines: [editLine(d, { quantity: 4 })], decisions: [decision(d, 0, true)] });
   assert.equal(changed.status, 200); assert.equal(changed.payload.lines[0].salesDecision, 'declined'); assert.equal(changed.payload.lines[0].supplyStatus, null);
-  assert.equal(changed.payload.stage, 'confirmed');
+  assert.equal(changed.payload.stage, 'await_customer_confirmation');
   const edited = await call(d.id, { expectedRevision: changed.payload.revision,
     lines: [editLine(changed.payload, { quantity: 5 })], decisions: [decision(d, 0, true)] });
-  assert.equal(edited.status, 200); assert.equal(edited.payload.lines[0].salesDecision, 'declined'); await assertStage(edited.payload, 'confirmed');
+  assert.equal(edited.status, 200); assert.equal(edited.payload.lines[0].salesDecision, 'declined'); await assertStage(edited.payload, 'await_customer_confirmation');
   const revoked = await call(d.id, { expectedRevision: edited.payload.revision, decisions: [decision(d, 0, false)] });
   assert.equal(revoked.status, 200); assert.equal(revoked.payload.lines[0].salesDecision, 'pending'); assert.equal(revoked.payload.stage, 'new_enquiry');
 });
 
 test('legacy decline migration plus current status view is repeatable and its schema changes roll back transactionally', async () => {
   assert.ok(existsSync(featureMigration));
-  const sql = readFileSync(featureMigration, 'utf8') + readFileSync('migrations/283_special_customer_confirmation.sql', 'utf8'), before = (await query('SELECT * FROM special_stock_workflow_stages ORDER BY request_id')).rows;
+  const sql = readFileSync(featureMigration, 'utf8') + ['283_special_customer_confirmation.sql','296_special_vendor_confirmation.sql','321_special_child_po.sql'].map(name=>readFileSync('migrations/'+name,'utf8')).join('\n'), before = (await query('SELECT * FROM special_stock_workflow_stages ORDER BY request_id')).rows;
   await query(sql); await query(sql); assert.deepEqual((await query('SELECT * FROM special_stock_workflow_stages ORDER BY request_id')).rows, before);
   await assert.rejects(withTransaction(async () => {
     await query('DROP VIEW special_stock_workflow_stages'); await query('ALTER TABLE sales_special_stock_cases DROP COLUMN line_edit_state');

@@ -1,4 +1,4 @@
-import {orderMenuItems,moveMenuItem} from './menu-order-model.js?v=20261006';
+import {orderMenuItems,moveMenuItem} from './menu-order-model.js?v=20261006&suiteRepair=20261030-v1';
 
 const app = document.getElementById('menuOrderAdmin');
 const escape = value => String(value ?? '').replace(/[&<>"']/gu, character =>

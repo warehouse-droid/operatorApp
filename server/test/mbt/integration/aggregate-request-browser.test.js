@@ -323,14 +323,14 @@ test('SCM confirms, reports on behalf, acknowledges shortfall and retains the Ag
   await expect(page.getByRole('tab', { name: 'Aggregate', exact: true })).toHaveAttribute('aria-selected', 'true');
   await context.close();
 });
-test('switching from a delayed Regular response cannot repaint the Aggregate tab', async () => {
+test('switching from a delayed Regular response cannot repaint the Aggregate tab', async t => {
   const { page, context } = await pageFor('scm');
   let release;
   const gate = new Promise(resolve => { release = resolve; });
-  let requested;
-  const started = new Promise(resolve => { requested = resolve; });
-  await page.route('**/api/scm/stock-requests?**', async route => { requested(); await gate; await route.continue(); });
-  await page.goto(`${base}/scm/stock-requests`);
+  t.after(async () => { release(); await context.close(); });
+  await page.route('**/api/scm/stock-requests?**', async route => { await gate; await route.continue(); }, { times: 1 });
+  const started = page.waitForRequest('**/api/scm/stock-requests?**');
+  await page.goto(`${base}/scm/stock-requests?tab=regular`);
   await started;
   await page.getByRole('tab', { name: 'Aggregate', exact: true }).click();
   release();
@@ -340,10 +340,10 @@ test('switching from a delayed Regular response cannot repaint the Aggregate tab
   await page.getByRole('tab', { name: 'Aggregate', exact: true }).click();
   await expect(page.locator('[data-aggregate-root]')).toBeVisible();
   await page.getByRole('tab', { name: 'Aggregate', exact: true }).press('ArrowLeft');
+  await expect(page.getByRole('tab', { name: 'Waitlist', exact: true })).toHaveAttribute('aria-selected', 'true');
+  await page.getByRole('tab', { name: 'Waitlist', exact: true }).press('Home');
   await expect(page.getByRole('tab', { name: 'Special', exact: true })).toHaveAttribute('aria-selected', 'true');
-  await page.getByRole('tab', { name: 'Special', exact: true }).press('Home');
-  await expect(page.getByRole('tab', { name: 'Regular', exact: true })).toHaveAttribute('aria-selected', 'true');
-  await page.getByRole('tab', { name: 'Regular', exact: true }).press('End');
+  await page.getByRole('tab', { name: 'Special', exact: true }).press('End');
   await expect(page.getByRole('tab', { name: 'Aggregate', exact: true })).toHaveAttribute('aria-selected', 'true');
   await capture(page, 'tabs');
   await context.close();
@@ -418,8 +418,8 @@ test('keyboard tab focus survives a background queue refresh', async () => {
   await expect(page.getByRole('button', { name: 'Refresh', exact: true })).toBeEnabled();
   await expect(page.getByRole('tab', { name: 'Aggregate', exact: true })).toBeFocused();
   await page.keyboard.press('ArrowLeft');
-  await expect(page.getByRole('tab', { name: 'Special', exact: true })).toHaveAttribute('aria-selected', 'true');
-  await expect(page.getByRole('tab', { name: 'Special', exact: true })).toBeFocused();
+  await expect(page.getByRole('tab', { name: 'Waitlist', exact: true })).toHaveAttribute('aria-selected', 'true');
+  await expect(page.getByRole('tab', { name: 'Waitlist', exact: true })).toBeFocused();
   await capture(page, 'keyboard-refresh');
   await context.close();
 });

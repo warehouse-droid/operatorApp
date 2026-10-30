@@ -1,3 +1,4 @@
+import { seedReviewedLegacyFulfillment } from '../../support/legacy-fulfillment-candidate.mjs';
 import assert from 'node:assert/strict';
 import crypto from 'node:crypto';
 import test, {after} from 'node:test';
@@ -36,6 +37,7 @@ const dependencies=f=>({fetchSource:async()=>source(f),getPolicy:input=>getOpera
 
 test('fully direct special SO materializes its 270.78 delivered quantity with exact pickup/drop evidence',()=>rollback(async()=>{
   const f=await seed();await deliver(f);
+  await seedReviewedLegacyFulfillment(f.so);
   const candidate=(await query('SELECT id FROM dispatch_sales_order_if_candidates WHERE dispatch_order_ref=$1',[f.so])).rows[0];
   const prepared=await prepareSalesOrderAutoFulfillmentCandidate(candidate.id);
   assert.equal(prepared.status,'queued');assert.equal(prepared.lineSnapshot.length,1);

@@ -75,7 +75,7 @@ test("P2 the installed operator shell precaches the versioned refresh guard and 
   assert.ok(assets[0].startsWith("/operator-delivery-refresh.js"));
   for (const asset of assets) { assert.ok(worker.includes(JSON.stringify(asset))); }
   assert.ok(assets[0].endsWith("v=20260924-operator-responsiveness-v1"));
-  assert.ok(assets[1].endsWith("v=20260925-receipt-confirmation-v1"));
-  assert.match(worker, /mbbs-yard-operator-20260925-receipt-confirmation-v1/u);
+  assert.ok(assets[1] === "/operator.js?v=20261028-repair-pwa&stockExchange=20261029&returnExchangeLayout=20261029&palletBottom=20261029");
+  assert.match(worker, /mbbs-yard-operator-20261030-shell-repair-v1/u);
   vm.runInNewContext(worker, { self: { addEventListener() {} } }, { filename: fileURLToPath(workerUrl) });
 });

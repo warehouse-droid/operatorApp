@@ -72,7 +72,7 @@ test("Sales regular stock request cannot retain an empty destination while an au
   });
   // This test isolates composer state. The shared yard menu is exercised in the browser.
   vm.runInContext(readPublic('regular-stock-quantity.js'), context, { filename: 'regular-stock-quantity.js' });
-  vm.runInContext(source.replace(/import\('\/(?:stock-request-yard-filter|sales-stock-status-filter|sales-stock-list-filters|stock-request-alert-search)\.js\?v=[^']+'\)/g, 'Promise.resolve({})'), context, { filename: "sales-stock-requests.js" });
+  vm.runInContext(source.replace(/import\('\/(?:stock-request-yard-filter|sales-stock-status-filter|sales-stock-list-filters|stock-request-alert-search|regular-stock-request-actions)\.js\?v=[^']+'\)/g, 'Promise.resolve({})'), context, { filename: "sales-stock-requests.js" });
   vm.runInContext('salesStockListFiltersHtml = testSalesFilters', context);
 
   const loading = vm.runInContext("salesStockLoad()", context);
@@ -230,7 +230,7 @@ test("stock-request feedback is content-sized and availability shows Sales plus 
   const scm = readPublic("scm-stock-requests.js");
   const css = readPublic("stock-requests.css");
 
-  assert.match(css, /grid-template-rows\s*:\s*auto\s+auto\s+auto\s+minmax\(0,\s*1fr\)/);
+  assert.match(css, /grid-template-rows\s*:\s*auto\s+auto\s+auto\s+auto/);
   assert.match(css, /\.stock-request-workspace\s*\{[^}]*grid-row\s*:\s*4/s);
   assert.match(css, /\.stock-request-notice\s*\{[^}]*align-self\s*:\s*start/s);
   for (const source of [sales, scm]) {
@@ -406,5 +406,5 @@ test("Sales Request Stock has complete Simplified Chinese UI and validation cove
   assert.equal(i18n.message("Select a source yard for ABC."), "请为 ABC 选择来源堆场。");
   assert.equal(i18n.message("Requested quantity 20 exceeds requestable availability 10."), "申请数量 20 超过可申请库存 10。");
   assert.match(html, /i18n\.js\?v=20260815-customer-pickup-photo-gate-v1/);
-  assert.match(html, /sales-stock-requests\.js\?v=20260927-yard-layout-v1/);
+  assert.match(html, /sales-stock-requests\.js\?[^"\s]*\bv=20260927-yard-layout-v1/);
 });

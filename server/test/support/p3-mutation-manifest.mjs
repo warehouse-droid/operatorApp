@@ -7,6 +7,11 @@
  */
 export const P3_DEDICATED_MUTATION_RUNNERS = Object.freeze([
   Object.freeze({
+    runner: "run-scm-po-to-handoff-mutations.mjs",
+    adminUrlEnvironment: null,
+    sourcePaths: Object.freeze(["src/smart-scm-po-handoff.js"])
+  }),
+  Object.freeze({
     runner: "run-scm-search-vendor-mutations.mjs",
     adminUrlEnvironment: null,
     sourcePaths: Object.freeze(["src/scm-vendor-completion.js", "src/dispatch-repository.js"])

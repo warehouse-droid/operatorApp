@@ -1,3 +1,4 @@
+import { assertIsolatedTestConnection } from '../../support/test-database-isolation.mjs';
 import test, { after } from 'node:test';
 import assert from 'node:assert/strict';
 import { readFile } from 'node:fs/promises';
@@ -11,11 +12,13 @@ const migration = 'migrations/258_special_stock_information.sql';
 const response = { supplyStatus: 'low_inventory', availabilityMode: 'no_projection', vendorId: 8899200, vendorName: 'TEST Vendor', vendorYard: 'TEST Yard' };
 async function fixture(run) {
   assert.equal(process.env.MBT_TEST_ISOLATED, '1');
-  assert.ok(process.env.DATABASE_URL.endsWith('/mbt_verify'));
+  assertIsolatedTestConnection(process.env.DATABASE_URL);
   const tx = await beginRollbackContext();
   try { await tx.run(async () => {
     if (existsSync(migration)) { const sql = await readFile(migration, 'utf8'); await query(sql); await query(sql); }
     await query(await readFile('migrations/283_special_customer_confirmation.sql', 'utf8'));
+    await query(await readFile('migrations/296_special_vendor_confirmation.sql', 'utf8'));
+    await query(await readFile('migrations/321_special_child_po.sql', 'utf8'));
     await query("INSERT INTO operators(id,username,display_name,password_hash,password_salt,role,roles,yard_location_ids) VALUES($1,$1,'TEST Update Rep','hash','salt','sales',ARRAY['sales'],ARRAY[1]) ON CONFLICT DO NOTHING", [actor]);
     const d = await repo.createSpecialStockCase({ storeLocationId: 1, inquiryDate: '2099-01-01', customerName: 'TEST Update', vendorId: 8899200, vendorName: 'TEST Vendor', fulfillmentMethod: 'yard_pickup',
       lines: [{ productName: 'TEST product', quantity: 1, uom: 'PLT', rate: 10, requiredDate: '2099-02-01' }] }, context);
@@ -46,7 +49,7 @@ test('SCM question pauses stock check, alerts scoped Sales, records reply, and r
   assert.equal(checked.lines[0].supplyStatus, 'low_inventory');
   await assert.rejects(() => repo.requestSpecialStockInformation(d.id, { expectedRevision: checked.revision, question: 'Ask after checking?' }, context), { code: 'SPECIAL_INFORMATION_LOCKED' });
   const accepted = await repo.decideSpecialStockLine(d.id, d.lines[0].id, { expectedRevision: checked.revision, decision: 'accepted' }, context);
-  assert.equal(accepted.stage, 'confirmed');
+  assert.equal(accepted.stage, 'await_customer_confirmation');
   assert.equal((await query('SELECT stage FROM special_stock_workflow_stages WHERE request_id=$1', [d.id])).rows[0].stage, accepted.stage);
 }));
 test('Pending information rejects blank/oversized notes, duplicate requests and issued or closed cases', () => fixture(async d => {
@@ -77,7 +80,7 @@ test('Accepted Low inventory remains ready, permits a dispatch handoff and vendo
   await query("UPDATE sales_special_stock_cases SET sales_order_netsuite_id=$2,sales_order_ref=$3,sales_order_approved=true,purchase_order_netsuite_id=$4,purchase_order_ref=$5 WHERE request_id=$1", [d.id, so, `TEST-SO-LOW-${so}`, po, `TEST-PO-LOW-${po}`]);
   detail = await repo.checkSpecialStockReadiness(d.id, d.lines[0].id, { expectedRevision: detail.revision, ready: true }, context);
   assert.equal(detail.lines[0].supplyStatus, 'low_inventory'); assert.equal(detail.readinessAlerts.length, 0);
-  assert.equal(detail.handoff.status, 'waiting_route'); assert.equal(detail.stage, 'dispatch_arrangement');
+  assert.equal(detail.handoff.status, 'waiting_route'); assert.equal(detail.stage, 'confirmed');
   await query("UPDATE sales_special_stock_cases SET fulfillment_method='vendor_pickup' WHERE request_id=$1", [d.id]);
   const pickup = { expectedRevision: detail.revision, pickupDate: '2099-02-01', pickupReference: 'Customer collection receipt' };
   await query("UPDATE sales_special_stock_lines SET supply_status='production' WHERE request_id=$1", [d.id]);

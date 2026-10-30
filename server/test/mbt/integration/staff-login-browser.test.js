@@ -5,8 +5,11 @@ import fs from 'node:fs/promises';
 import {chromium} from 'playwright';
 import {app} from '../../../src/server.js';
 import {closeDb} from '../../../src/db.js';
+import {createOperator} from '../../../src/auth-repository.js';
+import {randomUUID} from 'node:crypto';
 let server,browser,base;
 before(async()=>{
+ await createOperator({username:'staff-entry-admin-'+randomUUID(),displayName:'TEST Existing admin',password:randomUUID(),role:'admin',roles:['admin'],yardLocationIds:[]});
  server=app.listen(0,'127.0.0.1');await once(server,'listening');base=`http://127.0.0.1:${server.address().port}`;
  browser=await chromium.launch({headless:true,args:['--no-sandbox']});await fs.mkdir('test-artifacts/staff-login-reset-20261003/browser',{recursive:true});
 });
@@ -14,7 +17,7 @@ after(async()=>{await browser.close();server.closeAllConnections();await new Pro
 test('all staff module entry points share the login page while Driver remains separate',async()=>{
  const context=await browser.newContext({serviceWorkers:'block'}),page=await context.newPage();
  for(const path of ['/dispatch','/scm','/sales','/boss','/control','/admin/accounts','/operator','/delivery','/field-sales/']){
-  await page.coverage.startJSCoverage({resetOnNavigation:false});await page.goto(base+path);await page.waitForURL('**/login.html?next=**',{timeout:10000});
+  await page.coverage.startJSCoverage({resetOnNavigation:false});await page.goto(base+path);await page.waitForURL('**/login.html?next=**',{timeout:10000}).catch(error=>{throw new Error(path+': '+error.message+'; current path '+new URL(page.url()).pathname,{cause:error});});
   assert.equal(await page.getByRole('heading',{name:'Staff login'}).count(),1,path);await fs.writeFile('test-artifacts/staff-login-reset-20261003/browser/'+path.replaceAll('/','-')+'-coverage.json',JSON.stringify(await page.coverage.stopJSCoverage()));
  }
  await page.goto(base+'/driver');await page.waitForSelector('[data-form="login"]');

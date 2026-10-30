@@ -58,6 +58,10 @@ async function withIsolatedConfig(envFiles, activeEnvFile, operation) {
       path.join(fixtureRoot, "src/dispatch-planner-optimization.js"),
       await readFile(dispatchPlannerOptimizationSourcePath, "utf8")
     );
+    await writeFile(
+      path.join(fixtureRoot, "src/dispatch-order-recency.js"),
+      await readFile(path.join(serverRoot, "src/dispatch-order-recency.js"), "utf8")
+    );
     await symlink(nodeModulesPath, path.join(fixtureRoot, "node_modules"), "dir");
     for (const [file, contents] of Object.entries(envFiles)) {
       await writeFile(path.join(fixtureRoot, file), contents);

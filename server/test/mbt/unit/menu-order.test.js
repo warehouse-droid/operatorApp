@@ -31,7 +31,7 @@ test('catalog has independent groups, unique links and the admin editor',()=>{
   assert.ok(MENU_CATALOG.find(menu=>menu.key==='admin').items.some(item=>item.href==='/admin/menu-order'));
   const sidebar=fs.readFileSync(new URL('../../../public/app-sidebar.js',import.meta.url),'utf8');
   for(const menu of MENU_CATALOG) {
-    const block=sidebar.match(new RegExp(`const ${menu.key}Items = \\[([\\s\\S]*?)\\n  \\];`))[1];
+    const block=sidebar.match(new RegExp(`const ${menu.key}Items\\s*=\\s*\\[([\\s\\S]*?)\\];`))[1];
     const items=[...block.matchAll(/\{ label: "([^"]+)", href: "([^"]+)"/gu)].map(match=>({label:match[1],href:match[2]}));
     assert.deepEqual(menu.items,items,`${menu.label} catalog must track the sidebar`);
   }

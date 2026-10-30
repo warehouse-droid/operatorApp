@@ -33,16 +33,16 @@ test("the installed Driver shell cannot mix old DB/route code with photo recover
   ];
 
   for (const asset of changedAssets) {
-    const version = ["driver.css", "driver.js", "driver-upload.js"].includes(asset) ? DRIVER_UPLOAD_VERSION : ["driver-offline-db.js", "sor-rentals.css", "sor-signature.js", "sor-driver-signature.js"].includes(asset)
+    const version = asset === "driver.js" ? "20261028-repair-pwa" : asset === "driver-upload.js" ? "20261023-driver-upload-wait-v1" : asset === "driver.css" ? DRIVER_UPLOAD_VERSION : ["driver-offline-db.js", "sor-rentals.css", "sor-signature.js", "sor-driver-signature.js"].includes(asset)
       ? SOR_VERSION : asset === "i18n.js" ? "20260918-operator-display-settings-v1" : DRIVER_RECOVERY_VERSION;
     const versionedPath = `/${asset}?v=${version}`;
     assert.ok(html.includes(versionedPath), `${asset} must be versioned in driver.html.`);
     assert.ok(worker.includes(versionedPath), `${asset} must be versioned in the shell cache.`);
   }
-  assert.match(worker, /DRIVER_CACHE_NAME = `\$\{DRIVER_CACHE_PREFIX\}v47`/u);
-  assert.match(worker, /DRIVER_REFRESH_CACHE_NAME = `\$\{DRIVER_CACHE_PREFIX\}refresh-v47`/u);
+  assert.match(worker, /DRIVER_CACHE_NAME = `\$\{DRIVER_CACHE_PREFIX\}v56`/u);
+  assert.match(worker, /DRIVER_REFRESH_CACHE_NAME = `\$\{DRIVER_CACHE_PREFIX\}refresh-v56`/u);
   assert.match(worker, /cache\.addAll\(DRIVER_SHELL\.map\(\(url\) => new Request\([\s\S]*?cache: "reload"/u);
-  assert.match(read("driver.js"), /serviceWorker\.register\("\/driver-service-worker\.js\?v=20261016-driver-reconnect-v1"/u);
+  assert.match(read("driver.js"), /serviceWorker\.register\("\/driver-service-worker\.js\?v=20261028-repair-pwa"/u);
   assert.ok(html.indexOf("/driver-upload.js?") < html.indexOf("/driver.js?"), "The upload module must load before the Driver application.");
   assert.match(read("service-worker.js"), /url\.pathname\.startsWith\("\/driver-"\)/u);
 });

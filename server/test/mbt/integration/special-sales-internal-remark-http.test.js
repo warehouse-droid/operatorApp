@@ -1,3 +1,4 @@
+import { assertIsolatedTestConnection } from '../../support/test-database-isolation.mjs';
 import test, { before, after } from 'node:test';
 import assert from 'node:assert/strict';
 import { randomUUID } from 'node:crypto';
@@ -25,7 +26,7 @@ const path = id => `/api/sales/special-stock-requests/${id}/internal-remark`;
 const audit = async id => (await query("SELECT * FROM sales_special_stock_events WHERE request_id=$1 AND event_type='special_sales_internal_remark_updated' ORDER BY id", [id])).rows;
 before(async () => {
   assert.equal(process.env.MBT_TEST_ISOLATED, '1');
-  assert.equal(new URL(process.env.DATABASE_URL).hostname, 'mbbs-special-updates-db-20261002');
+  assertIsolatedTestConnection(process.env.DATABASE_URL);
   try { await query(await readFile('migrations/259_special_sales_internal_remark.sql', 'utf8')); } catch (error) { if (error.code !== 'ENOENT') throw error; }
   flag = (await query("SELECT enabled FROM mbt_feature_flags WHERE flag_key='special_stock_request_workflow'")).rows[0].enabled;
   await query("UPDATE mbt_feature_flags SET enabled=true WHERE flag_key='special_stock_request_workflow'");

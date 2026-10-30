@@ -68,7 +68,8 @@ test('every Sales account can preview, submit, list, filter, read and retry both
   }
 });
 
-test('SQL lists and detail authorization agree across yards, methods and versions',async()=>{
+const inRegularList = (type, authorized) => type === 'regular' && authorized;
+test('regular SQL lists and detail authorization enforce family and yard scope across methods and versions',async()=>{
   for (const type of ['regular','special']) for (const workflow of [1,2]) for (const method of ['delivery','pickup','stocking','waitlist']) {
     for (const version of [1,2]) for (const [source,destination] of [[28,1],[1,28],[28,15],[15,1],[28,28],[1,1]]) {
       const ref='TARGET-MATRIX-'+run+'-'+(++sequence);
@@ -78,7 +79,7 @@ test('SQL lists and detail authorization agree across yards, methods and version
         const paired=(source===28&&destination===1)||(source===1&&destination===28);
         const expected=yard===destination||(type==='regular'&&workflow===2&&method==='delivery'&&version===1&&paired);
         const listed=await listSalesStockRequests({...context(yard),search:ref});
-        assert.equal(listed.some(record=>record.id===Number(row.id)),expected,ref+' yard '+yard);
+        assert.equal(listed.some(record=>record.id===Number(row.id)),inRegularList(type,expected),ref+' yard '+yard);
         if(expected)assert.equal((await getSalesStockRequest(row.id,context(yard))).id,Number(row.id));
         else await assert.rejects(()=>getSalesStockRequest(row.id,context(yard)),{status:403});
       }
@@ -167,7 +168,8 @@ test('preview keeps candidates for missing pallet conversion and propagates unre
   await query('UPDATE inventory_items SET to_plt=NULL WHERE item_id=$1',[itemId]);
   try {
     const result=await previewDeliveryStockRequest(f.input,ctx,f.dependencies);
-    assert.equal(result.candidates.length,1);assert.equal(result.calculationCode,'REGULAR_DELIVERY_PALLET_CONVERSION');
+    assert.equal(result.candidates.length,1);assert.equal(result.calculationCode,undefined);
+    assert.equal(result.palletQuantity,0);assert.equal(result.lines[0].salesQty,100);
   }finally{await query('UPDATE inventory_items SET to_plt=100 WHERE item_id=$1',[itemId]);}
   f.order.lines[0].itemId=9800000999999;
   await assert.rejects(()=>previewDeliveryStockRequest(f.input,ctx,f.dependencies),{code:'STOCK_REQUEST_ITEM_NOT_FOUND'});

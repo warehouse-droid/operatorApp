@@ -32,7 +32,8 @@ test('property: skipped order stages match completed steps and preserve terminal
   }), evidence => {
     const real = { ...evidence, salesOrderSkipped: false, purchaseOrderSkipped: false,
       salesOrderId: evidence.salesOrderSkipped ? 91 : null,
-      purchaseOrderId: evidence.purchaseOrderSkipped ? 92 : null };
+      purchaseOrderId: evidence.purchaseOrderSkipped ? 92 : null, purchaseOrderApproved: true,
+      purchaseOrderReference: evidence.waitingForProduction ? '' : 'TEST-READY', purchaseOrderDispatchStatus: 'Queued' };
     assert.equal(deriveSpecialCaseStage(evidence), deriveSpecialCaseStage(real));
   }), { numRuns: 300, seed: 24092026 });
 });

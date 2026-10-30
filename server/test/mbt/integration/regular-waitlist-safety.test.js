@@ -57,12 +57,16 @@ test('preparation failures retain the reservation and a later conversion uses a 
   await finishWaitlistConversion(final.id,{salesOrderId:995003,salesOrderRef:'SO-REMAINDER'});
   const saved=await getWaitlistRequest(request.id,f.context);assert.equal(saved.waitlist.convertedQty,1000);assert.equal(saved.waitlist.waitingQty,0);assert.equal((await getWaitlistPool(s.pool.id)).convertedQty,1000);
 });
-test('allocation notices stay unread once per event and case acknowledgement clears them',async()=>{
+test('allocation acknowledgement clears unread events while the allocation still requires Sales action',async()=>{
   const s=await f.supply(),a=await s.demand(600);await f.allocate(s.pool,[[a,600]]);const current=await getWaitlistRequest(a.id,f.context);
   const alerts=await regularStockAlerts(f.context);assert(alerts.requests.some(r=>r.id===a.id));
   await acknowledgeRegularStockDecisions(a.id,{eventId:current.manualDecisionEventId},f.context);
   await acknowledgeRegularStockDecisions(a.id,{eventId:current.manualDecisionEventId},f.context);
-  assert.equal((await regularStockAlerts(f.context)).requests.some(r=>r.id===a.id),false);
+  const savedAfter = await regularStockAlerts(f.context);
+  assert.equal(savedAfter.unread, alerts.unread - 1);
+  assert.equal(savedAfter.actionRequired, alerts.actionRequired);
+  assert.equal(savedAfter.requests.some(r=>r.id===a.id),true);
+  assert.equal(Number((await query('SELECT event_id FROM regular_stock_decision_reads WHERE request_id=$1 AND operator_id=$2',[a.id,f.context.operatorId])).rows[0].event_id),current.manualDecisionEventId);
 });
 test('startup catch-up releases eligible stock once and never allocates returned quantities silently',async()=>{
   const s=await f.supply(),a=await s.demand(600);await f.allocate(s.pool,[[a,600]]);await s.demand(100);

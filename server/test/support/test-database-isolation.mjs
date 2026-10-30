@@ -11,6 +11,41 @@ const CLONE_DATABASE_PATTERN = /^mbt_test_file_[a-f0-9]{12}_[a-z0-9]+$/u;
 const MAX_CLONE_ATTEMPTS = 5;
 
 /**
+ * Validate a fixture connection before allowing test-only data mutations.
+ * @param {string | undefined} databaseUrl
+ * @param {NodeJS.ProcessEnv | Record<string, string | undefined>} [environment]
+ * @returns {string}
+ */
+export function assertIsolatedTestConnection(databaseUrl, environment = process.env) {
+  try {
+    const parsed = new URL(String(databaseUrl || ''));
+    const name = decodeURIComponent(parsed.pathname.slice(1));
+    if (!isFixtureTestEnvironment(environment)
+        || (parsed.port && parsed.port !== '5432') || parsed.hash
+        || [...parsed.searchParams.keys()].some(key => key !== 'application_name')
+        || !isFixtureDatabaseName(name)) {
+      throw new Error('Invalid fixture connection');
+    }
+    const base = new URL(parsed.href);
+    base.pathname = '/' + BASE_DATABASE_NAME;
+    parseDisposableDatabaseUrl(base.href);
+    return name;
+  } catch {
+    throw new Error('Fixtures require an isolated disposable test database.');
+  }
+}
+
+/** @param {NodeJS.ProcessEnv | Record<string, string | undefined>} environment */
+function isFixtureTestEnvironment(environment) {
+  return environment?.MBT_TEST_ISOLATED === '1' && environment?.NODE_ENV === 'test';
+}
+
+/** @param {string} name */
+function isFixtureDatabaseName(name) {
+  return name.length <= 63 && (name === BASE_DATABASE_NAME || CLONE_DATABASE_PATTERN.test(name));
+}
+
+/**
  * @param {string} databaseUrl
  * @returns {URL}
  */

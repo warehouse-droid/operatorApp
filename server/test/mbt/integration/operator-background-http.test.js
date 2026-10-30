@@ -41,19 +41,7 @@ before(async () => {
 });
 after(async () => {
   server?.closeAllConnections(); if (server) await new Promise(resolve => server.close(resolve));
-  if (owner) {
-    await query("DELETE FROM delivery_audit_log WHERE actor_operator_id=$1", [owner.operator.id]);
-    await query("DELETE FROM operator_load_records WHERE operator_id=$1", [owner.operator.id]);
-    await query("DELETE FROM customer_pickup_load_records WHERE operator_id=$1", [owner.operator.id]);
-    await query("DELETE FROM receiving_receipt_records WHERE operator_id=$1", [owner.operator.id]);
-    await query("DELETE FROM operator_background_photos WHERE action_id IN (SELECT id FROM operator_photo_actions WHERE operator_id=$1)", [owner.operator.id]);
-    await query("DELETE FROM operator_photo_actions WHERE operator_id=$1", [owner.operator.id]);
-    await query("DELETE FROM dispatch_delivery_groups WHERE group_ref=ANY($1::text[])", [groups]);
-    await query("DELETE FROM sales_order_lines WHERE sales_order_id=ANY($1::bigint[])", [orderIds]);
-    await query("DELETE FROM sales_orders WHERE netsuite_id=ANY($1::bigint[])", [orderIds]);
-    await query("DELETE FROM purchase_order_lines WHERE purchase_order_id=ANY($1::bigint[])", [purchaseIds]);
-    await query("DELETE FROM purchase_orders WHERE netsuite_id=ANY($1::bigint[])", [purchaseIds]);
-  }
+  // The per-file disposable database owns teardown, including immutable IF evidence.
   await closeDb();
 });
 

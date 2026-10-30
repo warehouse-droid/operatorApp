@@ -11,6 +11,26 @@ before(async () => {
 });
 after(async () => browser?.close());
 
+function rememberVersionedAsset(assets,path,url) {
+  if (['/scm-special-stock-requests.js', '/special-stock-case-status.js', '/special-stock-documents.css'].includes(path)
+      && (path !== '/special-stock-case-status.js' || url.searchParams.has('v'))) { assets.set(path,url); }
+}
+function staleStatusRenderer(path,url) {
+  return path === '/special-stock-case-status.js' && url.searchParams.get('v') === '20261002-stock-updates-v1' && !url.searchParams.has('scmPlanning');
+}
+
+async function plannedCardApi(route,path,record,order,writes) {
+  if (route.request().method() !== 'GET') { writes.push(route.request().method() + ' ' + path); }
+  if (path === '/api/auth/me') { return route.fulfill({ json: { operator: { id: 'test', role: 'scm', roles: ['scm'] } } }); }
+  if (path.endsWith('/policy')) { return route.fulfill({ json: { enabled: true } }); }
+  if (path.endsWith('/purchase-order/note')) { return route.fulfill({ json: { note: '' } }); }
+  if (path.startsWith('/api/dispatch/scm/v2/purchase-orders/')) { return route.fulfill({ json: { order } }); }
+  if (path === '/api/dispatch/scm/v2/purchase-orders') { return route.fulfill({ json: { orders: [order], total: 1 } }); }
+  if (path.endsWith('/special-stock-requests/95')) { return route.fulfill({ json: record }); }
+  if (path.endsWith('/special-stock-requests')) { return route.fulfill({ json: { requests: [record], yards: [{ locationId: 1, yardCode: '3445' }] } }); }
+  return route.fulfill({ json: { requests: [], yards: [], total: 0 } });
+}
+
 for (const width of [1440, 390]) test(`SCM Special Request detail loads the updated PO card at ${width}px`, async () => {
   const context = await browser.newContext({ viewport: { width, height: 1000 }, serviceWorkers: 'block' });
   await context.addInitScript(() => localStorage.setItem('mbbs.staff.token', 'test-scm-card'));
@@ -34,18 +54,10 @@ for (const width of [1440, 390]) test(`SCM Special Request detail loads the upda
     const request = route.request(), url = new URL(request.url()), path = url.pathname;
     if (url.hostname !== 'localhost') return route.abort();
     if (path.startsWith('/api/')) {
-      if (request.method() !== 'GET') writes.push(request.method() + ' ' + path);
-      if (path === '/api/auth/me') return route.fulfill({ json: { operator: { id: 'test', role: 'scm', roles: ['scm'] } } });
-      if (path.endsWith('/policy')) return route.fulfill({ json: { enabled: true } });
-      if (path.endsWith('/purchase-order/note')) return route.fulfill({ json: { note: '' } });
-      if (path.startsWith('/api/dispatch/scm/v2/purchase-orders/')) return route.fulfill({ json: { order } });
-      if (path === '/api/dispatch/scm/v2/purchase-orders') return route.fulfill({ json: { orders: [order], total: 1 } });
-      if (path.endsWith('/special-stock-requests/95')) return route.fulfill({ json: record });
-      if (path.endsWith('/special-stock-requests')) return route.fulfill({ json: { requests: [record], yards: [{ locationId: 1, yardCode: '3445' }] } });
-      return route.fulfill({ json: { requests: [], yards: [], total: 0 } });
+      return plannedCardApi(route,path,record,order,writes);
     }
-    if (['/scm-special-stock-requests.js', '/special-stock-case-status.js', '/special-stock-documents.css'].includes(path)) assets.set(path, url);
-    if (path === '/special-stock-case-status.js' && !url.searchParams.has('scmPlanning')) {
+    rememberVersionedAsset(assets,path,url);
+    if (staleStatusRenderer(path,url)) {
       // Simulate a browser retaining the old renderer at the previous module URL.
       return route.fulfill({ contentType: 'application/javascript', body: `
         export const specialClosureStatus=()=>'', specialClosureCardAlert=()=>'', specialClosureQueueAlert=()=>'', compareSpecialScmQueue=()=>0;
@@ -72,7 +84,8 @@ for (const width of [1440, 390]) test(`SCM Special Request detail loads the upda
     assert.equal(style.statusSize, style.referenceSize);
     assert.ok(parseFloat(style.statusSize) >= 16);
     for (const path of ['/scm-special-stock-requests.js', '/special-stock-case-status.js', '/special-stock-documents.css']) {
-      assert.equal(assets.get(path)?.searchParams.get('scmPlanning'), '20261002-v2', path);
+      const module=path==='/special-stock-case-status.js';
+      assert.equal(assets.get(path)?.searchParams.get(module?'v':'scmPlanning'),module?'20261016-po-sent-placement-v1':'20261002-v2',path);
     }
     await card.screenshot({ path: `${out}/scm-po-card-${width}.png` });
     await page.screenshot({ path: `${out}/scm-request-${width}.png`, fullPage: true });

@@ -84,6 +84,7 @@ function buildSidebarHarness() {
   const window = { MBBS_DISPATCH_OPERATOR: null };
   const harness = Function("window", "localStorage", `
     let sidebarOperator = null;
+    const mbrContractsEnabled = false, repairEnabled = false;
     ${mainItems}
     ${roleFunctions}
     ${visibleMainItems}
@@ -122,13 +123,13 @@ test("operation cycle-count facets paginate independently from the SKU result li
 
 test("operator cache assets advance with the cycle-count pagination release", () => {
   for (const asset of [
-    "/operator.css?v=20260916-operator-bottom-inset-v1",
-    "/operator.js?v=20260917-receiving-followup-v1"
+    "/operator.css?v=20261029-pallet-search&returnExchangeLayout=20261029&palletBottom=20261029",
+    "/operator.js?v=20261028-repair-pwa&stockExchange=20261029&returnExchangeLayout=20261029&palletBottom=20261029"
   ]) {
     assert.ok(operatorHtml.includes(asset));
     assert.ok(serviceWorker.includes(asset));
   }
-  assert.ok(serviceWorker.includes("mbbs-yard-operator-20260917-receiving-followup-v1"));
+  assert.ok(serviceWorker.includes("mbbs-yard-operator-20261030-shell-repair-v1"));
 });
 
 test("Dispatch and SCM card menus scroll within the fixed-height application shell", () => {

@@ -13,7 +13,7 @@ function detail(overrides={}) {
     lines:[{id:209,salesDecision:'pending',supplyStatus:'in_stock',stockCheckedAt:'2026-10-19T17:43:58.527Z',originalRate:null}],...overrides};
 }
 function html(d) {
-  return createBackorderUI({mount:{addEventListener(){}},audience:'scm',api:async()=>({vendors:[]}),getDetail:()=>d,setDetail(){},render(){}}).detail(d);
+  return createBackorderUI({mount:{addEventListener(){},querySelector(){return null;}},audience:'scm',api:async()=>({vendors:[]}),getDetail:()=>d,setDetail(){},render(){}}).detail(d);
 }
 
 test('PO recheck restores SCM PO controls after an SO link without changing Sales decisions',()=>{
@@ -35,7 +35,7 @@ test('PO recheck requires a linked SO and current stock review for pending mater
     const d=detail({salesOrderId:so?123:null,lines:lines.map((row,index)=>({...row,id:index+1,originalRate:null}))});
     const open=lines.filter(row=>row.supplyStatus!=='already_ordered'&&!['declined','closed'].includes(row.salesDecision));
     const expected=['sales_order','purchase_order'].includes(kind)&&open.length>0&&open.every(row=>Boolean(row.supplyStatus&&row.stockCheckedAt)
-      &&(row.salesDecision==='accepted'||kind==='purchase_order'&&so&&row.salesDecision==='pending'));
+      &&(row.salesDecision==='accepted'||(kind==='sales_order'||kind==='purchase_order'&&so)&&row.salesDecision==='pending'));
     assert.equal(canLinkBackorderOrder(d,kind),expected);
     if(expected)assert.doesNotThrow(()=>assertBackorderOrderLink(d,kind));
     else assert.throws(()=>assertBackorderOrderLink(d,kind),{code:'BACKORDER_SALES_ACCEPTANCE_REQUIRED',status:409});
@@ -45,7 +45,7 @@ test('PO recheck requires a linked SO and current stock review for pending mater
     assert.equal(canLinkBackorderOrder({...d,lines:[{...d.lines[0],...override}]},'purchase_order'),false);
   }
   assert.equal(canLinkBackorderOrder({...d,salesOrderId:null},'purchase_order'),false);
-  assert.equal(canLinkBackorderOrder(d,'sales_order'),false);
+  assert.equal(canLinkBackorderOrder(d,'sales_order'),true);
   assert.equal(canLinkBackorderOrder(d,'invalid'),false);
   assert.equal(canLinkBackorderOrder({...d,lines:[]},'purchase_order'),false);
   for(const supplyStatus of ['in_stock','low_inventory','vendor_transfer','production','allocation','no_stock']) {

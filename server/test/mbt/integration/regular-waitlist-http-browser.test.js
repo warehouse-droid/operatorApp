@@ -3,6 +3,7 @@ import assert from 'node:assert/strict';
 import test,{before,after} from 'node:test';
 import {randomUUID} from 'node:crypto';
 import {mkdir,writeFile} from 'node:fs/promises';
+import {dismissRegularAlerts} from '../../support/regular-stock-status-browser.mjs';
 import {chromium,expect} from '@playwright/test';
 import {app} from '../../../src/server.js';
 import {createOperator} from '../../../src/auth-repository.js';
@@ -22,7 +23,7 @@ before(async()=>{
 });
 after(async()=>{await browser?.close();server?.closeAllConnections();if(server)await new Promise(resolve=>server.close(resolve));await closeDb();});
 async function api(role,path,body){const start=performance.now();const response=await fetch(base+path,{method:body?'POST':'GET',headers:{Authorization:'Bearer '+users[role].token,'Content-Type':'application/json'},...(body?{body:JSON.stringify(body)}:{})});const data=await response.json();return {status:response.status,data,ms:performance.now()-start};}
-async function pageFor(role,path,width=1440){const context=await browser.newContext({viewport:{width,height:1000},serviceWorkers:'block'});await context.addInitScript(token=>localStorage.setItem('mbbs.staff.token',token),users[role].token);const page=await context.newPage();page.setDefaultTimeout(8000);await page.coverage.startJSCoverage({resetOnNavigation:false});await page.goto(base+path);return {page,close:async label=>{await writeFile(`${out}/${label}-coverage.json`,JSON.stringify(await page.coverage.stopJSCoverage()));await context.close();}};}
+async function pageFor(role,path,width=1440){const context=await browser.newContext({viewport:{width,height:1000},serviceWorkers:'block'});await context.addInitScript(token=>localStorage.setItem('mbbs.staff.token',token),users[role].token);const page=await context.newPage();if(role==='sales')await dismissRegularAlerts(page);page.setDefaultTimeout(8000);await page.coverage.startJSCoverage({resetOnNavigation:false});await page.goto(base+path);return {page,close:async label=>{await writeFile(`${out}/${label}-coverage.json`,JSON.stringify(await page.coverage.stopJSCoverage()));await context.close();}};}
 test('real local submission completes below one second, is idempotent, and enforces Sales and SCM boundaries',async()=>{
   const s=await f.supply(),body={deliveryMethod:'waitlist',customerId:f.customerId,destinationLocationId:1,lines:[{itemId:s.itemId,salesQty:1000}],operationKey:randomUUID()};
   const first=await api('sales','/api/sales/stock-requests',body);assert.equal(first.status,201);assert(first.ms<1000);times.push(first.ms);
@@ -35,7 +36,7 @@ test('real local submission completes below one second, is idempotent, and enfor
 });
 test('Sales Waitlist form requires an existing customer and one item, with no availability refresh',async()=>{
   const s=await f.supply(),{page,close}=await pageFor('sales','/sales/stock-requests?tab=regular',390),refreshes=[];
-  page.on('request',request=>{if(request.url().includes('/availability/refresh'))refreshes.push(request.url());});
+  page.on('request',request=>{if(request.url().includes('/availability/refresh')){refreshes.push(request.url());}});
   try{
     await page.locator('[data-sales-stock-action="new"]').click();await page.locator('[data-regular-field=deliveryMethod]').selectOption('waitlist');
     await expect(page.getByText('Type *',{exact:true})).toBeVisible();await expect(page.locator('[data-sales-stock-action=add-line]')).toHaveCount(0);

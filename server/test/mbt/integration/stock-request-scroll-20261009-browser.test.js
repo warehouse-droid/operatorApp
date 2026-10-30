@@ -81,8 +81,8 @@ for (const audience of ['scm', 'sales']) for (const kind of ['special', 'regular
       await page.mouse.wheel(0, 1600);
       await expect.poll(() => page.evaluate(() => window.scrollY)).toBeGreaterThan(1500);
       const before = await page.evaluate(() => {
-        const candidates = [...document.querySelectorAll('.stock-request-detail p, .stock-request-detail h3, .stock-request-detail label, .stock-request-event')];
-        const anchor = candidates.find(el => { const box = el.getBoundingClientRect(); return box.top > 80 && box.bottom < 820; });
+        const candidates = [...document.querySelectorAll('.stock-request-detail *')];
+        const anchor = candidates.find(el => { const box = el.getBoundingClientRect(); return !el.children.length && el.textContent.trim() && box.height > 0 && box.top > 80 && box.bottom < 820; });
         if (!anchor) throw Error('No visible request text to track');
         window.scrollTestAnchor = anchor;
         return { top: window.scrollY, y: anchor.getBoundingClientRect().top };

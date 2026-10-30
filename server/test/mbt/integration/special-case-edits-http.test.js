@@ -1,3 +1,4 @@
+import { assertIsolatedTestConnection } from '../../support/test-database-isolation.mjs';
 import test, { before, after } from 'node:test';
 import assert from 'node:assert/strict';
 import crypto from 'node:crypto';
@@ -64,7 +65,7 @@ async function reviewedCase({ production = false, draft = true } = {}) {
   return detail;
 }
 before(async () => {
-  assert.equal(process.env.MBT_TEST_ISOLATED, '1'); assert.equal(new URL(process.env.DATABASE_URL).hostname, 'mbbs-special-review-db');
+  assert.equal(process.env.MBT_TEST_ISOLATED, '1'); assertIsolatedTestConnection(process.env.DATABASE_URL);
   originalPriceTrigger = (await query("SELECT pg_get_functiondef('preserve_special_original_price()'::regprocedure) AS definition")).rows[0].definition;
   await query(migration());
   flag = (await query("SELECT enabled FROM mbt_feature_flags WHERE flag_key='special_stock_request_workflow'")).rows[0].enabled;

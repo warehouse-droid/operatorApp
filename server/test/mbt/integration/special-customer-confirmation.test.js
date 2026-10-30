@@ -1,3 +1,4 @@
+import { assertIsolatedTestConnection } from '../../support/test-database-isolation.mjs';
 import assert from 'node:assert/strict';
 import crypto from 'node:crypto';
 import { readFileSync } from 'node:fs';
@@ -83,7 +84,7 @@ async function assertProjections(detail, stage) {
 
 before(async () => {
   assert.equal(process.env.MBT_TEST_ISOLATED, '1');
-  assert.equal(new URL(process.env.DATABASE_URL).hostname, 'mbbs-special-review-db');
+  assertIsolatedTestConnection(process.env.DATABASE_URL);
   originalFlag = (await query("SELECT enabled FROM mbt_feature_flags WHERE flag_key='special_stock_request_workflow'")).rows[0].enabled;
   await query("UPDATE mbt_feature_flags SET enabled=true WHERE flag_key='special_stock_request_workflow'");
   server = app.listen(0, '127.0.0.1');
@@ -124,9 +125,9 @@ test('five lines: one rejected, one in-stock accepted and three accepted transfe
   assert.equal(detail.purchaseOrderId, null);
   assert.deepEqual(detail.lines.map(line => line.salesDecision), ['declined', 'accepted', 'accepted', 'accepted', 'accepted']);
   assert.deepEqual(detail.lines.map(line => line.supplyStatus), ['in_stock', 'in_stock', 'vendor_transfer', 'vendor_transfer', 'vendor_transfer']);
-  assert.ok(detail.lines.slice(2).every(line => line.availableDate === '2099-02-01'));
+  assert.ok(detail.lines.slice(2).every(line => line.availableDate === null && line.availabilityMode === 'so_placement'));
   assert.equal((await getSpecialStockAlertCounts()).confirmedOrders, scmBefore.confirmedOrders);
-  assert.deepEqual(await getSpecialSalesAlertCounts(context()), {...salesBefore,awaitCustomerConfirmation:salesBefore.awaitCustomerConfirmation+1});
+  assert.deepEqual(await getSpecialSalesAlertCounts(context()), {...salesBefore,total:salesBefore.total+1,awaitCustomerConfirmation:salesBefore.awaitCustomerConfirmation+1});
 });
 
 test('resolved accepted and rejected materials still await the SO, including a production ETA', async () => {

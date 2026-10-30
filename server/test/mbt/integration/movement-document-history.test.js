@@ -1,3 +1,4 @@
+import { assertIsolatedTestConnection } from '../../support/test-database-isolation.mjs';
 import assert from "node:assert/strict";
 import crypto from "node:crypto";
 import test, { after } from "node:test";
@@ -13,7 +14,7 @@ const posting = (type, ref) => ({ operatorNetSuitePosting: { transactions: [{ tr
 
 async function fixture(run) {
   assert.equal(process.env.MBT_TEST_ISOLATED, "1");
-  assert.match(process.env.DATABASE_URL, /\/mbt_(test|verify)(?:\?|$)/);
+  assertIsolatedTestConnection(process.env.DATABASE_URL);
   const rollback = await beginRollbackContext();
   try {
     await rollback.run(async () => {

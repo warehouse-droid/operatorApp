@@ -37,8 +37,8 @@ test("POB03684 partial IR contains exactly its two selected rows and the one ope
   const before = (await query("SELECT * FROM purchase_order_lines WHERE purchase_order_id=$1 ORDER BY id", [parent])).rows;
   const { result, rows, reads } = await draft(live);
   assert.deepEqual(rows, [
-    { orderLine: 6, location: 1, itemReceive: true, quantity: 108 },
-    { orderLine: 29, location: 1, itemReceive: true, quantity: 304 },
+    { orderLine: 6, location: 1, itemReceive: true, quantity: 108, custcol_plt: 1, custcol_lyr: 0, custcol_sec: 0, custcol_pcs: 0 },
+    { orderLine: 29, location: 1, itemReceive: true, quantity: 304, custcol_plt: 1, custcol_lyr: 0, custcol_sec: 0, custcol_pcs: 0 },
     { orderLine: 33, location: 1, itemReceive: false }
   ]);
   assert.deepEqual(reads, [parent]);
@@ -116,15 +116,17 @@ test("the production target resolver reads the current PO once and creates no Ne
 
 test("split receipts refresh their real positive parent and keep their selected quantity unchanged", () => scenario(async live => {
   await query("UPDATE purchase_order_lines SET received_pallet_qty=1,confirmed_at=now() WHERE purchase_order_id=$1 AND line_id=4759369", [child]);
+  await assert.rejects(draft(live, child), /SQFT source has no remaining quantity/);
+  live.find(row => row.line === 1).quantityReceived = 0;
   const { rows, reads, result } = await draft(live, child);
   assert.deepEqual(reads, [parent]);
   assert.equal(result.steps[0].sourceNetSuiteId, parent);
   assert.equal(result.steps[0].payload.memo, "#11619-1");
-  assert.deepEqual(rows.filter(row => row.itemReceive), [{ orderLine: 1, location: 1, itemReceive: true, quantity: 152 }]);
+  assert.deepEqual(rows.filter(row => row.itemReceive), [{ orderLine: 1, location: 1, itemReceive: true, quantity: 152, custcol_plt: 1, custcol_lyr: 0, custcol_sec: 0, custcol_pcs: 0 }]);
   assert.deepEqual(rows.filter(row => !row.itemReceive).map(row => row.orderLine), [6, 29, 33]);
 }));
 
-test("property: shuffled live counters affect only exact deselections and never the selected quantities", async () => {
+test("property: shuffled live counters preserve eligible quantities and block exhausted selections", async () => {
   await fc.assert(fc.asyncProperty(fc.array(fc.record({ completed: fc.boolean(), closed: fc.boolean() }), { minLength: 16, maxLength: 16 }), fc.boolean(),
     async (states, reverse) => scenario(async live => {
       const expected = [];
@@ -134,6 +136,13 @@ test("property: shuffled live counters affect only exact deselections and never 
         if (![6, 29].includes(row.line) && !states[index].completed && !states[index].closed) expected.push(row.line);
       }
       if (reverse) live.reverse();
+      if (live.some(row => [6, 29].includes(row.line) && (row.isClosed || row.quantityReceived === row.quantity))) {
+        await assert.rejects(draft(live), /SQFT source has no remaining quantity/);
+        for (const row of live.filter(candidate => [6, 29].includes(candidate.line))) {
+          row.quantityReceived = 0;
+          row.isClosed = false;
+        }
+      }
       const { rows } = await draft(live);
       assert.deepEqual(rows.filter(row => row.itemReceive).map(row => [row.orderLine, row.quantity]), [[6, 108], [29, 304]]);
       assert.deepEqual(rows.filter(row => !row.itemReceive).map(row => row.orderLine), expected.sort((a, b) => a - b));

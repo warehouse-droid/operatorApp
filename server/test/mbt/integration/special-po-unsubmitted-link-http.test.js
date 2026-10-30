@@ -1,3 +1,4 @@
+import { assertIsolatedTestConnection } from '../../support/test-database-isolation.mjs';
 import assert from 'node:assert/strict';
 import test,{before,after} from 'node:test';
 import crypto from 'node:crypto';
@@ -14,7 +15,7 @@ async function call(id,body,role='scm') {
   return {status:response.status,body:await response.json()};
 }
 before(async()=>{
-  assert.equal(process.env.MBT_TEST_ISOLATED,'1');assert.equal(new URL(process.env.DATABASE_URL).hostname,'mbbs-special-review-db');
+  assert.equal(process.env.MBT_TEST_ISOLATED,'1');assertIsolatedTestConnection(process.env.DATABASE_URL);
   flag=(await query("SELECT enabled FROM mbt_feature_flags WHERE flag_key='special_stock_request_workflow'")).rows[0].enabled;
   await query("UPDATE mbt_feature_flags SET enabled=true WHERE flag_key='special_stock_request_workflow'");
   await query("INSERT INTO inventory_items(item_id,item_name,stock_unit,raw,synced_at) VALUES(2055,'MBBS-Special Order','PC','{}',now()),(1784,'PALLET','EACH','{}',now()) ON CONFLICT DO NOTHING");

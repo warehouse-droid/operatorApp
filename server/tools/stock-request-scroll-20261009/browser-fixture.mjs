@@ -1,10 +1,12 @@
 /* global localStorage, window, EventTarget, structuredClone, getComputedStyle */
 import { readFile, mkdir } from 'node:fs/promises';
 import { expect } from '@playwright/test';
+import { stockScrollRecords } from '../../test/support/stock-scroll-records.mjs';
 
 export const out = 'test-artifacts/stock-request-scroll-20261009';
 const live = process.env.SCROLL_TEST_MODE === 'live';
-export const records = JSON.parse(await readFile(out + (live ? '/requests-after.json' : '/requests.json')));
+export const records = process.env.SCROLL_TEST_RECORDS
+  ? JSON.parse(await readFile(process.env.SCROLL_TEST_RECORDS)) : stockScrollRecords;
 
 export async function fixture(browser, { audience = 'scm', kind = 'special', width = 1440, height = 900, baseline = true, touch = false, fontOffset = 0 } = {}) {
   await mkdir(out, { recursive: true });
@@ -51,7 +53,7 @@ export async function fixture(browser, { audience = 'scm', kind = 'special', wid
     }
     const file = ({ '/sales/stock-requests': '/sales-stock-requests.html', '/scm/stock-requests': '/scm-stock-requests.html' })[path] || path;
     const overrides = ['/stock-requests.css', '/scm-stock-requests.html', '/sales-stock-requests.html', '/scm-stock-requests.js', '/sales-stock-requests.js', '/stock-request-view.js', '/special-stock-form-state.js'];
-    const root = live ? out + '/live-public-after' : !baseline && overrides.includes(file) ? 'public' : out + '/live-public';
+    const root = live ? out + '/live-public-after' : baseline && overrides.includes(file) ? out + '/live-public' : 'public';
     try {
       return route.fulfill({ body: await readFile(root + file), contentType: ({ js: 'application/javascript', css: 'text/css', html: 'text/html' })[file.split('.').at(-1)] || 'application/octet-stream' });
     } catch {

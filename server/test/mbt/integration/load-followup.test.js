@@ -14,8 +14,11 @@ async function fixture(run,pickup=true){
  return withTransaction(async()=>{
   const order=await packingOrder({salesOnly:true,quantity:2,packed:2});
   await query('UPDATE sales_orders SET sales_order_type=$2 WHERE netsuite_id=$1',[order.id,pickup?'Pick-Up':'Delivery']);
+  // Delivery-to-pickup handover releases the old packing; seed this pickup's new confirmation afterwards.
+  await query('UPDATE sales_order_lines SET packed_sales_qty=2 WHERE id=$1',[order.lineId]);
   for(let index=2;index<=4;index++) await query(`INSERT INTO sales_order_lines(sales_order_id,line_id,item_id,item_name,sku,item_type,quantity,unit,location_id,location,packed_sales_qty,netsuite_active)
    VALUES($1,$2::bigint,602,'Fixture','ITEM-'||($2::bigint)::text,'InvtPart',2,'PC',1,'3445',$3,true)`,[order.id,index,index===4?0:2]);
+  await query('UPDATE sales_order_lines SET confirmed=true,confirmed_at=now() WHERE sales_order_id=$1 AND packed_sales_qty>0',[order.id]);
   return run(order);
  },{rollback:true});
 }

@@ -52,7 +52,12 @@ async function fixture() {
 }
 async function preview(f) {
   const result = await request(f.first, "/preview", "POST", { locationId: 1, orderIds: f.orders.map((order) => order.orderId) });
-  assert.equal(result.status, 200, JSON.stringify(result.data));
+  const identities = result.status === 200 ? [] : await Promise.all(f.orders.map(async ({orderId}) => {
+    const order = await delivery.getDeliveryOrder(orderId);
+    return {orderId, type: order?.order_type, yard: order?.outbound_location_id, source: order?.source_location_id,
+      lines: order?.lines.map(line => ({id: line.id, locationId: line.location_id, location: line.location}))};
+  }));
+  assert.equal(result.status, 200, JSON.stringify({response:result.data,identities}));
   return result.data;
 }
 function photos(id) { return [1, 2].map((n) => `r2://operator/operator-consolidation-load-photo/2026/09/15/${id}/photo-${n}.jpg`); }
@@ -232,9 +237,10 @@ test("invalid selections, foreign yards and changed assignments cannot be submit
 
 test("CO and VRMA orders share load photos while preserving their local transitions", async () => {
   const f = await fixture(), suffix = crypto.randomUUID(), coRef = `CO-CONSOL-${suffix}`, vrmaRef = `VRMA-CONSOL-${suffix}`;
+  const coSource = await seedOperatorPickup();
   const coId = (await query(`INSERT INTO local_co_orders(co_ref,source_order_ref,from_location_id,from_location,to_location_id,to_location,status,
     delivery_order_id,dispatch_plan_id,dispatch_plan_date,dispatch_truck_plate,dispatch_load_name)
-    VALUES($1,$2,1,'3445',28,'2967','packed',$3,$4,$5,'CONSOL-TRUCK','Load 2') RETURNING id`, [coRef, f.first.tranid, -Number(f.first.orderId), f.plan.id, f.plan.plan_date])).rows[0].id;
+    VALUES($1,$2,1,'3445',28,'2967','packed',$3,$4,$5,'CONSOL-TRUCK','Load 2') RETURNING id`, [coRef, coSource.tranid, -Number(coSource.orderId), f.plan.id, f.plan.plan_date])).rows[0].id;
   await query(`INSERT INTO local_co_order_lines(co_id,line_id,item_id,item_name,quantity,unit,piece_qty,to_pcs,packed_piece_qty)
     VALUES($1,1,889201,'Item A',20,'PC',20,1,20)`, [coId]);
   const vendor = `Consol Vendor ${suffix}`, yard = `Consol Vendor Yard ${suffix}`;
@@ -246,10 +252,10 @@ test("CO and VRMA orders share load photos while preserving their local transiti
     VALUES($1,889201,'Item A',20,'PC',20,true)`, [vrmaId]);
   await query(`INSERT INTO dispatch_vrma_plan_assignments(plan_id,order_ref,plan_date,truck_plate,load_name)
     VALUES($1,$2,$3,'CONSOL-TRUCK','Load 2')`, [f.plan.id, vrmaRef, f.plan.plan_date]);
-  f.orders.push({ orderId: String(-Number(f.first.orderId)), tranid: coRef }, { orderId: `VRMA:${vrmaRef}`, tranid: vrmaRef });
+  f.orders.push({ orderId: String(-Number(coSource.orderId)), tranid: coRef }, { orderId: `VRMA:${vrmaRef}`, tranid: vrmaRef });
   f.truck.loads[0].stops.push(...[coRef, vrmaRef].map((ref) => ({ id: `drop-${ref}`, type: "drop", orderId: ref })));
   await query("UPDATE dispatch_plan_snapshots SET orders=orders || $2::jsonb,trucks=$3 WHERE plan_id=$1", [f.plan.id,
-    JSON.stringify([{ id: coRef, type: "CO", childOrders: [f.first.tranid] }, { id: vrmaRef, type: "PO" }]), JSON.stringify([f.truck])]);
+    JSON.stringify([{ id: coRef, type: "CO", childOrders: [coSource.tranid] }, { id: vrmaRef, type: "PO" }]), JSON.stringify([f.truck])]);
   const batch = await preview(f), events = [];
   configureConsolidationLoadEvents((type, payload) => events.push({ type, payload }));
   const loaded = await request(f.first, `/${batch.id}/submit`, "POST", { photoRefs: photos(batch.id) });
@@ -378,7 +384,7 @@ test("durable native TO failures retain the whole load; verified remote steps ar
   assert.equal(writes.length, 2);
 });
 
-test("HTTP admission saves SO and TO locally with the native gate enabled and waits for Driver completion", async () => {
+test("HTTP admission saves SO and TO locally with the native gate enabled and queues their background posting", async () => {
   const f = await fixture(), transfer = await addTransfer(f), batch = await preview(f);
   const previous = { ...config.netsuite }, fetchBoundary = globalThis.fetch;
   await query("UPDATE mbt_feature_flags SET enabled=true WHERE flag_key='operator_netsuite_delivery_prep_if_3445'");
@@ -399,10 +405,15 @@ test("HTTP admission saves SO and TO locally with the native gate enabled and wa
     assert.equal(await posting.getOperatorNetSuitePostingCommand(batch.id), null);
     const jobs=(await query('SELECT * FROM transfer_order_posting_jobs WHERE local_to_id=$1',[transfer.orderId])).rows;
     assert.equal(jobs.length,1);
-    assert.equal(jobs[0].status,'waiting_driver');
+    assert.equal(jobs[0].status,'waiting_posting');
     assert.equal(jobs[0].command_id,null);
     assert.equal(jobs[0].snapshot.lines[0].quantity,20);
     assert.equal((await query("SELECT 1 FROM operator_load_records WHERE response->>'consolidationLoadId'=$1", [batch.id])).rowCount, 3);
+    const candidates = (await query(`SELECT candidate.dispatch_order_ref,candidate.operator_load_snapshot
+      FROM dispatch_sales_order_if_candidates candidate JOIN operator_load_records record ON record.id=candidate.operator_load_record_id
+      WHERE record.response->>'consolidationLoadId'=$1`,[batch.id])).rows;
+    assert.deepEqual(candidates.map(row=>row.dispatch_order_ref).sort(),[f.first.tranid,f.second.tranid].sort());
+    assert.ok(candidates.every(row=>row.operator_load_snapshot.length===1&&Number(row.operator_load_snapshot[0].quantity)===20));
   } finally {
     globalThis.fetch = fetchBoundary;
     Object.assign(config.netsuite, previous);

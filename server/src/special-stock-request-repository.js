@@ -1215,7 +1215,7 @@ export async function editSpecialStockCaseLines(requestId, input = {}, { operato
     const special = await lockCase(id, input.expectedRevision);
     const detail = /** @type {Record<string,any>&{lines:ReturnType<typeof mapLine>[]}} */ (mapCase(special));
     assertScope(detail, authorizedStoreLocationIds);
-    if (!canEditSpecialCaseLines(detail)) {
+    if (special.operationally_complete || !canEditSpecialCaseLines(detail)) {
       throw workflowError('Case lines can only be edited on an active request before Sales Order creation. Resolve pending operations first.', 409, 'SPECIAL_CASE_EDIT_LOCKED');
     }
     const rows = /** @type {Array<Record<string,any>>} */ (await lineRows(id, { forUpdate: true }));
@@ -1252,7 +1252,7 @@ export async function editSpecialStockCaseLines(requestId, input = {}, { operato
     }
     const lineEditState = { ...(detail.lineEditState.orderReviewRequired || plan.decisions?.length ? { orderReviewRequired: true } : {}),
       ...(plan.restart && plan.decisions?.length ? { stage: 'new_enquiry', revision: detail.revision + 1 }
-        : !plan.restart && (plan.decisions?.length || Number(detail.lineEditState.revision) === detail.revision)
+        : !plan.restart && !plan.decisions?.length && Number(detail.lineEditState.revision) === detail.revision
           ? { stage: stageFor(detail), revision: detail.revision + 1 } : {}) };
     await query(`UPDATE sales_special_stock_cases SET
       line_edit_state=$3::jsonb,
@@ -3611,6 +3611,9 @@ export async function updateSpecialStockHeader(requestId, input = {}, { operator
   await withTransaction(async () => {
     const special = await lockCase(id, input.expectedRevision), detail = /** @type {Record<string,any>} */ (mapCase(special));
     assertScope(detail, authorizedStoreLocationIds);
+    if (special.operationally_complete) {
+      throw workflowError('This request is completed and its header is locked.', 409, 'SPECIAL_HEADER_LOCKED');
+    }
     if (!canEditSpecialHeader(detail)) {
       if (!canEditSpecialSalesInternalRemark(detail) || Object.keys(input).some(key => !['remarks', 'expectedRevision'].includes(key))) {
         throw workflowError('Only the Note can be edited on an active confirmed request. Delivery header changes require an editable request.', 409, 'SPECIAL_HEADER_LOCKED');

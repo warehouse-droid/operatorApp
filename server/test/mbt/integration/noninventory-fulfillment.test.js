@@ -26,11 +26,14 @@ async function automaticCandidate(value) {
   const event = (await query(`INSERT INTO dispatch_order_completion_events(order_kind,order_ref,dispatch_completed_at,
     completion_evidence_type,completion_evidence_id,actor_type,actor_id,reason)
     VALUES('SO',$1,now(),'driver_job',$2,'driver','test','') RETURNING id`, [value.ref, `test-${value.id}`])).rows[0];
-  const gate = 'dispatch_netsuite_sales_order_if_3445';
-  await query('UPDATE mbt_feature_flags SET enabled=true WHERE flag_key=$1', [gate]);
-  await query(`INSERT INTO dispatch_sales_order_if_gate_watermarks(gate_key,gate_revision,activation_event_id,activated_at)
-    VALUES($1,1,$2,now()) ON CONFLICT(gate_key) DO UPDATE SET activation_event_id=EXCLUDED.activation_event_id,activated_at=now()`, [gate, Number(event.id) - 1]);
-  return (await query('SELECT id FROM dispatch_sales_order_if_candidates WHERE completion_event_id=$1', [event.id])).rows[0];
+  assert.equal((await query('SELECT 1 FROM dispatch_sales_order_if_candidates WHERE completion_event_id=$1', [event.id])).rowCount, 0);
+  await query("UPDATE mbt_feature_flags SET enabled=true WHERE flag_key='dispatch_netsuite_sales_order_if_3445'");
+  const load = (await query(`INSERT INTO operator_load_records(load_type,order_family,order_id,order_ref,line_snapshot,response)
+    VALUES('sales_order_delivery_load','sales_order',$1,$2,$3::jsonb,'{}') RETURNING id`,
+    [value.id, value.ref, JSON.stringify([{ lineId: 1, itemId: 998190001, loadedQty: 2, loadedUom: 'EA' }])])).rows[0];
+  const candidate = (await query('SELECT id FROM dispatch_sales_order_if_candidates WHERE operator_load_record_id=$1', [load.id])).rows[0];
+  assert.ok(candidate, 'Operator load queues the current automatic fulfillment candidate');
+  return candidate;
 }
 
 test('noninventory remains visible in detail and batch but is excluded from fulfillable lines', async () => scenario(async () => {
@@ -62,13 +65,10 @@ test('ignored resale rows cannot keep inventory fulfillment partial or acquire f
   assert.equal(Number(refreshed.lines.find(l => l.item_type === 'InvtPart').fulfilled_piece_qty), 2);
 }));
 
-test('future automatic fulfillment snapshots ignore resale rows while retaining loaded inventory evidence', async () => scenario(async () => {
+test('Operator-load automatic fulfillment snapshots ignore resale rows while retaining loaded inventory evidence', async () => scenario(async () => {
   const value = await fixture();
   await query("UPDATE sales_orders SET operator_status='loaded',local_yard_order_status='Loaded' WHERE netsuite_id=$1", [value.id]);
   await query('UPDATE sales_order_lines SET loaded_qty=quantity WHERE sales_order_id=$1 AND item_type=$2', [value.id, 'InvtPart']);
-  await query(`INSERT INTO operator_load_records(load_type,order_family,order_id,order_ref,line_snapshot,response)
-    VALUES('sales_order_delivery_load','sales_order',$1,$2,$3::jsonb,'{}')`,
-    [value.id, value.ref, JSON.stringify([{ lineId: 1, loadedQty: 2 }])]);
   const candidate = await automaticCandidate(value);
   const result = await prepareSalesOrderAutoFulfillmentCandidate(candidate.id);
   assert.equal(result.status, 'queued', result.lastError);
@@ -76,7 +76,7 @@ test('future automatic fulfillment snapshots ignore resale rows while retaining 
   assert.equal((await getDeliveryOrder(value.id)).lines.length, 2);
 }));
 
-test('an automatic completion containing only resale items is skipped without an IF', async () => scenario(async () => {
+test('an Operator load containing only resale items is skipped without an IF', async () => scenario(async () => {
   const value = await fixture();
   await query("UPDATE sales_order_lines SET item_type='NonInvtPart' WHERE sales_order_id=$1", [value.id]);
   const candidate = await automaticCandidate(value);

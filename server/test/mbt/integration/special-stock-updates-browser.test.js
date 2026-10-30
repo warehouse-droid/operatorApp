@@ -1,5 +1,6 @@
+import { conversationBrowserBoundary, legacyConversationMessage } from '../../support/conversation-browser-boundary.mjs';
 /* global document, localStorage */
-import test, { before, after } from 'node:test';
+import test, { before as beforeAll, after } from 'node:test';
 import assert from 'node:assert/strict';
 import { readFile, mkdir, writeFile } from 'node:fs/promises';
 import { chromium, expect } from '@playwright/test';
@@ -7,7 +8,7 @@ import { chromium, expect } from '@playwright/test';
 let browser;
 let capture = 0;
 const out = 'test-artifacts/special-workflow-review/stock-updates-20261002/browser';
-before(async () => { await mkdir(out, { recursive: true }); browser = await chromium.launch({ headless: true, args: ['--no-sandbox'] }); });
+beforeAll(async () => { await mkdir(out, { recursive: true }); browser = await chromium.launch({ headless: true, args: ['--no-sandbox'] }); });
 after(async () => browser?.close());
 async function fixture(audience, width = 1440, configure = () => {}) {
   const context = await browser.newContext({ viewport: { width, height: 1000 }, serviceWorkers: 'block' });
@@ -19,12 +20,13 @@ async function fixture(audience, width = 1440, configure = () => {}) {
     await writeFile(`${out}/browser-coverage-${++capture}.json`, JSON.stringify(await page.coverage.stopJSCoverage()));
     return close();
   };
-  const record = { id: 1, requestRef: 'SPREQ-BATCH', stage: 'new_enquiry', revision: 1, storeName: '3445', storeLocationId: 1,
+  const record = { requestType: 'special', workflowKind: 'special', id: 1, requestRef: 'SPREQ-BATCH', stage: 'new_enquiry', revision: 1, storeName: '3445', storeLocationId: 1,
     customerName: 'TEST Customer', vendorName: 'TEST Vendor', vendorId: 8899200, inquiryDate: '2099-01-01', closeStatus: 'active', fulfillmentMethod: 'yard_pickup',
     lines: [1].map(id => ({ id, productName: `TEST product ${id}`, quantity: 2, uom: 'PLT', salesDecision: 'pending', supplyStatus: null, vendorYard: `Yard ${id}` })),
     salesOrderLines: [], purchaseOrderLines: [], events: [], media: [], readinessAlerts: [] };
   configure(record);
   const state = { record, posts: [], errors: [], fail: false };
+  state.conversation=conversationBrowserBoundary({audience,messages:record.informationRequest?[legacyConversationMessage(record.informationRequest.question)]:[],onSend:body=>{if(audience==='sales'&&record.informationRequest?.status==='pending'){record.informationRequest={...record.informationRequest,status:'answered',reply:body.message};record.stage='new_enquiry';}}});
   page.on('pageerror', e => state.errors.push(e.message));
   await page.route('**/*', async route => {
     const { pathname: path, hostname } = new URL(route.request().url());
@@ -58,6 +60,7 @@ async function fixture(audience, width = 1440, configure = () => {}) {
     try { return route.fulfill({ body: await readFile('public' + file), contentType: ({ js: 'application/javascript', css: 'text/css', html: 'text/html' })[file.split('.').at(-1)] || 'application/octet-stream' }); }
     catch { return route.fulfill({ status: 404, body: '' }); }
   });
+  await page.route(url=>/\/(conversation(?:\/read)?|stock-request-conversation-alerts)$/.test(url.pathname),state.conversation.handle);
   await page.goto(`http://localhost/${audience}/stock-requests?tab=special`);
   await page.locator('.stock-request-card[data-id="1"]').click();
   return { page, context, state };
@@ -76,16 +79,19 @@ test('SCM can save Low inventory without ETA and can request information before 
   } finally { await context.close(); }
   const second = await fixture('scm');
   try {
-    await second.page.locator('[name=question]').fill('Please confirm size <large>.');
-    second.state.fail = true;
-    await second.page.getByRole('button', { name: 'Ask Sales for more information' }).click();
-    await expect(second.page.locator('.stock-request-feedback')).toContainText('Review changed');
-    await expect(second.page.locator('[name=question]')).toHaveValue('Please confirm size <large>.');
-    second.state.fail = false;
-    await second.page.getByRole('button', { name: 'Ask Sales for more information' }).click();
-    await expect(second.page.locator('.special-information-request')).toContainText('Pending Update');
-    await expect(second.page.getByRole('button', { name: 'Save stock check', exact: true })).toHaveCount(0);
-    assert.equal(second.state.posts.at(-1).body.question, 'Please confirm size <large>.');
+    const panel=second.page.locator('[data-stock-conversation]'),before=structuredClone(second.state.record);
+    await panel.getByLabel('Message',{exact:true}).fill('Please confirm size <large>.');
+    second.state.conversation.fail = true;
+    await panel.getByRole('button', { name: 'Send message',exact:true }).click();
+    await expect(panel).toContainText('Message delivery unavailable');
+    await expect(panel.getByLabel('Message',{exact:true})).toHaveValue('Please confirm size <large>.');
+    second.state.conversation.fail = false;
+    await panel.getByRole('button', { name: 'Send message',exact:true }).click();
+    await expect(panel.locator('[data-conversation-messages]')).toContainText('Please confirm size <large>.');
+    await expect(second.page.getByRole('button', { name: 'Save stock check', exact: true })).toBeVisible();
+    assert.equal(second.state.conversation.posts.at(-1).body.message, 'Please confirm size <large>.');
+    assert.equal(second.state.conversation.posts[0].body.operationId,second.state.conversation.posts[1].body.operationId);
+    assert.deepEqual(second.state.record,before);
     assert.deepEqual(second.state.errors, []);
   } finally { await second.context.close(); }
 });
@@ -95,14 +101,15 @@ test('Sales sees an alert, answers SCM, and can confirm low inventory normally',
     record.stage = 'pending_update'; record.informationRequest = { status: 'pending', question: 'Confirm size <large>.' };
   });
   try {
-    await expect(page.locator('.special-information-request')).toContainText('Confirm size <large>.');
+    const panel=page.locator('[data-stock-conversation]');
+    await expect(panel).toContainText('Confirm size <large>.');
     await expect(page.locator('.stock-request-card')).toContainText('Update required');
-    await expect(page.locator('.sales-special-alert')).toHaveAccessibleName(/1 Pending Update/);
-    await expect(page.locator('.sales-special-alert')).toHaveAttribute('href', /stages=pending_update,/);
-    await page.locator('[name=reply]').fill('Large, blue.');
-    await page.getByRole('button', { name: 'Submit update to SCM' }).click();
-    await expect(page.locator('.special-information-request')).toContainText('Large, blue.');
-    assert.equal(state.posts.at(-1).body.reply, 'Large, blue.');
+    await expect(page.locator('.sales-special-alert')).toHaveAttribute('href','/sales/stock-requests?tab=special&alerts=1');
+    await panel.getByLabel('Message',{exact:true}).fill('Large, blue.');
+    await panel.getByRole('button',{name:'Send message',exact:true}).click();
+    await expect(panel.locator('[data-conversation-messages]')).toContainText('Large, blue.');
+    assert.equal(state.conversation.posts.at(-1).body.message,'Large, blue.');
+    assert.equal(state.record.informationRequest.status,'answered');
     await page.evaluate(() => window.MBBSSalesSpecialAlert.refresh());
     await expect(page.locator('.sales-special-alert')).toBeHidden();
     assert.deepEqual(state.errors, []);

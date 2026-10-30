@@ -4,12 +4,13 @@ import fc from 'fast-check';
 import {specialStage} from '../../../public/special-stock-workflow.js';
 import {specialPlanningStatus} from '../../../public/special-stock-case-status.js';
 import {specialDispatchPlanning} from '../../../src/special-stock-planning.js';
-test('property: a real unapproved PO remains Confirmed until approval, except terminal stages',()=>{
- fc.assert(fc.property(fc.boolean(),fc.boolean(),fc.constantFrom('vendor_pickup','yard_pickup','mbt_delivery'),(waiting,approved,method)=>{
- const e={salesOrderId:11,purchaseOrderId:12,purchaseOrderApproved:approved,waitingForProduction:waiting,fulfillmentMethod:method};
- assert.equal(specialStage(e),!approved||waiting||method==='vendor_pickup'?'confirmed':'dispatch_arrangement');
+test('property: real POs require approval and a queued reference before dispatch; terminal stages take precedence',()=>{
+ fc.assert(fc.property(fc.boolean(),fc.boolean(),fc.boolean(),fc.boolean(),fc.constantFrom('vendor_pickup','yard_pickup','mbt_delivery'),(waiting,approved,reference,queued,method)=>{
+ const e={salesOrderId:11,purchaseOrderId:12,purchaseOrderApproved:approved,waitingForProduction:waiting,fulfillmentMethod:method,
+   purchaseOrderReference:reference?'TEST-REF':'',purchaseOrderDispatchStatus:queued?'Queued':'Hold'};
+ assert.equal(specialStage(e),approved&&reference&&queued&&method!=='vendor_pickup'?'dispatch_arrangement':'confirmed');
  assert.equal(specialStage({...e,closed:true}),'closed');assert.equal(specialStage({...e,operationallyComplete:true}),'completed');
- }));
+ }),{seed:20261030,numRuns:500});
 });
 test('pending PO notice is visible with compact, detail and document planning displays',()=>{
  for(const compact of [false,true]) for(const showOrderPreviews of [false,true]) assert.match(specialPlanningStatus({purchaseOrderId:12,purchaseOrderApproved:false,purchaseOrderPendingApproval:true},compact,{showOrderPreviews}),/PO approval pending/i);

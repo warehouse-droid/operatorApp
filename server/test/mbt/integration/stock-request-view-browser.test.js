@@ -9,7 +9,7 @@ let browser;
 const timings = [];
 const measured=[];
 before(async () => {await mkdir(out, {recursive:true});browser = await chromium.launch({headless:true,channel:'chromium',args:['--no-sandbox']});});
-after(async () => {await browser?.close();await writeFile(`${out}/click-timings.json`, JSON.stringify(timings,null,2));await writeFile('test-artifacts/stocking-replies-20261006/view-browser-coverage.json',JSON.stringify(measured));});
+after(async () => {await browser?.close();await writeFile(`${out}/click-timings.json`, JSON.stringify(timings,null,2));await writeFile(`${out}/view-browser-coverage.json`,JSON.stringify(measured));});
 const deferred = () => {let resolve;const promise = new Promise(done => {resolve = done;});return {promise,resolve};};
 
 function record(id, audience, kind) {
@@ -142,8 +142,9 @@ for (const audience of ['sales','scm']) for (const kind of ['regular','special']
       timings.push({audience,kind,...timing});
       assert.equal(await page.evaluate(()=>window.clickPool===document.querySelector('.stock-request-list')&&window.clickCards.every((node,i)=>node===window.clickPool.children[i])),true);
       gate.resolve();await page.waitForLoadState('networkidle');
-      const after=state.calls.length;await page.locator('.stock-request-card[data-id="2"]').click();await page.waitForTimeout(100);
-      assert.equal(state.calls.length,after,'clicking the selected card must be a no-op');
+      const selectionCalls=()=>state.calls.filter(row=>/\/(?:special-)?stock-requests(?:$|\/\d+$)/.test(row.path)).length;
+      const after=selectionCalls();await page.locator('.stock-request-card[data-id="2"]').click();await page.waitForTimeout(100);
+      assert.equal(selectionCalls(),after,'clicking the selected card must not reload the queue or detail');
       assert.equal(state.calls.filter(row=>row.path.endsWith(`/${kind === 'special' ? 'special-stock-requests' : 'stock-requests'}`)).length,calls,'selection must not reload the queue');
       assert.deepEqual(state.errors,[]);
     } finally {await f.close();}

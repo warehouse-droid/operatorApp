@@ -36,9 +36,9 @@ test('queue hydration uses bounded SQL reads and equals full case details',()=>f
  pg.Client.prototype.query=function(...args){reads++;return original.apply(this,args);};
  let cases;try{cases=await listSpecialStockCases({search,audience:'scm'});}finally{pg.Client.prototype.query=original;}
  assert.ok(reads<=9,`Expected at most 9 SQL reads, got ${reads}`);
- for(const row of cases)assert.deepEqual(row,await getSpecialStockCase(row.id,{audience:'scm'}));
+ for(const row of cases)assert.deepEqual(row,{...await getSpecialStockCase(row.id,{audience:'scm'}),conversationEventId:0});
  const sales=await listSpecialStockCases({search,audience:'sales',authorizedStoreLocationIds:[1]});
- for(const row of sales){assert.equal(row.storeLocationId,1);assert.ok(!JSON.stringify(row).includes('unitPurchaseCost'));assert.deepEqual(row,await getSpecialStockCase(row.id,{audience:'sales',authorizedStoreLocationIds:[1]}));}
+ for(const row of sales){assert.equal(row.storeLocationId,1);assert.ok(!JSON.stringify(row).includes('unitPurchaseCost'));assert.deepEqual(row,{...await getSpecialStockCase(row.id,{audience:'sales',authorizedStoreLocationIds:[1]}),conversationEventId:0});}
 }));
 
 

@@ -1,3 +1,4 @@
+import { assertIsolatedTestConnection } from '../../support/test-database-isolation.mjs';
 import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
 import test, { before, after } from 'node:test';
@@ -6,7 +7,7 @@ import { parseStages } from '../../../public/special-stock-workflow.js';
 
 // Run the production list query against disposable tables on the isolated test DB.
 assert.equal(process.env.MBT_TEST_ISOLATED, '1');
-assert.equal(new URL(process.env.DATABASE_URL).hostname, 'mbbs-special-review-db');
+assertIsolatedTestConnection(process.env.DATABASE_URL);
 const client = new pg.Client({ connectionString: process.env.DATABASE_URL });
 const source = readFileSync('src/special-stock-request-repository.js', 'utf8');
 const start = source.indexOf('export async function listSpecialDispatchHandoffs(');
@@ -26,6 +27,7 @@ before(async () => {
     CREATE TEMP TABLE sales_special_stock_handoffs(request_id bigint,status text,updated_at timestamptz);
     CREATE TEMP TABLE sales_special_stock_cases(request_id bigint,sales_order_ref text,purchase_order_ref text,purchase_order_netsuite_id bigint);
     CREATE TEMP TABLE special_stock_workflow_stages(request_id bigint,stage text);
+    CREATE TEMP TABLE special_stock_purchase_targets(request_id bigint,po_id bigint);
     CREATE TEMP TABLE special_stock_purchase_approval(request_id bigint,approved boolean);
     CREATE TEMP TABLE sales_stock_requests(id bigint,request_ref text);
     CREATE TEMP TABLE purchase_orders(netsuite_id bigint,tranid text,dispatch_ref text);
@@ -33,6 +35,7 @@ before(async () => {
     INSERT INTO sales_special_stock_handoffs SELECT n,CASE WHEN n=6 THEN 'completed' ELSE 'ready' END,'2026-10-02' FROM generate_series(1,11) n;
     INSERT INTO sales_special_stock_cases SELECT n,'SO'||n,'PO'||n,n FROM generate_series(1,11) n;
     INSERT INTO special_stock_workflow_stages SELECT n,'dispatch_arrangement' FROM generate_series(1,11) n;
+    INSERT INTO special_stock_purchase_targets SELECT n,n FROM generate_series(1,11) n;
     INSERT INTO special_stock_purchase_approval SELECT n,n NOT IN (7,8) FROM generate_series(1,11) n;
     INSERT INTO sales_stock_requests SELECT n,'SPREQ-'||n FROM generate_series(1,11) n;
     INSERT INTO purchase_orders SELECT n,'PO'||n,'SN'||n FROM generate_series(1,11) n;

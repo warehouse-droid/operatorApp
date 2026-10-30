@@ -470,9 +470,7 @@
 
   /** @param {any} detail */
   function manualSalesLink(detail) {
-    if (detail.closeStatus !== 'active' || detail.informationRequest?.status === 'pending' || state.caseEditDraft
-        || !detail.lines.some(line => line.salesDecision === 'accepted')
-        || !detail.lines.every(line => ['accepted', 'declined', 'closed'].includes(line.salesDecision))
+    if (detail.closeStatus !== 'active' || state.caseEditDraft
         || detail.salesOrderId || detail.salesOrderSkipped || detail.purchaseOrderSkipped
         || detail.salesOrderSubmissionStartedAt || detail.salesOrderOperationStatus === 'creating') return '';
     return `<section class="stock-request-section"><h3>Manual Sales Order link</h3>

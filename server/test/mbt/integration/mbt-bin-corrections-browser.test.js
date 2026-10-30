@@ -160,7 +160,7 @@ test('browser: new BIN fee defaults to MBT and undelivered bin actions remain di
     await query("UPDATE mbt_contract_service_lines SET status='cancelled' WHERE service_line_id=$1", [converted.body.serviceLines[1].serviceLineId]);
     await page.getByRole('button', { name: new RegExp(converted.body.contract.contractNumber) }).click();
     await expect(cards).toHaveCount(1);
-    await expect(cards.first().getByRole('heading')).toContainText('Line 1');
+    await expect(cards.first().getByRole('heading')).toContainText('BIN00001 · 14YD');
     await writeFile('test-artifacts/frontdesk-browser-coverage.json', JSON.stringify(await page.coverage.stopJSCoverage()));
   } finally {
     await browser?.close(); server.closeAllConnections();

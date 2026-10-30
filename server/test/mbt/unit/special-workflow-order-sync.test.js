@@ -29,17 +29,15 @@ function harness({ syncFails = false } = {}) {
     failOperation: async () => calls.push(['failed']),
     sleep: async () => {}, config: { subsidiaryId: 2 }
   });
-  return { service, calls };
+  return { service, calls, detail };
 }
-test('SCM descriptions synchronize the exact SO line before PO creation', async () => {
-  const { service, calls } = harness();
+for (const syncFails of [false, true]) {test(`independent PO creation leaves SO descriptions unchanged even when the legacy writer ${syncFails ? 'would fail' : 'is available'}`, async () => {
+  const { service, calls, detail } = harness({ syncFails });
+  const before = structuredClone(detail.salesOrderLines);
   await service.createPurchaseOrder(42, { expectedRevision: 8, operationId: '01911111-1111-7111-8111-111111111115' });
-  assert.deepEqual(calls.map(call => call[0]), ['sync', 'record-sync', 'create-po']);
-  assert.equal(calls[0][1].changes[0].remoteLineId, 701);
-  assert.equal(calls[0][1].changes[0].description, 'After');
-});
-test('failed SO description synchronization blocks PO creation', async () => {
-  const { service, calls } = harness({ syncFails: true });
-  await assert.rejects(() => service.createPurchaseOrder(42, { expectedRevision: 8, operationId: '01911111-1111-7111-8111-111111111116' }), /Description update failed/);
-  assert.equal(calls.some(call => call[0] === 'create-po'), false);
-});
+  assert.deepEqual(calls.map(call => call[0]), ['create-po']);
+  assert.equal(calls[0][1].item.items[0].description, 'After');
+  assert.equal(calls[0][1].item.items[0].quantity, 10);
+  assert.equal(calls[0][1].item.items[0].rate, 2);
+  assert.deepEqual(detail.salesOrderLines, before);
+});}

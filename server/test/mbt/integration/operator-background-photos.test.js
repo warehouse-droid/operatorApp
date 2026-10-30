@@ -5,8 +5,8 @@ import { query, closeDb } from "../../../src/db.js";
 import { createOperator } from "../../../src/auth-repository.js";
 import { validateBackgroundPhotoManifest, withOperatorPhotoAction, receiveBackgroundPhoto, claimBackgroundPhoto,
   completeBackgroundPhoto, failBackgroundPhoto, getBackgroundPhoto, getBackgroundPhotoAction } from "../../../src/operator-background-photos.js";
-import { describeIsolatedTestDatabase } from "../../support/test-database-isolation.mjs";
-describeIsolatedTestDatabase(process.env.DATABASE_URL);
+import { assertIsolatedTestConnection } from "../../support/test-database-isolation.mjs";
+assertIsolatedTestConnection(process.env.DATABASE_URL);
 after(closeDb);
 const bytes = Buffer.from("photo-one");
 function manifest() { return [1, 2].map(() => ({ id: crypto.randomUUID(), sha256: crypto.createHash("sha256").update(bytes).digest("hex"), byteSize: bytes.length, mimeType: "image/jpeg" })); }

@@ -116,7 +116,7 @@ test('Sales notification opens the resolved case and its PO/ETA once, and remain
       const sales=await salesContext.newPage();sales.setDefaultTimeout(8000);await sales.goto(base+'/sales');
       await sales.evaluate(()=>window.MBBSRegularStockAlert.refresh());
       const alert=sales.locator('.regular-stock-alert[data-audience=sales]');await expect(alert).toBeVisible();
-      await expect(alert).toHaveAttribute('href',`/sales/stock-requests?tab=regular&requestId=${record.id}`);
+      await expect(alert).toHaveAttribute('href','/sales/stock-requests?tab=regular&alerts=1');
       const popup=sales.locator('dialog.regular-stock-popup');await expect(popup).toBeVisible();await expect(popup).toContainText(poRef);await expect(popup).toContainText('2026-10-15');
       const notifications=await context.request.get(base+'/api/sales/stock-requests/alerts',{headers:{Authorization:`Bearer ${tokens.sales}`}});
       const pending=(await notifications.json()).requests.filter(row=>['reply','resolve'].includes(row.action)).length;

@@ -1,3 +1,4 @@
+import { conversationBrowserBoundary, legacyConversationMessage } from '../../support/conversation-browser-boundary.mjs';
 /* global window, document, localStorage, EventTarget, MessageEvent, MutationObserver */
 import test,{before,after} from 'node:test';
 import assert from 'node:assert/strict';
@@ -21,9 +22,11 @@ async function fixture(audience,{purchase=false,reply=false,pendingTo=false}={})
   const state={r:record(purchase),calls:[],errors:[],alerts:{requests:[],total:0,unread:0}};
   if(reply){state.r.displayStatus='pending_update';state.r.regular.replyStatus='pending_update';state.r.regular.reply={audience:'scm',message:'Use the next load.',eta:null};state.r.events=[{id:2,eventType:'regular_scm_reply',actorName:'SCM',createdAt:'2026-10-06T00:00:00Z',details:state.r.regular.reply}];}
   if(pendingTo){
+    state.r.lines.forEach(line=>{line.status='approved';});
     state.r.status='active';state.r.bucket='accepted';state.r.regular.pickupTransfer={status:'complete',plan:{action:{mode:'pickup',requestRef:'REQ-1',destinationName:'3445',routes:[]}}};
     state.r.transfers=[{id:1,transferRef:'SRTO-1',revision:1,status:'pending_receipt',sourceLocationId:28,sourceName:'2967',destinationLocationId:1,destinationName:'3445',netsuiteTransferOrderRef:'TO-1',lines:state.r.lines}];
   }
+  state.conversation=conversationBrowserBoundary({audience,messages:reply?[legacyConversationMessage('Use the next load.')]:[],onSend:()=>{if(audience==='sales'&&state.r.regular.replyStatus==='pending_update'){state.r.regular.replyStatus='pending_scm';state.r.displayStatus='pending_scm';}}});
   page.on('pageerror',e=>state.errors.push(e.message));
   await page.route('**/*',async route=>{
     const path=new URL(route.request().url()).pathname;
@@ -50,6 +53,7 @@ async function fixture(audience,{purchase=false,reply=false,pendingTo=false}={})
     const file=({'/sales/stock-requests':'/sales-stock-requests.html','/scm/stock-requests':'/scm-stock-requests.html'})[path]||path;
     try{return route.fulfill({body:await readFile('public'+file),contentType:({js:'application/javascript',css:'text/css',html:'text/html',svg:'image/svg+xml'})[file.split('.').at(-1)]||'application/octet-stream'});}catch{return route.fulfill({status:404,body:''});}
   });
+  await page.route(url=>/\/(conversation(?:\/read)?|stock-request-conversation-alerts)$/.test(url.pathname),state.conversation.handle);
   await page.goto(`http://localhost/${audience}/stock-requests?tab=regular`);await expect(page.locator('.stock-request-detail h2')).toHaveText(pendingTo?'REQ-1 · SRTO-1':'REQ-1');await page.waitForLoadState('networkidle');
   return {page,state,close:async()=>{measured.push(...await page.coverage.stopJSCoverage());await context.close();}};
 }
@@ -65,18 +69,18 @@ test('Stocking enables all supported destination yards for 150 while Pickup keep
 });
 for(const purchase of [false,true])test(`SCM ${purchase?'Purchase':'Transfer'} Reply saves free text with no ETA and survives background updates`,async()=>{
   const f=await fixture('scm',{purchase});try{
-    await f.page.locator('[data-scm-stock-action="reply"]').click();const text=f.page.locator('[data-regular-reply-field="message"]');await text.fill('Call Sales first.\nNext load <script>alert(1)</script>');
-    await f.page.evaluate(()=>{window.replyFrozen={pool:document.querySelector('.stock-request-list'),text:document.querySelector('[data-regular-reply-field="message"]')};});
-    await update(f.page);await expect(f.page.locator('[data-stock-background-update]')).toBeVisible();assert.equal(await f.page.evaluate(()=>window.replyFrozen.pool===document.querySelector('.stock-request-list')&&window.replyFrozen.text===document.querySelector('[data-regular-reply-field="message"]')),true);await expect(text).toHaveValue('Call Sales first.\nNext load <script>alert(1)</script>');
-    await f.page.locator('[data-regular-reply-form] button[type="submit"]').click();await expect(f.page.locator('[data-regular-reply-history]')).toContainText('Next load <script>alert(1)</script>');
-    const sent=f.state.calls.find(call=>call.path.endsWith('/1/reply'));assert.equal(sent.body.eta,'');assert.equal(sent.body.expectedRevision,1);await expect(f.page.locator('.stock-request-detail .stock-request-heading')).toContainText('Pending update');assert.deepEqual(f.state.errors,[]);
+    const text=f.page.locator('[data-stock-conversation] textarea');await text.fill('Call Sales first.\nNext load <script>alert(1)</script>');
+    await f.page.evaluate(()=>{window.replyFrozen={pool:document.querySelector('.stock-request-list'),text:document.querySelector('[data-stock-conversation] textarea')};});
+    await update(f.page);await expect(f.page.locator('[data-stock-background-update]')).toBeVisible();assert.equal(await f.page.evaluate(()=>window.replyFrozen.pool===document.querySelector('.stock-request-list')&&window.replyFrozen.text===document.querySelector('[data-stock-conversation] textarea')),true);await expect(text).toHaveValue('Call Sales first.\nNext load <script>alert(1)</script>');
+    await f.page.locator('[data-stock-conversation] button[type="submit"]').click();await expect(f.page.locator('[data-conversation-messages]')).toContainText('Next load <script>alert(1)</script>');
+    const sent=f.state.conversation.posts[0];assert.deepEqual(Object.keys(sent.body).sort(),['message','operationId']);assert.equal(sent.body.message,'Call Sales first.\nNext load <script>alert(1)</script>');assert.equal(f.state.r.revision,1);assert.equal(f.state.r.displayStatus,'pending');assert.deepEqual(f.state.errors,[]);
   }finally{await f.close();}
 });
-test('Sales responds to SCM instructions with an optional SO and retained unsaved text',async()=>{
+test('Sales responds to legacy SCM instructions with an SO reference in retained typed text',async()=>{
   const f=await fixture('sales',{reply:true,purchase:true});try{
-    await f.page.locator('[data-sales-stock-action="reply"]').click();const text=f.page.locator('[data-regular-reply-field="message"]');await text.fill('Confirmed for the customer.');await f.page.locator('[data-regular-reply-field="salesOrderRef"]').fill('SO-123');
-    await update(f.page);await expect(text).toHaveValue('Confirmed for the customer.');await f.page.locator('[data-regular-reply-form] button[type="submit"]').click();
-    await expect(f.page.locator('[data-regular-reply-history]')).toContainText('SO-123');await expect(f.page.locator('.stock-request-detail .stock-request-heading')).toContainText('Pending SCM review');assert.deepEqual(f.state.errors,[]);
+    const text=f.page.locator('[data-stock-conversation] textarea');await text.fill('Confirmed for the customer. SO-123');
+    await update(f.page);await expect(text).toHaveValue('Confirmed for the customer. SO-123');await f.page.locator('[data-stock-conversation] button[type="submit"]').click();
+    await expect(f.page.locator('[data-conversation-messages]')).toContainText('SO-123');assert.equal(f.state.r.regular.replyStatus,'pending_scm');assert.equal(f.state.conversation.posts[0].body.message,'Confirmed for the customer. SO-123');assert.deepEqual(f.state.errors,[]);
   }finally{await f.close();}
 });
 test('Sales top-bar and popup alert reply and Resolve once per event without changing the pool',async()=>{
@@ -84,16 +88,16 @@ test('Sales top-bar and popup alert reply and Resolve once per event without cha
     await f.page.evaluate(()=>{window.poolBeforeAlert=document.querySelector('.stock-request-list');});
     f.state.alerts={total:1,unread:1,requests:[{id:1,requestRef:'REQ-1',eventId:5,action:'reply',message:'Next load.',eta:null}]};await update(f.page);
     const popup=f.page.locator('dialog.regular-stock-popup');await expect(popup).toBeVisible();await expect(popup).toContainText('Next load.');await expect(f.page.locator('.regular-stock-alert')).toContainText('1');
-    await popup.locator('button').click();await update(f.page);await expect(popup).toHaveCount(0);await expect(f.page.locator('.regular-stock-alert')).toBeVisible();
+    await popup.getByRole('button',{name:'Close',exact:true}).click();await update(f.page);await expect(popup).toHaveCount(0);await expect(f.page.locator('.regular-stock-alert')).toBeVisible();
     f.state.alerts.requests=[{id:1,requestRef:'REQ-1',eventId:6,action:'resolve',purchaseOrderRef:'PO-321',eta:'2026-10-20'}];await update(f.page);await expect(popup).toBeVisible();await expect(popup).toContainText('PO-321');await expect(popup).toContainText('2026-10-20');
     assert.equal(await f.page.evaluate(()=>window.poolBeforeAlert===document.querySelector('.stock-request-list')),true);assert.deepEqual(f.state.errors,[]);
   }finally{await f.close();}
 });
 test('Stocking instructions remain available for SCM in Pending TO without changing the Transfer Order',async()=>{
   const f=await fixture('scm',{reply:true,pendingTo:true});try{
-    await expect(f.page.locator('[data-regular-reply-history]')).toContainText('Use the next load.');
-    await f.page.locator('[data-scm-stock-action="reply"]').click();await f.page.locator('[data-regular-reply-field="message"]').fill('Call Sales before delivery.');
-    await f.page.locator('[data-regular-reply-form] button[type="submit"]').click();await expect(f.page.locator('[data-regular-reply-history]')).toContainText('Call Sales before delivery.');
-    await expect(f.page.locator('.stock-request-detail .stock-request-heading')).toContainText('Pending update');assert.equal(f.state.r.transfers[0].netsuiteTransferOrderRef,'TO-1');assert.equal(f.state.r.transfers[0].status,'pending_receipt');assert.deepEqual(f.state.errors,[]);
+    await expect(f.page.locator('[data-conversation-messages]')).toContainText('Use the next load.');
+    await f.page.locator('[data-stock-conversation] textarea').fill('Call Sales before delivery.');
+    await f.page.locator('[data-stock-conversation] button[type="submit"]').click();await expect(f.page.locator('[data-conversation-messages]')).toContainText('Call Sales before delivery.');
+    assert.equal(f.state.r.transfers[0].netsuiteTransferOrderRef,'TO-1');assert.equal(f.state.r.transfers[0].status,'pending_receipt');assert.deepEqual(f.state.errors,[]);
   }finally{await f.close();}
 });

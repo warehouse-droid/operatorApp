@@ -175,7 +175,7 @@ test('Backorder quotation attachments enforce Sales access, input bounds and ato
 });
 test('Backorder PO linkage notifies Sales with the PO number once and quotation changes do not repeat it',async()=>{
   let d=await reviewed(await create());
-  assert.ok(!(await http('sales',regular+'/alerts')).body.requests.some(row=>row.id===d.id));
+  assert.ok((await http('sales',regular+'/alerts')).body.requests.some(row=>row.id===d.id && row.action==='input_required' && row.reason==='awaiting_so'));
   d=await poLinked(d);const linkedRevision=d.revision;
   const alert=(await http('sales',regular+'/alerts')).body.requests.find(row=>row.id===d.id);
   assert.ok(alert);assert.equal(alert.purchaseOrderRef,'TEST-BO-PO');assert.match(alert.message,/PO linked/);assert.equal(alert.eventId,linkedRevision);
@@ -203,7 +203,7 @@ test('Backorder persisted pending information after PO linkage gets a fresh aler
   d=(await http('sales',regular+'/'+d.id)).body;
   assert.equal(d.stage,'pending_update');
   const information=(await http('sales',regular+'/alerts')).body.requests.find(row=>row.id===d.id);
-  assert.ok(information);assert.equal(information.eventId,d.revision);assert.match(information.message,/pending update/);
+  assert.ok(information);assert.equal(information.eventId,d.revision);assert.equal(information.action,'input_required');assert.equal(information.reason,'sales_reply');assert.equal(information.message,'SCM needs your update. Open the request to reply.');
   assert.equal((await http('sales',regular+'/'+d.id+'/decisions/read','POST',{eventId:information.eventId})).status,200);
   await query("UPDATE sales_special_stock_cases SET information_request='{}'::jsonb WHERE request_id=$1",[d.id]);
   await query('UPDATE sales_stock_requests SET revision=revision+1 WHERE id=$1',[d.id]);
@@ -301,10 +301,11 @@ test('Backorder header/material changes remain local after linking, preserve SKU
 });
 test('Backorder information replies, Regular alerts and acknowledgements use the authorized request profile',async()=>{
   let d=await create();d=await action(d,'scm','information/request',{question:'Please confirm the specifications'});assert.equal(d.stage,'pending_update');
-  const alert=await http('sales',regular+'/alerts');assert.ok(alert.body.requests.some(r=>r.id===d.id && r.action==='backorder'));
+  const alert=await http('sales',regular+'/alerts');assert.ok(alert.body.requests.some(r=>r.id===d.id && r.action==='input_required' && r.reason==='sales_reply'));
   assert.equal((await http('foreign',regular+'/'+d.id+'/decisions/read','POST',{eventId:d.revision})).status,403);
   assert.equal((await http('sales',regular+'/'+d.id+'/decisions/read','POST',{eventId:d.revision})).status,200);
-  assert.ok(!(await http('sales',regular+'/alerts')).body.requests.some(r=>r.id===d.id));
+  assert.ok((await http('sales',regular+'/alerts')).body.requests.some(r=>r.id===d.id && r.reason==='sales_reply'),'unanswered information remains actionable after acknowledgement');
+  assert.equal(Number((await query('SELECT event_id FROM regular_stock_decision_reads WHERE request_id=$1 AND operator_id=$2',[d.id,users.sales.id])).rows[0].event_id),d.revision);
   d=await action(d,'sales','information/submit',{reply:'Specifications confirmed'});assert.equal(d.informationRequest.status,'answered');
   const scm=await http('scm','/api/scm/stock-requests/alerts');assert.ok(scm.body.manualReview>0);
 });
@@ -352,7 +353,7 @@ test('Backorder native order previews preserve audience rules without requiring 
 test('Order webhooks leave linked Backorders unchanged in both the app and the packaged worker',async()=>{
   const {spawnSync}=await import('node:child_process');
   const {resolve}=await import('node:path');
-  const {mkdtempSync,cpSync,symlinkSync,writeFileSync,readFileSync,rmSync,existsSync}=await import('node:fs');
+  const {mkdtempSync,cpSync,symlinkSync,writeFileSync,readFileSync,rmSync}=await import('node:fs');
   const soId=so+21,poId=po+21;
   await query("INSERT INTO sales_orders(netsuite_id,tranid,status_text,netsuite_active) VALUES($1,'TEST-BO-WORKER-SO','Closed',false)",[soId]);
   await query("INSERT INTO purchase_orders(netsuite_id,tranid,status_text,netsuite_active) VALUES($1,'TEST-BO-WORKER-PO','Closed',false)",[poId]);
@@ -361,10 +362,8 @@ test('Order webhooks leave linked Backorders unchanged in both the app and the p
     let d=await poLinked(await reviewed(await create()),'TEST-BO-WORKER-PO');await planPo('TEST-BO-WORKER-PO');d=await action(d,'sales','sales-order/link',{salesOrderRef:'TEST-BO-WORKER-SO'});
     const before=(await query('SELECT to_jsonb(special) AS value FROM sales_special_stock_cases special WHERE request_id=$1',[d.id])).rows[0].value;
     for(const [orderKind,orderId] of [['sales_order',soId],['purchase_order',poId]])assert.deepEqual(await special.reconcileSpecialOrderWebhook({orderKind,orderId}),{matched:false});
-    for(const folder of ['src','public'])cpSync(resolve('tools/backorder-requests-20261006/baseline-worker/'+folder),root+'/'+folder,{recursive:true});
+    for(const folder of ['src','public'])cpSync(resolve(folder),root+'/'+folder,{recursive:true});
     symlinkSync(resolve('node_modules'),root+'/node_modules');cpSync('package.json',root+'/package.json');
-    const patch='tools/backorder-requests-20261006/worker-candidate/src/special-stock-request-repository.js';
-    if(existsSync(patch))writeFileSync(root+'/src/special-stock-request-repository.js',readFileSync(patch));
     const script=`import assert from 'node:assert/strict';import {reconcileSpecialOrderWebhook} from './src/special-stock-request-repository.js';import {closeDb} from './src/db.js';globalThis.fetch=()=>{throw Error('Backorder worker must not use external services');};try{for(const [orderKind,orderId] of ${JSON.stringify([['sales_order',soId],['purchase_order',poId]])})assert.deepEqual(await reconcileSpecialOrderWebhook({orderKind,orderId}),{matched:false});console.log('Worker ignores Backorder references');}finally{await closeDb();}`;
     const coverage=Boolean(process.env.NODE_V8_COVERAGE),report=resolve('test-artifacts/backorder-requests-20261006/worker-coverage');
     const args=coverage?[resolve('node_modules/c8/bin/c8.js'),'--all=false','--check-coverage=false','--include=src/special-stock-request-repository.js','--temp-directory='+root+'/coverage-raw','--report-dir='+report,'--reporter=json',process.execPath,'--input-type=module','-e',script]:['--input-type=module','-e',script];
@@ -392,7 +391,7 @@ test('Manual Backorder links keep incomplete material reviews in SCM notificatio
 });
 test('Manual Backorder links keep revised material confirmations in Sales notifications',async()=>{
   let d=await poLinked(await reviewed(await create()));d=await action(d,'scm',`lines/${d.lines[0].id}/response`,{supplyStatus:'in_stock',availabilityMode:'no_projection',vendorId:331,vendorName:'TEST BO Vendor',vendorYard:'Vendor yard'});
-  const alerts=await http('sales',regular+'/alerts');assert.ok(alerts.body.requests.some(row=>row.id===d.id && row.action==='backorder'));
+  const alerts=await http('sales',regular+'/alerts');assert.ok(alerts.body.requests.some(row=>row.id===d.id && row.action==='input_required' && row.reason==='sales_confirmation'));
 });
 
 
@@ -469,16 +468,17 @@ test('Confirmed Backorder lets Sales link SO after PO with any planning state',a
     assert.equal(d.salesOrderId,so,plan);assert.equal(d.purchaseOrderId,order.id,plan);assert.equal(d.stage,'confirmed',plan);
   }
 });
-test('SO linking rejects unfinished material review and ignores forged confirmation and planning flags',async()=>{
+test('SO linking rejects forged stock review and records acceptance only for genuinely reviewed materials',async()=>{
   let d=await create();
   const forged={stage:'confirmed',lines:d.lines.map(line=>({...line,salesDecision:'accepted',supplyStatus:'in_stock',stockCheckedAt:'2099-01-01'})),purchaseOrderId:po,dispatchPlanning:{purchaseOrder:{planned:true}}};
   await rejectedLink(d,'sales','sales','BACKORDER_SALES_ACCEPTANCE_REQUIRED',forged);
   for(const line of d.lines)d=await reviewStock(d,line);
-  await rejectedLink(d,'sales','sales','BACKORDER_SALES_ACCEPTANCE_REQUIRED');
-  d=await action(d,'sales',`lines/${d.lines[0].id}/decision`,{decision:'accepted'});
-  await rejectedLink(d,'sales','sales','BACKORDER_SALES_ACCEPTANCE_REQUIRED');
-  d=await action(d,'sales',`lines/${d.lines[1].id}/decision`,{decision:'declined',reason:'Not needed'});
-  d=await action(d,'sales','sales-order/link',{salesOrderRef:'TEST-BO-SO'});assert.equal(d.salesOrderId,so);
+  d=await action(d,'sales','sales-order/link',{salesOrderRef:'TEST-BO-SO'});
+  assert.equal(d.salesOrderId,so);assert.ok(d.lines.every(line=>line.salesDecision==='accepted'));
+  d=await create();for(const line of d.lines)d=await reviewStock(d,line);
+  d=await action(d,'sales',`lines/${d.lines[0].id}/decision`,{decision:'declined',reason:'Not needed'});
+  d=await action(d,'sales','sales-order/link',{salesOrderRef:'TEST-BO-SO'});
+  assert.equal(d.salesOrderId,so);assert.deepEqual(d.lines.map(line=>line.salesDecision),['declined','accepted']);
 });
 test('Concurrent Confirmed SO and PO links preserve revision checks and both links after retry',async()=>{
   let d=await reviewed(await create());const initial=d.revision,order=await uniquePo();
@@ -521,7 +521,7 @@ test('Backorder Sales replies become Confirmed only after every line replies and
   d=await poLinked(d);assert.equal(d.stage,'confirmed');assert.equal((await query('SELECT stage FROM special_stock_workflow_stages WHERE request_id=$1',[d.id])).rows[0].stage,'confirmed');
 });
 test('Backorder all rejected replies close it and freeze later local edits without changing neighboring requests',async()=>{
-  let d=await create();const other=await create();for(const line of d.lines)d=await reviewStock(d,line);
+  let d=await create();const other=await create();for(const line of d.lines){d=await reviewStock(d,line);}
   d=await action(d,'sales',`lines/${d.lines[0].id}/decision`,{decision:'declined',reason:'Not needed'});assert.equal(d.stage,'await_customer_confirmation');
   d=await action(d,'sales',`lines/${d.lines[1].id}/decision`,{decision:'declined',reason:'Not needed'});assert.equal(d.stage,'closed');assert.equal(d.closeStatus,'closed');
   assert.equal((await query('SELECT stage FROM special_stock_workflow_stages WHERE request_id=$1',[d.id])).rows[0].stage,'closed');

@@ -13,7 +13,7 @@ async function pageFor(role,id){
   await context.addInitScript(token=>localStorage.setItem('mbbs.staff.token',token),f.users[role].token);
   const page=await context.newPage(),errors=[];page.on('pageerror',e=>errors.push(e.message));page.setDefaultTimeout(10000);
   await page.goto(f.base+'/sales/stock-requests?tab=regular'+(id?'&requestId='+id:''));
-  await expect(page.locator('[data-sales-multi-filter="backorderStageFilter"] summary')).toBeVisible();
+  await expect(page.locator('[data-yard-filter="unifiedStatus"] summary')).toBeVisible();
   await page.evaluate(()=>window.MBBSRegularStockAlert.refresh());
   return {page,context,errors};
 }

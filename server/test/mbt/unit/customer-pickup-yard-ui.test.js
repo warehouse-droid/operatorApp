@@ -93,9 +93,9 @@ for (const yard of [1, 28]) {
 test('E12 HTML and service worker share the new operator asset cache version', () => {
   const html = readFileSync('public/operator.html', 'utf8');
   const worker = readFileSync('public/service-worker.js', 'utf8');
-  const version = '20261010-pickup-packs-yard-v1';
+  const version = '20261028-repair-pwa&stockExchange=20261029&returnExchangeLayout=20261029&palletBottom=20261029';
   assert.ok(html.includes(`/operator.js?v=${version}`));
   assert.ok(worker.includes(`/operator.js?v=${version}`));
-  assert.ok(worker.includes(`mbbs-yard-operator-${version}`));
+  assert.ok(worker.includes('mbbs-yard-operator-20261030-shell-repair-v1'));
   vm.runInNewContext(worker, { self: { addEventListener: () => {} } }, { filename: pathToFileURL(resolve('public/service-worker.js')).href });
 });

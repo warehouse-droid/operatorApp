@@ -4,6 +4,10 @@ export const MENU_CATALOG = [
     "label": "Modules",
     "items": [
       {
+        "label": "Repair",
+        "href": "/repair"
+      },
+      {
         "label": "BOSS approvals",
         "href": "/boss"
       },
@@ -32,12 +36,12 @@ export const MENU_CATALOG = [
         "href": "/field-sales/"
       },
       {
-        "label": "MBT",
-        "href": "/mbt"
-      },
-      {
         "label": "MBR",
         "href": "/mbr"
+      },
+      {
+        "label": "MBT",
+        "href": "/mbt"
       },
       {
         "label": "Aggregate Requests",
@@ -122,6 +126,10 @@ export const MENU_CATALOG = [
       {
         "label": "Order Locks",
         "href": "/control/order-locks"
+      },
+      {
+        "label": "Order Reopen",
+        "href": "/control/order-reopen"
       },
       {
         "label": "Item Classification",
@@ -230,6 +238,10 @@ export const MENU_CATALOG = [
       {
         "label": "Stock Requests",
         "href": "/scm/stock-requests"
+      },
+      {
+        "label": "Stock Check",
+        "href": "/scm/stock-check"
       },
       {
         "label": "TO Printing",
@@ -353,7 +365,20 @@ export const MENU_CATALOG = [
       }
     ]
   },
-  {"key":"mbr","label":"MBR","items":[{"label":"Contract","href":"/mbr/contracts"}]}
+  {
+    "key": "mbr",
+    "label": "MBR",
+    "items": [
+      {
+        "label": "Contract",
+        "href": "/mbr/contracts"
+      },
+      {
+        "label": "MBR Setup",
+        "href": "/mbr/setup"
+      }
+    ]
+  }
 ];
 
 function invalid(message) {

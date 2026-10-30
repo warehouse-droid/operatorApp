@@ -129,7 +129,7 @@ test("multi-line case transitions atomically from Sales to SCM and back to an ex
         decision: "declined",
         reason: "Customer declined line B."
       }, { operatorId: salesId, authorizedStoreLocationIds: [15] });
-      assert.equal(detail.stage, "confirmed");
+      assert.equal(detail.stage, "await_customer_confirmation");
 
       detail = await saveSpecialSalesOrderDraft(detail.id, {
         expectedRevision: detail.revision,
@@ -145,7 +145,7 @@ test("multi-line case transitions atomically from Sales to SCM and back to an ex
         materialLines: [{ caseLineId: detail.lines[0].id, itemId: 2055, description: "Special test item", quantity: 20, packageQuantity: 2, conversionToPc: 10, uom: "PC", rate: 42.5 }],
         ancillaryLines: []
       }, { operatorId: salesId, authorizedStoreLocationIds: [15] });
-      assert.equal(detail.customerId, 8880001);
+      assert.equal(detail.netsuiteCustomerId, 8880001);
       assert.deepEqual(detail.salesOrderLines.map((line) => line.caseLineId), [detail.lines[0].id]);
       assert.equal(detail.lines[0].unitPurchaseCost, undefined);
       assert.equal((await getSpecialStockCase(detail.id, { audience: "scm" })).lines[0].unitPurchaseCost, 2.1);
@@ -344,8 +344,12 @@ test("multi-line case transitions atomically from Sales to SCM and back to an ex
         pickupDate: "2099-09-06",
         pickupReference: "SIGNED-PICKUP-888"
       }, { operatorId: salesId, authorizedStoreLocationIds: [15] });
+      assert.equal(pickup.operationallyComplete, false, "Local collection is not NetSuite fulfillment evidence");
+      await query("UPDATE sales_orders SET status_text='Sales Order : Pending Billing' WHERE netsuite_id=$1", [pickup.salesOrderId]);
+      await query("UPDATE purchase_orders SET status_text='Purchase Order : Pending Bill' WHERE netsuite_id=$1", [pickup.purchaseOrderId]);
+      pickup = await getSpecialStockCase(pickup.id, { audience: "sales", authorizedStoreLocationIds: [15] });
       assert.equal(pickup.operationallyComplete, true);
-      assert.equal(pickup.operationalCompletionSource, "vendor_pickup");
+      assert.equal(pickup.operationalCompletionSource, "netsuite_order_completion");
       assert.equal(pickup.vendorPickupDate, "2099-09-06");
       assert.equal(pickup.vendorPickupReference, "SIGNED-PICKUP-888");
       assert.equal(pickup.stage, "completed");

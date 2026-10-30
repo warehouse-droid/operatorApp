@@ -1,3 +1,4 @@
+import { assertIsolatedTestConnection } from '../../support/test-database-isolation.mjs';
 import assert from 'node:assert/strict';
 import crypto from 'node:crypto';
 import test, { before, after } from 'node:test';
@@ -23,7 +24,7 @@ const request = (path, role, body) => fetch(base + path, {
 before(async () => {
   specialSalesReps.select=async id=>{assert.equal(Number(id),123);return {id:123,name:'TEST Selected Rep'};};
   assert.equal(process.env.MBT_TEST_ISOLATED, '1');
-  assert.ok(process.env.DATABASE_URL.endsWith('/mbt_verify'));
+  assertIsolatedTestConnection(process.env.DATABASE_URL);
   originalFlag = (await query("SELECT enabled FROM mbt_feature_flags WHERE flag_key='special_stock_request_workflow'")).rows[0].enabled;
   await query("UPDATE mbt_feature_flags SET enabled=true WHERE flag_key='special_stock_request_workflow'");
   server = app.listen(0, '127.0.0.1');

@@ -1,10 +1,11 @@
+import { conversationBrowserBoundary, legacyConversationMessage } from '../../support/conversation-browser-boundary.mjs';
 import assert from 'node:assert/strict';
-import test,{before,after} from 'node:test';
+import test,{before as beforeAll,after} from 'node:test';
 import {chromium,expect} from '@playwright/test';
 import {readFileSync,mkdirSync,writeFileSync,existsSync} from 'node:fs';
 import {join} from 'node:path';
 const root=process.cwd(),out='test-artifacts/stocking-line-actions-20261006/browser';let browser,serial=0;
-before(async()=>{mkdirSync(out,{recursive:true});browser=await chromium.launch({headless:true,args:['--no-sandbox']});});
+beforeAll(async()=>{mkdirSync(out,{recursive:true});browser=await chromium.launch({headless:true,args:['--no-sandbox']});});
 after(async()=>{await browser?.close();});
 async function fixture(audience='scm',purchase=true){
   const outputKey=++serial;
@@ -16,6 +17,7 @@ async function fixture(audience='scm',purchase=true){
     regular:{deliveryMethod:'stocking',stockingType:purchase?'purchase':'transfer',approval:{automatic:false,lines:[]}},
     lines:[10,11,12,13].map(id=>({id,itemId:100+id,itemName:'Material '+id,itemDescription:'Line description',status:'submitted',salesQty:20,salesUom:'EA',toPcs:1,toPlt:100,pieces:20,sourceLocationId:1,sourceName:'3445',destinationLocationId:28,destinationName:'2967'})),events:[],transfers:[],availability:[]}};
   if(audience==='sales')state.r.events=[{id:1,eventType:'regular_scm_reply',requestLineId:12,actorName:'SCM',createdAt:'2026-10-06',details:{message:'Material C instructions',lineId:12}}];
+  state.conversation=conversationBrowserBoundary({audience,messages:audience==='sales'?[legacyConversationMessage('Material C instructions','Material 12')]:[]});
   page.on('pageerror',error=>state.errors.push(error.message));
   await page.route('**/*',async route=>{
     const path=new URL(route.request().url()).pathname,method=route.request().method();
@@ -42,7 +44,8 @@ async function fixture(audience='scm',purchase=true){
     const file=join(root,'public',pathToFile);if(!existsSync(file))return route.fulfill({status:404,body:''});
     return route.fulfill({body:readFileSync(file),contentType:file.endsWith('.html')?'text/html':file.endsWith('.css')?'text/css':'application/javascript'});
   });
-  await page.goto(`http://stocking.test/${audience}/stock-requests?tab=regular&requestId=1`);await expect(page.locator('.stock-request-detail')).toContainText('REQ-LINES');
+  await page.route(url=>/\/(conversation(?:\/read)?|stock-request-conversation-alerts)$/.test(url.pathname),state.conversation.handle);
+  await page.goto(`http://localhost/${audience}/stock-requests?tab=regular&requestId=1`);await expect(page.locator('.stock-request-detail')).toContainText('REQ-LINES');
   return {page,state,async close(){writeFileSync(`${out}/${audience}-${purchase}-${outputKey}.coverage.json`,JSON.stringify(await page.coverage.stopJSCoverage()));await context.close();}};
 }
 test('SCM Purchase actions send only the clicked material even when other materials are pending',async()=>{
@@ -56,10 +59,13 @@ test('SCM Purchase actions send only the clicked material even when other materi
     await card(10).locator('[data-scm-stock-action="reject"]').click();await page.locator('[data-scm-stock-decision-reason]').fill('Reject this material only');
     await page.locator('[data-scm-stock-action="confirm-decision"]').click();await expect(card(10)).toContainText('Reject this material only');
     assert.deepEqual(state.calls.find(call=>call.path.endsWith('/line-decisions')).body.lineIds,[10]);
-    await card(12).locator('[data-scm-stock-action="reply"]').click();await card(12).locator('[data-regular-reply-field="message"]').fill('Instructions C <script>literal</script>');
-    await expect(card(13).locator('[data-regular-reply-form]')).toHaveCount(0);
-    await card(12).locator('[data-regular-reply-form] button[type="submit"]').click();await expect(card(12)).toContainText('Instructions C <script>literal</script>');
-    await expect(card(13)).not.toContainText('Instructions C');assert.equal(state.calls.find(call=>call.path.endsWith('/reply')).body.lineId,12);
+    const panel=page.locator('[data-stock-conversation]'),before=structuredClone(state.r);
+    await panel.getByLabel('Message',{exact:true}).fill('Material C instructions <script>literal</script>');
+    await panel.getByRole('button',{name:'Send message',exact:true}).click();
+    await expect(panel).toContainText('Material C instructions <script>literal</script>');
+    assert.deepEqual(state.r,before,'typed messages do not change individual material decisions');
+    assert.equal(state.conversation.posts[0].body.message,'Material C instructions <script>literal</script>');
+    assert.equal(state.conversation.posts[0].body.lineId,undefined);
     await card(13).locator('[data-scm-stock-action="resolve"]').click();await card(13).locator('[data-regular-resolution-field="purchaseOrderRef"]').fill('PO-D');
     await card(13).locator('[data-regular-resolution-field="eta"]').fill('2026-10-15');await card(13).locator('[data-regular-resolution-form] button[type="submit"]').click();
     await expect(card(13)).toContainText('PO-D');assert.equal(state.calls.find(call=>call.path.endsWith('/resolve')).body.lineId,13);
@@ -67,23 +73,28 @@ test('SCM Purchase actions send only the clicked material even when other materi
     await page.screenshot({path:out+'/purchase-lines.png',fullPage:true});
   }finally{await f.close();}
 });
-test('Transfer Stocking reply and Resolve controls belong to the individual material',async()=>{
+test('Transfer Stocking retains line-specific Reject and Resolve alongside its shared conversation',async()=>{
   const f=await fixture('scm',false);try{
-    const card=f.page.locator('[data-scm-stock-line-id="12"]');
-    for(const action of ['reject','reply','resolve'])await expect(card.locator(`[data-scm-stock-action="${action}"]`)).toHaveAttribute('data-line-id','12');
-    await card.locator('[data-scm-stock-action="reply"]').click();await card.locator('[data-regular-reply-field="message"]').fill('Transfer C only');
-    await card.locator('[data-regular-reply-form] button[type="submit"]').click();assert.equal(f.state.calls.find(call=>call.path.endsWith('/reply')).body.lineId,12);
-    await expect(f.page.locator('[data-scm-stock-line-id="10"]')).not.toContainText('Transfer C only');assert.deepEqual(f.state.errors,[]);
+    const card=f.page.locator('[data-scm-stock-line-id="12"]'),panel=f.page.locator('[data-stock-conversation]');
+    for(const action of ['reject','resolve'])await expect(card.locator(`[data-scm-stock-action="${action}"]`)).toHaveAttribute('data-line-id','12');
+    const before=structuredClone(f.state.r);
+    await panel.getByLabel('Message',{exact:true}).fill('Transfer C only');
+    await panel.getByRole('button',{name:'Send message',exact:true}).click();
+    await expect(panel).toContainText('Transfer C only');
+    assert.equal(f.state.conversation.posts[0].body.message,'Transfer C only');
+    assert.deepEqual(f.state.r,before);assert.deepEqual(f.state.errors,[]);
   }finally{await f.close();}
 });
-test('Sales can reply only in the instructed material card and sends its line ID',async()=>{
+test('Sales sees legacy material context and replies without changing any line',async()=>{
   const f=await fixture('sales');try{
-    const card=f.page.locator('[data-scm-stock-line-id="12"]');
-    await expect(f.page.locator('[data-sales-stock-action="reply"]')).toHaveCount(1);
-    await card.locator('[data-sales-stock-action="reply"]').click();await card.locator('[data-regular-reply-field="message"]').fill('Sales reply C');
-    await card.locator('[data-regular-reply-field="salesOrderRef"]').fill('SO-C');await card.locator('[data-regular-reply-form] button[type="submit"]').click();
-    const body=f.state.calls.find(call=>call.path.endsWith('/reply')).body;assert.equal(body.lineId,12);assert.equal(body.salesOrderRef,'SO-C');
-    await expect(card).toContainText('Sales reply C');await expect(f.page.locator('[data-scm-stock-line-id="11"]')).not.toContainText('Sales reply C');assert.deepEqual(f.state.errors,[]);
+    const panel=f.page.locator('[data-stock-conversation]');
+    await expect(panel).toContainText('Material C instructions');await expect(panel).toContainText('Material 12');
+    const before=structuredClone(f.state.r);
+    await panel.getByLabel('Message',{exact:true}).fill('Sales reply C: SO-C');
+    await panel.getByRole('button',{name:'Send message',exact:true}).click();
+    await expect(panel).toContainText('Sales reply C: SO-C');
+    assert.equal(f.state.conversation.posts[0].body.message,'Sales reply C: SO-C');
+    assert.deepEqual(f.state.r,before);assert.deepEqual(f.state.errors,[]);
   }finally{await f.close();}
 });
 test('Sales resolution notification identifies the material and its PO/ETA',async()=>{

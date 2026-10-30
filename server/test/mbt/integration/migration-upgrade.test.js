@@ -3,6 +3,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import pg from "pg";
+import { readdir } from "node:fs/promises";
 
 import {
   applyRootMigrationsThrough,
@@ -731,11 +732,9 @@ test("F06/F16: schema-101 upgrade preserves representative legacy records and is
     assert.deepEqual(maintenance.rows.map(row => row.column_name), [
       'plan_id', 'requests', 'generation', 'attempts', 'last_error', 'requested_at', 'available_at'
     ]);
-    assert.equal(receiptsBeforeNoOp.rowCount, 205);
-    assert.equal(
-      receiptsBeforeNoOp.rows.at(-1)?.filename,
-      "205_dispatch_plan_maintenance.sql"
-    );
+    const expectedMigrationFiles = (await readdir(new URL('../../../migrations/', import.meta.url)))
+      .filter(filename => /^\d+_.*\.sql$/.test(filename)).sort();
+    assert.deepEqual(receiptsBeforeNoOp.rows.map(row => row.filename), expectedMigrationFiles);
     assert.deepEqual(
       receiptsBeforeNoOp.rows
         .map((row) => row.filename)

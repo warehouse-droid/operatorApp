@@ -1,3 +1,4 @@
+import { assertIsolatedTestConnection } from '../../support/test-database-isolation.mjs';
 import test, { before, after } from 'node:test';
 import assert from 'node:assert/strict';
 import crypto from 'node:crypto';
@@ -11,7 +12,7 @@ const request = (path, role, body) => fetch(base + path, { method: body ? 'POST'
   headers: { ...(role ? { Authorization: `Bearer ${sessions[role].token}` } : {}), ...(body ? { 'Content-Type': 'application/json' } : {}) },
   body: body ? JSON.stringify(body) : undefined });
 before(async () => {
-  assert.equal(process.env.MBT_TEST_ISOLATED, '1'); assert.ok(process.env.DATABASE_URL.endsWith('/mbt_verify'));
+  assert.equal(process.env.MBT_TEST_ISOLATED, '1'); assertIsolatedTestConnection(process.env.DATABASE_URL);
   flag = (await query("SELECT enabled FROM mbt_feature_flags WHERE flag_key='special_stock_request_workflow'")).rows[0].enabled;
   await query("UPDATE mbt_feature_flags SET enabled=true WHERE flag_key='special_stock_request_workflow'");
   server = app.listen(0, '127.0.0.1'); await new Promise(resolve => server.once('listening', resolve)); base = `http://127.0.0.1:${server.address().port}`;

@@ -11,6 +11,7 @@
 .regular-status-filter { min-width: 0; }
 .regular-status-filter select { max-width: 100%; }
 .stock-request-status-line:has(.regular-status-summary) { flex-wrap: wrap; align-items: flex-start; }
+.stock-request-status-line:has(.regular-status-summary) > strong { display: inline-flex; align-items: center; min-height: 24px; }
 :is(#salesStockRequestApp, #scmStockRequestApp) .stock-request-page { min-width: 0; }
 :is(#salesStockRequestApp, #scmStockRequestApp) .stock-request-toolbar { display: flex; flex-wrap: wrap; align-items: flex-end; min-width: 0; }
 :is(#salesStockRequestApp, #scmStockRequestApp) .stock-request-toolbar > .stock-request-actions { flex-wrap: wrap; }

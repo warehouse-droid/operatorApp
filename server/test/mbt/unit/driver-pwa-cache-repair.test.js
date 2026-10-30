@@ -11,8 +11,8 @@ const PUBLIC = path.resolve(HERE, "../../../public");
 const DRIVER_SOURCE = fs.readFileSync(path.join(PUBLIC, "driver.js"), "utf8");
 const WORKER_SOURCE = fs.readFileSync(path.join(PUBLIC, "driver-service-worker.js"), "utf8");
 const ORIGIN = "https://driver-cache.test";
-const ACTIVE_CACHE = "mbbs-driver-shell-v41";
-const REFRESH_CACHE = "mbbs-driver-shell-refresh-v41";
+const ACTIVE_CACHE = "mbbs-driver-shell-v56";
+const REFRESH_CACHE = "mbbs-driver-shell-refresh-v56";
 const OFFLINE_MODE_URL = `${ORIGIN}/__mbbs_driver_offline_mode__`;
 
 function requestUrl(input) {
@@ -144,11 +144,11 @@ async function installWorker(listeners) {
   await completion;
 }
 
-test("a fresh Driver worker reloads every v41 shell asset and initializes only its scoped sentinel", async () => {
+test("a fresh Driver worker reloads every v56 shell asset and initializes only its scoped sentinel", async () => {
   const cacheStorage = new MemoryCacheStorage();
   await installWorker(createWorker(cacheStorage));
 
-  assert.equal(cacheStorage.networkRequests.length, 16);
+  assert.equal(cacheStorage.networkRequests.length, 20);
   assert.ok(cacheStorage.networkRequests.every((request) => request.cache === "reload"));
   assert.equal(await readBody(cacheStorage, ACTIVE_CACHE, OFFLINE_MODE_URL), "false");
   assert.deepEqual(await cacheStorage.keys(), [ACTIVE_CACHE]);
@@ -195,7 +195,7 @@ test("a successful repair replaces only the complete Driver shell and preserves 
       ok: true,
       version: "2026.08.12.3",
       cacheName: ACTIVE_CACHE,
-      refreshedAssetCount: 16
+      refreshedAssetCount: 20
     }
   );
   assert.equal(await readBody(cacheStorage, ACTIVE_CACHE, "/driver"), `network:${ORIGIN}/driver`);
@@ -203,7 +203,7 @@ test("a successful repair replaces only the complete Driver shell and preserves 
   assert.equal(await readBody(cacheStorage, ACTIVE_CACHE, OFFLINE_MODE_URL), "true");
   assert.equal(await readBody(cacheStorage, "mbbs-yard-operator-v99", "/operator"), "operator-shell");
   assert.deepEqual((await cacheStorage.keys()).sort(), [ACTIVE_CACHE, "mbbs-yard-operator-v99"]);
-  assert.equal(cacheStorage.networkRequests.length, 16);
+  assert.equal(cacheStorage.networkRequests.length, 20);
   assert.ok(cacheStorage.networkRequests.every((request) => request.cache === "reload"));
 });
 

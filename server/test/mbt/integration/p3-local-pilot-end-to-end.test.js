@@ -15,11 +15,13 @@ import {
 import { processDriverOfflineQueue } from "../../../src/driver-offline-service.js";
 import { recordAssetMovement } from "../../../src/mbt/asset-service.js";
 import * as binDispatchService from "../../../src/mbt/bin-dispatch-service.js";
+import { getMbtBinPlanning } from "../../../src/mbt/bin-planning-service.js";
 import { canonicalSha256 } from "../../../src/mbt/canonical-json.js";
 import { applyMbtDriverBinOfflineEvent } from "../../../src/mbt/driver-bin-offline-application.js";
 import { MbtError } from "../../../src/mbt/errors.js";
 import {
   acceptFrontdeskQuote,
+  collectFrontdeskServiceLine,
   convertFrontdeskQuote,
   createFrontdeskQuote,
   issueFrontdeskQuote
@@ -63,7 +65,6 @@ import {
 
 const RUN_ID = crypto.randomUUID().replaceAll("-", "");
 const {
-  advanceMbtBinContractLeg,
   assignMbtBinFrontLeg,
   listMbtBinFrontLegs
 } = binDispatchService;
@@ -266,7 +267,6 @@ async function convertImportedCustomer(fixture, planDate) {
 async function prepareDispatch(customer, contract, planDate) {
   const suffix = RUN_ID.slice(0, 12);
   const deliveryVisitId = contract.converted.body.visits[0].visitId;
-  const returnVisitId = contract.converted.body.visits[1].visitId;
   const contractId = contract.converted.body.contract.contractId;
   const assetId = crypto.randomUUID();
   const initialMovementId = crypto.randomUUID();
@@ -384,7 +384,6 @@ async function prepareDispatch(customer, contract, planDate) {
     planDate,
     contractId,
     deliveryVisitId,
-    returnVisitId,
     assetId,
     assetCode,
     initialMovementId,
@@ -643,8 +642,7 @@ test("P3.11 E2E-A: imported customer -> Front Desk -> BIN Dispatch -> offline Dr
     serviceAction,
     status
   })), [
-    { visitNumber: 1, serviceAction: "delivery", status: "ready" },
-    { visitNumber: 2, serviceAction: "return_bin", status: "tentative" }
+    { visitNumber: 1, serviceAction: "delivery", status: "ready" }
   ]);
   assert.equal(contract.converted.body.billingCase.status, "open");
 
@@ -655,8 +653,7 @@ test("P3.11 E2E-A: imported customer -> Front Desk -> BIN Dispatch -> offline Dr
   const deliveryCard = initialFeed.items.find(({ mbt }) => mbt.visitId === fixture.deliveryVisitId);
   assert.ok(deliveryCard, "the invented delivery front leg must be present in the BIN feed");
   assert.deepEqual(deliveryCard.mbt.timeline.map(({ relation, locked }) => ({ relation, locked })), [
-    { relation: "current", locked: false },
-    { relation: "future", locked: true }
+    { relation: "current", locked: false }
   ]);
   await assert.rejects(
     () => assignMbtBinFrontLeg(assignmentCommand(fixture, fixture.flatbedLoadId, "flatbed-control"), {
@@ -716,6 +713,24 @@ test("P3.11 E2E-A: imported customer -> Front Desk -> BIN Dispatch -> offline Dr
     executed.events.map(({ occurredAt }) => occurredAt));
   assert.equal(executed.applied.every(({ locationStatus }) => locationStatus === "not_checked_offline"), true);
 
+  assert.equal((await query('SELECT count(*)::int AS count FROM mbt_service_visits WHERE contract_id=$1', [fixture.contractId])).rows[0].count, 1,
+    'Delivery completion must not invent a collection request');
+  const serviceLine = (await query(`SELECT line.service_line_id, line.revision::int FROM mbt_contract_service_lines line
+    JOIN mbt_service_visits visit USING(service_line_id) WHERE visit.service_visit_id=$1`, [fixture.deliveryVisitId])).rows[0];
+  const expectedSuccessorStart = new Date(`${planDate}T12:00:00Z`);
+  expectedSuccessorStart.setUTCDate(expectedSuccessorStart.getUTCDate() + 14);
+  const expectedSuccessorEnd = new Date(expectedSuccessorStart.getTime() + 4 * 60 * 60 * 1_000);
+  const collectionInput = frontdeskCommand('pilot-collect', FRONTDESK, {
+    contractId: fixture.contractId, serviceLineId: serviceLine.service_line_id, expectedRevision: serviceLine.revision,
+    collectionWindow: { startAt: expectedSuccessorStart.toISOString(), endAt: expectedSuccessorEnd.toISOString() }
+  });
+  const collection = await collectFrontdeskServiceLine(collectionInput);
+  const collectionReplay = await collectFrontdeskServiceLine(structuredClone(collectionInput));
+  assert.equal(collection.replayed, false);
+  assert.equal(collectionReplay.replayed, true);
+  assert.deepEqual(collectionReplay.body, collection.body);
+  const returnVisitId = collection.body.collectionVisit.visitId;
+
   const completedState = await query(
     `SELECT visit.status, visit.revision::int AS visit_revision,
             visit.actual_completed_at, successor.status AS successor_status,
@@ -740,7 +755,7 @@ test("P3.11 E2E-A: imported customer -> Front Desk -> BIN Dispatch -> offline Dr
       WHERE visit.service_visit_id = $1`,
     [
       fixture.deliveryVisitId,
-      fixture.returnVisitId,
+      returnVisitId,
       offline.manifest.jobs.map(({ jobId }) => jobId),
       executed.events.map(({ eventId }) => eventId),
       fixture.assetId
@@ -758,7 +773,7 @@ test("P3.11 E2E-A: imported customer -> Front Desk -> BIN Dispatch -> offline Dr
     reservations: completedState.rows[0].reservations
   }, {
     visitStatus: "completed",
-    successorStatus: "tentative",
+    successorStatus: "ready",
     lifecycle: "at_customer",
     location: "customer_site",
     site: fixture.siteProfileId,
@@ -768,51 +783,24 @@ test("P3.11 E2E-A: imported customer -> Front Desk -> BIN Dispatch -> offline Dr
     reservations: 0
   });
 
-  const originalWindowMs = new Date(completedState.rows[0].successor_end).getTime()
-    - new Date(completedState.rows[0].successor_start).getTime();
-  assert.equal(originalWindowMs, 4 * 60 * 60 * 1_000);
-  const expectedSuccessorStart = new Date(completedState.rows[0].actual_completed_at);
-  expectedSuccessorStart.setUTCDate(
-    expectedSuccessorStart.getUTCDate() + completedState.rows[0].rental_calendar_days
-  );
-  const expectedSuccessorEnd = new Date(expectedSuccessorStart.getTime() + originalWindowMs);
-  const planRevision = await query("SELECT revision::int FROM dispatch_plans WHERE id = $1", [fixture.planId]);
-  const advanceInput = {
-    actor: DISPATCHER,
-    contractId: fixture.contractId,
-    completedVisitId: fixture.deliveryVisitId,
-    expectedCompletedVisitRevision: completedState.rows[0].visit_revision,
-    nextVisitId: fixture.returnVisitId,
-    expectedNextVisitRevision: completedState.rows[0].successor_revision,
-    planId: fixture.planId,
-    expectedPlanRevision: planRevision.rows[0].revision,
-    reason: "Advance the P3.11 successor from retained actual completion evidence",
-    idempotencyKey: identity("advance"),
-    correlationId: identity("advance-correlation"),
-    requestId: identity("advance-request")
-  };
-  const advanced = await advanceMbtBinContractLeg(advanceInput, { capability: enabledBinDispatchBoundary });
-  const advanceReplay = await advanceMbtBinContractLeg(structuredClone(advanceInput), { capability: enabledBinDispatchBoundary });
-  assert.equal(advanced.replayed, false);
-  assert.equal(advanceReplay.replayed, true);
-  assert.deepEqual(advanceReplay.body, advanced.body);
   const successor = await query(
-    `SELECT status, scheduled_start_at, scheduled_end_at
+    `SELECT status, scheduled_start_at, scheduled_end_at, dispatch_plan_id
        FROM mbt_service_visits WHERE service_visit_id = $1`,
-    [fixture.returnVisitId]
+    [returnVisitId]
   );
   assert.equal(successor.rows[0].status, "ready");
+  assert.equal(successor.rows[0].dispatch_plan_id, null);
   assert.equal(new Date(successor.rows[0].scheduled_start_at).toISOString(), expectedSuccessorStart.toISOString());
   assert.equal(new Date(successor.rows[0].scheduled_end_at).toISOString(), expectedSuccessorEnd.toISOString());
   const rebasedPlanDate = expectedSuccessorStart.toISOString().slice(0, 10);
-  const nextFeed = await listMbtBinFrontLegs({ planDate: rebasedPlanDate, search: "", limit: 100 }, {
+  const nextFeed = await getMbtBinPlanning({ planDate: rebasedPlanDate, search: '' }, {
     capability: enabledBinDispatchBoundary
   });
   assert.ok(
-    nextFeed.items.some(({ mbt }) => mbt.visitId === fixture.returnVisitId),
-    "the rebased return leg must be present on its new plan date"
+    nextFeed.pool.items.some(({ mbt }) => mbt.visitId === returnVisitId),
+    "the explicitly requested collection must be present on its requested date"
   );
-  assert.equal(nextFeed.items.some(({ mbt }) => mbt.visitId === fixture.deliveryVisitId), false);
+  assert.equal(nextFeed.pool.items.some(({ mbt }) => mbt.visitId === fixture.deliveryVisitId), false);
 
   const comparisonInputs = await exactMovementAndDistanceComparisons(fixture);
   const reconciliation = await createPilotReconciliationBatch({

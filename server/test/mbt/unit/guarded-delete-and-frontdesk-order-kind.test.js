@@ -95,7 +95,7 @@ test("Front Desk separates Delivery from fixed-price BIN and Aggregate Order wor
 test("Front Desk makes the 150-yard price choice explicit and durable", () => {
   assert.match(frontdeskHtml, /id=["']chargeOrderFrom150["']/u);
   assert.match(frontdeskHtml, /Order from 150/u);
-  assert.match(frontdeskHtml, /Required whenever aggregate travels with a bin/u);
+  assert.match(frontdeskHtml, /This pricing choice is independent of aggregate material/u);
   assert.match(frontdeskClient, /orderFrom150:\s*chargeOrderFrom150\.checked/u);
   assert.match(router, /pricingOriginYardCode:\s*body\.pricingOriginYardCode/u);
   assert.match(frontdeskService, /pricingOriginYardCode/u);

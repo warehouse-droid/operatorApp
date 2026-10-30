@@ -32,7 +32,7 @@ test('SCM vendor and item-name correction persists while awaiting customer confi
   assert.equal(detail.lines[0].brand, 'BWS');
   assert.equal(detail.lines[0].productName, 'Fire Pit 32" Square Insert');
   assert.equal(detail.lines[1].productName, 'Coping');
-  assert.match(specialItemDescription(detail.lines[0]), /^BWS · Fire Pit 32" Square Insert · Grey · 32 in · TEST spec$/);
+  assert.equal(specialItemDescription(detail.lines[0]), 'Fire Pit 32" Square Insert Grey 32 in TEST spec');
   for (const key of ['quantity', 'uom', 'originalRate', 'discountPercent', 'color', 'size', 'detailSpec', 'salesDecision', 'palletQty']) {
     assert.equal(detail.lines[0][key], before.lines[0][key], key);
   }

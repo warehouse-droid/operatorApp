@@ -37,6 +37,7 @@ async function fixture(width=1440,patch={},role='scm') {
     const file=path===`/${role}/stock-requests`?`/${role}-stock-requests.html`:path;
     try{return route.fulfill({body:await readFile('public'+file),contentType:({js:'application/javascript',css:'text/css',html:'text/html'})[file.split('.').at(-1)]||'application/octet-stream'});}catch{return route.fulfill({status:404,body:''});}
   });
+  await page.route(url=>/\/items\/\d+\/units$/.test(url.pathname),route=>route.fulfill({json:{noUnits:false,defaultUnitId:865,units:[{id:865,name:'PC'},{id:873,name:'EACH'},{id:950,name:'SQFT'}]}}));
   await page.goto(`http://localhost/${role}/stock-requests?tab=special`);await expect(page.locator(role==='sales'?'[data-special-link-so-form]':'[data-special-po-form]')).toBeVisible();
   return {page,state,close:async()=>{assert.deepEqual(state.errors,[]);await writeFile(`${out}/coverage-${++capture}.json`,JSON.stringify(await page.coverage.stopJSCoverage()));await context.close();}};
 }
@@ -49,7 +50,7 @@ test('reference-only SO displays accepted material purchase review on desktop an
       await material.locator('[name=unitPurchaseCost]').fill('6');await material.locator('[name=vendorDiscountPercent]').fill('0');
       await form.getByRole('button',{name:'Create PO in NetSuite',exact:true}).click();await expect(form).toHaveCount(0);
       assert.equal(state.posts.length,1);assert.equal(state.posts[0].path,'/api/scm/special-stock-requests/1/purchase-order/create');
-      assert.deepEqual(state.posts[0].body.lines,[{caseLineId:36,description:'SO stone',quantity:'144',uom:'SQFT',unitPurchaseCost:'6',vendorDiscountPercent:'0'}]);
+      assert.deepEqual(state.posts[0].body.lines,[{caseLineId:36,description:'SO stone',quantity:'144',uom:'SQFT',unitId:'950',unitPurchaseCost:'6',vendorDiscountPercent:'0',palletQty:'',layerQty:'',sectionQty:'',pieceQty:''}]);
       assert.equal(state.posts[0].body.customLinkage,undefined);assert.deepEqual(state.record.salesOrderLines,[]);
     }finally{await close();}
   }

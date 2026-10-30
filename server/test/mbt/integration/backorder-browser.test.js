@@ -1,4 +1,4 @@
-/* global Node, scmStockState, requestAnimationFrame */
+/* global scmStockState, requestAnimationFrame */
 import assert from 'node:assert/strict';
 import crypto from 'node:crypto';
 import test,{before,after} from 'node:test';
@@ -7,7 +7,7 @@ import {mkdirSync,writeFileSync} from 'node:fs';
 import {app} from '../../../src/server.js';
 import {query,closeDb} from '../../../src/db.js';
 import {createOperator} from '../../../src/auth-repository.js';
-import {chooseRegularStatuses} from '../../support/regular-stock-status-browser.mjs';
+import {chooseRegularStatuses,expectRegularStatuses,dismissRegularAlerts} from '../../support/regular-stock-status-browser.mjs';
 
 const users={},out=process.env.BACKORDER_BROWSER_OUTPUT || 'test-artifacts/backorder-enhancements-20261007/browser',sku=88999301;
 let browser,server,base,requestId,planCount=0;
@@ -26,19 +26,23 @@ before(async()=>{
   browser=await chromium.launch({headless:true,args:['--no-sandbox']});
 });
 after(async()=>{await browser?.close();server?.closeAllConnections();if(server)await new Promise(r=>server.close(r));await closeDb();});
-async function pageFor(role,id,{vendorFailure=false,home=false}={}){
+async function acknowledgeOtherAlerts(role,id){
   // Prior cases can now emit a PO-link alert after their SO link. Acknowledge
   // other fixtures through the real API, keeping the selected case's alert intact.
   if(role==='sales' && id){
     const response=await fetch(base+'/api/sales/stock-requests/alerts',{headers:{authorization:'Bearer '+users.sales}});assert.equal(response.status,200);
     for(const row of (await response.json()).requests||[]){if(row.id===id)continue;const read=await fetch(base+`/api/sales/stock-requests/${row.id}/decisions/read`,{method:'POST',headers:{authorization:'Bearer '+users.sales,'content-type':'application/json'},body:JSON.stringify({eventId:row.eventId})});assert.equal(read.status,200);}
   }
+}
+async function pageFor(role,id,{vendorFailure=false,home=false}={}){
+  await acknowledgeOtherAlerts(role,id);
   const context=await browser.newContext({viewport:{width:1440,height:1100},serviceWorkers:'block'});
   await context.addInitScript(token=>{localStorage.setItem('mbbs.staff.token',token);localStorage.setItem('mbbs.sales.stockRequests.bucket','pending');if(localStorage.getItem('mbbs.scm.stockRequests.queue')===null)localStorage.setItem('mbbs.scm.stockRequests.queue','request');},users[role]);
   const page=await context.newPage(),errors=[],calls=[],directoryFinished=new Set();page.on('pageerror',e=>{errors.push(e.message);console.log(e.stack);});page.on('request',r=>calls.push({url:r.url(),method:r.method()}));page.setDefaultTimeout(10000);await page.coverage.startJSCoverage({resetOnNavigation:false});
   const directoryDone=r=>{if(r.url().includes('/stock-requests/backorder/vendors?'))directoryFinished.add(new URL(r.url()).searchParams.get('search'));};
   page.on('requestfinished',directoryDone);page.on('requestfailed',directoryDone);
   if(vendorFailure)await page.route('**/stock-requests/backorder/vendors?*',route=>route.fulfill({status:503,contentType:'application/json',body:JSON.stringify({error:'TEST directory outage'})}));
+  if(role==='sales'&&!home)await dismissRegularAlerts(page);
   await page.goto(home?`${base}/${role}`:`${base}/${role}/stock-requests?tab=regular${id?'&requestId='+id:''}`);
   if(role==='scm'&&!home){
     await page.waitForFunction(()=>typeof scmStockState!=='undefined'&&!scmStockState.loading);
@@ -137,10 +141,10 @@ test('SCM and Sales link orders while Confirmed, then queue the PO reference for
     await expect(p.locator('[data-backorder-form][data-action="purchase-order/link"]')).toHaveCount(0);assert.deepEqual(scm.errors,[]);
   }finally{await scm.close();}
   const sales=await pageFor('sales',requestId);try{
-    const p=sales.page,decision=p.locator('[data-backorder-form][data-action$="/decision"]');await expect(p.locator('[data-backorder-detail]')).toContainText('Backorder');await expect(p.locator('dialog.regular-stock-popup[open]')).toHaveCount(0);
-    await expect(p.locator('[data-backorder-form][data-action="sales-order/link"]')).toHaveCount(0);
+    const p=sales.page,decision=p.locator('[data-backorder-form][data-action$="/decision"]');await expect(p.locator('[data-backorder-detail]')).toContainText('Backorder');await expect(decision).toBeVisible();
+    await expect(p.locator('[data-backorder-form][data-action="sales-order/link"]')).toHaveCount(1);
     await decision.locator('[name="decision"]').selectOption('accepted');await decision.locator('button[type="submit"]').click();await expect(p.locator('[data-backorder-line]')).toContainText('accepted');await expect(p.locator('[data-backorder-form][data-action="sales-order/link"]')).toHaveCount(1);assert.deepEqual(sales.errors,[]);
-    await expect(p.locator('[data-backorder-detail] .stock-request-heading')).toContainText('Confirmed');
+    await expect(p.locator('[data-backorder-detail] .stock-request-heading')).toContainText('Pending Sales');
     await expect(p.locator('[data-backorder-detail]')).not.toContainText('after SCM links the PO');
     await p.screenshot({path:out+'/sales-confirmed-so-link.png',fullPage:true});
     const link=p.locator('[data-backorder-form][data-action="sales-order/link"]');await link.locator('[name="salesOrderRef"]').fill('TEST-BROWSER-SO');await link.locator('button[type="submit"]').click();
@@ -148,16 +152,16 @@ test('SCM and Sales link orders while Confirmed, then queue the PO reference for
     assert.equal((await api('sales','/api/sales/stock-requests/'+requestId)).purchaseOrderId,null);
   }finally{await sales.close();}
   const purchasing=await pageFor('scm',requestId);try{
-    const p=purchasing.page,link=p.locator('[data-backorder-form][data-action="purchase-order/link"]');await expect(link).toHaveCount(1);await expect(p.locator('[data-backorder-detail] .stock-request-heading')).toContainText('Confirmed');
+    const p=purchasing.page,link=p.locator('[data-backorder-form][data-action="purchase-order/link"]');await expect(link).toHaveCount(1);await expect(p.locator('[data-backorder-detail] .stock-request-heading')).toContainText('In Progress');
     await p.screenshot({path:out+'/scm-confirmed-po-link.png',fullPage:true});
     await link.locator('[name="purchaseOrderRef"]').fill('TEST-BROWSER-PO');await link.locator('button[type="submit"]').click();
     await expect(p.locator('[data-backorder-detail]')).toContainText('TEST-BROWSER-PO');await expect(p.locator('[data-backorder-detail]')).not.toContainText('PO approval');assert.deepEqual(purchasing.errors,[]);
   }finally{await purchasing.close();}
   const final=await pageFor('sales',requestId);try{
     const p=final.page;await expect(p.locator('[data-backorder-detail]')).toContainText('TEST-BROWSER-SO');await expect(p.locator('[data-backorder-detail]')).toContainText('TEST-BROWSER-PO');
-    await expect(p.locator('[data-backorder-detail] .stock-request-heading')).toContainText('Confirmed');await expect(p.locator('[data-backorder-form][data-action="sales-order/link"]')).toHaveCount(0);await expect(p.locator('[data-action="already-ordered/sales-order"]')).toHaveCount(1);await expect(p.locator('[data-action="quotation/link"]')).toHaveCount(0);const saved=await api('sales','/api/sales/stock-requests/'+requestId);assert.equal(saved.stage,'confirmed');assert.equal(saved.operationallyComplete,false);
+    await expect(p.locator('[data-backorder-detail] .stock-request-heading')).toContainText('In Progress');await expect(p.locator('[data-backorder-form][data-action="sales-order/link"]')).toHaveCount(0);await expect(p.locator('[data-action="already-ordered/sales-order"]')).toHaveCount(1);await expect(p.locator('[data-action="quotation/link"]')).toHaveCount(0);const saved=await api('sales','/api/sales/stock-requests/'+requestId);assert.equal(saved.stage,'confirmed');assert.equal(saved.operationallyComplete,false);
     await query("UPDATE purchase_orders SET dispatch_ref='TEST-BROWSER-REF',initial_scm_status='Queued' WHERE netsuite_id=88999303");
-    await p.reload();await expect(p.locator('[data-backorder-detail] .stock-request-heading')).toContainText('Dispatch Arrangement');assert.equal((await api('sales','/api/sales/stock-requests/'+requestId)).stage,'dispatch_arrangement');
+    await p.reload();await expect(p.locator('[data-backorder-detail] .stock-request-heading')).toContainText('In Progress');assert.equal((await api('sales','/api/sales/stock-requests/'+requestId)).stage,'dispatch_arrangement');
     await p.screenshot({path:out+'/sales-dispatch-arrangement.png',fullPage:true});assert.deepEqual(final.errors,[]);
   }finally{await final.close();}
 });
@@ -187,16 +191,21 @@ test('A pending Backorder save cannot replace another request selected by Sales'
     const r=await fetch(base+'/api/sales/stock-requests',{method:'POST',headers:{authorization:'Bearer '+users.sales,'content-type':'application/json'},body:JSON.stringify({deliveryMethod:'backorder',customerName:'TEST Backorder Customer',destinationLocationId:1,vendorId:331,vendorName:'TEST Vendor',fulfillmentMethod:'yard_pickup',remarks:description,lines:[{itemId:sku,salesQty:2,rate:10}]})});
     assert.equal(r.status,201);return r.json();
   }
-  const a=await create('First request'),b=await create('Second request'),f=await pageFor('sales',a.id);
-  let release;const gate=new Promise(r=>release=r);let held;const responseHeld=new Promise(r=>held=r);
+  const a=await create('First request'),b=await create('Second request'),f=await pageFor('sales');
+  let release;const gate=new Promise(r=>release=r);let responseHeld=false;
   try{
-    const p=f.page;await expect(p.locator('[data-backorder-detail]')).toContainText(a.requestRef);
-    await p.route(`**/api/sales/stock-requests/${a.id}/backorder/header`,async route=>{const response=await route.fetch();held();await gate;await route.fulfill({response});});
+    const p=f.page;
+    await expect(p.locator(`[data-sales-stock-action="select"][data-id="${b.id}"]`)).toBeVisible();
+    const selected=p.waitForResponse(r=>r.url().endsWith(`/api/sales/stock-requests/${a.id}`)&&r.request().method()==='GET');
+    await p.locator(`[data-sales-stock-action="select"][data-id="${a.id}"]`).click();
+    assert.equal((await selected).status(),200);
+    await expect(p.locator('[data-backorder-detail]')).toContainText(a.requestRef);
+    await p.route(`**/api/sales/stock-requests/${a.id}/backorder/header`,async route=>{const response=await route.fetch();responseHeld=true;await gate;await route.fulfill({response});});
     await p.getByText('Edit request header',{exact:true}).click();
     const header=p.locator('[data-backorder-form][data-action="header"]');await header.locator('[name="remarks"]').fill('Saved first request');await header.locator('button[type="submit"]').click();
-    await responseHeld;
+    await expect.poll(()=>responseHeld).toBe(true);
     await p.locator(`[data-sales-stock-action="select"][data-id="${b.id}"]`).click();await expect(p.locator('[data-backorder-detail]')).toContainText(b.requestRef);
-    await p.evaluate(()=>{window.backorderSelections=[];new MutationObserver(()=>{const id=document.querySelector('[data-backorder-detail]')?.getAttribute('data-backorder-id');if(id)window.backorderSelections.push(Number(id));}).observe(document.getElementById('salesStockRequestApp'),{childList:true,subtree:true});});
+    await p.evaluate(()=>{window.backorderSelections=[];new MutationObserver(()=>{const id=document.querySelector('[data-backorder-detail]')?.getAttribute('data-backorder-id');if(id){window.backorderSelections.push(Number(id));}}).observe(document.getElementById('salesStockRequestApp'),{childList:true,subtree:true});});
     const finished=p.waitForResponse(r=>r.url().endsWith(`/api/sales/stock-requests/${a.id}/backorder/header`));release();await finished;
     await p.waitForTimeout(200);await expect(p.locator('[data-backorder-detail]')).toContainText(b.requestRef);
     assert.ok((await p.evaluate(()=>window.backorderSelections)).every(id=>id===b.id),'A stale save must never display the first request over the second');
@@ -207,13 +216,13 @@ test('A pending Backorder save cannot replace another request selected by Sales'
 test('Backorder local editing, quote preview, information replies and closed-stage filters work in the browser',async()=>{
   const r=await fetch(base+'/api/sales/stock-requests',{method:'POST',headers:{authorization:'Bearer '+users.sales,'content-type':'application/json'},body:JSON.stringify({deliveryMethod:'backorder',customerName:'TEST Backorder Customer',destinationLocationId:1,vendorId:331,vendorName:'TEST Vendor',fulfillmentMethod:'yard_pickup',lines:[{itemId:sku,salesQty:5,rate:10}]})});assert.equal(r.status,201);const d=await r.json();
   const scm=await pageFor('scm',d.id);try{
-    const p=scm.page,form=p.locator('[data-backorder-form][data-action="information/request"]');
-    await form.locator('[name="question"]').fill('Confirm the requested size');await form.locator('button[type="submit"]').click();
-    await expect(p.locator('[data-backorder-detail]')).toContainText('Confirm the requested size');assert.deepEqual(scm.errors,[]);
+    const p=scm.page,panel=p.locator('[data-stock-conversation]');
+    await panel.getByLabel('Message',{exact:true}).fill('Confirm the requested size');await panel.getByRole('button',{name:'Send message',exact:true}).click();
+    await expect(panel).toContainText('Confirm the requested size');assert.deepEqual(scm.errors,[]);
   }finally{await scm.close();}
   const sales=await pageFor('sales',d.id);try{
     const p=sales.page;await expect(p.locator('[data-backorder-detail]')).toContainText(d.requestRef);
-    const reply=p.locator('[data-backorder-form][data-action="information/submit"]');await reply.locator('[name="reply"]').fill('Size confirmed');await reply.locator('button[type="submit"]').click();await expect(reply).toHaveCount(0);
+    const reply=p.locator('[data-stock-conversation]');await expect(reply).toContainText('Confirm the requested size');await reply.getByLabel('Message',{exact:true}).fill('Size confirmed');await reply.getByRole('button',{name:'Send message',exact:true}).click();await expect(reply.locator('[data-conversation-messages]')).toContainText('Size confirmed');
     await p.getByText('Edit request material',{exact:true}).click();
     const material=p.locator('[data-backorder-form][data-action$="/edit"]');await material.locator('[name="quantity"]').fill('15');await expect(material.locator('[name="rate"],[name="discountPercent"]')).toHaveCount(0);await material.locator('[name="productName"]').fill('Local quote material');await material.locator('button[type="submit"]').click();
     await expect(p.locator('[data-backorder-line]')).toContainText('15 EA');await expect(p.locator('[data-backorder-line]')).toContainText('Local quote material');
@@ -228,50 +237,54 @@ test('Backorder local editing, quote preview, information replies and closed-sta
     const link=p.locator('[data-backorder-form][data-action="sales-order/link"]');await link.locator('[name="salesOrderRef"]').fill('UNKNOWN-BROWSER-SO');await link.locator('button[type="submit"]').click();await expect(p.locator('[data-backorder-error]')).toContainText('not found');await expect(link.locator('[name="salesOrderRef"]')).toHaveValue('UNKNOWN-BROWSER-SO');await expect(link.locator('button[type="submit"]')).toBeEnabled();
     await p.evaluate(()=>{const create=URL.createObjectURL.bind(URL);URL.createObjectURL=blob=>{window.backorderPreviewBlob=blob;return create(blob);};});
     const quote=p.waitForResponse(x=>x.url().endsWith('/backorder/quote.pdf'));await p.locator('[data-backorder-document="quote.pdf"]').click();const pdf=await quote;assert.equal(pdf.status(),200);assert.match(pdf.headers()['content-type'],/application\/pdf/);const bytes=await pdf.body();const raw=await fetch(base+`/api/sales/stock-requests/${d.id}/backorder/quote.pdf`,{headers:{authorization:'Bearer '+users.sales}});const actual=Buffer.from(await raw.arrayBuffer());console.log('PDF response evidence:',JSON.stringify({browserHeaders:pdf.headers(),browserLength:bytes.length,httpLength:actual.length,httpPrefix:actual.subarray(0,5).toString()}));writeFileSync(out+'/backorder-quote-http.pdf',actual);await expect.poll(()=>p.evaluate(()=>window.backorderPreviewBlob?.size||0)).toBeGreaterThan(5);const received=Buffer.from(await p.evaluate(async()=>Array.from(new Uint8Array(await window.backorderPreviewBlob.arrayBuffer()))));writeFileSync(out+'/backorder-quote.pdf',received);assert.equal(received.subarray(0,5).toString(),'%PDF-');assert.equal(received.length,actual.length);
+    await p.locator('dialog[open]').getByRole('button',{name:/Close/i}).click();
     const close=p.locator('[data-backorder-form][data-action="close"]');await expect(close).toBeVisible();await close.locator('[name="reason"]').fill('No longer required');await close.locator('button[type="submit"]').click();await expect(p.locator('[data-backorder-detail]')).toContainText('Closed');await expect(p.locator('[data-backorder-form]:not([data-action="quotation/link"])')).toHaveCount(0);await expect(p.locator('[data-action="quotation/link"]')).toHaveCount(1);
-    await p.locator('[data-sales-multi-filter="requestTypeFilter"] summary').click();await p.locator('[data-sales-stock-filter="requestTypeFilter"][value="backorder"]').check();await p.locator('[data-sales-multi-filter="backorderStageFilter"] summary').click();await p.locator('[data-sales-stock-filter="backorderStageFilter"][value="closed"]').check();await expect(p.locator(`[data-sales-stock-action="select"][data-id="${d.id}"]`)).toBeVisible();
-    await p.locator('[data-sales-stock-action="clear-filters"]').click();await expect(p.locator('[data-sales-stock-filter="requestTypeFilter"]:checked')).toHaveCount(0);await expect(p.locator('[data-sales-stock-filter="backorderStageFilter"]:checked')).toHaveCount(0);
+    await p.locator('[data-sales-multi-filter="requestTypeFilter"] summary').click();await p.locator('[data-sales-stock-filter="requestTypeFilter"][value="backorder"]').check();await chooseRegularStatuses(p,'sales','closed');await expect(p.locator(`[data-sales-stock-action="select"][data-id="${d.id}"]`)).toBeVisible();
+    await p.locator('[data-sales-stock-action="clear-filters"]').click();await expect(p.locator('[data-sales-stock-filter="requestTypeFilter"]:checked')).toHaveCount(0);await expectRegularStatuses(p,'sales','active');
     assert.deepEqual(sales.errors,[]);
   }finally{await sales.close();}
 });
 
 
-test('SCM Backorder case-stage and clear filters find closed requests without TO queues',async()=>{
+test('SCM Backorder status and clear filters find closed requests and preserve API stage filtering',async()=>{
   const complete=await api('sales','/api/sales/stock-requests/'+requestId);assert.equal(complete.stage,'dispatch_arrangement');
   const row=(await query("SELECT id,request_ref FROM sales_stock_requests r JOIN sales_special_stock_cases c ON c.request_id=r.id WHERE c.workflow_kind='backorder' AND c.close_status='closed' ORDER BY r.id DESC LIMIT 1")).rows[0];assert.ok(row);
+  const closed=await api('scm','/api/scm/stock-requests?type=backorder&stage=closed&unifiedStatus=all');
+  assert.ok(closed.requests.some(request=>request.id===Number(row.id)));assert.ok(!closed.requests.some(request=>request.id===requestId));
   const f=await pageFor('scm');try{
-    const p=f.page;await p.locator('[data-scm-stock-filter="requestTypeFilter"]').selectOption('backorder');await p.locator('[data-scm-stock-filter="backorderStageFilter"]').selectOption('closed');await expect(p.locator(`[data-scm-stock-action="select"][data-id="${row.id}"]`)).toBeVisible();
+    const p=f.page;await p.locator('[data-scm-stock-filter="requestTypeFilter"]').selectOption('backorder');await chooseRegularStatuses(p,'scm','closed');
+    await expect(p.locator(`[data-scm-stock-action="select"][data-id="${row.id}"]`)).toBeVisible();
     await expect(p.locator(`[data-scm-stock-action="select"][data-id="${requestId}"]`)).toHaveCount(0);
-    await p.locator('[data-scm-stock-filter="backorderStageFilter"]').selectOption('dispatch_arrangement');await expect(p.locator(`[data-scm-stock-action="select"][data-id="${requestId}"]`)).toBeVisible();await expect(p.locator(`[data-scm-stock-action="select"][data-id="${row.id}"]`)).toHaveCount(0);
-    await expect(p.locator('details[aria-label="Regular stock request queue"]')).toBeVisible();
-    await p.locator('[data-scm-stock-action="clear-filters"]').click();await expect(p.locator('[data-scm-stock-filter="requestTypeFilter"]')).toHaveValue('');await expect(p.locator('[data-scm-stock-filter="backorderStageFilter"]')).toHaveCount(0);assert.deepEqual(f.errors,[]);
+    await chooseRegularStatuses(p,'scm','in_progress');await expect(p.locator(`[data-scm-stock-action="select"][data-id="${requestId}"]`)).toBeVisible();await expect(p.locator(`[data-scm-stock-action="select"][data-id="${row.id}"]`)).toHaveCount(0);
+    await p.locator('[data-scm-stock-action="clear-filters"]').click();await expect(p.locator('[data-scm-stock-filter="requestTypeFilter"]')).toHaveValue('');await expectRegularStatuses(p,'scm','active');assert.deepEqual(f.errors,[]);
   }finally{await f.close();}
 });
 
 test('New Backorder enquiry hides order links in Sales and SCM',async()=>{
   const response=await fetch(base+'/api/sales/stock-requests',{method:'POST',headers:{authorization:'Bearer '+users.sales,'content-type':'application/json'},body:JSON.stringify({deliveryMethod:'backorder',customerName:'TEST Backorder Customer',destinationLocationId:1,fulfillmentMethod:'yard_pickup',lines:[{itemId:sku,salesQty:2}]})});assert.equal(response.status,201);const d=await response.json();
-  for(const role of ['sales','scm']){const f=await pageFor(role,d.id);try{await expect(f.page.locator('[data-backorder-detail]')).toContainText('New enquiry');await expect(f.page.locator('[data-backorder-form][data-action$="-order/link"]')).toHaveCount(0);assert.deepEqual(f.errors,[]);}finally{await f.close();}}
+  for(const role of ['sales','scm']){const f=await pageFor(role,d.id);try{await expect(f.page.locator('[data-backorder-detail]')).toContainText('Pending SCM');await expect(f.page.locator('[data-backorder-form][data-action$="-order/link"]')).toHaveCount(0);assert.deepEqual(f.errors,[]);}finally{await f.close();}}
 });
-test('SCM Request information appears before the material lines',async()=>{
+test('SCM has one shared conversation alongside the material lines',async()=>{
   const response=await fetch(base+'/api/sales/stock-requests',{method:'POST',headers:{authorization:'Bearer '+users.sales,'content-type':'application/json'},body:JSON.stringify({deliveryMethod:'backorder',customerName:'TEST Backorder Customer',destinationLocationId:1,fulfillmentMethod:'yard_pickup',lines:[{itemId:sku,salesQty:2}]})});assert.equal(response.status,201);const d=await response.json();
   const f=await pageFor('scm',d.id);try{
-    await expect(f.page.locator('[data-backorder-form][data-action="information/request"]')).toBeVisible();
-    assert.ok(await f.page.evaluate(()=>Boolean(document.querySelector('[data-backorder-form][data-action="information/request"]').compareDocumentPosition(document.querySelector('[data-backorder-line]'))&Node.DOCUMENT_POSITION_FOLLOWING)));
+    await expect(f.page.locator('[data-stock-conversation]')).toBeVisible();
+    await expect(f.page.locator('[data-stock-conversation]')).toHaveCount(1);
+    await expect(f.page.locator('[data-backorder-line]')).toHaveCount(1);
     assert.deepEqual(f.errors,[]);
   }finally{await f.close();}
 });
 
-test('SCM Regular queue filter supports multiple selections, persists them and clears with other filters',async()=>{
+test('SCM Regular status filter supports multiple selections, persists them and clears with other filters',async()=>{
   const d=await api('sales','/api/sales/stock-requests',{deliveryMethod:'backorder',customerName:'TEST Backorder Customer',destinationLocationId:1,fulfillmentMethod:'yard_pickup',lines:[{itemId:sku,salesQty:2}]});
   const f=await pageFor('scm');try{
-    const p=f.page,filter=p.locator('details[aria-label="Regular stock request queue"]');await expect(filter).toBeVisible();
-    await expect(p.locator(`[data-scm-stock-action="select"][data-id="${d.id}"]`)).toBeVisible();await filter.locator('summary').click();
-    await expect(filter.locator('input[type="checkbox"]')).toHaveCount(5);await expect(filter.locator('[value="request"]')).toBeChecked();
-    const load=p.waitForResponse(r=>r.url().includes('/api/scm/stock-requests?')&&new URL(r.url()).searchParams.get('queue')==='request,closed');await filter.locator('[value="closed"]').check();assert.equal((await load).status(),200);
-    await expect(filter).toHaveAttribute('open','');await expect(filter.locator('[value="request"]')).toBeChecked();await expect(filter.locator('[value="closed"]')).toBeChecked();
+    const p=f.page,filter=p.locator('[data-yard-filter="unifiedStatus"]');await expect(filter).toBeVisible();
+    await expect(p.locator(`[data-scm-stock-action="select"][data-id="${d.id}"]`)).toBeVisible();
+    await expect(filter.locator('input[type="checkbox"]')).toHaveCount(6);await expectRegularStatuses(p,'scm','active');
+    await chooseRegularStatuses(p,'scm','pending_scm,in_progress,closed');
     await expect(p.locator(`[data-scm-stock-action="select"][data-id="${d.id}"]`)).toBeVisible();await expect(p.locator(`[data-scm-stock-action="select"][data-id="${requestId}"]`)).toBeVisible();
-    await p.reload();await expect(filter).toBeVisible();await expect(p.locator(`[data-scm-stock-action="select"][data-id="${d.id}"]`)).toBeVisible();await filter.locator('summary').click();await expect(filter.locator('[value="closed"]')).toBeChecked();await expect(filter.locator('[value="request"]')).toBeChecked();
-    await p.locator('[data-scm-stock-action="clear-filters"]').click();await expect(filter.locator('summary')).toContainText('All');assert.deepEqual(f.errors,[]);
+    await p.reload();await expect(filter).toBeVisible();await expectRegularStatuses(p,'scm','pending_scm,in_progress,closed');
+    await expect(p.locator(`[data-scm-stock-action="select"][data-id="${d.id}"]`)).toBeVisible();
+    await p.locator('[data-scm-stock-action="clear-filters"]').click();await expectRegularStatuses(p,'scm','active');assert.deepEqual(f.errors,[]);
     await p.screenshot({path:out+'/queue-multiselect.png',fullPage:true});
   }finally{await f.close();}
 });

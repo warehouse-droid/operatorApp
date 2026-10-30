@@ -21,7 +21,7 @@ async function fixture(audience='sales',width=1600,configure=()=>{}){
  if(path.endsWith('/policy'))return route.fulfill({json:{enabled:true}});
  if(path.endsWith('/sales-reps'))return route.fulfill({json:{salesReps:[{id:123,name:'Chosen Rep'},{id:456,name:'Second Rep'}]}});
  if(path.endsWith('/customers'))return route.fulfill({json:{customers:[{id:88,displayName:'Account Lender',entityNumber:'ACCOUNT88',phone:'555-0188'}]}});
- if(path==='/api/sales/special-stock-requests/alerts')return route.fulfill({json:{awaitCustomerConfirmation:1,dispatchArrangement:2,waitForProduction:3,total:6}});
+ if(path==='/api/sales/special-stock-requests/alerts')return route.fulfill({json:{awaitCustomerConfirmation:1,dispatchArrangement:2,waitForProduction:3,total:6,requests:[{id:1,requestRef:state.record.requestRef}]}});
  if(path.endsWith('/special-stock-requests')){state.queries.push(url.searchParams.toString());return route.fulfill({json:{yards:[{locationId:1,yardCode:'3445'}],vendors:['Vendor A','B, Inc.','<Vendor>'],requests:[state.record]}});}
  if(path.endsWith('/special-stock-requests/1'))return route.fulfill({json:state.record});
  return route.fulfill({json:{requests:[],yards:[],total:0}});
@@ -61,10 +61,10 @@ test('SO account stays separate from original customer and Sales alert links to 
  const {page,state,close}=await fixture('sales',1600,d=>{d.lines[0].salesDecision='accepted';d.lines[0].brand='Vendor A';d.lines[0].size='12';d.stage='confirmed';});try{
  const form=page.locator('[data-special-so-form]');await expect(form.getByText('NetSuite customer account *',{exact:true})).toBeVisible();await expect(form.locator('[name=customerSearch]')).toHaveValue('Account Lender');await expect(page.locator('.stock-request-detail')).toContainText('Original Customer');await expect(page.locator('.stock-request-detail')).toContainText('555-0199');
  await expect(form.locator('[name=description]')).toHaveValue('Stone Buff 12 Honed edge');
- const alert=page.locator('a.sales-special-alert');await expect(alert).toBeVisible();await expect(alert).toHaveAttribute('href',/mine=1/);await expect(alert).toHaveAttribute('title',/production.*Transfer/);
+ const alert=page.locator('a.sales-special-alert');await expect(alert).toBeVisible();await expect(alert).toHaveAttribute('href','/sales/stock-requests?tab=special&alerts=1');await expect(alert).toHaveAttribute('title',/production.*Transfer/);
  await form.locator('[name=customerSearch]').fill('Account');await page.locator('[data-special-sales-action="choose-customer"]').click();await form.locator('[name=palletTotal]').fill('0');await form.getByRole('button',{name:'Save SO draft'}).click();await expect.poll(()=>state.posts.length).toBe(1);assert.equal(Number(state.posts[0].body.customerId),88);assert.equal(state.record.customerId,77);
  assert.equal(state.posts[0].body.materialLines[0].description,'Stone Buff 12 Honed edge');
- await alert.click();await expect(page.locator('[data-special-mine]')).toBeChecked();for(const stage of ['await_customer_confirmation','dispatch_arrangement','wait_for_production'])await expect(page.locator(`[data-special-stage][value="${stage}"]`)).toBeChecked();assert.equal(new URLSearchParams(state.queries.at(-1)).get('mine'),'1');
+ await alert.click();await expect.poll(()=>new URLSearchParams(state.queries.at(-1)).get('search')).toBe('SPREQ-TEST');assert.equal(new URLSearchParams(state.queries.at(-1)).get('allStatuses'),'1');await expect(page.locator('[data-stock-alert-search]')).toBeVisible();
  }finally{await close();}
 });
 test('mobile composer stays within the page and shows specification and expiry controls',async()=>{

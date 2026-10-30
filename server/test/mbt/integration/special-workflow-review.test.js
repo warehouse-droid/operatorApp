@@ -40,11 +40,11 @@ test('accepted ETA needs no mapping and survives a revised SCM ETA', () => fixtu
   let detail = await repository.createSpecialStockCase(input, context);
   detail = await respond(detail, { supplyStatus: 'production' });
   detail = await repository.decideSpecialStockLine(detail.id, detail.lines[0].id, { expectedRevision: detail.revision, decision: 'accepted' }, context);
-  assert.equal(detail.stage, 'confirmed');
+  assert.equal(detail.stage, 'await_customer_confirmation');
   assert.equal(detail.lines[0].itemResolution, null);
   detail = await respond(detail, { supplyStatus: 'production', availableDate: '2099-01-27' });
   assert.equal(detail.lines[0].salesDecision, 'accepted');
-  assert.equal(detail.stage, 'confirmed');
+  assert.equal(detail.stage, 'await_customer_confirmation');
 }));
 
 test('SO draft resolves fixed product once and retains one pallet line across saves', () => fixture(async () => {
@@ -111,7 +111,7 @@ test('yard completion requires local PO arrival and complete customer collection
   assert.equal(filtered[0].id, detail.id);
 }));
 
-test('real order service persists submission and recovers after SO patch success before PO creation', () => fixture(async () => {
+test('real order service recovers an independent PO after a lost creation response and preserves the SO', () => fixture(async () => {
   const { createSpecialStockRequestService } = await import('../../../src/special-stock-request-service.js');
   const { synchronizeSpecialDescriptions } = await import('../../../src/special-stock-netsuite-adapter.js');
   let detail = await repository.createSpecialStockCase({...input,lines:input.lines.map(line=>({...line,rate:4800})),fulfillmentMethod:'mbt_delivery',deliveryAddress:'TEST delivery',deliveryContactName:'TEST contact',deliveryContactPhone:'555-0100'}, context);
@@ -119,7 +119,7 @@ test('real order service persists submission and recovers after SO patch success
   detail = await repository.decideSpecialStockLine(detail.id,detail.lines[0].id,{expectedRevision:detail.revision,decision:'accepted'},context);
   detail = await repository.saveSpecialSalesOrderDraft(detail.id,{expectedRevision:detail.revision,customerId:8899100,operationalYardLocationId:1,fulfillmentMethod:'mbt_delivery',deliveryAddress:'TEST delivery',deliveryContactName:'TEST contact',deliveryContactPhone:'555-0100',palletTotal:0,
     materialLines:[{caseLineId:detail.lines[0].id,itemId:2055,description:'Original product',quantity:1200,packageQuantity:2,conversionToPc:600,uom:'PC',rate:4800}]},context);
-  const orders=new Map(); let nextId=8899700,posts=0,patches=0,failSync=true;
+  const orders=new Map(); let nextId=8899700,posts=0,patches=0,hidePurchaseMarker=true;
   async function create(kind,payload) {
     posts++; const id=nextId++, sales=kind==='sales_order', ref=`TEST-${sales?'SO':'PO'}-${id}`;
     const items=payload.item.items.map((line,index)=>({...line,line:index+1,uniqueKey:id*100+index+1}));
@@ -133,8 +133,9 @@ test('real order service persists submission and recovers after SO patch success
   const service=createSpecialStockRequestService({ assertPurchaseOrderReady: async () => {}, selectSalesRep: async () => ({ id: 123, name: 'TEST NetSuite Rep' }),
     findLinkedPurchaseOrder: async () => null,
     resolveLocations:async()=>[{netsuiteLocationId:1}],resolveOrderUnits:async lines=>lines.map(line=>({...line,unitId:1})),
-    config:{pickupMethodId:1,deliveryMethodId:2},createSalesOrder:payload=>create('sales_order',payload),createPurchaseOrder:payload=>create('purchase_order',payload),
-    findMarkerOrders:async({orderKind})=>orders.has(orderKind)?[{id:orders.get(orderKind).id,entity_id:orderKind==='sales_order'?8899100:8899200,location_id:1}]:[],
+    config:{pickupMethodId:1,deliveryMethodId:2},createSalesOrder:payload=>create('sales_order',payload),
+    createPurchaseOrder:async payload=>{await create('purchase_order',payload);throw new Error('Lost acknowledgement after PO creation');},
+    findMarkerOrders:async({orderKind})=>orders.has(orderKind)&&!(orderKind==='purchase_order'&&hidePurchaseMarker)?[{id:orders.get(orderKind).id,entity_id:orderKind==='sales_order'?8899100:8899200,location_id:1}]:[],
     fetchSalesOrderReference:async()=>({tranid:orders.get('sales_order').ref,status_text:'Pending Fulfillment'}),
     fetchPurchaseOrderReference:async()=>({tranid:orders.get('purchase_order').ref,status_text:'Pending Receipt'}),
     synchronizeSalesDescriptions:async change=>{
@@ -143,22 +144,22 @@ test('real order service persists submission and recovers after SO patch success
         if(options.method==='PATCH'){patches++;for(const edit of options.body.item.items)Object.assign(payload.item.items.find(line=>line.line===edit.line),edit);}
         return {data:structuredClone(payload)};
       }});
-      if(failSync){failSync=false;throw new Error('Lost acknowledgement after verified SO patch');}
     },sleep:async()=>{}
   });
   detail=await service.createSalesOrder(detail.id,{expectedRevision:detail.revision,operationId:'01911111-1111-7111-8111-111111111121'},context);
   assert.ok(detail.salesOrderSubmissionStartedAt);
   const operationId='01911111-1111-7111-8111-111111111122';
-  await assert.rejects(()=>service.createPurchaseOrder(detail.id,{ vendorDiscountAmount: 0,expectedRevision:detail.revision,operationId,lines:[{caseLineId:detail.lines[0].id,description:'SCM reviewed description',quantity:20,uom:'PC',vendorDiscountPercent:0,unitPurchaseCost:3}]},context),/Lost acknowledgement/);
+  await assert.rejects(()=>service.createPurchaseOrder(detail.id,{ pallet:{quantity:0},vendorDiscountAmount: 0,expectedRevision:detail.revision,operationId,lines:[{caseLineId:detail.lines[0].id,description:'SCM reviewed description',quantity:20,uom:'PC',vendorDiscountPercent:0,unitPurchaseCost:3}]},context),/Lost acknowledgement/);
   detail=await repository.getSpecialStockCase(detail.id);
-  assert.equal(detail.purchaseOrderOperationStatus,'attention');assert.equal(posts,1);
+  assert.equal(detail.purchaseOrderOperationStatus,'attention');assert.equal(posts,2);
+  hidePurchaseMarker=false;
   detail=await service.createPurchaseOrder(detail.id,{expectedRevision:detail.revision,operationId},context);
-  assert.equal(detail.stage,'dispatch_arrangement'); assert.equal(detail.attention,false); assert.equal(patches,1);assert.equal(posts,2);
+  assert.equal(detail.stage,'confirmed'); assert.equal(detail.attention,false); assert.equal(patches,0);assert.equal(posts,2);
   assert.ok(detail.purchaseOrderSubmissionStartedAt);
-  assert.equal(detail.salesOrderLines[0].quantity,20);assert.equal(detail.salesOrderLines[0].rate,8);
-  assert.equal(detail.salesOrderLines[0].description,'SCM reviewed description');assert.equal(detail.purchaseOrderLines[0].quantity,20);
+  assert.equal(detail.salesOrderLines[0].quantity,1200);assert.equal(detail.salesOrderLines[0].rate,8);
+  assert.equal(detail.salesOrderLines[0].description,'Original product');assert.equal(detail.purchaseOrderLines[0].quantity,20);
   const canonical=await query('SELECT item_description,quantity FROM sales_order_lines WHERE sales_order_id=$1',[detail.salesOrderId]);
-  assert.equal(canonical.rows[0].item_description,'SCM reviewed description');assert.equal(Number(canonical.rows[0].quantity),20);
+  assert.equal(canonical.rows[0].item_description,'Original product');assert.equal(Number(canonical.rows[0].quantity),1200);
   const { listDispatchOrders } = await import('../../../src/dispatch-repository.js');
   const dispatchOrders = await listDispatchOrders({exactOrderRefs:[detail.salesOrderRef],type:'SO'});
   const dispatchOrder = dispatchOrders.find(order=>order.id===detail.salesOrderRef);

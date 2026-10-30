@@ -1,3 +1,4 @@
+import { assertIsolatedTestConnection } from '../../support/test-database-isolation.mjs';
 import test, { before, after } from 'node:test';
 import assert from 'node:assert/strict';
 import { randomUUID } from 'node:crypto';
@@ -15,7 +16,7 @@ async function request(path, user, body) {
 }
 before(async () => {
   assert.equal(process.env.MBT_TEST_ISOLATED, '1');
-  assert.equal(new URL(process.env.DATABASE_URL).hostname, 'mbbs-special-updates-db-20261002');
+  assertIsolatedTestConnection(process.env.DATABASE_URL);
   await query(await readFile('migrations/258_special_stock_information.sql', 'utf8'));
   flag = (await query("SELECT enabled FROM mbt_feature_flags WHERE flag_key='special_stock_request_workflow'")).rows[0].enabled;
   await query("UPDATE mbt_feature_flags SET enabled=true WHERE flag_key='special_stock_request_workflow'");

@@ -105,13 +105,16 @@ test('SCM stock check submits editable material details and packing in its exist
     const secondRow = await Promise.all(['vendorYard', 'salesVisibleNote', 'scmInternalNote'].map(name => line.locator(`[name=${name}]`).locator('..').boundingBox()));
     assert.ok(secondRow.every(box => box && Math.abs(box.y - secondRow[0].y) < 1), JSON.stringify(secondRow));
     await line.screenshot({ path: out + '/scm-compact-desktop.png' });
-    for (const status of ['production', 'vendor_transfer']) {
+    for (const status of ['production']) {
       await line.locator('[name=supplyStatus]').selectOption(status);
       await expect(line.locator('[name=availableDate]')).toBeVisible();
       const withEta = await Promise.all(['requiredDate', 'supplyStatus', 'vendorName', 'availableDate'].map(name => line.locator(`[name=${name}]`).boundingBox()));
       assert.ok(withEta.every(box => box && Math.abs(box.y - withEta[0].y) < 1), JSON.stringify(withEta));
     }
     await line.screenshot({ path: out + '/scm-eta-first-row-desktop.png' });
+    await line.locator('[name=supplyStatus]').selectOption('vendor_transfer');
+    await expect(line.locator('[name=availableDate]')).toBeHidden();
+    await expect(line.locator('[data-special-transfer-eta]')).toContainText('SO placement +5 working days');
     await line.locator('[name=supplyStatus]').selectOption('in_stock');
     await expect(line.locator('[name=availableDate]')).toBeHidden();
     await line.getByRole('button', { name: 'Edit', exact: true }).click();
@@ -168,19 +171,19 @@ test('SCM refreshes the right panel status and ETA layout from the latest reques
     state.stockCheckReply = saved => {
       const reply = structuredClone(saved);
       saved.stage = 'await_customer_confirmation';
-      Object.assign(saved.lines[0], { supplyStatus: 'vendor_transfer', availableDate: '2099-03-20', responseVendorName: 'Updated Vendor' });
+      Object.assign(saved.lines[0], { supplyStatus: 'production', availabilityMode:'dated', availableDate: '2099-03-20', responseVendorName: 'Updated Vendor' });
       return reply;
     };
     await page.getByRole('button', { name: 'Save stock check', exact: true }).click();
     await expect(page.locator('.stock-request-detail > .stock-request-heading > .stock-request-pill')).toHaveText('Await Customer Confirmation');
     assert.equal(state.posts.length, 1); assert.equal(state.reads.length, readsBefore + 1);
-    await expect(form.locator('[name=supplyStatus]')).toHaveValue('vendor_transfer');
+    await expect(form.locator('[name=supplyStatus]')).toHaveValue('production');
     await expect(form.locator('[name=availableDate]')).toHaveValue('2099-03-20');
     await expect(form.locator('[name=vendorName]')).toHaveValue('Updated Vendor');
     const row = await Promise.all(['requiredDate', 'supplyStatus', 'vendorName', 'availableDate'].map(name => form.locator(`[name=${name}]`).boundingBox()));
     assert.ok(row.every(box => box && Math.abs(box.y - row[0].y) < 1), JSON.stringify(row));
     await expect(form.locator('[name=productName]')).toBeHidden();
-    await expect(page.locator('.stock-request-card .stock-request-pill')).toHaveText('Await Customer Confirmation');
+    await expect(page.locator('.stock-request-card .stock-request-pill.await_customer_confirmation')).toHaveText('Await Customer Confirmation');
     assert.deepEqual(state.errors, []);
   } finally { await context.close(); }
 });

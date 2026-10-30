@@ -85,9 +85,9 @@ test("SN1400625 ignores deleted parent history and preserves the exact three con
     assert.equal(step.sourceOrderRef,"POB03669");
     assert.equal(step.payload.memo,"SN1400625");
     assert.deepEqual(step.payload.item.items,[
-      {orderLine:1,location:1,itemReceive:true,quantity:360},
-      {orderLine:24,location:1,itemReceive:true,quantity:360},
-      {orderLine:25,location:1,itemReceive:true,quantity:288},
+      {orderLine:1,location:1,itemReceive:true,quantity:360,custcol_plt:0,custcol_lyr:0,custcol_sec:0,custcol_pcs:0},
+      {orderLine:24,location:1,itemReceive:true,quantity:360,custcol_plt:0,custcol_lyr:0,custcol_sec:0,custcol_pcs:0},
+      {orderLine:25,location:1,itemReceive:true,quantity:288,custcol_plt:0,custcol_lyr:0,custcol_sec:0,custcol_pcs:0},
       {orderLine:34,location:1,itemReceive:false}
     ]);
   });

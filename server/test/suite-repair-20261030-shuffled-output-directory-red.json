@@ -1,0 +1,245 @@
+{
+  "passed": false,
+  "label": "full-verification",
+  "specApproval": "not obtained (autonomous run)",
+  "selection": "full",
+  "shuffleSeed": 20261030,
+  "result": {
+    "fileCount": 1256,
+    "tests": 7630,
+    "pass": 7628,
+    "fail": 1,
+    "cancelled": 0,
+    "skipped": 1,
+    "failedFiles": [
+      {
+        "file": "test/mbt/integration/regular-waitlist-startup.test.js",
+        "failures": [
+          "real server startup runs waitlist catch-up without posting NetSuite orders"
+        ],
+        "tests": 1,
+        "pass": 0,
+        "fail": 1,
+        "cancelled": 0,
+        "skipped": 0,
+        "firstFailureEvidence": [
+          "\u2716 real server startup runs waitlist catch-up without posting NetSuite orders (4978.55999ms)",
+          "  AssertionError [ERR_ASSERTION]: Error: ENOENT: no such file or directory, open 'test-artifacts/regular-waitlist/startup.json'",
+          "      at writeFileSync (node:fs:2380:20)",
+          "      at file:///app/tools/regular-waitlist-startup.mjs:13:3",
+          "      at process.processTicksAndRejections (node:internal/process/task_queues:95:5) {",
+          "    errno: -2,",
+          "    code: 'ENOENT',",
+          "    syscall: 'open',",
+          "    path: 'test-artifacts/regular-waitlist/startup.json'",
+          "  }",
+          "  ",
+          "  ",
+          "  1 !== 0",
+          "  ",
+          "      at TestContext.<anonymous> (file:///app/test/mbt/integration/regular-waitlist-startup.test.js:10:10)",
+          "      at process.processTicksAndRejections (node:internal/process/task_queues:95:5)",
+          "      at async Test.run (node:internal/test_runner/test:797:9)",
+          "      at async Test.processPendingSubtests (node:internal/test_runner/test:526:7) {",
+          "    generatedMessage: false,",
+          "    code: 'ERR_ASSERTION',",
+          "    actual: 1,",
+          "    expected: 0,",
+          "    operator: 'strictEqual'",
+          "  }"
+        ],
+        "failureDetails": [
+          {
+            "test": "real server startup runs waitlist catch-up without posting NetSuite orders",
+            "message": [
+              "  AssertionError [ERR_ASSERTION]: Error: ENOENT: no such file or directory, open 'test-artifacts/regular-waitlist/startup.json'",
+              "      at writeFileSync (node:fs:2380:20)",
+              "      at file:///app/tools/regular-waitlist-startup.mjs:13:3",
+              "      at process.processTicksAndRejections (node:internal/process/task_queues:95:5) {",
+              "    errno: -2,",
+              "    code: 'ENOENT',",
+              "    syscall: 'open',",
+              "    path: 'test-artifacts/regular-waitlist/startup.json'"
+            ],
+            "location": "at TestContext.<anonymous> (file:///app/test/mbt/integration/regular-waitlist-startup.test.js:10:10)"
+          }
+        ]
+      }
+    ]
+  },
+  "exitCode": 1,
+  "sourceTreeHash": "98cac8eb1c71d93386cedbbecd0df7fb61e5b0db8f37d1d566f31bc89d70526d",
+  "static": {
+    "baselineCommit": "859dbc987d88fdd41b475f3738cefe9704aae3ea",
+    "types": {
+      "baselineCount": 339,
+      "candidateCount": 339,
+      "newCount": 0,
+      "newDiagnostics": []
+    },
+    "lint": {
+      "baselineCount": 722,
+      "candidateCount": 703,
+      "newCount": 0,
+      "newDiagnostics": []
+    },
+    "passed": true
+  },
+  "coverage": {
+    "captures": 2720,
+    "changedLines": 60,
+    "covered": 59,
+    "files": [
+      {
+        "file": "public/app-sidebar.js",
+        "changedLines": 5,
+        "covered": 5,
+        "uncovered": [],
+        "instrumented": true
+      },
+      {
+        "file": "public/login.js",
+        "changedLines": 1,
+        "covered": 0,
+        "uncovered": [
+          43
+        ],
+        "instrumented": true
+      },
+      {
+        "file": "public/menu-order-model.js",
+        "changedLines": 16,
+        "covered": 16,
+        "uncovered": [],
+        "instrumented": true
+      },
+      {
+        "file": "public/regular-stock-alert.js",
+        "changedLines": 4,
+        "covered": 4,
+        "uncovered": [],
+        "instrumented": true
+      },
+      {
+        "file": "public/sales-special-stock-requests.js",
+        "changedLines": 1,
+        "covered": 1,
+        "uncovered": [],
+        "instrumented": true
+      },
+      {
+        "file": "public/scm-waitlist.js",
+        "changedLines": 12,
+        "covered": 12,
+        "uncovered": [],
+        "instrumented": true
+      },
+      {
+        "file": "public/service-worker.js",
+        "changedLines": 10,
+        "covered": 10,
+        "uncovered": [],
+        "instrumented": true
+      },
+      {
+        "file": "src/consolidation-load-posting.js",
+        "changedLines": 1,
+        "covered": 1,
+        "uncovered": [],
+        "instrumented": true
+      },
+      {
+        "file": "src/delivery-repository.js",
+        "changedLines": 3,
+        "covered": 3,
+        "uncovered": [],
+        "instrumented": true
+      },
+      {
+        "file": "src/netsuite.js",
+        "changedLines": 3,
+        "covered": 3,
+        "uncovered": [],
+        "instrumented": true
+      },
+      {
+        "file": "src/special-stock-request-repository.js",
+        "changedLines": 4,
+        "covered": 4,
+        "uncovered": [],
+        "instrumented": true
+      }
+    ]
+  },
+  "mutations": {
+    "passed": false,
+    "killed": 4,
+    "total": 5,
+    "results": [
+      {
+        "name": "ambiguous-write-retry",
+        "file": "src/netsuite.js",
+        "test": "test/mbt/integration/netsuite-write-retry-safety.test.js",
+        "killed": true,
+        "tests": 5,
+        "failed": 1,
+        "firstFailure": [
+          "an ambiguous write response is never retried even when its message mentions request limits"
+        ]
+      },
+      {
+        "name": "stale-return-clears-new-event",
+        "file": "public/scm-waitlist.js",
+        "test": "test/mbt/integration/scm-waitlist-return-race-browser.test.js",
+        "killed": true,
+        "tests": 1,
+        "failed": 1,
+        "firstFailure": [
+          "returned-pool acknowledgement preserves drafts, reports failure and cannot clear a newer return"
+        ]
+      },
+      {
+        "name": "synchronous-so-consolidation",
+        "file": "src/consolidation-load-posting.js",
+        "test": "test/mbt/unit/consolidation-load-posting.test.js",
+        "killed": false,
+        "tests": 6,
+        "failed": 4,
+        "firstFailure": [
+          "sales_load_background Sales Orders and local CO loads never materialize NetSuite targets"
+        ],
+        "propertyAloneKilled": false
+      },
+      {
+        "name": "completed-special-edit",
+        "file": "src/special-stock-request-repository.js",
+        "test": "test/mbt/integration/special-case-edits-http.test.js",
+        "killed": true,
+        "tests": 20,
+        "failed": 1,
+        "firstFailure": [
+          "existing or skipped orders, closure, remote submissions, uncertain operations and reviews lock all edits"
+        ]
+      },
+      {
+        "name": "secondary-login-role-lost",
+        "file": "public/login.js",
+        "test": "test/mbt/unit/ui-navigation-contract.test.js",
+        "killed": true,
+        "tests": 3,
+        "failed": 1,
+        "firstFailure": [
+          "F02/F15: root login stores the shared token and honors MBT primary, secondary and server home routes"
+        ]
+      }
+    ]
+  },
+  "cleanup": {
+    "exitCode": 0,
+    "leftovers": {
+      "container": [],
+      "volume": [],
+      "network": []
+    }
+  }
+}

@@ -148,6 +148,11 @@
     { label: "Audit", href: "/admin/audit", controlSection: "audit", icon: "AU" }
   ];
 
+  const mbrItems = [
+    { label: "Contract", href: "/mbr/contracts", icon: "CT" },
+    { label: "MBR Setup", href: "/mbr/setup", icon: "SE" }
+  ];
+
   const mbtItems = [
     { label: "Overview", href: "/mbt", icon: "OV", mbtRoles: ["admin", "dispatcher", "mbt_frontdesk", "mbt_billing"] },
     { label: "Front Desk", href: "/mbt/frontdesk", icon: "FD", mbtRole: "mbt_frontdesk" },
@@ -214,7 +219,7 @@
       {label:"Repair portal",href:"/repair",icon:"RP"},
       {label:"Repair Team",href:"/repair/workshop",icon:"RT",authorities:["admin","repair_technician"]}
     ].filter(item=>itemAllowedByAuthority(item))};
-    if (path.startsWith("/mbr")) return { title: "MBR", items: [{ label: "Contract", href: "/mbr/contracts", icon: "CT" }, { label: "MBR Setup", href: "/mbr/setup", icon: "SE" }] };
+    if (path.startsWith("/mbr")) return { title: "MBR", items: mbrItems };
     if (path.startsWith("/aggregate-requests")) return {
       title: "Aggregate Requests", items: [{ label: "Requests", href: "/aggregate-requests", icon: "AG" }]
     };
@@ -779,7 +784,7 @@
     document.head.appendChild(appEventStream);
     const regularAlert = document.createElement("script");
     regularAlert.async = false;
-    regularAlert.src = "/regular-stock-alert.js?alertSearch=20261023&allAlerts=20261022-v1&arrival=20261020-v1&input=20261020-v1&v=20261014-os-notifications&stockingReply=20261006-v1&backorder=20261007-v1&stockCheck=20261009&preferences=20261021-roles-sounds";
+    regularAlert.src = "/regular-stock-alert.js?alertSearch=20261023&allAlerts=20261022-v1&arrival=20261020-v1&input=20261020-v1&v=20261014-os-notifications&stockingReply=20261006-v1&backorder=20261007-v1&stockCheck=20261009&preferences=20261021-roles-sounds&suiteRepair=20261030-v1";
     document.head.appendChild(regularAlert);
     const aggregateAlert = document.createElement("script");
     aggregateAlert.async = false;

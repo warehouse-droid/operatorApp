@@ -19,7 +19,7 @@ const submit = async () => submitReturnBatch({ operatorId: actor, input: await s
 const creates = remote => remote.requests.filter(row => row.method === 'POST' && /\/record\//.test(row.address)).length;
 const addFee = remote => remote.created.values().next().value.item.items.push(
   { item: { id: '-2' }, itemType: { id: 'Subtotal' }, amount: 12.5 },
-  { item: { id: '3015' }, itemType: { id: 'Discount' }, rate: -35, amount: -4.38 }
+  { item: { id: '3016' }, itemType: { id: 'Discount' }, rate: -35, amount: -4.38 }
 );
 
 test('C1 verified CM with accounting additions recovers the same transaction without a remote write', async t => {
@@ -62,14 +62,19 @@ test('R1 RA verification failures also wait for manual correction', async t => {
 });
 
 test('C2/R1 accounting additions cannot finalize a new draft and do not cause an automatic retry loop', async t => {
-  const remote = await creditFixture(t); remote.control.alter = () => addFee(remote);
+  const remote = await creditFixture(t);
+  let admittedRows;
+  remote.control.alter = () => {
+    admittedRows = structuredClone(remote.created.values().next().value.item.items);
+    addFee(remote);
+  };
   const input = await submitInput();
   await assert.rejects(submitReturnBatch({ operatorId: actor, input, autoSync: true }), { code: 'RETURN_SUBMISSION_DRAFT' });
   const calls = remote.requests.length;
   assert.deepEqual(await processPendingReturnSyncs(), { queued: 0, succeeded: 0, failed: 0 });
   assert.equal(remote.requests.length, calls);
   assert.equal((await query('SELECT id FROM return_records WHERE operator_id=$1', [actor])).rowCount, 0);
-  remote.created.values().next().value.item.items.splice(1);
+  remote.created.values().next().value.item.items = admittedRows;
   const result = await submitReturnBatch({ operatorId: actor, input, autoSync: true });
   assert.equal(result.stockReturn.netSuiteSyncStatus, 'succeeded');
   assert.equal(creates(remote), 1);

@@ -1,3 +1,4 @@
+import { conversationBrowserBoundary, legacyConversationMessage } from '../../support/conversation-browser-boundary.mjs';
 /* global window, document, localStorage, EventTarget, MessageEvent, MutationObserver */
 import test,{before,after} from 'node:test';
 import assert from 'node:assert/strict';
@@ -25,9 +26,11 @@ async function fixture(audience,{purchase=false,reply=false,pendingTo=false}={})
   const state={r:record(purchase),calls:[],errors:[],alerts:{requests:[],total:0,unread:0}};
   if(reply){state.r.displayStatus='pending_update';state.r.regular.replyStatus='pending_update';state.r.regular.reply={audience:'scm',message:'Use the next load.',eta:null};state.r.events=[{id:2,eventType:'regular_scm_reply',actorName:'SCM',createdAt:'2026-10-06T00:00:00Z',details:state.r.regular.reply}];}
   if(pendingTo){
+    state.r.lines.forEach(line=>{line.status='approved';});
     state.r.status='active';state.r.bucket='accepted';state.r.regular.pickupTransfer={status:'complete',plan:{action:{mode:'pickup',requestRef:'REQ-1',destinationName:'3445',routes:[]}}};
     state.r.transfers=[{id:1,transferRef:'SRTO-1',revision:1,status:'pending_receipt',sourceLocationId:28,sourceName:'2967',destinationLocationId:1,destinationName:'3445',netsuiteTransferOrderRef:'TO-1',lines:state.r.lines}];
   }
+  state.conversation=conversationBrowserBoundary({audience,messages:reply?[legacyConversationMessage('Use the next load.')]:[],onSend:()=>{if(audience==='sales'&&state.r.regular.replyStatus==='pending_update'){state.r.regular.replyStatus='pending_scm';state.r.displayStatus='pending_scm';}}});
   page.on('pageerror',e=>state.errors.push(e.message));
   await page.route('**/*',async route=>{
     const path=new URL(route.request().url()).pathname;
@@ -63,15 +66,16 @@ async function fixture(audience,{purchase=false,reply=false,pendingTo=false}={})
     const file=({'/sales/stock-requests':'/sales-stock-requests.html','/scm/stock-requests':'/scm-stock-requests.html'})[path]||path;
     try{return route.fulfill({body:await publicFile(file),contentType:({js:'application/javascript',css:'text/css',html:'text/html',svg:'image/svg+xml'})[file.split('.').at(-1)]||'application/octet-stream'});}catch{return route.fulfill({status:404,body:''});}
   });
+  await page.route(url=>/\/(conversation(?:\/read)?|stock-request-conversation-alerts)$/.test(url.pathname),state.conversation.handle);
   await page.goto(`http://localhost/${audience}/stock-requests?tab=regular`);await expect(page.locator('.stock-request-detail h2')).toHaveText(pendingTo?'REQ-1 · SRTO-1':'REQ-1');await page.waitForLoadState('networkidle');
   return {page,state,close:async()=>{measured.push(...await page.coverage.stopJSCoverage());await context.close();}};
 }
 async function update(page){await page.evaluate(()=>{for(const stream of window.replyEvents.filter(s=>!s.closed))stream.dispatchEvent(new MessageEvent('app-event',{data:JSON.stringify({type:'stock-request.updated',payload:{requestId:1}})}));});}
 
-for(const purchase of [false,true])test(`SCM ${purchase?'Purchase':'Transfer'} puts Reply in the existing action row and converts one line through customer selection`,async()=>{
+for(const purchase of [false,true])test(`SCM ${purchase?'Purchase':'Transfer'} offers the shared conversation and converts one line through customer selection`,async()=>{
   const f=await fixture('scm',{purchase});try{
-    const reply=f.page.locator('[data-scm-stock-action="reply"]');await expect(reply).toHaveCount(1);
-    assert.equal(await reply.evaluate(button=>button.parentElement===document.querySelector('[data-scm-stock-action="refresh-evidence"]').parentElement),true);
+    await expect(f.page.locator('[data-stock-conversation]')).toHaveCount(1);
+    await expect(f.page.locator('[data-scm-stock-action="refresh-evidence"]')).toBeVisible();
     await f.page.locator('[data-scm-stock-action="waitlist-line"]').click();
     const dialog=f.page.locator('dialog[data-stocking-waitlist-dialog]'),query=dialog.locator('[data-stocking-waitlist-customer-query]');await expect(dialog).toBeVisible();await query.fill('Existing');
     await update(f.page);await expect(query).toHaveValue('Existing');await dialog.locator('[data-stocking-waitlist-customer="99"]').click();
@@ -83,9 +87,10 @@ for(const purchase of [false,true])test(`SCM ${purchase?'Purchase':'Transfer'} p
     await f.page.locator('.stock-request-detail a[href="/scm/stock-requests?tab=waitlist&requestId=2"]').click();await expect(f.page.locator('[data-waitlist-request-row="2"]')).toBeVisible();assert.deepEqual(f.state.errors,[]);
   }finally{await f.close();}
 });
-test('SCM Pending TO keeps Reply in the TO action row and exposes no waitlist conversion for committed lines',async()=>{
+test('SCM Pending TO keeps its conversation and exposes no waitlist conversion for committed lines',async()=>{
   const f=await fixture('scm',{reply:true,pendingTo:true});try{
-    const reply=f.page.locator('[data-scm-stock-action="reply"]');assert.equal(await reply.evaluate(button=>button.parentElement===document.querySelector('[data-scm-stock-action="save-transfer"]').parentElement),true);
+    await expect(f.page.locator('[data-stock-conversation]')).toContainText('Use the next load.');
+    await expect(f.page.locator('[data-scm-stock-action="save-transfer"]')).toBeVisible();
     await expect(f.page.locator('[data-scm-stock-action="waitlist-line"]')).toHaveCount(0);
   }finally{await f.close();}
 });

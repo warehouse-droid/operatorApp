@@ -57,14 +57,9 @@ test('Entered stocking customer persists and appears in Sales and SCM cards and 
         await expect(page.locator('.stock-request-detail north')).toHaveCount(0);
         if (type === 'transfer' && role === 'scm') {
           await query("INSERT INTO sales_stock_transfers(request_id,source_location_id,source_name,destination_location_id,destination_name,created_by) VALUES($1,1,'3445',28,'TEST destination',$2)", [record.id, actors.scm]);
-          await page.locator('[data-yard-filter="queue"] summary').click();
-          await page.locator('[data-yard-filter="queue"] [data-yard-filter-clear="queue"]').click();
+          await query("UPDATE sales_stock_request_lines SET status='approved' WHERE request_id=$1",[record.id]);
+          await page.locator('[data-scm-stock-action="refresh"]').click();
           await expect.poll(()=>page.evaluate(()=>scmStockState.loading)).toBe(false);
-          const queue=page.locator('[data-yard-filter="queue"]');
-          if(!await queue.evaluate(element=>element.open))await queue.locator('summary').click();
-          await page.locator('[name="queue"][value="pending_to"]').check();
-          await expect.poll(()=>page.evaluate(()=>scmStockState.loading)).toBe(false);
-          if(await queue.evaluate(element=>element.open))await queue.locator('summary').click();
           await card.click();
           await expect(page.locator('.stock-request-detail')).toContainText(name);
           await expect(page.locator('.stock-request-detail h2')).toContainText('STTO-');

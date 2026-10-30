@@ -65,7 +65,7 @@ test('browser uses one multi-select Status, persists it, shows input alert and c
   try{
     await page.goto(f.base+`/sales/stock-requests?tab=regular&requestId=${d.id}`);
     await expect(page.locator('.regular-stock-popup[open] h2')).toHaveText('Stock request needs your input');
-    for(let i=0;i<15&&await page.locator('.regular-stock-popup[open]').count();i++)await page.locator('.regular-stock-popup button').click();
+    for(let i=0;i<15&&await page.locator('.regular-stock-popup[open]').count();i++)await page.locator('.regular-stock-popup').getByRole('button',{name:'Close',exact:true}).click();
     await expect(page.locator('[data-sales-stock-filter="backorderStageFilter"]')).toHaveCount(0);
     const menu=page.locator('[data-yard-filter="unifiedStatus"]');await expect(menu).toBeVisible();await menu.locator('summary').click();
     await page.locator('[data-sales-stock-filter="unifiedStatus"][value="pending_sales"]').check();
@@ -78,7 +78,7 @@ test('browser uses one multi-select Status, persists it, shows input alert and c
     await expect(page.locator('[data-sales-stock-filter="unifiedStatus"][value="closed"]')).toBeChecked();
     await page.locator('[data-yard-filter-apply="unifiedStatus"]').click();
     // Dismiss informational popups; the action badge must remain.
-    for(let i=0;i<15&&await page.locator('.regular-stock-popup[open]').count();i++)await page.locator('.regular-stock-popup button').click();
+    for(let i=0;i<15&&await page.locator('.regular-stock-popup[open]').count();i++)await page.locator('.regular-stock-popup').getByRole('button',{name:'Close',exact:true}).click();
     await expect(page.locator('.regular-stock-alert[data-audience="sales"]')).toContainText('need your input');
     await page.locator(`.stock-request-card[data-id="${d.id}"]`).click();
     await expect(page.locator('[data-sales-stock-action="close-expired"]')).toBeVisible();

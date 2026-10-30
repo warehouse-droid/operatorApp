@@ -1,6 +1,7 @@
 // The complete npm test selection, divided without changing any assertions.
 import {readdir} from 'node:fs/promises';
 import path from 'node:path';
+import {createHash} from 'node:crypto';
 import {runNodeTestFilesIsolated} from '../test/support/test-database-isolation.mjs';
 import {buildIsolatedTestEnvironment} from '../test/support/test-foundation.mjs';
 const index = Number(process.argv[2]), count = Number(process.argv[3]);
@@ -19,6 +20,10 @@ async function discover(directory) {
 const all = process.argv[4] ? JSON.parse(process.argv[4]).map(file => path.resolve(file))
   : (await Promise.all(groups.map(group => discover(path.resolve('test/mbt', group))))).flat();
 if (new Set(all).size !== all.length) throw new Error('Duplicate test file');
+if (process.env.MBBS_TEST_SHUFFLE_SEED) {
+  const rank = file => createHash('sha256').update(process.env.MBBS_TEST_SHUFFLE_SEED + ':' + file).digest('hex');
+  all.sort((a, b) => rank(a).localeCompare(rank(b)));
+}
 const files = all.filter((_, position) => position % count === index);
 console.log(JSON.stringify({shard: index + 1, shards: count, selectedFiles: files.length, totalFiles: all.length}));
 process.exitCode = files.length ? await runNodeTestFilesIsolated(files, {

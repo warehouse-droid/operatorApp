@@ -40,6 +40,7 @@
   }
   function render(){
     if(!state.mount||!active())return;
+    const restoreFocus=window.MBBSStockRequestTabs?.preserveFocus?.();
     const returned=state.pools.filter(p=>p.returnedUnread);
     state.mount.innerHTML=`<div class="waitlist-workspace">${window.MBBSStockRequestTabs.html()}<div class="stock-request-heading"><div><h1>Regular waitlist</h1><p>Assign PO supply to customer demand, then Sales creates the SO.</p></div><button type="button" data-waitlist-refresh>Refresh</button></div>
       ${state.error?`<p class="stock-request-error" role="alert">${esc(state.error)}</p>`:''}
@@ -48,6 +49,7 @@
       ${state.tab==='requests'?waitingRequests():`<section class="stock-request-section"><h3>Add PO / split PO pool</h3><form data-waitlist-pool-form><div class="waitlist-toolbar"><label><span>Find existing PO / split PO</span><input data-waitlist-po-search type="search" value="${esc(state.search)}" placeholder="PO reference" /></label><label><span>PO *</span><select data-waitlist-po required><option value="">Select an existing PO</option>${state.orders.map(o=>`<option value="${o.id}" ${state.selectedPo?.id===o.id?'selected':''}>${esc(o.ref)}</option>`).join('')}</select></label><label><span>Item *</span><select name="itemId" required><option value="">Select one item</option>${(state.selectedPo?.items||[]).map(i=>`<option value="${i.itemId}">${esc(i.itemCode)} · ${i.quantity==null?'Unit review required':number(i.quantity)+' '+esc(i.salesUom)}</option>`).join('')}</select></label><button ${state.busy?'disabled':''}>Open pool</button></div></form></section>
         <div class="waitlist-layout"><aside class="waitlist-pool-list">${state.pools.map(p=>`<button type="button" data-waitlist-pool="${p.id}" aria-pressed="${state.pool?.id===p.id}"><strong>${esc(p.purchaseOrderRef)} · ${esc(p.itemCode)}</strong><small>${number(p.availableQty)} ${esc(p.salesUom)} available${p.attention?' · Review PO':''}</small></button>`).join('')||'<p>No PO pools yet.</p>'}</aside><div>${poolDetail(state.pool)}</div></div>`}</div>`;
     updates?.paint();
+    restoreFocus?.();
   }
   const requestsUrl=()=>'/api/scm/waitlist/requests?'+(window.RegularStockStatus?.params(state).toString()||'');
   async function load(){
@@ -66,8 +68,17 @@
     for(const card of state.mount.querySelectorAll('.waitlist-pool-list [data-waitlist-pool]'))card.setAttribute('aria-pressed',String(Number(card.dataset.waitlistPool)===state.pool?.id));
     updates?.paint();
   }
+  async function acknowledgeReturnedPool(pool){
+    if(!pool?.returnedUnread)return;
+    const {id,lastReturnEventId}=pool;
+    await state.api(`/api/scm/waitlist/pools/${id}/read`,{method:'POST',body:JSON.stringify({eventId:lastReturnEventId})});
+    const row=state.pools.find(value=>value.id===id);
+    if(row?.lastReturnEventId===lastReturnEventId)row.returnedUnread=false;
+    if(state.pool?.id===id&&state.pool.lastReturnEventId===lastReturnEventId)state.pool.returnedUnread=false;
+    if(!row?.returnedUnread)state.mount?.querySelector(`.waitlist-returned [data-waitlist-pool="${id}"]`)?.closest('.waitlist-returned')?.remove();
+  }
   async function selectPool(id){
-    if(state.tab==='pools'&&state.pool?.id===id)return;
+    if(state.tab==='pools'&&state.pool?.id===id){await acknowledgeReturnedPool(state.pool);return;}
     const current=++generation,readVersion=updates?.version,edits=updates?.editVersion;
     state.choices.clear();state.reason='';state.tab='pools';
     state.pool=structuredClone(state.pools.find(pool=>pool.id===id)||null);
@@ -78,7 +89,7 @@
     if(current!==generation||!active())return;
     if(edits!==updates?.editVersion||readVersion!==updates?.version){updates?.changed();return;}
     state.pool=pool;renderPool();
-    if(state.pool.returnedUnread){await state.api(`/api/scm/waitlist/pools/${id}/read`,{method:'POST',body:JSON.stringify({eventId:state.pool.lastReturnEventId})});const row=state.pools.find(p=>p.id===Number(id));if(row)row.returnedUnread=false;if(state.pool?.id===id)state.pool.returnedUnread=false;}
+    await acknowledgeReturnedPool(state.pool);
   }
   document.addEventListener('input',/** @param {Event & {target:HTMLInputElement}} event */ event=>{
     if(!active())return;

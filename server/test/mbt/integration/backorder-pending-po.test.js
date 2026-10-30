@@ -24,14 +24,14 @@ after(async()=>{
   if(f)await f.close();
 });
 
-test('Sales and SCM APIs filter SO-linked requests by Pending SCM and retain production waiting',async()=>{
+test('Sales and SCM APIs filter SO-linked requests by In Progress and retain production waiting',async()=>{
   const snapshot=async()=>(await f.query('SELECT status,revision,regular_details FROM sales_stock_requests WHERE id=$1',[d.id])).rows;
   const before=await snapshot();
   for(const role of ['sales','scm']){
     const detail=await f.detail(d,role);
-    assert.equal(detail.statusSummary.status,'pending_scm');assert.equal(detail.statusSummary.detail,'awaiting_po');
+    assert.equal(detail.statusSummary.status,'in_progress');assert.equal(detail.statusSummary.detail,'processing');
     assert.deepEqual(detail.statusSummary.waitingReasons,['production']);
-    for(const [status,included] of [['pending_scm',true],['pending_sales',false],['in_progress',false],['pending_scm,completed',true]]){
+    for(const [status,included] of [['pending_scm',false],['pending_sales',false],['in_progress',true],['in_progress,completed',true]]){
       const result=await f.http(role,`/api/${role}/stock-requests?type=backorder&queue=&search=${d.requestRef}&unifiedStatus=${status}&waitingReason=production`);
       assert.equal(result.status,200);assert.equal(result.body.requests.some(row=>row.id===d.id),included);
     }
@@ -41,7 +41,7 @@ test('Sales and SCM APIs filter SO-linked requests by Pending SCM and retain pro
   assert.deepEqual(await snapshot(),before);
 });
 
-test('Sales and SCM browsers show Pending SCM and Awaiting PO in the list, filter and detail',async()=>{
+test('Sales and SCM browsers show In Progress and Processing orders in the list, filter and detail',async()=>{
   browser=await chromium.launch({headless:true,args:['--no-sandbox','--disable-dev-shm-usage']});
   for(const role of ['sales','scm']){
     const context=await browser.newContext({viewport:{width:1440,height:1000},serviceWorkers:'block'}),page=await context.newPage(),errors=[];
@@ -50,15 +50,15 @@ test('Sales and SCM browsers show Pending SCM and Awaiting PO in the list, filte
     try{
       await page.goto(f.base+`/${role}/stock-requests?tab=regular`);
       const card=page.locator(`.stock-request-card[data-id="${d.id}"]`);
-      await expect(card.locator('[data-regular-main-status]')).toHaveText('Pending SCM');
-      await expect(card.locator('.regular-status-detail')).toHaveText('Awaiting PO');
+      await expect(card.locator('[data-regular-main-status]')).toHaveText('In Progress');
+      await expect(card.locator('.regular-status-detail')).toHaveText('Processing orders');
       await expect(card.locator('[data-stock-request-waiting]')).toHaveText('Waiting for Production');
-      await chooseRegularStatuses(page,role,'pending_scm');await expect(card).toBeVisible();
-      await chooseRegularStatuses(page,role,'in_progress');await expect(card).toHaveCount(0);
-      await chooseRegularStatuses(page,role,'pending_scm');await card.click();
+      await chooseRegularStatuses(page,role,'in_progress');await expect(card).toBeVisible();
+      await chooseRegularStatuses(page,role,'pending_scm');await expect(card).toHaveCount(0);
+      await chooseRegularStatuses(page,role,'in_progress');await card.click();
       const detail=page.locator('.stock-request-detail');
-      await expect(detail.locator('[data-regular-main-status]')).toHaveText('Pending SCM');
-      await expect(detail.locator('.regular-status-detail')).toHaveText('Awaiting PO');
+      await expect(detail.locator('[data-regular-main-status]')).toHaveText('In Progress');
+      await expect(detail.locator('.regular-status-detail')).toHaveText('Processing orders');
       await page.screenshot({path:`${out}/${role}-pending-po.png`,fullPage:true});
       await page.setViewportSize({width:390,height:844});
       await expect(detail.locator('[data-regular-main-status]')).toBeVisible();
@@ -68,10 +68,10 @@ test('Sales and SCM browsers show Pending SCM and Awaiting PO in the list, filte
   }
 });
 
-test('linking the PO clears Pending SCM and a production-only request then waits for stock',async()=>{
+test('linking the PO keeps SO processing and its production supply reason',async()=>{
   d=await f.action(d,'scm','purchase-order/link',{purchaseOrderRef:'TEST-PENDING-PO-PO'});
   assert.equal(d.purchaseOrderId,po);assert.equal(d.statusSummary.status,'in_progress');
   assert.equal(d.statusSummary.detail,'processing');assert.deepEqual(d.statusSummary.waitingReasons,['production']);
   d=await f.action(d,'sales',`lines/${d.lines[0].id}/decision`,{decision:'closed',reason:'Material no longer required'});
-  assert.equal(d.statusSummary.status,'waiting_stock');assert.equal(d.statusSummary.detail,'supply_wait');
+  assert.equal(d.statusSummary.status,'in_progress');assert.equal(d.statusSummary.detail,'processing');
 });

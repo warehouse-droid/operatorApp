@@ -53,8 +53,10 @@
     if(row.action==='stock_check')stockChecks.delete(row.id);
     if(row.action==='stock_check'){
       displayed.set('check:'+row.id,row.eventId);checkSeen[row.id]=row.eventId;savePopupSeen(checkKey,checkSeen);
-      const duplicate=counts.sales?.requests?.find(item=>item.id===row.id&&item.action==='backorder'&&!item.message?.includes('PO linked:'));
-      if(duplicate){seen[row.id]=duplicate.eventId;displayed.set(row.id,duplicate.eventId);savePopupSeen(key,seen);}
+      const duplicate=counts.sales?.requests?.find(item=>item.id===row.id&&(
+        item.action==='input_required'&&item.reason==='sales_confirmation'
+        || item.action==='backorder'&&!item.message?.includes('PO linked:')));
+      if(duplicate){const id=noticeKey(duplicate);seen[id]=duplicate.eventId;displayed.set(id,duplicate.eventId);savePopupSeen(key,seen);}
     }else{displayed.set(noticeKey(row),row.eventId);seen[noticeKey(row)]=row.eventId;savePopupSeen(key,seen);}
     previousFocus=document.activeElement;
     const modal=document.createElement('dialog');dialog=modal;modal.className='regular-stock-popup';modal.dataset.osNotificationId=notificationId(row);modal.dataset.notificationRole='sales';modal.setAttribute('aria-labelledby','regular-stock-popup-title');

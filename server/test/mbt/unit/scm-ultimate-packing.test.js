@@ -90,11 +90,15 @@ test("partial vendor hub routing survives urgent consolidation", () => {
     .reduce((sum, entry) => sum + entry.proposedPallets, 0), 4);
 });
 
-test("captured plan 429 keeps BWS Woodbridge -> 2967 urgent quantity in one truck", () => {
-  const fixture = JSON.parse(readFileSync("test-artifacts/scm-ultimate-packing-20261005/replay-input.json", "utf8"));
-  const plan = fixture.plans.find((entry) => Number(entry.id) === 429);
-  assert.ok(plan, "The reported plan must be present in the replay fixture");
-  const drafts = plan.proposals.filter((proposal) => Number(proposal.sourceVendorYardId) === 73);
+test("synthetic replay of plan 429 keeps 25 urgent Woodbridge-to-2967 pallets in one truck", () => {
+  // Keep this regression self-contained; disposable production captures are not fixtures.
+  const plan = { settings_snapshot: { truck_capacity_lbs: 78000 } };
+  const drafts = [
+    { proposalType: 'PO', sourceName: 'BWS Woodbridge', sourceVendorYardId: 73, phase: 'direct_vendor',
+      lines: [line(1, 15, 2400, 'ultimate_urgent', 28), line(2, 10, 2463.68, 'ultimate_urgent', 28)] },
+    { proposalType: 'PO', sourceName: 'BWS Woodbridge', sourceVendorYardId: 73, phase: 'direct_vendor',
+      lines: [line(3, 20, 2100, 'normal', 1)] }
+  ];
   const expected = drafts.flatMap((draft) => draft.lines).filter((entry) =>
     Number(entry.destinationLocationId) === 28 && entry.urgencyLevel === "ultimate_urgent");
   assert.equal(expected.reduce((sum, entry) => sum + Number(entry.proposedPallets), 0), 25);

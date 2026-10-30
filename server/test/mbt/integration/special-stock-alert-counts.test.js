@@ -1,3 +1,4 @@
+import { assertIsolatedTestConnection } from '../../support/test-database-isolation.mjs';
 import assert from 'node:assert/strict';
 import test, { after } from 'node:test';
 import { beginRollbackContext, closeDb, query } from '../../../src/db.js';
@@ -7,7 +8,7 @@ import { createSpecialStockCase } from '../../../src/special-stock-request-repos
 after(closeDb);
 test('Special counts include every new and confirmed case across yards, beyond the 60-case queue page', async () => {
   assert.equal(process.env.MBT_TEST_ISOLATED, '1');
-  assert.ok(process.env.DATABASE_URL.endsWith('/mbt_verify'));
+  assertIsolatedTestConnection(process.env.DATABASE_URL);
   const transaction = await beginRollbackContext();
   try {
     await transaction.run(async () => {
@@ -26,6 +27,9 @@ test('Special counts include every new and confirmed case across yards, beyond t
       await query('UPDATE sales_special_stock_cases SET sales_order_skipped=true, purchase_order_skipped=true WHERE request_id=$1', [cases[63].id]);
       await query("UPDATE sales_special_stock_cases SET close_status='closed' WHERE request_id=$1", [cases[64].id]);
       await query('UPDATE sales_special_stock_cases SET operationally_complete=true WHERE request_id=$1', [cases[65].id]);
+      await query("INSERT INTO sales_orders(netsuite_id,tranid,fulfillment_status,fulfilled_at,netsuite_active) VALUES(993330101,'TEST-ALERT-COMPLETE-SO','fulfilled',now(),true)");
+      await query("INSERT INTO purchase_orders(netsuite_id,tranid,receipt_status,received_at,netsuite_active) VALUES(993330102,'TEST-ALERT-COMPLETE-PO','received',now(),true)");
+      await query("UPDATE sales_special_stock_cases SET sales_order_netsuite_id=993330101,sales_order_ref='TEST-ALERT-COMPLETE-SO',purchase_order_netsuite_id=993330102,purchase_order_ref='TEST-ALERT-COMPLETE-PO' WHERE request_id=$1",[cases[65].id]);
       assert.deepEqual(await getSpecialStockAlertCounts(), { newRequests: initial.newRequests + 60, confirmedOrders: initial.confirmedOrders + 2, total: initial.total + 62 });
       await query("UPDATE sales_special_stock_cases SET close_status='closed' WHERE request_id=$1", [cases[61].id]);
       await query("UPDATE sales_special_stock_lines SET supply_status='in_stock' WHERE request_id=$1", [cases[0].id]);

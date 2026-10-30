@@ -58,11 +58,11 @@ test("page confirmation has a duplicate-click guard and ships in a fresh Operato
   assert.match(operator, /pageConfirming = true;/u);
   assert.match(operator, /pageConfirming = false;/u);
   assert.match(css, /@media \(max-width: 700px\)[\s\S]*?\.receiving-grid\s*\{[\s\S]*?grid-template-columns:\s*minmax\(0, 1fr\)/u);
-  assert.match(html, /operator\.css\?v=20260916-operator-bottom-inset-v1/u);
-  assert.match(html, /operator\.js\?v=20260917-load-followup-v1/u);
-  assert.match(serviceWorker, /mbbs-yard-operator-20260917-load-followup-v1/u);
-  assert.match(serviceWorker, /operator\.css\?v=20260916-operator-bottom-inset-v1/u);
-  assert.match(serviceWorker, /operator\.js\?v=20260917-load-followup-v1/u);
+  assert.match(html, /operator\.css\?v=20261029-pallet-search&returnExchangeLayout=20261029&palletBottom=20261029/u);
+  assert.match(html, /operator\.js\?v=20261028-repair-pwa&stockExchange=20261029&returnExchangeLayout=20261029&palletBottom=20261029/u);
+  assert.match(serviceWorker, /mbbs-yard-operator-20261030-shell-repair-v1/u);
+  assert.match(serviceWorker, /operator\.css\?v=20261029-pallet-search&returnExchangeLayout=20261029&palletBottom=20261029/u);
+  assert.match(serviceWorker, /operator\.js\?v=20261028-repair-pwa&stockExchange=20261029&returnExchangeLayout=20261029&palletBottom=20261029/u);
 });
 
 test("server exposes separate Customer Pickup and PO-only batch endpoints", async () => {

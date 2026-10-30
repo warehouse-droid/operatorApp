@@ -1,3 +1,4 @@
+import { assertIsolatedTestConnection } from '../../support/test-database-isolation.mjs';
 import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 import vm from "node:vm";
@@ -9,9 +10,7 @@ import { createOperator, loginOperator, getOperatorByToken, operatorHomeRoute } 
 import { createOperatorPreferencesRouter } from "../../../src/operator-preferences-router.js";
 import { normalizeOperatorPreferences } from "../../../src/operator-preferences-policy.js";
 
-if (process.env.MBT_TEST_ISOLATED !== "1" || !/\/mbt_test(?:[?#]|$)/.test(process.env.DATABASE_URL || "")) {
-  throw new Error("Preferences tests require the disposable test database.");
-}
+assertIsolatedTestConnection(process.env.DATABASE_URL);
 
 // Execute the existing production authentication/role middleware, without starting
 // the production app or its background workers.

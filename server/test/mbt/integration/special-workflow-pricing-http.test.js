@@ -135,7 +135,7 @@ test('unprepared delivery failure allows request removal over HTTP without remot
  assert.equal(approved.payload.quantityReview.status,'approved');assert.equal(nativeFetches,before);
  assert.deepEqual((await query('SELECT fulfillment_change FROM sales_special_stock_cases WHERE request_id=$1',[d.id])).rows[0].fulfillment_change,journal);
 });
-test('saved quotes enforce login, role, yard and workflow scope and end only when a real SO is linked', async () => {
+test('saved quotes enforce login, role, yard and workflow scope and remain available after a real SO is linked', async () => {
   const d = await draft(), path = `/api/sales/special-stock-requests/${d.id}/quote.pdf`;
   assert.equal((await documentRequest(path, null)).status, 401);
   assert.equal((await documentRequest(path, 'dispatch')).status, 403);
@@ -147,8 +147,8 @@ test('saved quotes enforce login, role, yard and workflow scope and end only whe
   try { assert.equal((await documentRequest(path)).status, 404); }
   finally { await query("UPDATE mbt_feature_flags SET enabled=true WHERE flag_key='special_stock_request_workflow'"); }
   await query("UPDATE sales_special_stock_cases SET sales_order_netsuite_id=8899490,sales_order_ref='TEST-SO' WHERE request_id=$1", [d.id]);
-  assert.equal((await documentRequest(path)).status, 409);
-  assert.equal((await documentRequest(path.replace('/sales/', '/scm/'), 'scm')).status, 409);
+  assert.equal((await documentRequest(path)).status, 200);
+  assert.equal((await documentRequest(path.replace('/sales/', '/scm/'), 'scm')).status, 200);
 });
 
 test('native SO/PO PDFs persist exact bytes, enforce Sales/SCM roles, and refresh after local changes', async () => {

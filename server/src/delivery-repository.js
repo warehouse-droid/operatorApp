@@ -2311,7 +2311,9 @@ export async function listSavedDeliveryOrdersForOperator(operatorId, { locationI
   );
   const orders = await getDeliveryOrdersBatch(saved.rows.map((item) => item.order_key));
   const orderByKey = new Map(orders.map((order) => [String(order.netsuite_id), order]));
-  const reopenedIds = await locallyReopenedSalesOrderIds(orders.filter(order => order.order_type === "sales_order").map(order => order.netsuite_id));
+  const reopenedIds = await locallyReopenedSalesOrderIds(orders
+    .filter(order => order.order_type === "sales_order" && !isDispatchGroupOrderId(order.netsuite_id))
+    .map(order => order.netsuite_id));
   const rows = [];
   for (const item of saved.rows) {
     const order = orderByKey.get(String(item.order_key));

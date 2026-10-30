@@ -55,6 +55,7 @@ async function fixture(audience, width = 1440, configure = () => {}) {
     try { return route.fulfill({ body: await readFile('public' + file), contentType: ({ js: 'application/javascript', css: 'text/css', html: 'text/html' })[file.split('.').at(-1)] || 'application/octet-stream' }); }
     catch { return route.fulfill({ status: 404, body: '' }); }
   });
+  await page.route(url=>/\/items\/\d+\/units$/.test(url.pathname),route=>route.fulfill({json:{noUnits:false,defaultUnitId:865,units:[{id:865,name:'PC'},{id:873,name:'EACH'},{id:950,name:'SQFT'}]}}));
   await page.goto(`http://localhost/${audience}/stock-requests?tab=special`);
   await page.locator('.stock-request-card[data-id="1"]').click();
   return { page, context, state };
@@ -74,7 +75,7 @@ test('SCM one save validates every ETA, preserves all line drafts after failure,
     await lines.nth(0).locator('[name=salesVisibleNote]').fill('First reply');
     await lines.nth(1).locator('[name=salesVisibleNote]').fill('Second reply');
     await lines.nth(0).locator('[name=supplyStatus]').selectOption('production');
-    await lines.nth(1).locator('[name=supplyStatus]').selectOption('vendor_transfer');
+    await lines.nth(1).locator('[name=supplyStatus]').selectOption('production');
     await lines.nth(0).locator('[name=availableDate]').fill('2099-02-01');
     await save.click(); assert.equal(state.posts.length, 0);
     await lines.nth(1).locator('[name=availableDate]').fill('2099-03-01');
@@ -89,7 +90,7 @@ test('SCM one save validates every ETA, preserves all line drafts after failure,
     assert.equal(state.posts.length, 2);
     assert.equal(state.posts[1].path, '/api/scm/special-stock-requests/1/stock-check');
     assert.deepEqual(state.posts[1].body.lines.map(l => [l.lineId,l.supplyStatus,l.availableDate,l.salesVisibleNote]),
-      [[1,'production','2099-02-01','First reply'],[2,'vendor_transfer','2099-03-01','Second reply'],[3,'in_stock',null,'']]);
+      [[1,'production','2099-02-01','First reply'],[2,'production','2099-03-01','Second reply'],[3,'in_stock',null,'']]);
     assert.equal(state.posts[1].body.expectedRevision, 1);
     assert.deepEqual(state.errors, []);
     await page.screenshot({ path: `${out}/scm-batch.png`, fullPage: true });
@@ -102,6 +103,7 @@ for (const supplyStatus of ['in_stock', 'no_stock']) test(`SCM edits item names 
   });
   try {
     const name = page.locator('[data-special-stock-line]').first().locator('[name=productName]');
+    await page.locator('[data-special-stock-line]').first().getByRole('button',{name:'Edit',exact:true}).click();
     await expect(name).toHaveValue('TEST product 1');
     await name.fill('Fire Pit 32" Square Insert <img src=x>');
     state.fail = true;
@@ -173,7 +175,7 @@ test('SCM requires a percentage per material, retains distinct failed inputs, an
     await expect(page.locator('[name=vendorDiscountAmount]')).toHaveCount(0);
     await expect(discount.nth(0)).toHaveValue('');await create.click();assert.equal(state.posts.length,0);
     for(const [i,pct] of ['0','10','20'].entries()) await discount.nth(i).fill(pct);
-    await expect(page.locator('[data-special-purchase-totals]')).toContainText('Gross purchase total: 300 · Vendor discount: 30 · Net purchase total: 270');
+    await expect(page.locator('[data-special-purchase-totals]')).toContainText('Gross purchase total: $300.00 · Vendor discount: $30.00 · Net purchase total: $270.00');
     state.fail=true;await create.click();
     await expect(page.locator('.stock-request-feedback')).toContainText('Review changed');
     for(const [i,pct] of ['0','10','20'].entries()) await expect(discount.nth(i)).toHaveValue(pct);

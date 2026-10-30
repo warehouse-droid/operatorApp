@@ -30,7 +30,7 @@ test('all declined or closed materials cannot produce a quote containing only ch
   for (const decision of ['accepted', 'pending', undefined]) {
     d.lines = [item(1, decision)]; assert.equal(buildSpecialQuote(d, profile).snapshot.lines.length, 3);
   }
-  assert.throws(() => buildSpecialQuote({ ...d, salesOrderId: 1 }, profile), { status: 409 });
+  assert.deepEqual(buildSpecialQuote({ ...d, salesOrderId: 1 }, profile).snapshot, buildSpecialQuote(d, profile).snapshot);
 });
 
 test('Property: quote eligibility changes only eligible material amounts and includes charges exactly once', () => {

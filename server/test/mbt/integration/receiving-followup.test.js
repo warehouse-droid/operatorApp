@@ -30,7 +30,7 @@ test("the pallet follow-up creates a distinct IR draft and omits the already com
   await confirmReceivingLine(orderId, f.pallet.id, { salesQty: 28 }, actor);
   const next = await draft();
   assert.notEqual(next.steps[0].externalId, first.steps[0].externalId);
-  assert.deepEqual(selected(next), [{ orderLine: 34, quantity: 28, itemReceive: true, location: 1 }]);
+  assert.deepEqual(selected(next), [{ orderLine: 34, quantity: 28, itemReceive: true, location: 1, custcol_plt: 0, custcol_lyr: 0, custcol_sec: 0, custcol_pcs: 0 }]);
   assert.equal(next.steps[0].sourceNetSuiteId, parentId);
   assert.equal(next.steps[0].payload.memo, "SN1400625");
   assert.equal(next.steps[0].payload.custbody9, "SN1400625");

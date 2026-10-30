@@ -1,3 +1,4 @@
+import { assertIsolatedTestConnection } from '../../support/test-database-isolation.mjs';
 import test, { after } from 'node:test';
 import assert from 'node:assert/strict';
 import { beginRollbackContext, closeDb, query } from '../../../src/db.js';
@@ -6,7 +7,7 @@ import * as repo from '../../../src/special-stock-request-repository.js';
 after(closeDb);
 test('Worker preserves Pending Update and blocks stock readiness until Sales replies', async () => {
   assert.equal(process.env.MBT_TEST_ISOLATED, '1');
-  assert.equal(new URL(process.env.DATABASE_URL).hostname, 'mbbs-special-updates-db-20261002');
+  assertIsolatedTestConnection(process.env.DATABASE_URL);
   const tx = await beginRollbackContext();
   try {
     await tx.run(async () => {
@@ -27,7 +28,7 @@ const actor = 'stock-update-worker-available-test', context = { operatorId: acto
 const response = { supplyStatus: 'low_inventory', availabilityMode: 'no_projection', vendorId: 8899200, vendorName: 'TEST Vendor', vendorYard: 'TEST Yard' };
 async function fixture(run) {
   assert.equal(process.env.MBT_TEST_ISOLATED, '1');
-  assert.equal(new URL(process.env.DATABASE_URL).hostname, 'mbbs-special-updates-db-20261002');
+  assertIsolatedTestConnection(process.env.DATABASE_URL);
   const tx = await beginRollbackContext();
   try { await tx.run(async () => {
     await query("INSERT INTO operators(id,username,display_name,password_hash,password_salt,role,roles,yard_location_ids) VALUES($1,$1,'TEST Worker Available','test','test','sales',ARRAY['sales'],ARRAY[1]) ON CONFLICT DO NOTHING", [actor]);
@@ -50,11 +51,14 @@ test('Accepted Low inventory remains ready, permits a dispatch handoff and vendo
   await query("UPDATE sales_special_stock_cases SET sales_order_netsuite_id=$2,sales_order_ref=$3,sales_order_approved=true,purchase_order_netsuite_id=$4,purchase_order_ref=$5 WHERE request_id=$1", [d.id, so, `TEST-SO-LOW-${so}`, po, `TEST-PO-LOW-${po}`]);
   detail = await repo.checkSpecialStockReadiness(d.id, d.lines[0].id, { expectedRevision: detail.revision, ready: true }, context);
   assert.equal(detail.lines[0].supplyStatus, 'low_inventory'); assert.equal(detail.readinessAlerts.length, 0);
-  assert.equal(detail.handoff.status, 'waiting_route'); assert.equal(detail.stage, 'dispatch_arrangement');
+  assert.equal(detail.handoff.status, 'waiting_route'); assert.equal(detail.stage, 'confirmed');
   await query("UPDATE sales_special_stock_cases SET fulfillment_method='vendor_pickup' WHERE request_id=$1", [d.id]);
   const pickup = { expectedRevision: detail.revision, pickupDate: '2099-02-01', pickupReference: 'Customer collection receipt' };
   await query("UPDATE sales_special_stock_lines SET supply_status='production' WHERE request_id=$1", [d.id]);
   await assert.rejects(() => repo.completeSpecialVendorPickup(d.id, pickup, context), { code: 'SPECIAL_STOCK_NOT_READY' });
   await query("UPDATE sales_special_stock_lines SET supply_status='low_inventory' WHERE request_id=$1", [d.id]);
-  assert.equal((await repo.completeSpecialVendorPickup(d.id, pickup, context)).stage, 'completed');
+  const collected = await repo.completeSpecialVendorPickup(d.id, pickup, context);
+  assert.equal(collected.stage, 'confirmed');
+  assert.equal(collected.vendorPickupReference, pickup.pickupReference);
+  assert.equal(collected.events.filter(event => event.eventType === 'special_vendor_pickup_completed').length, 1);
 }));

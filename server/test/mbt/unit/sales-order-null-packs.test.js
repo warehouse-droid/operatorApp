@@ -84,7 +84,7 @@ test('discounted direct and estimate SO transports explicitly send null for ever
 test('PO payloads retain existing behavior and independent purchase quantities', () => {
   const payload = buildSpecialPurchaseOrderPayload({ caseId: 9, vendorId: 5, netsuiteLocationId: 1,
     lines: [{ itemId: 2055, quantity: 24, rate: 10, ...packs(0) }] });
-  assert.ok(native.every(field => !Object.hasOwn(payload.item.items[0], field)));
+  assert.deepEqual(native.map(field => payload.item.items[0][field]), [null, null, null, null]);
   assert.equal(payload.item.items[0].quantity, 24);
   assert.equal(payload.item.items[0].rate, 10);
 });

@@ -111,7 +111,8 @@ test('a failed transaction leaves neither a message nor an alert',async()=>{
 test('Resolve produces a new unread Sales alert after a previously read SCM reply',async()=>{
   const r=await request(),instruction=(await send(r)).body;
   assert.equal((await http(`/api/sales/stock-requests/${r.id}/decisions/read`,'sales',{eventId:instruction.manualDecisionEventId})).status,200);
-  assert.ok(!(await http('/api/sales/stock-requests/alerts','sales')).body.requests.some(row=>row.id===r.id));
+  assert.equal(Number((await query('SELECT event_id FROM regular_stock_decision_reads WHERE request_id=$1 AND operator_id=$2',[r.id,actors.sales.id])).rows[0].event_id),instruction.manualDecisionEventId);
+  assert.ok((await http('/api/sales/stock-requests/alerts','sales')).body.requests.some(row=>row.id===r.id), 'a pending Sales response remains actionable after reading');
   const resolved=await http(`/api/scm/stock-requests/${r.id}/resolve`,'scm',{expectedRevision:instruction.revision,purchaseOrderRef:'REPLY-PO-'+run,eta:'2026-11-01'});assert.equal(resolved.status,200);
   assert.equal(resolved.body.displayStatus,'resolved');assert.equal((await send(resolved.body)).status,409);
   const alert=(await http('/api/sales/stock-requests/alerts','sales')).body.requests.find(row=>row.id===r.id);assert.equal(alert.eventId,resolved.body.manualDecisionEventId);assert.equal(alert.action,'resolve');

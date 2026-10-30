@@ -147,6 +147,12 @@ test('closed, completed, cancelled, closure-pending and skipped cases stop notif
   for(const patch of ["close_status='closed'","close_status='closure_pending'","operationally_complete=true","sales_order_skipped=true,purchase_order_skipped=true,purchase_order_netsuite_id=NULL,purchase_order_ref=NULL"]){
     const detail=await newCase();assert.ok((await notices()).some(a=>a.requestId===detail.id));
     await query('UPDATE sales_special_stock_cases SET '+patch+' WHERE request_id=$1',[detail.id]);
+    if(patch==='operationally_complete=true'){
+      const soId=890000000+detail.id,soRef='TEST-COMPLETE-'+detail.id;
+      await query("INSERT INTO sales_orders(netsuite_id,tranid,status_text,netsuite_active) VALUES($1,$2,'Sales Order : Pending Billing',true)",[soId,soRef]);
+      await query("UPDATE purchase_orders SET status_text='Purchase Order : Pending Bill' WHERE netsuite_id=$1",[detail.poId]);
+      await query('UPDATE sales_special_stock_cases SET sales_order_netsuite_id=$2,sales_order_ref=$3 WHERE request_id=$1',[detail.id,soId,soRef]);
+    }
     assert.ok(!(await notices()).some(a=>a.requestId===detail.id),patch);
   }
   const detail=await newCase();await query("UPDATE sales_stock_requests SET status='cancelled' WHERE id=$1",[detail.id]);assert.ok(!(await notices()).some(a=>a.requestId===detail.id));

@@ -1,4 +1,4 @@
-import {normalizeMenuOrders,orderMenuItems} from './menu-order-model.js?v=20261006';
+import {normalizeMenuOrders,orderMenuItems} from './menu-order-model.js?v=20261006&suiteRepair=20261030-v1';
 
 let snapshot = {revision:0,orders:{}};
 let pending = null;

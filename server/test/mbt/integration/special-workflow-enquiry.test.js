@@ -45,9 +45,11 @@ test('directory customer identity persists from enquiry through SO draft without
  await query("INSERT INTO sales_orders(netsuite_id,tranid,customer_id,status_text,netsuite_active) VALUES(8899570,'TEST-WRONG-CUSTOMER',8899502,'Pending Fulfillment',true)");
  await assert.rejects(()=>repo.linkSpecialSalesOrder(d.id,{expectedRevision:d.revision,source:'standalone',salesOrderId:8899570,salesOrderRef:'TEST-WRONG-CUSTOMER'},context),{code:'SPECIAL_SO_CUSTOMER_MISMATCH'});
  await canonical(id+2);
- d=await repo.saveSpecialSalesOrderDraft(d.id,{...draft,expectedRevision:d.revision,customerId:id+2},context);assert.equal(d.customerId,id+2);
- const stored=(await query('SELECT canonical_customer_id,directory_customer_id FROM sales_special_stock_cases WHERE request_id=$1',[d.id])).rows[0];
- assert.equal(Number(stored.canonical_customer_id),id+2);assert.equal(stored.directory_customer_id,null);
+ d=await repo.saveSpecialSalesOrderDraft(d.id,{...draft,expectedRevision:d.revision,customerId:id+2},context);
+ assert.equal(d.customerId,id);assert.equal(d.netsuiteCustomerId,id+2);
+ const stored=(await query('SELECT canonical_customer_id,directory_customer_id,order_customer_netsuite_id FROM sales_special_stock_cases WHERE request_id=$1',[d.id])).rows[0];
+ assert.equal(stored.canonical_customer_id,null);assert.equal(Number(stored.directory_customer_id),id);
+ assert.equal(Number(stored.order_customer_netsuite_id),id+2);
 }));
 test('unknown directory identities and unauthorized yards remain rejected',()=>fixture(async()=>{
  await assert.rejects(()=>repo.createSpecialStockCase({...input(),customerId:id+99},context),{code:'SPECIAL_CASE_CUSTOMER_INVALID'});

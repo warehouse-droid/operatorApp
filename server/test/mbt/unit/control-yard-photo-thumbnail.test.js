@@ -69,7 +69,7 @@ test("Yard In/Outbound incremental detail renders hydrate secure photo thumbnail
 });
 
 test("Control and Admin request the cache-busted thumbnail hydration client", () => {
-  const expectedAsset = "/control.js?v=20260917-return-ra-v1";
+  const expectedAsset = "/control.js?v=20261022-aggregate-nightly-labels-v1";
   assert.ok(controlHtml.includes(expectedAsset));
   assert.ok(adminHtml.includes(expectedAsset));
 });

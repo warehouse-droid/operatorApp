@@ -18,7 +18,10 @@ export async function dismissRegularAlerts(page){
   page.setDefaultTimeout(10000);
   await page.addLocatorHandler(page.locator('.regular-stock-popup[open]'),async()=>{
     for(let count=0;count<300&&await page.locator('.regular-stock-popup[open]').count();count++){
-      await page.locator('.regular-stock-popup[open]').getByRole('button',{name:/^(Close|关闭)$/}).click();
+      // A concurrent acknowledgement may remove this popup between checks.
+      // Dispatch the real close-button event only while the button still exists.
+      await page.locator('.regular-stock-popup[open]').getByRole('button',{name:/^(Close|关闭)$/})
+        .evaluateAll(buttons=>buttons[0]?.click());
     }
   });
 }

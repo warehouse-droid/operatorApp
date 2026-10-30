@@ -6,6 +6,7 @@ import { createFrontdeskQuote, issueFrontdeskQuote, acceptFrontdeskQuote, conver
   exchangeFrontdeskServiceLine, collectFrontdeskServiceLine } from '../../../src/mbt/frontdesk-service.js';
 import { previewFrontdeskChargeRequest } from '../../../src/mbt/customer-charge-request-service.js';
 import { getMbtBinPlanning } from '../../../src/mbt/bin-planning-service.js';
+import { getBinOrderWorkflowOptions, configureBinOrderWorkflow } from '../../../src/mbt/bin-order-workflow-service.js';
 import { createFrontdeskPrerequisites, frontdeskCommand, quoteCommand, frontdeskDistanceResolver,
   frontdeskTaxResolver } from '../support/frontdesk-fixtures.js';
 import { boundary } from '../support/bin-planning-fixtures.js';
@@ -72,17 +73,26 @@ test('a delivered sibling can be collected while the newly added bin remains blo
   await assert.rejects(operation(f, added, 'collect'), error => error.code === 'MBT_FRONTDESK_BIN_NOT_DELIVERED');
 });
 
-test('two fresh deliveries show unavailable physical bins instead of reporting missing front legs', async () => {
+test('two fresh deliveries remain visible awaiting configuration and cannot select an unavailable physical bin', async () => {
   const f = await fixture();
+  const before = await snapshot(f);
   const feed = await getMbtBinPlanning({ planDate: '2037-08-03', search: f.contract.contractNumber }, boundary);
   assert.equal(feed.pool.total, 2);
   assert.equal(new Set(feed.pool.items.map(card => card.mbt.serviceLineId)).size, 2);
   for (const card of feed.pool.items) {
     assert.equal(card.serviceAction, 'delivery');
-    assert.match(card.blockedReason, /no available.*bin/i);
-    assert.doesNotMatch(card.blockedReason, /front leg.*missing/i);
+    assert.equal(card.blockedReason, null);
+    assert.equal(card.workflow.configurationRequired, true);
     assert.equal(card.mbt.frontLeg.dispatchable, false);
+    const options = await getBinOrderWorkflowOptions(card.mbt.visitId);
+    assert.equal(options.assets.length, 0);
+    await assert.rejects(configureBinOrderWorkflow({
+      actor: { operatorId: actor.operatorId, roles: ['dispatcher'] }, visitId: card.mbt.visitId,
+      expectedRevision: card.workflow.revision, deliveryAssetId: crypto.randomUUID(),
+      idempotencyKey: crypto.randomUUID(), correlationId: crypto.randomUUID(), requestId: crypto.randomUUID()
+    }), /The selected physical bin is unavailable/);
   }
+  assert.deepEqual(await snapshot(f), before);
 });
 
 test('simultaneous premature exchange and collection both reject without partial changes', async () => {

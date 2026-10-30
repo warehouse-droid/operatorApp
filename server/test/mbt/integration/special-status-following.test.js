@@ -1,3 +1,4 @@
+import { assertIsolatedTestConnection } from '../../support/test-database-isolation.mjs';
 import test, { before, after, beforeEach } from 'node:test';
 import assert from 'node:assert/strict';
 import { createOperator } from '../../../src/auth-repository.js';
@@ -10,12 +11,14 @@ import { readSpecialDriverProgress } from '../../../src/special-stock-logistics.
 
 const so = 8800101, po = 8800102, stamp = '2026-10-02 18:33:06.937123+00';
 let caseId, server, base, token;
+const previousMirrorRole = config.netSuiteMirror.role;
 const observation = type => ({ orderType: type, netsuiteOrderId: type === 'sales_order' ? so : po,
   tranid: type === 'sales_order' ? 'TEST-STATUS-SO' : 'TEST-STATUS-PO', status: 'F',
   statusText: type === 'sales_order' ? 'Sales Order : Pending Billing' : 'Purchase Order : Pending Bill', syncedAt: stamp });
 before(async () => {
   assert.equal(process.env.MBT_TEST_ISOLATED,'1');assert.equal(process.env.NETSUITE_DIRECT_ACCESS_ENABLED,'false');
-  assert.ok(process.env.DATABASE_URL.endsWith('/mbt_verify'));
+  assertIsolatedTestConnection(process.env.DATABASE_URL);
+  config.netSuiteMirror.role = 'source';
   const user = await createOperator({ username: 'special-status-test', displayName: 'TEST', password: 'test-status-only',
     role: 'admin', roles: ['admin','sales','scm'], yardLocationIds: [1] });
   const operator = (await query("SELECT id FROM operators WHERE username='special-status-test'")).rows[0];
@@ -55,7 +58,7 @@ beforeEach(async () => {
     await query(`UPDATE ${table} SET status='B',status_text=$2,synced_at=$3 WHERE netsuite_id=$1`, [id,label,stamp]);
   }
 });
-after(async () => { if (server) await new Promise(resolve => server.close(resolve)); await closeDb(); });
+after(async () => { config.netSuiteMirror.role = previousMirrorRole; if (server) await new Promise(resolve => server.close(resolve)); await closeDb(); });
 async function business() {
   return (await query(`SELECT jsonb_build_object('request',(SELECT to_jsonb(r) FROM sales_stock_requests r WHERE id=$1),
     'case',(SELECT to_jsonb(s) FROM sales_special_stock_cases s WHERE request_id=$1),

@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 import test from "node:test";
+import { specialLineFields, SPECIAL_LINE_UNITS } from "../../../public/special-stock-line-fields.js";
 
 const read = (path) => readFileSync(new URL(`../../../${path}`, import.meta.url), "utf8");
 
@@ -61,9 +62,10 @@ test("Sales and SCM Special tabs are real feature-gated interfaces", () => {
   assert.match(salesSpecial, /Pallets needed/u);
   assert.doesNotMatch(salesSpecial, /<span>Case required date/u);
   assert.doesNotMatch(salesSpecial, /<span>Estimate number/u);
-  for (const value of ["PLT", "LYR", "SEC", "PCS", "EACH"]) {
-    assert.match(salesSpecial, new RegExp(`\\[\"${value}\"`, "u"));
-  }
+  assert.match(salesSpecial, /specialLineFields\(/u);
+  assert.deepEqual(SPECIAL_LINE_UNITS, ['PLT', 'LYR', 'SEC', 'PCS', 'EACH', 'SQFT']);
+  const fields = specialLineFields({uom:'PLT'});
+  for (const value of SPECIAL_LINE_UNITS) {assert.ok(fields.includes(`value="${value}"`));}
   assert.match(scmSpecial, /SCM stock check/u);
   assert.match(scmSpecial, /Review and create Purchase Order/u);
   assert.match(scmSpecial, /data-special-po-form/u);

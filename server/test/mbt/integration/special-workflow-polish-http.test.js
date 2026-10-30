@@ -1,3 +1,4 @@
+import { assertIsolatedTestConnection } from '../../support/test-database-isolation.mjs';
 import assert from 'node:assert/strict';
 import crypto from 'node:crypto';
 import test, { before, after } from 'node:test';
@@ -33,7 +34,7 @@ const poLines = detail => detail.purchaseOrderLines.map(line => ({ caseLineId: l
 
 before(async () => {
   assert.equal(process.env.MBT_TEST_ISOLATED, '1');
-  assert.ok(process.env.DATABASE_URL.endsWith('/mbt_verify'));
+  assertIsolatedTestConnection(process.env.DATABASE_URL);
   original = (await query('SELECT enabled FROM mbt_feature_flags WHERE flag_key=$1', [gate])).rows[0].enabled;
   originalWorkflow = (await query("SELECT enabled FROM mbt_feature_flags WHERE flag_key='special_stock_request_workflow'")).rows[0].enabled;
   await query("UPDATE mbt_feature_flags SET enabled=true WHERE flag_key IN ($1,'special_stock_request_workflow')", [gate]);
