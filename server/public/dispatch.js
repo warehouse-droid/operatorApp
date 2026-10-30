@@ -824,8 +824,14 @@ function applyAtomicDependencyMutationPayload(payload, context = {}) {
   }
   dispatchOrderRefreshEpoch += 1;
   if (payload?.plan) {
-    lastAcknowledgedPlanState = dispatchPlanWireState(payload.plan);
     if (context.generation !== undefined && context.generation !== localPlanGeneration) {
+      if (!mergeAcknowledgedDependencyPlan(payload.plan)) {
+        routeNotice = "Dependency updated. Your newer local draft is still visible. Review the saved plan before saving these conflicting edits.";
+        blockedPlanSaveFence = { planId: String(currentPlan?.id || ""), message: routeNotice };
+        blockedRemotePlanUpdate = true;
+        renderDispatchNoticePatch();
+        return false;
+      }
       currentPlan = compactCurrentPlan(payload.plan);
       minimumPlanRevisionToApply = { planId: String(payload.plan.id), revision: Number(payload.plan.revision) };
       saveQueued = true;
@@ -6901,6 +6907,46 @@ function splitOrderPlanningBlock(splits = []) {
 
 let binStopLabelsById = new Map();
 
+function withSavedDependencyProjection(candidate = {}, saved = {}) {
+  const next = { ...candidate };
+  const fields = ["pickupLocations", "orderDependencies", "orderDependency", "directPickupManifest",
+    "dependencyDirectPickup", "dependencyWaitingForTransfer", "dependencyAttention", "dependencyUncovered",
+    "dependencyUncoveredQuantity", "dependencyHidden", "dependentSalesOrderRef", "dependencyLabels", "toRouteProjection"];
+  for (const field of fields) {
+    if (Object.hasOwn(saved, field)) {next[field] = structuredClone(saved[field]);}
+    else {delete next[field];}
+  }
+  if (Array.isArray(candidate.childOrderDetails)) {
+    const children = new Map((saved.childOrderDetails || []).map(child => [String(child.id), child]));
+    next.childOrderDetails = candidate.childOrderDetails.map(child => children.has(String(child.id))
+      ? withSavedDependencyProjection(child, children.get(String(child.id))) : child);
+  }
+  return next;
+}
+
+function mergeAcknowledgedDependencyPlan(saved) {
+  const before = lastAcknowledgedPlanState;
+  const after = dispatchPlanWireState(saved);
+  if (!before) {return false;}
+  // Structural changes or simultaneous route edits require review. A newer
+  // unrelated order edit can be retained with the existing three-way merger.
+  const sameIds = (left, right) => dispatchSourceValueEqual(left.map(item => String(item.id)), right.map(item => String(item.id)));
+  if (!sameIds(before.orders, after.orders) || !sameIds(before.trucks, after.trucks)) {return false;}
+  const mergedOrders = mergeDispatchSourceRefreshOrders(orders, before.orders.map(normalizeOrder), after.orders.map(normalizeOrder));
+  const mergedTrucks = mergeDispatchSourceRefreshOrders(trucksFromFleetAndSavedPlan(trucks),
+    trucksFromFleetAndSavedPlan(before.trucks), trucksFromFleetAndSavedPlan(after.trucks));
+  if (!mergedOrders || !mergedTrucks) {return false;}
+  orders = mergedOrders;
+  trucks = mergedTrucks;
+  const byId = new Map(after.orders.map(order => [String(order.id), order]));
+  orderCatalog = orderCatalog.map(order => byId.has(String(order.id))
+    ? withSavedDependencyProjection(order, byId.get(String(order.id))) : order);
+  lastAcknowledgedPlanState = after;
+  rememberAssignedOrderEvidence(orders);
+  resetUndoHistory();
+  return true;
+}
+
 function applySavedPlan(saved) {
   if (!Array.isArray(saved?.orders) || !Array.isArray(saved?.trucks)) return false;
   if (saved.binStopLabels) binStopLabelsById = new Map(Object.entries(saved.binStopLabels));
@@ -6971,13 +7017,13 @@ function applySavedPlan(saved) {
       keepPlanningFields.items = order.items;
       keepPlanningFields.raw = order.raw;
     }
-    const merged = preserveActiveOrderEvidence(order, {
+    const merged = preserveActiveOrderEvidence(order, withSavedDependencyProjection({
       ...order,
       ...base,
       ...Object.fromEntries(Object.entries(keepPlanningFields).filter(([, value]) => value !== undefined)),
       shortageAvailability: base.shortageAvailability || order.shortageAvailability,
       committedQty: base.shortageAvailability ? base.committedQty : order.committedQty
-    }, activityEvidence);
+    }, order), activityEvidence);
     return [order.id, normalizeOrder(globalThis.DispatchAddressGuard?.preserve(order, merged).order || merged)];
   }));
   const hiddenOrderIds = new Set([

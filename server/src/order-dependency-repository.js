@@ -4,6 +4,7 @@ import { config, isNetSuiteSandboxEnvironment } from "./config.js";
 import { query, withTransaction } from "./db.js";
 import { completeDirectTransfersForDependencies } from "./direct-to-completion-repository.js";
 import { projectDirectTransferResidual } from "./dispatch-to-route-projection.js";
+import { stripDispatchTransferDependencyProjection } from "./dispatch-plan-order-projection.js";
 import { completedTransferUnlinkAllowed } from "./scm-dependency-management-policy.js";
 import { writeDispatchAudit } from "./dispatch-audit-repository.js";
 import { resolveDispatchSalesTarget } from "./dispatch-order-target-repository.js";
@@ -4593,7 +4594,13 @@ export async function cancelOrderDependency(
 
 export async function enrichDispatchOrdersWithDependencies(orders = []) {
   if (!orders.length) {return [];}
-  const orderRefs = [...new Set(orders.flatMap(dispatchOrderRefs))];
+  orders = orders.map(stripDispatchTransferDependencyProjection);
+  /** @param {import("./dispatch-plan-order-projection.js").TransferDependencySnapshot} order @returns {string[]} */
+  const dependencyRefs = order => [...new Set([
+    ...dispatchOrderRefs(order),
+    ...(order.type === "CO" ? [] : (order.childOrderDetails || []).flatMap(dependencyRefs))
+  ])];
+  const orderRefs = [...new Set(orders.flatMap(dependencyRefs))];
   const [dependencies, shortageRows] = await Promise.all([
     loadDependencies({ orderRefs }),
     salesOrderShortageRows(null, orderRefs).catch(() => [])
@@ -4610,9 +4617,14 @@ export async function enrichDispatchOrdersWithDependencies(orders = []) {
     bySales.get(dependency.salesOrderRef).push(dependency);
     byTransfer.set(dependency.transferOrderRef, dependency);
   }
-  return orders.map((order) => {
+  /** @param {import("./dispatch-plan-order-projection.js").TransferDependencySnapshot} snapshot
+   * @returns {import("./dispatch-plan-order-projection.js").TransferDependencySnapshot} */
+  const project = (snapshot) => {
+    const order = Array.isArray(snapshot.childOrderDetails) && snapshot.type !== "CO"
+      ? { ...snapshot, childOrderDetails: snapshot.childOrderDetails.map(project) }
+      : snapshot;
     const ref = text(order.id || order.tranid);
-    const salesRefs = dispatchOrderRefs({ ...order, id: ref });
+    const salesRefs = dependencyRefs({ ...order, id: ref });
     const salesDependencies = [...new Map(
       salesRefs.flatMap((salesRef) => bySales.get(salesRef) || [])
         .map((dependency) => [String(dependency.id), dependency])
@@ -4671,7 +4683,8 @@ export async function enrichDispatchOrdersWithDependencies(orders = []) {
       };
     }
     return order;
-  });
+  };
+  return orders.map(project);
 }
 
 export function normalDispatchGroupTargets(plan = {}) {

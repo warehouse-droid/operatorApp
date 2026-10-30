@@ -1,0 +1,208 @@
+{
+  "passed": true,
+  "baseImage": "sha256:84764179b5e9d7769b64b1f195be82fd4170f6d7ef3202fc4bdc3f041e4836ff",
+  "files": {
+    "src/scm-dependency-plan-reconciler.js": "888dc11da123ef01533cd001864747e9a3a5f7c79b689a0a8c5d4d5bd868b1ec",
+    "src/dispatch-pickup-visits.js": "fec0b5c7d0888025b9028938ce44ca9f94391a1d841ce0f45ae4e72de4978e17",
+    "src/scm-dependency-command-service.js": "6be3f51b3d9802de194b61aed7c62c6cdc1725693c57926e470846c12c54e207"
+  },
+  "baselineFiles": {
+    "src/scm-dependency-plan-reconciler.js": "a0f2bd3cebc67e3a1e5c1435bdbe64b1572143bafd4af193b15eef11d2d359ed",
+    "src/dispatch-pickup-visits.js": "e68c1f991abe954a4dfd916a4ea173f7d8f31ce2c28f8758263e93b16e01ded2",
+    "src/scm-dependency-command-service.js": "88bc23e69c50de36db3b0d30d80efb0f8acd53c4d639e98176422b1f8f4f1d32"
+  },
+  "changedLines": {
+    "src/scm-dependency-plan-reconciler.js": [
+      2,
+      272,
+      274,
+      276,
+      277,
+      278,
+      279,
+      280,
+      281,
+      282,
+      283,
+      284,
+      293,
+      300,
+      330,
+      331,
+      332,
+      333,
+      335,
+      366,
+      367,
+      394
+    ],
+    "src/dispatch-pickup-visits.js": [
+      138,
+      162,
+      320
+    ],
+    "src/scm-dependency-command-service.js": [
+      244
+    ]
+  },
+  "specApproval": "not obtained (autonomous run)",
+  "scope": "Full dependency-management suite plus pickup, projection, residual, concurrency and command regression suites; unrelated product suites excluded.",
+  "mutations": [
+    {
+      "name": "obsolete allocation survives",
+      "killed": true
+    },
+    {
+      "name": "unrelated references pruned",
+      "killed": true
+    },
+    {
+      "name": "unknown reference pruned",
+      "killed": true
+    },
+    {
+      "name": "protected pickup pruned",
+      "killed": true
+    },
+    {
+      "name": "shared allocation not added",
+      "killed": true
+    },
+    {
+      "name": "repeat visit duplicated",
+      "killed": true
+    },
+    {
+      "name": "configured empty visit rejected",
+      "killed": true
+    }
+  ],
+  "versions": {
+    "node": "v20.20.2",
+    "tools": {
+      "typescript": "7.0.2",
+      "eslint": "10.8.0",
+      "c8": "12.0.0",
+      "fast-check": "4.9.0"
+    }
+  },
+  "baseline": {
+    "status": 1,
+    "tests": 126,
+    "pass": 123,
+    "fail": 3,
+    "skipped": 0,
+    "failures": [
+      "Operator loading remains an execution blocker even when the packing header says packed",
+      "RP-05 active travel protects its destination while allowing work after it",
+      "actual PO link preserves the dependent SO packing and still blocks loading"
+    ],
+    "failureDetails": [
+      {
+        "test": "actual PO link preserves the dependent SO packing and still blocks loading",
+        "details": "  ---\n  failureType: 'testCodeFailure'\n  error: 'Missing expected rejection.'\n  code: 'ERR_ASSERTION'\n  name: 'AssertionError'\n  stack: |-\n    process.processTicksAndRejections (node:internal/process/task_queues:95:5)\n    async file:///app/test-artifacts/candidate/test/dispatch/integration/to-dependency-packing-independent.test.js:141:5\n    async rollbackTest (file:///app/test-artifacts/candidate/test/dispatch/integration/to-dependency-packing-independent.test.js:43:9)\n    async TestContext.<anonymous> (file:///app/test-artifacts/candidate/test/dispatch/integration/to-dependency-packing-independent.test.js:125:3)\n    async Test.run (node:internal/test_runner/test:797:9)\n    async Test.processPendingSubtests (node:internal/test_runner/test:526:7)"
+      },
+      {
+        "test": "Operator loading remains an execution blocker even when the packing header says packed",
+        "details": "  ---\n  failureType: 'testCodeFailure'\n  error: |-\n    Expected values to be strictly equal:\n    \n    true !== false\n    \n  code: 'ERR_ASSERTION'\n  name: 'AssertionError'\n  expected: false\n  actual: true\n  operator: 'strictEqual'"
+      },
+      {
+        "test": "RP-05 active travel protects its destination while allowing work after it",
+        "details": "  ---\n  failureType: 'testCodeFailure'\n  error: |-\n    Expected values to be strictly equal:\n    \n    true !== false\n    \n  code: 'ERR_ASSERTION'\n  name: 'AssertionError'\n  expected: false\n  actual: true\n  operator: 'strictEqual'"
+      }
+    ]
+  },
+  "focused": {
+    "status": 0,
+    "tests": 12,
+    "pass": 12,
+    "fail": 0,
+    "skipped": 0,
+    "failures": [],
+    "failureDetails": []
+  },
+  "types": {
+    "baselineDiagnostics": 4370,
+    "candidateDiagnostics": 4370,
+    "newDiagnostics": []
+  },
+  "lint": 0,
+  "secretScan": 0,
+  "suite": {
+    "status": 1,
+    "tests": 138,
+    "pass": 135,
+    "fail": 3,
+    "skipped": 0,
+    "failures": [
+      "Operator loading remains an execution blocker even when the packing header says packed",
+      "RP-05 active travel protects its destination while allowing work after it",
+      "actual PO link preserves the dependent SO packing and still blocks loading"
+    ],
+    "failureDetails": [
+      {
+        "test": "actual PO link preserves the dependent SO packing and still blocks loading",
+        "details": "  ---\n  failureType: 'testCodeFailure'\n  error: 'Missing expected rejection.'\n  code: 'ERR_ASSERTION'\n  name: 'AssertionError'\n  stack: |-\n    process.processTicksAndRejections (node:internal/process/task_queues:95:5)\n    async file:///app/test-artifacts/candidate/test/dispatch/integration/to-dependency-packing-independent.test.js:141:5\n    async rollbackTest (file:///app/test-artifacts/candidate/test/dispatch/integration/to-dependency-packing-independent.test.js:43:9)\n    async TestContext.<anonymous> (file:///app/test-artifacts/candidate/test/dispatch/integration/to-dependency-packing-independent.test.js:125:3)\n    async Test.run (node:internal/test_runner/test:797:9)\n    async Test.processPendingSubtests (node:internal/test_runner/test:526:7)"
+      },
+      {
+        "test": "Operator loading remains an execution blocker even when the packing header says packed",
+        "details": "  ---\n  failureType: 'testCodeFailure'\n  error: |-\n    Expected values to be strictly equal:\n    \n    true !== false\n    \n  code: 'ERR_ASSERTION'\n  name: 'AssertionError'\n  expected: false\n  actual: true\n  operator: 'strictEqual'"
+      },
+      {
+        "test": "RP-05 active travel protects its destination while allowing work after it",
+        "details": "  ---\n  failureType: 'testCodeFailure'\n  error: |-\n    Expected values to be strictly equal:\n    \n    true !== false\n    \n  code: 'ERR_ASSERTION'\n  name: 'AssertionError'\n  expected: false\n  actual: true\n  operator: 'strictEqual'"
+      }
+    ]
+  },
+  "changedLineCoverage": [
+    {
+      "file": "src/scm-dependency-plan-reconciler.js",
+      "covered": 20,
+      "total": 20
+    },
+    {
+      "file": "src/dispatch-pickup-visits.js",
+      "covered": 3,
+      "total": 3
+    },
+    {
+      "file": "src/scm-dependency-command-service.js",
+      "covered": 1,
+      "total": 1
+    }
+  ],
+  "reverseOrder": {
+    "status": 0,
+    "tests": 12,
+    "pass": 12,
+    "fail": 0,
+    "skipped": 0,
+    "failures": [],
+    "failureDetails": []
+  },
+  "supplyChain": "No dependency changes. Runtime change adds no network, filesystem, subprocess or environment capabilities.",
+  "knownLimits": [
+    "Legacy TypeScript diagnostics are compared with baseline; this is not a fully typed codebase.",
+    "Browser end-to-end skipped: no UI or request contract changed; real command service and plan persistence exercised."
+  ],
+  "redReproduction": "Before the fix, both actual synthetic commands failed with DISPATCH_PICKUP_ORDER_WRONG_YARD at 2967. Broader regression review led to restricting cleanup to intentional dependency commands; ordinary manual-pickup validation remains enforced.",
+  "cleanup": {
+    "containersRemoved": true,
+    "disposableVolumesRemoved": true,
+    "testNetworksRemoved": true,
+    "rawArtifactsRemoved": true,
+    "dockerPsAndPsAllVerified": true,
+    "productionHealthPassed": true
+  },
+  "deployment": {
+    "deployed": true,
+    "at": "2026-10-30T13:31:24.947523+00:00",
+    "imageId": "sha256:42021bee2b26ba53a8d6953525f7132b55c42b3d8a8c23a20d00e2bae664b9d3",
+    "configurationPreserved": true,
+    "dependenciesUnchanged": true,
+    "health": 200,
+    "sourceHashesVerified": true,
+    "directDatabaseEdits": false
+  },
+  "verificationCommand": "bash docker/run-dependency-pickup-checks.sh"
+}

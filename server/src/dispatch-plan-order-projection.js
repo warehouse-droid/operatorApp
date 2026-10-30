@@ -148,6 +148,47 @@ export function stripDispatchRelationshipProjections(orders = []) {
   return (Array.isArray(orders) ? orders : []).map(stripDispatchRelationshipProjection);
 }
 
+/**
+ * @typedef {{[field: string]: unknown, id?: string, tranid?: string, type?: string,
+ * sourceYard?: string, originalOrderId?: string, childOrders?: string[], pickupLocations?: string[],
+ * childOrderDetails?: TransferDependencySnapshot[],
+ * orderDependencies?: Array<{mode?: string, sourceLocation?: string}>,
+ * directPickupManifest?: Array<{location?: string}>, poPickupManifest?: Array<{location?: string}>,
+ * toRouteProjection?: {hasResidual?: boolean}}} TransferDependencySnapshot
+ */
+
+/** @param {TransferDependencySnapshot} order @returns {string[]} */
+function transferPickupLocations(order = {}, retained = false) {
+  return [
+    ...(retained ? nativePickupLocations(order) : []),
+    ...(order[retained ? "poPickupManifest" : "directPickupManifest"] || []).map(entry => entry.location),
+    ...(retained ? [] : (order.orderDependencies || [])
+      .filter(link => link.mode === "direct_to_customer").map(link => link.sourceLocation)),
+    ...(order.childOrderDetails || []).flatMap(child => transferPickupLocations(child, retained))
+  ].map(text).filter(Boolean);
+}
+
+// TO hydration also runs after PO allocation hydration: retain PO cargo and
+// native child yards while discarding every cached TO relationship projection.
+/** @param {TransferDependencySnapshot} order @returns {TransferDependencySnapshot} */
+export function stripDispatchTransferDependencyProjection(order = {}) {
+  const previous = transferPickupLocations(order);
+  const retained = transferPickupLocations(order, true);
+  const next = { ...order };
+  if (Array.isArray(order.pickupLocations)) {
+    next.pickupLocations = order.pickupLocations.filter(location =>
+      !previous.some(candidate => scmDependencyLocationsMatch(candidate, location))
+      || retained.some(candidate => scmDependencyLocationsMatch(candidate, location)));
+  }
+  if (Array.isArray(order.childOrderDetails)) {
+    next.childOrderDetails = order.childOrderDetails.map(stripDispatchTransferDependencyProjection);
+  }
+  for (const field of RELATIONSHIP_ORDER_FIELDS) {
+    if (!["poPickupManifest", "poRouteProjection", "po_route_projection"].includes(field)) {delete next[field];}
+  }
+  return next;
+}
+
 export function dispatchRelationshipProjectionContext(orders = []) {
   const purchaseOrderRefs = [];
   const releasedTargetRefs = [];

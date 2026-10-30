@@ -8,6 +8,7 @@ import { overlayDispatchOrderCompletionStatuses } from "./dispatch-completion-re
 import { overlayFulfilledSalesDeliveryPlanning } from "./dispatch-fulfilled-so-repository.js";
 import { reconcileDispatchPlanLocalCos } from "./dispatch-co-lifecycle.js";
 import { reconcileDispatchGlobalOrderSources } from "./dispatch-delivery-group-repository.js";
+import { enrichDispatchOrdersWithDependencies } from "./order-dependency-repository.js";
 import {
   compactDispatchOrderCard,
   dispatchOrderSearchText
@@ -251,7 +252,8 @@ export async function getDispatchOrderCatalogOrder(ref) {
   const canonical = order.type === "CO"
     ? (await reconcileDispatchPlanLocalCos({ orders: [order], trucks: [] })).orders
     : [order];
-  const full = (await overlayFulfilledSalesDeliveryPlanning(await overlayDispatchOrderCompletionStatuses(canonical)))[0];
+  const current = await enrichDispatchOrdersWithDependencies(canonical);
+  const full = (await overlayFulfilledSalesDeliveryPlanning(await overlayDispatchOrderCompletionStatuses(current)))[0];
   return full ? { ...full, catalogHydrated: true, catalogDetailSignature: compactDispatchOrderCard(full).catalogDetailSignature } : null;
 }
 
@@ -343,7 +345,7 @@ export async function listDispatchOrderPool({
   const result = await query(
     `WITH pool_catalog AS (
        SELECT catalog.order_ref, catalog.order_type, catalog.eligible,
-              catalog.search_text, catalog.card, catalog.activity_at
+              catalog.search_text, catalog.card, catalog.activity_at, catalog.full_order
          FROM dispatch_order_catalog_entries catalog
         WHERE NOT EXISTS (
           SELECT 1
@@ -365,7 +367,7 @@ export async function listDispatchOrderPool({
        UNION ALL
        SELECT global_split.split_ref, global_split.order_type,
               global_split.eligible, global_split.search_text,
-              global_split.card, COALESCE(NULLIF(global_split.card->>'firstSeenAt', '')::timestamptz, date_trunc('milliseconds', global_split.created_at))
+              global_split.card, COALESCE(NULLIF(global_split.card->>'firstSeenAt', '')::timestamptz, date_trunc('milliseconds', global_split.created_at)), global_split.full_order
          FROM dispatch_global_order_splits global_split
         WHERE global_split.active = true
           AND NOT EXISTS (
@@ -377,7 +379,7 @@ export async function listDispatchOrderPool({
        UNION ALL
        SELECT global_group.group_ref, global_group.order_type,
               global_group.eligible, global_group.search_text,
-              global_group.card, COALESCE(NULLIF(global_group.card->>'firstSeenAt', '')::timestamptz, date_trunc('milliseconds', global_group.created_at))
+              global_group.card, COALESCE(NULLIF(global_group.card->>'firstSeenAt', '')::timestamptz, date_trunc('milliseconds', global_group.created_at)), global_group.full_order
          FROM dispatch_global_order_groups global_group
         WHERE global_group.active = true
           AND EXISTS (
@@ -454,7 +456,7 @@ export async function listDispatchOrderPool({
        SELECT candidate.*, CASE WHEN ${deliveryPrioritySql('candidate')} THEN 1 ELSE 0 END AS delivery_rank
          FROM visible_catalog candidate
      )
-     SELECT catalog.order_ref, catalog.card, catalog.activity_at, catalog.delivery_rank,
+     SELECT catalog.order_ref, catalog.card, catalog.full_order, catalog.activity_at, catalog.delivery_rank,
             CASE WHEN $2 <> '' AND lower(catalog.order_ref) = $2 THEN 1 ELSE 0 END AS exact_rank,
             assignment.plan_id::text AS plan_id,
             assignment.plan_date::text AS plan_date,
@@ -503,9 +505,16 @@ export async function listDispatchOrderPool({
   const hasMore = result.rows.length > safeLimit;
   const page = result.rows.slice(0, safeLimit);
   const last = page.at(-1);
+  // Only hydrate the bounded result page, then compact it again. Stored cards
+  // and grouped child snapshots can outlive cancelled TO relationships.
+  const current = await enrichDispatchOrdersWithDependencies(page.map(row => row.full_order));
   const [orders, state] = await Promise.all([
     overlayDispatchOrderCompletionStatuses(
-      page.map((row) => ({ ...row.card, ...assignmentFields(row),...(row.delivery_rank?{deliveryApprovalPriority:true}:{}) }))
+      current.map((order, index) => {
+        const row = page[index];
+        return { ...compactDispatchOrderCard(order), firstSeenAt: row.card.firstSeenAt,
+          ...assignmentFields(row), ...(row.delivery_rank ? { deliveryApprovalPriority: true } : {}) };
+      })
     ).then(overlayFulfilledSalesDeliveryPlanning),
     getDispatchOrderCatalogState()
   ]);

@@ -1,5 +1,5 @@
 import { dispatchDependencyOrderRefs } from "./yard-dependency-structure.js";
-import { dispatchLoadProtectedBoundary, dispatchPickupOverridesMatch, dispatchRequiredPickupVisitLocations } from "./dispatch-pickup-visits.js";
+import { dispatchLoadProtectedBoundary, dispatchPickupOverridesMatch, dispatchPickupVisitLocationAllowed, dispatchRequiredPickupVisitLocations } from "./dispatch-pickup-visits.js";
 
 function text(value) {
   return String(value ?? "").trim();
@@ -269,11 +269,19 @@ function emptyLinkedSourcePickup(order, location, plan) {
  * @param {Map<string, LinkedPickupOrder>} ordersByRef
  * @param {Set<string>} affected
  * @param {object} plan
+ * @param {boolean} reconcileExplicitPickupAllocations
  */
-function pruneEmptyLinkedPickup(stop, ordersByRef, affected, plan) {
+function pruneObsoletePickupAllocations(stop, ordersByRef, affected, plan, reconcileExplicitPickupAllocations) {
   if (stop?.type !== "pick" || !Array.isArray(stop.orderRefs) || !stop.orderRefs.length) {return stop;}
-  const retained = stop.orderRefs.filter(ref => !affected.has(text(ref).toLowerCase())
-    || !emptyLinkedSourcePickup(ordersByRef.get(text(ref).toLowerCase()), stop.location, plan));
+  const retained = stop.orderRefs.filter(ref => {
+    const key = text(ref).toLowerCase();
+    const order = ordersByRef.get(key);
+    if (!affected.has(key) || !order) {return true;}
+    // Intentional dependency commands may refresh dispatcher-created visits.
+    // Ordinary saves still validate invalid manual allocations without deleting them.
+    return (!reconcileExplicitPickupAllocations || dispatchPickupVisitLocationAllowed(order, stop.location))
+      && !emptyLinkedSourcePickup(order, stop.location, plan);
+  });
   if (retained.length === stop.orderRefs.length) {return stop;}
   if (!retained.length) {return null;}
   return { ...stop, orderRefs: retained,
@@ -282,14 +290,14 @@ function pruneEmptyLinkedPickup(stop, ordersByRef, affected, plan) {
       ? { dependencyTargetRefs: stop.dependencyTargetRefs.filter(ref => retained.includes(ref)) } : {}) };
 }
 
-function reconcileLoad(load = {}, ordersByRef, affected, plan, activity) {
+function reconcileLoad(load = {}, ordersByRef, affected, plan, activity, reconcileExplicitPickupAllocations = false) {
   let stops = Array.isArray(load.stops) ? load.stops.map((stop) => ({ ...stop })) : [];
   const boundary = dispatchLoadProtectedBoundary(load, activity);
   const protectedIds = new Set(stops.slice(0, boundary + 1).map(stop => text(stop.id)));
   const requirements = requirementsForStops(stops, ordersByRef);
 
   stops = stops.map(/** @param {LinkedPickupStop} stop */ stop => protectedIds.has(text(stop.id))
-    ? stop : pruneEmptyLinkedPickup(stop, ordersByRef, affected, plan)).filter(Boolean);
+    ? stop : pruneObsoletePickupAllocations(stop, ordersByRef, affected, plan, reconcileExplicitPickupAllocations)).filter(Boolean);
 
   stops = stops.filter((stop) => {
     if (protectedIds.has(text(stop.id))) {return true;}
@@ -319,11 +327,12 @@ function reconcileLoad(load = {}, ordersByRef, affected, plan, activity) {
     const locations = requiredPickupLocations(order, plan);
     const isSov = dispatchDependencyOrderRefs(order).some(ref => /^SOV/iu.test(ref));
     for (const location of locations) {
-      const priorPickup = stops.slice(0, index).find((stop) => stop?.type === "pick" && samePlace(stop.location, location)
-        && dispatchPickupOverridesMatch(ordersByRef.get(text(stop.orderId || stop.orderRefs?.[0]).toLowerCase()), order)
-        && (!isSov || !protectedIds.has(text(stop.id)) || refs(stop.orderRefs || [stop.orderId]).includes(targetRef)));
+      const priorPickups = stops.slice(0, index).filter((stop) => stop?.type === "pick" && samePlace(stop.location, location)
+        && dispatchPickupOverridesMatch(ordersByRef.get(text(stop.orderId || stop.orderRefs?.[0]).toLowerCase()), order));
+      const priorPickup = priorPickups.find(stop => refs(stop.orderRefs || [stop.orderId]).includes(targetRef))
+        || priorPickups.find(stop => !protectedIds.has(text(stop.id)));
       if (priorPickup) {
-        if ((isSov || text(order.pickupAddressOverride)) && !protectedIds.has(text(priorPickup.id)) && Array.isArray(priorPickup.orderRefs)) {
+        if (!protectedIds.has(text(priorPickup.id)) && Array.isArray(priorPickup.orderRefs)) {
           priorPickup.orderRefs = refs([...priorPickup.orderRefs, targetRef]);
         }
         if (protectedIds.has(text(priorPickup.id))) {continue;}
@@ -354,7 +363,8 @@ export function reconcileDependencyManagedPickups({
   enrichedOrders = [],
   affectedTargetRefs = [],
   preservedPoOrderRefs = new Set(),
-  activity = []
+  activity = [],
+  reconcileExplicitPickupAllocations = false
 } = {}) {
   // Relationship aliases identify related orders, not interchangeable snapshots.
   // A group or sibling split must never replace another order's own identity.
@@ -381,7 +391,7 @@ export function reconcileDependencyManagedPickups({
     orders,
     trucks: residualTrucks.map((truck) => ({
       ...truck,
-      loads: (truck.loads || []).map((load) => reconcileLoad(load, ordersByRef, affected, plan, activity))
+      loads: (truck.loads || []).map((load) => reconcileLoad(load, ordersByRef, affected, plan, activity, reconcileExplicitPickupAllocations))
     }))
   };
 }

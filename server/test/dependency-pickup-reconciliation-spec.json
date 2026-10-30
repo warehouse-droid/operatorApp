@@ -1,0 +1,26 @@
+{
+  "issue": "Dependency mode changes and unlink fail when an explicit pickup retains a target whose refreshed route no longer uses that yard.",
+  "tier": 3,
+  "specApproval": "not obtained (autonomous run); user explicitly requested fix and prevention",
+  "setup": "Use existing node:test, fast-check, c8, ESLint and TypeScript in disposable bounded Compose. No dependencies, migrations, commits or direct production data edits. Deploy only verified runtime modules over the live image with rollback.",
+  "acceptance": [
+    "Unlinking or switching a direct TO dependency removes the affected group's obsolete explicit pickup at 2967 and permits the revised plan to pass pickup validation.",
+    "Shared pickup visits retain unaffected references, metadata and order; adding a newly required order to a shared explicit visit makes its pickup allocation valid.",
+    "Required native, child, CO and remaining dependency pickups stay intact, including configured visits with unknown or zero cargo.",
+    "Started pickup, active travel and completed prefixes remain unchanged. Unknown and unrelated references are not silently repaired.",
+    "Reconciliation is idempotent and does not mutate its input. Actual dependency commands persist relationship and route atomically; stale commands still fail.",
+    "All test containers, volumes, networks and temporary artifacts are removed; live health passes after teardown and release.",
+    "Added after broader regression review: only intentional dependency commands may prune invalid explicit allocations. Ordinary authoritative projection retains invalid manual pickups so route validation still rejects them.",
+    "Follow-up: catalogue and feed hydration must rebuild TO dependency projections at every grouped child from current relationships. Cancelled links must not survive in cached group or split documents; active links, PO allocations, native yards and source cargo must survive.",
+    "Follow-up: applying an acknowledged plan must not restore cancelled dependencies from the browser catalogue. Its next real browser save must pass pickup validation.",
+    "Follow-up: an unrelated edit during a dependency request must survive while the acknowledged pickup change is adopted. Conflicting route edits must retain the local draft and stop autosave at the old revision for explicit review, never silently advance the fence.",
+    "Follow-up found during adversarial review: compact pool cards must also carry current pickup fields; their later refresh must not reintroduce the stale yard. Pool responses must remain compact and paginated."
+  ],
+  "failureModel": {
+    "lostSharedCargo": "explicit shared-stop assertions and generated reference sets",
+    "changedDriverHistory": "protected pickup/travel/completed-prefix cases and existing command blockers",
+    "invalidFutureRoute": "real pickup validation, command integration and relink regression",
+    "partialOrStaleWrite": "database rollback and revision-fence tests; existing transaction mechanism retained",
+    "deploymentDrift": "live baseline checksums, image overlay, configuration preservation and rollback"
+  }
+}

@@ -241,6 +241,7 @@ async function refreshAffectedPlan(command, actor, preview, relationship) {
   const reconciled = reconcileDependencyManagedPickups({
     plan: { ...currentPlan, orders },
     enrichedOrders: orders,
+    reconcileExplicitPickupAllocations: true,
     affectedTargetRefs: [...new Set([
       relationship.targetRef || command.targetRef,
       ...(relationship.relatedOrderRefs || [])

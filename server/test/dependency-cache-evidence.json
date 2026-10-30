@@ -1,0 +1,396 @@
+{
+  "passed": true,
+  "baseImage": "sha256:4340038d497be978b6edcba5945526a24ad62b1bfd7576a3918480be6f07e202",
+  "sourceRevision": "f49e1462393483b19e15bbc1fdf67e7919276aab",
+  "files": {
+    "src/dispatch-plan-order-projection.js": "bfc53e97df5233fdcadfd1f47439664072fb4e7a53c608477c5e1e9d7ea9fbd2",
+    "src/order-dependency-repository.js": "805e9d87464c3fa9705dcde36180f8065003c4071672e248ca29a5c4cbb0ade5",
+    "src/dispatch-order-catalog-repository.js": "c7b2e76a1dbf784f139a74dc8387c99b8412281b33afd7af430e20a5ba56831d",
+    "public/dispatch.js": "7f6daef8cbb71e592faa8e003e2f59b9b519781dd0c4de788ad10c246d7aa42d",
+    "public/dispatch.html": "8b0ee849bc4c26234d688803a5468d99b69eb4cf7f40f7caddd6662fb04e2b4c",
+    "public/mbt-planning.html": "c3c8c7ef40a9c17c90561091f308ecec2f1aa29e77bc1e2dd50f03946ff35424"
+  },
+  "baselineFiles": {
+    "src/dispatch-plan-order-projection.js": "d334910ba69e87b191c411e343e8556e83af2d19e6ef995bb31da7e8d99deb16",
+    "src/order-dependency-repository.js": "6a78d67b1a1ff617125ed191e2a15cb2a58859fe59f20258d768f7a3bec5225f",
+    "src/dispatch-order-catalog-repository.js": "e9a8d92fa41beb653c4ef7821fdf56ef49a64314e7bec9907518346b0f0e2baf",
+    "public/dispatch.js": "2734f1e497c148677700c4a7a209204ae27231fd36acd337c2d77c8653bd277d",
+    "public/dispatch.html": "f410f707ecfc90ebd0357c1d16af1fffdad7e0dc94b64cba165062c735bdad89",
+    "public/mbt-planning.html": "aefe3d6a7e5963c020aa71b6b65967943072c1c1296a38eeb48503e16ac0c4b7"
+  },
+  "changedLines": {
+    "src/dispatch-plan-order-projection.js": [
+      149,
+      150,
+      151,
+      152,
+      153,
+      154,
+      155,
+      156,
+      157,
+      158,
+      159,
+      160,
+      161,
+      162,
+      163,
+      164,
+      165,
+      166,
+      167,
+      168,
+      169,
+      170,
+      171,
+      172,
+      173,
+      174,
+      175,
+      176,
+      177,
+      178,
+      179,
+      180,
+      181,
+      182,
+      183,
+      184,
+      185,
+      186,
+      187,
+      188,
+      189
+    ],
+    "src/order-dependency-repository.js": [
+      7,
+      4597,
+      4598,
+      4599,
+      4600,
+      4601,
+      4602,
+      4603,
+      4620,
+      4621,
+      4622,
+      4623,
+      4624,
+      4625,
+      4627,
+      4686,
+      4687
+    ],
+    "src/dispatch-order-catalog-repository.js": [
+      11,
+      255,
+      256,
+      348,
+      370,
+      382,
+      459,
+      508,
+      509,
+      510,
+      513,
+      514,
+      515,
+      516,
+      517
+    ],
+    "public/dispatch.js": [
+      828,
+      829,
+      830,
+      831,
+      832,
+      833,
+      834,
+      6910,
+      6911,
+      6912,
+      6913,
+      6914,
+      6915,
+      6916,
+      6917,
+      6918,
+      6919,
+      6920,
+      6921,
+      6922,
+      6923,
+      6924,
+      6925,
+      6926,
+      6927,
+      6928,
+      6929,
+      6930,
+      6931,
+      6932,
+      6933,
+      6934,
+      6935,
+      6936,
+      6937,
+      6938,
+      6939,
+      6940,
+      6941,
+      6942,
+      6943,
+      6944,
+      6945,
+      6946,
+      6947,
+      6948,
+      6949,
+      7020,
+      7026
+    ],
+    "public/dispatch.html": [
+      20
+    ],
+    "public/mbt-planning.html": [
+      25
+    ]
+  },
+  "specApproval": "not obtained (autonomous run)",
+  "scope": "Full dependency-management suite plus pickup, projection, residual, concurrency and command regression suites; unrelated product suites excluded.",
+  "mutations": [
+    {
+      "name": "obsolete TO yard survives",
+      "killed": true,
+      "propertyOnly": true
+    },
+    {
+      "name": "native or PO yard removed",
+      "killed": true,
+      "propertyOnly": true
+    },
+    {
+      "name": "nested stale dependency survives",
+      "killed": true,
+      "propertyOnly": true
+    },
+    {
+      "name": "current child links not projected",
+      "killed": true,
+      "propertyOnly": false
+    },
+    {
+      "name": "catalogue returns stale projection",
+      "killed": true,
+      "propertyOnly": false
+    },
+    {
+      "name": "browser catalogue overrides saved dependency",
+      "killed": true,
+      "propertyOnly": false
+    },
+    {
+      "name": "in-flight response skips reconciliation",
+      "killed": true,
+      "propertyOnly": false
+    },
+    {
+      "name": "conflict fails to fence autosave",
+      "killed": true,
+      "propertyOnly": false
+    }
+  ],
+  "versions": {
+    "node": "v20.20.2",
+    "tools": {
+      "typescript": "7.0.2",
+      "eslint": "10.8.0",
+      "c8": "12.0.0",
+      "fast-check": "4.9.0"
+    }
+  },
+  "secretScan": 0,
+  "types": {
+    "baselineDiagnostics": 7900,
+    "candidateDiagnostics": 7900,
+    "newDiagnostics": [],
+    "changedExistingDiagnostics": [
+      {
+        "location": "src/dispatch-plan-repository.js(102,35): error TS2322",
+        "before": "Type 'any[]' is not assignable to type 'never[]'.",
+        "after": "Type 'TransferDependencySnapshot[]' is not assignable to type 'never[]'."
+      }
+    ]
+  },
+  "lint": {
+    "baseline": 56,
+    "candidate": 56,
+    "newDiagnostics": []
+  },
+  "baseline": {
+    "status": 1,
+    "tests": 168,
+    "pass": 165,
+    "fail": 3,
+    "skipped": 0,
+    "failures": [
+      "Operator loading remains an execution blocker even when the packing header says packed",
+      "RP-05 active travel protects its destination while allowing work after it",
+      "actual PO link preserves the dependent SO packing and still blocks loading"
+    ],
+    "failureDetails": [
+      {
+        "test": "actual PO link preserves the dependent SO packing and still blocks loading",
+        "details": "  ---\n  failureType: 'testCodeFailure'\n  error: 'Missing expected rejection.'\n  code: 'ERR_ASSERTION'\n  name: 'AssertionError'\n  stack: |-\n    process.processTicksAndRejections (node:internal/process/task_queues:95:5)\n    async file:///app/test-artifacts/candidate/test/dispatch/integration/to-dependency-packing-independent.test.js:141:5\n    async rollbackTest (file:///app/test-artifacts/candidate/test/dispatch/integration/to-dependency-packing-independent.test.js:43:9)\n    async TestContext.<anonymous> (file:///app/test-artifacts/candidate/test/dispatch/integration/to-dependency-packing-independent.test.js:125:3)\n    async Test.run (node:internal/test_runner/test:797:9)\n    async Test.processPendingSubtests (node:internal/test_runner/test:526:7)"
+      },
+      {
+        "test": "Operator loading remains an execution blocker even when the packing header says packed",
+        "details": "  ---\n  failureType: 'testCodeFailure'\n  error: |-\n    Expected values to be strictly equal:\n    \n    true !== false\n    \n  code: 'ERR_ASSERTION'\n  name: 'AssertionError'\n  expected: false\n  actual: true\n  operator: 'strictEqual'"
+      },
+      {
+        "test": "RP-05 active travel protects its destination while allowing work after it",
+        "details": "  ---\n  failureType: 'testCodeFailure'\n  error: |-\n    Expected values to be strictly equal:\n    \n    true !== false\n    \n  code: 'ERR_ASSERTION'\n  name: 'AssertionError'\n  expected: false\n  actual: true\n  operator: 'strictEqual'"
+      }
+    ]
+  },
+  "focused": {
+    "status": 0,
+    "tests": 12,
+    "pass": 12,
+    "fail": 0,
+    "skipped": 0,
+    "failures": [],
+    "failureDetails": []
+  },
+  "suite": {
+    "status": 1,
+    "tests": 180,
+    "pass": 177,
+    "fail": 3,
+    "skipped": 0,
+    "failures": [
+      "Operator loading remains an execution blocker even when the packing header says packed",
+      "RP-05 active travel protects its destination while allowing work after it",
+      "actual PO link preserves the dependent SO packing and still blocks loading"
+    ],
+    "failureDetails": [
+      {
+        "test": "actual PO link preserves the dependent SO packing and still blocks loading",
+        "details": "  ---\n  failureType: 'testCodeFailure'\n  error: 'Missing expected rejection.'\n  code: 'ERR_ASSERTION'\n  name: 'AssertionError'\n  stack: |-\n    process.processTicksAndRejections (node:internal/process/task_queues:95:5)\n    async file:///app/test-artifacts/candidate/test/dispatch/integration/to-dependency-packing-independent.test.js:141:5\n    async rollbackTest (file:///app/test-artifacts/candidate/test/dispatch/integration/to-dependency-packing-independent.test.js:43:9)\n    async TestContext.<anonymous> (file:///app/test-artifacts/candidate/test/dispatch/integration/to-dependency-packing-independent.test.js:125:3)\n    async Test.run (node:internal/test_runner/test:797:9)\n    async Test.processPendingSubtests (node:internal/test_runner/test:526:7)"
+      },
+      {
+        "test": "Operator loading remains an execution blocker even when the packing header says packed",
+        "details": "  ---\n  failureType: 'testCodeFailure'\n  error: |-\n    Expected values to be strictly equal:\n    \n    true !== false\n    \n  code: 'ERR_ASSERTION'\n  name: 'AssertionError'\n  expected: false\n  actual: true\n  operator: 'strictEqual'"
+      },
+      {
+        "test": "RP-05 active travel protects its destination while allowing work after it",
+        "details": "  ---\n  failureType: 'testCodeFailure'\n  error: |-\n    Expected values to be strictly equal:\n    \n    true !== false\n    \n  code: 'ERR_ASSERTION'\n  name: 'AssertionError'\n  expected: false\n  actual: true\n  operator: 'strictEqual'"
+      }
+    ]
+  },
+  "changedLineCoverage": [
+    {
+      "file": "src/dispatch-plan-order-projection.js",
+      "covered": 36,
+      "total": 36
+    },
+    {
+      "file": "src/order-dependency-repository.js",
+      "covered": 17,
+      "total": 17
+    },
+    {
+      "file": "src/dispatch-order-catalog-repository.js",
+      "covered": 13,
+      "total": 13
+    },
+    {
+      "file": "public/dispatch.js",
+      "covered": 45,
+      "total": 45
+    }
+  ],
+  "reverseOrder": {
+    "status": 0,
+    "tests": 12,
+    "pass": 12,
+    "fail": 0,
+    "skipped": 0,
+    "failures": [],
+    "failureDetails": []
+  },
+  "supplyChain": "No dependency changes. Runtime change adds no network, filesystem, subprocess or environment capabilities.",
+  "knownLimits": [
+    "Legacy TypeScript diagnostics are compared with baseline; this is not a fully typed codebase.",
+    "Browser network boundaries are stubbed; pickup acceptance uses the real server validator and database command suites run separately.",
+    "Unrelated product suites are outside this dispatch change. Existing suite failures are compared with the exact live image."
+  ],
+  "assetCacheVersion": "20261030-dependency-cache (both entry pages checked)",
+  "red": "Before implementation: 6 reproducing failures, 1 existing passing browser-save scenario. A later compact-pool regression also failed on the obsolete 2967 yard before its fix. Initial fixture/schema and incremental-save mock corrections were completed before the behavioral red runs.",
+  "scannerScope": "All changed runtime lines and complete new tests/fixture/gauntlet. An initial full-file scan matched two unchanged source-review HTML interpolations; neither was a credential or part of this patch.",
+  "reproduce": "bash docker/run-dependency-cache-checks.sh",
+  "deployment": {
+    "deployed": true,
+    "at": "2026-10-30T14:37:05.897244+00:00",
+    "imageId": "sha256:dcfdc8bd0f7616411bc8a2365de211c599a87541f75210e3315ad06730ca9d11",
+    "configurationPreserved": true,
+    "dependenciesUnchanged": true,
+    "health": 200,
+    "sourceHashesVerified": true,
+    "directDatabaseEdits": false
+  },
+  "liveOrderVerification": {
+    "group": "GOA-10724S1-10878S1",
+    "planId": "373",
+    "revision": "61",
+    "activePickupLocations": [
+      "3445"
+    ],
+    "detailPickupLocations": [
+      "3445"
+    ],
+    "searchPickupLocations": [
+      "3445"
+    ],
+    "cancelledLinksExcluded": [
+      "300",
+      "301"
+    ],
+    "readOnly": true,
+    "targetPickupIssues": 0
+  },
+  "cleanup": {
+    "verifiedAt": "2026-10-30T14:38:30.916021+00:00",
+    "containers": [],
+    "volumes": [],
+    "networks": [],
+    "temporaryRunArtifacts": 0,
+    "liveHealth": {
+      "ok": true,
+      "app": "MBBS Yard Server"
+    },
+    "otherActiveTestProjects": [
+      "mbbs-repair-tests-2986188-e2e-run-3c2e2c1f359b",
+      "mbbs-repair-tests-2986188-db-1"
+    ],
+    "scope": "All resources created by this task removed; separate concurrent tasks retain responsibility for their active test projects."
+  },
+  "acceptanceToTests": {
+    "Nested cancelled links, active child links and compact catalogue refresh": "test/dispatch/integration/dependency-pickup-cache.test.js",
+    "Saved plan precedence, subsequent save, concurrent edit retention and conflict fencing": "test/dispatch/frontend/dependency-pickup-cache.browser.test.mjs",
+    "Idempotence, native and PO yard retention, immutable input (120 generated cases)": "test/dispatch/unit/dependency-pickup-cache.test.js",
+    "Original unlink and mode-change route reconciliation": "test/dispatch/integration/dependency-pickup-reconciliation.test.js"
+  },
+  "verificationSourceHashes": {
+    "test/dispatch/integration/dependency-pickup-cache.test.js": "87a6982f22460bfd0ca1b01092e6bc314a6a3ba066c86adec39956e53715eec4",
+    "test/dispatch/frontend/dependency-pickup-cache.browser.test.mjs": "ccaa3e11adaea0d8d49701066f4bc770b9e941795d37f1926d7d4ba24f6c7afc",
+    "test/dispatch/unit/dependency-pickup-cache.test.js": "727d586f7fb4ef3f99e4c8d6cefdfda5ed12c4d2070627d2100524fc324567fc",
+    "test/dispatch/integration/dependency-pickup-reconciliation.test.js": "49d980091da7bf10365efe0f61e2d838aacbe915d6b08f8de6f83042ad6d1d0c",
+    "test/support/dependency-pickup-cache-fixture.mjs": "cc3eea16c2a1695b04b59a15941a63aea401e987476db5c142dc83e3586c782d",
+    "tools/dependency-cache-gauntlet.mjs": "e88c9f629f40fede3efabe9efa3abc29352541a2fb8039df3b653a632dfad80b",
+    "tools/dependency-cache-release.py": "fed0b732c585f7be7bbc266ff557a14835597b7f339a1733b064c984b37cb0fb",
+    "tools/dependency-cache-live-check.mjs": "e13eb2d10986ce2dc3092a604aea4c3bb670a9183a25ac81d6882fad7feb505b",
+    "test/dependency-pickup-reconciliation-spec.json": "b5d55d678fd6cc6efe7d422279437b29b7cfae1a68281eb7547ace9c7122a8c3",
+    "../docker/run-dependency-cache-checks.sh": "cb17cf7996c65bad9b4cbc36760d2238f4cd42f6a8df51d1392e062a7996d498"
+  }
+}

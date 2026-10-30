@@ -135,7 +135,7 @@ export function dispatchRequiredPickupVisitLocations(order = {}, plan = {}) {
   });
 }
 
-function orderRequiresLocation(order = {}, location = "") {
+export function dispatchPickupVisitLocationAllowed(order = {}, location = "") {
   const wanted = locationKey(location);
   // A configured visit already in the route remains valid even if its current
   // cargo is empty; only the missing-pickup check requires nonempty visits.
@@ -159,7 +159,7 @@ function loadDeliveryRefs(plan = {}, load = {}, location = "") {
     if (!deliveryStop(stop)) continue;
     for (const ref of directDeliveryRefs(stop)) {
       const order = orderByRef(plan, ref);
-      if (order && orderRequiresLocation(order, wanted)) refs.push(ref);
+      if (order && dispatchPickupVisitLocationAllowed(order, wanted)) refs.push(ref);
     }
   }
   return unique(refs);
@@ -317,7 +317,7 @@ function validateMaterializedPickupVisits(plan = {}, { allowLegacyPassthrough = 
             ));
             continue;
           }
-          if (!orderRequiresLocation(order, stop.location || stop.yard)) {
+          if (!dispatchPickupVisitLocationAllowed(order, stop.location || stop.yard)) {
             conflicts.push(conflict(
               "DISPATCH_PICKUP_ORDER_WRONG_YARD",
               `${ref} does not require pickup at ${text(stop.location || stop.yard)}.`,
