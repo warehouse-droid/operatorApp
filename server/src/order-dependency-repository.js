@@ -605,13 +605,13 @@ export async function assertNoActiveOrderDependenciesByRefs(orderRefs = [], acti
 export async function getSalesOrderDependencyExecutionBlock(orderRefs = []) {
   const refs = [...new Set((orderRefs || []).map(text).filter(Boolean))];
   if (!refs.length) return null;
+  // A materialized split waits for its parent's replenishment link only when it
+  // carries a linked item (see dependencyAppliesToDispatchOrder).
   const result = await query(
     `WITH requested_refs AS (
        SELECT unnest($1::text[]) AS order_ref
-     ), effective_refs AS (
-       SELECT order_ref FROM requested_refs
-       UNION
-       SELECT split.source_so_ref
+     ), split_sources AS (
+       SELECT split.source_so_ref, split.split_so_id
          FROM dispatch_scm_so_splits split
          JOIN requested_refs requested ON requested.order_ref = split.split_so_ref
         WHERE split.status = 'active'
@@ -632,11 +632,28 @@ export async function getSalesOrderDependencyExecutionBlock(orderRefs = []) {
        LEFT JOIN scm_reconciliation_order_state state
          ON state.order_kind = 'TO'
         AND state.source_order_netsuite_id = d.transfer_order_id
-      WHERE EXISTS (
-              SELECT 1
-                FROM effective_refs candidate
-               WHERE candidate.order_ref = d.dispatch_target_ref
-                  OR candidate.order_ref = d.sales_order_ref
+      WHERE (
+              EXISTS (
+                SELECT 1
+                  FROM requested_refs candidate
+                 WHERE candidate.order_ref = d.dispatch_target_ref
+                    OR candidate.order_ref = d.sales_order_ref
+              )
+              OR EXISTS (
+                SELECT 1
+                  FROM split_sources source
+                 WHERE (source.source_so_ref = d.dispatch_target_ref OR source.source_so_ref = d.sales_order_ref)
+                   AND (
+                     NOT EXISTS (SELECT 1 FROM order_dependency_lines dl
+                                  WHERE dl.dependency_id = d.id AND dl.item_id IS NOT NULL)
+                     OR NOT EXISTS (SELECT 1 FROM sales_order_lines sl
+                                     WHERE sl.sales_order_id = source.split_so_id AND sl.netsuite_active = true)
+                     OR EXISTS (SELECT 1 FROM sales_order_lines sl
+                                 WHERE sl.sales_order_id = source.split_so_id AND sl.netsuite_active = true
+                                   AND (sl.item_id IS NULL OR sl.item_id IN (
+                                     SELECT dl.item_id FROM order_dependency_lines dl WHERE dl.dependency_id = d.id)))
+                   )
+              )
             )
         AND d.dependency_mode = 'yard_replenishment'
         AND d.status <> 'cancelled'
@@ -4592,6 +4609,22 @@ export async function cancelOrderDependency(
   });
 }
 
+// A replenishment link made on a Sales Order before it was split still names the
+// whole order. A split, or a group holding splits, waits for it only when it
+// carries a linked item; without complete item identities the link still applies.
+// Direct pickups also shape pickup yards, so their scope is left unchanged.
+export function dependencyAppliesToDispatchOrder(dependency = {}, order = {}) {
+  if (dependency.mode !== "yard_replenishment") return true;
+  const ref = text(order.id || order.tranid);
+  const targets = [dependency.dispatchTargetRef, dependency.salesOrderRef, dependency.canonicalSalesOrderRef].map(text);
+  if (!ref || targets.includes(ref)) return true;
+  const linked = new Set((dependency.lines || []).map((line) => text(line.itemId ?? line.item_id)).filter(Boolean));
+  const items = Array.isArray(order.items) ? order.items : [];
+  if (!linked.size || !items.length) return true;
+  const itemIds = items.map((item) => text(item.itemId ?? item.item_id));
+  return itemIds.some((id) => !id || linked.has(id));
+}
+
 export async function enrichDispatchOrdersWithDependencies(orders = []) {
   if (!orders.length) {return [];}
   orders = orders.map(stripDispatchTransferDependencyProjection);
@@ -4627,6 +4660,7 @@ export async function enrichDispatchOrdersWithDependencies(orders = []) {
     const salesRefs = dependencyRefs({ ...order, id: ref });
     const salesDependencies = [...new Map(
       salesRefs.flatMap((salesRef) => bySales.get(salesRef) || [])
+        .filter((dependency) => dependencyAppliesToDispatchOrder(dependency, order))
         .map((dependency) => [String(dependency.id), dependency])
     ).values()];
     const uncoveredQuantity = salesRefs.reduce((total, salesRef) => total + number(uncoveredBySales.get(salesRef)), 0);
@@ -4931,13 +4965,15 @@ export async function validateDispatchPlanDependencies(plan = {}) {
     dependencies.filter((dependency) => dependency.mode === "yard_replenishment").map((dependency) => dependency.transferOrderRef),
     plan
   );
+  const planOrderByRef = new Map((plan.orders || []).map((order) => [text(order.id), order]));
   const conflicts = [];
   for (const dependency of dependencies) {
     const dispatchTargetRef = text(dependency.dispatchTargetRef || dependency.salesOrderRef);
     const canonicalRef = text(dependency.canonicalSalesOrderRef);
     const plannedSalesRef = current.has(dispatchTargetRef) ? dispatchTargetRef : canonicalRef;
-    const salesAssignments = assignmentsByRef.get(plannedSalesRef) || [];
-    const salesAssignment = current.get(plannedSalesRef);
+    const salesAssignments = (assignmentsByRef.get(plannedSalesRef) || []).filter((assignment) =>
+      dependencyAppliesToDispatchOrder(dependency, planOrderByRef.get(assignment.orderRef) || { id: assignment.orderRef }));
+    const salesAssignment = salesAssignments.at(-1);
     if (dependency.mode === "yard_replenishment" && dependency.transferReceived) continue;
     if (dependency.status === "attention") {
       if (salesAssignments.length) conflicts.push(`${plannedSalesRef}: ${dependency.attentionReason || `${dependency.transferOrderRef} requires attention`}.`);

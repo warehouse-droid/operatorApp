@@ -39,6 +39,29 @@ and headless Chromium `test/dispatch/frontend/dependency-pickup-cache.browser.te
 2967 stop). Pre-existing failures unrelated to the fix: billed SO HTTP save,
 SOA07894 event replay, split-date-conflict classic/v2 saves.
 
+## Fix status (follow-up, 2026-10-30)
+
+Each fix was reproduced by a failing test first, then fixed until green.
+
+| Finding | Fix | Tests |
+|---|---|---|
+| Priority 1–2: stale route legs | `estimateForLoad` ignores an estimate whose visited places (count, address, route location) differ from the current stops; stop times and labels keep it. Toll toggle invalidates the saved estimate too. | `test/dispatch/frontend/route-estimate-staleness.browser.test.mjs` |
+| Priority 3: rejected save stuck | Rejected saves (409 business conflict, 202 recovery draft) show "Undo last change" and "Discard unsaved changes" (reloads the saved plan). Ungroup refuses a load the driver already started. | `rejected-save-recovery.browser.test.mjs`, `ungroup-driver-activity.browser.test.mjs` |
+| Priority 4: grouped split deactivated | Confirmed-plan materialization collects splits inside groups, keeps them active and materializes never-confirmed grouped splits. | `test/dispatch/integration/grouped-split-confirmation.test.js` |
+| Priority 5: regroup cancels PO links | Regroup asks before removing the old group's PO links (shared check with Ungroup; a failed check still leaves the groups unchanged). | `regroup-po-links.browser.test.mjs`, existing `dispatch-ungroup-po-warning.test.js` |
+| Priority 6: parent TO link gates every split | Replenishment links apply to a split (or group of splits) only when it carries a linked item; enrichment, plan validation, driver start and client splits share one rule. Direct-pickup links unchanged. | `test/dispatch/integration/split-dependency-scope.test.js`, `test/dispatch/unit/split-dependency-scope.test.js` |
+| Grouping pickups | Pickups after the grouped drop merge into an earlier same-yard visit or move ahead of it; removing/ungrouping keeps shared pickup visits. | `group-pickup-placement.browser.test.mjs` |
+
+Replay found the grouped-split deactivation already happened in production:
+`SOA10724-S1/S2` and `SOA10878-S1/S2` (plan 373) are inactive and are restored
+by the next confirmed save once the fix is deployed.
+
+Pre-existing failures (identical before and after these fixes): 53 tests across
+the 32 dependency/delivery suites, `dispatch-first-split-group-status`,
+`dispatch-pickup-address` (SOA09326), `dispatch-repeat-pickup-visits` RP-08.
+The `dispatch-authoritative-retirement` harness was missing
+`withSavedDependencyProjection` and is fixed.
+
 ## Priority fixes
 
 1. **Route times go stale after almost any stop edit** (verified).

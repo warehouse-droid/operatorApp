@@ -605,6 +605,8 @@ let dispatchPlanActionPromise = null;
 let pendingDispatchPlanAction = null;
 let pendingPlanSaveAttempt = null;
 let blockedPlanSaveFence = null;
+// The server rejected the current draft; autosave will keep failing until it changes.
+let rejectedPlanSave = false;
 let dispatchDraftJournalTimer = null;
 let dispatchDraftStoragePromise = null;
 let dispatchDraftBackupError = "";
@@ -7308,18 +7310,21 @@ async function savePlanToServer(payload, { retryOnStale = true, forceSave = fals
           .map((item) => `${item.orderRef} on ${displayDate(item.planDate)}`)
           .join(", ");
         localPlanDirty = true;
+        rejectedPlanSave = true;
         routeNotice = `Cannot save: order already planned on another date${details ? ` (${details})` : "."}`;
         renderDispatchNoticePatch();
         return { blocked: true, code: conflict.code };
       }
       if (conflict.code === "DISPATCH_CO_SEQUENCE_INVALID") {
         localPlanDirty = true;
+        rejectedPlanSave = true;
         routeNotice = conflict.error || "CO must be planned before the original order pickup.";
         renderDispatchNoticePatch();
         return { blocked: true, code: conflict.code };
       }
       if (conflict.code && !["STALE_DISPATCH_PLAN", "DISPATCH_PLAN_FENCE_REQUIRED"].includes(conflict.code)) {
         localPlanDirty = true;
+        rejectedPlanSave = true;
         routeNotice = [...new Set((conflict.conflicts || []).map(item => item.message).filter(Boolean))].join(" ") || conflict.error || "Driver or truck assignment is invalid.";
         renderDispatchNoticePatch();
         return { blocked: true, code: conflict.code, error: routeNotice, businessConflict: true };
@@ -7356,6 +7361,7 @@ async function savePlanToServer(payload, { retryOnStale = true, forceSave = fals
     if (responsePayload?.applied === false && responsePayload?.recoveryDraft) {
       pendingPlanSaveAttempt = null;
       localPlanDirty = true;
+      rejectedPlanSave = true;
       const firstIssue = responsePayload.validationIssues?.[0];
       const issueMessage = (responsePayload.validationIssues || []).flatMap(issue => issue.conflicts?.length ? issue.conflicts.map(conflict => conflict.message || issue.message) : [issue.message]).filter(Boolean).join(" ") || String(firstIssue?.message || "The submitted plan needs correction.");
       routeNotice = `Draft backed up separately, but not applied to the active plan: ${issueMessage}`;
@@ -7679,6 +7685,7 @@ function clearLocalPlanDirty(savedAt = "", savedGeneration = localPlanGeneration
   if (savedGeneration !== localPlanGeneration) return;
   if (savedAt && lastLocalPlanEditAt && new Date(savedAt) < new Date(lastLocalPlanEditAt)) return;
   localPlanDirty = false;
+  rejectedPlanSave = false;
   queueDispatchDraftJournal();
   lastLocalPlanEditAt = "";
   if (blockedRemotePlanUpdate) {
@@ -7694,6 +7701,7 @@ function clearLocalPlanDirty(savedAt = "", savedGeneration = localPlanGeneration
 function resetLocalPlanDirty() {
   const refreshSetup = blockedDispatchSetupUpdate;
   blockedPlanSaveFence = null;
+  rejectedPlanSave = false;
   localPlanDirty = false;
   lastLocalPlanEditAt = "";
   pendingPlanMutationAction = "dispatch_plan_autosaved";
@@ -9072,7 +9080,27 @@ function normalizeRouteEstimateForLoad(load, estimate) {
 
 function estimateForLoad(load) {
   const estimate = routeEstimates[load?.id] || load?.routeEstimate || null;
-  return normalizeRouteEstimateForLoad(load, estimate);
+  return normalizeRouteEstimateForLoad(load, routeEstimateFitsLoadStops(load, estimate) ? estimate : null);
+}
+
+// An estimate holds one Google leg per gap between the places it was computed
+// for. Once the visited places change, those legs no longer line up with the
+// route, so the estimate is ignored until it is recomputed. Stop times, labels
+// and the start time do not change the driving legs, so they keep it.
+function routeEstimateFitsLoadStops(load, estimate) {
+  if (!estimate || !load?.id) return Boolean(estimate);
+  const { truck } = findLoad(load.id);
+  if (!truck) return true;
+  const stops = mapStopsForLoad(load, truck);
+  const legs = Array.isArray(estimate.legMinutes) ? estimate.legMinutes : [];
+  if (legs.length && legs.length !== stops.length - 1) return false;
+  const signature = String(estimate.routeSignature || "");
+  if (!signature) return true;
+  // routeSignature(): stops joined by ">", fields type|orderId|address|routeLocation|title|stay.
+  const stored = signature.slice(signature.indexOf("@") + 1, signature.lastIndexOf("@start:")).split(">")
+    .map((stop) => stop.split("|").slice(2, 4).join("|"));
+  const current = routeSignature(stops).split(">").map((stop) => stop.split("|").slice(2, 4).join("|"));
+  return stored.length === current.length && stored.every((place, index) => place === current[index]);
 }
 
 function routeEstimateMatchesMeta(estimate, meta) {
@@ -10779,19 +10807,33 @@ function selectedOrders() {
   return [...selectedOrderIds].map(orderById).filter(Boolean);
 }
 
+// Removing orders drops their stops, but a pickup visit shared with other orders
+// stays where it is and only loses the removed orders' references.
+function stopsWithoutOrders(stops = [], ids = new Set()) {
+  return stops.flatMap((stop) => {
+    if (stop.type === "pick" && Array.isArray(stop.orderRefs)) {
+      const kept = stop.orderRefs.filter((ref) => !ids.has(dispatchOrderRefKey(ref)));
+      if (kept.length && kept.length < stop.orderRefs.length) {
+        return [{ ...stop, orderRefs: kept, orderId: ids.has(dispatchOrderRefKey(stop.orderId)) ? kept[0] : stop.orderId }];
+      }
+    }
+    return ids.has(dispatchOrderRefKey(stop.orderId)) ? [] : [stop];
+  });
+}
+
 function removeStopsForOrders(orderIds = []) {
   const ids = new Set(orderIds.map(dispatchOrderRefKey).filter(Boolean));
   if (!ids.size) return [];
   const removed = [];
   for (const truck of trucks) {
     for (const load of truck.loads) {
-      const beforeCount = load.stops.length;
-      load.stops = load.stops.filter((stop) => {
-        const shouldRemove = ids.has(dispatchOrderRefKey(stop.orderId));
-        if (shouldRemove) removed.push({ truckId: truck.id, loadId: load.id, stop: summarizeStop(stop) });
-        return !shouldRemove;
-      });
-      if (beforeCount !== load.stops.length) cleanupOrphanPickupStops();
+      const beforeStops = load.stops;
+      load.stops = stopsWithoutOrders(beforeStops, ids);
+      const keptIds = new Set(load.stops.map((stop) => stop.id));
+      for (const stop of beforeStops) {
+        if (!keptIds.has(stop.id)) removed.push({ truckId: truck.id, loadId: load.id, stop: summarizeStop(stop) });
+      }
+      if (beforeStops.length !== load.stops.length) cleanupOrphanPickupStops();
     }
   }
   return removed;
@@ -12221,6 +12263,7 @@ function renderDispatchRouteNotice() {
   if (dispatchDraftBackupError && localPlanDirty) {messages.push(`<div>${escapeHtml(dispatchDraftBackupError)}</div>`);}
   if (pendingDispatchPlanAction && !confirmInFlight) {messages.push(`<div>A plan action is waiting for its saved result.<div class="dispatch-draft-actions"><button data-action="retry-dispatch-plan-action" type="button">Retry pending action</button></div></div>`);}
   if (routeNotice) {messages.push(`<div>${escapeHtml(routeNotice)}</div>`);}
+  if (rejectedPlanSave && localPlanDirty) {messages.push(`<div>The saved plan is unchanged. Undo the last change or discard unsaved changes to continue.<div class="dispatch-draft-actions"><button data-action="undo-plan" type="button">Undo last change</button><button data-action="discard-rejected-plan-changes" type="button">Discard unsaved changes</button></div></div>`);}
   return messages.length ? `<div class="route-notice dispatch-save-notice${reviews ? " source-review-notice" : ""}"><div>${messages.join("")}</div>${routeNotice || visibleExecutedOrderReviewHistory().length ? '<button data-action="close-route-notice" type="button" aria-label="Dismiss notice">x</button>' : ""}</div>` : "";
 }
 
@@ -15561,6 +15604,20 @@ function refreshSplitQuantityValidation(order) {
   if (confirm) confirm.disabled = Boolean(message);
 }
 
+// Mirrors the server rule: a replenishment link made before a split applies only
+// to splits carrying a linked item (or whose items lack identities).
+function dependencyAppliesToDispatchOrder(dependency = {}, order = {}) {
+  if (dependency.mode !== "yard_replenishment") return true;
+  const clean = (value) => String(value ?? "").trim();
+  const ref = clean(order.id || order.tranid);
+  const targets = [dependency.dispatchTargetRef, dependency.salesOrderRef, dependency.canonicalSalesOrderRef].map(clean);
+  if (!ref || targets.includes(ref)) return true;
+  const linked = new Set((dependency.lines || []).map((line) => clean(line.itemId ?? line.item_id)).filter(Boolean));
+  const items = Array.isArray(order.items) ? order.items : [];
+  if (!linked.size || !items.length) return true;
+  return items.map((item) => clean(item.itemId ?? item.item_id)).some((itemId) => !itemId || linked.has(itemId));
+}
+
 function splitOrder(orderId, parts = 2, startSuffix = 1) {
   const order = orderById(orderId);
   if (!order || order.type === "CUSTOM") return false;
@@ -15580,9 +15637,12 @@ function splitOrder(orderId, parts = 2, startSuffix = 1) {
   orders.splice(orders.findIndex((item) => item.id === order.id), 1);
   const splits = Array.from({ length: cleanParts }).map((_, index) => {
     const totals = splitTotalsForPart(order, index);
+    const id = `${order.id}-S${cleanStartSuffix + index}`;
     return {
       ...order,
-      id: `${order.id}-S${cleanStartSuffix + index}`,
+      ...(Array.isArray(order.orderDependencies) ? { orderDependencies: order.orderDependencies
+        .filter((dependency) => dependencyAppliesToDispatchOrder(dependency, { id, items: totals.items })) } : {}),
+      id,
       planOwned: true,
       pallets: totals.pallets,
       specialPalletTotal: order.specialPalletTotal == null ? null : totals.pallets,
@@ -15811,6 +15871,40 @@ function groupedOrderPlanningDependencyBlockMessage(grouped, planning = {}) {
   );
 }
 
+// Member drops collapse into one grouped drop at the earliest member's position.
+// Member pickups that came after it must happen before it: merge each into an
+// earlier visit at the same yard, or move it ahead of the drop.
+function groupPickupsBeforeGroupedDrop(load, stops, groupedStop, groupRef) {
+  const dropIndex = stops.indexOf(groupedStop);
+  if (dropIndex < 0) return stops;
+  const before = stops.slice(0, dropIndex);
+  const after = [];
+  const refsOf = (stop) => (Array.isArray(stop.orderRefs) ? stop.orderRefs : [stop.orderId]).map(String);
+  for (const stop of stops.slice(dropIndex + 1)) {
+    if (stop.type !== "pick" || !refsOf(stop).includes(groupRef)) {
+      after.push(stop);
+      continue;
+    }
+    const others = refsOf(stop).filter((ref) => ref !== groupRef);
+    const location = normalizedPickupLocation(stop.location);
+    const earlierIndex = before.findIndex((candidate) => candidate.type === "pick"
+      && normalizedPickupLocation(candidate.location) === location);
+    if (earlierIndex >= 0) {
+      const earlier = before[earlierIndex];
+      if (Array.isArray(earlier.orderRefs) && !earlier.orderRefs.map(String).includes(groupRef)) {
+        before[earlierIndex] = { ...earlier, orderRefs: [...earlier.orderRefs, groupRef] };
+      }
+    } else {
+      before.push(others.length ? makePickupStop(load, { id: groupRef }, stop.location)
+        : { ...stop, orderId: groupRef, orderRefs: [groupRef] });
+    }
+    if (others.length) {
+      after.push({ ...stop, orderRefs: others, orderId: String(stop.orderId) === groupRef ? others[0] : stop.orderId });
+    }
+  }
+  return [...before, groupedStop, ...after];
+}
+
 function applyGroupedOrderPlanning(grouped, planning = {}) {
   const load = planning.load;
   if (!load || !planning.assignments?.length) return;
@@ -15845,7 +15939,7 @@ function applyGroupedOrderPlanning(grouped, planning = {}) {
     }
     nextStops.push(stop);
   }
-  load.stops = nextStops;
+  load.stops = groupPickupsBeforeGroupedDrop(load, nextStops, groupedStop, String(grouped.id));
   selectedLoadId = load.id;
   delete routeCache[load.id];
   delete routeEstimates[load.id];
@@ -16025,22 +16119,64 @@ function groupedOrderTransitCoId(order) {
   return relatedCo?.id || "";
 }
 
+// Retiring a group (Ungroup, or Regroup into a larger group) cancels the PO
+// links made on that group, so ask first. The server is the authority on those
+// links; if it cannot be checked, the group is left unchanged.
+async function confirmGroupPoLinkRemoval(groupRefs = [], verb = "Ungroup") {
+  const purchaseRefs = [];
+  for (const groupRef of groupRefs) {
+    const group = orderById(groupRef);
+    if (!group || !(group.type === "SO" || group.childOrderDetails?.some((child) => child.type === "SO"))) continue;
+    let allocations;
+    try {
+      const params = new URLSearchParams({ planDate: currentPlanDate });
+      const response = await fetch(`/api/dispatch/orders/${encodeURIComponent(groupRef)}/po-allocations?${params}`);
+      if (!response.ok) throw new Error(await dispatchErrorMessage(response));
+      allocations = (await response.json()).allocations || [];
+    } catch (error) {
+      routeNotice = `Unable to check PO allocations for ${groupRef}: ${error.message}`;
+      return { proceed: false, purchaseRefs };
+    }
+    const refs = [...new Set(allocations.map((allocation) => allocation.poOrderRef).filter(Boolean))];
+    purchaseRefs.push(...refs);
+    if (allocations.length && !confirm(`${verb} ${groupRef}?\n\nThis group has ${allocations.length} PO allocation${allocations.length === 1 ? "" : "s"}${refs.length ? ` linked to ${refs.join(", ")}` : ""}. ${verb}ing will remove all of these PO allocations.\n\nContinue?`)) {
+      return { proceed: false, purchaseRefs };
+    }
+  }
+  return { proceed: true, purchaseRefs };
+}
+
+// The server keeps a started driver's stops; ungrouping would remove them and
+// every later save would be rejected. Refuse up front, as grouping does.
+function ungroupDriverActivityBlock(groupId) {
+  for (const truck of trucks || []) {
+    for (const load of truck.loads || []) {
+      if (!(load.stops || []).some((stop) => String(stop.orderId || "") === String(groupId))) continue;
+      if (orderHasDriverActivityInLoad(load, groupId)) {
+        return `Cannot ungroup ${groupId} in ${truck.plate || "truck"} ${load.name || "load"} because driver activity has already started.`;
+      }
+    }
+  }
+  return "";
+}
+
 async function ungroupOrderWithPoCheck(orderId) {
   const grouped = orderById(orderId);
   if (!grouped?.childOrders?.length) return false;
+  const activityBlock = ungroupDriverActivityBlock(orderId);
+  if (activityBlock) {
+    routeNotice = activityBlock;
+    render({ save: false });
+    return false;
+  }
   try {
-    const refreshRefs = [...grouped.childOrders];
     if (grouped.type === "SO" || grouped.childOrderDetails?.some((child) => child.type === "SO")) {
       await saveCurrentPlanNow();
-      const params = new URLSearchParams({ planDate: currentPlanDate });
-      const response = await fetch(`/api/dispatch/orders/${encodeURIComponent(orderId)}/po-allocations?${params}`);
-      if (!response.ok) throw new Error(await dispatchErrorMessage(response));
-      const allocations = (await response.json()).allocations || [];
-      const purchaseRefs = [...new Set(allocations.map((allocation) => allocation.poOrderRef).filter(Boolean))];
-      refreshRefs.push(...purchaseRefs);
-      if (allocations.length && !confirm(`Ungroup ${orderId}?\n\nThis group has ${allocations.length} PO allocation${allocations.length === 1 ? "" : "s"}${purchaseRefs.length ? ` linked to ${purchaseRefs.join(", ")}` : ""}. Ungrouping will remove all of these PO allocations.\n\nContinue?`)) {
-        return false;
-      }
+    }
+    const poCheck = await confirmGroupPoLinkRemoval([orderId], "Ungroup");
+    if (!poCheck.proceed) {
+      render({ save: false });
+      return false;
     }
     const restored = ungroupOrder(orderId);
     if (!restored) {
@@ -16048,11 +16184,11 @@ async function ungroupOrderWithPoCheck(orderId) {
       return false;
     }
     queueGlobalOrderRetirement(orderId);
-    requestTargetedOrderPoolRefresh(refreshRefs);
+    requestTargetedOrderPoolRefresh([...grouped.childOrders, ...poCheck.purchaseRefs]);
     commitPlanMutation("ungroup_order");
     return true;
   } catch (error) {
-    routeNotice = `Unable to check PO allocations for ${orderId}: ${error.message}`;
+    routeNotice = `Ungroup ${orderId} failed: ${error.message}`;
     render({ save: false });
     return false;
   }
@@ -16064,6 +16200,11 @@ function ungroupOrder(orderId) {
   const coId = groupedOrderTransitCoId(group);
   if (coId) {
     routeNotice = `Cancel ${coId} before ungrouping ${group.id}.`;
+    return null;
+  }
+  const activityBlock = ungroupDriverActivityBlock(group.id);
+  if (activityBlock) {
+    routeNotice = activityBlock;
     return null;
   }
   const before = summarizeOrder(group);
@@ -17311,6 +17452,18 @@ app.addEventListener("click", async (event) => {
     }
     return;
   }
+  if (action === "discard-rejected-plan-changes") {
+    if (!window.confirm("Discard all unsaved changes and reload the saved plan?")) return;
+    resetLocalPlanDirty();
+    loadPlanForDate(currentPlanDate, { createIfMissing: false }).then(() => {
+      routeNotice = "Unsaved changes discarded. The saved plan is loaded.";
+      render({ save: false });
+    }).catch((error) => {
+      routeNotice = `Reloading the saved plan failed: ${error.message}`;
+      render({ save: false });
+    });
+    return;
+  }
   if (action === "undo-plan") {
     if (!undoDispatchChange()) {
       routeNotice = "Nothing to undo.";
@@ -17584,13 +17737,18 @@ app.addEventListener("click", async (event) => {
       .filter((order) => Array.isArray(order.childOrders) && order.childOrders.length)
       .map((order) => String(order.id || ""))
       .filter(Boolean);
+    const poCheck = await confirmGroupPoLinkRemoval(replacedGroupRefs, "Regroup");
+    if (!poCheck.proceed) {
+      render({ save: false });
+      return;
+    }
     if (!groupOrder(button.dataset.order)) {
       render({ save: false });
       return;
     }
     replacedGroupRefs.forEach(queueGlobalOrderRetirement);
     queueGlobalOrderReactivation(selectedOrderId);
-    requestTargetedOrderPoolRefresh([selectedOrderId]);
+    requestTargetedOrderPoolRefresh([selectedOrderId, ...poCheck.purchaseRefs]);
     logDispatchAudit({
       action: "orders_grouped",
       entityType: "order",
@@ -17924,13 +18082,14 @@ app.addEventListener("click", async (event) => {
       const warning = orderHasDriverActivityInLoad(found.load, orderId) ? stopActivityLockNotice(found.stop) : "";
       if (warning) routeNotice = `Cannot remove stop: ${warning}`;
       else {
-        const remainingStops = found.load.stops.filter((stop) => stop.orderId !== orderId);
+        const remainingStops = stopsWithoutOrders(found.load.stops, new Set([dispatchOrderRefKey(orderId)]));
         if (physicalActivityPositionChanged(found.load, remainingStops)) {
           routeNotice = stopSequenceActivityLockNotice();
           return render({ save: false });
         }
         const before = summarizeLoad(found.load);
-        const removed = found.load.stops.filter((stop) => stop.orderId === orderId).map(summarizeStop);
+        const remainingIds = new Set(remainingStops.map((stop) => stop.id));
+        const removed = found.load.stops.filter((stop) => !remainingIds.has(stop.id)).map(summarizeStop);
         found.load.stops = remainingStops;
         syncPickupStops();
         cleanupOrphanPickupStops();
@@ -17966,8 +18125,7 @@ app.addEventListener("click", async (event) => {
     if (!load) return;
     const before = summarizeLoad(load);
     load.allowTolls = !Boolean(load.allowTolls);
-    delete routeCache[load.id];
-    delete routeEstimates[load.id];
+    invalidateDriverRoutesFromLoad(load.id);
     routeNotice = load.allowTolls
       ? `${truck?.plate || "Truck"} ${load.name} may use toll roads. Google refines this on confirmation or manual refresh.`
       : `${truck?.plate || "Truck"} ${load.name} will avoid toll roads. Google refines this on confirmation or manual refresh.`;

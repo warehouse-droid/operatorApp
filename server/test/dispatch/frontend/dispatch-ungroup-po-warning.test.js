@@ -9,9 +9,10 @@ import { cargoFunctions } from "../../support/sales-order-cargo-fixture.mjs";
 function browser({ allocations = [], accept = true, failed = false, type = "SO", blocked = false } = {}) {
   const calls = [];
   const group = { id: "GOA-9948-9949-9998", type, childOrders: ["SOA09948", "SOA09949", "SOA09998"] };
-  const functions = cargoFunctions(process.env.PO_IDENTITY_BROWSER_SOURCE || "../../public/dispatch.js", ["ungroupOrderWithPoCheck"], {
+  const functions = cargoFunctions(process.env.PO_IDENTITY_BROWSER_SOURCE || "../../public/dispatch.js", ["ungroupOrderWithPoCheck", "confirmGroupPoLinkRemoval"], {
     orderById: () => group,
     groupedOrderTransitCoId: () => "",
+    ungroupDriverActivityBlock: () => "",
     currentPlanDate: "2026-10-15",
     URLSearchParams,
     saveCurrentPlanNow: async () => { calls.push("save"); },

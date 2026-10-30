@@ -67,6 +67,7 @@ const extractedFunctions = [
   "preserveMbtReadOnlyLoads",
   "findLoad",
   "planPayload",
+  "withSavedDependencyProjection",
   "applySavedPlan",
   "resetPlanningBoard",
   "resetUndoHistory",

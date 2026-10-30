@@ -3220,21 +3220,35 @@ function placedDeliveryOrderRefs(plan = {}) {
   return refs;
 }
 
+// A split can travel inside a group (group after split). It keeps its own
+// materialized order, so collect group members as well as top-level orders.
+// A CO only carries copies of its source members, which keep their own lifecycle.
+function planSplitOrders(plan = {}) {
+  const found = new Map();
+  const visit = (order, placementRef, materialize) => {
+    if (!order || typeof order !== "object") return;
+    const ref = String(order.id || "").trim();
+    if (ref && isSplitOrder(order) && ["SO", "TO"].includes(order.type) && !found.has(ref)) {
+      found.set(ref, { order: { ...order, originalOrderId: splitParentOrderId(order) }, placementRef, materialize });
+    }
+    const carriesMembers = String(order.type || "").trim().toUpperCase() !== "CO";
+    for (const child of order.childOrderDetails || []) visit(child, placementRef, materialize && carriesMembers);
+  };
+  for (const order of plan.orders || []) visit(order, String(order?.id || "").trim(), true);
+  return [...found.values()];
+}
+
 async function materializeDispatchSplitOrders(plan) {
   const placedOrderRefs = placedDeliveryOrderRefs(plan);
-  const allSplits = (plan.orders || [])
-    .filter((order) =>
-      isSplitOrder(order)
-      && ["SO", "TO"].includes(order.type)
-    )
-    .map((order) => ({ ...order, originalOrderId: splitParentOrderId(order) }));
+  const planSplits = planSplitOrders(plan);
+  const allSplits = planSplits.map((entry) => entry.order);
   const activeSplitRefs = allSplits.map((order) => String(order.id || ""));
   // Plan snapshots cache unplaced order-pool rows. Preserve their split identity,
   // but do not let an empty legacy row block materialization for the placed loads.
-  const splits = allSplits.filter((order) =>
-    placedOrderRefs.has(String(order.id || "").trim())
+  const splits = planSplits.filter(({ order, placementRef, materialize }) => materialize && (
+    placedOrderRefs.has(placementRef)
     || (Array.isArray(order.items) && order.items.some(Boolean))
-  );
+  )).map((entry) => entry.order);
   await query(
     `UPDATE sales_orders
         SET netsuite_active = false,
@@ -3340,9 +3354,9 @@ async function materializeDispatchSplitOrders(plan) {
     splits: splits.length,
     splitRefs: activeSplitRefs,
     splitParentRefs: [...new Set(
-      allSplits
-        .filter((order) => placedOrderRefs.has(String(order.id || "").trim()))
-        .map(splitParentOrderId)
+      planSplits
+        .filter(({ placementRef }) => placedOrderRefs.has(placementRef))
+        .map(({ order }) => splitParentOrderId(order))
         .filter(Boolean)
     )]
   };
